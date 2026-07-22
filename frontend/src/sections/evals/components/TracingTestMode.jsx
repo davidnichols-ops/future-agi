@@ -242,6 +242,10 @@ const TracingTestMode = React.forwardRef(
       // Optional: seed the variable→field mapping (used when editing an
       // already-configured eval so the user's previous mapping is preserved).
       initialMapping = null,
+      // Optional: seed the selected tracing project WITHOUT locking the
+      // picker (Eval Detail page restores the saved project but lets the
+      // user change it — unlike initialProjectId which locks the task flow).
+      initialTracingProjectId = null,
       errorLocalizerEnabled = false,
       isComposite = false,
       compositeAdhocConfig = null,
@@ -270,7 +274,7 @@ const TracingTestMode = React.forwardRef(
     const [projects, setProjects] = useState([]);
     const [loadingProjects, setLoadingProjects] = useState(false);
     const [selectedProjectId, setSelectedProjectId] = useState(
-      initialProjectId || "",
+      initialProjectId || initialTracingProjectId || "",
     );
 
     // Row type
@@ -387,6 +391,33 @@ const TracingTestMode = React.forwardRef(
       mapping,
       setMapping,
     });
+
+    // Seed the mapping / project from a saved version once it arrives. The
+    // useState initializer covers the synchronous case; these cover the async
+    // case (version loads after mount). Merged per key so a saved value wins
+    // over an auto-derived one without discarding auto-derived keys the save
+    // never covered.
+    const mappingSeededRef = useRef(
+      !!(initialMapping && Object.keys(initialMapping).length),
+    );
+    useEffect(() => {
+      if (mappingSeededRef.current) return;
+      if (initialMapping && Object.keys(initialMapping).length) {
+        mappingSeededRef.current = true;
+        setMapping((prev) => ({ ...prev, ...initialMapping }));
+      }
+    }, [initialMapping]);
+
+    const projectSeededRef = useRef(
+      !!(initialProjectId || initialTracingProjectId),
+    );
+    useEffect(() => {
+      if (projectSeededRef.current || projectLocked) return;
+      if (initialTracingProjectId) {
+        projectSeededRef.current = true;
+        setSelectedProjectId((prev) => prev || initialTracingProjectId);
+      }
+    }, [initialTracingProjectId, projectLocked]);
 
     // Template ID ref (updated via imperative handle for first-test flow)
     const templateIdRef = useRef(templateId);
@@ -1066,8 +1097,13 @@ const TracingTestMode = React.forwardRef(
           if (overrideTemplateId) templateIdRef.current = overrideTemplateId;
           handleRunTest();
         },
+        // Read by Save Version to persist the current mapping + project.
+        getMappingState: () => ({
+          mapping,
+          tracingProjectId: selectedProjectId || null,
+        }),
       }),
-      [handleRunTest],
+      [handleRunTest, mapping, selectedProjectId],
     );
 
     return (
