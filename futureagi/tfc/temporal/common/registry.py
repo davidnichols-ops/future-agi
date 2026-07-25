@@ -854,15 +854,19 @@ def get_activities_for_queue(queue: str) -> list[Callable]:
 
 
 def get_all_queues() -> list[str]:
-    """Get all queues that have registered workflows or activities.
+    """Get product queues that have registered workflows or activities.
 
-    Includes ``backfill``. Callers that poll multiple queues MUST force the
-    backfill worker to ``max_concurrent_activities=1`` (process-wide Vapi rate
-    limiter) while leaving other queues at their requested concurrency.
+    Excludes ``backfill``: that queue is opt-in via
+    ``start_vapi_backfill_worker`` / ``start_backfill_worker`` only. Multi-queue
+    workers must not poll it (sync activities need a dedicated executor, and the
+    Vapi rate limiter is process-local).
     """
     _ensure_workflows_registered()
     _ensure_activities_registered()
-    return list(set(list(_workflow_registry.keys()) + list(_activity_registry.keys())))
+    queues = set(list(_workflow_registry.keys()) + list(_activity_registry.keys()))
+    queues.discard("backfill")
+    return list(queues)
+
 
 
 def get_all_workflows() -> list[type]:

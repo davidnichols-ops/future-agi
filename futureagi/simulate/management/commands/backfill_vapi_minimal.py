@@ -100,7 +100,8 @@ class Command(BaseCommand):
         if not os.getenv("VAPI_API_RATE_LIMIT_PER_SECOND"):
             self.stdout.write(
                 self.style.WARNING(
-                    "VAPI_API_RATE_LIMIT_PER_SECOND is unset; authenticated API fallback is disabled"
+                    "VAPI_API_RATE_LIMIT_PER_SECOND is unset; "
+                    "authenticated API downloads will not be throttled"
                 )
             )
         limit = options["proof_gate"] or options["limit"]

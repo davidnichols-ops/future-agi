@@ -180,11 +180,12 @@ class Command(BaseCommand):
             # Map Celery-style queue names to Temporal queue names
             if task_queue in TASK_QUEUES:
                 task_queue = TASK_QUEUES[task_queue]
-            # Dedicated path may still target backfill alone; require slot=1 there.
-            if task_queue == "backfill" and max_concurrent_activities != 1:
+            # backfill is dedicated-only: sync activities need activity_executor
+            # and a single process-wide Vapi rate-limit slot.
+            if task_queue == "backfill":
                 raise CommandError(
-                    "backfill queue requires --max-concurrent-activities 1 "
-                    "(or use start_vapi_backfill_worker / start_backfill_worker)"
+                    "backfill queue is not supported by start_temporal_worker; "
+                    "use start_vapi_backfill_worker / start_backfill_worker"
                 )
             queues_to_poll = [task_queue]
             workflows, activities = get_workflows_and_activities_for_queue(task_queue)
@@ -300,14 +301,10 @@ class Command(BaseCommand):
             def create_worker_kwargs(queue_name: str) -> dict:
                 """Create worker configuration for a specific queue."""
                 # One Worker per queue with that queue's own registration.
-                # backfill is forced to a single activity slot so all-queues can
-                # poll it without defeating the process-wide Vapi rate limiter.
                 q_workflows, q_activities = get_workflows_and_activities_for_queue(
                     queue_name
                 )
-                activity_slots = (
-                    1 if queue_name == "backfill" else max_concurrent_activities
-                )
+                activity_slots = max_concurrent_activities
 
                 kwargs = {
                     "client": client,

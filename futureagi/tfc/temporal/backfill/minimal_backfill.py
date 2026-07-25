@@ -227,21 +227,47 @@ def _project_id(row: Any) -> str:
     return str(value)
 
 
+def _system_vapi_api_key() -> str | None:
+    """FutureAGI system Vapi key (env) — same default as ``VapiService``."""
+    return os.getenv("VAPI_API_KEY") or None
+
+
+
+
 def _api_key(row: Any, project_id: str) -> str | None:
+    """Match live simulation key selection, with system key as backup.
+
+    - outbound → customer AgentDefinition, else system ``VAPI_API_KEY``, else project
+    - inbound / unknown → system ``VAPI_API_KEY`` first (FAGI-owned calls), else project
+    """
     from tracer.utils.vapi_recording import VapiRecordingService
 
+    system_key = _system_vapi_api_key()
+
     call = _call(row)
-    if call is None:
-        return VapiRecordingService.get_api_key_for_project(project_id)
-    if (
+    if call is not None and (
         str((call.call_metadata or {}).get("call_direction") or "").lower()
         == "outbound"
     ):
         agent_id = call.test_execution.agent_definition_id or getattr(
             call.test_execution.run_test, "agent_definition_id", None
         )
-        return VapiRecordingService.get_api_key_for_agent_definition(agent_id)
+        agent_key = VapiRecordingService.get_api_key_for_agent_definition(agent_id)
+        if agent_key:
+            return agent_key
+        if system_key:
+            return system_key
+        return VapiRecordingService.get_api_key_for_project(project_id)
+    # Inbound (and unknown): system first like VoiceServiceManager, then project.
+    if system_key:
+        return system_key
     return VapiRecordingService.get_api_key_for_project(project_id)
+
+
+
+
+
+
 
 
 def _wait_for_api_slot(rate: int) -> None:
@@ -312,6 +338,7 @@ def _ch_call_id(attrs: dict[str, str], extra_call_id: str | None = None) -> str 
 
 
 def _api_key_for_attributes(attrs: dict[str, str], project_id: str) -> str | None:
+    """Customer project/agent first; system ``VAPI_API_KEY`` always last backup."""
     from tracer.utils.vapi_recording import VapiRecordingService
 
     direction = (
@@ -319,8 +346,16 @@ def _api_key_for_attributes(attrs: dict[str, str], project_id: str) -> str | Non
     ).lower()
     agent_id = attrs.get("agent_definition_id") or attrs.get("agent.id")
     if direction == "outbound" and agent_id:
-        return VapiRecordingService.get_api_key_for_agent_definition(agent_id)
-    return VapiRecordingService.get_api_key_for_project(project_id)
+        agent_key = VapiRecordingService.get_api_key_for_agent_definition(agent_id)
+        if agent_key:
+            return agent_key
+    project_key = VapiRecordingService.get_api_key_for_project(project_id)
+    if project_key:
+        return project_key
+    return _system_vapi_api_key()
+
+
+
 
 
 def _validate_storage_stat(stat: Any) -> None:
@@ -354,14 +389,14 @@ def _valid_direct_audio(response: Any) -> tuple[bytes, str] | None:
     return content, ext
 
 
-def _raise_direct_fallback_disabled(direct_error: BaseException | None) -> None:
-    if isinstance(direct_error, Exception) and _is_retryable(direct_error):
-        raise direct_error
-    if direct_error is not None:
-        raise RuntimeError(
-            f"Direct URL failed and authenticated fallback is disabled: {direct_error}"
-        ) from direct_error
-    raise RuntimeError("Direct URL failed and authenticated fallback is disabled")
+def _raise_authenticated_download_failed(
+    error: BaseException | None, *, reason: str
+) -> None:
+    if isinstance(error, Exception) and _is_retryable(error):
+        raise error
+    if error is not None:
+        raise RuntimeError(f"{reason}: {error}") from error
+    raise RuntimeError(reason)
 
 
 def _download(
@@ -370,51 +405,76 @@ def _download(
     kind: str,
     api_key_provider: Any | None = None,
 ) -> tuple[bytes, str | None]:
-    """Direct-URL first with audio validation; API key only on authenticated fallback.
+    """Authenticated Vapi API first (live rehost), public URL only as last resort.
 
-    Returns ``(audio_bytes, detected_extension_or_None)``. Extension is set when
-    the direct URL path validated via ``_detected_audio_extension``; API fallback
-    leaves it None so ``_stored`` detects once on upload.
+    Public CDN hosts are expired; production path is API-key download via
+    ``VapiRecordingService.download_artifact_sync``, same as
+    ``convert_audio_url_to_s3_sync`` / live normalize rehost.
+
+    Returns ``(audio_bytes, detected_extension_or_None)``.
     """
-    import requests
-
+    from simulate.temporal.utils.async_storage import MAX_AUDIO_FILE_SIZE
+    from tfc.utils.ssrf_guard import safe_fetch
+    from tracer.models.observability_provider import ProviderChoices
     from tracer.utils.vapi_recording import VapiRecordingService
 
-    direct_error: BaseException | None = None
-    try:
-        response = requests.get(url, timeout=60, allow_redirects=True)
-        response.raise_for_status()
-        validated = _valid_direct_audio(response)
-        if validated is not None:
-            return validated
-        headers = getattr(response, "headers", None) or {}
-        content_type = str(
-            headers.get("Content-Type") or headers.get("content-type") or ""
-        )
-        direct_error = RuntimeError(
-            f"Direct URL response is not valid audio (content_type={content_type!r}, "
-            f"bytes={len(getattr(response, 'content', b'') or b'')})"
-        )
-    except requests.RequestException as exc:
-        direct_error = exc
-
-    rate = int(os.getenv("VAPI_API_RATE_LIMIT_PER_SECOND", "0") or "0")
-    if rate <= 0:
-        _raise_direct_fallback_disabled(direct_error)
-
-    # Only resolve credentials when authenticated fallback is actually enabled.
-    api_key = api_key_provider() if callable(api_key_provider) else None
-    if not api_key:
-        _raise_direct_fallback_disabled(direct_error)
-
     artifact = VapiRecordingService.artifact_for_url_type(kind)
+    api_key = api_key_provider() if callable(api_key_provider) else None
+
+    # --- Preferred path: authenticated artifact API (live rehost parity) ---
+    if VapiRecordingService.is_authenticated_download(
+        ProviderChoices.VAPI, api_key, call_id, artifact
+    ):
+        rate = int(os.getenv("VAPI_API_RATE_LIMIT_PER_SECOND", "0") or "0")
+        if rate > 0:
+            _wait_for_api_slot(rate)
+        data = VapiRecordingService.download_artifact_sync(call_id, artifact, api_key)
+        if not data:
+            raise RuntimeError("Empty Vapi artifact")
+        return data, None
+
+    # --- Last resort: direct URL (legacy / non-Vapi hosts if any remain) ---
+    direct_error: BaseException | None = None
+    if url:
+        try:
+            response = safe_fetch(
+                url,
+                method="GET",
+                timeout=60,
+                max_bytes=MAX_AUDIO_FILE_SIZE,
+            )
+            response.raise_for_status()
+            validated = _valid_direct_audio(response)
+            if validated is not None:
+                return validated
+            headers = getattr(response, "headers", None) or {}
+            content_type = str(
+                headers.get("Content-Type") or headers.get("content-type") or ""
+            )
+            direct_error = RuntimeError(
+                f"Direct URL response is not valid audio (content_type={content_type!r}, "
+                f"bytes={len(getattr(response, 'content', b'') or b'')})"
+            )
+        except Exception as exc:
+            direct_error = exc
+
+    if not api_key:
+        _raise_authenticated_download_failed(
+            direct_error,
+            reason="Vapi API key unavailable and direct URL download failed",
+        )
     if not artifact:
         raise ValueError(f"Unknown artifact type {kind}")
-    _wait_for_api_slot(rate)
-    data = VapiRecordingService.download_artifact_sync(call_id, artifact, api_key)
-    if not data:
-        raise RuntimeError("Empty Vapi artifact")
-    return data, None
+    if not call_id:
+        raise ValueError("call_id is required for authenticated Vapi download")
+    _raise_authenticated_download_failed(
+        direct_error,
+        reason="Authenticated Vapi download prerequisites missing after direct URL failure",
+    )
+
+
+
+
 
 
 def _object_key_from_existing_url(base: str, url: str) -> str | None:
@@ -474,26 +534,44 @@ def _stored(
 
 
 def _update_pg(row: Any, kind: str, old: str, new: str) -> bool:
-    fields = []
-    field_name = TOP_FIELD.get(kind)
-    if field_name and getattr(row, field_name, None) == old:
-        setattr(row, field_name, new)
-        fields.append(field_name)
-    original = row.provider_call_data or {}
-    vapi = original.get("vapi")
-    if isinstance(vapi, dict):
-        vapi_copy = copy.deepcopy(vapi)
-        nested_changed = False
-        for path in PATHS[kind]:
-            nested_changed = _replace(vapi_copy, path, old, new) or nested_changed
-        if nested_changed:
-            payload = dict(original)
-            payload["vapi"] = vapi_copy
-            row.provider_call_data = payload
-            fields.append("provider_call_data")
-    if fields:
-        row.save(update_fields=list(dict.fromkeys(fields)))
-    return bool(fields)
+    """Rewrite recording URLs on a fresh locked row.
+
+    Re-reads under ``select_for_update`` so concurrent writers that deep-merge
+    ``provider_call_data`` (e.g. agent egress_id) are not clobbered by a stale
+    in-memory snapshot held across downloads.
+    """
+    from django.db import transaction
+
+    model = type(row)
+    with transaction.atomic():
+        locked = model.objects.select_for_update().get(pk=row.pk)
+        fields: list[str] = []
+        field_name = TOP_FIELD.get(kind)
+        if field_name and getattr(locked, field_name, None) == old:
+            setattr(locked, field_name, new)
+            fields.append(field_name)
+        original = locked.provider_call_data or {}
+        vapi = original.get("vapi")
+        if isinstance(vapi, dict):
+            vapi_copy = copy.deepcopy(vapi)
+            nested_changed = False
+            for path in PATHS[kind]:
+                nested_changed = _replace(vapi_copy, path, old, new) or nested_changed
+            if nested_changed:
+                payload = dict(original)
+                payload["vapi"] = vapi_copy
+                locked.provider_call_data = payload
+                fields.append("provider_call_data")
+        if not fields:
+            return False
+        locked.save(update_fields=list(dict.fromkeys(fields)))
+        # Keep the caller's in-memory row aligned for subsequent kinds.
+        if field_name and field_name in fields:
+            setattr(row, field_name, getattr(locked, field_name))
+        if "provider_call_data" in fields:
+            row.provider_call_data = locked.provider_call_data
+        return True
+
 
 
 def _pg_pending_q():
@@ -766,21 +844,21 @@ def _ch_shape(ch: Any) -> tuple[str, str | None, str, str, str]:
     shape = detect_spans_table_shape(ch.execute)
     if shape not in {"v1", "v2"}:
         raise RuntimeError(f"Unsupported spans shape {shape}")
-    active = "attrs_string" if shape == "v2" else "span_attr_str"
+    # v1 uses _peerdb_version counters. Stamping time.time_ns() would dominate
+    # later CDC and can resurrect soft-deleted rows. Prod is v2-only.
+    if shape == "v1":
+        raise RuntimeError(
+            "Vapi recording backfill requires spans v2 (_version); "
+            "refusing v1/_peerdb_version shape"
+        )
+    active = "attrs_string"
     columns = {
         row[0]: row[1]
         for row in ch.execute(
             "SELECT name,type FROM system.columns WHERE database=currentDatabase() AND table='spans'"
         )
     }
-    if shape == "v2":
-        extra, version_col, deleted_col = "attributes_extra", "_version", "is_deleted"
-    else:
-        extra, version_col, deleted_col = (
-            "span_attributes_raw",
-            "_peerdb_version",
-            "_peerdb_is_deleted",
-        )
+    extra, version_col, deleted_col = "attributes_extra", "_version", "is_deleted"
     if active not in columns:
         raise RuntimeError(f"spans missing active map column {active}")
     return (
@@ -790,6 +868,7 @@ def _ch_shape(ch: Any) -> tuple[str, str | None, str, str, str]:
         version_col,
         deleted_col,
     )
+
 
 
 def _ch_map_predicate(active: str) -> str:

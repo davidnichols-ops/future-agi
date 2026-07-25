@@ -192,7 +192,15 @@ class VapiRecordingService:
             agent_def = None
         if agent_def is None:
             return None
-        return cls._api_key_from_agent_definition(agent_def)
+        try:
+            return cls._api_key_from_agent_definition(agent_def)
+        except Exception:
+            logger.exception(
+                "vapi_recording_service.get_api_key_provider_row_failed",
+                provider_id=str(getattr(provider, "id", None)),
+            )
+            return None
+
 
     @classmethod
     def _api_key_from_any_agent_on_project(
@@ -224,10 +232,18 @@ class VapiRecordingService:
         """Resolve Vapi api_key through the canonical ProviderCredentials chain."""
         from simulate.services.agent_definition import resolve_api_key_for_version
 
-        version = agent_def.active_version or agent_def.latest_version
-        if version is None:
+        try:
+            version = agent_def.active_version or agent_def.latest_version
+            if version is None:
+                return None
+            return resolve_api_key_for_version(version)
+        except Exception:
+            logger.exception(
+                "vapi_recording_service.get_api_key_agent_definition_decrypt_failed",
+                agent_definition_id=str(getattr(agent_def, "id", None)),
+            )
             return None
-        return resolve_api_key_for_version(version)
+
 
     @classmethod
     async def download_artifact_async(

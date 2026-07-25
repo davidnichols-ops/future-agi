@@ -397,24 +397,19 @@ def convert_audio_url_to_s3_sync(
                 api_key=api_key,
             )
         else:
-            # Unauthenticated sync download via requests with size guard
-            response = requests.get(
-                audio_url, stream=True, timeout=DOWNLOAD_TIMEOUT
+            # Unauthenticated sync download via SSRF-safe fetch (hop revalidation).
+            from tfc.utils.ssrf_guard import safe_fetch
+
+            response = safe_fetch(
+                audio_url,
+                method="GET",
+                timeout=DOWNLOAD_TIMEOUT,
+                max_bytes=MAX_AUDIO_FILE_SIZE,
             )
             response.raise_for_status()
-
-            chunks = []
-            total_size = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    chunks.append(chunk)
-                    total_size += len(chunk)
-                    if total_size > MAX_AUDIO_FILE_SIZE:
-                        raise ValueError(
-                            f"Audio file exceeds maximum size of "
-                            f"{MAX_AUDIO_FILE_SIZE / (1024 * 1024):.1f}MB"
-                        )
-            audio_bytes = b"".join(chunks)
+            audio_bytes = response.content or b""
+            if not audio_bytes:
+                raise ValueError("Empty audio body from direct URL")
 
         object_key = _rehost_object_key(
             object_key_base, _detected_audio_extension(audio_bytes)
