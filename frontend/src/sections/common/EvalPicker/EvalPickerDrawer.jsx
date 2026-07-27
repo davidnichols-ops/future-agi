@@ -16,7 +16,6 @@ import { useEvalPickerContext } from "./context/EvalPickerContext";
 import EvalPickerList from "./EvalPickerList";
 import EvalPickerConfigFull from "./EvalPickerConfigFull";
 import EvalPickerCreateNew from "./EvalPickerCreateNew";
-import { normalizeEvalPickerEval } from "./evalPickerValue";
 
 const STEP_TITLES = {
   list: "Select Evaluation",
@@ -54,7 +53,7 @@ const EvalPickerContent = ({ onStepChange }) => {
       if (skipConfig) {
         setIsSaving(true);
         try {
-          await onEvalAdded?.(normalizeEvalPickerEval(evalData));
+          await onEvalAdded?.(evalData);
           onClose?.();
         } catch {
           // Parent handles error display
@@ -212,7 +211,6 @@ const EvalPickerContent = ({ onStepChange }) => {
           {step === "config" && selectedEval && (
             <EvalPickerConfigFull
               key={
-                selectedEval?.templateId ||
                 selectedEval?.template_id ||
                 selectedEval?.id
               }
@@ -321,12 +319,7 @@ const EvalPickerDrawer = ({
       }}
     >
       <EvalPickerProvider
-        key={
-          initialEval?.user_eval_id ||
-          initialEval?.userEvalId ||
-          initialEval?.id ||
-          "new"
-        }
+        key={initialEval?.user_eval_id || initialEval?.id || "new"}
         source={source}
         sourceId={sourceId}
         sourceRowType={sourceRowType}

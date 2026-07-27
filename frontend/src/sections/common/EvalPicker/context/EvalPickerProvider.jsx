@@ -2,7 +2,6 @@ import React, { useState, useCallback, useEffect } from "react";
 import PropTypes from "prop-types";
 import { useForm } from "react-hook-form";
 import { EvalPickerContext } from "./EvalPickerContext";
-import { normalizeEvalPickerEval } from "../evalPickerValue";
 
 const EvalPickerProvider = ({
   children,
@@ -42,9 +41,7 @@ const EvalPickerProvider = ({
   sourceTimeWindow = null,
 }) => {
   const [step, setStep] = useState(initialEval ? "config" : "list");
-  const [selectedEval, setSelectedEvalState] = useState(
-    normalizeEvalPickerEval(initialEval),
-  );
+  const [selectedEval, setSelectedEvalState] = useState(initialEval);
   // True when the drawer was opened in edit mode (initialEval was provided).
   // In edit mode the back button closes the drawer instead of going to list.
   const isEditMode = !!initialEval;
@@ -53,13 +50,13 @@ const EvalPickerProvider = ({
   // jump to config with that eval pre-selected.
   useEffect(() => {
     if (initialEval) {
-      setSelectedEvalState(normalizeEvalPickerEval(initialEval));
+      setSelectedEvalState(initialEval);
       setStep("config");
     }
   }, [initialEval]);
 
   const setSelectedEval = useCallback((evalData) => {
-    setSelectedEvalState(normalizeEvalPickerEval(evalData));
+    setSelectedEvalState(evalData);
   }, []);
 
   const handleReset = useCallback(() => {
