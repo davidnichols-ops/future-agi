@@ -38,6 +38,19 @@ from tfc.billing.boundary import (
 )
 
 
+def _ee_package_present() -> bool:
+    """True when a real ``ee`` package is importable.
+
+    Root conftest installs OSS stubs into ``sys.modules`` with ``__spec__=None``
+    so ``has_ee`` stays False. ``importlib.util.find_spec("ee")`` then raises
+    ``ValueError`` — treat that as absent (same pattern as annotation tests).
+    """
+    try:
+        return importlib.util.find_spec("ee") is not None
+    except (ModuleNotFoundError, ValueError):
+        return False
+
+
 # ── UsageDecision immutability ───────────────────────────────────────────────
 
 
@@ -267,7 +280,7 @@ class TestNoopBillingGatewayClientsRaise:
 
 
 @pytest.mark.skipif(
-    importlib.util.find_spec("ee") is None,
+    not _ee_package_present(),
     reason="delegation tests patch ee.usage import paths; requires the ee package",
 )
 class TestEeBillingDelegation:
