@@ -57,11 +57,9 @@ def get_v2_config() -> dict[str, Any]:
     """Read the CH 25.3 connection config, falling back to the legacy
     `CLICKHOUSE` dict (so a single-cluster deployment Just Works).
 
-    Per-key precedence:
-      1. Explicit `settings.CLICKHOUSE_V2[...]` if configured
-      2. Env vars `CH25_*`
-      3. Legacy `settings.CLICKHOUSE[...]` values
-      4. The module-level DEFAULT_* constant
+    Per-key precedence: `settings.CLICKHOUSE_V2[...]`, then the `CH25_*` env
+    var, then the legacy `settings.CLICKHOUSE` counterpart where one exists
+    (`host`, `user`, `password` and `database`), then the DEFAULT_* constant.
     """
     legacy = getattr(settings, "CLICKHOUSE", {}) or {}
     cfg = getattr(settings, "CLICKHOUSE_V2", {}) or {}
@@ -79,11 +77,12 @@ def get_v2_config() -> dict[str, Any]:
                 default=DEFAULT_HTTP_PORT,
             )
         ),
+        # No legacy fallback: CLICKHOUSE["CH_PORT"] defaults to the HTTP port,
+        # so it is not a safe source for the native port.
         "tcp_port": int(
             _configured(
                 cfg.get("CH25_TCP_PORT"),
                 os.getenv("CH25_TCP_PORT"),
-                legacy.get("CH_PORT"),
                 default=DEFAULT_TCP_PORT,
             )
         ),

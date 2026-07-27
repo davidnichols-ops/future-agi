@@ -3862,6 +3862,9 @@ class TestAnalyticsQueryService:
 # ============================================================================
 
 
+CH25_AUTH_ERROR = "Code: 194. DB::Exception: default: Authentication failed"
+
+
 @pytest.mark.unit
 class TestConsistencyChecker:
     """Test consistency monitoring."""
@@ -3922,7 +3925,8 @@ class TestConsistencyChecker:
         checker._ch_client = mock.Mock(ping=mock.Mock(return_value=True))
         return checker
 
-    def _patched_health_inputs(self, v2_connected):
+    def _healthy_cluster_patches(self):
+        """Enabled CH on healthy CDC lag, so only the v2 probe decides the status."""
         from tracer.services.clickhouse.consistency import (
             CDC_LAG_DEGRADED_SECONDS,
             ConsistencyChecker,
@@ -3938,17 +3942,19 @@ class TestConsistencyChecker:
                 "get_cdc_lag",
                 return_value={"tracer_trace": float(CDC_LAG_DEGRADED_SECONDS - 1)},
             ),
-            mock.patch.object(
-                ConsistencyChecker, "check_v2_connection", return_value=v2_connected
-            ),
         )
 
     def test_health_status_degraded_when_v2_probe_fails(self):
-        """A failing CH25 probe degrades a cluster the native client still reaches."""
-        checker = self._connected_checker()
-        enabled, lag, probe = self._patched_health_inputs(v2_connected=False)
+        """A rejected CH25 probe degrades a cluster the native client still reaches."""
+        import clickhouse_connect
 
-        with enabled, lag, probe:
+        checker = self._connected_checker()
+        enabled, lag = self._healthy_cluster_patches()
+        refused = mock.patch.object(
+            clickhouse_connect, "get_client", side_effect=RuntimeError(CH25_AUTH_ERROR)
+        )
+
+        with enabled, lag, refused:
             health = checker.get_health_status()
 
         assert health.clickhouse_connected is True
@@ -3956,13 +3962,20 @@ class TestConsistencyChecker:
         assert health.status == "degraded"
 
     def test_health_status_healthy_when_v2_probe_succeeds(self):
-        """A passing CH25 probe leaves a connected, low-lag cluster healthy."""
+        """A CH25 probe query that answers leaves a low-lag cluster healthy."""
+        import clickhouse_connect
+
         checker = self._connected_checker()
-        enabled, lag, probe = self._patched_health_inputs(v2_connected=True)
+        enabled, lag = self._healthy_cluster_patches()
+        v2_client = mock.Mock(command=mock.Mock(return_value=1))
+        probe = mock.patch.object(
+            clickhouse_connect, "get_client", return_value=v2_client
+        )
 
         with enabled, lag, probe:
             health = checker.get_health_status()
 
+        assert v2_client.command.called
         assert health.clickhouse_v2_connected is True
         assert health.status == "healthy"
 
@@ -3972,13 +3985,26 @@ class TestConsistencyChecker:
 
         from tracer.services.clickhouse.consistency import ConsistencyChecker
 
-        def refuse(**kwargs):
-            raise RuntimeError(
-                "Code: 194. DB::Exception: default: Authentication failed"
-            )
-
-        with mock.patch.object(clickhouse_connect, "get_client", refuse):
+        with mock.patch.object(
+            clickhouse_connect, "get_client", side_effect=RuntimeError(CH25_AUTH_ERROR)
+        ):
             assert ConsistencyChecker().check_v2_connection() is False
+
+    def test_check_v2_connection_false_when_the_probe_query_is_rejected(self):
+        """A client that connects but cannot run the probe query reports False."""
+        import clickhouse_connect
+
+        from tracer.services.clickhouse.consistency import ConsistencyChecker
+
+        rejected = mock.Mock(side_effect=RuntimeError(CH25_AUTH_ERROR))
+        v2_client = mock.Mock(command=rejected)
+
+        with mock.patch.object(
+            clickhouse_connect, "get_client", return_value=v2_client
+        ):
+            assert ConsistencyChecker().check_v2_connection() is False
+
+        v2_client.close.assert_called_once()
 
 
 # ============================================================================

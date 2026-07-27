@@ -20,7 +20,7 @@ from tracer.services.clickhouse.client import (
 logger = structlog.get_logger(__name__)
 
 CDC_LAG_DEGRADED_SECONDS = 60
-V2_PING_TIMEOUT_SECONDS = 5
+V2_PROBE_TIMEOUT_SECONDS = 5
 
 
 @dataclass
@@ -144,28 +144,35 @@ class ConsistencyChecker:
         return lag
 
     def check_v2_connection(self) -> bool:
-        """Ping the CH25 HTTP endpoint the observe read path authenticates against.
+        """Run an authenticated query against the CH25 HTTP endpoint.
 
         `self._ch_client` speaks the native protocol with the legacy credentials,
         so it stays green while the v2 HTTP credentials are wrong, which is how
         a v2 auth failure reached customers with this endpoint reporting healthy.
+        `/ping` is unauthenticated, so it has to be a real query against the
+        configured database to cover both the credentials and the database name.
         """
         try:
             import clickhouse_connect
+        except ImportError:
+            logger.warning("clickhouse_v2_health_probe_unavailable")
+            return False
 
-            from tracer.services.clickhouse.v2 import get_v2_config
+        from tracer.services.clickhouse.v2 import get_v2_config
 
-            cfg = get_v2_config()
+        cfg = get_v2_config()
+        try:
             client = clickhouse_connect.get_client(
                 host=cfg["host"],
                 port=cfg["http_port"],
                 username=cfg["user"],
                 password=cfg["password"],
                 database=cfg["database"],
-                send_receive_timeout=V2_PING_TIMEOUT_SECONDS,
+                connect_timeout=V2_PROBE_TIMEOUT_SECONDS,
+                send_receive_timeout=V2_PROBE_TIMEOUT_SECONDS,
             )
             try:
-                return bool(client.ping())
+                return bool(client.command("SELECT 1"))
             finally:
                 client.close()
         except Exception as e:
@@ -183,7 +190,7 @@ class ConsistencyChecker:
 
         connected = self._ch_client.ping()
         cdc_lag = self.get_cdc_lag() if connected else {}
-        v2_connected = self.check_v2_connection()
+        v2_connected = self.check_v2_connection() if connected else False
 
         # Determine status
         if not connected:

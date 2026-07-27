@@ -7,6 +7,7 @@ Plus how the same settings resolve into a v2 connection config.
 """
 from __future__ import annotations
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -149,16 +150,29 @@ _END_USER_ID = "11111111-1111-1111-1111-111111111111"
 
 
 def _override_config(**ch25_overrides):
-    """Helper: a legacy CLICKHOUSE plus CLICKHOUSE_V2 as settings.py builds it."""
+    """Helper: a legacy CLICKHOUSE plus an explicitly unconfigured CLICKHOUSE_V2."""
     from django.test.utils import override_settings
 
-    import tfc.settings.settings as deployment_settings
-
-    # tfc.settings.test replaces CLICKHOUSE_V2 with the test-cluster values, so
-    # take the base module's dict to see what a real deployment resolves from.
-    base = dict(deployment_settings.CLICKHOUSE_V2)
+    # Spelled out key by key rather than read from the settings module, whose
+    # CLICKHOUSE_V2 is frozen from the environment at import: CI exports CH25_*
+    # and those values would otherwise leak into every override.
+    base = {
+        "QUERY_TYPES_V2_PRIMARY": "",
+        "QUERY_TYPES_V2_ONLY":    "",
+        "QUERY_TYPES_SHADOW":     "",
+        "QUERY_TYPES_DISABLED":   "",
+    }
+    base.update({key: None for key in _CH25_CONNECTION_KEYS})
     base.update(ch25_overrides)
     return override_settings(CLICKHOUSE=dict(_LEGACY_CLICKHOUSE), CLICKHOUSE_V2=base)
+
+
+def test_settings_leave_unset_ch25_connection_keys_unconfigured():
+    """settings.py adds no default to a CH25 connection key, so legacy can win."""
+    import tfc.settings.settings as deployment_settings
+
+    for key in _CH25_CONNECTION_KEYS:
+        assert deployment_settings.CLICKHOUSE_V2[key] == os.getenv(key)
 
 
 @pytest.fixture
@@ -239,18 +253,28 @@ def test_end_user_lookup_pairs_a_ch25_password_with_the_legacy_user(
 
 
 def test_unset_ch25_keys_fall_through_to_the_legacy_connection(no_ch25_env):
-    """Host, database and TCP port come from the legacy cluster when CH25 sets none."""
+    """Host and database come from the legacy cluster when CH25 sets none."""
     with _override_config():
         cfg = get_v2_config()
 
     assert cfg["host"] == _LEGACY_CLICKHOUSE["CH_HOST"]
     assert cfg["database"] == _LEGACY_CLICKHOUSE["CH_DATABASE"]
-    assert cfg["tcp_port"] == int(_LEGACY_CLICKHOUSE["CH_PORT"])
     assert cfg["http_port"] == DEFAULT_HTTP_PORT
 
 
+def test_ports_never_inherit_the_legacy_port(no_ch25_env):
+    """Neither port reads legacy CH_PORT, which carries an HTTP-port default."""
+    with _override_config():
+        cfg = get_v2_config()
+
+    assert cfg["tcp_port"] == DEFAULT_TCP_PORT
+    assert cfg["http_port"] == DEFAULT_HTTP_PORT
+    assert cfg["tcp_port"] != int(_LEGACY_CLICKHOUSE["CH_PORT"])
+    assert cfg["http_port"] != int(_LEGACY_CLICKHOUSE["CH_PORT"])
+
+
 def test_empty_ch25_values_are_treated_as_unset(no_ch25_env):
-    """An empty CH25 value is not a value: the legacy cluster still wins."""
+    """An empty CH25 value is not a value: the next source still wins."""
     with _override_config(
         CH25_HOST="", CH25_HTTP_PORT="", CH25_TCP_PORT="", CH25_DATABASE=""
     ):
@@ -258,15 +282,15 @@ def test_empty_ch25_values_are_treated_as_unset(no_ch25_env):
 
     assert cfg["host"] == _LEGACY_CLICKHOUSE["CH_HOST"]
     assert cfg["database"] == _LEGACY_CLICKHOUSE["CH_DATABASE"]
-    assert cfg["tcp_port"] == int(_LEGACY_CLICKHOUSE["CH_PORT"])
+    assert cfg["tcp_port"] == DEFAULT_TCP_PORT
     assert cfg["http_port"] == DEFAULT_HTTP_PORT
 
 
 @pytest.mark.parametrize(
     "http_port, tcp_port, expected_http, expected_tcp",
     [
-        (None, None, DEFAULT_HTTP_PORT, int(_LEGACY_CLICKHOUSE["CH_PORT"])),
-        ("", "", DEFAULT_HTTP_PORT, int(_LEGACY_CLICKHOUSE["CH_PORT"])),
+        (None, None, DEFAULT_HTTP_PORT, DEFAULT_TCP_PORT),
+        ("", "", DEFAULT_HTTP_PORT, DEFAULT_TCP_PORT),
         ("18123", "19000", 18123, 19000),
         (18123, 19000, 18123, 19000),
     ],
