@@ -260,11 +260,7 @@ const ManageExperimentEvalsDrawer = ({
       mapping: evalItem.config?.mapping || evalItem.mapping,
       model: evalItem.model || evalItem.selected_model,
       run_config: evalItem.config,
-      // Seed EvalPickerConfigFull's version dropdown with the currently
-      // pinned version so reopening after Update Evaluation renders the
-      // just-saved version rather than the template default.
-      pinned_version_id:
-        evalItem.pinned_version_id ?? evalItem.pinnedVersionId ?? null,
+      pinned_version_id: evalItem.pinned_version_id,
       compositeWeightOverrides:
         evalItem.compositeWeightOverrides ||
         evalItem.composite_weight_overrides,
