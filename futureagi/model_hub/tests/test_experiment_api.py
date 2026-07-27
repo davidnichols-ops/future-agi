@@ -1591,8 +1591,6 @@ class TestExperimentInlineEvalMetrics:
             "expected": "expected_column",
         }
 
-    # ==================== TH-6979: pinned_version_id parity ====================
-
     @pytest.fixture
     def user_eval_template(self, db, organization, workspace):
         from model_hub.models.choices import OwnerChoices
@@ -1609,8 +1607,6 @@ class TestExperimentInlineEvalMetrics:
     def test_create_eval_metrics_inline_pins_v1_for_user_template(
         self, experiment, dataset, organization, user, workspace, user_eval_template
     ):
-        """Baseline: creation without an explicit pin still creates + pins V1
-        (parity with the dataset EditAndRunUserEvalView side)."""
         from model_hub.models.evals_metric import EvalTemplateVersion
         from model_hub.views.experiments import _create_eval_metrics_inline
 
@@ -1638,15 +1634,9 @@ class TestExperimentInlineEvalMetrics:
     def test_create_eval_metrics_inline_honors_explicit_pinned_version(
         self, experiment, dataset, organization, user, workspace, user_eval_template
     ):
-        """TH-6979 core: passing `pinned_version_id` on the entry re-baselines
-        the pin so `maybe_pin_new_version` dedups against the user's pick
-        instead of silently creating a new version."""
         from model_hub.models.evals_metric import EvalTemplateVersion
         from model_hub.views.experiments import _create_eval_metrics_inline
 
-        # Two pre-existing versions on the template. v1's snapshot mirrors
-        # what `maybe_pin_new_version` would build for the entry below so
-        # dedup can hit exactly (`template.config | inner | {"model": ...}`).
         v1_snap = {"foo": "one", "model": user_eval_template.model}
         v1 = EvalTemplateVersion.objects.create_version(
             eval_template=user_eval_template,
@@ -1665,8 +1655,6 @@ class TestExperimentInlineEvalMetrics:
             workspace=workspace,
         )
 
-        # Entry replays v1's snapshot exactly (so dedup fires) and asks
-        # the FE version pin to snap back to v1.
         metrics = _create_eval_metrics_inline(
             eval_entries=[
                 {
@@ -1687,20 +1675,16 @@ class TestExperimentInlineEvalMetrics:
             workspace=workspace,
         )
         m = metrics[0]
-        # Dedup fired: pinned_version_id == v1, no v3 created.
         assert str(m.pinned_version_id) == str(v1.id)
         assert (
             EvalTemplateVersion.objects.filter(eval_template=user_eval_template).count()
             == 2
         )
-        # v2 stays around and still exists; v1 is the pin.
         assert EvalTemplateVersion.objects.filter(id=v2.id).exists()
 
     def test_apply_pinned_version_baseline_rejects_foreign_template(
         self, experiment, dataset, organization, user, workspace, user_eval_template
     ):
-        """Guard: pin id belonging to a different template raises so the
-        wrapping view surfaces it as a 400 rather than silently ignoring."""
         from model_hub.models.choices import OwnerChoices
         from model_hub.models.evals_metric import EvalTemplateVersion
         from model_hub.views.experiments import (
@@ -1719,8 +1703,6 @@ class TestExperimentInlineEvalMetrics:
             organization=organization,
             workspace=workspace,
         )
-        # Create a metric bound to user_eval_template but reference a version
-        # from other_tpl in the entry — this should error out.
         metric = UserEvalMetric.objects.create(
             name="th-6979-mismatch",
             organization=organization,
@@ -1740,9 +1722,6 @@ class TestExperimentInlineEvalMetrics:
     def test_has_eval_changed_detects_version_only_switch(
         self, experiment, dataset, organization, user, workspace, user_eval_template
     ):
-        """Switching versions without editing config still triggers re-run —
-        otherwise `_diff_and_update_evals` would skip the update branch and
-        the pin would never be re-applied."""
         from model_hub.models.evals_metric import EvalTemplateVersion
         from model_hub.views.experiments import _has_eval_changed
 
