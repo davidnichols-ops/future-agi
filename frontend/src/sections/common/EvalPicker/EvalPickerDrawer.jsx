@@ -321,7 +321,12 @@ const EvalPickerDrawer = ({
       }}
     >
       <EvalPickerProvider
-        key={initialEval?.userEvalId || initialEval?.id || "new"}
+        key={
+          initialEval?.user_eval_id ||
+          initialEval?.userEvalId ||
+          initialEval?.id ||
+          "new"
+        }
         source={source}
         sourceId={sourceId}
         sourceRowType={sourceRowType}

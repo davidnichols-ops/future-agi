@@ -135,7 +135,10 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     [evalData],
   );
   const templateId =
-    evalData?.template_id || evalData?.id;
+    evalData?.template_id ||
+    evalData?.templateId ||
+    normalizedEvalData?.templateId ||
+    evalData?.id;
   // ── Data (same hooks as EvalDetailPage) ──
   const { data: fullEval, isLoading, isError } = useEvalDetail(templateId);
   const normalizedFullEval = useMemo(
@@ -147,9 +150,14 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
   const updateEval = useUpdateEval(templateId);
   const createVersion = useCreateEvalVersion(templateId);
 
+  const initialPinnedVersionId =
+    normalizedEvalData?.pinnedVersionId ??
+    evalData?.pinned_version_id ??
+    null;
+
   // ── Editable state (mirrors EvalDetailPage) ──
   const [selectedVersionId, setSelectedVersionId] = useState(
-    evalData?.pinned_version_id ?? null,
+    initialPinnedVersionId,
   );
   const [instructions, setInstructions] = useState("");
   const [code, setCode] = useState("");
@@ -177,11 +185,15 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
   const [dataReady, setDataReady] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
   useEffect(() => {
-    const pinned = evalData?.pinned_version_id ?? null;
+    const pinned =
+      normalizedEvalData?.pinnedVersionId ??
+      evalData?.pinned_version_id ??
+      null;
     if (pinned && !selectedVersionId && !isDirty) {
       setSelectedVersionId(pinned);
     }
   }, [
+    normalizedEvalData?.pinnedVersionId,
     evalData?.pinned_version_id,
     selectedVersionId,
     isDirty,
@@ -979,7 +991,9 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     const tools = build_tools_payload(connectorIds);
 
     const templateType =
-      fullEval?.template_type || evalData?.template_type;
+      fullEval?.template_type ||
+      evalData?.template_type ||
+      normalizedEvalData?.templateType;
 
     const resolvedConfig = buildEvalTemplateConfig({
       baseConfig: fullEval?.config || evalData?.config || {},
@@ -996,7 +1010,10 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
       templateFormat,
     });
 
-    const userEvalId = evalData?.user_eval_id;
+    const userEvalId =
+      evalData?.user_eval_id ??
+      evalData?.userEvalId ??
+      normalizedEvalData?.userEvalId;
 
     const resolvedName =
       source === "composite"
