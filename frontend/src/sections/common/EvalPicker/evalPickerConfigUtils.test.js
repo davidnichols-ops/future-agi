@@ -325,14 +325,12 @@ describe("getSourceModeVariables", () => {
   });
 });
 
-// TH-6979: guard the shared payload builder used by both experiment
-// drawers so runtime overrides + composite handling don't regress.
 describe("buildExperimentEvalRuntimePayload", () => {
   it("wraps single-eval config with mapping + run_config + params", () => {
     const mapping = { output: "col-uuid" };
     const payload = buildExperimentEvalRuntimePayload(
       {
-        templateType: "single",
+        template_type: "single",
         config: { rule_prompt: "hi", output: "Pass/Fail" },
         model: "turing_large",
         agent_mode: "agent",
@@ -369,7 +367,7 @@ describe("buildExperimentEvalRuntimePayload", () => {
 
   it("omits run_config / params when the picker didn't emit any override", () => {
     const payload = buildExperimentEvalRuntimePayload(
-      { templateType: "single", config: { rule_prompt: "hi" } },
+      { template_type: "single", config: { rule_prompt: "hi" } },
       { output: "col-uuid" },
     );
     expect(payload).toEqual({
@@ -381,7 +379,7 @@ describe("buildExperimentEvalRuntimePayload", () => {
   it("blanks the config for composite templates and skips per-child overrides", () => {
     const payload = buildExperimentEvalRuntimePayload(
       {
-        templateType: "composite",
+        template_type: "composite",
         config: { rule_prompt: "should-not-flow-through" },
         model: "should-not-flow-through",
         agent_mode: "should-not-flow-through",
@@ -390,8 +388,6 @@ describe("buildExperimentEvalRuntimePayload", () => {
       { output: "col-uuid" },
     );
     expect(payload.config).toEqual({});
-    // Composite bindings only allow data_injection + error_localizer_enabled
-    // through, not the per-child single-eval knobs.
     expect(payload.run_config).toEqual({
       data_injection: { variables_only: true },
     });

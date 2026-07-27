@@ -384,7 +384,7 @@ const TaskConfigPanel = ({
 
   const handleEvalAdded = useCallback(
     async (evalConfig) => {
-      const tplId = evalConfig.templateId || evalConfig.template_id;
+      const tplId = evalConfig.template_id;
 
       // When editing, configuredEvals[editingIndex].id is always the CustomEvalConfig id
       // (set from POST response on first add, or from the API on task load)
@@ -402,7 +402,7 @@ const TaskConfigPanel = ({
           ...serialized.config,
           mapping: evalConfig.mapping || {},
         },
-        error_localizer: !!evalConfig.errorLocalizerEnabled,
+        error_localizer: !!evalConfig.error_localizer_enabled,
       };
 
       let finalEval = { ...evalConfig, template_id: tplId };

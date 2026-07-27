@@ -135,7 +135,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     [evalData],
   );
   const templateId =
-    evalData?.templateId || evalData?.template_id || evalData?.id;
+    evalData?.template_id || evalData?.id;
   // ── Data (same hooks as EvalDetailPage) ──
   const { data: fullEval, isLoading, isError } = useEvalDetail(templateId);
   const normalizedFullEval = useMemo(
@@ -177,14 +177,12 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
   const [dataReady, setDataReady] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
   useEffect(() => {
-    const pinned =
-      evalData?.pinned_version_id ?? evalData?.pinnedVersionId ?? null;
+    const pinned = evalData?.pinned_version_id ?? null;
     if (pinned && !selectedVersionId && !isDirty) {
       setSelectedVersionId(pinned);
     }
   }, [
     evalData?.pinned_version_id,
-    evalData?.pinnedVersionId,
     selectedVersionId,
     isDirty,
   ]);
@@ -981,9 +979,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     const tools = build_tools_payload(connectorIds);
 
     const templateType =
-      fullEval?.template_type ||
-      fullEval?.templateType ||
-      evalData?.template_type;
+      fullEval?.template_type || evalData?.template_type;
 
     const resolvedConfig = buildEvalTemplateConfig({
       baseConfig: fullEval?.config || evalData?.config || {},
@@ -1000,15 +996,8 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
       templateFormat,
     });
 
-    // When the picker was opened in edit mode (initialEval came from a
-    // saved-evals row or the column-menu Edit Eval action), evalData
-    // carries `userEvalId` — the existing UserEvalMetric id. The host
-    // (EvaluationDrawer) reads this to route to /edit_and_run_user_eval
-    // instead of /add_user_eval, preventing duplicate bindings.
-    const userEvalId = evalData?.userEvalId;
+    const userEvalId = evalData?.user_eval_id;
 
-    // In edit mode: evalData.name is the saved instance name — skip
-    // fullEval.name (template name) so it never overwrites the instance name.
     const resolvedName =
       source === "composite"
         ? fullEval?.name || evalData?.name || evalName
@@ -1017,21 +1006,17 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
           : evalName || fullEval?.name || evalData?.name;
 
     if (templateType === "composite") {
-      // Composite metrics don't carry prompt/model/output-type/choice-score
-      // state — those live on each child template. Emit only the fields
-      // the host needs to create a UserEvalMetric plus the per-binding
-      // weight overrides.
       onSave({
-        templateId,
-        evalTemplateId: templateId,
-        userEvalId,
+        template_id: templateId,
+        eval_template_id: templateId,
+        user_eval_id: userEvalId,
         name: resolvedName,
         mapping: sourceMapping,
-        evalTemplate: fullEval || evalData,
-        evalType,
-        templateType,
+        eval_template: fullEval || evalData,
+        eval_type: evalType,
+        template_type: templateType,
         config: fullEval?.config || evalData?.config,
-        versionId: selectedVersionId,
+        version_id: selectedVersionId,
         data_injection: dataInjection,
         error_localizer_enabled: errorLocalizerEnabled,
         composite_weight_overrides: compositeChildWeights,
@@ -1040,30 +1025,24 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     }
 
     onSave({
-      templateId,
-      evalTemplateId: templateId,
-      userEvalId,
+      template_id: templateId,
+      eval_template_id: templateId,
+      user_eval_id: userEvalId,
       name: resolvedName,
       model,
       mapping: sourceMapping,
-      evalTemplate: fullEval || evalData,
-      evalType,
-      templateType,
-      outputType,
+      eval_template: fullEval || evalData,
+      eval_type: evalType,
+      template_type: templateType,
+      output_type: outputType,
       config: resolvedConfig,
-      versionId: selectedVersionId,
+      version_id: selectedVersionId,
       instructions,
       messages,
       pass_threshold: passThreshold,
       choice_scores: choiceScores,
       multi_choice: multiChoice,
-      // Code-eval static params (function_params_schema inputs, e.g.
-      // min_words / max_words). Persisted so the backend writes them onto
-      // UserEvalMetric.config.params and future runs can read them via
-      // kwargs. Empty object is fine — backend treats it the same as
-      // "no static params" (eval body then reads kwargs.get(...) → None).
       params: evalType === "code" ? codeParams : {},
-      // Runtime overrides — these become config.run_config on the backend.
       agent_mode: agentMode,
       check_internet: useInternet,
       summary:

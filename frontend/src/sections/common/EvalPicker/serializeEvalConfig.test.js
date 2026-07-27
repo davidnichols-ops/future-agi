@@ -4,7 +4,7 @@ import { serializeEvalConfig } from "./serializeEvalConfig";
 describe("serializeEvalConfig", () => {
   it("emits runtime overrides only inside config.run_config", () => {
     const payload = serializeEvalConfig({
-      templateId: "template-1",
+      template_id: "template-1",
       name: "quality_check",
       model: "turing_large",
       mapping: { output: "answer" },
@@ -49,7 +49,7 @@ describe("serializeEvalConfig", () => {
 
     expect(
       serializeEvalConfig({
-        templateId: "template-1",
+        template_id: "template-1",
         name: "quality_check",
         filters,
       }).filters,

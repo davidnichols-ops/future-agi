@@ -24,22 +24,11 @@ export function normalizeOldEndpointEval(e) {
         : "llm");
   const created_by_name =
     e.created_by_name || (owner === "system" ? "System" : "User");
-  const templateId = e.template_id || e.eval_template_id || e.id;
+  const template_id = e.template_id || e.eval_template_id || e.id;
   return {
-    // IMPORTANT: the picker's config/detail flow operates on eval
-    // TEMPLATE ids, not user-eval binding ids. Old getEvalsList
-    // returns both (`id` = user eval, `template_id` = template). Use
-    // templateId as the canonical row id so opening the config drawer
-    // fetches the correct eval detail and renders the right type.
-    id: templateId,
-    templateId,
-    // Only already-attached UserEvalMetric rows carry a distinct
-    // `template_id` from the backend; catalog rows (preset / custom
-    // templates) return `id = template.id` with no `template_id`.
-    // Forwarding `e.id` on catalog rows would cause EvaluationDrawer
-    // to route "Add" clicks to /edit_and_run_user_eval/<template_id>
-    // and 404 with "Eval not found" (TH-4533).
-    userEvalId: e.template_id ? e.id : undefined,
+    id: template_id,
+    template_id,
+    user_eval_id: e.template_id ? e.id : undefined,
     name: e.name || e.eval_template_name,
     template_type: e.template_type || "single",
     eval_type,
@@ -151,18 +140,12 @@ export function useEvalPickerData({
   const items = useMemo(() => {
     if (!rawData) return [];
     if (isUsingOldEndpoint) {
-      // Old endpoint: { evals: [...] }. See `normalizeOldEndpointEval` above
-      // for the field-mapping contract — backend returns snake_case and we
-      // preserve it as snake_case (TH-6125 regression).
       const evals = rawData?.evals || [];
       return evals.map(normalizeOldEndpointEval);
     }
-    // New endpoint already returns normalized items; still ensure the
-    // picker has a stable templateId alias for edit/config flows.
     return (rawData?.items || []).map((item) => ({
       ...item,
-      templateId:
-        item.templateId || item.template_id || item.eval_template_id || item.id,
+      template_id: item.template_id || item.eval_template_id || item.id,
     }));
   }, [rawData, isUsingOldEndpoint]);
 

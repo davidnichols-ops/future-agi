@@ -78,16 +78,9 @@ const EvaluationDrawerChild = ({
   // When editing an existing eval, pre-select it so the picker opens at config step
   const [editingEval, setEditingEval] = useState(null);
 
-  // Route a saved-eval row into the EvalPicker in edit mode. Shared between
-  // the saved-eval list "Edit" button and the column-menu "Edit Eval" entry.
-  //
-  // `name` is deliberately the saved user-eval *instance* name (not the
-  // template name) so the edit form pre-fills the instance's current name —
-  // users can then rename the binding. EvalPickerConfigFull's isEditMode
-  // branch reads this via evalData.name.
   const openEditForSavedEval = useCallback(
     (evalItem) => {
-      const tplId = evalItem.templateId || evalItem.template_id;
+      const tplId = evalItem.template_id || evalItem.templateId;
       if (!tplId) {
         enqueueSnackbar("Cannot edit: template ID not found. Try refreshing.", {
           variant: "warning",
@@ -96,38 +89,24 @@ const EvaluationDrawerChild = ({
       }
       setEditingEval({
         ...evalItem,
-        // id is what EvalPickerConfigFull passes to useEvalDetail(templateId)
         id: tplId,
+        template_id: tplId,
         name: evalItem.name,
-        evalType: evalItem.eval_type,
-        // Pre-populate the config screen so it renders before the detail
-        // API responds. Read run_config from the stored config blob (where
-        // the backend persists it) and fall back to a top-level run_config
-        // field for callers that pre-shape evalItem differently.
+        eval_type: evalItem.eval_type,
         config: {
           required_keys: evalItem.eval_required_keys || [],
           ...(evalItem.config?.run_config || evalItem.run_config || {}),
-          // Multi-turn LLM evals persist the full message chain on the
-          // template config, not under run_config — forward it so the
-          // picker pre-populates with every turn (not just System) before
-          // the detail API response merges the canonical value in.
           ...(evalItem.config?.messages
             ? { messages: evalItem.config.messages }
             : {}),
-          // Map the UserEvalMetric.error_localizer BooleanField to the key
-          // EvalPickerConfigFull expects so the toggle shows the saved state.
           ...(evalItem.error_localizer !== undefined
             ? { error_localizer_enabled: evalItem.error_localizer }
             : {}),
         },
         mapping: evalItem.mapping || {},
-        outputType: evalItem.output_type,
-        // Existing UserEvalMetric id — handleAdd routes via editEval
-        // endpoint instead of addEval to avoid duplicate bindings.
-        // The column-menu path matches via user_eval_id/userEvalId, so
-        // evalItem.id may not be the user-eval id — normalize here.
-        userEvalId: evalItem.user_eval_id ?? evalItem.userEvalId ?? evalItem.id,
-        pinned_version_id: evalItem.pinned_version_id ?? evalItem.pinnedVersionId ?? null,
+        output_type: evalItem.output_type,
+        user_eval_id: evalItem.user_eval_id ?? evalItem.id,
+        pinned_version_id: evalItem.pinned_version_id,
       });
       setEvalPickerOpen(true);
     },
@@ -567,11 +546,6 @@ const EvaluationDrawerChild = ({
         source={module || "dataset"}
         sourceId={id || ""}
         sourceColumns={allColumns || []}
-        // Experiment evals reference two values that don't exist as real
-        // dataset cells — the prompt/agent output and the full prompt chain.
-        // Surface them as virtual columns in the variable-mapping dropdown
-        // so users can map eval inputs to them (mirrors the legacy
-        // ManageExperimentEvalsDrawer.experimentVirtualColumns).
         extraColumns={
           module === "experiment"
             ? [
@@ -590,18 +564,10 @@ const EvaluationDrawerChild = ({
           const { handleRun } = actionButtonConfig;
           if (!handleRun) return;
 
-          // Backend `UserEvalSerializer` (model_hub/serializers/eval_runner.py)
-          // expects `template_id` (snake_case), not `eval_template`. It also
-          // stores runtime overrides under config.run_config — everything the
-          // EvalPicker lets the user customize (model / mode / summary / etc.)
-          // should be forwarded so eval_runner can apply it at run time.
-          const isComposite = evalConfig.templateType === "composite";
+          const isComposite = evalConfig.template_type === "composite";
 
           const runConfig = {};
           if (!isComposite) {
-            // Single-eval runtime overrides. Composite children each
-            // carry their own model/mode/tools — none of this applies
-            // at the composite binding level.
             if (evalConfig.model) runConfig.model = evalConfig.model;
             if (evalConfig.agent_mode)
               runConfig.agent_mode = evalConfig.agent_mode;
@@ -623,33 +589,21 @@ const EvaluationDrawerChild = ({
             if (evalConfig.multi_choice !== undefined)
               runConfig.multi_choice = !!evalConfig.multi_choice;
           }
-          // Data injection applies to both single and composite — the
-          // backend resolves it at row-evaluation time.
           if (evalConfig.data_injection)
             runConfig.data_injection = evalConfig.data_injection;
-          // Error localizer toggle was previously dropped between
-          // EvalPickerConfigFull and the backend. It now flows through
-          // for both single and composite bindings.
           if (evalConfig.error_localizer_enabled !== undefined)
             runConfig.error_localizer_enabled =
               !!evalConfig.error_localizer_enabled;
 
-          // Code-eval static params (function_params_schema values).
-          // `EvalPickerConfigFull.handleSave` hands them back on
-          // evalConfig.params; forward to `config.params` so the backend
-          // persists them on UserEvalMetric.config.params and each row's
-          // evaluate() call receives them via **kwargs at run time.
           const evalParams =
             evalConfig.params && typeof evalConfig.params === "object"
               ? evalConfig.params
               : {};
 
-          // Build the payload — workbench endpoint expects a different
-          // shape than the dataset/task/experiment endpoints.
           let payload;
           if ((module || "dataset") === "workbench") {
             payload = {
-              id: evalConfig.templateId,
+              id: evalConfig.template_id,
               name: evalConfig.name,
               mapping: evalConfig.mapping || {},
               model: isComposite ? undefined : evalConfig.model,
@@ -666,16 +620,9 @@ const EvaluationDrawerChild = ({
           } else {
             payload = {
               name: evalConfig.name,
-              template_id: evalConfig.templateId,
+              template_id: evalConfig.template_id,
               model: isComposite ? undefined : evalConfig.model,
-              // In the optimization context the optimizer runs evals itself —
-              // skip the full-dataset run so adding an eval is near-instant.
-              // Dataset adds are also save-only now: the user runs evals
-              // manually from the dataset grid rather than auto-running on
-              // add, which would otherwise queue work the user didn't ask for.
               run: module !== "run-optimization" && module !== "dataset",
-              // Mirror the workbench path: surface error_localizer at the top
-              // level so EditAndRunUserEvalView can update eval_metric.error_localizer.
               error_localizer: runConfig.error_localizer_enabled ?? false,
               config: {
                 mapping: evalConfig.mapping || {},
@@ -687,42 +634,27 @@ const EvaluationDrawerChild = ({
                   ? { run_config: runConfig }
                   : {}),
               },
-              ...(isComposite && evalConfig.compositeWeightOverrides
-                ? {
-                    composite_weight_overrides:
-                      evalConfig.compositeWeightOverrides,
-                  }
-                : {}),
               ...(isComposite && evalConfig.composite_weight_overrides
                 ? {
                     composite_weight_overrides:
                       evalConfig.composite_weight_overrides,
                   }
                 : {}),
-              ...(evalConfig.versionId
-                ? { pinned_version_id: evalConfig.versionId }
+              ...(evalConfig.version_id
+                ? { pinned_version_id: evalConfig.version_id }
                 : {}),
             };
           }
-          // Edit branch: POST directly to /edit_and_run_user_eval/{id} so the
-          // existing UserEvalMetric is updated in place rather than duplicated
-          // by /add_user_eval (dataset) or /experiments/<id>/add-eval/
-          // (experiment). For experiment scope, the backend keys by
-          // source_id=experiment_id, so we attach experiment_id to the body
-          // — same pattern as the rest of the per-eval endpoints.
-          // Workbench + task modules keep their own create-or-update routes.
           const effectiveModule = module || "dataset";
           if (
-            evalConfig?.userEvalId &&
+            evalConfig?.user_eval_id &&
             (effectiveModule === "dataset" ||
               effectiveModule === "run-optimization" ||
               effectiveModule === "experiment")
           ) {
             try {
-              // `id` in this drawer is always the datasetId for dataset /
-              // experiment flows (experiment evals still live under a dataset).
               await axios.post(
-                endpoints.develop.eval.editEval(id, evalConfig.userEvalId),
+                endpoints.develop.eval.editEval(id, evalConfig.user_eval_id),
                 {
                   ...payload,
                   ...(effectiveModule === "experiment" && experimentId
@@ -733,10 +665,9 @@ const EvaluationDrawerChild = ({
               queryClient.invalidateQueries({
                 queryKey: getUserEvalListKey(module, id),
               });
-              // Invalidate version cache so reopening shows the new version
-              if (evalConfig.templateId) {
+              if (evalConfig.template_id) {
                 queryClient.invalidateQueries({
-                  queryKey: ["evals", "versions", evalConfig.templateId],
+                  queryKey: ["evals", "versions", evalConfig.template_id],
                 });
               }
               if (effectiveModule === "run-optimization") {
@@ -755,20 +686,13 @@ const EvaluationDrawerChild = ({
               setEvalPickerOpen(false);
               setVisibleSection("list");
             } catch (err) {
-              // Let EvalPickerDrawer's handleSaveEval catch keep the
-              // drawer open on failure.
               throw err;
             }
             return;
           }
-          // Non-dataset edit: forward user_eval_id in the payload so the
-          // module-specific endpoint can route to its own update path if
-          // it supports one.
-          if (evalConfig?.userEvalId) {
-            payload.user_eval_id = evalConfig.userEvalId;
+          if (evalConfig?.user_eval_id) {
+            payload.user_eval_id = evalConfig.user_eval_id;
           }
-          // await so errors propagate to EvalPickerDrawer's handleSaveEval
-          // catch block — keeps the drawer open on failure.
           await handleRun(payload, () => {
             setEvalPickerOpen(false);
             setVisibleSection("list");

@@ -104,17 +104,10 @@ export const buildEvalTemplateConfig = ({
   return nextConfig;
 };
 
-// Build the nested `{ mapping, config, run_config, params }` payload the
-// experiment endpoints expect (matches the shape EvaluationDrawer sends to
-// /edit_and_run_user_eval). Kept here so both the creation wizard and the
-// Manage-Evaluations drawer emit an identical shape — otherwise runtime
-// overrides picked in the drawer (agent_mode, tools, summary, …) never
-// reach `UserEvalMetric.config.run_config` and the pinned version snapshot
-// ends up equal to the template default.
 export const buildExperimentEvalRuntimePayload = (evalConfig, mapping) => {
-  const isComposite = evalConfig.templateType === "composite";
+  const isComposite = evalConfig.template_type === "composite";
   const templateConfig =
-    evalConfig.config || evalConfig.evalTemplate?.config || {};
+    evalConfig.config || evalConfig.eval_template?.config || {};
   const runConfig = {};
   if (!isComposite) {
     if (evalConfig.model) runConfig.model = evalConfig.model;

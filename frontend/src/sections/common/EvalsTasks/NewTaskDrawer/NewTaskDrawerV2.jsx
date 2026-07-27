@@ -282,7 +282,7 @@ const NewTaskDrawerV2 = ({
   // Handle adding eval from the new picker
   const handleEvalAdded = useCallback(
     async (evalConfig) => {
-      const tplId = evalConfig.templateId || evalConfig.template_id;
+      const tplId = evalConfig.template_id;
       const existingId = evalConfig.id;
       // Use serializeEvalConfig so function-params land at config.params.
       const serialized = serializeEvalConfig(evalConfig);
@@ -297,7 +297,7 @@ const NewTaskDrawerV2 = ({
               model: evalConfig.model || null,
               mapping: evalConfig.mapping,
               config: serialized.config,
-              error_localizer: evalConfig.errorLocalizerEnabled || false,
+              error_localizer: evalConfig.error_localizer_enabled || false,
             },
           );
           id = resp?.result?.id ?? existingId;
@@ -311,7 +311,7 @@ const NewTaskDrawerV2 = ({
               model: evalConfig.model || null,
               mapping: evalConfig.mapping,
               config: serialized.config,
-              error_localizer: evalConfig.errorLocalizerEnabled || false,
+              error_localizer: evalConfig.error_localizer_enabled || false,
             },
           );
           id = resp?.result?.id;

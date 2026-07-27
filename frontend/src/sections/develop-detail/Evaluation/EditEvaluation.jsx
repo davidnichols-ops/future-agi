@@ -104,7 +104,6 @@ const EditEvaluation = ({
     },
   });
 
-  // Build initialEval in the shape EvalPickerDrawer / EvalPickerConfigFull expects
   const initialEval = useMemo(() => {
     if (!evalConfig) return null;
     const tplId =
@@ -114,14 +113,10 @@ const EditEvaluation = ({
     if (!tplId) return null;
     return {
       id: tplId,
-      // Use the saved user eval instance name (not the template name) so the
-      // edit form pre-fills with the correct name and the edit endpoint
-      // receives the right value.
+      template_id: tplId,
       name: evalConfig.name,
-      evalType: evalConfig.eval_type || evalConfig.evalType,
-      // API returns saved model as selected_model; fall back to model field
+      eval_type: evalConfig.eval_type || evalConfig.evalType,
       model: evalConfig.selected_model || evalConfig.model,
-      // run_config may be top-level, camelCase, or nested under config
       run_config:
         evalConfig.run_config ||
         evalConfig.runConfig ||
@@ -139,26 +134,25 @@ const EditEvaluation = ({
           {}),
       },
       mapping: evalConfig.mapping || evalConfig.config?.mapping || {},
-      outputType: evalConfig.output_type || evalConfig.outputType,
-      userEvalId: evalConfig.id,
+      output_type: evalConfig.output_type || evalConfig.outputType,
+      user_eval_id: evalConfig.id,
     };
   }, [evalConfig]);
 
   const handleEvalAdded = async (cfg) => {
-    // Build run_config from EvalPickerConfigFull output
     const runConfig = {};
     if (cfg.model) runConfig.model = cfg.model;
-    if (cfg.agentMode) runConfig.agent_mode = cfg.agentMode;
-    if (cfg.checkInternet !== undefined)
-      runConfig.check_internet = !!cfg.checkInternet;
+    if (cfg.agent_mode) runConfig.agent_mode = cfg.agent_mode;
+    if (cfg.check_internet !== undefined)
+      runConfig.check_internet = !!cfg.check_internet;
     if (cfg.summary) runConfig.summary = cfg.summary;
-    if (cfg.dataInjection) runConfig.data_injection = cfg.dataInjection;
-    if (cfg.knowledgeBases) runConfig.knowledge_bases = cfg.knowledgeBases;
+    if (cfg.data_injection) runConfig.data_injection = cfg.data_injection;
+    if (cfg.knowledge_bases) runConfig.knowledge_bases = cfg.knowledge_bases;
     if (cfg.tools) runConfig.tools = cfg.tools;
-    if (cfg.passThreshold !== undefined)
-      runConfig.pass_threshold = cfg.passThreshold;
-    if (cfg.choiceScores && Object.keys(cfg.choiceScores).length)
-      runConfig.choice_scores = cfg.choiceScores;
+    if (cfg.pass_threshold !== undefined)
+      runConfig.pass_threshold = cfg.pass_threshold;
+    if (cfg.choice_scores && Object.keys(cfg.choice_scores).length)
+      runConfig.choice_scores = cfg.choice_scores;
 
     const payload = {
       run: false,

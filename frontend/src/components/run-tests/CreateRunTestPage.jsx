@@ -561,7 +561,10 @@ const CreateRunTestPage = ({ open, onClose }) => {
             evalConfig.name ||
             evalConfig.evalTemplateName ||
             "Unnamed Evaluation",
-          template_id: evalConfig.templateId || evalConfig.id?.split("_")[0], // Extract original template ID
+          template_id:
+            evalConfig.template_id ||
+            evalConfig.templateId ||
+            evalConfig.id?.split("_")[0],
           mapping: evalConfig.config?.mapping || {},
           config: evalConfig.config || {},
           error_localizer: evalConfig?.errorLocalizer,
@@ -643,14 +646,15 @@ const CreateRunTestPage = ({ open, onClose }) => {
 
   const toLegacyEvalShape = (evalConfig, versionedName) => {
     const serialized = serializeEvalConfig(evalConfig);
+    const templateId = evalConfig.template_id;
     return {
-      evalId: `${evalConfig.templateId}_${Date.now()}_${Math.random()
+      evalId: `${templateId}_${Date.now()}_${Math.random()
         .toString(36)
         .slice(2, 8)}`,
-      templateId: evalConfig.templateId,
+      templateId,
       name: versionedName,
-      evalTemplateName: evalConfig.evalTemplate?.name || evalConfig.name,
-      description: evalConfig.evalTemplate?.description || "",
+      evalTemplateName: evalConfig.eval_template?.name || evalConfig.name,
+      description: evalConfig.eval_template?.description || "",
       type: "user_built",
       mapping: evalConfig.mapping || {},
       config: {
@@ -659,20 +663,20 @@ const CreateRunTestPage = ({ open, onClose }) => {
         ...(evalConfig.instructions != null && {
           instructions: evalConfig.instructions,
         }),
-        ...(evalConfig.passThreshold != null && {
-          pass_threshold: evalConfig.passThreshold,
+        ...(evalConfig.pass_threshold != null && {
+          pass_threshold: evalConfig.pass_threshold,
         }),
-        ...(evalConfig.choiceScores &&
-          Object.keys(evalConfig.choiceScores).length > 0 && {
-            choice_scores: evalConfig.choiceScores,
+        ...(evalConfig.choice_scores &&
+          Object.keys(evalConfig.choice_scores).length > 0 && {
+            choice_scores: evalConfig.choice_scores,
           }),
       },
       model: evalConfig.model,
       evalRequiredKeys:
-        evalConfig.evalTemplate?.required_keys ||
-        evalConfig.evalTemplate?.requiredKeys ||
+        evalConfig.eval_template?.required_keys ||
+        evalConfig.eval_template?.requiredKeys ||
         [],
-      evalTemplateTags: evalConfig.evalTemplate?.tags || [],
+      evalTemplateTags: evalConfig.eval_template?.tags || [],
       errorLocalizer: !!evalConfig.error_localizer_enabled,
     };
   };
@@ -689,7 +693,7 @@ const CreateRunTestPage = ({ open, onClose }) => {
       const versionedName = getVersionedEvalName(
         evalConfig.name,
         updated,
-        evalConfig.templateId,
+        evalConfig.template_id,
       );
       return [...updated, toLegacyEvalShape(evalConfig, versionedName)];
     });

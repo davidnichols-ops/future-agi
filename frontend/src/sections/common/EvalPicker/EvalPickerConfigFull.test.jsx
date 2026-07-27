@@ -155,7 +155,7 @@ const renderConfigFull = ({ sourceTimeWindow } = {}) =>
       sourceTimeWindow={sourceTimeWindow}
     >
       <EvalPickerConfigFull
-        evalData={{ id: "tpl-1", templateId: "tpl-1", name: "toxicity" }}
+        evalData={{ id: "tpl-1", template_id: "tpl-1", name: "toxicity" }}
         onBack={() => {}}
         onSave={() => {}}
         isSaving={false}

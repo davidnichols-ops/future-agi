@@ -173,17 +173,17 @@ const EvalPickerConfig = ({ evalData, onBack, onSave, isSaving }) => {
 
   const handleSave = useCallback(() => {
     const templateId =
-      evalData?.templateId || evalData?.template_id || evalData?.id;
+      evalData?.template_id || evalData?.templateId || evalData?.id;
     const evalConfig = {
-      templateId,
-      evalTemplateId: templateId,
+      template_id: templateId,
+      eval_template_id: templateId,
       name: evalName,
       model,
       mapping,
-      evalTemplate: normalizedEvalData,
-      evalType: normalizedEvalData?.evalType,
-      templateType: normalizedEvalData?.templateType,
-      outputType: normalizedEvalData?.outputType,
+      eval_template: normalizedEvalData,
+      eval_type: normalizedEvalData?.evalType,
+      template_type: normalizedEvalData?.templateType,
+      output_type: normalizedEvalData?.outputType,
       config: normalizedEvalData?.config,
     };
     onSave(evalConfig);

@@ -38,7 +38,7 @@ describe("normalizeOldEndpointEval", () => {
     expect(out.created_by_name).toBe("User");
   });
 
-  it("uses template_id as the canonical id; sets userEvalId only on attached rows", () => {
+  it("uses template_id as the canonical id; sets user_eval_id only on attached rows", () => {
     // Catalog row — no template_id; id IS the template id.
     const catalog = normalizeOldEndpointEval({
       id: "tpl-1",
@@ -46,8 +46,8 @@ describe("normalizeOldEndpointEval", () => {
       type: "futureagi_built",
     });
     expect(catalog.id).toBe("tpl-1");
-    expect(catalog.templateId).toBe("tpl-1");
-    expect(catalog.userEvalId).toBeUndefined();
+    expect(catalog.template_id).toBe("tpl-1");
+    expect(catalog.user_eval_id).toBeUndefined();
 
     // Attached UserEvalMetric row — separate template_id and id.
     const attached = normalizeOldEndpointEval({
@@ -56,8 +56,8 @@ describe("normalizeOldEndpointEval", () => {
       name: "my eval",
     });
     expect(attached.id).toBe("tpl-1");
-    expect(attached.templateId).toBe("tpl-1");
-    expect(attached.userEvalId).toBe("uem-1");
+    expect(attached.template_id).toBe("tpl-1");
+    expect(attached.user_eval_id).toBe("uem-1");
   });
 
   it("derives eval_type from tags when eval_type is missing", () => {
@@ -128,8 +128,8 @@ describe("normalizeOldEndpointEval", () => {
     const out = normalizeOldEndpointEval(OLD_ENDPOINT_FIXTURE);
     expect(out).toMatchObject({
       id: "tpl-7",
-      templateId: "tpl-7",
-      userEvalId: "uem-42",
+      template_id: "tpl-7",
+      user_eval_id: "uem-42",
       name: "customer_agent_clarification_seeking",
       template_type: "single",
       eval_type: "agent",
@@ -145,6 +145,8 @@ describe("normalizeOldEndpointEval", () => {
       model: "gpt-4o-mini",
     });
     for (const camel of [
+      "templateId",
+      "userEvalId",
       "templateType",
       "evalType",
       "outputType",

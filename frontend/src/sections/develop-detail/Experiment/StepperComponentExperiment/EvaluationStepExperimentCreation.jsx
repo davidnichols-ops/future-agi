@@ -71,10 +71,6 @@ const EvaluationStepExperimentCreation = ({
     update,
   } = useFieldArray({ control, name: "userEvalMetrics" });
 
-  // In the Edit-Experiment wizard, every Update-Evaluation click should
-  // persist immediately — the batched save at "Run Experiment" isn't
-  // enough because the picker's version selection can't round-trip
-  // without a server PUT. Mirrors `ManageExperimentEvalsDrawer` semantics.
   const canSaveInline = isEditingExperiment && Boolean(experimentId);
   const { mutate: saveEvalsInline } = useMutation({
     mutationFn: (nextEvals) =>
@@ -82,9 +78,6 @@ const EvaluationStepExperimentCreation = ({
         user_eval_metrics: transformUserEvalMetricsForApi(nextEvals, true),
       }),
     onSuccess: async (resp) => {
-      // Sync form state to the server-authoritative pin + any new
-      // version rows the BE just created. Falls back to a refetch when
-      // the response body doesn't carry the fresh eval list.
       const fresh = resp?.data?.result?.user_eval_metrics;
       if (Array.isArray(fresh)) {
         replaceEvals(
@@ -92,7 +85,7 @@ const EvaluationStepExperimentCreation = ({
             ...item,
             evalId: item.id,
             actualEvalCreatedId: item.id,
-            templateId: item.template_id,
+            template_id: item.template_id,
           })),
         );
       }
@@ -126,9 +119,6 @@ const EvaluationStepExperimentCreation = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userEvalList, replaceEvals]);
   const handleAddEvaluation = (evalConfig) => {
-    // Build mapping: DatasetTestMode returns { variable: "column_name" }.
-    // The backend expects { variable: "column_uuid" }.
-    // Translate using updatedEvalColumns.
     const rawMapping = evalConfig.mapping || {};
     const translatedMapping = {};
     for (const [variable, colName] of Object.entries(rawMapping)) {
@@ -145,34 +135,36 @@ const EvaluationStepExperimentCreation = ({
     );
 
     const evalEntry = {
-      evalId: evalConfig.templateId,
+      evalId: evalConfig.template_id,
       evalTemplateName: evalConfig.name,
-      templateId: evalConfig.templateId,
+      template_id: evalConfig.template_id,
+      templateId: evalConfig.template_id,
       mapping: translatedMapping,
       model: evalConfig.model,
       config: fullConfig,
-      templateDetails: evalConfig.evalTemplate,
-      templateType: evalConfig.templateType,
+      templateDetails: evalConfig.eval_template,
+      template_type: evalConfig.template_type,
+      templateType: evalConfig.template_type,
       requiredKeys:
-        evalConfig.evalTemplate?.requiredKeys ||
+        evalConfig.eval_template?.required_keys ||
+        evalConfig.eval_template?.requiredKeys ||
+        evalConfig.config?.required_keys ||
         evalConfig.config?.requiredKeys ||
         [],
-      // Carry the version dropdown pick through form state → schema
-      // transform → POST body so the backend can pin it as the dedup
-      // baseline (see `_create_eval_metrics_inline`).
-      pinned_version_id: evalConfig.versionId ?? null,
-      ...(evalConfig.templateType === "composite" &&
-      evalConfig.compositeWeightOverrides
-        ? { compositeWeightOverrides: evalConfig.compositeWeightOverrides }
+      pinned_version_id: evalConfig.version_id,
+      ...(evalConfig.template_type === "composite" &&
+      evalConfig.composite_weight_overrides
+        ? {
+            composite_weight_overrides: evalConfig.composite_weight_overrides,
+          }
         : {}),
     };
 
     let nextEvals;
     if (editingEval) {
-      // Edit mode: replace the existing field in place, keep the same name.
       const idx = evalFields.findIndex((f) => {
         const fid = f.actualEvalCreatedId || f.evalId || f.id;
-        return fid === editingEval.userEvalId;
+        return fid === editingEval.user_eval_id;
       });
       if (idx !== -1) {
         const merged = {
@@ -186,19 +178,15 @@ const EvaluationStepExperimentCreation = ({
         nextEvals = evalFields;
       }
     } else {
-      // Add mode: append with versioned name to avoid duplicates.
       const versionedName = getVersionedEvalName(
         evalConfig.name,
         evalFields,
-        evalConfig.templateId,
+        evalConfig.template_id,
       );
       const created = { ...evalEntry, name: versionedName };
       append(created);
       nextEvals = [...evalFields, created];
     }
-    // Persist immediately when we're inside the Edit-Experiment wizard so
-    // the picker's version pick and config edits land in DB without
-    // waiting for Run Experiment.
     if (canSaveInline) saveEvalsInline(nextEvals);
     setEditingEval(null);
     setOpenEvaluationDialog(false);
@@ -211,30 +199,26 @@ const EvaluationStepExperimentCreation = ({
 
   const handleEditEval = (evalItem) => {
     const tplId =
-      evalItem.templateId ||
       evalItem.template_id ||
-      evalItem.evalTemplateId ||
+      evalItem.templateId ||
       evalItem.eval_template_id ||
+      evalItem.evalTemplateId ||
       evalItem.evalId ||
       evalItem.id;
     setEditingEval({
       id: tplId,
-      // During creation the eval only has a local field id; during editing
-      // it may carry a backend-assigned id (actualEvalCreatedId).
-      userEvalId:
+      template_id: tplId,
+      user_eval_id:
         evalItem.actualEvalCreatedId || evalItem.evalId || evalItem.id,
       name: evalItem.name || evalItem.evalTemplateName,
-      templateType: evalItem.templateType || evalItem.template_type,
+      template_type: evalItem.template_type || evalItem.templateType,
       mapping: evalItem.config?.mapping || evalItem.mapping,
       model: evalItem.model || evalItem.selected_model,
       run_config: evalItem.config,
-      // Seed the version dropdown from the last pinned pick so reopening
-      // preserves the user's choice instead of falling back to default.
-      pinned_version_id:
-        evalItem.pinned_version_id ?? evalItem.pinnedVersionId ?? null,
-      compositeWeightOverrides:
-        evalItem.compositeWeightOverrides ||
-        evalItem.composite_weight_overrides,
+      pinned_version_id: evalItem.pinned_version_id,
+      composite_weight_overrides:
+        evalItem.composite_weight_overrides ||
+        evalItem.compositeWeightOverrides,
     });
     setOpenEvaluationDialog(true);
   };

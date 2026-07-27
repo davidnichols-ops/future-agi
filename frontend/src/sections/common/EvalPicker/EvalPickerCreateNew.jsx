@@ -514,18 +514,14 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
       if (source === "task" && onFiltersChange) {
         onFiltersChange(localFilterForm.getValues("filters") || []);
       }
-      // Now add to the current context. data_injection (seeded from
-      // sourceRowType) is forwarded so the consumer's serializeEvalConfig
-      // captures it inside config.run_config — same shape an existing
-      // eval would emit through EvalPickerConfigFull.
       onSave({
-        templateId: draftId,
-        evalTemplateId: draftId,
+        template_id: draftId,
+        eval_template_id: draftId,
         name: name.trim(),
         model,
         mapping: sourceMapping,
-        evalType,
-        outputType,
+        eval_type: evalType,
+        output_type: outputType,
         instructions,
         data_injection:
           evalType === "agent"
@@ -600,11 +596,10 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
       setSelectedEval({
         id: result?.id,
         name: name.trim(),
-        templateType: "composite",
-        evalType: result?.eval_type || "llm",
-        outputType:
+        template_type: "composite",
+        eval_type: result?.eval_type || "llm",
+        output_type:
           compositeChildAxis === "percentage" ? "percentage" : "pass_fail",
-        // EvalPickerConfigFull seeds its mapping panel from this.
         mapping: sourceMapping,
       });
       setStep("config");

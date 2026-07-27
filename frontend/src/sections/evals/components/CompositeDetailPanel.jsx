@@ -109,16 +109,9 @@ const CompositeDetailPanel = ({
     setPendingAxis(null);
   };
 
-  // Accepts both shapes:
-  //   - skipConfig=true raw eval metadata: { id, name, evalType, ... }
-  //   - skipConfig=false EvalPickerConfigFull payload:
-  //     { templateId, evalTemplateId, name, evalType, mapping,
-  //       versionId, ... }
-  // The latter is sent when the user goes through the config screen
-  // for a child eval (playground + version + settings + mapping).
   const handleEvalAdded = (evalMeta) => {
     const childId =
-      evalMeta?.id || evalMeta?.templateId || evalMeta?.evalTemplateId;
+      evalMeta?.id || evalMeta?.template_id || evalMeta?.eval_template_id;
     if (!childId) return;
     if (childrenList.some((c) => c.child_id === childId)) {
       setPickerOpen(false);
@@ -138,18 +131,11 @@ const CompositeDetailPanel = ({
         child_id: childId,
         child_name: evalMeta.name || childId,
         order: childrenList.length,
-        eval_type: evalMeta.evalType || evalMeta.eval_type || "llm",
+        eval_type: evalMeta.eval_type || "llm",
         weight: 1.0,
-        // Persist the per-child version the user pinned in the picker
-        // so the composite always invokes this exact version. Stored as
-        // `pinned_version_id` for the backend; the human-readable
-        // `pinned_version_number` is resolved server-side on fetch.
-        ...(evalMeta.versionId
-          ? { pinned_version_id: evalMeta.versionId }
+        ...(evalMeta.version_id
+          ? { pinned_version_id: evalMeta.version_id }
           : {}),
-        // Persist the per-child variable mapping the user just configured.
-        // Backend `composite_runner` uses it when resolving each child's
-        // variables against the dataset row at evaluation time.
         ...(evalMeta.mapping && Object.keys(evalMeta.mapping).length
           ? { mapping: evalMeta.mapping }
           : {}),

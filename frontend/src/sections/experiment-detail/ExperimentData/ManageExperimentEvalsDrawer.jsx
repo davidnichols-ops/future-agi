@@ -33,23 +33,15 @@ const transformEvals = (evalList) =>
       isUUID(evalItem?.actualEvalCreatedId) && {
         id: evalItem?.actualEvalCreatedId,
       }),
-    template_id: evalItem.templateId || evalItem.id,
+    template_id: evalItem.template_id || evalItem.templateId || evalItem.id,
     name: evalItem.name || evalItem.evalTemplateName || "Unnamed Evaluation",
     config: evalItem.config,
     model: evalItem.model,
     error_localizer: evalItem.errorLocalizer,
     kb_id: evalItem.kbId || null,
-    // Carry the version dropdown pick so the backend can pin it as the
-    // dedup baseline in `_diff_and_update_evals` /
-    // `_create_eval_metrics_inline`.
-    pinned_version_id:
-      evalItem.pinned_version_id ?? evalItem.pinnedVersionId ?? null,
-    // Forward composite per-binding weight overrides when the bound
-    // template is a composite. The experiment runner's composite branch
-    // (Phase C) reads this off `UserEvalMetric.composite_weight_overrides`
-    // and hands it to `CompositeEvaluationRunner` at run time.
-    ...(evalItem.compositeWeightOverrides
-      ? { composite_weight_overrides: evalItem.compositeWeightOverrides }
+    pinned_version_id: evalItem.pinned_version_id,
+    ...(evalItem.composite_weight_overrides
+      ? { composite_weight_overrides: evalItem.composite_weight_overrides }
       : {}),
   }));
 
@@ -105,15 +97,6 @@ const ManageExperimentEvalsDrawer = ({
     },
   });
 
-  // Use the dataset-level start_evals_process endpoint with experiment_id so
-  // experiment evals go through the same code path as dataset evals — the
-  // backend delegates to the experiment rerun workflow when experiment_id
-  // is present. Keeps the endpoint surface symmetric with get_evals_list,
-  // edit_and_run_user_eval, and stop_user_eval.
-  // Invalidate the caches that render eval state — covers the experiment
-  // detail view, experiment list grid, and the per-module eval lists keyed
-  // under both "develop" and "experiment" prefixes (get_evals_list uses the
-  // module-prefixed key defined in getEvalsList.jsx).
   const invalidateEvalCaches = () => {
     queryClient.invalidateQueries({ queryKey: ["experiment", experimentId] });
     queryClient.invalidateQueries({ queryKey: ["experiment-list"] });
@@ -173,7 +156,6 @@ const ManageExperimentEvalsDrawer = ({
   };
 
   const handleAddEvaluation = (evalConfig) => {
-    // Translate column names to UUIDs
     const rawMapping = evalConfig.mapping || {};
     const translatedMapping = {};
     for (const [variable, colName] of Object.entries(rawMapping)) {
@@ -185,39 +167,40 @@ const ManageExperimentEvalsDrawer = ({
     }
 
     const builtEval = {
-      templateId: evalConfig.templateId,
+      template_id: evalConfig.template_id,
+      templateId: evalConfig.template_id,
       evalTemplateName: evalConfig.name,
       model: evalConfig.model,
       mapping: translatedMapping,
       config: buildExperimentEvalRuntimePayload(evalConfig, translatedMapping),
-      templateType: evalConfig.templateType,
-      // Carry the picker's version selection through to `transformEvals`.
-      pinned_version_id: evalConfig.versionId ?? null,
-      ...(evalConfig.templateType === "composite" &&
-      evalConfig.compositeWeightOverrides
-        ? { compositeWeightOverrides: evalConfig.compositeWeightOverrides }
+      template_type: evalConfig.template_type,
+      templateType: evalConfig.template_type,
+      pinned_version_id: evalConfig.version_id,
+      ...(evalConfig.template_type === "composite" &&
+      evalConfig.composite_weight_overrides
+        ? {
+            composite_weight_overrides: evalConfig.composite_weight_overrides,
+          }
         : {}),
     };
 
     if (editingEval) {
-      // Edit mode: replace the existing eval in-place
       builtEval.name = evalConfig.name;
-      builtEval.actualEvalCreatedId = editingEval.userEvalId;
-      builtEval.id = editingEval.userEvalId;
+      builtEval.actualEvalCreatedId = editingEval.user_eval_id;
+      builtEval.id = editingEval.user_eval_id;
       setEvals((prev) => {
         const updated = prev.map((e) => {
           const eid = e.actualEvalCreatedId || e.evalId || e.id;
-          return eid === editingEval.userEvalId ? { ...e, ...builtEval } : e;
+          return eid === editingEval.user_eval_id ? { ...e, ...builtEval } : e;
         });
         updateExperiment(updated);
         return updated;
       });
     } else {
-      // Add mode: append with versioned name
       const versionedName = getVersionedEvalName(
         evalConfig.name,
         evals,
-        evalConfig.templateId,
+        evalConfig.template_id,
       );
       builtEval.name = versionedName;
       setEvals((prev) => {
@@ -244,26 +227,24 @@ const ManageExperimentEvalsDrawer = ({
   };
 
   const handleEditEval = (evalItem) => {
-    // The template ID comes from different field names depending on
-    // whether the eval was just added (templateId) or loaded from
-    // the backend (template_id / eval_template_id).
     const tplId =
-      evalItem.templateId ||
       evalItem.template_id ||
-      evalItem.evalTemplateId ||
-      evalItem.eval_template_id;
+      evalItem.templateId ||
+      evalItem.eval_template_id ||
+      evalItem.evalTemplateId;
     setEditingEval({
       id: tplId || evalItem.id,
-      userEvalId: evalItem.actualEvalCreatedId || evalItem.id,
+      template_id: tplId || evalItem.id,
+      user_eval_id: evalItem.actualEvalCreatedId || evalItem.id,
       name: evalItem.name || evalItem.evalTemplateName,
-      templateType: evalItem.templateType || evalItem.template_type,
+      template_type: evalItem.template_type || evalItem.templateType,
       mapping: evalItem.config?.mapping || evalItem.mapping,
       model: evalItem.model || evalItem.selected_model,
       run_config: evalItem.config,
       pinned_version_id: evalItem.pinned_version_id,
-      compositeWeightOverrides:
-        evalItem.compositeWeightOverrides ||
-        evalItem.composite_weight_overrides,
+      composite_weight_overrides:
+        evalItem.composite_weight_overrides ||
+        evalItem.compositeWeightOverrides,
     });
     setOpenEvaluationDialog(true);
   };
