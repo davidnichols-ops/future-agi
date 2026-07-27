@@ -38,6 +38,9 @@ class UsageDecision:
     error_code: str = ""
     upgrade_cta: Optional[dict] = field(default=None)
     retry_after: Optional[int] = None
+    dimension: str = ""
+    current_usage: Optional[float] = None
+    limit: Optional[float] = None
 
 
 _ALLOW = UsageDecision(allowed=True)
@@ -102,6 +105,7 @@ class Billing:
         event_type: str,
         *,
         amount: float = 1.0,
+        event_id: Optional[str] = None,
         **properties: Any,
     ) -> None:
         """Emit a metering event (fire-and-forget).  Always succeeds in OSS."""
@@ -272,7 +276,9 @@ class _NoopBilling(Billing):
 
     has_ee_billing = False
 
-    def record_usage(self, org_id, event_type, *, amount=1.0, **properties):
+    def record_usage(
+        self, org_id, event_type, *, amount=1.0, event_id=None, **properties
+    ):
         pass
 
     def check_usage(self, org_id, event_type, amount=0):
@@ -342,16 +348,21 @@ class _NoopBilling(Billing):
 class _EeBilling(Billing):
     """Delegates all operations to ee.usage via lazy imports."""
 
-    def record_usage(self, org_id, event_type, *, amount=1.0, **properties):
+    def record_usage(
+        self, org_id, event_type, *, amount=1.0, event_id=None, **properties
+    ):
         from ee.usage.services.emitter import emit
         from ee.usage.schemas.events import UsageEvent
 
-        emit(UsageEvent(
-            org_id=str(org_id),
-            event_type=event_type,
-            amount=amount,
-            properties=properties,
-        ))
+        emit(
+            UsageEvent(
+                org_id=str(org_id),
+                event_type=event_type,
+                amount=amount,
+                properties=properties,
+                **({"event_id": event_id} if event_id else {}),
+            )
+        )
 
     def check_usage(self, org_id, event_type, amount=0):
         from ee.usage.services.metering import check_usage as _check
@@ -359,9 +370,13 @@ class _EeBilling(Billing):
         result = _check(str(org_id), event_type, amount)
         return UsageDecision(
             allowed=getattr(result, "allowed", True),
-            reason=getattr(result, "reason", ""),
-            error_code=getattr(result, "error_code", ""),
+            reason=getattr(result, "reason", "") or "",
+            error_code=getattr(result, "error_code", "") or "",
             upgrade_cta=_cta_dict(getattr(result, "upgrade_cta", None)),
+            retry_after=getattr(result, "retry_after", None),
+            dimension=getattr(result, "dimension", "") or "",
+            current_usage=getattr(result, "current_usage", None),
+            limit=getattr(result, "limit", None),
         )
 
     def log_and_deduct(

@@ -127,6 +127,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     isEditMode,
     requiredColumnId,
     onFiltersChange,
+    sourceTimeWindow,
     filterForm: localFilterForm,
   } = useEvalPickerContext();
   const normalizedEvalData = useMemo(
@@ -200,8 +201,13 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
     name: "filters",
   });
   const localApiFilters = useMemo(
-    () => buildApiFilterArray(localFormFilters),
-    [localFormFilters],
+    () =>
+      buildApiFilterArray(
+        localFormFilters,
+        sourceTimeWindow?.startDate,
+        sourceTimeWindow?.endDate,
+      ),
+    [localFormFilters, sourceTimeWindow?.startDate, sourceTimeWindow?.endDate],
   );
 
   const handleSourceReadyChange = useCallback((ready, mapping) => {
@@ -1867,7 +1873,6 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                     initialMapping={evalData?.mapping}
                     errorLocalizerEnabled={errorLocalizerEnabled}
                     localFilters={localApiFilters}
-                    pickerSourceColumns={sourceColumns}
                     allowCustomFieldPath
                     {...compositeSourceModeProps}
                   />
@@ -2015,6 +2020,7 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
             settings only. */}
         {source !== "composite" &&
           !sourceReady &&
+          !hasDataInjection &&
           !testError &&
           !testPassed && (
             <Typography
@@ -2190,7 +2196,12 @@ const EvalPickerConfigFull = ({ evalData, onBack, onSave, isSaving }) => {
                 : `Your Mustache template has no variables. Add a {{variable}} placeholder (e.g. {{input}}) before ${actionLabel}.`;
           }
 
-          if (!addDisabled && source !== "composite" && !sourceReady) {
+          if (
+            !addDisabled &&
+            source !== "composite" &&
+            !sourceReady &&
+            !hasDataInjection
+          ) {
             addDisabled = true;
             addDisabledReason = `Map all variables before ${actionLabel}.`;
           }

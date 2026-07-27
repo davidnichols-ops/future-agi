@@ -1,6 +1,81 @@
 import { describe, it, expect } from "vitest";
-import { getAggColumnLabel, getYAxisRangeWarning } from "../widgetUtils";
+import {
+  fromAxisConfigPayload,
+  getAggColumnLabel,
+  getYAxisRangeWarning,
+  seriesHasDataPoints,
+  toAxisConfigPayload,
+} from "../widgetUtils";
 import { ALL_AGGREGATIONS } from "../constants";
+
+describe("axis config contract", () => {
+  const uiConfig = {
+    leftY: { prefixSuffix: "prefix", outOfBounds: "visible", unit: "ms" },
+    rightY: { prefixSuffix: "suffix", outOfBounds: "hidden" },
+    xAxis: { visible: true },
+    seriesAxis: { 0: "right" },
+  };
+
+  it("serializes UI state to the snake_case API contract", () => {
+    expect(toAxisConfigPayload(uiConfig)).toEqual({
+      left_y: {
+        prefix_suffix: "prefix",
+        out_of_bounds: "visible",
+        unit: "ms",
+      },
+      right_y: { prefix_suffix: "suffix", out_of_bounds: "hidden" },
+      x_axis: { visible: true },
+      series_axis: { 0: "right" },
+    });
+  });
+
+  it("restores the snake_case API contract to UI state", () => {
+    expect(fromAxisConfigPayload(toAxisConfigPayload(uiConfig))).toEqual(
+      uiConfig,
+    );
+  });
+
+  it("restores legacy camelCase axis configs during rollout", () => {
+    expect(fromAxisConfigPayload(uiConfig)).toEqual(uiConfig);
+  });
+});
+
+describe("seriesHasDataPoints", () => {
+  it("returns false when series is empty", () => {
+    expect(seriesHasDataPoints([])).toBe(false);
+  });
+
+  it("returns false when every series entry has an empty data array", () => {
+    expect(
+      seriesHasDataPoints([
+        { name: "a", data: [] },
+        { name: "b", data: [] },
+      ]),
+    ).toBe(false);
+  });
+
+  it("returns true when at least one series entry has data points", () => {
+    expect(
+      seriesHasDataPoints([
+        { name: "a", data: [] },
+        { name: "b", data: [{ x: 0, y: 1 }] },
+      ]),
+    ).toBe(true);
+  });
+
+  it("does not crash on a null/undefined series entry", () => {
+    // red if the ?. guard on `s` is reverted: series.some((s) => (s.data || [])...) throws
+    // TypeError: Cannot read properties of undefined (reading 'data')
+    expect(
+      seriesHasDataPoints([
+        null,
+        undefined,
+        { name: "a", data: [{ x: 0, y: 1 }] },
+      ]),
+    ).toBe(true);
+    expect(seriesHasDataPoints([null, undefined])).toBe(false);
+  });
+});
 
 describe("getAggColumnLabel", () => {
   it("returns 'Average' when metrics list is empty", () => {
@@ -26,12 +101,16 @@ describe("getAggColumnLabel", () => {
     // red if source drifts from this mock again: WidgetEditorView renders
     // "95th Percentile" for p95, not the raw value "p95".
     const metrics = [{ aggregation: "p95" }];
-    expect(getAggColumnLabel(metrics, ALL_AGGREGATIONS)).toBe("95th Percentile");
+    expect(getAggColumnLabel(metrics, ALL_AGGREGATIONS)).toBe(
+      "95th Percentile",
+    );
   });
 
   it("returns the real percentile label (25th Percentile)", () => {
     const metrics = [{ aggregation: "p25" }];
-    expect(getAggColumnLabel(metrics, ALL_AGGREGATIONS)).toBe("25th Percentile");
+    expect(getAggColumnLabel(metrics, ALL_AGGREGATIONS)).toBe(
+      "25th Percentile",
+    );
   });
 
   it("returns 'Agg.' when multiple metrics have different aggregations", () => {

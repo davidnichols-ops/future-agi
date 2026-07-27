@@ -164,6 +164,8 @@ from simulate.utils.test_execution import (
 )
 from simulate.utils.test_execution_utils import (
     TestExecutionUtils,
+    build_eval_column,
+    reconcile_eval_column_order,
     reconcile_scenario_column_order,
 )
 from simulate.views.scoping import run_test_workspace_filter
@@ -2088,15 +2090,7 @@ class TestExecutionDetailView(APIView):
                     default_columns = copy.deepcopy(DEFAULT_CHAT_SIM_COL)
 
                 for eval_config in eval_configs:
-                    default_columns.append(
-                        {
-                            "column_name": eval_config.name,
-                            "id": str(eval_config.id),
-                            "eval_config": eval_config.eval_template.config,
-                            "visible": True,
-                            "type": "evaluation",
-                        }
-                    )
+                    default_columns.append(build_eval_column(eval_config))
 
                 # Save the default column order
                 test_execution.execution_metadata["column_order"] = default_columns
@@ -2110,6 +2104,21 @@ class TestExecutionDetailView(APIView):
                 column_order=column_order,
             )
             if scenario_columns_changed:
+                test_execution.execution_metadata["column_order"] = column_order
+                test_execution.save(update_fields=["execution_metadata"])
+
+            evaluated_eval_ids = set()
+            for eo in CallExecution.objects.filter(
+                test_execution=test_execution
+            ).values_list("eval_outputs", flat=True):
+                if isinstance(eo, dict):
+                    evaluated_eval_ids.update(eo.keys())
+            column_order, eval_columns_changed = reconcile_eval_column_order(
+                column_order=column_order,
+                eval_configs=eval_configs,
+                evaluated_eval_ids=evaluated_eval_ids,
+            )
+            if eval_columns_changed:
                 test_execution.execution_metadata["column_order"] = column_order
                 test_execution.save(update_fields=["execution_metadata"])
 
@@ -3196,14 +3205,25 @@ class CallExecutionDetailView(APIView):
                     vapi_data, include_call_logs=False
                 )
             else:
-                # Fallback for other providers (retell etc.): ship the raw
-                # payload under `raw_log` so the Attributes tab at least
-                # renders the full object tree.
-                provider_data = next(
-                    (v for v in pcd.values() if isinstance(v, dict)), None
+                # Other providers (Bland, Retell, ElevenLabs, Twilio): reuse the
+                # same per-provider normalizer the ingest pipeline runs, so the
+                # Attributes tab renders flat eval attributes (call.duration,
+                # conversation.transcript.*, cost, ...) instead of a single
+                # collapsed raw_log tree. Falls back to raw_log if no normalizer
+                # matches the provider key.
+                from tracer.utils.observability_provider import (
+                    flatten_provider_call_attributes,
+                )
+
+                provider_key, provider_data = next(
+                    ((k, v) for k, v in pcd.items() if isinstance(v, dict)),
+                    (None, None),
                 )
                 if provider_data:
-                    response_data["attributes"] = {"raw_log": provider_data}
+                    attrs = flatten_provider_call_attributes(
+                        provider_key, provider_data
+                    )
+                    response_data["attributes"] = attrs or {"raw_log": provider_data}
 
             return Response(response_data, status=status.HTTP_200_OK)
 
@@ -3459,12 +3479,37 @@ class CallExecutionLogsView(APIView):
                             call_execution_id=str(call_execution.id),
                         )
                     else:
+                        # Resolve the customer api_key so the ingest task can
+                        # hit the authenticated call-log endpoint. Absent, the
+                        # task falls back to the legacy unauthenticated URL.
+                        provider_call_id = None
+                        provider_api_key = None
+                        try:
+                            test_exec = getattr(
+                                call_execution, "test_execution", None
+                            )
+                            version = (
+                                getattr(test_exec, "agent_version", None) if test_exec else None
+                            )
+                            if version is not None:
+                                from simulate.services.agent_definition import resolve_api_key_for_version
+
+                                provider_api_key = resolve_api_key_for_version(version)
+                            provider_call_id = (
+                                vapi.get("id") if isinstance(vapi, dict) else None
+                            )
+                        except Exception:
+                            provider_api_key = None
+                            provider_call_id = None
+
                         try:
                             ingest_call_logs_task.apply_async(
                                 args=(str(call_execution.id), log_url),
                                 kwargs={
                                     "verify_ssl": False,
                                     "source": CallLogEntry.LogSource.CUSTOMER,
+                                    "call_id": provider_call_id,
+                                    "api_key": provider_api_key,
                                 },
                             )
                         except Exception:
@@ -4872,7 +4917,7 @@ class RunTestExecutionsView(APIView):
 
     @swagger_auto_schema(
         responses={
-            200: RunTestExecutionsResponseSerializer(many=True),
+            200: RunTestExecutionsResponseSerializer(),
             404: RunTestErrorResponseSerializer,
             500: RunTestErrorResponseSerializer,
         },

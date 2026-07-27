@@ -24,6 +24,7 @@ def emit_span_ingestion_usage(
     payload_bytes: int,
     *,
     source: str,
+    event_id: str | None = None,
 ) -> None:
     try:
         # In OSS, get_billing() returns _NoopBilling which silently no-ops.
@@ -40,6 +41,7 @@ def emit_span_ingestion_usage(
                     BillingEventType.OBSERVE_ADD,
                     amount=payload_bytes,
                     source=source,
+                    event_id=event_id,
                 )
             return
 
@@ -55,6 +57,7 @@ def emit_span_ingestion_usage(
                     org_id_str,
                     BillingEventType.OBSERVE_ADD,
                     amount=payload_bytes,
+                    event_id=event_id,
                     **props,
                 )
             return
@@ -69,6 +72,7 @@ def emit_span_ingestion_usage(
                 amount=tracing_units,
                 traces=tracing_units,
                 source=source,
+                event_id=event_id,
             )
     except Exception:
         logger.exception("usage_metering_skipped")

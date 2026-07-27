@@ -122,6 +122,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
     setSelectedEval,
     setStep,
     onFiltersChange,
+    sourceTimeWindow,
     filterForm: localFilterForm,
   } = useEvalPickerContext();
   const { enqueueSnackbar } = useSnackbar();
@@ -164,8 +165,13 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
     name: "filters",
   });
   const localApiFilters = useMemo(
-    () => buildApiFilterArray(localFormFilters),
-    [localFormFilters],
+    () =>
+      buildApiFilterArray(
+        localFormFilters,
+        sourceTimeWindow?.startDate,
+        sourceTimeWindow?.endDate,
+      ),
+    [localFormFilters, sourceTimeWindow?.startDate, sourceTimeWindow?.endDate],
   );
 
   // Composite eval state (only used when evalType === "composite")
@@ -395,7 +401,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
       }
     }
 
-    if (!sourceReady && source !== "composite") {
+    if (!sourceReady && source !== "composite" && !hasDataInjection) {
       next.mapping = "Map all variables before saving";
     }
 
@@ -645,7 +651,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
       (evalType === "code"
         ? code.trim()
         : instructions.trim() && !needsTemplateVariable) &&
-      (source === "composite" || sourceReady);
+      (source === "composite" || sourceReady || hasDataInjection);
 
   const getDisabledReason = () => {
     if (!name.trim()) return "Name is required";
@@ -1312,7 +1318,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
             </Typography>
           </Box>
         )}
-        {!sourceReady && !testError && !testPassed && (
+        {!sourceReady && !hasDataInjection && !testError && !testPassed && (
           <Typography
             variant="caption"
             color="text.secondary"
