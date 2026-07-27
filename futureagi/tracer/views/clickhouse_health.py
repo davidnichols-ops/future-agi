@@ -51,6 +51,7 @@ class ClickHouseHealthView(APIView):
                 {
                     "status": health.status,
                     "clickhouse_connected": health.clickhouse_connected,
+                    "clickhouse_v2_connected": health.clickhouse_v2_connected,
                     "cdc_lag": health.cdc_lag,
                     "routing": health.details.get("routing", {}),
                 },

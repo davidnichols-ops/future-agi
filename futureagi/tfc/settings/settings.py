@@ -800,13 +800,15 @@ WEBAUTHN_CHALLENGE_TTL = 120  # 2 minutes
 # The new spans cluster (typed Maps + typed JSON; PLAN_V2_NO_CDC). Falls back
 # to the legacy CLICKHOUSE dict above for connection details if not set
 # explicitly — see tracer/services/clickhouse/v2/__init__.py:get_v2_config().
+# Connection keys carry no default here: an unset key must stay None so
+# get_v2_config() can tell "not configured" from "configured as empty".
 CLICKHOUSE_V2 = {
     "CH25_HOST":      os.getenv("CH25_HOST"),
-    "CH25_HTTP_PORT": os.getenv("CH25_HTTP_PORT", "8123"),
-    "CH25_TCP_PORT":  os.getenv("CH25_TCP_PORT", "9000"),
-    "CH25_USER":      os.getenv("CH25_USER", "default"),
-    "CH25_PASSWORD":  os.getenv("CH25_PASSWORD", ""),
-    "CH25_DATABASE":  os.getenv("CH25_DATABASE", "default"),
+    "CH25_HTTP_PORT": os.getenv("CH25_HTTP_PORT"),
+    "CH25_TCP_PORT":  os.getenv("CH25_TCP_PORT"),
+    "CH25_USER":      os.getenv("CH25_USER"),
+    "CH25_PASSWORD":  os.getenv("CH25_PASSWORD"),
+    "CH25_DATABASE":  os.getenv("CH25_DATABASE"),
     # ─── Per-query-type routing for the shadow-mode rollout ──────────────────
     # Comma-separated query type names. See tracer/services/clickhouse/v2/shadow.py
     # for RoutingMode definitions. Anything not listed defaults to V1_ONLY.

@@ -3914,6 +3914,72 @@ class TestConsistencyChecker:
             assert isinstance(pg_table, str)
             assert isinstance(ch_table, str)
 
+    def _connected_checker(self):
+        """A checker whose legacy native client pings green."""
+        from tracer.services.clickhouse.consistency import ConsistencyChecker
+
+        checker = ConsistencyChecker()
+        checker._ch_client = mock.Mock(ping=mock.Mock(return_value=True))
+        return checker
+
+    def _patched_health_inputs(self, v2_connected):
+        from tracer.services.clickhouse.consistency import (
+            CDC_LAG_DEGRADED_SECONDS,
+            ConsistencyChecker,
+        )
+
+        return (
+            mock.patch(
+                "tracer.services.clickhouse.consistency.is_clickhouse_enabled",
+                return_value=True,
+            ),
+            mock.patch.object(
+                ConsistencyChecker,
+                "get_cdc_lag",
+                return_value={"tracer_trace": float(CDC_LAG_DEGRADED_SECONDS - 1)},
+            ),
+            mock.patch.object(
+                ConsistencyChecker, "check_v2_connection", return_value=v2_connected
+            ),
+        )
+
+    def test_health_status_degraded_when_v2_probe_fails(self):
+        """A failing CH25 probe degrades a cluster the native client still reaches."""
+        checker = self._connected_checker()
+        enabled, lag, probe = self._patched_health_inputs(v2_connected=False)
+
+        with enabled, lag, probe:
+            health = checker.get_health_status()
+
+        assert health.clickhouse_connected is True
+        assert health.clickhouse_v2_connected is False
+        assert health.status == "degraded"
+
+    def test_health_status_healthy_when_v2_probe_succeeds(self):
+        """A passing CH25 probe leaves a connected, low-lag cluster healthy."""
+        checker = self._connected_checker()
+        enabled, lag, probe = self._patched_health_inputs(v2_connected=True)
+
+        with enabled, lag, probe:
+            health = checker.get_health_status()
+
+        assert health.clickhouse_v2_connected is True
+        assert health.status == "healthy"
+
+    def test_check_v2_connection_reports_false_instead_of_raising(self):
+        """A CH25 credential failure is reported, not raised, at the health endpoint."""
+        import clickhouse_connect
+
+        from tracer.services.clickhouse.consistency import ConsistencyChecker
+
+        def refuse(**kwargs):
+            raise RuntimeError(
+                "Code: 194. DB::Exception: default: Authentication failed"
+            )
+
+        with mock.patch.object(clickhouse_connect, "get_client", refuse):
+            assert ConsistencyChecker().check_v2_connection() is False
+
 
 # ============================================================================
 # 6. Base Query Builder Tests

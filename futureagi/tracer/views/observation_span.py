@@ -1423,7 +1423,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         except Exception as e:
             logger.exception(f"Error in fetching the spans list of observe: {str(e)}")
             return self._gm.bad_request(
-                f"error fetching the spans list of observe {str(e)}"
+                f"error fetching the spans list of observe {get_error_message('FAILED_TO_FETCH_TRACE_LIST')}"
             )
 
     def _list_spans_clickhouse(
@@ -2171,7 +2171,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         except Exception as e:
             logger.exception(f"Error in fetching graph data: {str(e)}")
-            return self._gm.bad_request(f"Error fetching graph data: {str(e)}")
+            return self._gm.bad_request(
+                f"Error fetching graph data: {get_error_message('FAILED_TO_FETCH_GRAPH_DATA')}"
+            )
 
     @validated_request(
         query_serializer=ObservationAttributeListQuerySerializer,
@@ -2196,7 +2198,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         except Exception as e:
             logger.exception(f"error fetching span attributes list: {str(e)}")
             return self._gm.bad_request(
-                f"error fetching the span attributes list {str(e)}"
+                f"error fetching the span attributes list {get_error_message('FAILED_TO_FETCH_ATTRIBUTE_LIST')}"
             )
 
     @validated_request(
@@ -2253,7 +2255,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         except Exception as e:
             logger.exception(f"error fetching eval attributes list: {str(e)}")
             return self._gm.bad_request(
-                f"error fetching the eval attributes list {str(e)}"
+                f"error fetching the eval attributes list {get_error_message('FAILED_TO_FETCH_ATTRIBUTE_LIST')}"
             )
 
     # Trace + session model fields the resolver allow-lists; mirrors the
@@ -2575,8 +2577,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.success_response(result)
 
         except Exception as e:
+            logger.exception(f"error fetching evaluation details: {str(e)}")
             return self._gm.bad_request(
-                f"error fetching the eval attributes list {str(e)}"
+                f"error fetching the evaluation details {get_error_message('FAILED_TO_FETCH_EVALUATION_DETAILS')}"
             )
 
     @action(detail=False, methods=["get"])
@@ -3422,7 +3425,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         except Exception as e:
             logger.exception(f"Error fetching span id by index (observe): {str(e)}")
-            return self._gm.bad_request(f"error fetching the span id by index {str(e)}")
+            return self._gm.bad_request(
+                f"error fetching the span id by index {get_error_message('FAILED_TO_FETCH_TRACE_ID')}"
+            )
 
 
 def get_observation_spans(filters):

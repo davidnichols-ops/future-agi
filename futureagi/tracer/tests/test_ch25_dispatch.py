@@ -3,6 +3,7 @@ Pin the v1↔v2 dispatch behavior.
 
 Tests the factory in tracer/services/clickhouse/v2/dispatch.py: given a
 query type + settings, the right builder class comes back.
+Plus how the same settings resolve into a v2 connection config.
 """
 from __future__ import annotations
 
@@ -10,6 +11,15 @@ from unittest.mock import patch
 
 import pytest
 
+from tracer.services.clickhouse.v2 import (
+    DEFAULT_DATABASE,
+    DEFAULT_HOST,
+    DEFAULT_HTTP_PORT,
+    DEFAULT_PASSWORD,
+    DEFAULT_TCP_PORT,
+    DEFAULT_USER,
+    get_v2_config,
+)
 from tracer.services.clickhouse.v2.dispatch import (
     get_query_builder_class,
     get_v1_class,
@@ -115,3 +125,177 @@ def test_get_v2_class_returns_none_when_unregistered():
         assert get_v2_class("UNREGISTERED_V2") is None
     finally:
         del _REGISTRY["UNREGISTERED_V2"]
+
+
+# ─── Connection config resolution ────────────────────────────────────────────
+_LEGACY_CLICKHOUSE = {
+    "CH_HOST":     "ch-legacy.internal",
+    "CH_PORT":     "9440",
+    "CH_USERNAME": "fagi_app",
+    "CH_PASSWORD": "REAL_SECRET",
+    "CH_DATABASE": "futureagi_prod",
+}
+
+_CH25_CONNECTION_KEYS = (
+    "CH25_HOST",
+    "CH25_HTTP_PORT",
+    "CH25_TCP_PORT",
+    "CH25_USER",
+    "CH25_PASSWORD",
+    "CH25_DATABASE",
+)
+
+_END_USER_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def _override_config(**ch25_overrides):
+    """Helper: a legacy CLICKHOUSE plus CLICKHOUSE_V2 as settings.py builds it."""
+    from django.test.utils import override_settings
+
+    import tfc.settings.settings as deployment_settings
+
+    # tfc.settings.test replaces CLICKHOUSE_V2 with the test-cluster values, so
+    # take the base module's dict to see what a real deployment resolves from.
+    base = dict(deployment_settings.CLICKHOUSE_V2)
+    base.update(ch25_overrides)
+    return override_settings(CLICKHOUSE=dict(_LEGACY_CLICKHOUSE), CLICKHOUSE_V2=base)
+
+
+@pytest.fixture
+def no_ch25_env(monkeypatch):
+    """Strip CH25_* from the process so only settings drive resolution."""
+    for key in _CH25_CONNECTION_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture
+def captured_connect_kwargs(monkeypatch):
+    """Capture what clickhouse-connect is asked to connect with."""
+    import clickhouse_connect
+
+    captured = {}
+
+    class _Result:
+        result_rows: list = []
+
+    class _Client:
+        def query(self, *args, **kwargs):
+            return _Result()
+
+        def close(self):
+            pass
+
+    def _get_client(**kwargs):
+        captured.update(kwargs)
+        return _Client()
+
+    monkeypatch.setattr(clickhouse_connect, "get_client", _get_client)
+    return captured
+
+
+@pytest.fixture
+def end_user_reader():
+    """The observe end-user lookup, with its cached client dropped either side."""
+    from tracer.services.clickhouse.v2 import end_user_dict_reader
+
+    end_user_dict_reader._reset_client()
+    yield end_user_dict_reader
+    end_user_dict_reader._reset_client()
+
+
+def test_end_user_lookup_uses_the_legacy_pair_when_ch25_is_unset(
+    no_ch25_env, captured_connect_kwargs, end_user_reader
+):
+    """Legacy-only config: the lookup sends that cluster's user AND its password."""
+    with _override_config():
+        end_user_reader.resolve_end_user_fields([_END_USER_ID])
+
+    assert captured_connect_kwargs["host"] == _LEGACY_CLICKHOUSE["CH_HOST"]
+    assert captured_connect_kwargs["username"] == _LEGACY_CLICKHOUSE["CH_USERNAME"]
+    assert captured_connect_kwargs["password"] == _LEGACY_CLICKHOUSE["CH_PASSWORD"]
+    assert captured_connect_kwargs["database"] == _LEGACY_CLICKHOUSE["CH_DATABASE"]
+
+
+def test_end_user_lookup_pairs_a_ch25_user_with_the_legacy_password(
+    no_ch25_env, captured_connect_kwargs, end_user_reader
+):
+    """Setting only CH25_USER leaves the password on the legacy cluster's value."""
+    with _override_config(CH25_USER="ch25_app"):
+        end_user_reader.resolve_end_user_fields([_END_USER_ID])
+
+    assert captured_connect_kwargs["username"] == "ch25_app"
+    assert captured_connect_kwargs["password"] == _LEGACY_CLICKHOUSE["CH_PASSWORD"]
+
+
+def test_end_user_lookup_pairs_a_ch25_password_with_the_legacy_user(
+    no_ch25_env, captured_connect_kwargs, end_user_reader
+):
+    """Setting only CH25_PASSWORD leaves the user on the legacy cluster's value."""
+    with _override_config(CH25_PASSWORD="CH25_SECRET"):
+        end_user_reader.resolve_end_user_fields([_END_USER_ID])
+
+    assert captured_connect_kwargs["username"] == _LEGACY_CLICKHOUSE["CH_USERNAME"]
+    assert captured_connect_kwargs["password"] == "CH25_SECRET"
+
+
+def test_unset_ch25_keys_fall_through_to_the_legacy_connection(no_ch25_env):
+    """Host, database and TCP port come from the legacy cluster when CH25 sets none."""
+    with _override_config():
+        cfg = get_v2_config()
+
+    assert cfg["host"] == _LEGACY_CLICKHOUSE["CH_HOST"]
+    assert cfg["database"] == _LEGACY_CLICKHOUSE["CH_DATABASE"]
+    assert cfg["tcp_port"] == int(_LEGACY_CLICKHOUSE["CH_PORT"])
+    assert cfg["http_port"] == DEFAULT_HTTP_PORT
+
+
+def test_empty_ch25_values_are_treated_as_unset(no_ch25_env):
+    """An empty CH25 value is not a value: the legacy cluster still wins."""
+    with _override_config(
+        CH25_HOST="", CH25_HTTP_PORT="", CH25_TCP_PORT="", CH25_DATABASE=""
+    ):
+        cfg = get_v2_config()
+
+    assert cfg["host"] == _LEGACY_CLICKHOUSE["CH_HOST"]
+    assert cfg["database"] == _LEGACY_CLICKHOUSE["CH_DATABASE"]
+    assert cfg["tcp_port"] == int(_LEGACY_CLICKHOUSE["CH_PORT"])
+    assert cfg["http_port"] == DEFAULT_HTTP_PORT
+
+
+@pytest.mark.parametrize(
+    "http_port, tcp_port, expected_http, expected_tcp",
+    [
+        (None, None, DEFAULT_HTTP_PORT, int(_LEGACY_CLICKHOUSE["CH_PORT"])),
+        ("", "", DEFAULT_HTTP_PORT, int(_LEGACY_CLICKHOUSE["CH_PORT"])),
+        ("18123", "19000", 18123, 19000),
+        (18123, 19000, 18123, 19000),
+    ],
+)
+def test_ports_always_resolve_to_ints(
+    no_ch25_env, http_port, tcp_port, expected_http, expected_tcp
+):
+    """Unset, empty, string and int port settings all resolve to an int."""
+    with _override_config(CH25_HTTP_PORT=http_port, CH25_TCP_PORT=tcp_port):
+        cfg = get_v2_config()
+
+    assert cfg["http_port"] == expected_http
+    assert cfg["tcp_port"] == expected_tcp
+    assert isinstance(cfg["http_port"], int)
+    assert isinstance(cfg["tcp_port"], int)
+
+
+def test_module_defaults_apply_when_neither_cluster_is_configured(no_ch25_env):
+    """With no ClickHouse settings, every key falls back to its DEFAULT_* constant."""
+    from django.test.utils import override_settings
+
+    with override_settings(CLICKHOUSE={}, CLICKHOUSE_V2={}):
+        cfg = get_v2_config()
+
+    assert cfg == {
+        "host": DEFAULT_HOST,
+        "http_port": DEFAULT_HTTP_PORT,
+        "tcp_port": DEFAULT_TCP_PORT,
+        "user": DEFAULT_USER,
+        "password": DEFAULT_PASSWORD,
+        "database": DEFAULT_DATABASE,
+    }

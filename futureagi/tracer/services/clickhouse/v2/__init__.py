@@ -33,24 +33,78 @@ from typing import Any
 from django.conf import settings
 
 
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8123
+DEFAULT_TCP_PORT = 9000
+DEFAULT_USER = "default"
+DEFAULT_PASSWORD = ""
+DEFAULT_DATABASE = "futureagi"
+
+
+def _configured(*values: Any, default: Any = None) -> Any:
+    """First value that was actually supplied, else `default`.
+
+    Presence, not truthiness: an unset setting is None and an unset env var
+    reads as "", so neither can shadow the next source in the chain.
+    """
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return default
+
+
 def get_v2_config() -> dict[str, Any]:
     """Read the CH 25.3 connection config, falling back to the legacy
-    `CLICKHOUSE` dict's host (so a single-cluster deployment Just Works).
+    `CLICKHOUSE` dict (so a single-cluster deployment Just Works).
 
-    Settings precedence:
-      1. Explicit `settings.CLICKHOUSE_V2[...]` if defined
+    Per-key precedence:
+      1. Explicit `settings.CLICKHOUSE_V2[...]` if configured
       2. Env vars `CH25_*`
-      3. Legacy `settings.CLICKHOUSE[...]` values (re-used to point at the same host)
+      3. Legacy `settings.CLICKHOUSE[...]` values
+      4. The module-level DEFAULT_* constant
     """
     legacy = getattr(settings, "CLICKHOUSE", {}) or {}
     cfg = getattr(settings, "CLICKHOUSE_V2", {}) or {}
     return {
-        "host":      cfg.get("CH25_HOST")      or os.getenv("CH25_HOST")      or legacy.get("CH_HOST", "127.0.0.1"),
-        "http_port": int(cfg.get("CH25_HTTP_PORT") or os.getenv("CH25_HTTP_PORT") or 8123),
-        "tcp_port":  int(cfg.get("CH25_TCP_PORT")  or os.getenv("CH25_TCP_PORT")  or legacy.get("CH_PORT", 9000)),
-        "user":      cfg.get("CH25_USER")      or os.getenv("CH25_USER")      or legacy.get("CH_USERNAME", "default"),
-        "password":  cfg.get("CH25_PASSWORD")  or os.getenv("CH25_PASSWORD")  or legacy.get("CH_PASSWORD", ""),
-        "database":  cfg.get("CH25_DATABASE")  or os.getenv("CH25_DATABASE")  or legacy.get("CH_DATABASE", "futureagi"),
+        "host": _configured(
+            cfg.get("CH25_HOST"),
+            os.getenv("CH25_HOST"),
+            legacy.get("CH_HOST"),
+            default=DEFAULT_HOST,
+        ),
+        "http_port": int(
+            _configured(
+                cfg.get("CH25_HTTP_PORT"),
+                os.getenv("CH25_HTTP_PORT"),
+                default=DEFAULT_HTTP_PORT,
+            )
+        ),
+        "tcp_port": int(
+            _configured(
+                cfg.get("CH25_TCP_PORT"),
+                os.getenv("CH25_TCP_PORT"),
+                legacy.get("CH_PORT"),
+                default=DEFAULT_TCP_PORT,
+            )
+        ),
+        "user": _configured(
+            cfg.get("CH25_USER"),
+            os.getenv("CH25_USER"),
+            legacy.get("CH_USERNAME"),
+            default=DEFAULT_USER,
+        ),
+        "password": _configured(
+            cfg.get("CH25_PASSWORD"),
+            os.getenv("CH25_PASSWORD"),
+            legacy.get("CH_PASSWORD"),
+            default=DEFAULT_PASSWORD,
+        ),
+        "database": _configured(
+            cfg.get("CH25_DATABASE"),
+            os.getenv("CH25_DATABASE"),
+            legacy.get("CH_DATABASE"),
+            default=DEFAULT_DATABASE,
+        ),
     }
 
 

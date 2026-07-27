@@ -19,6 +19,9 @@ from tracer.services.clickhouse.client import (
 
 logger = structlog.get_logger(__name__)
 
+CDC_LAG_DEGRADED_SECONDS = 60
+V2_PING_TIMEOUT_SECONDS = 5
+
 
 @dataclass
 class ConsistencyResult:
@@ -40,6 +43,7 @@ class HealthStatus:
     status: str  # "healthy", "degraded", "unhealthy"
     clickhouse_connected: bool
     cdc_lag: dict[str, float]  # table -> lag_seconds
+    clickhouse_v2_connected: bool = False
     last_consistency_check: dict | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
@@ -139,6 +143,35 @@ class ConsistencyChecker:
                 lag[table] = -1
         return lag
 
+    def check_v2_connection(self) -> bool:
+        """Ping the CH25 HTTP endpoint the observe read path authenticates against.
+
+        `self._ch_client` speaks the native protocol with the legacy credentials,
+        so it stays green while the v2 HTTP credentials are wrong, which is how
+        a v2 auth failure reached customers with this endpoint reporting healthy.
+        """
+        try:
+            import clickhouse_connect
+
+            from tracer.services.clickhouse.v2 import get_v2_config
+
+            cfg = get_v2_config()
+            client = clickhouse_connect.get_client(
+                host=cfg["host"],
+                port=cfg["http_port"],
+                username=cfg["user"],
+                password=cfg["password"],
+                database=cfg["database"],
+                send_receive_timeout=V2_PING_TIMEOUT_SECONDS,
+            )
+            try:
+                return bool(client.ping())
+            finally:
+                client.close()
+        except Exception as e:
+            logger.warning("clickhouse_v2_health_probe_failed", error=str(e))
+            return False
+
     def get_health_status(self) -> HealthStatus:
         """Get overall health status."""
         if not is_clickhouse_enabled():
@@ -150,11 +183,14 @@ class ConsistencyChecker:
 
         connected = self._ch_client.ping()
         cdc_lag = self.get_cdc_lag() if connected else {}
+        v2_connected = self.check_v2_connection()
 
         # Determine status
         if not connected:
             status = "unhealthy"
-        elif any(v > 60 for v in cdc_lag.values() if v > 0):
+        elif not v2_connected or any(
+            v > CDC_LAG_DEGRADED_SECONDS for v in cdc_lag.values() if v > 0
+        ):
             status = "degraded"
         else:
             status = "healthy"
@@ -163,6 +199,7 @@ class ConsistencyChecker:
             status=status,
             clickhouse_connected=connected,
             cdc_lag=cdc_lag,
+            clickhouse_v2_connected=v2_connected,
             details={
                 "routing": {
                     k: v

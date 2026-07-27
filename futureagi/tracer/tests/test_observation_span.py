@@ -7,6 +7,7 @@ Tests for /tracer/observation-span/ endpoints.
 import json
 import uuid
 from datetime import timedelta
+from unittest import mock
 
 import pytest
 from django.utils import timezone
@@ -17,6 +18,7 @@ from model_hub.models.choices import AnnotationTypeChoices, FeedbackSourceChoice
 from model_hub.models.develop_annotations import AnnotationsLabels
 from model_hub.models.ai_model import AIModel
 from model_hub.models.evals_metric import Feedback
+from tfc.utils.error_codes import get_error_message
 from tracer.models.observation_span import ObservationSpan
 from tracer.models.project import Project
 from tracer.models.project_version import ProjectVersion
@@ -26,6 +28,38 @@ AUTH_REQUIRED_STATUS_CODES = (
     status.HTTP_401_UNAUTHORIZED,
     status.HTTP_403_FORBIDDEN,
 )
+
+# Shaped like the credential failure the CH driver raises: it names the cluster
+# host, the CH error code and the rejected user.
+CLICKHOUSE_INTERNAL_HOST = "ch25-shard0.observe.svc.cluster.local"
+CLICKHOUSE_AUTH_ERROR = (
+    "Code: 194. DB::Exception: default: Authentication failed: password is "
+    f"incorrect, or there is no user with such name ({CLICKHOUSE_INTERNAL_HOST}:9000)"
+)
+
+
+def clickhouse_auth_failure():
+    """A CH call that fails the way a rejected credential pair does."""
+    return mock.Mock(side_effect=RuntimeError(CLICKHOUSE_AUTH_ERROR))
+
+
+def assert_clickhouse_error_hidden(response, error_code, ch_call):
+    """Assert the CH call ran and its 400 carries only the sanitized message."""
+    assert ch_call.called
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    body = response.content.decode()
+    assert CLICKHOUSE_AUTH_ERROR not in body
+    assert CLICKHOUSE_INTERNAL_HOST not in body
+    assert get_error_message(error_code) in body
+
+
+def fail_span_attribute_read(monkeypatch):
+    """Make the CH attribute-key read raise the driver's credential error."""
+    from tracer.services.clickhouse.query_service import AnalyticsQueryService
+
+    ch_call = clickhouse_auth_failure()
+    monkeypatch.setattr(AnalyticsQueryService, "get_span_attribute_keys_ch", ch_call)
+    return ch_call
 
 
 def get_result(response):
@@ -659,7 +693,8 @@ class TestObservationSpanListSpansObserveAPI:
         self, auth_client, observe_project, session_trace, monkeypatch
     ):
         """CH is authoritative post-migration: a CH error surfaces as 400
-        rather than falling back to the dropped-table PG path."""
+        rather than falling back to the dropped-table PG path, and the
+        driver's own text never reaches the response body."""
         from tracer.services.clickhouse.query_service import QueryType
         from tracer.views.observation_span import ObservationSpanView
 
@@ -678,23 +713,100 @@ class TestObservationSpanListSpansObserveAPI:
             lambda self, query_type: query_type == QueryType.SPAN_LIST,
         )
 
-        def fail_clickhouse(
-            self, request, project_id, validated_data, analytics, **kwargs
-        ):
-            raise RuntimeError("clickhouse unavailable")
-
-        monkeypatch.setattr(
-            ObservationSpanView,
-            "_list_spans_clickhouse",
-            fail_clickhouse,
-        )
+        ch_call = clickhouse_auth_failure()
+        monkeypatch.setattr(ObservationSpanView, "_list_spans_clickhouse", ch_call)
 
         response = auth_client.get(
             "/tracer/observation-span/list_spans_observe/",
             {"project_id": str(observe_project.id), "filters": "[]"},
         )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert_clickhouse_error_hidden(response, "FAILED_TO_FETCH_TRACE_LIST", ch_call)
+
+
+@pytest.mark.integration
+@pytest.mark.api
+class TestObservationSpanClickHouseErrorSanitization:
+    """Observe read handlers that surface a CH failure without its text."""
+
+    def test_span_attributes_list_hides_the_clickhouse_error(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """get_span_attributes_list returns the sanitized attribute-list message."""
+        ch_call = fail_span_attribute_read(monkeypatch)
+
+        response = auth_client.get(
+            "/tracer/observation-span/get_span_attributes_list/",
+            {"filters": json.dumps({"project_id": str(observe_project.id)})},
+        )
+
+        assert_clickhouse_error_hidden(
+            response, "FAILED_TO_FETCH_ATTRIBUTE_LIST", ch_call
+        )
+
+    def test_eval_attributes_list_hides_the_clickhouse_error(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """get_eval_attributes_list returns the sanitized attribute-list message."""
+        ch_call = fail_span_attribute_read(monkeypatch)
+
+        response = auth_client.get(
+            "/tracer/observation-span/get_eval_attributes_list/",
+            {
+                "filters": json.dumps({"project_id": str(observe_project.id)}),
+                "row_type": "traces",
+            },
+        )
+
+        assert_clickhouse_error_hidden(
+            response, "FAILED_TO_FETCH_ATTRIBUTE_LIST", ch_call
+        )
+
+    def test_evaluation_details_hides_the_clickhouse_error(
+        self, auth_client, monkeypatch
+    ):
+        """get_evaluation_details returns the sanitized evaluation-details message."""
+        from tracer.views.observation_span import ObservationSpanView
+
+        ch_call = clickhouse_auth_failure()
+        monkeypatch.setattr(
+            ObservationSpanView, "_get_evaluation_details_clickhouse", ch_call
+        )
+
+        response = auth_client.get(
+            "/tracer/observation-span/get_evaluation_details/",
+            {
+                "observation_span_id": f"observe_span_{uuid.uuid4().hex[:8]}",
+                "custom_eval_config_id": str(uuid.uuid4()),
+            },
+        )
+
+        assert_clickhouse_error_hidden(
+            response, "FAILED_TO_FETCH_EVALUATION_DETAILS", ch_call
+        )
+
+    def test_trace_id_by_index_observe_hides_the_clickhouse_error(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """The observe trace-id walk returns the sanitized trace-id message."""
+        ch_call = clickhouse_auth_failure()
+        monkeypatch.setattr(
+            "tracer.services.clickhouse.v2.end_user_dict_reader."
+            "resolve_end_user_ids_by_user_id",
+            ch_call,
+        )
+
+        response = auth_client.get(
+            "/tracer/observation-span/get_trace_id_by_index_spans_as_observe/",
+            {
+                "span_id": f"observe_span_{uuid.uuid4().hex[:8]}",
+                "project_id": str(observe_project.id),
+                "user_id": "customer-42",
+                "filters": "[]",
+            },
+        )
+
+        assert_clickhouse_error_hidden(response, "FAILED_TO_FETCH_TRACE_ID", ch_call)
 
 
 @pytest.mark.integration
@@ -865,6 +977,29 @@ class TestObservationSpanGraphMethodsAPI:
 
         assert response.status_code == status.HTTP_200_OK
         assert isinstance(get_result(response).get("data"), list)
+
+    def test_get_graph_methods_hides_the_clickhouse_error(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """An annotation graph CH failure returns the sanitized graph message."""
+        ch_call = clickhouse_auth_failure()
+        monkeypatch.setattr(
+            "tracer.views.observation_span.fetch_annotation_graph_ch", ch_call
+        )
+
+        response = auth_client.post(
+            "/tracer/observation-span/get_graph_methods/",
+            {
+                "project_id": str(observe_project.id),
+                "filters": [],
+                "interval": "day",
+                "property": "average",
+                "req_data_config": {"id": "sentiment", "type": "ANNOTATION"},
+            },
+            format="json",
+        )
+
+        assert_clickhouse_error_hidden(response, "FAILED_TO_FETCH_GRAPH_DATA", ch_call)
 
 
 @pytest.mark.integration

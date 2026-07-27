@@ -167,6 +167,14 @@ err_dict = {
     "COMMON_COLUMNS_NOT_FOUND": ["No common columns found between datasets."],
     "FAILED_TO_FETCH_DATASETS": ["Unable to fetch datasets list. Please try again."],
     "FAILED_TO_FETCH_TRACE_LIST": ["Unable to fetch traces list. Please try again."],
+    "FAILED_TO_FETCH_ATTRIBUTE_LIST": [
+        "Unable to fetch attributes list. Please try again."
+    ],
+    "FAILED_TO_FETCH_GRAPH_DATA": ["Unable to fetch graph data. Please try again."],
+    "FAILED_TO_FETCH_EVALUATION_DETAILS": [
+        "Unable to fetch evaluation details. Please try again."
+    ],
+    "FAILED_TO_FETCH_TRACE_ID": ["Unable to fetch trace ID. Please try again."],
     "MISSING_COLUMN_ID": ["Column ID is required."],
     "MISSING_METRIC_ID": ["Metric ID is required."],
     "MISSING_METRIC_IDS": ["Metric IDs are required."],
