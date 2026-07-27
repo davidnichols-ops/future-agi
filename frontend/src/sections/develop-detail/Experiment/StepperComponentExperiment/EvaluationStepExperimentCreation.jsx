@@ -92,8 +92,8 @@ const EvaluationStepExperimentCreation = ({
               prevById.get(String(item.id)) ||
               (nextEvals || []).find(
                 (e) =>
-                  String(e.template_id || e.templateId) ===
-                    String(item.template_id) && e.name === item.name,
+                  String(e.template_id) === String(item.template_id) &&
+                  e.name === item.name,
               );
             return {
               ...prev,
@@ -101,11 +101,9 @@ const EvaluationStepExperimentCreation = ({
               evalId: item.id,
               actualEvalCreatedId: item.id,
               template_id: item.template_id,
-              templateId: item.template_id,
-              template_type: prev?.template_type || prev?.templateType,
-              templateType: prev?.template_type || prev?.templateType,
-              requiredKeys: prev?.requiredKeys,
-              templateDetails: prev?.templateDetails || item.template_details,
+              template_type: prev?.template_type,
+              required_keys: prev?.required_keys,
+              template_details: prev?.template_details || item.template_details,
               composite_weight_overrides:
                 prev?.composite_weight_overrides ??
                 item.composite_weight_overrides,
@@ -162,20 +160,16 @@ const EvaluationStepExperimentCreation = ({
 
     const evalEntry = {
       evalId: evalConfig.template_id,
-      evalTemplateName: evalConfig.name,
+      name: evalConfig.name,
       template_id: evalConfig.template_id,
-      templateId: evalConfig.template_id,
       mapping: translatedMapping,
       model: evalConfig.model,
       config: fullConfig,
-      templateDetails: evalConfig.eval_template,
+      template_details: evalConfig.eval_template,
       template_type: evalConfig.template_type,
-      templateType: evalConfig.template_type,
-      requiredKeys:
+      required_keys:
         evalConfig.eval_template?.required_keys ||
-        evalConfig.eval_template?.requiredKeys ||
         evalConfig.config?.required_keys ||
-        evalConfig.config?.requiredKeys ||
         [],
       pinned_version_id: evalConfig.version_id,
       ...(evalConfig.template_type === "composite" &&
@@ -226,9 +220,7 @@ const EvaluationStepExperimentCreation = ({
   const handleEditEval = (evalItem) => {
     const tplId =
       evalItem.template_id ||
-      evalItem.templateId ||
       evalItem.eval_template_id ||
-      evalItem.evalTemplateId ||
       evalItem.evalId ||
       evalItem.id;
     setEditingEval({
@@ -236,15 +228,13 @@ const EvaluationStepExperimentCreation = ({
       template_id: tplId,
       user_eval_id:
         evalItem.actualEvalCreatedId || evalItem.evalId || evalItem.id,
-      name: evalItem.name || evalItem.evalTemplateName,
-      template_type: evalItem.template_type || evalItem.templateType,
+      name: evalItem.name,
+      template_type: evalItem.template_type,
       mapping: evalItem.config?.mapping || evalItem.mapping,
       model: evalItem.model || evalItem.selected_model,
       run_config: evalItem.config,
       pinned_version_id: evalItem.pinned_version_id,
-      composite_weight_overrides:
-        evalItem.composite_weight_overrides ||
-        evalItem.compositeWeightOverrides,
+      composite_weight_overrides: evalItem.composite_weight_overrides,
     });
     setOpenEvaluationDialog(true);
   };
