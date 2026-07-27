@@ -77,16 +77,42 @@ const EvaluationStepExperimentCreation = ({
       axios.put(endpoints.develop.experiment.update(experimentId), {
         user_eval_metrics: transformUserEvalMetricsForApi(nextEvals, true),
       }),
-    onSuccess: async (resp) => {
+    onSuccess: async (resp, nextEvals) => {
       const fresh = resp?.data?.result?.user_eval_metrics;
       if (Array.isArray(fresh)) {
+        const prevById = new Map(
+          (nextEvals || []).map((e) => [
+            String(e.actualEvalCreatedId || e.id || ""),
+            e,
+          ]),
+        );
         replaceEvals(
-          fresh.map((item) => ({
-            ...item,
-            evalId: item.id,
-            actualEvalCreatedId: item.id,
-            template_id: item.template_id,
-          })),
+          fresh.map((item) => {
+            const prev =
+              prevById.get(String(item.id)) ||
+              (nextEvals || []).find(
+                (e) =>
+                  String(e.template_id || e.templateId) ===
+                    String(item.template_id) && e.name === item.name,
+              );
+            return {
+              ...prev,
+              ...item,
+              evalId: item.id,
+              actualEvalCreatedId: item.id,
+              template_id: item.template_id,
+              templateId: item.template_id,
+              template_type: prev?.template_type || prev?.templateType,
+              templateType: prev?.template_type || prev?.templateType,
+              requiredKeys: prev?.requiredKeys,
+              templateDetails: prev?.templateDetails || item.template_details,
+              composite_weight_overrides:
+                prev?.composite_weight_overrides ??
+                item.composite_weight_overrides,
+              mapping: prev?.mapping || item.config?.mapping,
+              pinned_version_id: item.pinned_version_id,
+            };
+          }),
         );
       }
       await queryClient.refetchQueries({
