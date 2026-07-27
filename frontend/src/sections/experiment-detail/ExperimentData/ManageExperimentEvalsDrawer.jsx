@@ -33,12 +33,12 @@ const transformEvals = (evalList) =>
       isUUID(evalItem?.actualEvalCreatedId) && {
         id: evalItem?.actualEvalCreatedId,
       }),
-    template_id: evalItem.template_id || evalItem.templateId || evalItem.id,
-    name: evalItem.name || evalItem.evalTemplateName || "Unnamed Evaluation",
+    template_id: evalItem.template_id || evalItem.id,
+    name: evalItem.name || "Unnamed Evaluation",
     config: evalItem.config,
     model: evalItem.model,
-    error_localizer: evalItem.errorLocalizer,
-    kb_id: evalItem.kbId || null,
+    error_localizer: evalItem.error_localizer,
+    kb_id: evalItem.kb_id || null,
     pinned_version_id: evalItem.pinned_version_id,
     ...(evalItem.composite_weight_overrides
       ? { composite_weight_overrides: evalItem.composite_weight_overrides }
@@ -168,13 +168,11 @@ const ManageExperimentEvalsDrawer = ({
 
     const builtEval = {
       template_id: evalConfig.template_id,
-      templateId: evalConfig.template_id,
-      evalTemplateName: evalConfig.name,
+      name: evalConfig.name,
       model: evalConfig.model,
       mapping: translatedMapping,
       config: buildExperimentEvalRuntimePayload(evalConfig, translatedMapping),
       template_type: evalConfig.template_type,
-      templateType: evalConfig.template_type,
       pinned_version_id: evalConfig.version_id,
       ...(evalConfig.template_type === "composite" &&
       evalConfig.composite_weight_overrides
@@ -228,23 +226,18 @@ const ManageExperimentEvalsDrawer = ({
 
   const handleEditEval = (evalItem) => {
     const tplId =
-      evalItem.template_id ||
-      evalItem.templateId ||
-      evalItem.eval_template_id ||
-      evalItem.evalTemplateId;
+      evalItem.template_id || evalItem.eval_template_id || evalItem.id;
     setEditingEval({
-      id: tplId || evalItem.id,
-      template_id: tplId || evalItem.id,
+      id: tplId,
+      template_id: tplId,
       user_eval_id: evalItem.actualEvalCreatedId || evalItem.id,
-      name: evalItem.name || evalItem.evalTemplateName,
-      template_type: evalItem.template_type || evalItem.templateType,
+      name: evalItem.name,
+      template_type: evalItem.template_type,
       mapping: evalItem.config?.mapping || evalItem.mapping,
       model: evalItem.model || evalItem.selected_model,
       run_config: evalItem.config,
       pinned_version_id: evalItem.pinned_version_id,
-      composite_weight_overrides:
-        evalItem.composite_weight_overrides ||
-        evalItem.compositeWeightOverrides,
+      composite_weight_overrides: evalItem.composite_weight_overrides,
     });
     setOpenEvaluationDialog(true);
   };
@@ -464,8 +457,7 @@ const ManageExperimentEvalsDrawer = ({
                               <Typography variant="subtitle2">
                                 {evalItem.name}
                               </Typography>
-                              {(evalItem.templateType === "composite" ||
-                                evalItem.template_type === "composite") && (
+                              {evalItem.template_type === "composite" && (
                                 <Chip
                                   label="Composite"
                                   size="small"

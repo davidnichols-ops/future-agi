@@ -738,3 +738,23 @@ export const promptConfigTransform = (
 
   return [];
 };
+
+export const transformUserEvalMetricsForApi = (userEvalMetrics, isEditing) =>
+  (userEvalMetrics ?? []).map((evalItem) => ({
+    ...(isEditing &&
+      evalItem?.actualEvalCreatedId &&
+      isUUID(evalItem?.actualEvalCreatedId) && {
+        id: evalItem?.actualEvalCreatedId,
+      }),
+    template_id:
+      evalItem.template_id || evalItem?.template_details?.id || evalItem.id,
+    name: evalItem.name || "Unnamed Evaluation",
+    config: evalItem.config,
+    model: evalItem.model,
+    error_localizer: evalItem.error_localizer,
+    kb_id: evalItem.kb_id || null,
+    pinned_version_id: evalItem.pinned_version_id,
+    ...(evalItem.composite_weight_overrides
+      ? { composite_weight_overrides: evalItem.composite_weight_overrides }
+      : {}),
+  }));

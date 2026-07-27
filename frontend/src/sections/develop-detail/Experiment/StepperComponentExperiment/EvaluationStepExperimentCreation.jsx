@@ -24,7 +24,7 @@ import { buildExperimentEvalRuntimePayload } from "src/sections/common/EvalPicke
 import { getVersionedEvalName } from "src/components/run-tests/common";
 import { ShowComponent } from "src/components/show";
 import { isUUID } from "src/utils/utils";
-import { transformUserEvalMetricsForApi } from "../schema";
+import { transformUserEvalMetricsForApi } from "../utils";
 
 const EvaluationStepExperimentCreation = ({
   control,
