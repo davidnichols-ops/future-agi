@@ -162,8 +162,8 @@ def initiate_chat(
                 )
 
         # Resolve the simulated customer's first message (LLM → provided initial_message → default).
-        initial_message, initial_message_source = get_chat_initial_message(
-            call_execution
+        initial_message, initial_message_source, initial_llm_usage = (
+            get_chat_initial_message(call_execution)
         )
 
         # Create assistant using ChatServiceManager
@@ -263,6 +263,36 @@ def initiate_chat(
             workspace=workspace,
             tokens=initial_tokens,
         )
+
+        if initial_llm_usage:
+            input_tokens = int(initial_llm_usage.get("input_tokens") or 0)
+            output_tokens = int(initial_llm_usage.get("output_tokens") or 0)
+            total_tokens = input_tokens + output_tokens
+            if total_tokens > 0:
+                try:
+                    from ee.usage.schemas.event_types import BillingEventType
+                    from ee.usage.schemas.events import UsageEvent
+                    from ee.usage.services.emitter import emit
+
+                    emit(
+                        UsageEvent(
+                            org_id=str(organization.id),
+                            event_type=BillingEventType.TEXT_CALL,
+                            amount=total_tokens,
+                            properties={
+                                "source": "simulate_chat_initial_message",
+                                "source_id": str(call_execution.id),
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                                "total_tokens": total_tokens,
+                            },
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "chat_initial_message_bill_failed",
+                        call_execution_id=str(call_execution.id),
+                    )
 
         ##check if test execution is pending
         if (

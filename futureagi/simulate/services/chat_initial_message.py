@@ -157,13 +157,15 @@ def _generate_chat_initial_message(
     situation: str,
     agent_name: str | None,
     initial_message_hint: str | None = None,
-) -> str | None:
+) -> tuple[str | None, dict | None]:
     """
     Generate a realistic first customer message for chat using an LLM.
-    Returns None on failure so callers can fall back to the default initial message.
+    Returns (text, usage) or (None, None) on failure so callers can fall
+    back to the default initial message; `usage` carries `LLM.token_usage`
+    (`prompt_tokens` + `completion_tokens`) for billing rollup.
     """
     if not situation:
-        return None
+        return None, None
 
     style = _extract_chat_style(persona or {})
     guidance = _build_chat_initial_message_guidance(persona or {}, style)
@@ -201,7 +203,7 @@ def _generate_chat_initial_message(
             guidance_lines=len(guidance.split("\n")) if guidance else 0,
             hint_present=bool(hint),
         )
-        model_cfg = ModelConfigs.CLAUDE_4_5_SONNET_BEDROCK_ARN
+        model_cfg = ModelConfigs.VERTEX_GEMINI_2_5_PRO
         llm = LLM(
             model_name=model_cfg.model_name,
             temperature=0.7,  # Higher for more natural variation
@@ -217,15 +219,22 @@ def _generate_chat_initial_message(
         # so the caller can fall back to a safe default without leaking error text to users.
         if "LLM call failed:" in text:
             logger.exception("chat_initial_message_llm_failed", error=text)
-            return None
+            return None, None
 
-        return text or None
+        usage_src = getattr(llm, "token_usage", None) or {}
+        usage = {
+            "input_tokens": int(usage_src.get("prompt_tokens") or 0),
+            "output_tokens": int(usage_src.get("completion_tokens") or 0),
+        }
+        return (text or None, usage if text else None)
     except Exception as e:
         logger.exception("chat_initial_message_generation_failed", error=str(e))
-        return None
+        return None, None
 
 
-def get_chat_initial_message(call_execution: CallExecution) -> tuple[str, str]:
+def get_chat_initial_message(
+    call_execution: CallExecution,
+) -> tuple[str, str, dict | None]:
     """
     Resolve the initial customer message for a chat simulation.
 
@@ -235,10 +244,14 @@ def get_chat_initial_message(call_execution: CallExecution) -> tuple[str, str]:
     3) Hardcoded "Hi!"
 
     Returns:
-        (initial_message, source) where source is one of:
+        (initial_message, source, usage) where source is one of:
         - "llm_generated"
         - "provided_initial_message"
         - "default_hi"
+        usage carries the LLM's `{input_tokens, output_tokens}` for the
+        "llm_generated" source (rolled into the per-call TEXT_CALL emit
+        so the persona-first-line spend joins the same `text_sim_tokens`
+        counter as every subsequent turn) and None otherwise.
     """
     call_metadata = call_execution.call_metadata or {}
     provided_initial_message = call_metadata.get("initial_message")
@@ -254,16 +267,16 @@ def get_chat_initial_message(call_execution: CallExecution) -> tuple[str, str]:
         else None
     )
 
-    generated = _generate_chat_initial_message(
+    generated, usage = _generate_chat_initial_message(
         persona=persona,
         situation=situation,
         agent_name=agent_name,
         initial_message_hint=provided_initial_message,
     )
     if generated:
-        return generated, "llm_generated"
+        return generated, "llm_generated", usage
 
     if provided_initial_message and str(provided_initial_message).strip():
-        return str(provided_initial_message).strip(), "provided_initial_message"
+        return str(provided_initial_message).strip(), "provided_initial_message", None
 
-    return "Hi!", "default_hi"
+    return "Hi!", "default_hi", None
