@@ -4119,27 +4119,6 @@ OSS_AVAILABLE_MODELS = [
         "notes": "GA multimodal embedding model; 8K input context. Replaces gemini-embedding-001 as recommended default.",
     },
     {
-        "model_name": "gemini/gemini-3-pro-preview",
-        "providers": "gemini",
-        "api_key_name": "GEMINI_API_KEY",
-        "mode": "chat",
-        "best_for": ["Gemini 3 flagship reasoning", "long-context multimodal analysis", "advanced coding"],
-        "use_case": [
-            "complex reasoning over large datasets",
-            "STEM problem solving",
-            "enterprise agent workflows",
-        ],
-        "cutoff": "04-2026",
-        "rate_limits": {
-            "requests_per_minute": 5,
-            "requests_per_day": 100,
-            "tokens_per_minute": 250000,
-        },
-        "latency": 120,
-        "pricing": {"input_per_1M_tokens": 2.0, "output_per_1M_tokens": 12.0},
-        "notes": "Preview tier. Base Gemini 3 Pro; 1M context, 64K max output.",
-    },
-    {
         "model_name": "gemini/gemini-3-flash-preview",
         "providers": "gemini",
         "api_key_name": "GEMINI_API_KEY",
