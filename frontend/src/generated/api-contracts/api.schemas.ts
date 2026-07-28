@@ -17677,6 +17677,8 @@ export const ColumnDefinitionApiDataType = {
   persona: 'persona',
 } as const;
 
+export type ColumnDefinitionApiProperty = {[key: string]: string};
+
 export interface ColumnDefinitionApi {
   /**
      * @minLength 1
@@ -17689,6 +17691,7 @@ export interface ColumnDefinitionApi {
      * @maxLength 200
      */
   description: string;
+  property?: ColumnDefinitionApiProperty;
 }
 
 export interface ScenarioCreateRequestApi {
