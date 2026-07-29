@@ -33,7 +33,10 @@ export default function AuthSpaceLayout({ children, maxWidth = 440 }) {
           m: "auto",
           display: "flex",
           flexDirection: "column",
+          // Center everything — brand, headings, and form all share the same
+          // centered axis.
           alignItems: "center",
+          textAlign: "center",
         }}
       >
         {/* Brand */}

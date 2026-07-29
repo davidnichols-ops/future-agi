@@ -101,11 +101,7 @@ export default function ForgotPasswordView() {
       alignItems="center"
       maxWidth={"440px"}
     >
-      <Typography
-        variant="m3"
-        fontWeight={"fontWeightMedium"}
-        alignSelf={"flex-start"}
-      >
+      <Typography variant="m3" fontWeight={"fontWeightMedium"}>
         We will email you a link to reset your password
       </Typography>
       <FormTextFieldV2
@@ -149,7 +145,7 @@ export default function ForgotPasswordView() {
         href={paths.auth.jwt.login}
         color="primary"
         variant="subtitle2"
-        sx={{ alignItems: "center", display: "inline-flex" }}
+        sx={{ alignItems: "center", display: "inline-flex", alignSelf: "center" }}
       >
         <Iconify icon="eva:arrow-ios-back-fill" width={16} />
         Back to sign in
