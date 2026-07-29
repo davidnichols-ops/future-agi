@@ -424,7 +424,7 @@ def run_eval_func(
             try:
                 per_run_fee = get_billing().eval_per_run_fee()
             except Exception:
-                pass
+                logger.warning("eval_per_run_fee_lookup_failed", exc_info=True)
             actual_cost = llm_cost + per_run_fee
 
             is_composite_source = source in {

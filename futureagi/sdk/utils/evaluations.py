@@ -259,7 +259,7 @@ def _run_eval(eval_template, inputs, model, user, workspace, eval_config=None):
         try:
             per_run_fee = billing.eval_per_run_fee()
         except Exception:
-            pass
+            logger.warning("eval_per_run_fee_lookup_failed", exc_info=True)
         actual_cost = llm_cost + per_run_fee
         credits = billing.ai_credits(actual_cost)
 
@@ -517,7 +517,7 @@ def _run_protect(
             try:
                 per_run_fee = get_billing().eval_per_run_fee()
             except Exception:
-                pass
+                logger.warning("eval_per_run_fee_lookup_failed", exc_info=True)
             actual_cost = llm_cost + per_run_fee
 
             billing_protect = get_billing()

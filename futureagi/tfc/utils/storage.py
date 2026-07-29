@@ -536,7 +536,9 @@ def upload_document_to_s3(
                     source="dataset_document",
                 )
             except Exception:
-                pass
+                logger.warning(
+                    "usage_emit_failed", source="dataset_document", exc_info=True
+                )
 
         return url
     except ValueError as e:
@@ -649,7 +651,9 @@ def upload_image_to_s3(
                     source="trace_image",
                 )
             except Exception:
-                pass
+                logger.warning(
+                    "usage_emit_failed", source="trace_image", exc_info=True
+                )
 
         # Generate and return the public URL of the uploaded image
         url = get_object_url(bucket_name, object_key)
@@ -870,7 +874,9 @@ def upload_audio_to_s3_duration(
                     source="dataset_audio",
                 )
             except Exception:
-                pass
+                logger.warning(
+                    "usage_emit_failed", source="dataset_audio", exc_info=True
+                )
 
         return url, duration_seconds
     except ValueError as e:
@@ -1234,7 +1240,7 @@ def upload_file_to_s3(
                     kb_id=str(kb_id) if kb_id else None,
                 )
             except Exception:
-                pass
+                logger.warning("usage_emit_failed", source="kb_upload", exc_info=True)
 
         # Generate and return the public URL of the uploaded file
         url = get_object_url(bucket_name, object_key)
@@ -1819,7 +1825,9 @@ def upload_audio_to_s3(
                     source="trace_audio",
                 )
             except Exception:
-                pass
+                logger.warning(
+                    "usage_emit_failed", source="trace_audio", exc_info=True
+                )
 
         # Generate and return the public URL of the uploaded audio
         url = get_object_url(bucket_name, object_key)
@@ -2002,7 +2010,9 @@ def upload_video_to_s3(
                             source="trace_video",
                         )
                     except Exception:
-                        pass
+                        logger.warning(
+                            "usage_emit_failed", source="trace_video", exc_info=True
+                        )
 
                 thumbnail_url = get_object_url(bucket_name, thumbnail_object_key)
                 return url, thumbnail_url
@@ -2018,7 +2028,9 @@ def upload_video_to_s3(
                             source="trace_video",
                         )
                     except Exception:
-                        pass
+                        logger.warning(
+                            "usage_emit_failed", source="trace_video", exc_info=True
+                        )
                 return url, None
         else:
             if org_id:
@@ -2031,7 +2043,9 @@ def upload_video_to_s3(
                         source="trace_video",
                     )
                 except Exception:
-                    pass
+                    logger.warning(
+                        "usage_emit_failed", source="trace_video", exc_info=True
+                    )
             return url
     except Exception as e:
         logger.exception(f"Error uploading video to S3: {str(e)}")

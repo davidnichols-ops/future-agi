@@ -1260,7 +1260,7 @@ class EvaluationRunner:
                 try:
                     per_run_fee = get_billing().eval_per_run_fee()
                 except Exception:
-                    pass
+                    logger.warning("eval_per_run_fee_lookup_failed", exc_info=True)
                 actual_cost = llm_cost + per_run_fee
 
                 logger.info(
