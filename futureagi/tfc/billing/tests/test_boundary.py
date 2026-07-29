@@ -20,6 +20,8 @@ Every method on ``Billing`` has:
 """
 
 import importlib.util
+import logging
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -347,6 +349,71 @@ class TestEeBillingDelegation:
             )
             d = self.b.check_rate_limit("org-1", "ingestion")
         assert d.allowed is True
+
+
+# ── broken-ee entitlement default ────────────────────────────────────────────
+
+
+class TestEntitlementsUnavailableDefault:
+    """``ee`` on disk but ``entitlements`` unimportable — a broken install.
+
+    ``get_billing()`` only probes ``import ee.usage``, and that package's
+    ``__init__`` is empty, so a half-copied or half-broken ee checkout still
+    yields ``_EeBilling``. The default these gates then fall back to is
+    derived from ``is_oss()`` rather than hardcoded: EE/Cloud falls open so a
+    packaging fault doesn't hard-down paid features, OSS-mode falls closed so
+    a broken install isn't a way to obtain them for free.
+    """
+
+    def setup_method(self):
+        self.b = _EeBilling()
+
+    @staticmethod
+    def _entitlements_broken():
+        return patch.dict(sys.modules, {"ee.usage.services.entitlements": None})
+
+    def test_has_feature_falls_open_on_ee_or_cloud(self):
+        with self._entitlements_broken(), patch("tfc.ee_gating.is_oss", return_value=False):
+            assert self.b.has_feature("org-1", "has_agreement_metrics") is True
+
+    def test_has_feature_falls_closed_on_oss_mode(self):
+        with self._entitlements_broken(), patch("tfc.ee_gating.is_oss", return_value=True):
+            assert self.b.has_feature("org-1", "has_agreement_metrics") is False
+
+    def test_check_feature_gate_falls_open_on_ee_or_cloud(self):
+        with self._entitlements_broken(), patch("tfc.ee_gating.is_oss", return_value=False):
+            assert self.b.check_feature_gate("org-1", "has_voice_sim").allowed is True
+
+    def test_check_feature_gate_falls_closed_on_oss_mode(self):
+        with self._entitlements_broken(), patch("tfc.ee_gating.is_oss", return_value=True):
+            d = self.b.check_feature_gate("org-1", "has_voice_sim")
+        assert d.allowed is False
+        assert "EE or Cloud" in d.reason
+
+    def test_oss_mode_denial_matches_the_noop_answer(self):
+        """A broken ee install must not be more permissive than no ee at all."""
+        with self._entitlements_broken(), patch("tfc.ee_gating.is_oss", return_value=True):
+            broken = self.b.check_feature_gate("org-1", "has_synthetic_data")
+        assert broken == _NoopBilling().check_feature_gate("org-1", "has_synthetic_data")
+
+    def test_can_create_allows_in_both_modes(self):
+        """Resource limits, not entitlement — OSS has no caps either, so
+        there is no is_oss() split here (see _NoopBilling.can_create)."""
+        for oss in (True, False):
+            with self._entitlements_broken(), patch("tfc.ee_gating.is_oss", return_value=oss):
+                assert self.b.can_create("org-1", "knowledge_bases", 0).allowed is True
+
+    def test_both_defaults_are_logged_at_error(self, caplog):
+        for oss in (True, False):
+            caplog.clear()
+            with caplog.at_level(logging.ERROR, logger="tfc.billing.boundary"):
+                with self._entitlements_broken(), patch(
+                    "tfc.ee_gating.is_oss", return_value=oss
+                ):
+                    self.b.has_feature("org-1", "has_agreement_metrics")
+            assert any(r.levelno == logging.ERROR for r in caplog.records), (
+                f"broken entitlements must log at ERROR (is_oss={oss})"
+            )
 
 
 # ── get_billing() factory ────────────────────────────────────────────────────

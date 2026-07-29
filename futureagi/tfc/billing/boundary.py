@@ -44,6 +44,9 @@ class UsageDecision:
 
 
 _ALLOW = UsageDecision(allowed=True)
+_DENY_UNENTITLED = UsageDecision(
+    allowed=False, reason="This feature requires an EE or Cloud plan."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +308,7 @@ class _NoopBilling(Billing):
         return False  # entitlement: fail-CLOSED — avoids the develop_annotations leak
 
     def check_feature_gate(self, org_id, feature):
-        return UsageDecision(allowed=False, reason="This feature requires an EE or Cloud plan.")
+        return _DENY_UNENTITLED
 
     def can_create(self, org_id, resource, current_count=0):
         return _ALLOW
@@ -414,13 +417,10 @@ class _EeBilling(Billing):
         return BillingConfig.get().calculate_ai_credits(cost_usd)
 
     def has_feature(self, org_id, feature):
-        # ee present but entitlements broken → allow by default, mirroring
-        # tfc.ee_gating.check_ee_feature's ImportError policy.
         try:
             from ee.usage.services.entitlements import Entitlements
         except ImportError:
-            _log_entitlements_import_failure()
-            return True
+            return _entitlements_unavailable_allows()
 
         return Entitlements.has_feature_unified(str(org_id), feature)
 
@@ -428,8 +428,7 @@ class _EeBilling(Billing):
         try:
             from ee.usage.services.entitlements import Entitlements
         except ImportError:
-            _log_entitlements_import_failure()
-            return _ALLOW
+            return _ALLOW if _entitlements_unavailable_allows() else _DENY_UNENTITLED
 
         result = Entitlements.check_feature(str(org_id), feature)
         return UsageDecision(
@@ -443,7 +442,7 @@ class _EeBilling(Billing):
         try:
             from ee.usage.services.entitlements import Entitlements
         except ImportError:
-            _log_entitlements_import_failure()
+            _log_limits_import_failure()
             return _ALLOW
 
         result = Entitlements.can_create(str(org_id), resource, current_count)
@@ -551,16 +550,50 @@ class _EeBilling(Billing):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _log_entitlements_import_failure() -> None:
+def _entitlements_unavailable_allows() -> bool:
+    """Default answer for a feature gate when ``entitlements`` won't import.
+
+    The default is derived from the environment oracle rather than hardcoded,
+    which is the precedence ``tfc.ee_gating.check_ee_feature`` already applies
+    via the ``is_oss()`` guard it runs before its own ImportError fallback:
+
+    * EE/Cloud fails **open**. A packaging fault must not hard-down every
+      gated feature for orgs that are paying for them.
+    * OSS-mode fails **closed**. A checkout with ``ee/`` on disk but no
+      licence and no Cloud secret was never entitled to these features, so a
+      broken import must not become a way to obtain them. This is the wider
+      half of the fail-open window — dev boxes and unlicensed CI.
+
+    Logged at ERROR either way: fail-open is a revenue leak and fail-closed is
+    a paid feature going dark, and both need to trip log-based alerting.
+    """
     import logging
 
-    # ERROR, not warning: entitlements failing open on a broken EE install
-    # means every paid feature is granted to every org — a revenue leak that
-    # must be loud enough to trip log-based alerting.
-    logging.getLogger(__name__).error(
-        "ee.usage.services.entitlements import failed; entitlements are "
-        "FAILING OPEN — every feature gate is allowing by default. "
+    from tfc.ee_gating import is_oss
+
+    log = logging.getLogger(__name__)
+    if is_oss():
+        log.error(
+            "ee.usage.services.entitlements import failed on an OSS-mode "
+            "deployment; entitlement gates are failing CLOSED. "
+            "Fix the ee install."
+        )
+        return False
+
+    log.error(
+        "ee.usage.services.entitlements import failed; entitlement gates are "
+        "FAILING OPEN — every gated feature is allowed by default. "
         "Fix the ee install immediately."
+    )
+    return True
+
+
+def _log_limits_import_failure() -> None:
+    import logging
+
+    logging.getLogger(__name__).error(
+        "ee.usage.services.entitlements import failed; resource limits are "
+        "NOT being enforced. Fix the ee install immediately."
     )
 
 
