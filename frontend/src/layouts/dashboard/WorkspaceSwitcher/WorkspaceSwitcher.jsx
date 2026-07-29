@@ -27,6 +27,7 @@ import { ConfirmDialog } from "src/components/custom-dialog";
 import { useLocation, useNavigate } from "react-router";
 import AllActionForm from "src/pages/dashboard/settings/UserManagementV2/AllActionForm";
 import { Events, PropertyName, trackEvent } from "src/utils/Mixpanel";
+import { useDeploymentMode } from "src/hooks/useDeploymentMode";
 
 // --- Section header with optional + button -----------------------------------
 
@@ -220,6 +221,7 @@ const WorkspaceSwitcher = ({ collapsed }) => {
 
   const navigate = useNavigate();
   const location = useLocation();
+  const { isOSS } = useDeploymentMode();
   const { logout, user } = useAuthContext();
   const {
     currentWorkspaceId,
@@ -498,7 +500,12 @@ const WorkspaceSwitcher = ({ collapsed }) => {
               "redirect-url-from-settings",
               location.pathname,
             );
-            navigate("/dashboard/settings/usage-summary");
+            // OSS has no Usage Summary — land on Members directly.
+            navigate(
+              isOSS
+                ? "/dashboard/settings/user-management"
+                : "/dashboard/settings/usage-summary",
+            );
             setOpen(false);
             closeAllPoppers(); // Close sub-poppers to prevent hover triggering during navigation
           }}

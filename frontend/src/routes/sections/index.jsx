@@ -1,6 +1,6 @@
-import React, { Suspense, useMemo } from "react";
+import React, { Suspense, useMemo, useEffect } from "react";
 import lazyWithRetry from "src/utils/lazyWithRetry";
-import { Navigate, useRoutes } from "react-router-dom";
+import { Navigate, useRoutes, useLocation, useNavigate } from "react-router-dom";
 
 import { mainRoutes } from "./main";
 import { authRoutes } from "./auth";
@@ -14,9 +14,14 @@ import {
   usePostLoginPath,
 } from "src/hooks/useDeploymentMode";
 import SOSLoginPage from "src/pages/SOSLoginPage";
+import { paths } from "src/routes/paths";
+import { isAccountCreated } from "src/sections/oss-setup/ossFlowState";
 
 const OAuthConsent = lazyWithRetry(() => import("src/pages/mcp/OAuthConsent"));
 const SharedView = lazyWithRetry(() => import("src/pages/shared/SharedView"));
+const OssSetupView = lazyWithRetry(
+  () => import("src/sections/oss-setup/OssSetupView"),
+);
 
 // ----------------------------------------------------------------------
 
@@ -31,14 +36,47 @@ export default function Router() {
     [user, currentWorkspaceRole, isOSS],
   );
 
+  // OSS: show the launch-mode screen once per browser session. A returning user
+  // who reopens the app (browser restores a deep dashboard URL) is routed
+  // through /setup first; after launch mode they land back in the product.
+  const navigate = useNavigate();
+  const location = useLocation();
+  useEffect(() => {
+    if (!isOSS || !user) return;
+    if (sessionStorage.getItem("oss_launch_seen") === "1") return;
+    if (location.pathname.startsWith("/dashboard")) {
+      navigate("/setup", { replace: true });
+    }
+  }, [isOSS, user, location.pathname, navigate]);
+
+  // OSS entry routing:
+  //   • authenticated              → /setup (launch mode → skips validation → product)
+  //   • first-time (no account)    → /setup (launch mode → validation → sign up)
+  //   • returning, logged out      → login
+  let rootTarget = postLoginPath;
+  if (isOSS) {
+    if (user) rootTarget = "/setup";
+    else rootTarget = isAccountCreated() ? paths.auth.jwt.login : "/setup";
+  }
+
   const element = useRoutes([
     {
       path: "/",
-      element: <Navigate to={postLoginPath} replace />,
+      element: <Navigate to={rootTarget} replace />,
     },
     {
       path: "/sos",
       element: <SOSLoginPage />,
+    },
+
+    // OSS self-host setup flow (pre-login, no dashboard layout)
+    {
+      path: "/setup",
+      element: (
+        <Suspense fallback={<SplashScreen />}>
+          <OssSetupView />
+        </Suspense>
+      ),
     },
 
     // MCP OAuth consent (standalone, no dashboard layout, requires auth)

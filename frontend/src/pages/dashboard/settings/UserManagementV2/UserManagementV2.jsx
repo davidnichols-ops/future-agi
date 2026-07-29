@@ -31,6 +31,9 @@ import { LEVELS } from "./constant";
 import { useUserManagementStore } from "./UserManagementStore";
 import { endpoints } from "src/utils/axios";
 import { gridSortModelToMemberListSort } from "./memberListGridQuery";
+import OssInviteDialog from "./oss-invite/OssInviteDialog";
+import { isProtoSession, getInvites, inviteToRow } from "./oss-invite/ossInviteState";
+import { InviteLinkCell, InviteActionCell } from "./oss-invite/ProtoInviteCells";
 
 const UserManagementV2 = ({ workspaceScope = false }) => {
   const { workspaceId: workspaceIdParam } = useParams();
@@ -59,6 +62,13 @@ const UserManagementV2 = ({ workspaceScope = false }) => {
     role === "workspace_admin";
 
   const { allowed: canSendInvite } = useCanSendInvite(orgLevel, effectiveLevel);
+
+  // OSS prototype: drive invites through the local link/SMTP flow (the real
+  // RBAC endpoints 401 under the proto session). Org-level Members page only.
+  const protoInvite = isProtoSession() && !workspaceScope;
+  const refreshGrid = useCallback(() => {
+    gridApiRef.current?.api?.refreshServerSide({ purge: true });
+  }, []);
 
   const columnDefs = useMemo(
     () => [
@@ -114,20 +124,40 @@ const UserManagementV2 = ({ workspaceScope = false }) => {
         valueFormatter: (params) =>
           params?.value ? format(new Date(params?.value), "dd/MM/yyyy") : "",
       },
-      ...(canManageUsers
+      // OSS proto: show the invite link inline (pending invites live in this
+      // same table) with a copy button + delivery indicator.
+      ...(protoInvite
         ? [
+            {
+              headerName: "Invite link",
+              field: "invite_link",
+              flex: 1.8,
+              sortable: false,
+              cellRenderer: InviteLinkCell,
+            },
             {
               headerName: " ",
               field: "action",
-              width: 50,
-              cellRenderer: ActionRender,
-              cellRendererParams: { workspaceScope, workspaceId },
+              width: 56,
               sortable: false,
+              cellRenderer: InviteActionCell,
+              cellRendererParams: { onRefresh: refreshGrid },
             },
           ]
-        : []),
+        : canManageUsers
+          ? [
+              {
+                headerName: " ",
+                field: "action",
+                width: 50,
+                cellRenderer: ActionRender,
+                cellRendererParams: { workspaceScope, workspaceId },
+                sortable: false,
+              },
+            ]
+          : []),
     ],
-    [canManageUsers, workspaceScope],
+    [canManageUsers, workspaceScope, protoInvite, refreshGrid, workspaceId],
   );
 
   // When workspaceScope is true, use workspace-specific member endpoint
@@ -157,6 +187,46 @@ const UserManagementV2 = ({ workspaceScope = false }) => {
           clearTimeout(overlayTimeoutRef.current);
           overlayTimeoutRef.current = null;
         }
+
+        // Prototype session: the members API 401s (no real backend account),
+        // which leaves the grid full of "ERR" cells and a stuck loading
+        // overlay. Serve the current owner as a single real row instead — the
+        // realistic state right after a fresh OSS setup (teammates are invited
+        // later from inside the product).
+        const isProtoSession =
+          import.meta.env.VITE_PROTOTYPE_AUTH_BYPASS === "true" &&
+          localStorage.getItem("oss_proto_session") === "1";
+        if (isProtoSession) {
+          const ownerRow = {
+            id: "oss-proto-user",
+            name: user?.name || "You",
+            org_role: "Owner",
+            org_level: LEVELS.OWNER,
+            ws_role: "Owner",
+            email: user?.email || "you@futureagi.com",
+            status: "Active",
+            created_at: new Date().toISOString(),
+            workspaces: [
+              {
+                workspace_id: "default",
+                workspace_name: "Default",
+                ws_role: "Owner",
+                ws_level: LEVELS.OWNER,
+              },
+            ],
+          };
+          // Pending invites are shown inline in this same table.
+          const inviteRows = getInvites().map(inviteToRow);
+          const q = search.trim().toLowerCase();
+          const rows = [ownerRow, ...inviteRows].filter(
+            (r) => !q || `${r.name} ${r.email}`.toLowerCase().includes(q),
+          );
+          setUsersList(rows);
+          params.api.setGridOption("context", { totalRowCount: rows.length });
+          params.success({ rowData: rows, rowCount: rows.length });
+          return;
+        }
+
         try {
           const queryOptions = getUserQueryOptions(
             {
@@ -244,7 +314,16 @@ const UserManagementV2 = ({ workspaceScope = false }) => {
           {workspaceScope ? "Workspace Members" : "User Management"}
         </title>
       </Helmet>
-      <Box sx={{ paddingX: "2px" }}>
+      <Box
+        sx={{
+          paddingX: "2px",
+          ...(protoInvite && {
+            display: "flex",
+            flexDirection: "column",
+            height: "calc(100vh - 24px)",
+          }),
+        }}
+      >
         {workspaceId && !workspaceScope && (
           <Box mb={2} display="flex" gap={2}>
             <BackButton onBack={() => navigate(-1)} />
@@ -301,17 +380,29 @@ const UserManagementV2 = ({ workspaceScope = false }) => {
             </Button>
           )}
         </Box>
-        <AllActionForm
-          openActionForm={inviteUser ? { action: "invite-user" } : null}
-          onClose={() => setInviteUser(false)}
-          gridApi={gridApiRef?.current?.api}
-          workspaceId={workspaceId}
-        />
+        {protoInvite ? (
+          <OssInviteDialog
+            open={inviteUser}
+            onClose={() => setInviteUser(false)}
+            onInvited={refreshGrid}
+          />
+        ) : (
+          <AllActionForm
+            openActionForm={inviteUser ? { action: "invite-user" } : null}
+            onClose={() => setInviteUser(false)}
+            gridApi={gridApiRef?.current?.api}
+            workspaceId={workspaceId}
+          />
+        )}
         {/* table data */}
         <Box
-          sx={{
-            height: `calc(100vh - ${workspaceId && !workspaceScope ? 210 : 160}px)`,
-          }}
+          sx={
+            protoInvite
+              ? { flex: 1, minHeight: 240 }
+              : {
+                  height: `calc(100vh - ${workspaceId && !workspaceScope ? 210 : 160}px)`,
+                }
+          }
         >
           <GridTable
             // @ts-ignore

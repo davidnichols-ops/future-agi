@@ -11,13 +11,15 @@ import {
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSnackbar } from "src/components/snackbar";
+import { useDeploymentMode } from "src/hooks/useDeploymentMode";
+import OrgInviteLinks from "./OrgInviteLinks";
 import { LoadingButton } from "@mui/lab";
 import axios, { endpoints } from "src/utils/axios";
 import { Events, trackEvent, PropertyName } from "src/utils/Mixpanel";
 import PropTypes from "prop-types";
 import { paths } from "src/routes/paths";
 import { FormSearchSelectFieldState } from "src/components/FromSearchSelectField";
-import RightSectionAuth from "./RightSectionAuth";
+import AuthSpaceLayout from "./AuthSpaceLayout";
 import { Controller, useForm, useFieldArray, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import RadioField from "src/components/RadioField/RadioField";
@@ -184,7 +186,10 @@ const useOrganizationInitialData = (isOwner) => {
         const response = await axios.get(endpoints.auth.create_org);
         const orgDetails = response?.data?.result;
 
-        const prefilledMembers =
+        // Already-added members are `disabled` — they render in the invite
+        // table below, not as editable rows. A single empty row is always
+        // appended as the "draft" the user types the next invite into.
+        const existing =
           orgDetails.results.length > 0
             ? orgDetails?.results?.reverse().map((member) => ({
                 email: member.email,
@@ -192,23 +197,27 @@ const useOrganizationInitialData = (isOwner) => {
                 organization_role: member.organization_role,
                 disabled: true,
               }))
-            : [
-                {
-                  email: "",
-                  name: "",
-                  organization_role: "Owner",
-                  disabled: false,
-                },
-              ];
+            : [];
+
+        const prefilledMembers = [
+          ...existing,
+          { email: "", name: "", organization_role: "Member", disabled: false },
+        ];
 
         setInitialData({
           orgName: orgDetails.org_name,
           members: prefilledMembers,
         });
       } catch (error) {
-        enqueueSnackbar("Failed to fetch organization details", {
-          variant: "error",
-        });
+        // Prototype session has no real org, so this 401 is expected — stay quiet.
+        const protoSession =
+          import.meta.env.VITE_PROTOTYPE_AUTH_BYPASS === "true" &&
+          localStorage.getItem("oss_proto_session") === "1";
+        if (!protoSession) {
+          enqueueSnackbar("Failed to fetch organization details", {
+            variant: "error",
+          });
+        }
         setInitialData({
           orgName: "",
           members: [
@@ -256,6 +265,7 @@ const SetupOrganization = ({ getStarted = false }) => {
   const { enqueueSnackbar } = useSnackbar();
   const { user } = useAuthContext();
   const isOwner = user?.organization_role === "Owner";
+  const { isOSS } = useDeploymentMode();
   const { initialData, isLoading: isFetchingInitialData } =
     useOrganizationInitialData(isOwner);
 
@@ -283,13 +293,13 @@ const SetupOrganization = ({ getStarted = false }) => {
 
   const defaultValuesForUserForm = useCallback(() => {
     const customRole = !DEFAULT_ROLES?.includes(userOnboardingData?.role);
-    const goalsArray = GOALS_LIST.map((goal) => {
-      const isSelected = userOnboardingData?.goals?.some(
-        (g) => g.toLowerCase() === goal.label.toLowerCase(),
-      );
-
-      return isSelected;
-    });
+    const goalsArray = GOALS_LIST.map((goal) =>
+      Boolean(
+        userOnboardingData?.goals?.some(
+          (g) => g.toLowerCase() === goal.label.toLowerCase(),
+        ),
+      ),
+    );
 
     return {
       role: customRole ? "" : userOnboardingData?.role || "",
@@ -359,6 +369,17 @@ const SetupOrganization = ({ getStarted = false }) => {
           ),
     };
 
+    // Prototype session: the onboarding POST would 401 — just advance to the
+    // org step.
+    if (
+      import.meta.env.VITE_PROTOTYPE_AUTH_BYPASS === "true" &&
+      localStorage.getItem("oss_proto_session") === "1"
+    ) {
+      localStorage.removeItem("signupProvider");
+      setActiveStep(2);
+      return;
+    }
+
     saveUserData(payload);
   };
 
@@ -385,7 +406,7 @@ const SetupOrganization = ({ getStarted = false }) => {
     formState: { isValid: IsOrgFormValid },
   } = orgForm;
 
-  const { fields, append, remove } = useFieldArray({
+  const { fields, append, remove, update } = useFieldArray({
     control: orgForm.control,
     name: "members",
   });
@@ -411,14 +432,49 @@ const SetupOrganization = ({ getStarted = false }) => {
     }
   }, [roleValue]);
 
+  // "+ Add" commits the draft row into the invite table below and leaves a
+  // fresh empty row for the next teammate.
   const addMember = useCallback(() => {
+    const all = orgForm.getValues("members") || [];
+    const draftIndex = all.findIndex((m) => !m?.disabled);
+    const draft = draftIndex >= 0 ? all[draftIndex] : null;
+    const email = draft?.email?.trim();
+
+    if (!email) {
+      enqueueSnackbar("Enter an email address to add", { variant: "error" });
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      enqueueSnackbar("Enter a valid email address", { variant: "error" });
+      return;
+    }
+    if (
+      all.some(
+        (m, i) =>
+          i !== draftIndex &&
+          m?.email?.trim()?.toLowerCase() === email.toLowerCase(),
+      )
+    ) {
+      enqueueSnackbar("That email has already been added", {
+        variant: "error",
+      });
+      return;
+    }
+
+    // Commit the draft, then open a new empty draft row.
+    update(draftIndex, {
+      ...draft,
+      email,
+      organization_role: draft?.organization_role || "Member",
+      disabled: true,
+    });
     append({
       email: "",
       name: "",
       organization_role: "Member",
       disabled: false,
     });
-  }, [append, getStarted, memberToadd?.length, enqueueSnackbar]);
+  }, [orgForm, update, append, enqueueSnackbar]);
 
   const removeMember = useCallback(
     (index) => {
@@ -579,6 +635,15 @@ const SetupOrganization = ({ getStarted = false }) => {
   });
 
   const handleOrgSubmit = orgForm.handleSubmit((data) => {
+    // Prototype session: skip the (unauthorized) create-org call and go
+    // straight into the product.
+    if (
+      import.meta.env.VITE_PROTOTYPE_AUTH_BYPASS === "true" &&
+      localStorage.getItem("oss_proto_session") === "1"
+    ) {
+      window.location.href = paths.dashboard.getstarted;
+      return;
+    }
     const processedData = {
       ...data,
       members: data?.members.map((member) => ({
@@ -610,106 +675,81 @@ const SetupOrganization = ({ getStarted = false }) => {
             />
           )}
 
-          <Typography variant="m2" fontWeight="fontWeightMedium">
-            Invite people to collaborate in FutureAGI
-          </Typography>
+          {/* OSS self-host keeps this step to just the org name — teammates
+              are invited later from inside the product. */}
+          {!isOSS && (
+            <>
+              <Typography variant="m2" fontWeight="fontWeightMedium">
+                Invite people to collaborate in FutureAGI
+              </Typography>
 
-          <Box
-            sx={{
-              width: "100%",
-              height: getStarted ? "250px" : "220px",
-              bgcolor: "background.paper",
-              overflowY: "auto",
-              scrollbarWidth: "none",
-              scrollBehavior: "auto",
-              "&::-webkit-scrollbar": {
-                display: "none",
-              },
-              msOverflowStyle: "none",
-            }}
-          >
-            {/* Prefilled members */}
-            {prefilledMembers.length > 0 && (
-              <Box mt={2}>
-                {prefilledMembers.map((member) => {
+              <Box
+                sx={{
+                  width: "100%",
+                  height: getStarted ? "250px" : "220px",
+                  bgcolor: "background.paper",
+                  overflowY: "auto",
+                  scrollbarWidth: "none",
+                  scrollBehavior: "auto",
+                  "&::-webkit-scrollbar": {
+                    display: "none",
+                  },
+                  msOverflowStyle: "none",
+                }}
+              >
+                {newMembers.map((member) => {
                   const originalIndex = fields.findIndex(
                     (f) => f.id === member.id,
                   );
                   return (
-                    <MemberRow
-                      key={member.id}
-                      member={member}
-                      index={originalIndex}
-                      getStarted={getStarted}
-                      editable={false}
-                      control={orgForm.control}
-                    />
+                    <Box mt={2} key={member.id}>
+                      <MemberRow
+                        member={member}
+                        index={originalIndex}
+                        getStarted={getStarted}
+                        editable
+                        control={orgForm.control}
+                        onRemove={removeMember}
+                        errors={
+                          orgForm.formState.errors.members?.[originalIndex]
+                        }
+                      />
+                    </Box>
                   );
                 })}
-              </Box>
-            )}
 
-            {/* Invited members from API */}
-            {invitesData?.results?.length > 0 && (
-              <Box mt={2}>
-                {invitesData.results.map((member) => (
-                  <MemberRow
-                    key={`invite-${member.id}`}
-                    member={member}
-                    getStarted={getStarted}
-                    editable={false}
-                  />
-                ))}
-              </Box>
-            )}
+                <Box sx={{ mt: 2 }}>
+                  <Typography
+                    variant={getStarted ? "body2" : "s1.2"}
+                    sx={{
+                      color: "primary.main",
+                      cursor: "pointer",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      border: "1px solid",
+                      borderColor: "primary.main",
+                      borderRadius: getStarted ? 1 : 0.5,
+                      padding: "4px 10px",
+                      transition: "all 0.2s",
+                      fontWeight: !getStarted && 500,
+                      "&:hover": { bgcolor: "action.hover" },
+                    }}
+                    onClick={addMember}
+                    disable={!getStarted && memberToadd?.length > 3}
+                  >
+                    <SvgColor
+                      src="/assets/icons/ic_add.svg"
+                      width={15}
+                      height={15}
+                      sx={{ mr: 1 }}
+                    />
 
-            {newMembers.map((member) => {
-              const originalIndex = fields.findIndex((f) => f.id === member.id);
-              return (
-                <Box mt={2} key={member.id}>
-                  <MemberRow
-                    member={member}
-                    index={originalIndex}
-                    getStarted={getStarted}
-                    editable
-                    control={orgForm.control}
-                    onRemove={removeMember}
-                    errors={orgForm.formState.errors.members?.[originalIndex]}
-                  />
+                    {getStarted ? "Add members" : "Add"}
+                  </Typography>
                 </Box>
-              );
-            })}
-
-            <Box sx={{ mt: 2 }}>
-              <Typography
-                variant={getStarted ? "body2" : "s1.2"}
-                sx={{
-                  color: "primary.main",
-                  cursor: "pointer",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  border: "1px solid",
-                  borderColor: "primary.main",
-                  borderRadius: getStarted ? 1 : 0.5,
-                  padding: "4px 10px",
-                  transition: "all 0.2s",
-                  fontWeight: !getStarted && 500,
-                  "&:hover": { bgcolor: "action.hover" },
-                }}
-                onClick={addMember}
-                disable={!getStarted && memberToadd?.length > 3}
-              >
-                <SvgColor
-                  src="/assets/icons/ic_add.svg"
-                  width={15}
-                  height={15}
-                  sx={{ mr: 1 }}
-                />
-
-                {getStarted ? "Add members" : "Add"}
-              </Typography>
-            </Box>
-          </Box>
+              </Box>
+            </>
+          )}
 
           <LoadingButton
             fullWidth
@@ -871,10 +911,8 @@ const SetupOrganization = ({ getStarted = false }) => {
               sx={{ borderRadius: 0.5 }}
               variant="contained"
               loading={isSavingUserData}
-              disabled={isSavingUserData || (!roleValue && !customRoleValue)}
-              onClick={handleSubmitUserData((data) =>
-                onSubmitUserData(data, false),
-              )}
+              disabled={isSavingUserData}
+              onClick={() => onSubmitUserData(userForm.getValues(), false)}
               color="primary"
             >
               Continue
@@ -884,7 +922,7 @@ const SetupOrganization = ({ getStarted = false }) => {
               textAlign="center"
               onClick={
                 !isSavingUserData
-                  ? handleSubmitUserData((data) => onSubmitUserData(data, true))
+                  ? () => onSubmitUserData(userForm.getValues(), true)
                   : undefined
               }
               sx={{
@@ -974,50 +1012,17 @@ const SetupOrganization = ({ getStarted = false }) => {
   }
 
   return (
-    <Box sx={{ width: "100%", height: "100vh", display: "flex" }}>
-      <Box
-        sx={{
-          width: "50%",
-          height: "100vh",
-          bgcolor: "background.paper",
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          overflowY: "auto",
-        }}
-      >
-        <Box
-          sx={{
-            maxWidth: "640px",
-            width: "100%",
-            px: 10,
-            paddingY: "100px",
-            display: "flex",
-            flexDirection: "column",
-            gap: 2,
-            height: "fit-content",
-          }}
-        >
-          <DotsStepper
-            variant="dots"
-            steps={isOwner ? 3 : 2}
-            position="static"
-            activeStep={activeStep}
-          />
-          {renderContent()}
-        </Box>
+    <AuthSpaceLayout maxWidth={520}>
+      <Box sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
+        <DotsStepper
+          variant="dots"
+          steps={isOwner ? 3 : 2}
+          position="static"
+          activeStep={activeStep}
+        />
+        {renderContent()}
       </Box>
-
-      <Box
-        sx={{
-          width: "50%",
-          height: "100%",
-          backgroundColor: "background.neutral",
-        }}
-      >
-        <RightSectionAuth />
-      </Box>
-    </Box>
+    </AuthSpaceLayout>
   );
 };
 

@@ -11,6 +11,8 @@ import IconButton from "@mui/material/IconButton";
 import Typography from "@mui/material/Typography";
 
 import { useRouter } from "src/routes/hooks";
+import { paths } from "src/routes/paths";
+import { useDeploymentMode } from "src/hooks/useDeploymentMode";
 
 import { useAuthContext } from "src/auth/hooks";
 
@@ -41,6 +43,7 @@ export default function AccountPopover() {
   const router = useRouter();
 
   const { logout, user } = useAuthContext();
+  const { isOSS } = useDeploymentMode();
 
   const popover = usePopover();
 
@@ -49,7 +52,8 @@ export default function AccountPopover() {
       await logout();
       localStorage.removeItem("intial-render");
       popover.onClose();
-      router.replace("/");
+      // OSS: logout → sign-up (reopening a fresh tab shows login).
+      router.replace(isOSS ? paths.auth.jwt.register : "/");
     } catch (error) {
       logger.error("Logout failed", error);
     }

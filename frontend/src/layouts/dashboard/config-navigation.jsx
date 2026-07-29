@@ -433,7 +433,8 @@ export function useNavSettingsData() {
 
     // Section 3: Organization (based on role permissions for each item)
     const orgItems = [];
-    if (canAccess(RoutesName.usageSummary)) {
+    // Usage Summary is an upgrade-gated placeholder on OSS — hide it there.
+    if (!isOSS && canAccess(RoutesName.usageSummary)) {
       orgItems.push({
         title: "Usage Summary",
         path: "/dashboard/settings/usage-summary",

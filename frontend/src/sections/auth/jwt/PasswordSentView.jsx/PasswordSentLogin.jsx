@@ -106,7 +106,9 @@ const PasswordSentLogin = ({
             sx={{ "& .MuiOutlinedInput-root": { borderRadius: 0.5 } }}
             {...(errorMsg && {
               error: true,
-              helperText: "Please recheck the password",
+              // Surface the real reason (user not found, reCAPTCHA rejected,
+              // etc.) instead of always blaming the password.
+              helperText: errorMsg,
             })}
             InputProps={{
               endAdornment: (

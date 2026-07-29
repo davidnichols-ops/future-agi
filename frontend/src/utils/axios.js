@@ -94,6 +94,16 @@ axiosInstance.interceptors.response.use(
       );
     }
 
+    // Prototype-only local session: the OSS onboarding screens run without a
+    // real token, so 401s are expected — don't clear state or redirect.
+    if (
+      status === RESPONSE_CODES.UNAUTHORIZED &&
+      import.meta.env.VITE_PROTOTYPE_AUTH_BYPASS === "true" &&
+      localStorage.getItem("oss_proto_session") === "1"
+    ) {
+      return Promise.reject(error);
+    }
+
     // Handle 401 and try refresh
     if (status === RESPONSE_CODES.UNAUTHORIZED && !originalRequest?._retry) {
       const refreshToken = getRefreshToken();

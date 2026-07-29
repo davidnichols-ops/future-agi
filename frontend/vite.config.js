@@ -78,6 +78,11 @@ export default defineConfig({
   },
   server: {
     port: 3031,
+    // Allow serving over a *.futureagi.com hostname mapped to 127.0.0.1 in
+    // /etc/hosts. reCAPTCHA binds its token to the page's hostname, and the
+    // site key only trusts futureagi.com — so `localhost` tokens are rejected
+    // by server-side verification while a subdomain passes.
+    allowedHosts: [".futureagi.com"],
     hmr: {
       overlay: false,
     },

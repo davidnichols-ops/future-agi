@@ -11,6 +11,8 @@ import {
 } from "@mui/material";
 import React from "react";
 import { useNavigate } from "react-router";
+import { paths } from "src/routes/paths";
+import { useDeploymentMode } from "src/hooks/useDeploymentMode";
 import { useAuthContext } from "src/auth/hooks";
 import Iconify from "src/components/iconify";
 import PropTypes from "prop-types";
@@ -24,10 +26,13 @@ const ProfilePopover = ({ anchorEl, open, onClose }) => {
   const isOwner = user?.organization_role === "Owner";
 
   const navigate = useNavigate();
+  const { isOSS } = useDeploymentMode();
 
   const onLogoutClick = () => {
     logout();
-    navigate("/", { replace: true });
+    // OSS: logging out drops back to the sign-up page (reopening a fresh tab
+    // shows login, handled by the root redirect).
+    navigate(isOSS ? paths.auth.jwt.register : "/", { replace: true });
   };
 
   // const ShieldIcon = ({ ...props }) => {

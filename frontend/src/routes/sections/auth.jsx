@@ -98,11 +98,10 @@ const authJwt = {
     {
       path: "setup-org",
       element: (
-        <AuthClassicLayout>
-          <AuthGuard>
-            <SetupOrg />
-          </AuthGuard>
-        </AuthClassicLayout>
+        // SetupOrg brings its own full-screen space layout.
+        <AuthGuard>
+          <SetupOrg />
+        </AuthGuard>
       ),
     },
     {

@@ -387,6 +387,10 @@ services:
       FI_HTTP_ADDR: ":4318"
       FI_ADMIN_ADDR: ":9464"
       FI_DEAD_LETTER_FILE: /var/lib/fi-collector/dead_letter.jsonl
+      # Postgres used to validate ingestion API keys + resolve project_name.
+      # Without this, auth falls back to the placeholder DSN in collector.yaml
+      # (user:password@db:5432/tfc) and ALL authenticated ingestion fails.
+      FI_PG_WRITE: postgres://futureagi:futureagi@postgres:5432/futureagi
     volumes:
       - fi-collector-data:/var/lib/fi-collector
     depends_on:

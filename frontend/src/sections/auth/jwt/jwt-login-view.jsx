@@ -40,15 +40,17 @@ import {
   browserSupportsWebAuthn,
   startAuthentication,
 } from "@simplewebauthn/browser";
-import RightSectionAuth from "./RightSectionAuth";
+import AuthSpaceLayout from "./AuthSpaceLayout";
 import { isValidUtm } from "src/utils/utmUtils";
-import { usePostLoginPath } from "src/hooks/useDeploymentMode";
+import { usePostLoginPath, useDeploymentMode } from "src/hooks/useDeploymentMode";
 
 // ----------------------------------------------------------------------
 
 export default function JwtLoginView() {
   const { login } = useAuthContext();
   const postLoginPath = usePostLoginPath();
+  // OSS self-host: only local email/password auth — hide social/passkey/SSO.
+  const { isOSS } = useDeploymentMode();
   const router = useRouter();
   const [errorMsg, setErrorMsg] = useState("");
   const [searchParams] = useSearchParams();
@@ -611,12 +613,14 @@ export default function JwtLoginView() {
         </Link>
         .
       </Typography>
-      <Divider>
-        <Typography variant="body2" sx={{ color: "text.disabled" }}>
-          or
-        </Typography>
-      </Divider>
-      <Stack spacing={1.5}>
+      {!isOSS && (
+        <>
+          <Divider>
+            <Typography variant="body2" sx={{ color: "text.disabled" }}>
+              or
+            </Typography>
+          </Divider>
+          <Stack spacing={1.5}>
         {browserSupportsWebAuthn() && (
           <LoadingButton
             sx={{
@@ -731,108 +735,53 @@ export default function JwtLoginView() {
             Continue with SSO/SAML
           </Typography>
         </Button>
+          </Stack>
+        </>
+      )}
 
-        {/* 🔹 New SAML/SSO Login Button */}
-
-        {/* ✅ Added Create Account Link */}
-        <Typography
-          fontSize={"15px"}
-          fontWeight={"fontWeightMedium"}
-          color="text.secondary"
-          sx={{ textAlign: "center" }}
+      <Typography
+        fontSize={"15px"}
+        fontWeight={"fontWeightMedium"}
+        color="text.secondary"
+        sx={{ textAlign: "center", mt: 1 }}
+      >
+        Don’t have an account?
+        <Link
+          variant="subtitle2"
+          component={RouterLink}
+          to={paths.auth.jwt.register + search}
+          sx={{ color: "primary.main" }}
         >
-          Don’t have an account?
-          <Link
-            variant="subtitle2"
-            component={RouterLink}
-            to={paths.auth.jwt.register + search}
-            sx={{ color: "primary.main" }}
-          >
-            {" "}
-            Sign up
-          </Link>
-        </Typography>
-      </Stack>
+          {" "}
+          Sign up
+        </Link>
+      </Typography>
     </Stack>
   );
 
   // Show loading screen while accepting an invitation (token present but not yet failed)
   if (token && !inviteFailed) {
     return (
-      <Box sx={{ width: "100%", height: "100vh", display: "flex" }}>
-        <Box
-          sx={{
-            width: "50%",
-            height: "100vh",
-            display: "flex",
-            justifyContent: "center",
-            alignItems: "center",
-            bgcolor: "background.paper",
-          }}
-        >
-          <Stack spacing={2} alignItems="center">
-            <CircularProgress size={32} />
-            <Typography
-              fontWeight="fontWeightMedium"
-              sx={{ fontSize: "16px", color: "text.secondary" }}
-            >
-              Accepting your invitation...
-            </Typography>
-          </Stack>
-        </Box>
-        <Box
-          sx={{
-            width: "50%",
-            height: "100%",
-            backgroundColor: "background.neutral",
-          }}
-        >
-          <RightSectionAuth />
-        </Box>
-      </Box>
+      <AuthSpaceLayout>
+        <Stack spacing={2} alignItems="center" sx={{ py: 6 }}>
+          <CircularProgress size={32} />
+          <Typography
+            fontWeight="fontWeightMedium"
+            sx={{ fontSize: "16px", color: "text.secondary" }}
+          >
+            Accepting your invitation...
+          </Typography>
+        </Stack>
+      </AuthSpaceLayout>
     );
   }
 
   return (
-    <Box sx={{ width: "100%", height: "100vh", display: "flex" }}>
-      {/* Left Side - Form */}
-      <Box
-        sx={{
-          width: "50%",
-          height: "100vh",
-          display: "flex",
-          justifyContent: "center",
-
-          bgcolor: "background.paper",
-          overflowY: "auto",
-        }}
-      >
-        <Box
-          sx={{
-            maxWidth: "640px",
-            paddingY: "100px",
-            width: "100%",
-            px: 10,
-            height: "fit-content",
-          }}
-        >
-          <FormProvider methods={methods} onSubmit={onSubmit}>
-            {renderHead}
-            {renderForm}
-          </FormProvider>
-        </Box>
-      </Box>
-
-      {/* Right Side - Image with Text Overlay */}
-      <Box
-        sx={{
-          width: "50%",
-          height: "100%",
-          backgroundColor: "background.neutral",
-        }}
-      >
-        <RightSectionAuth />
-      </Box>
-    </Box>
+    <AuthSpaceLayout>
+      <FormProvider methods={methods} onSubmit={onSubmit}>
+        {renderHead}
+        {renderForm}
+      </FormProvider>
+    </AuthSpaceLayout>
   );
 }

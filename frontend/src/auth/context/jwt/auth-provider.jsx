@@ -74,6 +74,27 @@ export function AuthProvider({ children }) {
 
   const initialize = useCallback(async () => {
     try {
+      // Prototype-only local session: lets the OSS signup flow reach
+      // role → goals → org on a backend that can't activate the account.
+      if (
+        import.meta.env.VITE_PROTOTYPE_AUTH_BYPASS === "true" &&
+        localStorage.getItem("oss_proto_session") === "1"
+      ) {
+        dispatch({
+          type: "INITIAL",
+          payload: {
+            user: {
+              id: "oss-proto-user",
+              email: localStorage.getItem("oss_proto_email") || "you@futureagi.com",
+              name: localStorage.getItem("oss_proto_name") || "You",
+              organization_role: "Owner",
+              accessToken: "oss-proto",
+            },
+          },
+        });
+        return;
+      }
+
       const accessToken = localStorage.getItem(STORAGE_KEY);
 
       if (accessToken) {
@@ -287,6 +308,7 @@ export function AuthProvider({ children }) {
   const logout = useCallback(async () => {
     try {
       const accessToken = localStorage.getItem(STORAGE_KEY);
+      localStorage.removeItem("oss_proto_session");
       setSession(null);
       clearTokens();
       resetUser();

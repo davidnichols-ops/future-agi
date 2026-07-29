@@ -13,15 +13,20 @@ import axios, { endpoints } from "src/utils/axios";
 import { paths } from "src/routes/paths";
 
 export function useDeploymentMode() {
+  // Dev/prototype override — force a mode without a backend that reports it.
+  // e.g. VITE_DEPLOYMENT_MODE_OVERRIDE=oss to preview the self-host experience.
+  const override = import.meta.env.VITE_DEPLOYMENT_MODE_OVERRIDE;
+
   const { data, isLoading } = useQuery({
     queryKey: ["deployment-info"],
     queryFn: () => axios.get(endpoints.settings.v2.deploymentInfo),
     select: (res) => res.data?.result?.mode || "oss",
     staleTime: Infinity,
     retry: 1,
+    enabled: !override,
   });
 
-  const mode = data || "oss";
+  const mode = override || data || "oss";
 
   return {
     mode,
@@ -37,5 +42,6 @@ export function usePostLoginPath() {
 
   const returnTo = localStorage.getItem("redirectUrl");
   if (returnTo) return returnTo;
-  return isOSS ? paths.dashboard.develop : paths.dashboard.falconAI;
+  // OSS always lands inside the product on the Get Started page.
+  return isOSS ? paths.dashboard.getstarted : paths.dashboard.falconAI;
 }

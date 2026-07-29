@@ -1,3 +1,45 @@
+// Local dev only: reCAPTCHA tokens minted on `localhost` are rejected by the
+// server-side check (the site key trusts futureagi.com and its subdomains), so
+// bounce to the local.futureagi.com alias (mapped to 127.0.0.1 in /etc/hosts).
+if (import.meta.env.DEV && window.location.hostname === "localhost") {
+  window.location.replace(
+    window.location.href.replace("//localhost", "//local.futureagi.com"),
+  );
+}
+
+// Prototype demo only: replay the full first-time OSS setup flow on every fresh
+// tab. sessionStorage is per-tab and wiped when the tab closes, so its absence
+// marks a newly-opened tab — on that first load we clear the persisted auth +
+// setup flags once, so the app boots back into launch mode → validation → sign
+// up → role → goals → org → product. The marker then stays set for the life of
+// the tab, so navigating the flow (or the app) never resets mid-way.
+if (
+  import.meta.env.DEV &&
+  import.meta.env.VITE_PROTOTYPE_AUTH_BYPASS === "true" &&
+  !sessionStorage.getItem("oss_demo_session")
+) {
+  [
+    "accessToken",
+    "refreshToken",
+    "rememberMe",
+    "sosMode",
+    "oss_proto_session",
+    "oss_proto_email",
+    "oss_proto_name",
+    "oss_validation_done",
+    "oss_account_created",
+    "oss_launch_seen",
+    "initial-render",
+    "redirectUrl",
+  ].forEach((k) => localStorage.removeItem(k));
+  sessionStorage.clear();
+  sessionStorage.setItem("oss_demo_session", "1");
+  // A reopened tab restores its last URL (e.g. a deep /dashboard route), which
+  // would otherwise bounce to login. Force the app to boot at the very first
+  // setup screen so the whole first-time flow always replays from the start.
+  window.history.replaceState(null, "", "/setup");
+}
+
 import React from "react";
 import { Suspense } from "react";
 import ReactDOM from "react-dom/client";

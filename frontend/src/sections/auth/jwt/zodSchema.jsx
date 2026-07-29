@@ -4,7 +4,10 @@ export const userDataSchema = z
   .object({
     role: z.string().optional(),
     customRole: z.string().optional(),
-    goals: z.array(z.boolean()).optional(),
+    // Goals are entirely optional — a user may pick any, all, or none. Allow
+    // undefined elements (checkboxes never toggled) so no "Required" error is
+    // raised and Skip/Continue aren't blocked by validation.
+    goals: z.array(z.boolean().optional()).optional(),
   })
   .refine((data) => data.role?.trim() || data.customRole?.trim(), {
     message: "Please select a role or enter your role",
@@ -16,10 +19,9 @@ export const organizationSchema = z.object({
   members: z
     .array(
       z.object({
-        email: z
-          .string()
-          .email("Invalid email format")
-          .min(1, "Email is required"),
+        // An empty string is the untyped "draft" row (stripped on submit);
+        // anything else must be a valid email.
+        email: z.union([z.literal(""), z.string().email("Invalid email format")]),
         name: z.string().optional(),
         organization_role: z.string().min(1, "Role is required"),
         disabled: z.boolean().optional(),
