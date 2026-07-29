@@ -5,32 +5,26 @@ name: OSS Boundary
 # "works on EE, broken/free on OSS" regressions — e.g. gates that skip on OSS,
 # _NoopBilling call-shape drift, or imports of ee.usage leaking outside
 # tfc/billing/boundary.py.
+#
+# The leak-check has to run on any PR that can introduce a leak, not just on
+# PRs that touch the boundary itself — so the path filter is the whole backend.
 on:
   pull_request:
     branches: [main, develop, dev]
     paths:
-      - "futureagi/tfc/billing/**"
-      - "futureagi/tfc/ee_gating.py"
-      - "futureagi/tfc/ee_gates.py"
-      - "futureagi/conftest.py"
-      - "futureagi/model_hub/tests/test_annotation_workflow_api.py"
-      - "futureagi/model_hub/tests/test_annotation_advanced_api.py"
+      - "futureagi/**"
       - ".github/workflows/oss-boundary.yml"
   push:
     branches: [main, develop, dev]
     paths:
-      - "futureagi/tfc/billing/**"
-      - "futureagi/tfc/ee_gating.py"
-      - "futureagi/tfc/ee_gates.py"
-      - "futureagi/conftest.py"
-      - "futureagi/model_hub/tests/test_annotation_workflow_api.py"
-      - "futureagi/model_hub/tests/test_annotation_advanced_api.py"
+      - "futureagi/**"
       - ".github/workflows/oss-boundary.yml"
   workflow_dispatch:
 
 jobs:
   oss-boundary-tests:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # No fork guard: this job consumes no secrets (every service is a local
+    # container), and fork PRs are the likeliest source of unguarded ee imports.
     runs-on: ubuntu-latest
     services:
       postgres:
