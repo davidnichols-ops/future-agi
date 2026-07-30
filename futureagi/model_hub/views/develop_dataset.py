@@ -301,9 +301,8 @@ from tfc.utils.storage import (
     upload_image_to_s3,
 )
 
-ROW_LIMIT_REACHED_MESSAGE = (
-    "Row limit reached. Please upgrade to a higher tier to avail more rows."
-)
+
+ROW_LIMIT_REACHED_MESSAGE = get_error_message("TOO_MANY_ROWS")
 
 logger = structlog.get_logger(__name__)
 

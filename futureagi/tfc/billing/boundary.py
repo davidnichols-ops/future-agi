@@ -111,7 +111,12 @@ class Billing:
         event_id: Optional[str] = None,
         **properties: Any,
     ) -> None:
-        """Emit a metering event (fire-and-forget).  Always succeeds in OSS."""
+        """Emit a metering event (fire-and-forget).  Never raises.
+
+        EE guards event construction + emit and logs failures at ERROR
+        (UsageEvent validates its fields, so e.g. a negative amount is a
+        validation error, not a silent drop).  OSS no-ops.
+        """
         raise NotImplementedError
 
     def check_usage(
@@ -146,19 +151,25 @@ class Billing:
         api_call_type: str,
         config: Optional[dict] = None,
         workspace: Any = None,
-        **extra: Any,
+        sdk_source: bool = False,
     ) -> Any:
         """Gate resource creation (datasets, rows, KB) and log the attempt.  No-ops in OSS.
 
-        ``**extra`` is forwarded to the EE implementation so callers can pass
-        the extra kwargs the underlying ee.usage function accepts (e.g.
-        ``sdk_source=True``) without every one of them having to be spelled
-        out on the boundary.
+        Explicit signature (mirrors ee's ``log_and_deduct_cost_for_resource_request``)
+        for the same reason as ``log_and_deduct``: a typo'd kwarg must raise
+        ``TypeError`` identically on OSS and EE instead of no-opping on one
+        and blowing up on the other.
         """
         raise NotImplementedError
 
     def ai_credits(self, cost_usd: float) -> float:
-        """Convert a raw LLM cost (USD) to AI credits (fractional).  Returns 0 in OSS."""
+        """Convert a raw LLM cost (USD) to AI credits (fractional).
+
+        Returns 0.0 in OSS.  On EE/Cloud, ``BillingConfig.calculate_ai_credits``
+        floors unknown/zero cost at **1 credit** (its documented minimum), so
+        ``ai_credits(0)`` is 1.0 on EE and 0.0 on OSS — callers defaulting cost
+        with ``.get("total_cost", 0)`` should expect that asymmetry.
+        """
         raise NotImplementedError
 
     def has_feature(self, org_id: str, feature: str) -> bool:
@@ -298,7 +309,7 @@ class _NoopBilling(Billing):
     ):
         return None
 
-    def log_and_deduct_resource(self, organization, api_call_type, config=None, workspace=None, **extra):
+    def log_and_deduct_resource(self, organization, api_call_type, config=None, workspace=None, sdk_source=False):
         return None
 
     def ai_credits(self, cost_usd):
@@ -354,18 +365,34 @@ class _EeBilling(Billing):
     def record_usage(
         self, org_id, event_type, *, amount=1.0, event_id=None, **properties
     ):
-        from ee.usage.services.emitter import emit
-        from ee.usage.schemas.events import UsageEvent
+        # Construction is guarded together with emit: UsageEvent validates
+        # (org_id non-empty, event_type <=50 chars, amount >= 0), so a bad
+        # value would otherwise raise out of a fire-and-forget method — and
+        # several call sites swallow that in a bare except, killing the
+        # ee-side emit-failure alarm.  Log here so the signal survives.
+        try:
+            from ee.usage.services.emitter import emit
+            from ee.usage.schemas.events import UsageEvent
 
-        emit(
-            UsageEvent(
-                org_id=str(org_id),
-                event_type=event_type,
-                amount=amount,
-                properties=properties,
-                **({"event_id": event_id} if event_id else {}),
+            emit(
+                UsageEvent(
+                    org_id=str(org_id),
+                    event_type=event_type,
+                    amount=amount,
+                    properties=properties,
+                    **({"event_id": event_id} if event_id else {}),
+                )
             )
-        )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).error(
+                "usage_event_emit_failed org_id=%s event_type=%s amount=%s",
+                org_id,
+                event_type,
+                amount,
+                exc_info=True,
+            )
 
     def check_usage(self, org_id, event_type, amount=0):
         from ee.usage.services.metering import check_usage as _check
@@ -402,11 +429,15 @@ class _EeBilling(Billing):
             workspace=workspace,
         )
 
-    def log_and_deduct_resource(self, organization, api_call_type, config=None, workspace=None, **extra):
+    def log_and_deduct_resource(self, organization, api_call_type, config=None, workspace=None, sdk_source=False):
         from ee.usage.utils.usage_entries import log_and_deduct_cost_for_resource_request
 
         return log_and_deduct_cost_for_resource_request(
-            organization, api_call_type, config=config, workspace=workspace, **extra
+            organization,
+            api_call_type,
+            config=config,
+            sdk_source=sdk_source,
+            workspace=workspace,
         )
 
     def ai_credits(self, cost_usd):
@@ -522,7 +553,7 @@ class _EeBilling(Billing):
     def check_rate_limit(self, org_id, limit_type):
         from ee.usage.services.rate_limiter import RateLimiter
 
-        result = RateLimiter.check(org_id, limit_type)
+        result = RateLimiter.check(str(org_id), limit_type)
         return UsageDecision(
             allowed=getattr(result, "allowed", True),
             reason=getattr(result, "reason", ""),
@@ -617,16 +648,39 @@ _instance: Optional[Billing] = None
 def get_billing() -> Billing:
     """Return the process-singleton Billing implementation.
 
-    _EeBilling if ee.usage is importable, _NoopBilling otherwise.
+    The deployment-mode oracle is ``tfc.ee_gating.is_oss()`` — the same one
+    the rest of the codebase uses (license/cloud-secret based), NOT a bare
+    import probe.  An unlicensed checkout with ``ee/`` on disk (every dev
+    box) is an OSS deployment and gets _NoopBilling: no metering, no
+    free-tier ingestion denials, entitlements fail-CLOSED.
+
+    Only EE/Cloud-mode deployments get _EeBilling.  If ee.usage then fails
+    to import, billing is broken on a deployment that is supposed to bill —
+    fall back to _NoopBilling but log at ERROR (billing silently turning
+    off on the revenue path must trip log-based alerting).
+
     Cached for the process lifetime — never changes after first call.
     """
     global _instance
     if _instance is None:
-        try:
-            import ee.usage  # noqa: F401
-            _instance = _EeBilling()
-        except ImportError:
+        from tfc.ee_gating import is_oss
+
+        if is_oss():
             _instance = _NoopBilling()
+        else:
+            try:
+                import ee.usage  # noqa: F401
+                _instance = _EeBilling()
+            except ImportError:
+                import logging
+
+                logging.getLogger(__name__).error(
+                    "Deployment mode is EE/Cloud but ee.usage failed to "
+                    "import — billing is OFF (falling back to _NoopBilling). "
+                    "Fix the ee install immediately.",
+                    exc_info=True,
+                )
+                _instance = _NoopBilling()
     return _instance
 
 
@@ -663,4 +717,14 @@ try:
     from ee.usage.exceptions import UsageLimitExceeded  # noqa: F401
 except ImportError:
     class UsageLimitExceeded(Exception):  # type: ignore[misc]
-        """OSS stub — raised in EE/Cloud when usage limits are exceeded."""
+        """OSS stub — mirrors ee.usage.exceptions.UsageLimitExceeded's
+        contract: carries the check result on ``.check_result`` and derives
+        the message from its ``reason``, so handlers written against the EE
+        class (e.g. ``usage_limit_response(e.check_result)``) behave
+        identically when the stub is the one raised."""
+
+        def __init__(self, check_result: Any = None):
+            self.check_result = check_result
+            super().__init__(
+                getattr(check_result, "reason", None) or "Usage limit exceeded"
+            )

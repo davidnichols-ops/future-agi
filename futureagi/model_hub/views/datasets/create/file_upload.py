@@ -1028,7 +1028,7 @@ class CreateDatasetFromLocalFileView(CreateAPIView):
                 workspace=request.workspace,
             )
             if billing.resource_denied(call_log_row):
-                return self._gm.too_many_requests("Row limit reached")
+                return self._gm.too_many_requests(get_error_message("TOO_MANY_ROWS"))
             if call_log_row is not None:
                 call_log_row.status = APICallStatusChoices.SUCCESS.value
                 call_log_row.save()

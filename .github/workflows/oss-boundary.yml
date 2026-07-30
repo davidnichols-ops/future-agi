@@ -129,24 +129,31 @@ jobs:
 
       - name: Check ee.usage does not leak outside the boundary
         run: |
-          # Grandfathered files below either pre-date the boundary (guarded
+          # Grandfathered FILES below either pre-date the boundary (guarded
           # try/except ImportError lazy imports on EE-only paths) or are the
-          # environment oracle itself. New leaks must go through the boundary.
+          # environment oracle itself. Exemptions are pinned to exact file
+          # paths — NOT import-string patterns — so a new unguarded
+          # `from ee.usage.models import ...` in any other file still fails.
+          # New leaks must go through the boundary.
+          exempt='^\./(tfc/billing/boundary|tfc/ee_gating|tfc/ee_gates'
+          exempt+='|tfc/temporal/billing/activities|tfc/temporal/schedules/retention'
+          exempt+='|tfc/temporal/schedules/billing|tfc/temporal/common/registry'
+          exempt+='|tfc/deployment_telemetry/config|tfc/constants/api_calls'
+          exempt+='|simulate/services/test_executor|model_hub/utils/composite_execution'
+          exempt+='|model_hub/views/separate_evals|model_hub/views/develop_optimiser'
+          exempt+='|model_hub/tasks/user_evaluation|mcp_server/rate_limiter'
+          exempt+='|analytics/mixpanel_util|accounts/views/workspace_management'
+          exempt+='|accounts/aws_marketplace_utils|ai_tools/tools/usage/get_cost_breakdown'
+          exempt+='|ai_tools/tools/prompts/get_prompt_execution_results'
+          exempt+='|ai_tools/tools/evaluations/(get_eval_logs|get_eval_log_detail|delete_eval_template|delete_eval_logs|trigger_error_localization)'
+          exempt+='|ai_tools/tools/context/whoami)\.py:'
           leaks=$(grep -rEn "from ee\.usage|import ee\.usage" \
             --include="*.py" \
             --exclude-dir=ee \
             --exclude-dir=tests \
             . \
             | grep -vE "^[^:]+:[0-9]+:\s*#" \
-            | grep -v "tfc/billing/boundary.py" \
-            | grep -v "ee\.usage\.models" \
-            | grep -v "ee\.usage\.deployment" \
-            | grep -v "tfc/ee_gating.py" \
-            | grep -v "^\./tfc/ee_gates.py" \
-            | grep -v "^\./tfc/temporal/" \
-            | grep -v "^\./simulate/services/test_executor.py" \
-            | grep -v "^\./model_hub/utils/composite_execution.py" \
-            | grep -v "^\./ai_tools/tools/evaluations/trigger_error_localization.py" \
+            | grep -vE "$exempt" \
             || true)
           if [ -n "$leaks" ]; then
             echo "::error::ee.usage imported outside tfc/billing/boundary.py (grandfathered files are pinned in this step):"

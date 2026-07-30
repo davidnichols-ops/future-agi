@@ -207,6 +207,11 @@ def _voice_sim_gate_response(user_organization, gm):
     Two layers:
       1. OSS gate (402, upgrade_required) — via tfc.ee_gates.
       2. Cloud/EE plan entitlement (`has_voice_sim`) — 403 on denial.
+
+    Deliberate site-level fail-CLOSED when ee is broken on an EE/Cloud
+    deployment: voice calls cost real Vapi money, so we must not let them
+    through unbillable. The boundary's global broken-ee policy fails open
+    elsewhere; voice is the exception (same as pre-boundary).
     """
     from tfc.ee_gates import voice_sim_oss_gate_response
 
@@ -217,8 +222,22 @@ def _voice_sim_gate_response(user_organization, gm):
     from tfc.billing.boundary import get_billing
     billing = get_billing()
     if not billing.has_ee_billing:
-        # OSS handled by voice_sim_oss_gate_response above; nothing more to do.
-        return None
+  
+        from rest_framework.response import Response
+
+        from tfc.utils.api_errors import build_error_envelope
+
+        return Response(
+            build_error_envelope(
+                "Voice simulation is unavailable: billing is "
+                "misconfigured on this deployment.",
+                status_code=402,
+                error_type="entitlement_error",
+                code="ENTITLEMENT_DENIED",
+                extra={"upgrade_required": True, "feature": "voice_sim"},
+            ),
+            status=402,
+        )
     gate = billing.check_feature_gate(str(user_organization.id), "has_voice_sim")
     if not gate.allowed:
         return gm.forbidden_response(gate.reason)

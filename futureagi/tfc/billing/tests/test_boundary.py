@@ -305,6 +305,30 @@ class TestEeBillingDelegation:
         assert event.event_type == "syn.gen"
         assert event.amount == 5
 
+    def test_record_usage_never_raises_on_emit_failure(self, caplog):
+        # Fire-and-forget contract: a broken emitter must not blow up the
+        # caller's request — but it MUST log at ERROR (call sites swallow
+        # exceptions, so this log line is the only surviving signal).
+        with patch(
+            "ee.usage.services.emitter.emit", side_effect=RuntimeError("kafka down")
+        ):
+            with caplog.at_level(logging.ERROR, logger="tfc.billing.boundary"):
+                self.b.record_usage("org-1", "syn.gen", amount=5)
+        assert any(
+            "usage_event_emit_failed" in r.getMessage() for r in caplog.records
+        )
+
+    def test_record_usage_never_raises_on_validation_error(self, caplog):
+        # UsageEvent validates amount >= 0; construction failures are part of
+        # the same guarded block, so a bad value logs instead of raising.
+        with patch("ee.usage.services.emitter.emit") as mock_emit:
+            with caplog.at_level(logging.ERROR, logger="tfc.billing.boundary"):
+                self.b.record_usage("org-1", "syn.gen", amount=-5)
+        mock_emit.assert_not_called()
+        assert any(
+            "usage_event_emit_failed" in r.getMessage() for r in caplog.records
+        )
+
     def test_check_usage_delegates_and_wraps_result(self):
         with patch("ee.usage.services.metering.check_usage") as mock_chk:
             mock_chk.return_value = MagicMock(
@@ -420,8 +444,9 @@ class TestEntitlementsUnavailableDefault:
 
 
 class TestGetBillingFactory:
-    """``get_billing()`` is a process-singleton. First call determines the
-    impl; subsequent calls return the same instance.
+    """``get_billing()`` is a process-singleton keyed on the deployment-mode
+    oracle (``tfc.ee_gating.is_oss``), NOT a bare import probe. Both factory
+    branches are pinned deterministically by patching the oracle.
     """
 
     def setup_method(self):
@@ -448,33 +473,39 @@ class TestGetBillingFactory:
         b1 = get_billing()
         _reset_for_testing()
         b2 = get_billing()
-        # After reset the next call re-detects; instance identity may differ.
-        assert b1 is not b2 or type(b1) is type(b2)  # either fresh instance or same type
+        assert b1 is not b2  # reset really flushed — a fresh instance was built
+        assert type(b1) is type(b2)  # same env → same detection outcome
 
-    def test_picks_ee_billing_when_ee_usage_present(self):
-        # Test env has ee/ so this should pick _EeBilling.
-        _reset_for_testing()
-        b = get_billing()
-        # Whether ee is present depends on install; assert the class name is
-        # one of the two known impls.
-        assert type(b).__name__ in ("_EeBilling", "_NoopBilling")
+    def test_oss_mode_picks_noop_even_when_ee_imports(self):
+        # The oracle question from review: an unlicensed checkout with ee/
+        # on disk (every dev box, the OSS test lane's stubs) is an OSS
+        # deployment and must get _NoopBilling even though `import ee.usage`
+        # succeeds.
+        with patch("tfc.ee_gating.is_oss", return_value=True):
+            b = get_billing()
+        assert isinstance(b, _NoopBilling)
 
-    def test_falls_back_to_noop_when_ee_usage_absent(self):
-        # Simulate ImportError on `import ee.usage` — the factory should
-        # pick _NoopBilling.
-        _reset_for_testing()
-        with patch.dict("sys.modules", {"ee.usage": None}):
-            # Patching sys.modules with None makes ``import ee.usage`` raise ImportError.
-            import tfc.billing.boundary as boundary_mod
-            # Force re-detect
-            boundary_mod._instance = None
-            try:
+    def test_ee_mode_picks_ee_billing(self):
+        with patch("tfc.ee_gating.is_oss", return_value=False):
+            b = get_billing()
+        assert isinstance(b, _EeBilling)
+
+    def test_ee_mode_with_broken_ee_falls_back_to_noop_and_logs_error(
+        self, caplog
+    ):
+        # EE/Cloud mode with ee.usage failing to import = billing silently
+        # off on a deployment that is supposed to bill. Falls back to Noop
+        # and MUST log at ERROR so alerting trips.
+        with patch("tfc.ee_gating.is_oss", return_value=False), patch.dict(
+            "sys.modules", {"ee.usage": None}
+        ):
+            # sys.modules[name] = None makes `import ee.usage` raise ImportError.
+            with caplog.at_level(logging.ERROR, logger="tfc.billing.boundary"):
                 b = get_billing()
-            except Exception:
-                # Some environments still succeed; skip assertion.
-                pytest.skip("import fault injection didn't take on this env")
-                return
-        assert isinstance(b, (_NoopBilling, _EeBilling))
+        assert isinstance(b, _NoopBilling)
+        assert any(
+            r.levelno == logging.ERROR for r in caplog.records
+        ), "broken ee on an EE/Cloud deployment must log at ERROR"
 
 
 # ── Billing protocol completeness ────────────────────────────────────────────
@@ -563,6 +594,26 @@ class TestGuardHelpers:
         assert _EeBilling.deduct_denied is Billing.deduct_denied
         assert _NoopBilling.resource_denied is Billing.resource_denied
         assert _EeBilling.resource_denied is Billing.resource_denied
+
+
+# ── UsageLimitExceeded contract ──────────────────────────────────────────────
+
+
+class TestUsageLimitExceededContract:
+    """The ee class and the OSS stub must agree: carry the check result on
+    ``.check_result`` and derive the message from its ``reason``. The eval
+    playground handler calls ``usage_limit_response(e.check_result)``, so a
+    stub without the attribute would AttributeError on OSS."""
+
+    def test_carries_check_result_and_reason(self):
+        from types import SimpleNamespace
+
+        from tfc.billing.boundary import UsageLimitExceeded
+
+        check = SimpleNamespace(reason="Free tier limit hit", allowed=False)
+        exc = UsageLimitExceeded(check)
+        assert exc.check_result is check
+        assert "Free tier limit hit" in str(exc)
 
 
 # ── Re-exports (token_usage_properties, llm_usage_properties) ────────────────
