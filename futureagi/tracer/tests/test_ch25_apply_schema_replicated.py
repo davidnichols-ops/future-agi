@@ -415,12 +415,14 @@ class TestAttrValueBloomIndexFile:
         # bloom could never skip anything.
         assert not any("mapValues(attrs_bool)" in s for s in statements)
 
-    def test_materializes_both_indexes(self, statements):
-        mats = [s for s in statements if "MATERIALIZE INDEX" in s]
-        assert len(mats) == 2
-        joined = "\n".join(mats)
-        assert "idx_attrs_str_values" in joined
-        assert "idx_attrs_num_values" in joined
+    def test_no_materialize_in_boot_applier(self, statements):
+        # MATERIALIZE INDEX is an unbounded background mutation; run
+        # synchronously by the boot-time applier (120s HTTP timeout) it times
+        # out on a large spans table, the file never records in
+        # schema_versions, and it re-applies + re-errors on every boot
+        # (CORE-BACKEND-11KX). The file must contain only fast, idempotent
+        # metadata DDL; backfilling existing parts is a separate ops step.
+        assert not any("MATERIALIZE INDEX" in s for s in statements)
 
     def test_every_statement_survives_replicated_rewrite(self, statements):
         for stmt in statements:
