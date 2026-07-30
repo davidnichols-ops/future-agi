@@ -384,20 +384,35 @@ const TraceGrid = React.forwardRef(
       }
 
       const bottomRowObj = {};
-      const annotationCols = columns.filter(
-        (c) => c?.groupBy === "Annotation Metrics",
-      );
-      // Eval columns group under their eval-task header; everything else —
-      // custom columns included — stays flat in store order (TH-6119). Customs
-      // carry no evalTaskName, so buildColumnBlocks emits them as flat blocks
-      // at their own position rather than collapsing them into one bucket.
-      const mainCols = columns.filter(
-        (c) => c?.groupBy !== "Annotation Metrics",
-      );
 
-      const columnDefsResult = buildColumnBlocks(mainCols).map((block) => {
+      // Annotation col defs, keyed by store id. An expanded metric generates
+      // several child defs, so each entry is a list. Built up-front so the
+      // ordered pass below can drop them at their own store position — they
+      // used to be appended after every other column, which silently undid a
+      // user's drag of an annotation column on the next rebuild.
+      const annotationDefsById = new Map();
+      for (const c of columns) {
+        if (c?.groupBy !== "Annotation Metrics") continue;
+        const generated =
+          generateAnnotationColumnsForTracing([c], showMetricsIds) || [];
+        const flat = [];
+        for (const group of generated) {
+          if (group.children) flat.push(...group.children);
+          else flat.push(group);
+        }
+        if (flat.length) annotationDefsById.set(c.id, flat);
+      }
+
+      // Eval columns group under their eval-task header; everything else —
+      // custom and annotation columns included — stays flat in store order
+      // (TH-6119). Only eval columns carry evalTaskName, so buildColumnBlocks
+      // emits the rest as flat blocks at their own position.
+      const columnDefsResult = buildColumnBlocks(columns).flatMap((block) => {
         if (block.type === "col") {
           const c = block.col;
+          if (annotationDefsById.has(c?.id)) {
+            return annotationDefsById.get(c.id);
+          }
           bottomRowObj[c?.id] = c?.average ? `${c?.average}` : null;
           const colDef = getTraceListColumnDefs(c);
           return c?.groupBy === "Custom Columns"
@@ -416,22 +431,6 @@ const TraceGrid = React.forwardRef(
           }),
         };
       });
-
-      // Add annotation columns as flat columns (not grouped)
-      const annotationColumns = generateAnnotationColumnsForTracing(
-        annotationCols,
-        showMetricsIds,
-      );
-      if (annotationColumns?.length > 0) {
-        // Flatten: extract children from annotation groups
-        for (const group of annotationColumns) {
-          if (group.children) {
-            columnDefsResult.push(...group.children);
-          } else {
-            columnDefsResult.push(group);
-          }
-        }
-      }
       return {
         columnDefs: columnDefsResult,
         bottomRow: [

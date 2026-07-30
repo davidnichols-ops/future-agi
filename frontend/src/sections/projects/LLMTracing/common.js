@@ -761,6 +761,9 @@ export const generateAnnotationColumnsForTracing = (
         return {
           headerName: displayName,
           field: metricId,
+          // Without this the column-visibility toggle has no effect on
+          // annotation columns — they render regardless of isVisible.
+          hide: metric?.isVisible === false,
           flex: 1,
           minWidth: 200,
           headerComponent: AnnotationHeaderCellRenderer,
@@ -794,6 +797,8 @@ export const generateAnnotationColumnsForTracing = (
       const avgColumn = {
         headerName: "Avg",
         field: `${metricId}.score`,
+        // Hiding the metric hides every column it expands into.
+        hide: metric?.isVisible === false,
         flex: 1,
         minWidth: 200,
         headerComponent: AnnotationHeaderCellRenderer,
@@ -824,6 +829,7 @@ export const generateAnnotationColumnsForTracing = (
       const annotatorColumns = metricAnnotators.map((annotator) => ({
         headerName: annotator?.user_name,
         field: `${metricId}.annotators.${annotator?.user_id}`,
+        hide: metric?.isVisible === false,
         flex: 1,
         minWidth: 200,
         ...(outputType === "text" ? { wrapText: true, autoHeight: true } : {}),

@@ -343,21 +343,36 @@ const SpanGrid = React.forwardRef(
       }
 
       const bottomRowObj = {};
-      const annotationCols = columns.filter(
-        (c) => c?.groupBy === "Annotation Metrics",
-      );
-      const mainCols = columns.filter(
-        (c) => c?.groupBy !== "Annotation Metrics",
-      );
+
+      // Annotation col defs, keyed by store id. An expanded metric generates
+      // several child defs, so each entry is a list. Built up-front so the
+      // ordered pass below can drop them at their own store position — they
+      // used to be appended after every other column, which silently undid a
+      // user's drag of an annotation column on the next rebuild.
+      const annotationDefsById = new Map();
+      for (const c of columns) {
+        if (c?.groupBy !== "Annotation Metrics") continue;
+        const generated =
+          generateAnnotationColumnsForTracing([c], showMetricsIds) || [];
+        const flat = [];
+        for (const group of generated) {
+          if (group.children) flat.push(...group.children);
+          else flat.push(group);
+        }
+        if (flat.length) annotationDefsById.set(c.id, flat);
+      }
 
       // Eval columns grouped under their parent Eval Task (two-tier header with
-      // T/S glyph). Everything else — custom columns included — stays flat in
-      // its store position: a shared bucket collapsed them together and
-      // oscillated the order (TH-6119). Customs carry no evalTaskName, so
-      // buildColumnBlocks emits them as flat blocks.
-      const columnDefsResult = buildColumnBlocks(mainCols).map((block) => {
+      // T/S glyph). Everything else — custom and annotation columns included —
+      // stays flat in its store position: a shared bucket collapsed them
+      // together and oscillated the order (TH-6119). Only eval columns carry
+      // evalTaskName, so buildColumnBlocks emits the rest as flat blocks.
+      const columnDefsResult = buildColumnBlocks(columns).flatMap((block) => {
         if (block.type === "col") {
           const c = block.col;
+          if (annotationDefsById.has(c?.id)) {
+            return annotationDefsById.get(c.id);
+          }
           bottomRowObj[c?.id] = c?.average ? `${c?.average}` : null;
           const colDef = getSpanListColumnDefs(c);
           // Custom col: flat, but keep its width/style.
@@ -390,20 +405,6 @@ const SpanGrid = React.forwardRef(
         };
       });
 
-      // Annotation columns as flat columns (not grouped)
-      const annotationColumns = generateAnnotationColumnsForTracing(
-        annotationCols,
-        showMetricsIds,
-      );
-      if (annotationColumns?.length > 0) {
-        for (const group of annotationColumns) {
-          if (group.children) {
-            columnDefsResult.push(...group.children);
-          } else {
-            columnDefsResult.push(group);
-          }
-        }
-      }
       return {
         columnDefs: columnDefsResult,
         bottomRow: [
