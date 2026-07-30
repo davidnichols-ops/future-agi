@@ -4,7 +4,7 @@ import { Box, Typography } from "@mui/material";
 import Iconify from "src/components/iconify";
 import { ResultChip } from "src/sections/projects/LLMTracing/Renderers/EvalResultChips";
 import EvalDetailExpansion from "./EvalDetailExpansion";
-import { spanResultChip, spanHasDetail } from "./utils";
+import { spanResultChip, spanHasDetail, activatableProps } from "./utils";
 import { evalSpanShape } from "./shapes";
 
 // One span's result under a rolled-up eval; expands to its explanation/localizer.
@@ -24,7 +24,10 @@ const BreakdownRow = ({
   return (
     <>
       <Box
-        onClick={() => canExpand && setOpen((p) => !p)}
+        {...activatableProps(() => setOpen((p) => !p), {
+          expanded: open,
+          enabled: canExpand,
+        })}
         sx={{
           display: "flex",
           alignItems: "center",

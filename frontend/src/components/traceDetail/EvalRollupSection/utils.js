@@ -56,3 +56,31 @@ export const spanPassed = (span, outputType) => {
 // (span_id + config_id). Passing and choice evals stay collapsed (nothing to fix).
 export const spanHasDetail = (span, outputType) =>
   !!(span.explanation || span.error) || !spanPassed(span, outputType);
+
+// Keyboard parity for the click-to-expand rows and CTAs in this section. These
+// are plain Boxes, so without this they are unreachable by keyboard and screen
+// readers get no affordance or state (review: cdileep23).
+//
+// `expanded` adds aria-expanded for disclosure rows; omit it for plain buttons.
+// `enabled: false` returns nothing, so a row that cannot expand stays out of
+// the tab order rather than offering a no-op stop.
+export const activatableProps = (
+  onActivate,
+  { expanded, enabled = true } = {},
+) => {
+  if (!enabled || typeof onActivate !== "function") return {};
+  return {
+    role: "button",
+    tabIndex: 0,
+    ...(expanded === undefined ? {} : { "aria-expanded": expanded }),
+    onClick: onActivate,
+    onKeyDown: (e) => {
+      // Space scrolls the page by default; Enter/Space are the expected
+      // activation keys for role="button".
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        onActivate(e);
+      }
+    },
+  };
+};

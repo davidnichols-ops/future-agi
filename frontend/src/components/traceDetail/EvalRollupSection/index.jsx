@@ -61,14 +61,18 @@ const EvalRollupSection = ({
           f += ev.aggregate?.fail || 0;
           if (ev.aggregate?.fail) failing.push(ev);
         } else if (kind === EVAL_KIND.NUMERIC) {
+          // Count every span, but record the eval at most once — pushing per
+          // failing span sent Falcon the same eval N times (review: cdileep23).
+          let anySpanFailed = false;
           for (const s of ev.spans || []) {
             if (s.error || typeof s.value !== "number") continue;
             if (isNumericPass(s.value)) p += 1;
             else {
               f += 1;
-              failing.push(ev);
+              anySpanFailed = true;
             }
           }
+          if (anySpanFailed) failing.push(ev);
         }
       }
     }

@@ -3,6 +3,7 @@ import PropTypes from "prop-types";
 import { Box, Typography } from "@mui/material";
 import { alpha } from "@mui/material/styles";
 import Iconify from "src/components/iconify";
+import { activatableProps } from "./utils";
 
 // Pass/fail counts + progress bar; `onFix` (when set) renders the Fix-with-Falcon CTA.
 const SummaryBar = ({ passed, total, failedCount, passRate, onFix }) => (
@@ -60,7 +61,7 @@ const SummaryBar = ({ passed, total, failedCount, passRate, onFix }) => (
     </Box>
     {onFix && (
       <Box
-        onClick={onFix}
+        {...activatableProps(onFix)}
         sx={{
           display: "inline-flex",
           alignItems: "center",

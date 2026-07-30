@@ -5,7 +5,7 @@ import Iconify from "src/components/iconify";
 import { evalCellChips } from "src/sections/projects/LLMTracing/evalCellModel";
 import { ResultChip } from "src/sections/projects/LLMTracing/Renderers/EvalResultChips";
 import BreakdownRow from "./BreakdownRow";
-import { colFromEval, NAME_W } from "./utils";
+import { colFromEval, NAME_W, activatableProps } from "./utils";
 import { evalShape } from "./shapes";
 
 // One eval rolled up across its spans (trace scope); expands to the per-span
@@ -20,7 +20,7 @@ const EvalRollupRow = ({ ev, onSelectSpan, onFixWithFalcon }) => {
   return (
     <>
       <Box
-        onClick={() => setOpen((p) => !p)}
+        {...activatableProps(() => setOpen((p) => !p), { expanded: open })}
         sx={{
           display: "flex",
           alignItems: "flex-start",

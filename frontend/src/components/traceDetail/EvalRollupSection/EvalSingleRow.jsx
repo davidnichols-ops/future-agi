@@ -4,7 +4,7 @@ import { Box, Typography } from "@mui/material";
 import Iconify from "src/components/iconify";
 import { ResultChip } from "src/sections/projects/LLMTracing/Renderers/EvalResultChips";
 import EvalDetailExpansion from "./EvalDetailExpansion";
-import { spanResultChip, spanHasDetail, NAME_W } from "./utils";
+import { spanResultChip, spanHasDetail, NAME_W, activatableProps } from "./utils";
 import { evalShape } from "./shapes";
 
 // Span scope: one eval's result for the selected span; expands to the
@@ -18,7 +18,10 @@ const EvalSingleRow = ({ ev, onFixWithFalcon }) => {
   return (
     <>
       <Box
-        onClick={() => canExpand && setOpen((p) => !p)}
+        {...activatableProps(() => setOpen((p) => !p), {
+          expanded: open,
+          enabled: canExpand,
+        })}
         sx={{
           display: "flex",
           alignItems: "flex-start",

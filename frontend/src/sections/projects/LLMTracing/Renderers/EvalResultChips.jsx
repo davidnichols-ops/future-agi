@@ -9,13 +9,18 @@ const TONE_TO_PALETTE = {
   fail: "error",
   neutral: "warning",
   errored: "error",
+  // `plain` is the fallback tone for non-numeric scalar values; without an
+  // entry here it resolved to `info` and rendered blue (review: cdileep23).
+  plain: "grey",
 };
 
 export const ResultChip = ({ label, tone, dense = false }) => {
   const theme = useTheme();
   const palette =
     theme.palette[TONE_TO_PALETTE[tone] || "info"] || theme.palette.info;
-  const color = palette.main;
+  // Semantic palettes expose `main`; `grey` is a shade ramp (0–900) with no
+  // `main`, so fall back to its mid shade rather than an undefined colour.
+  const color = palette.main || palette[500];
   return (
     <Box
       component="span"
