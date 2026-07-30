@@ -37,6 +37,8 @@ import { REPLAY_MODULES } from "../SessionsView/ReplaySessions/configurations";
 import { useShallowToggleAnnotationsStore } from "../../agents/store";
 import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
+import { buildColumnBlocks } from "./evalTaskGrouping";
+import EvalTaskGroupHeader from "./Renderers/EvalTaskGroupHeader";
 
 const ROWS_LIMIT = 25;
 const EMPTY_EXTRA_FILTERS = [];
@@ -66,6 +68,7 @@ const TraceGrid = React.forwardRef(
     const agTheme = useAgTheme();
     const theme = useTheme();
     const [dateInterval] = useUrlState("dateInterval", "day");
+    const [, setDrawerTab] = useUrlState("drawerTab");
     const { openReplaySessionDrawer, currentStep, validatedSteps } =
       useReplaySessionsStoreShallow((state) => ({
         openReplaySessionDrawer: state.openReplaySessionDrawer,
@@ -380,23 +383,39 @@ const TraceGrid = React.forwardRef(
         };
       }
 
-      // Flat columns — no grouping for eval/annotation metrics
       const bottomRowObj = {};
       const annotationCols = columns.filter(
         (c) => c?.groupBy === "Annotation Metrics",
       );
-      // Custom columns flat (ungrouped), in store order.
-      const columnDefsResult = [];
-      for (const c of columns) {
-        if (c?.groupBy === "Annotation Metrics") continue;
-        bottomRowObj[c?.id] = c?.average ? `${c?.average}` : null;
-        if (c?.groupBy === "Custom Columns") {
+      // Eval columns group under their eval-task header; everything else —
+      // custom columns included — stays flat in store order (TH-6119). Customs
+      // carry no evalTaskName, so buildColumnBlocks emits them as flat blocks
+      // at their own position rather than collapsing them into one bucket.
+      const mainCols = columns.filter(
+        (c) => c?.groupBy !== "Annotation Metrics",
+      );
+
+      const columnDefsResult = buildColumnBlocks(mainCols).map((block) => {
+        if (block.type === "col") {
+          const c = block.col;
+          bottomRowObj[c?.id] = c?.average ? `${c?.average}` : null;
           const colDef = getTraceListColumnDefs(c);
-          columnDefsResult.push({ ...colDef, minWidth: 200, flex: 1 });
-          continue;
+          return c?.groupBy === "Custom Columns"
+            ? { ...colDef, minWidth: 200, flex: 1 }
+            : colDef;
         }
-        columnDefsResult.push(getTraceListColumnDefs(c));
-      }
+        const task = block.group;
+        return {
+          headerName: task.taskName,
+          headerGroupComponent: EvalTaskGroupHeader,
+          headerGroupComponentParams: { rowType: task.rowType },
+          marryChildren: true,
+          children: task.evals.map((c) => {
+            bottomRowObj[c?.id] = c?.average ? `${c?.average}` : null;
+            return getTraceListColumnDefs(c);
+          }),
+        };
+      });
 
       // Add annotation columns as flat columns (not grouped)
       const annotationColumns = generateAnnotationColumnsForTracing(
@@ -516,11 +535,18 @@ const TraceGrid = React.forwardRef(
         if (!traceId) {
           return;
         }
+        // Eval-cell click pre-focuses the drawer's Evals tab (read once on
+        // open); any other cell clears it for the default tab.
+        setDrawerTab(
+          event?.colDef?.headerComponentParams?.group === "Evaluation Metrics"
+            ? "evals"
+            : null,
+        );
         setTraceDetailDrawerOpen({ traceId: traceId, filters: filters });
 
         // trackEvent(Events.observeTraceidClicked);
       },
-      [filters, setTraceDetailDrawerOpen],
+      [filters, setTraceDetailDrawerOpen, setDrawerTab],
     );
 
     const shouldDisable = useMemo(() => {
