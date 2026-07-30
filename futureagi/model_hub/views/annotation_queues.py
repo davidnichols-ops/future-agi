@@ -4677,6 +4677,22 @@ class QueueItemViewSet(BaseModelViewSetMixinWithUserOrg, viewsets.ModelViewSet):
                         QueueItemReviewThread.STATUS_REOPENED,
                     ],
                 ),
+                # workflow_status and workflow_status_label each resolved this same
+                # lookup per rendered item, so a page of items awaiting review cost
+                # 2 extra queries per row on top of the base — 55 queries for 25
+                # items vs 15 for 5 (TH-7211). It was already annotated below, but
+                # only when the caller filtered by in_review/resubmitted, and the
+                # serializer never read it. Annotating unconditionally makes the
+                # status flat for every page and for a single-item retrieve; the
+                # status filters below read this same alias.
+                _has_addressed_review=Exists(
+                    QueueItemReviewThread.objects.filter(
+                        queue_item_id=OuterRef("pk"),
+                        blocking=True,
+                        status=QueueItemReviewThread.STATUS_ADDRESSED,
+                        deleted=False,
+                    )
+                ),
             )
         )
         queue_id = self.kwargs.get("queue_id")
@@ -4697,20 +4713,6 @@ class QueueItemViewSet(BaseModelViewSetMixinWithUserOrg, viewsets.ModelViewSet):
 
         if statuses:
             status_q = Q()
-            addressed_threads = QueueItemReviewThread.objects.filter(
-                queue_item_id=OuterRef("pk"),
-                blocking=True,
-                status=QueueItemReviewThread.STATUS_ADDRESSED,
-                deleted=False,
-            )
-            if any(
-                workflow_status in statuses
-                for workflow_status in ("in_review", "resubmitted")
-            ):
-                queryset = queryset.annotate(
-                    _has_addressed_review=Exists(addressed_threads)
-                )
-
             for item_status in statuses:
                 if item_status == "in_review":
                     status_q |= Q(

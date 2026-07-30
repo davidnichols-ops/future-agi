@@ -519,18 +519,18 @@ class QueueItemSerializer(serializers.ModelSerializer):
         return resolve_source_preview(obj, ch_cache=self.context.get("ch_source_cache"))
 
     def get_workflow_status(self, obj):
-        if (
-            obj.review_status == "pending_review"
-            and QueueItemReviewThread.objects.filter(
-                queue_item=obj,
-                blocking=True,
-                status=QueueItemReviewThread.STATUS_ADDRESSED,
-                deleted=False,
-            ).exists()
-        ):
-            return "resubmitted"
         if obj.review_status == "pending_review":
-            return "in_review"
+            # Annotated by QueueItemViewSet.get_queryset; the query is the fallback
+            # for callers that serialize an item they fetched themselves.
+            has_addressed = getattr(obj, "_has_addressed_review", None)
+            if has_addressed is None:
+                has_addressed = QueueItemReviewThread.objects.filter(
+                    queue_item=obj,
+                    blocking=True,
+                    status=QueueItemReviewThread.STATUS_ADDRESSED,
+                    deleted=False,
+                ).exists()
+            return "resubmitted" if has_addressed else "in_review"
         if obj.review_status == "rejected":
             return "needs_changes"
         return obj.status
