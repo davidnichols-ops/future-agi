@@ -68,7 +68,7 @@ const AttributeKeyList = ({
             size="small"
             fullWidth
             sx={{ mt: 1, justifyContent: "flex-start" }}
-            onClick={() => onSelectKey(manualKey)}
+            onClick={() => onSelectKey(manualKey, undefined)}
           >
             Use &quot;{manualKey}&quot;
           </Button>
@@ -77,9 +77,9 @@ const AttributeKeyList = ({
       <List sx={{ overflow: "auto", flex: 1, p: 1 }} dense>
         {filtered.map(({ key, type, count }) => (
           <ListItemButton
-            key={key}
+            key={`${key}:${type}`}
             selected={selectedKey === key}
-            onClick={() => onSelectKey(key)}
+            onClick={() => onSelectKey(key, type)}
             sx={{ borderRadius: 1, py: 0.75 }}
           >
             <ListItemText

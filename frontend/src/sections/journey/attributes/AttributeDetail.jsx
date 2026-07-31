@@ -18,12 +18,16 @@ import { useQuery } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import AttributeValueChart from "./AttributeValueChart";
 
-const AttributeDetail = ({ projectId, attributeKey }) => {
+const AttributeDetail = ({ projectId, attributeKey, attributeType }) => {
   const { data: detail, isLoading } = useQuery({
-    queryKey: ["span-attribute-detail", projectId, attributeKey],
+    queryKey: ["span-attribute-detail", projectId, attributeKey, attributeType],
     queryFn: () =>
       axios.get(endpoints.project.spanAttributeDetail(), {
-        params: { project_id: projectId, key: attributeKey },
+        params: {
+          project_id: projectId,
+          key: attributeKey,
+          ...(attributeType ? { type: attributeType } : {}),
+        },
       }),
     select: (data) => data.data,
     enabled: Boolean(projectId) && Boolean(attributeKey),
@@ -200,6 +204,7 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
 AttributeDetail.propTypes = {
   projectId: PropTypes.string,
   attributeKey: PropTypes.string,
+  attributeType: PropTypes.oneOf(["string", "number", "boolean"]),
 };
 
 export default AttributeDetail;

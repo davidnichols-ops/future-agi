@@ -9,8 +9,10 @@ from accounts.models.user import User
 from accounts.models.workspace import Workspace
 from model_hub.models.ai_model import AIModel
 from tfc.constants.roles import OrganizationRoles
+from tfc.utils.api_serializers import ApiTextErrorResponseSerializer
 from tracer.models.project import Project
 from tracer.serializers.span_attributes import (
+    SpanAttributeDetailQuerySerializer,
     SpanAttributeDetailResponseSerializer,
     SpanAttributeValuesResponseSerializer,
 )
@@ -29,6 +31,22 @@ def _project_query(path, project_id):
     if path != KEYS_PATH:
         query["key"] = "final_status"
     return query
+
+
+def test_span_attribute_detail_query_type_is_optional_and_validated():
+    base_query = {
+        "project_id": "11111111-2222-4333-8444-555555555555",
+        "key": "customer_stage",
+    }
+    legacy = SpanAttributeDetailQuerySerializer(data=base_query)
+    typed = SpanAttributeDetailQuerySerializer(data={**base_query, "type": "number"})
+    invalid = SpanAttributeDetailQuerySerializer(data={**base_query, "type": "integer"})
+
+    assert legacy.is_valid(), legacy.errors
+    assert typed.is_valid(), typed.errors
+    assert typed.validated_data["type"] == "number"
+    assert not invalid.is_valid()
+    assert "type" in invalid.errors
 
 
 @pytest.mark.parametrize("path", [KEYS_PATH, VALUES_PATH, DETAIL_PATH])
@@ -304,7 +322,9 @@ def test_span_attribute_key_discovery_query_uses_exact_bounded_window(
     assert query.count("start_time >= %(window_start)s") == 3
     assert query.count("start_time < %(window_end)s") == 3
     assert query.count("is_deleted = 0") == 3
-    assert query.count("LIMIT 10000") == 3
+    # Three per-map samples plus the existing outer catalog cap.
+    assert query.count("LIMIT 1000") == 4
+    assert "LIMIT 10000" not in query
     assert "FINAL" not in query
     assert captured["params"]["window_start"] == window_start
     assert captured["params"]["window_end"] == NOW
@@ -715,11 +735,10 @@ def test_span_attribute_values_read_budget_error_returns_safe_incomplete_200(
 
 
 @pytest.mark.parametrize(
-    ("type_counts", "detail_rows", "expected_type", "expected_payload", "map_name"),
+    ("detail_rows", "expected_type", "expected_payload", "map_name"),
     [
         (
-            [(5, 0, 0)],
-            [("complete", 3), ("failed", 1)],
+            [("complete",), ("complete",), ("complete",), ("failed",)],
             "string",
             {
                 "count": 4,
@@ -732,7 +751,6 @@ def test_span_attribute_values_read_budget_error_returns_safe_incomplete_200(
             "attrs_string",
         ),
         (
-            [(0, 5, 0)],
             [(4, 1.0, 9.0, 4.5, 4.0, 8.0)],
             "number",
             {
@@ -746,8 +764,7 @@ def test_span_attribute_values_read_budget_error_returns_safe_incomplete_200(
             "attrs_number",
         ),
         (
-            [(0, 0, 5)],
-            [(True, 3), (False, 1)],
+            [(True,), (True,), (True,), (False,)],
             "boolean",
             {
                 "count": 4,
@@ -762,8 +779,7 @@ def test_span_attribute_values_read_budget_error_returns_safe_incomplete_200(
     ],
 )
 @pytest.mark.django_db
-def test_span_attribute_detail_uses_bounded_budget_for_type_and_detail_reads(
-    type_counts,
+def test_span_attribute_detail_uses_validated_type_without_discovery_scan(
     detail_rows,
     expected_type,
     expected_payload,
@@ -775,10 +791,124 @@ def test_span_attribute_detail_uses_bounded_budget_for_type_and_detail_reads(
 ):
     settings.FILTER_VALUES_DEFAULT_LOOKBACK_DAYS = 7
     client = MagicMock()
-    client.execute_read.side_effect = [
-        (type_counts, [], 3.0),
-        (detail_rows, [], 4.0),
-    ]
+    client.execute_read.return_value = (detail_rows, [], 4.0)
+    monkeypatch.setattr(span_attributes, "ClickHouseClient", lambda: client)
+    monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
+    monkeypatch.setattr(span_attributes.timezone, "now", lambda: NOW)
+
+    response = auth_client.get(
+        DETAIL_PATH,
+        data={
+            "project_id": str(observe_project.id),
+            "key": "custom_metric",
+            "type": expected_type,
+        },
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json() == {
+        "key": "custom_metric",
+        "type": expected_type,
+        **expected_payload,
+        "query_complete": True,
+        "query_status": "complete",
+        "query_window_start": "2026-07-23T12:34:56Z",
+        "query_window_end": "2026-07-30T12:34:56Z",
+    }
+
+    assert client.execute_read.call_count == 1
+    detail_query = client.execute_read.call_args.args[0]
+    assert f"mapContains({map_name}, %(key)s)" in detail_query
+
+    for call in client.execute_read.call_args_list:
+        query, params = call.args
+        kwargs = call.kwargs
+        assert "FROM spans" in query
+        assert "PREWHERE project_id = %(project_id)s" in query
+        assert "start_time >= %(window_start)s" in query
+        assert "start_time < %(window_end)s" in query
+        assert "is_deleted = 0" in query
+        assert params["project_id"] == str(observe_project.id)
+        assert params["key"] == "custom_metric"
+        assert params["window_end"] - params["window_start"] == timedelta(days=7)
+        assert kwargs["timeout_ms"] == 750
+        assert kwargs["settings"]["max_memory_usage"] == 256 * 1024 * 1024
+        assert kwargs["settings"]["max_bytes_to_read"] == 1024 * 1024 * 1024
+        assert kwargs["settings"]["read_overflow_mode"] == "throw"
+        assert kwargs["settings"]["timeout_overflow_mode"] == "throw"
+
+
+@pytest.mark.django_db
+def test_span_attribute_detail_rejects_invalid_type_before_clickhouse(
+    auth_client,
+    observe_project,
+    monkeypatch,
+):
+    client_factory = MagicMock()
+    monkeypatch.setattr(span_attributes, "ClickHouseClient", client_factory)
+    monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
+
+    response = auth_client.get(
+        DETAIL_PATH,
+        data={
+            "project_id": str(observe_project.id),
+            "key": "custom_metric",
+            "type": "integer",
+        },
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    client_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("attribute_type", "detail_rows", "map_name"),
+    [
+        ("string", [], "attrs_string"),
+        ("number", [(0, None, None, None, None, None)], "attrs_number"),
+        ("boolean", [], "attrs_bool"),
+    ],
+)
+@pytest.mark.django_db
+def test_span_attribute_detail_stale_requested_type_does_not_return_zero_data(
+    attribute_type,
+    detail_rows,
+    map_name,
+    auth_client,
+    observe_project,
+    monkeypatch,
+):
+    client = MagicMock()
+    client.execute_read.return_value = (detail_rows, [], 2.0)
+    monkeypatch.setattr(span_attributes, "ClickHouseClient", lambda: client)
+    monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
+    monkeypatch.setattr(span_attributes.timezone, "now", lambda: NOW)
+
+    response = auth_client.get(
+        DETAIL_PATH,
+        data={
+            "project_id": str(observe_project.id),
+            "key": "custom_metric",
+            "type": attribute_type,
+        },
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert "No data found for this attribute type" in response.json()["message"]
+    assert client.execute_read.call_count == 1
+    assert map_name in client.execute_read.call_args.args[0]
+
+
+@pytest.mark.django_db
+def test_final_status_guaranteed_type_skips_raw_type_probes(
+    auth_client,
+    observe_project,
+    settings,
+    monkeypatch,
+):
+    settings.TRACE_FILTER_VALUES_ATTR_ROLLUP_ENABLED = False
+    client = MagicMock()
+    client.execute_read.return_value = ([("complete",)], [], 4.0)
     monkeypatch.setattr(span_attributes, "ClickHouseClient", lambda: client)
     monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
     monkeypatch.setattr(span_attributes.timezone, "now", lambda: NOW)
@@ -792,41 +922,91 @@ def test_span_attribute_detail_uses_bounded_budget_for_type_and_detail_reads(
     )
 
     assert response.status_code == status.HTTP_200_OK
+    assert response.json()["type"] == "string"
+    assert client.execute_read.call_count == 1
+    query = client.execute_read.call_args.args[0]
+    assert "mapContains(attrs_string, %(key)s)" in query
+    assert "attrs_number" not in query
+    assert "attrs_bool" not in query
+
+
+@pytest.mark.django_db
+def test_final_status_rejects_a_conflicting_requested_type(
+    auth_client,
+    observe_project,
+    monkeypatch,
+):
+    client_factory = MagicMock()
+    monkeypatch.setattr(span_attributes, "ClickHouseClient", client_factory)
+    monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
+
+    response = auth_client.get(
+        DETAIL_PATH,
+        data={
+            "project_id": str(observe_project.id),
+            "key": "final_status",
+            "type": "number",
+        },
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["result"] == (
+        "Attribute key has guaranteed type 'string'; the requested type does not match"
+    )
+    client_factory.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_final_status_detail_uses_exact_aligned_rollup_without_raw_type_scan(
+    auth_client,
+    observe_project,
+    settings,
+    monkeypatch,
+):
+    aligned_now = datetime(2026, 7, 30, 13, tzinfo=UTC)
+    settings.FILTER_VALUES_DEFAULT_LOOKBACK_DAYS = 7
+    settings.TRACE_FILTER_VALUES_ATTR_ROLLUP_ENABLED = True
+    settings.DASHBOARD_ATTR_ROLLUP_COVERED_SINCE = datetime(2026, 7, 1, tzinfo=UTC)
+    client = MagicMock()
+    client.execute_read.return_value = (
+        [("complete", 3), ("failed", 1)],
+        [("value", "String"), ("cnt", "UInt64")],
+        4.0,
+    )
+    monkeypatch.setattr(span_attributes, "ClickHouseClient", lambda: client)
+    monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
+    monkeypatch.setattr(span_attributes.timezone, "now", lambda: aligned_now)
+
+    response = auth_client.get(
+        DETAIL_PATH,
+        data={
+            "project_id": str(observe_project.id),
+            "key": "final_status",
+        },
+    )
+
+    assert response.status_code == status.HTTP_200_OK
     assert response.json() == {
         "key": "final_status",
-        "type": expected_type,
-        **expected_payload,
+        "type": "string",
+        "count": 4,
+        "unique_values": 2,
+        "top_values": [
+            {"value": "complete", "count": 3, "percentage": 75.0},
+            {"value": "failed", "count": 1, "percentage": 25.0},
+        ],
         "query_complete": True,
         "query_status": "complete",
-        "query_window_start": "2026-07-23T12:34:56Z",
-        "query_window_end": "2026-07-30T12:34:56Z",
+        "query_window_start": "2026-07-23T13:00:00Z",
+        "query_window_end": "2026-07-30T13:00:00Z",
     }
-
-    assert client.execute_read.call_count == 2
-    type_query = client.execute_read.call_args_list[0].args[0]
-    detail_query = client.execute_read.call_args_list[1].args[0]
-    assert "attrs_string" in type_query
-    assert "attrs_number" in type_query
-    assert "attrs_bool" in type_query
-    assert f"mapContains({map_name}, %(key)s)" in detail_query
-
-    for call in client.execute_read.call_args_list:
-        query, params = call.args
-        kwargs = call.kwargs
-        assert "FROM spans" in query
-        assert "PREWHERE project_id = %(project_id)s" in query
-        assert "start_time >= %(window_start)s" in query
-        assert "start_time < %(window_end)s" in query
-        assert "is_deleted = 0" in query
-        assert "(parent_span_id IS NULL OR parent_span_id = '')" in query
-        assert params["project_id"] == str(observe_project.id)
-        assert params["key"] == "final_status"
-        assert params["window_end"] - params["window_start"] == timedelta(days=7)
-        assert kwargs["timeout_ms"] == 750
-        assert kwargs["settings"]["max_memory_usage"] == 256 * 1024 * 1024
-        assert kwargs["settings"]["max_bytes_to_read"] == 1024 * 1024 * 1024
-        assert kwargs["settings"]["read_overflow_mode"] == "throw"
-        assert kwargs["settings"]["timeout_overflow_mode"] == "throw"
+    assert client.execute_read.call_count == 1
+    query, params = client.execute_read.call_args.args
+    assert "FROM dashboard_attr_rollup" in query
+    assert "FROM spans" not in query
+    assert "countMerge(n)" in query
+    assert params["window_start"] == datetime(2026, 7, 23, 13, tzinfo=UTC)
+    assert params["window_end"] == aligned_now
 
 
 @pytest.mark.django_db
@@ -836,10 +1016,11 @@ def test_span_attribute_string_detail_marks_top_100_as_sampled(
     monkeypatch,
 ):
     client = MagicMock()
-    client.execute_read.side_effect = [
-        ([(101, 0, 0)], [], 3.0),
-        ([(f"value-{index:03d}", 1) for index in range(101)], [], 4.0),
-    ]
+    client.execute_read.return_value = (
+        [(f"value-{index:03d}",) for index in range(101)],
+        [],
+        4.0,
+    )
     monkeypatch.setattr(span_attributes, "ClickHouseClient", lambda: client)
     monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
     monkeypatch.setattr(span_attributes.timezone, "now", lambda: NOW)
@@ -849,18 +1030,22 @@ def test_span_attribute_string_detail_marks_top_100_as_sampled(
         data={
             "project_id": str(observe_project.id),
             "key": "synthetic_status",
+            "type": "string",
         },
     )
 
     assert response.status_code == status.HTTP_200_OK
     payload = response.json()
-    assert payload["count"] == 100
-    assert payload["unique_values"] == 100
+    assert payload["count"] == 101
+    assert payload["unique_values"] == 101
     assert len(payload["top_values"]) == 100
     assert payload["query_complete"] is False
     assert payload["query_status"] == "sampled"
     assert payload["query_error_code"] == "sample_limit"
-    assert "LIMIT 101" in client.execute_read.call_args_list[1].args[0]
+    detail_query, detail_params = client.execute_read.call_args.args
+    assert "GROUP BY" not in detail_query
+    assert "LIMIT %(sample_limit)s" in detail_query
+    assert detail_params["sample_limit"] == 2000
     serializer = SpanAttributeDetailResponseSerializer(data=payload)
     assert serializer.is_valid(), serializer.errors
 
@@ -883,13 +1068,13 @@ def test_span_attribute_detail_type_budget_error_returns_safe_degraded_200(
         DETAIL_PATH,
         data={
             "project_id": str(observe_project.id),
-            "key": "final_status",
+            "key": "customer_stage",
         },
     )
 
     assert response.status_code == status.HTTP_200_OK
     assert response.json() == {
-        "key": "final_status",
+        "key": "customer_stage",
         "query_complete": False,
         "query_status": "degraded",
         "query_error_code": "read_budget_exceeded",
@@ -906,10 +1091,9 @@ def test_span_attribute_detail_data_budget_error_preserves_detected_type_only(
     monkeypatch,
 ):
     client = MagicMock()
-    client.execute_read.side_effect = [
-        ([(5, 0, 0)], [], 3.0),
-        TimeoutError("Code 159 secret ClickHouse detail stack trace"),
-    ]
+    client.execute_read.side_effect = TimeoutError(
+        "Code 159 secret ClickHouse detail stack trace"
+    )
     monkeypatch.setattr(span_attributes, "ClickHouseClient", lambda: client)
     monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
     monkeypatch.setattr(span_attributes.timezone, "now", lambda: NOW)
@@ -934,3 +1118,208 @@ def test_span_attribute_detail_data_budget_error_preserves_detected_type_only(
     }
     assert "count" not in response.json()
     assert b"secret ClickHouse" not in response.content
+
+
+def test_span_attribute_detail_type_probes_ignore_row_order_and_stably_order_maps():
+    client = MagicMock()
+
+    def execute_read(query, *_args, **_kwargs):
+        present = "attrs_string" in query or "attrs_bool" in query
+        return ([(1,)] if present else [], [], 2.0)
+
+    client.execute_read.side_effect = execute_read
+    params = {
+        "project_id": "11111111-2222-4333-8444-555555555555",
+        "key": "customer_stage",
+        "window_start": NOW - timedelta(days=7),
+        "window_end": NOW,
+    }
+
+    result = span_attributes.SpanAttributeDetailView()._detect_types(client, params)
+
+    assert result == ("string", "boolean")
+    assert client.execute_read.call_count == 3
+    expected_maps = ("attrs_string", "attrs_number", "attrs_bool")
+    for call, expected_map in zip(
+        client.execute_read.call_args_list, expected_maps, strict=True
+    ):
+        query, query_params = call.args
+        assert "SELECT 1" in query
+        assert "LIMIT 1" in query
+        assert f"mapContains({expected_map}, %(key)s)" in query
+        assert sum(name in query for name in expected_maps) == 1
+        assert "multiIf" not in query
+        assert query_params == params
+
+
+def test_span_attribute_detail_type_probes_share_one_deadline(monkeypatch):
+    client = MagicMock()
+    client.execute_read.return_value = ([], [], 2.0)
+    monotonic = MagicMock(side_effect=[100.0, 100.05, 100.20, 100.30])
+    monkeypatch.setattr(span_attributes.time, "monotonic", monotonic)
+    params = {
+        "project_id": "11111111-2222-4333-8444-555555555555",
+        "key": "customer_stage",
+        "window_start": NOW - timedelta(days=7),
+        "window_end": NOW,
+    }
+
+    result = span_attributes.SpanAttributeDetailView()._detect_types(client, params)
+
+    assert result == ()
+    timeouts = [
+        call.kwargs["timeout_ms"] for call in client.execute_read.call_args_list
+    ]
+    assert 750 >= timeouts[0] > timeouts[1] > timeouts[2] > 0
+
+
+@pytest.mark.parametrize(
+    ("method_name", "rows"),
+    [
+        ("_string_detail", []),
+        ("_number_detail", [(0, None, None, None, None, None)]),
+        ("_boolean_detail", []),
+    ],
+)
+def test_typed_detail_methods_reject_empty_data(method_name, rows):
+    client = MagicMock()
+    client.execute_read.return_value = (rows, [], 2.0)
+    params = {
+        "project_id": "11111111-2222-4333-8444-555555555555",
+        "key": "customer_stage",
+        "window_start": NOW - timedelta(days=7),
+        "window_end": NOW,
+    }
+
+    response = getattr(span_attributes.SpanAttributeDetailView(), method_name)(
+        client, params
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.data["result"] == "No data found for this attribute type"
+
+
+def test_mixed_type_error_is_sanitized_and_matches_text_error_contract():
+    response = span_attributes.SpanAttributeDetailView()._mixed_type_response(
+        ("string", "boolean")
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.data["result"] == (
+        "Attribute key has multiple stored types (string, boolean); "
+        "specify the type query parameter"
+    )
+    assert "customer_secret" not in str(response.data)
+    serializer = ApiTextErrorResponseSerializer(data=response.data)
+    assert serializer.is_valid(), serializer.errors
+
+
+@pytest.mark.django_db
+def test_span_attribute_detail_mixed_types_are_disclosed_in_stable_order(
+    auth_client,
+    observe_project,
+    monkeypatch,
+):
+    client = MagicMock()
+
+    def execute_read(query, *_args, **_kwargs):
+        present = "attrs_string" in query or "attrs_bool" in query
+        return ([(1,)] if present else [], [], 2.0)
+
+    client.execute_read.side_effect = execute_read
+    monkeypatch.setattr(span_attributes, "ClickHouseClient", lambda: client)
+    monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
+    monkeypatch.setattr(span_attributes.timezone, "now", lambda: NOW)
+
+    response = auth_client.get(
+        DETAIL_PATH,
+        data={
+            "project_id": str(observe_project.id),
+            "key": "mixed_attribute",
+        },
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    payload = response.json()
+    assert payload["result"] == (
+        "Attribute key has multiple stored types (string, boolean); "
+        "specify the type query parameter"
+    )
+    serializer = ApiTextErrorResponseSerializer(data=payload)
+    assert serializer.is_valid(), serializer.errors
+    assert client.execute_read.call_count == 3
+
+
+def test_span_attribute_string_detail_bounds_rows_and_discloses_sample():
+    client = MagicMock()
+    client.execute_read.return_value = (
+        [("active",)] * span_attributes.SPAN_ATTRIBUTE_VALUE_SAMPLE_MAX_ROWS,
+        [],
+        3.0,
+    )
+    params = {
+        "project_id": "11111111-2222-4333-8444-555555555555",
+        "key": "customer_stage",
+        "window_start": NOW - timedelta(days=7),
+        "window_end": NOW,
+    }
+
+    response = span_attributes.SpanAttributeDetailView()._string_detail(client, params)
+
+    assert response.data["count"] == 2000
+    assert response.data["top_values"] == [
+        {"value": "active", "count": 2000, "percentage": 100.0}
+    ]
+    assert response.data["query_complete"] is False
+    assert response.data["query_status"] == "sampled"
+    assert response.data["query_error_code"] == "sample_limit"
+    query, query_params = client.execute_read.call_args.args
+    assert "GROUP BY" not in query
+    assert "LIMIT %(sample_limit)s" in query
+    assert query_params["sample_limit"] == 2000
+
+
+def test_span_attribute_string_rollup_detail_avoids_raw_spans():
+    client = MagicMock()
+    client.execute_read.return_value = ([("complete", 4)], [], 1.0)
+    params = {
+        "project_id": "11111111-2222-4333-8444-555555555555",
+        "key": "final_status",
+        "window_start": NOW - timedelta(days=7),
+        "window_end": NOW,
+    }
+
+    response = span_attributes.SpanAttributeDetailView()._string_rollup_detail(
+        client, params
+    )
+
+    assert response.data["type"] == "string"
+    assert response.data["count"] == 4
+    assert response.data["query_complete"] is True
+    query = client.execute_read.call_args.args[0]
+    assert "FROM dashboard_attr_rollup" in query
+    assert "FROM spans" not in query
+    assert "countMerge(n)" in query
+
+
+def test_detail_rollup_rejects_non_aligned_picker_expansion(settings):
+    settings.TRACE_FILTER_VALUES_ATTR_ROLLUP_ENABLED = True
+    settings.DASHBOARD_ATTR_ROLLUP_COVERED_SINCE = datetime(2026, 7, 1, tzinfo=UTC)
+    window_start = NOW - timedelta(days=7)
+
+    # Value suggestions deliberately include the leading partial hour.
+    assert span_attributes._covered_attribute_rollup_window(window_start, NOW) == (
+        datetime(2026, 7, 23, 12, tzinfo=UTC),
+        NOW,
+    )
+    # Detail counts must not call that expanded interval complete.
+    assert (
+        span_attributes._covered_attribute_detail_rollup_window(window_start, NOW)
+        is None
+    )
+
+    aligned_end = datetime(2026, 7, 30, 13, tzinfo=UTC)
+    aligned_start = aligned_end - timedelta(days=7)
+    assert span_attributes._covered_attribute_detail_rollup_window(
+        aligned_start, aligned_end
+    ) == (aligned_start, aligned_end)

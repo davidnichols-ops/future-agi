@@ -5,8 +5,11 @@ import pytest
 from tracer.serializers.filters import ObserveGraphDataResultSerializer
 from tracer.services.clickhouse.graph_dispatch import (
     GRAPH_READ_SETTINGS,
+    SYSTEM_GRAPH_READ_SETTINGS,
+    SYSTEM_GRAPH_READ_TIMEOUT_MS,
     degraded_graph_response,
     fetch_system_metric_graph_ch,
+    format_system_metric_graph,
 )
 from tracer.services.clickhouse.query_builders.time_series import (
     TimeSeriesQueryBuilder,
@@ -413,10 +416,99 @@ class TestTraceGraphAttributeRollup:
 
 @pytest.mark.unit
 class TestGraphReadFailureContract:
+    @pytest.mark.parametrize(
+        ("metric_id", "series_key", "point_field", "expected"),
+        [
+            ("latency", "latency", "latency", 42.5),
+            ("tokens", "tokens", "tokens", 12),
+            ("total_tokens", "total_tokens", "tokens", 13),
+            ("cost", "cost", "cost", 0.125),
+            ("traffic", "traffic", "traffic", 9),
+            ("prompt_tokens", "prompt_tokens", "prompt_tokens", 7),
+            ("input_tokens", "input_tokens", "prompt_tokens", 8),
+            (
+                "completion_tokens",
+                "completion_tokens",
+                "completion_tokens",
+                5,
+            ),
+            ("output_tokens", "output_tokens", "completion_tokens", 6),
+            ("error_rate", "error_rate", "error_rate", 2.5),
+        ],
+    )
+    def test_system_graph_uses_the_supported_metric_value_alias(
+        self, metric_id, series_key, point_field, expected
+    ):
+        timestamp = "2026-07-30T00:00:00"
+        result = format_system_metric_graph(
+            {
+                series_key: [
+                    {
+                        "timestamp": timestamp,
+                        point_field: expected,
+                    }
+                ],
+                "traffic": [{"timestamp": timestamp, "traffic": 9}],
+            },
+            metric_id,
+        )
+
+        assert result["data"] == [
+            {
+                "timestamp": timestamp,
+                "value": expected,
+                "primary_traffic": 9,
+            }
+        ]
+
     def test_graph_limits_throw_instead_of_returning_partial_results(self):
         assert GRAPH_READ_SETTINGS["read_overflow_mode"] == "throw"
         assert GRAPH_READ_SETTINGS["result_overflow_mode"] == "throw"
         assert GRAPH_READ_SETTINGS["timeout_overflow_mode"] == "throw"
+
+    def test_system_graph_reads_only_requested_raw_metric_with_bounded_headroom(self):
+        calls = []
+
+        class Result:
+            data = []
+            columns = []
+
+        class Analytics:
+            def execute_ch_query(self, query, params, timeout_ms, settings):
+                calls.append((query, params, timeout_ms, settings))
+                return Result()
+
+        fetch_system_metric_graph_ch(
+            analytics=Analytics(),
+            project_id=PROJECT_ID,
+            filters=[
+                _date_filter(),
+                _attr_filter("prompt_slug", op="equals", value="agent_2"),
+            ],
+            interval="day",
+            metric_id="latency",
+            observe_type="span",
+        )
+
+        assert len(calls) == 1
+        query, _, timeout_ms, settings = calls[0]
+        assert "FROM spans" in query
+        assert "avg(latency_ms) AS avg_latency" in query
+        assert "count() AS traffic_count" in query
+        assert "0 AS total_tokens" in query
+        assert "0 AS avg_cost" in query
+        assert "0 AS prompt_tokens" in query
+        assert "0 AS completion_tokens" in query
+        assert "0 AS error_rate" in query
+        assert "sum(total_tokens)" not in query
+        assert "avg(cost)" not in query
+        assert "sum(prompt_tokens)" not in query
+        assert "sum(completion_tokens)" not in query
+        assert "countIf(status = 'ERROR')" not in query
+        assert timeout_ms == SYSTEM_GRAPH_READ_TIMEOUT_MS == 1250
+        assert settings == SYSTEM_GRAPH_READ_SETTINGS
+        assert settings["max_memory_usage"] == 256 * 1024 * 1024
+        assert settings["max_bytes_to_read"] == 1536 * 1024 * 1024
 
     @pytest.mark.parametrize(
         ("exc", "expected_code"),

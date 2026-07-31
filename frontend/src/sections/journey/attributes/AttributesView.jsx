@@ -11,6 +11,7 @@ const AttributesView = () => {
   const { id: projectId } = useParams();
   const [selectedGroup, setSelectedGroup] = useState(null);
   const [selectedKey, setSelectedKey] = useState(null);
+  const [selectedType, setSelectedType] = useState(null);
 
   const { data: attributeDiscovery, isLoading } = useQuery({
     queryKey: ["span-attribute-keys", projectId],
@@ -63,6 +64,11 @@ const AttributesView = () => {
     if (!selectedGroup) return attributeKeys;
     return groups.find((g) => g.prefix === selectedGroup)?.keys || [];
   }, [selectedGroup, groups, attributeKeys]);
+
+  const handleSelectKey = (key, type) => {
+    setSelectedKey(key);
+    setSelectedType(type || null);
+  };
 
   if (isLoading) {
     return (
@@ -124,10 +130,14 @@ const AttributesView = () => {
         <AttributeKeyList
           keys={filteredKeys}
           selectedKey={selectedKey}
-          onSelectKey={setSelectedKey}
+          onSelectKey={handleSelectKey}
           allowManualEntry
         />
-        <AttributeDetail projectId={projectId} attributeKey={selectedKey} />
+        <AttributeDetail
+          projectId={projectId}
+          attributeKey={selectedKey}
+          attributeType={selectedType}
+        />
       </Box>
     </Box>
   );

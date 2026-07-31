@@ -24,16 +24,25 @@ def test_historical_span_query_samples_before_bounded_top_k():
 
     assert "LIMIT 1 BY id" not in compact_sql
     assert "FROM spans FINAL" in compact_sql
-    assert "ORDER BY toStartOfMinute(eval_order_start_time) DESC, id" in compact_sql
+    assert compact_sql.count("ORDER BY toStartOfMinute(start_time) DESC, id") == 1
+    assert compact_sql.count("LIMIT %(id_limit)s") == 1
     assert (
         "modulo(cityHash64(%(id_sampling_salt)s, toString(id)), 100) "
         "< %(id_sampling_rate)s"
     ) in compact_sql
     assert "lower(observation_type) IN" in compact_sql
     assert params["id_limit"] == 200
-    assert params["lim"] == 200
+    assert "lim" not in params
     assert params["id_sampling_salt"] == "task-1"
     assert params["id_sampling_rate"] == 50.0
+
+
+def test_eval_task_sort_spills_before_selector_memory_cap():
+    settings = row_resolver._EVAL_TASK_READ_SETTINGS
+
+    assert settings["max_memory_usage"] == 256 * 1024 * 1024
+    assert settings["max_bytes_before_external_sort"] == 128 * 1024 * 1024
+    assert 0 < settings["max_bytes_before_external_sort"] < settings["max_memory_usage"]
 
 
 def test_continuous_span_query_streams_without_full_window_sort():
@@ -88,10 +97,35 @@ def test_trace_task_preview_filters_final_status_on_scoped_root_row():
     assert "project_id = %(project_id)s" in compact_sql
     assert "start_time >= %(start_date)s" in compact_sql
     assert "start_time < %(end_date)s" in compact_sql
-    assert (
-        "ORDER BY toStartOfMinute(eval_order_start_time) DESC, trace_id" in compact_sql
-    )
+    assert compact_sql.count("ORDER BY toStartOfMinute(start_time) DESC, trace_id") == 1
+    assert compact_sql.count("LIMIT %(id_limit)s") == 1
     assert params["project_id"] == "11111111-1111-1111-1111-111111111111"
+
+
+def test_trace_legacy_observation_type_keeps_required_outer_filter():
+    sql, params = row_resolver._build_sample_query(
+        project_id="11111111-1111-1111-1111-111111111111",
+        row_type=RowType.TRACES,
+        salt="task-legacy-observation-type",
+        sampling_rate=100,
+        filters={"observation_type": ["llm"]},
+        limit=10,
+    )
+    compact_sql = " ".join(sql.split())
+
+    assert compact_sql.count("ORDER BY toStartOfMinute(start_time) DESC, trace_id") == 1
+    assert (
+        compact_sql.count(
+            "ORDER BY toStartOfMinute(eval_order_start_time) DESC, trace_id"
+        )
+        == 1
+    )
+    assert compact_sql.count("LIMIT %(id_limit)s") == 1
+    assert compact_sql.count("LIMIT %(lim)s") == 1
+    assert "trace_id IN (SELECT trace_id FROM spans" in compact_sql
+    assert params["id_limit"] == 20
+    assert params["lim"] == 20
+    assert params["otypes"] == ("llm",)
 
 
 @pytest.mark.parametrize(
@@ -136,16 +170,16 @@ def test_task_identity_siblings_and_created_at_reach_bounded_v2_sql(
     assert params["id_sampling_salt"] == "task-1"
     assert params["id_sampling_rate"] == 50.0
     assert params["id_limit"] == candidate_limit
-    assert params["lim"] == candidate_limit
     if row_type in (RowType.SPANS, RowType.TRACES):
-        assert (
-            "ORDER BY toStartOfMinute(eval_order_start_time) "
-            f"DESC, {id_column}" in compact_sql
-        )
+        assert "lim" not in params
+        assert f"ORDER BY toStartOfMinute(start_time) DESC, {id_column}" in compact_sql
+        assert compact_sql.count("ORDER BY") == 1
+        assert compact_sql.count("LIMIT %(id_limit)s") == 1
+        assert "WHERE 1 = 1" not in compact_sql
     else:
+        assert params["lim"] == candidate_limit
         assert f"ORDER BY {id_column}" in compact_sql
-    assert "LIMIT %(id_limit)s" in compact_sql
-    assert "WHERE 1 = 1" in compact_sql
+        assert "WHERE 1 = 1" in compact_sql
 
 
 def test_historical_span_caller_deduplicates_and_trims(monkeypatch):
@@ -185,7 +219,7 @@ def test_historical_span_caller_deduplicates_and_trims(monkeypatch):
     ]
     assert "LIMIT 1 BY id" not in reader.sql
     assert reader.params["id_limit"] == 6
-    assert reader.params["lim"] == 6
+    assert "lim" not in reader.params
     assert reader.closed is True
 
 
@@ -407,9 +441,7 @@ def test_historical_trace_any_span_filter_verifies_original_window(
         spans_limit=1,
     )
 
-    assert list(row_resolver.iter_desired_rows(task)) == [
-        ["trace-with-remote-child"]
-    ]
+    assert list(row_resolver.iter_desired_rows(task)) == [["trace-with-remote-child"]]
 
     assert len(reader.calls) == 3
     seed_sql, seed_params, seed_settings = reader.calls[1]
@@ -771,8 +803,8 @@ def test_whole_window_and_forced_fallback_select_identical_order(monkeypatch):
 
     assert whole_ids == fallback_ids == ["span-b", "span-c", "span-a"]
     assert (
-        "ORDER BY toStartOfMinute(eval_order_start_time) DESC, id"
-        in whole_reader.calls[0][0]
+        whole_reader.calls[0][0].count("ORDER BY toStartOfMinute(start_time) DESC, id")
+        == 1
     )
     assert all(
         "SELECT DISTINCT id" in sql and "ORDER BY id" in sql
@@ -846,7 +878,8 @@ def test_whole_window_candidate_cap_with_enough_unique_ids_does_not_slice(
 
         def stream_query(self, sql, params, *, batch_size, settings):
             self.calls += 1
-            assert params["lim"] == 6
+            assert params["id_limit"] == 6
+            assert "lim" not in params
             yield ["span-a", "span-a", "span-b", "span-b", "span-c", "span-c"]
 
         def close(self):

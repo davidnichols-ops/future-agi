@@ -136,6 +136,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         *,
         slice_end: Any = None,
         limit: int | None = None,
+        before_start_time: Any = None,
+        before_id: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Build the Phase-1 query for paginated span data.
 
@@ -150,6 +152,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             limit: Optional raw-prefix limit for this slice. The bounded
                 executor lowers it as rows are collected so it never transfers
                 more than the one global prefix needed for the requested page.
+            before_start_time: Optional keyset timestamp for continuing a
+                saturated slice in canonical newest-first order.
+            before_id: Span-id tiebreak paired with ``before_start_time``.
+                Both keyset values are required together.
 
         The regular ``start_date``/``end_date`` params remain bound to the full
         requested window so the count query still describes the full request.
@@ -183,6 +189,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
 
         self.params.pop("slice_start", None)
         self.params.pop("slice_end", None)
+        self.params.pop("keyset_start_time", None)
+        self.params.pop("keyset_id", None)
         slice_fragment = ""
         if since is not None:
             self.params["slice_start"] = since
@@ -192,6 +200,24 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 slice_fragment += " AND start_time < %(slice_end)s"
         elif slice_end is not None:
             raise ValueError("slice_end requires since")
+
+        if (before_start_time is None) != (before_id is None):
+            raise ValueError(
+                "before_start_time and before_id must be provided together"
+            )
+        keyset_fragment = ""
+        if before_start_time is not None:
+            self.params["keyset_start_time"] = before_start_time
+            self.params["keyset_id"] = str(before_id)
+            keyset_fragment = """
+              AND (
+                  start_time < %(keyset_start_time)s
+                  OR (
+                      start_time = %(keyset_start_time)s
+                      AND id < %(keyset_id)s
+                  )
+              )
+            """
 
         # Prefix-fetch pagination: read the sorted prefix [0, offset +
         # 2*page_size) in ONE bounded top-K pass and let the view dedup by
@@ -268,6 +294,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
               AND start_time >= %(start_date)s
               AND start_time < %(end_date)s
               {slice_fragment}
+              {keyset_fragment}
               {pv_fragment}
               {filter_fragment}
             """
@@ -341,6 +368,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
           AND start_time >= %(start_date)s
           AND start_time < %(end_date)s
           {slice_fragment}
+          {keyset_fragment}
           {end_user_fragment}
           {pv_fragment}
           {filter_fragment}
@@ -460,10 +488,11 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                span_attr_num AS attrs_number,
                span_attr_bool AS attrs_bool
         FROM {self.TABLE}
-        PREWHERE id IN %(content_span_ids)s
-        WHERE {self.project_filter_sql()} AND is_deleted = 0
+        PREWHERE {self.project_filter_sql()}
+          AND id IN %(content_span_ids)s
           AND start_time >= %(start_date)s - INTERVAL 1 DAY
           AND start_time < %(end_date)s + INTERVAL 1 DAY
+        WHERE is_deleted = 0
         """
         return query, params
 
@@ -490,6 +519,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         params = dict(self.params)
         params.pop("slice_start", None)
         params.pop("slice_end", None)
+        params.pop("keyset_start_time", None)
+        params.pop("keyset_id", None)
         params.update(extra_params)
 
         filter_fragment = f"AND {extra_where}" if extra_where else ""

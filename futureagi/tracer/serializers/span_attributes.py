@@ -24,6 +24,10 @@ class SpanAttributeValuesQuerySerializer(serializers.Serializer):
 class SpanAttributeDetailQuerySerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
     key = serializers.CharField()
+    type = serializers.ChoiceField(
+        choices=["string", "number", "boolean"],
+        required=False,
+    )
 
 
 class SpanAttributeKeySerializer(serializers.Serializer):

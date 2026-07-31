@@ -840,10 +840,10 @@ class TestObservationSpanListSpansObserveAPI:
         )
         assert response.status_code == status.HTTP_200_OK
 
-    def test_task_preview_skips_count_content_and_metric_queries(
+    def test_unfiltered_task_preview_uses_bounded_prefix_and_skips_enrichment(
         self, auth_client, observe_project, monkeypatch
     ):
-        """A cheap exact whole-window read fills the task preview.
+        """An unfiltered preview uses a cheap exact whole-window prefix read.
 
         Exact counts, content hydration, eval discovery, and annotation pivots
         are grid concerns. A healthy low-volume tenant can prove the requested
@@ -903,15 +903,6 @@ class TestObservationSpanListSpansObserveAPI:
                 "filters": json.dumps(
                     [
                         {
-                            "column_id": "prompt_slug",
-                            "filter_config": {
-                                "filter_type": "text",
-                                "filter_op": "equals",
-                                "filter_value": "synthetic_prompt_v2",
-                                "col_type": "SPAN_ATTRIBUTE",
-                            },
-                        },
-                        {
                             "column_id": "created_at",
                             "filter_config": {
                                 "filter_type": "datetime",
@@ -932,7 +923,8 @@ class TestObservationSpanListSpansObserveAPI:
         assert len(calls) == 1
         query, params, timeout_ms, settings = calls[0]
         assert 0 < timeout_ms <= 750
-        assert settings["max_threads"] == 2
+        assert settings["max_threads"] == 1
+        assert settings["max_block_size"] == 8192
         assert settings["max_result_rows"] == 30
         assert "ORDER BY start_time DESC" in query
         assert "start_time >= %(slice_start)s" in query
@@ -1057,7 +1049,20 @@ class TestObservationSpanListSpansObserveAPI:
 
         def fake_execute(self, query, params=None, timeout_ms=10000, settings=None):
             calls.append((query, params, timeout_ms, settings))
-            if "ORDER BY start_time DESC" in query:
+            if "content_span_ids" in (params or {}):
+                data = [
+                    {
+                        "id": span_id,
+                        "input": "",
+                        "output": "",
+                        "attributes_extra": {},
+                        "attrs_string": {},
+                        "attrs_number": {},
+                        "attrs_bool": {},
+                    }
+                    for span_id in params["content_span_ids"]
+                ]
+            elif "ORDER BY start_time DESC" in query:
                 data = [
                     {
                         "id": f"grid-span-{index}",
@@ -1127,6 +1132,12 @@ class TestObservationSpanListSpansObserveAPI:
 
         assert response.status_code == status.HTTP_200_OK
         assert not any("count()" in query.lower() for query, *_ in calls)
+        content_calls = [
+            call for call in calls if "SELECT id, input, output" in call[0]
+        ]
+        assert len(content_calls) == 1
+        assert content_calls[0][3]["max_threads"] == 1
+        assert content_calls[0][3]["max_block_size"] == 8192
         result = get_result(response)
         assert len(result["table"]) == 2
         assert result["metadata"]["total_rows"] == 4

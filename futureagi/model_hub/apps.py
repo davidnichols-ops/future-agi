@@ -24,9 +24,24 @@ def startup_db_mutations_disabled() -> bool:
 
 
 def guarded_management_command(argv: list[str]) -> str | None:
-    if len(argv) < 2 or os.path.basename(argv[0]) != "manage.py":
+    if not argv:
         return None
-    command = argv[1]
+
+    executable = os.path.basename(argv[0])
+    command: str | None = None
+    if executable == "manage.py" and len(argv) >= 2:
+        command = argv[1]
+    elif executable in {"django-admin", "django-admin.py"} and len(argv) >= 2:
+        command = argv[1]
+    elif (
+        executable.startswith("python")
+        and len(argv) >= 4
+        and argv[1:3] == ["-m", "django"]
+    ):
+        command = argv[3]
+
+    if command is None:
+        return None
     if command in STARTUP_SAFE_MANAGEMENT_COMMANDS:
         return None
     return command

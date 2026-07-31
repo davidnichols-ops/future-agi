@@ -21,6 +21,18 @@ GRAPH_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
 }
 
+# Raw system-metric graphs are the one graph shape that must aggregate a
+# project/time slice of ``spans`` after applying arbitrary row predicates.
+# Production evidence shows this shape staying below the 256 MiB memory cap
+# while narrowly exhausting the generic 750 ms / 1 GiB read limits. Keep eval
+# and annotation graphs on the tighter defaults; grant only this shape bounded
+# headroom after the builder has pruned unused metric columns.
+SYSTEM_GRAPH_READ_TIMEOUT_MS = 1250
+SYSTEM_GRAPH_READ_SETTINGS = {
+    **GRAPH_READ_SETTINGS,
+    "max_bytes_to_read": 1536 * 1024 * 1024,
+}
+
 
 def degraded_graph_response(metric_id: str, exc: Exception) -> dict[str, Any]:
     """Return a safe, machine-readable graph failure without leaking CH text."""
@@ -127,19 +139,50 @@ def _format_eval_graph_response(
     }
 
 
+_SYSTEM_METRIC_GRAPH_FIELDS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "latency": ("latency", ("value", "latency")),
+    "tokens": ("tokens", ("value", "tokens")),
+    "total_tokens": ("total_tokens", ("value", "tokens")),
+    "cost": ("cost", ("value", "cost")),
+    "traffic": ("traffic", ("traffic", "value")),
+    "prompt_tokens": ("prompt_tokens", ("value", "prompt_tokens")),
+    "input_tokens": ("input_tokens", ("value", "prompt_tokens")),
+    "completion_tokens": ("completion_tokens", ("value", "completion_tokens")),
+    "output_tokens": ("output_tokens", ("value", "completion_tokens")),
+    "error_rate": ("error_rate", ("value", "error_rate")),
+}
+
+
+def _metric_point_value(point: dict[str, Any], fields: tuple[str, ...]) -> Any:
+    for field in fields:
+        if field in point and point[field] is not None:
+            return point[field]
+    return 0
+
+
 def format_system_metric_graph(
     ch_data: dict[str, list[dict[str, Any]]], metric_id: str
 ) -> dict[str, Any]:
-    metric_key = metric_id if metric_id in ch_data else "latency"
+    normalized_metric = str(metric_id or "").strip().lower()
+    metric_key, value_fields = _SYSTEM_METRIC_GRAPH_FIELDS.get(
+        normalized_metric,
+        (
+            normalized_metric if normalized_metric in ch_data else "latency",
+            ("value", normalized_metric),
+        ),
+    )
     metric_points = ch_data.get(metric_key, [])
     traffic_points = ch_data.get("traffic", [])
-    traffic_by_ts = {t.get("timestamp"): t.get("traffic", 0) for t in traffic_points}
+    traffic_by_ts = {
+        point.get("timestamp"): _metric_point_value(point, ("traffic", "value"))
+        for point in traffic_points
+    }
     return {
         "metric_name": metric_id,
         "data": [
             {
                 "timestamp": p.get("timestamp"),
-                "value": p.get("value", 0),
+                "value": _metric_point_value(p, value_fields),
                 "primary_traffic": traffic_by_ts.get(p.get("timestamp"), 0),
             }
             for p in metric_points
@@ -170,7 +213,7 @@ def fetch_system_metric_graph_ch(
     interval: str,
     metric_id: str,
     observe_type: str = "trace",
-    timeout_ms: int = GRAPH_READ_TIMEOUT_MS,
+    timeout_ms: int = SYSTEM_GRAPH_READ_TIMEOUT_MS,
 ) -> dict[str, Any]:
     builder = TimeSeriesQueryBuilder(
         project_id=str(project_id),
@@ -178,13 +221,14 @@ def fetch_system_metric_graph_ch(
         interval=interval,
         observe_type=observe_type,
         metric_id=metric_id,
+        single_metric=True,
     )
     query, params = builder.build()
     result = analytics.execute_ch_query(
         query,
         params,
         timeout_ms=timeout_ms,
-        settings=GRAPH_READ_SETTINGS,
+        settings=SYSTEM_GRAPH_READ_SETTINGS,
     )
     ch_data = builder.format_result(result.data, result.columns or [])
     response = format_system_metric_graph(ch_data, metric_id)

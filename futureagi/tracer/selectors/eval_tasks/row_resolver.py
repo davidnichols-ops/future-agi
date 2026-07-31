@@ -52,6 +52,11 @@ _EVAL_TASK_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
     "max_threads": 2,
     "max_memory_usage": 256 * 1024 * 1024,
+    # The activity-wide eval guardrail uses a 2 GiB external-sort threshold
+    # under its ordinary 4 GiB memory cap. This selector intentionally tightens
+    # the cap to 256 MiB, so it must also lower the spill threshold; otherwise
+    # the bounded top-K reaches code 241 before external sorting can start.
+    "max_bytes_before_external_sort": 128 * 1024 * 1024,
     "max_bytes_to_read": 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
 }
@@ -193,7 +198,7 @@ def _resolve_bounded_historical_span_ids(
         if not is_read_budget_error(exc):
             raise
     else:
-        candidate_limit = int(params.get("lim") or 0)
+        candidate_limit = int(params.get("lim") or params.get("id_limit") or 0)
         # Reaching the requested unique-id cap proves the canonical prefix.
         # Duplicate-margin exhaustion matters only when it did not.
         if len(whole_window_prefix) >= limit:
@@ -860,6 +865,20 @@ def _build_sample_query(
             f"AND project_id = %(ot_project_id)s AND is_deleted = 0"
             f"{root_pred})"
         )
+
+    # For a bounded historical span/trace selector, sampling, canonical
+    # newest-minute ordering, and the duplicate-margin LIMIT are already pushed
+    # into build_id_query(). With no legacy outer predicate left to apply, the
+    # wrapper below would perform the same ORDER BY + LIMIT a second time over
+    # as many as 2 * spans_limit rows. Besides being redundant, that second
+    # top-K can hold enough String ids to trip the selector's 256 MiB cap.
+    #
+    # Return the builder query directly. stream_query() deliberately consumes
+    # only its first column, so the private eval_order_start_time ordering
+    # column remains invisible to callers. Slice queries still need DISTINCT,
+    # and trace/session/voice queries with an outer predicate keep the wrapper.
+    if recent_minute_order and not ot_pred:
+        return inner_sql, params
 
     result_limit = (
         limit

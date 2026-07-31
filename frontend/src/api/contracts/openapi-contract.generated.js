@@ -8701,6 +8701,17 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "type": "string",
               "minLength": 1
             }
+          },
+          "type": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "string",
+                "number",
+                "boolean"
+              ]
+            }
           }
         },
         "responses": {

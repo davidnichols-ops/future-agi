@@ -471,8 +471,9 @@ class TestSpanAttributeKeysPartitionPruning:
     behind ``observation_type``/``service_name`` in the sort key, so an ordered
     top-N reads the whole window (materializing the fat ``attrs_*`` maps) before
     ``LIMIT`` applies -> Code 396 / Code 159 on high-volume projects. Without the
-    ORDER BY, ``project_id`` leading the sort key lets ``LIMIT 10000`` bound the
-    scan. Also pin that only the Map ``.keys`` subcolumn is read (never values).
+    ORDER BY, ``project_id`` leading the sort key lets the small per-map LIMIT
+    bound the scan. Also pin that only the Map ``.keys`` subcolumn is read
+    (never values).
     """
 
     def _capture_sql(self, monkeypatch, *, recent_days=7) -> str:
@@ -505,7 +506,7 @@ class TestSpanAttributeKeysPartitionPruning:
         sql = self._capture_sql(monkeypatch, recent_days=7)
         # start_time is the partition key -> CH can prune to the window.
         assert "start_time >= now() - toIntervalDay" in sql
-        # The recency ORDER BY is dropped so LIMIT 10000 bounds the scan.
+        # The recency ORDER BY is dropped so the sample LIMIT bounds the scan.
         assert "ORDER BY start_time" not in sql
 
     def test_reads_keys_subcolumn_not_whole_map(self, monkeypatch):
@@ -519,8 +520,11 @@ class TestSpanAttributeKeysPartitionPruning:
 
     def test_preserves_limit_and_type_labels(self, monkeypatch):
         sql = self._capture_sql(monkeypatch, recent_days=7)
-        # The per-map LIMIT and type labels are unchanged by the fix.
-        assert "LIMIT 10000" in sql
+        # Wide maps made the old 10k-row sample exceed the endpoint's 256 MiB
+        # budget. Discovery is explicitly sampled, so keep the smaller cap.
+        # Three per-map samples plus the existing outer catalog cap.
+        assert sql.count("LIMIT 1000") == 4
+        assert "LIMIT 10000" not in sql
         assert "'string'" in sql
         assert "'number'" in sql
         assert "'boolean'" in sql
@@ -533,12 +537,12 @@ class TestSpanAttributeKeysPartitionPruning:
 
     def test_full_project_discovery_skips_order_by_to_short_circuit(self, monkeypatch):
         # recent_days=None (dashboard/metrics filter discovery): no window, so
-        # the ORDER BY must be dropped or LIMIT 10000 can't short-circuit and
+        # the ORDER BY must be dropped or the sample LIMIT can't short-circuit and
         # CH scans the whole project (~477k rows) instead of ~15k.
         sql = self._capture_sql(monkeypatch, recent_days=None)
         assert "start_time >= now()" not in sql
         assert "ORDER BY start_time" not in sql
-        assert "LIMIT 10000" in sql
+        assert sql.count("LIMIT 1000") == 4
 
 
 @pytest.mark.integration

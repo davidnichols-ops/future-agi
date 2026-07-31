@@ -23,8 +23,10 @@ vi.mock("src/utils/axios", () => ({
 }));
 
 vi.mock("../AttributeDetail", () => ({
-  default: ({ attributeKey }) => (
-    <div>Selected detail: {attributeKey || "none"}</div>
+  default: ({ attributeKey, attributeType }) => (
+    <div>
+      Selected detail: {attributeKey || "none"} ({attributeType || "untyped"})
+    </div>
   ),
 }));
 
@@ -76,8 +78,26 @@ describe("AttributesView", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByText("Selected detail: custom.status"),
+        screen.getByText("Selected detail: custom.status (untyped)"),
       ).toBeInTheDocument(),
     );
+  });
+
+  it("retains the selected picker type for the detail request", async () => {
+    axios.get.mockResolvedValue({
+      data: {
+        result: [{ key: "final_status", type: "string" }],
+        query_complete: true,
+        query_status: "complete",
+      },
+    });
+
+    renderView();
+
+    await userEvent.click(await screen.findByText("final_status"));
+
+    expect(
+      screen.getByText("Selected detail: final_status (string)"),
+    ).toBeInTheDocument();
   });
 });

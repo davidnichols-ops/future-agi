@@ -20,11 +20,15 @@ import pytest
 
 @pytest.mark.unit
 class TestTracesOfSessionPagination:
-    def test_all_span_attribute_types_use_candidate_scan(self):
+    def test_span_attribute_scan_routing(self):
+        from tracer.services.clickhouse.query_service import (
+            GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES,
+        )
         from tracer.views.trace import (
             _candidate_seed_filters,
             _has_only_time_filters,
             _requires_candidate_filter_scan,
+            _requires_root_attribute_slice_scan,
         )
 
         for filter_type, value in (
@@ -45,6 +49,19 @@ class TestTracesOfSessionPagination:
                     }
                 ]
             )
+
+        for root_attribute in GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES:
+            root_filter = {
+                "column_id": root_attribute,
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "completed",
+                },
+            }
+            assert not _requires_candidate_filter_scan([root_filter])
+            assert _requires_root_attribute_slice_scan([root_filter])
 
         assert not _requires_candidate_filter_scan(
             [
@@ -141,12 +158,9 @@ class TestTracesOfSessionPagination:
             },
         }
 
-        assert (
-            _candidate_seed_filters(
-                [*root_filters, final_status_filter, expensive_attr]
-            )
-            == root_filters
-        )
+        assert _candidate_seed_filters(
+            [*root_filters, final_status_filter, expensive_attr]
+        ) == [*root_filters, final_status_filter]
 
         child_membership_status = {
             "column_id": "status",
@@ -254,8 +268,12 @@ class TestTracesOfSessionPagination:
                         if str(trace_id) in by_id
                     ]
                 )
-            # Phase-1 paginated trace list (default light-column SELECT).
-            if "trace_session_id" in q and "uniq(" not in q and "AS cid" not in q:
+            # Phase-1 paginated trace list (full row or narrow candidate seed).
+            if (
+                "ORDER BY start_time DESC" in q
+                and "uniq(" not in q
+                and "AS cid" not in q
+            ):
                 return SimpleNamespace(data=list(trace_rows))
             return SimpleNamespace(data=[])
 
@@ -362,10 +380,191 @@ class TestTracesOfSessionPagination:
         assert seed_call.kwargs["timeout_ms"] == 250
         assert hydrate_call.kwargs["timeout_ms"] <= 750
         assert "candidate_trace_ids" in hydrate_call.args[1]
-        assert seed_call.kwargs["settings"]["max_threads"] == 2
-        assert hydrate_call.kwargs["settings"]["max_threads"] == 2
+        seed_select = seed_call.args[0].split("FROM", 1)[0]
+        assert "trace_id" in seed_select
+        assert "start_time" in seed_select
+        assert "trace_name" not in seed_select
+        assert "prompt_tokens" not in seed_select
+        assert seed_call.kwargs["settings"]["max_threads"] == 1
+        assert seed_call.kwargs["settings"]["max_block_size"] == 8192
+        assert hydrate_call.kwargs["settings"]["max_threads"] == 1
+        assert hydrate_call.kwargs["settings"]["max_block_size"] == 8192
         mock_cfg.objects.filter.assert_not_called()
         mock_labels.assert_not_called()
+
+    def test_guaranteed_root_attribute_preview_uses_bounded_root_slice(self):
+        from tracer.services.clickhouse.query_service import (
+            GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES,
+        )
+        from tracer.services.clickhouse.v2.query_builders.trace_list import (
+            TraceListQueryBuilderV2,
+        )
+
+        view = self._make_view()
+        request = self._make_request(page_size=10)
+        now = datetime(2026, 7, 30, 12)
+        rows = [
+            self._trace_row(uuid.uuid4(), now - timedelta(seconds=index))
+            for index in range(30)
+        ]
+        calls = []
+
+        def _execute(query, params=None, **kwargs):
+            params = dict(params or {})
+            calls.append((query, params, kwargs))
+            if "candidate_trace_ids" not in params:
+                return SimpleNamespace(data=list(rows))
+            by_id = {row["trace_id"]: row for row in rows}
+            return SimpleNamespace(
+                data=[
+                    by_id[str(trace_id)]
+                    for trace_id in params["candidate_trace_ids"]
+                    if str(trace_id) in by_id
+                ]
+            )
+
+        analytics = mock.MagicMock()
+        analytics.execute_ch_query.side_effect = _execute
+        root_attribute = next(iter(GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES))
+
+        with mock.patch(
+            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+            return_value=TraceListQueryBuilderV2,
+        ):
+            with mock.patch("tracer.views.trace.timezone.now", return_value=now):
+                status, payload = view._list_traces_of_session_clickhouse(
+                    request,
+                    project_id=str(uuid.uuid4()),
+                    validated_data={
+                        "filters": [
+                            {
+                                "column_id": root_attribute,
+                                "filter_config": {
+                                    "col_type": "SPAN_ATTRIBUTE",
+                                    "filter_type": "text",
+                                    "filter_op": "equals",
+                                    "filter_value": "completed",
+                                },
+                            },
+                            {
+                                "column_id": "start_time",
+                                "filter_config": {
+                                    "col_type": "SYSTEM_METRIC",
+                                    "filter_type": "datetime",
+                                    "filter_op": "between",
+                                    "filter_value": [
+                                        now - timedelta(days=7),
+                                        now,
+                                    ],
+                                },
+                            },
+                        ],
+                        "page_number": 0,
+                        "page_size": 10,
+                        "preview": True,
+                    },
+                    analytics=analytics,
+                    org_project_ids=None,
+                    org=request.organization,
+                )
+
+        assert status == "ok"
+        assert len(payload["table"]) == 10
+        assert [row["trace_id"] for row in payload["table"]] == [
+            row["trace_id"] for row in rows[:10]
+        ]
+        assert payload["metadata"]["total_rows_is_lower_bound"] is True
+        assert payload["metadata"].get("query_complete", True) is True
+        assert len(calls) == 2
+
+        seed_query, seed_params, seed_kwargs = calls[0]
+        assert "candidate_trace_ids" not in seed_params
+        assert seed_params["start_date"] == now - timedelta(minutes=5)
+        assert seed_params["end_date"] == now
+        assert f"mapContains(attrs_string, '{root_attribute}')" in seed_query
+        assert "trace_id IN (SELECT trace_id FROM spans" not in seed_query
+        assert seed_kwargs["timeout_ms"] <= 750
+        assert seed_kwargs["settings"]["max_threads"] == 1
+        assert seed_kwargs["settings"]["max_block_size"] == 8192
+
+        probe_query, probe_params, probe_kwargs = calls[1]
+        assert len(probe_params["candidate_trace_ids"]) == len(rows)
+        assert f"mapContains(attrs_string, '{root_attribute}')" in probe_query
+        assert "trace_id IN (SELECT trace_id FROM spans" not in probe_query
+        assert probe_kwargs["timeout_ms"] <= 750
+
+    def test_guaranteed_root_attribute_slice_timeout_is_honestly_degraded(self):
+        from tracer.services.clickhouse.v2.query_builders.trace_list import (
+            TraceListQueryBuilderV2,
+        )
+
+        view = self._make_view()
+        request = self._make_request(page_size=10)
+        now = datetime(2026, 7, 30, 12)
+        calls = []
+
+        def _execute(query, params=None, **kwargs):
+            calls.append((query, dict(params or {}), kwargs))
+            raise TimeoutError("bounded root slice exceeded its read budget")
+
+        analytics = mock.MagicMock()
+        analytics.execute_ch_query.side_effect = _execute
+        with (
+            mock.patch(
+                "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+                return_value=TraceListQueryBuilderV2,
+            ),
+            mock.patch("tracer.views.trace.timezone.now", return_value=now),
+        ):
+            status, payload = view._list_traces_of_session_clickhouse(
+                request,
+                project_id=str(uuid.uuid4()),
+                validated_data={
+                    "filters": [
+                        {
+                            "column_id": "final_status",
+                            "filter_config": {
+                                "col_type": "SPAN_ATTRIBUTE",
+                                "filter_type": "text",
+                                "filter_op": "equals",
+                                "filter_value": "completed",
+                            },
+                        },
+                        {
+                            "column_id": "start_time",
+                            "filter_config": {
+                                "col_type": "SYSTEM_METRIC",
+                                "filter_type": "datetime",
+                                "filter_op": "between",
+                                "filter_value": [
+                                    now - timedelta(days=7),
+                                    now,
+                                ],
+                            },
+                        },
+                    ],
+                    "page_number": 0,
+                    "page_size": 10,
+                    "preview": True,
+                },
+                analytics=analytics,
+                org_project_ids=None,
+                org=request.organization,
+            )
+
+        assert status == "ok"
+        assert payload["table"] == []
+        assert payload["metadata"]["total_rows_is_lower_bound"] is True
+        assert payload["metadata"]["query_complete"] is False
+        assert payload["metadata"]["query_status"] == "degraded"
+        assert payload["metadata"]["query_error_code"] == "read_budget_exceeded"
+        assert len(calls) == 1
+        query, params, kwargs = calls[0]
+        assert params["start_date"] == now - timedelta(minutes=5)
+        assert params["end_date"] == now
+        assert "mapContains(attrs_string, 'final_status')" in query
+        assert "trace_id IN (SELECT trace_id FROM spans" not in query
+        assert kwargs["timeout_ms"] <= 750
 
     def test_text_filter_preview_uses_bounded_trace_id_candidates(self):
         """A generic string attribute never builds a project-wide membership set."""
@@ -398,6 +597,7 @@ class TestTracesOfSessionPagination:
             ids = list(params["candidate_trace_ids"])
             assert len(ids) == 50
             assert query.count("candidate_trace_ids") >= 2
+            assert "trace_id IN (SELECT trace_id FROM spans FINAL" in query
             by_id = {row["trace_id"]: row for row in candidate_rows}
             # Deliberately reverse the CH response. The view must restore the
             # authoritative newest-root candidate order before paginating.
@@ -562,8 +762,8 @@ class TestTracesOfSessionPagination:
                             },
                         },
                         {
-                            "column_id": "final_status",
-                            "display_name": "final_status",
+                            "column_id": "arbitrary_status",
+                            "display_name": "arbitrary_status",
                             "filter_config": {
                                 "col_type": "SPAN_ATTRIBUTE",
                                 "filter_type": "text",

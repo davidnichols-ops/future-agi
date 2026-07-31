@@ -17389,13 +17389,15 @@ export const getApiTracesSpanAttributeDetailListUrl = (params: ApiTracesSpanAttr
 }
 
 /**
- * Determines the attribute type by probing which map contains the key, then
-returns type-appropriate statistics:
+ * Uses a validated caller-supplied type when available. Legacy callers are
+supported by bounded per-map existence probes, with mixed types reported
+as ambiguous instead of selecting whichever row ClickHouse returns first.
+It then returns type-appropriate statistics:
   - string: top values with percentages
   - number: min, max, avg, p50, p95
   - boolean: true/false distribution
 
-GET /api/traces/span-attribute-detail/?project_id=<uuid>&key=<attr_key>
+GET /api/traces/span-attribute-detail/?project_id=<uuid>&key=<attr_key>&type=<type>
  * @summary Full detail for a specific span attribute key.
  */
 export const apiTracesSpanAttributeDetailList = async (params: ApiTracesSpanAttributeDetailListParams, options?: RequestInit): Promise<apiTracesSpanAttributeDetailListResponse> => {

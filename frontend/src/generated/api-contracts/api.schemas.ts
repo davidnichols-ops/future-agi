@@ -24366,7 +24366,17 @@ project_id: string;
  * @minLength 1
  */
 key: string;
+type?: ApiTracesSpanAttributeDetailListType;
 };
+
+export type ApiTracesSpanAttributeDetailListType = typeof ApiTracesSpanAttributeDetailListType[keyof typeof ApiTracesSpanAttributeDetailListType];
+
+
+export const ApiTracesSpanAttributeDetailListType = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
 
 export type ApiTracesSpanAttributeKeysListParams = {
 project_id: string;

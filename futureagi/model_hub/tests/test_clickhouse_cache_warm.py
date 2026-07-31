@@ -78,6 +78,19 @@ def test_management_command_guard_allows_only_startup_commands(argv):
     assert guarded_management_command(argv) is None
 
 
+@pytest.mark.parametrize(
+    ("argv", "command"),
+    [
+        (["django-admin", "migrate"], "migrate"),
+        (["/usr/local/bin/django-admin.py", "makemigrations"], "makemigrations"),
+        (["python", "-m", "django", "migrate"], "migrate"),
+        (["python3.11", "-m", "django", "ch25_apply_schema"], "ch25_apply_schema"),
+    ],
+)
+def test_management_command_guard_covers_all_django_entrypoints(argv, command):
+    assert guarded_management_command(argv) == command
+
+
 def _warmup_sql(monkeypatch, *, drops_legacy_chain: bool) -> list[str]:
     monkeypatch.setattr(
         "tracer.services.clickhouse.schema.should_drop_legacy_chain",

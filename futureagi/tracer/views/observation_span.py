@@ -137,7 +137,26 @@ _BOUNDED_ANALYTICS_SETTINGS = {
     "result_overflow_mode": "throw",
 }
 
-_SPAN_FILTER_SCAN_BUDGET_MS = 750
+# Span pages are the only list shape without a projection ordered by
+# (project_id, start_time). Use one thread and one physical index-granule-sized
+# block for their prefix and fat-column reads: the process-wide driver default
+# is 100k rows, which lets a single query hold several 64 MiB fat-row granules
+# at once and narrowly breach the 256 MiB cap.
+_SPAN_PREFIX_READ_SETTINGS = {
+    **_BOUNDED_ANALYTICS_SETTINGS,
+    "max_threads": 1,
+    "max_block_size": 8192,
+}
+_SPAN_CONTENT_READ_SETTINGS = {
+    **_BOUNDED_ANALYTICS_SETTINGS,
+    "max_threads": 1,
+    "max_block_size": 8192,
+}
+
+# Match the trace list's bounded scan envelope while retaining a 750 ms ceiling
+# on every individual ClickHouse statement.
+_SPAN_FILTER_SCAN_BUDGET_MS = 900
+_SPAN_FILTER_QUERY_TIMEOUT_MS = 750
 _SPAN_FILTER_SCAN_MIN_SLICE = timedelta(minutes=1)
 _SPAN_FILTER_SCAN_MAX_ATTEMPTS = 16
 _SPAN_FILTER_SCAN_MIN_QUERY_MS = 25
@@ -155,16 +174,17 @@ def _execute_bounded_span_filter_prefix(
 ) -> tuple[QueryResult, bool, bool]:
     """Read a deterministic span prefix under one shared read deadline.
 
-    Map-backed text, number, and boolean predicates can exceed the per-query
-    memory cap when ClickHouse evaluates a multi-day window at once. For a
-    window wider than the bounded slice horizon, first give the exact whole-
-    window query a small part of the deadline. This preserves healthy,
-    low-volume behavior (including old matches) without making a tenant's data
-    volume change the result. If that attempt exceeds its read budget, adjacent
-    slices start at one minute and grow geometrically after completed empty or
-    sparse reads. A widened slice that exceeds a read limit is retried from the
-    exact same cursor at one minute, so no interval is skipped. Newest-to-oldest
-    concatenation exactly preserves ``ORDER BY start_time DESC, id DESC``.
+    The all-span table has no projection ordered solely by project and time, so
+    both raw Map predicates and an unfiltered multi-day top-K can exceed a
+    per-query read budget. For a window wider than the bounded slice horizon,
+    first give the exact whole-window query a small part of the deadline. This
+    preserves healthy, low-volume behavior (including old matches) without
+    making a tenant's data volume change the result. If that attempt exceeds its
+    read budget, adjacent slices start at one minute and grow geometrically
+    after completed empty or sparse reads. A widened slice that exceeds a read
+    limit is retried from the exact same cursor at one minute, so no interval is
+    skipped. Newest-to-oldest concatenation exactly preserves
+    ``ORDER BY start_time DESC, id DESC``.
 
     All slices share one wall-clock deadline.  A slice receives only the
     remaining timeout, and resource-limit failures never contribute partial
@@ -192,10 +212,11 @@ def _execute_bounded_span_filter_prefix(
             False,
         )
 
-    # Deep pages whose required deterministic prefix exceeds the endpoint's
-    # result cap cannot be proven correct under this bounded contract. Return an
-    # explicit incomplete result instead of silently serving the wrong page.
-    if prefix_limit <= 0 or prefix_limit > max_result_rows:
+    # ``max_result_rows`` is a per-statement guard, not a pagination ceiling.
+    # Deep pages continue a saturated time slice with the canonical
+    # ``(start_time, id)`` keyset below, so no individual result crosses the
+    # guard even when the deterministic prefix spans several statements.
+    if prefix_limit <= 0:
         return (
             QueryResult([], 0, "clickhouse", 0),
             False,
@@ -236,6 +257,12 @@ def _execute_bounded_span_filter_prefix(
     full_window_scanned = False
     slice_width = _SPAN_FILTER_SCAN_MIN_SLICE
     slice_horizon = _SPAN_FILTER_SCAN_MIN_SLICE * max(int(max_slices), 0)
+    keyset_start_time = None
+    keyset_id: str | None = None
+    continuation_query: str | None = None
+    continuation_base_params: dict | None = None
+    slice_row_checkpoint = 0
+    slice_seen_checkpoint: set[str] = set()
 
     # A fixed number of minute slices cannot prove an empty result or find an
     # older match in a wider window. Low-volume tenants can answer the exact
@@ -251,7 +278,7 @@ def _execute_bounded_span_filter_prefix(
         )
         if fast_attempt_ms >= _SPAN_FILTER_SCAN_MIN_QUERY_MS:
             fast_settings = {
-                **_BOUNDED_ANALYTICS_SETTINGS,
+                **_SPAN_PREFIX_READ_SETTINGS,
                 "max_result_rows": initial_slice_limit,
             }
             try:
@@ -264,9 +291,7 @@ def _execute_bounded_span_filter_prefix(
             except Exception as exc:
                 if not is_read_budget_error(exc):
                     raise
-                logger.info(
-                    "whole-window span attribute-filter attempt exceeded sub-budget"
-                )
+                logger.info("whole-window span prefix attempt exceeded sub-budget")
             else:
                 fast_rows = list(fast_result.data)
                 for row in fast_rows[:initial_slice_limit]:
@@ -355,35 +380,65 @@ def _execute_bounded_span_filter_prefix(
             max_result_rows,
             prefix_limit - len(rows) + builder.page_size,
         )
+        slice_query = query
         slice_params = {
             **base_params,
             "slice_start": slice_start,
             "slice_end": cursor,
             "limit": slice_limit,
         }
+        if keyset_start_time is not None:
+            if continuation_query is None or continuation_base_params is None:
+                continuation_query, continuation_base_params = builder.build(
+                    since=start_date,
+                    slice_end=end_date,
+                    limit=max_result_rows,
+                    before_start_time=keyset_start_time,
+                    before_id=keyset_id,
+                )
+                # ``build`` keeps bound parameters on the builder for later
+                # count/content phases. Preserve the original non-keyset state;
+                # the continuation owns its copied parameter template.
+                builder.params = dict(base_params)
+            slice_query = continuation_query
+            slice_params = {
+                **continuation_base_params,
+                "slice_start": slice_start,
+                "slice_end": cursor,
+                "limit": slice_limit,
+                "keyset_start_time": keyset_start_time,
+                "keyset_id": keyset_id,
+            }
         slice_settings = {
-            **_BOUNDED_ANALYTICS_SETTINGS,
+            **_SPAN_PREFIX_READ_SETTINGS,
             "max_result_rows": slice_limit,
         }
         try:
             slice_result = analytics.execute_ch_query(
-                query,
+                slice_query,
                 slice_params,
-                timeout_ms=remaining_ms,
+                timeout_ms=min(_SPAN_FILTER_QUERY_TIMEOUT_MS, remaining_ms),
                 settings=slice_settings,
             )
         except Exception as exc:
             if not is_read_budget_error(exc):
                 raise
             logger.warning(
-                "bounded span attribute-filter slice exceeded read budget",
+                "bounded span prefix slice exceeded read budget",
                 slice_seconds=int((cursor - slice_start).total_seconds()),
                 error=str(exc)[:200],
             )
             if slice_width > _SPAN_FILTER_SCAN_MIN_SLICE:
                 # Retry the same newest boundary with the minimum slice. The
-                # failed throw-mode query contributes no rows, and the cursor
-                # is deliberately unchanged.
+                # failed throw-mode query contributes no rows. If this was a
+                # within-slice continuation, roll back that slice's successful
+                # prefix too: narrowing it while retaining older rows from the
+                # wider interval would break global ordering.
+                del rows[slice_row_checkpoint:]
+                seen_ids.clear()
+                seen_ids.update(slice_seen_checkpoint)
+                keyset_start_time = None
+                keyset_id = None
                 slice_width = _SPAN_FILTER_SCAN_MIN_SLICE
                 continue
             break
@@ -400,16 +455,31 @@ def _execute_bounded_span_filter_prefix(
         if slice_exhausted:
             # This completed query exhausted the whole half-open slice.
             cursor = slice_start
+            keyset_start_time = None
+            keyset_id = None
+            slice_row_checkpoint = len(rows)
+            slice_seen_checkpoint = set(seen_ids)
             remaining_window = cursor - start_date
             if remaining_window > timedelta(0):
                 slice_width = min(slice_width * 2, remaining_window)
         if len(rows) >= prefix_limit:
             break
         if not slice_exhausted:
-            # There may be more rows in this same slice. Without an additional
-            # within-slice keyset read, advancing would violate the global
-            # prefix. Fail closed under the bounded contract.
-            break
+            # Continue the exact same half-open time slice below its last
+            # canonical key. A successful throw-mode top-K proves every row
+            # above the key was read; strict ``(start_time, id)`` descent then
+            # makes the concatenated chunks one exact global prefix. Physical
+            # duplicates with the same key can be skipped safely because the
+            # endpoint de-duplicates by id.
+            last_row = slice_rows[slice_limit - 1]
+            next_start_time = last_row.get("start_time")
+            next_id = str(last_row.get("id", ""))
+            if next_start_time is None or not next_id:
+                break
+            next_keyset = (next_start_time, next_id)
+            if next_keyset == (keyset_start_time, keyset_id):
+                break
+            keyset_start_time, keyset_id = next_keyset
 
     if cursor <= start_date:
         full_window_scanned = True
@@ -1794,9 +1864,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         def _enrichment_error_code(exc: Exception) -> str:
             return (
-                "read_budget_exceeded"
-                if is_read_budget_error(exc)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
             )
 
         # P3b step2 precondition — user_id → end_user reverse-resolve (CH, not PG).
@@ -1939,16 +2007,16 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         # Phase 1: Paginated spans (light columns — no input/output).
         #
-        # Map-backed attribute predicates are evaluated through adjacent
-        # one-minute slices. Every slice shares one 750ms wall-clock deadline
-        # and gets only the remaining server timeout; this avoids the old
-        # failure mode where one wide map scan consumed 10–30 seconds. The
-        # executor is generic across text, number, and boolean attributes and
-        # returns an explicit incomplete prefix when the proof cannot finish.
+        # The all-span table has no project/time-ordered projection. Evaluate
+        # every canonical newest-first page through adjacent time slices so an
+        # unfiltered 30-day top-K cannot scan the full tenant before LIMIT.
+        # Map-backed predicates use the same exact executor. It returns an
+        # explicit incomplete prefix when the proof cannot finish.
         bounded_filter_path = builder.requires_bounded_filter_scan()
+        bounded_prefix_path = not builder.sort_params
         phase1_query_complete = True
         phase1_full_window_scanned = False
-        if bounded_filter_path:
+        if bounded_prefix_path:
             (
                 result,
                 phase1_query_complete,
@@ -2036,15 +2104,13 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     content_query,
                     content_params,
                     timeout_ms=750,
-                    settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    settings=_SPAN_CONTENT_READ_SETTINGS,
                 ).data
                 returned_ids = {
                     str(row.get("id", "")) for row in content_rows if row.get("id")
                 }
                 content_error = (
-                    None
-                    if set(span_ids).issubset(returned_ids)
-                    else "query_failed"
+                    None if set(span_ids).issubset(returned_ids) else "query_failed"
                 )
                 if content_error is not None:
                     logger.warning(
@@ -2420,7 +2486,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             or (bounded_filter_path and not phase1_full_window_scanned)
         ):
             metadata["total_rows_is_lower_bound"] = True
-        if bounded_filter_path:
+        if bounded_prefix_path:
             metadata.update(
                 {
                     "query_complete": phase1_query_complete,
@@ -2474,9 +2540,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         def _enrichment_error_code(exc: Exception) -> str:
             return (
-                "read_budget_exceeded"
-                if is_read_budget_error(exc)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
             )
 
         # Get eval configs from PG (small config table)
@@ -2506,13 +2570,15 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         )
 
         # Phase 1: Paginated spans (light columns — no input/output).
-        # Attribute predicates share the same generic one-minute bounded
-        # executor as the observe grid/task preview; unfiltered and indexed
-        # system-metric requests retain the existing single-query path.
+        # Every canonical newest-first page shares the same exact sliced prefix
+        # executor as the observe grid/task preview. This prevents unfiltered
+        # and indexed requests from doing a full-window top-K on the all-span
+        # table, which has no project/time-ordered projection.
         bounded_filter_path = builder.requires_bounded_filter_scan()
+        bounded_prefix_path = not builder.sort_params
         phase1_query_complete = True
         phase1_full_window_scanned = False
-        if bounded_filter_path:
+        if bounded_prefix_path:
             (
                 result,
                 phase1_query_complete,
@@ -2548,7 +2614,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         content_query,
                         content_params,
                         timeout_ms=750,
-                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                        settings=_SPAN_CONTENT_READ_SETTINGS,
                     )
                     content_map = {str(r.get("id", "")): r for r in content_result.data}
                     if not set(span_ids).issubset(content_map):
@@ -2708,7 +2774,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             bounded_filter_path and not phase1_full_window_scanned
         ):
             metadata["total_rows_is_lower_bound"] = True
-        if bounded_filter_path:
+        if bounded_prefix_path:
             metadata.update(
                 {
                     "query_complete": phase1_query_complete,
@@ -4080,9 +4146,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "Span navigation could not be completed. Please try again."
             )
             response.data["code"] = (
-                "read_budget_exceeded"
-                if is_read_budget_error(e)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(e) else "query_failed"
             )
             return response
 
@@ -4392,9 +4456,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "Span navigation could not be completed. Please try again."
             )
             response.data["code"] = (
-                "read_budget_exceeded"
-                if is_read_budget_error(e)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(e) else "query_failed"
             )
             return response
 

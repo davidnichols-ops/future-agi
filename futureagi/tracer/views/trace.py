@@ -86,7 +86,11 @@ from tracer.services.clickhouse.query_builders import (
 )
 from tracer.services.clickhouse.query_builders.base import NIL_UUID
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
-from tracer.services.clickhouse.query_service import AnalyticsQueryService, QueryResult
+from tracer.services.clickhouse.query_service import (
+    GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES,
+    AnalyticsQueryService,
+    QueryResult,
+)
 from tracer.services.clickhouse.read_budget import (
     FUTURE_TAIL_PROBE_SETTINGS,
     build_future_tail_probe,
@@ -131,15 +135,26 @@ _FILTERED_TRACE_SCAN_BUDGET_MS = 900
 _FILTERED_TRACE_CANDIDATE_BATCH = 50
 _FILTERED_TRACE_SEED_SLICE = timedelta(minutes=5)
 _FILTERED_TRACE_MAX_FUTURE_SKEW = timedelta(minutes=5)
+# The seed stream establishes only order and identity; the point-scoped probe
+# below hydrates full light rows. Keeping this select inside ``proj_root_spans``
+# avoids falling back to a wide base-table scan for date-only/unfiltered pages.
+_TRACE_CANDIDATE_SEED_COLUMNS = ["trace_id", "start_time"]
+_TRACE_CANDIDATE_READ_SETTINGS = {
+    **_BOUNDED_ANALYTICS_SETTINGS,
+    "max_threads": 1,
+    "max_block_size": 8192,
+}
 
 
 def _requires_candidate_filter_scan(filters):
     """Return whether a trace page needs bounded trace-ID candidates.
 
-    Every span attribute can compile to an any-span raw-Map membership
-    subquery, whether its declared type is text, number, or boolean. Unknown
-    system metrics fall back to the same compiler path. Known root-only metrics,
-    IDs, sessions, tags, and time columns retain their direct/indexed path.
+    Generic span attributes can compile to an any-span raw-Map membership
+    subquery, whether their declared type is text, number, or boolean.
+    Attributes in the canonical guaranteed-root registry compile directly on
+    the already scoped root row. Unknown system metrics fall back to the same
+    membership path. Known root-only metrics, IDs, sessions, tags, and time
+    columns retain their direct/indexed path.
     """
 
     for item in filters or []:
@@ -150,6 +165,8 @@ def _requires_candidate_filter_scan(filters):
         col_type = config.get("col_type") or config.get("colType")
         normalized_col_type = str(col_type or "").strip().upper()
         if normalized_col_type == "SPAN_ATTRIBUTE":
+            if column_id in GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES:
+                continue
             return True
         if normalized_col_type != "SYSTEM_METRIC":
             continue
@@ -182,6 +199,26 @@ def _requires_candidate_filter_scan(filters):
     return False
 
 
+def _requires_root_attribute_slice_scan(filters):
+    """Return whether a direct root-Map predicate needs bounded time slices.
+
+    Guaranteed root attributes do not need the generic any-span membership
+    subquery, but they still read raw attribute Maps. Keep them on the root
+    row while bounding that read to adjacent five-minute intervals.
+    """
+
+    for item in filters or []:
+        column_id = item.get("column_id") or item.get("columnId")
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        col_type = config.get("col_type") or config.get("colType")
+        if (
+            str(col_type or "").strip().upper() == "SPAN_ATTRIBUTE"
+            and column_id in GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES
+        ):
+            return True
+    return False
+
+
 def _has_only_time_filters(filters):
     """Whether the compact trace table can seed the exact newest prefix."""
     return all(
@@ -198,9 +235,9 @@ def _candidate_seed_filters(filters):
     project's newest roots and could falsely miss an older session. Root-only
     system metrics and trace tags also compile directly against the already
     root-scoped seed row; retaining them can reduce a large tenant to a small
-    candidate set before a generic any-span attribute membership probe. Every
-    raw Map attribute remains probe-only, including ``final_status``: applying
-    one to the whole seed window would recreate the incident's expensive scan.
+    candidate set before a generic any-span attribute membership probe.
+    Guaranteed root attributes compile to that same direct row predicate and
+    are safe to retain. Other raw Map attributes remain probe-only.
     """
 
     def _is_direct_root_filter(item):
@@ -222,7 +259,7 @@ def _candidate_seed_filters(filters):
             str(config.get("col_type") or config.get("colType") or "").strip().upper()
         )
         if normalized_col_type == "SPAN_ATTRIBUTE":
-            return False
+            return column_id in GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES
         if normalized_col_type not in {"", "NORMAL", "SYSTEM_METRIC"}:
             return False
 
@@ -3321,9 +3358,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "Trace navigation could not be completed. Please try again."
             )
             response.data["code"] = (
-                "read_budget_exceeded"
-                if is_read_budget_error(e)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(e) else "query_failed"
             )
             return response
 
@@ -3766,7 +3801,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # the root span's ``start_time``: ingestion delay can make those clocks
         # differ and silently reorder or omit a trace.
         candidate_filter_scan_used = _requires_candidate_filter_scan(filters)
-        candidate_scan_used = candidate_filter_scan_used or (
+        root_attribute_slice_scan_used = _requires_root_attribute_slice_scan(filters)
+        bounded_filter_scan_used = (
+            candidate_filter_scan_used or root_attribute_slice_scan_used
+        )
+        candidate_scan_used = bounded_filter_scan_used or (
             not org_scope and _has_only_time_filters(filters)
         )
         candidate_scan_complete = True
@@ -3850,7 +3889,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         filtered_query,
                         filtered_params,
                         timeout_ms=min(750, remaining_ms),
-                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                        settings=_TRACE_CANDIDATE_READ_SETTINGS,
                     )
                 except Exception as exc:
                     if not is_read_budget_error(exc):
@@ -3885,7 +3924,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # of the shared deadline for adjacent five-minute slices.
             fast_remaining_ms = _remaining_scan_ms(deadline)
             fast_timeout_ms = min(250, max(fast_remaining_ms - 25, 0))
-            if fast_timeout_ms >= 25:
+            # A guaranteed root attribute is direct (no any-span membership),
+            # but it still scans a raw Map. Never spend even the fast
+            # sub-budget on the caller's whole window; start with the newest
+            # bounded root slice and keep the attribute in that seed.
+            if not root_attribute_slice_scan_used and fast_timeout_ms >= 25:
                 fast_builder = BuilderCls(
                     project_id=None if org_scope else str(project_id),
                     project_ids=(
@@ -3894,6 +3937,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     filters=_candidate_seed_filters(filters),
                     page_number=0,
                     page_size=_FILTERED_TRACE_CANDIDATE_BATCH // 2,
+                    columns=_TRACE_CANDIDATE_SEED_COLUMNS,
                 )
                 fast_query, fast_params = fast_builder.build(since=None)
                 try:
@@ -3901,7 +3945,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         fast_query,
                         fast_params,
                         timeout_ms=fast_timeout_ms,
-                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                        settings=_TRACE_CANDIDATE_READ_SETTINGS,
                     )
                 except Exception as exc:
                     if not is_read_budget_error(exc):
@@ -4014,6 +4058,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     filters=seed_filters,
                     page_number=batch_index * 2,
                     page_size=_FILTERED_TRACE_CANDIDATE_BATCH // 2,
+                    columns=_TRACE_CANDIDATE_SEED_COLUMNS,
                 )
                 candidate_query, candidate_params = candidate_builder.build(since=None)
                 try:
@@ -4021,7 +4066,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         candidate_query,
                         candidate_params,
                         timeout_ms=min(750, remaining_ms),
-                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                        settings=_TRACE_CANDIDATE_READ_SETTINGS,
                     )
                 except Exception as exc:
                     if not is_read_budget_error(exc):
@@ -4064,10 +4109,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             return last_result, scan_complete
 
         # Generic span attributes and legacy string filters use bounded
-        # candidate batches. Date-only/unfiltered pages use those same exact
-        # root slices, while indexed root filters retain the single top-K
-        # query. Both paths share hard resource settings and never expose a
-        # ClickHouse exception.
+        # candidate batches. Guaranteed root attributes stay direct on the
+        # root row but use adjacent time slices, without an any-span membership
+        # subquery. Date-only/unfiltered pages use those same exact root slices;
+        # other indexed root filters retain the single top-K query. Every path
+        # shares hard resource settings and never exposes a ClickHouse exception.
         try:
             if candidate_scan_used:
                 result, candidate_scan_complete = _execute_candidate_batched_page()
@@ -4188,8 +4234,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # counts a strict budget; on timeout return a monotonic lower bound so
         # the data page stays usable and the cluster never spends tens of
         # seconds/GBs merely computing a footer.
-        total_count_is_lower_bound = candidate_filter_scan_used
-        if candidate_filter_scan_used:
+        total_count_is_lower_bound = bounded_filter_scan_used
+        if bounded_filter_scan_used:
             # Re-running the full-window Map predicate just to render a footer
             # would undo the bounded page fix. The page can be exact while its
             # display count remains an honest monotonic lower bound. Use every
@@ -4319,9 +4365,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         except Exception as exc:
             user_id_map = {}
             enrichment_error_codes.add(
-                "read_budget_exceeded"
-                if is_read_budget_error(exc)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
             )
             logger.warning(
                 "trace user enrichment exceeded budget",

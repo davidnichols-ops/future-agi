@@ -71,6 +71,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         system_metric_filters: dict[str, Any] | None = None,
         observe_type: str = "trace",
         metric_id: str = "latency",
+        single_metric: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id, **kwargs)
@@ -79,6 +80,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         self.system_metric_filters = system_metric_filters or {}
         self.observe_type = str(observe_type or "trace").strip().lower()
         self.metric_id = metric_id
+        self.single_metric = bool(single_metric)
         self.start_date: datetime | None = None
         self.end_date: datetime | None = None
         self.rollup_window_adjusted = False
@@ -737,6 +739,69 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
     # Private query builders
     # ------------------------------------------------------------------
 
+    def _metric_selects(self, *, aggregate_source: bool) -> dict[str, str]:
+        """Return all response aliases while reading only the requested metric.
+
+        ``fetch_system_metric_graph_ch`` returns one selected series plus traffic,
+        but the historical query computed every metric on every raw row. Keeping
+        zero-valued aliases preserves ``format_result`` and direct-builder
+        compatibility while ClickHouse can prune the unused source columns.
+        Non-graph callers retain the original all-metric query by leaving
+        ``single_metric`` false.
+        """
+        if aggregate_source:
+            selects = {
+                "avg_latency": (
+                    "(quantilesTDigestMerge(0.5, 0.95, 0.99)(latency_q))[1]"
+                ),
+                "total_tokens": "sumMerge(total_tokens_sum)",
+                "avg_cost": "sumMerge(cost_sum) / greatest(countMerge(n), 1)",
+                "traffic_count": "countMerge(n)",
+                "prompt_tokens": "sumMerge(prompt_tokens_sum)",
+                "completion_tokens": "sumMerge(completion_tokens_sum)",
+                "error_rate": (
+                    "countMerge(error_count) * 100.0 / greatest(countMerge(n), 1)"
+                ),
+            }
+        else:
+            selects = {
+                "avg_latency": "avg(latency_ms)",
+                "total_tokens": "sum(total_tokens)",
+                "avg_cost": "avg(cost)",
+                "traffic_count": "count()",
+                "prompt_tokens": "sum(prompt_tokens)",
+                "completion_tokens": "sum(completion_tokens)",
+                "error_rate": (
+                    "countIf(status = 'ERROR') * 100.0 / greatest(count(), 1)"
+                ),
+            }
+
+        if not self.single_metric:
+            return selects
+
+        metric_alias = {
+            "latency": "avg_latency",
+            "tokens": "total_tokens",
+            "total_tokens": "total_tokens",
+            "cost": "avg_cost",
+            "traffic": "traffic_count",
+            "prompt_tokens": "prompt_tokens",
+            "input_tokens": "prompt_tokens",
+            "completion_tokens": "completion_tokens",
+            "output_tokens": "completion_tokens",
+            "error_rate": "error_rate",
+        }.get(str(self.metric_id or "").strip().lower(), "avg_latency")
+        return {
+            alias: expression if alias in {metric_alias, "traffic_count"} else "0"
+            for alias, expression in selects.items()
+        }
+
+    @staticmethod
+    def _select_list(selects: dict[str, str]) -> str:
+        return ",\n            ".join(
+            f"{expression} AS {alias}" for alias, expression in selects.items()
+        )
+
     def _build_agg_query(self) -> tuple[str, dict[str, Any]]:
         """Build a query against the pre-aggregated ``spans_hourly_rollup`` table.
 
@@ -747,24 +812,12 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         for the rollup table definition.
         """
         bucket_fn = self.time_bucket_expr(self.interval)
+        metric_selects = self._select_list(self._metric_selects(aggregate_source=True))
 
-        # quantilesTDigestMerge returns a Tuple; index [1] is the 0.5 (median).
-        # The v2 rollup stores 3 quantiles (0.5, 0.95, 0.99) vs the legacy 4
-        # (0.5, 0.9, 0.95, 0.99) — we still surface the median as avg_latency
-        # to preserve the dashboard contract.
         query = f"""
         SELECT
             {bucket_fn}(hour) AS time_bucket,
-            (quantilesTDigestMerge(0.5, 0.95, 0.99)(latency_q))[1]
-                AS avg_latency,
-            sumMerge(total_tokens_sum) AS total_tokens,
-            sumMerge(cost_sum) / greatest(countMerge(n), 1)
-                AS avg_cost,
-            countMerge(n) AS traffic_count,
-            sumMerge(prompt_tokens_sum) AS prompt_tokens,
-            sumMerge(completion_tokens_sum) AS completion_tokens,
-            countMerge(error_count) * 100.0 / greatest(countMerge(n), 1)
-                AS error_rate
+            {metric_selects}
         FROM {self.AGG_TABLE}
         WHERE project_id = %(project_id)s
           AND hour >= %(start_date)s
@@ -782,6 +835,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
     ) -> tuple[str, dict[str, Any]]:
         """Build a query against the raw ``spans`` table with filters applied."""
         bucket_fn = self.time_bucket_expr(self.interval)
+        metric_selects = self._select_list(self._metric_selects(aggregate_source=False))
         entity_scope = (
             "AND (parent_span_id IS NULL OR parent_span_id = '')"
             if self.observe_type == "trace"
@@ -791,14 +845,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         query = f"""
         SELECT
             {bucket_fn}(start_time) AS time_bucket,
-            avg(latency_ms) AS avg_latency,
-            sum(total_tokens) AS total_tokens,
-            avg(cost) AS avg_cost,
-            count() AS traffic_count,
-            sum(prompt_tokens) AS prompt_tokens,
-            sum(completion_tokens) AS completion_tokens,
-            countIf(status = 'ERROR') * 100.0 / greatest(count(), 1)
-                AS error_rate
+            {metric_selects}
         FROM {self.RAW_TABLE}
         {candidate_join}
         PREWHERE {self.project_filter_sql()}

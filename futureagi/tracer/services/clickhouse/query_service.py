@@ -91,6 +91,13 @@ _BOUNDED_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
 }
 
+# Attribute inventories are suggestions, not an exhaustive schema read.  A
+# 10k-row sample exceeded the 256 MiB read budget on wide-map projects before
+# ClickHouse could return any keys.  Exact-key lookup remains available for a
+# known rare key, and guaranteed/saved picker paths are merged by callers, so a
+# smaller honest sample improves availability without claiming completeness.
+_SPAN_ATTRIBUTE_DISCOVERY_SAMPLE_ROWS = 1000
+
 
 class QueryType(StrEnum):
     """Supported query types with per-type routing."""
@@ -230,7 +237,7 @@ class AnalyticsQueryService:
                     WHERE project_id IN %(project_ids)s
                       AND is_deleted = 0
                       {recent_filter}
-                    LIMIT 10000
+                    LIMIT {_SPAN_ATTRIBUTE_DISCOVERY_SAMPLE_ROWS}
                 ) ARRAY JOIN ks AS key
                 GROUP BY key
                 UNION ALL
@@ -239,7 +246,7 @@ class AnalyticsQueryService:
                     WHERE project_id IN %(project_ids)s
                       AND is_deleted = 0
                       {recent_filter}
-                    LIMIT 10000
+                    LIMIT {_SPAN_ATTRIBUTE_DISCOVERY_SAMPLE_ROWS}
                 ) ARRAY JOIN ks AS key
                 GROUP BY key
                 UNION ALL
@@ -248,7 +255,7 @@ class AnalyticsQueryService:
                     WHERE project_id IN %(project_ids)s
                       AND is_deleted = 0
                       {recent_filter}
-                    LIMIT 10000
+                    LIMIT {_SPAN_ATTRIBUTE_DISCOVERY_SAMPLE_ROWS}
                 ) ARRAY JOIN ks AS key
                 GROUP BY key
             )
@@ -429,7 +436,7 @@ class AnalyticsQueryService:
         # Two bounds keep it bounded even on very large projects:
         #   * 7-day window on `start_time` (the partition key is
         #     `toDate(start_time)`) so CH can skip partitions and granules.
-        #   * `LIMIT 10000` inside each per-map subquery before the
+        #   * a small LIMIT inside each per-map subquery before the
         #     ARRAY JOIN — without this, projects with millions of spans
         #     and wide `attrs_*` maps hit Code: 307 (max_bytes_to_read)
         #     because every row's Map gets exploded.

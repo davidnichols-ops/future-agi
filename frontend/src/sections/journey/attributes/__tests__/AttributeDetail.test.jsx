@@ -21,7 +21,7 @@ vi.mock("../AttributeValueChart", () => ({
   default: () => <div>Attribute value chart</div>,
 }));
 
-const renderDetail = () => {
+const renderDetail = ({ attributeType } = {}) => {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: {
@@ -31,7 +31,11 @@ const renderDetail = () => {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <AttributeDetail projectId="project-1" attributeKey="final_status" />
+      <AttributeDetail
+        projectId="project-1"
+        attributeKey="final_status"
+        attributeType={attributeType}
+      />
     </QueryClientProvider>,
   );
 };
@@ -63,5 +67,32 @@ describe("AttributeDetail", () => {
     expect(screen.getByText("final_status")).toBeInTheDocument();
     expect(screen.queryByText("0 spans")).not.toBeInTheDocument();
     expect(screen.queryByText("undefined spans")).not.toBeInTheDocument();
+  });
+
+  it("passes a picker-provided type to the detail endpoint", async () => {
+    axios.get.mockResolvedValue({
+      data: {
+        key: "final_status",
+        type: "string",
+        count: 1,
+        query_complete: true,
+        query_status: "complete",
+      },
+    });
+
+    renderDetail({ attributeType: "string" });
+
+    await waitFor(() =>
+      expect(axios.get).toHaveBeenCalledWith(
+        "/api/traces/span-attribute-detail/",
+        {
+          params: {
+            project_id: "project-1",
+            key: "final_status",
+            type: "string",
+          },
+        },
+      ),
+    );
   });
 });

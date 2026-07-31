@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 from clickhouse_driver.errors import ErrorCodes, ServerException
 
+from tracer.services.clickhouse.page_dedup import paginate_deduped
 from tracer.services.clickhouse.query_builders.span_list import SpanListQueryBuilder
 from tracer.services.clickhouse.query_service import QueryResult
 from tracer.views.observation_span import _execute_bounded_span_filter_prefix
@@ -48,6 +49,31 @@ def _builder(
         page_number=page_number,
         page_size=page_size,
         filters=_filters(start, end),
+    )
+
+
+def _unfiltered_builder(
+    start: datetime,
+    end: datetime,
+    *,
+    page_number: int = 0,
+    page_size: int = 2,
+) -> SpanListQueryBuilder:
+    return SpanListQueryBuilder(
+        project_id="11111111-1111-1111-1111-111111111111",
+        page_number=page_number,
+        page_size=page_size,
+        filters=[
+            {
+                "column_id": "start_time",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "datetime",
+                    "filter_op": "between",
+                    "filter_value": [start.isoformat(), end.isoformat()],
+                },
+            }
+        ],
     )
 
 
@@ -144,6 +170,39 @@ def test_adjacent_slices_preserve_exact_newest_first_prefix():
     assert first_settings["timeout_overflow_mode"] == "throw"
     assert first_settings["read_overflow_mode"] == "throw"
     assert first_settings["max_result_rows"] == 6
+    assert first_settings["max_threads"] == 1
+    assert first_settings["max_block_size"] == 8192
+
+
+def test_unfiltered_span_prefix_uses_adjacent_low_memory_slices():
+    end = datetime(2026, 7, 30, 12, 2)
+    start = end - timedelta(minutes=2)
+    analytics = _Analytics(
+        [
+            [{"id": "newest"}],
+            [{"id": "older"}],
+        ]
+    )
+
+    result, complete, full_window = _execute_bounded_span_filter_prefix(
+        _unfiltered_builder(start, end),
+        analytics,
+        clock=lambda: 0,
+    )
+
+    assert [row["id"] for row in result.data] == ["newest", "older"]
+    assert complete is True
+    assert full_window is True
+    assert len(analytics.calls) == 2
+    for query, params, timeout_ms, settings in analytics.calls:
+        assert "FROM spans FINAL" not in query
+        assert "ORDER BY start_time DESC, id DESC" in query
+        assert "start_time >= %(slice_start)s" in query
+        assert "start_time < %(slice_end)s" in query
+        assert params["limit"] > 0
+        assert 0 < timeout_ms <= 750
+        assert settings["max_threads"] == 1
+        assert settings["max_block_size"] == 8192
 
 
 def test_duplicate_ids_across_slices_do_not_fill_the_unique_prefix():
@@ -434,7 +493,7 @@ def test_shared_deadline_returns_an_explicit_incomplete_exact_prefix():
     result, complete, full_window = _execute_bounded_span_filter_prefix(
         _builder(start, end),
         analytics,
-        clock=_Clock(0, 0.01, 0.8, 0.81),
+        clock=_Clock(0, 0.2, 0.91, 0.92),
     )
 
     assert [row["id"] for row in result.data] == ["newest-match"]
@@ -478,19 +537,144 @@ def test_programming_error_is_not_hidden_as_an_empty_result():
         )
 
 
-def test_deep_page_beyond_result_cap_is_explicitly_incomplete_without_query():
-    end = datetime(2026, 7, 30, 12, 10)
-    start = end - timedelta(minutes=10)
-    analytics = _Analytics()
+def test_deep_page_low_volume_window_is_proven_empty_and_complete():
+    end = datetime(2026, 7, 30, 12, 1)
+    start = end - timedelta(minutes=1)
+    source_rows = [
+        {
+            "id": f"span-{index:06d}",
+            "start_time": end - timedelta(seconds=index / 100),
+        }
+        for index in range(1200)
+    ]
+    analytics = _Analytics([source_rows])
 
     result, complete, full_window = _execute_bounded_span_filter_prefix(
-        _builder(start, end, page_number=4, page_size=500),
+        _builder(start, end, page_number=3, page_size=500),
         analytics,
         clock=lambda: 0,
     )
 
-    assert result.data == []
-    assert analytics.calls == []
+    page, has_more = paginate_deduped(result.data, "id", 3, 500)
+    assert page == []
+    assert has_more is False
+    assert result.data == source_rows
+    assert complete is True
+    assert full_window is True
+    assert len(analytics.calls) == 1
+    assert analytics.calls[0][1]["limit"] == 2000
+    assert analytics.calls[0][3]["max_result_rows"] == 2000
+
+
+def test_deep_page_dense_slice_continues_below_two_thousand_row_cap():
+    end = datetime(2026, 7, 30, 12, 1)
+    start = end - timedelta(minutes=1)
+    first_rows = [
+        {
+            "id": f"span-{index:06d}",
+            "start_time": end - timedelta(milliseconds=index),
+        }
+        for index in range(2000)
+    ]
+    second_rows = [
+        {
+            "id": f"span-{2000 + index:06d}",
+            "start_time": end - timedelta(milliseconds=2000 + index),
+        }
+        for index in range(750)
+    ]
+    analytics = _Analytics([first_rows, second_rows])
+
+    result, complete, full_window = _execute_bounded_span_filter_prefix(
+        _builder(start, end, page_number=3, page_size=500),
+        analytics,
+        clock=lambda: 0,
+    )
+
+    page, has_more = paginate_deduped(result.data, "id", 3, 500)
+    assert page == first_rows[1500:2000]
+    assert has_more is True
+    assert len(result.data) == 2750
+    assert complete is True
+    assert full_window is True
+    assert len(analytics.calls) == 2
+    first_query, first_params, _, first_settings = analytics.calls[0]
+    second_query, second_params, _, second_settings = analytics.calls[1]
+    assert "keyset_start_time" not in first_query
+    assert "start_time < %(keyset_start_time)s" in second_query
+    assert second_params["keyset_start_time"] == first_rows[-1]["start_time"]
+    assert second_params["keyset_id"] == first_rows[-1]["id"]
+    assert first_params["limit"] == first_settings["max_result_rows"] == 2000
+    assert second_params["limit"] == second_settings["max_result_rows"] == 1000
+
+
+def test_keyset_preserves_equal_timestamps_and_dedups_ids_across_chunks():
+    end = datetime(2026, 7, 30, 12, 1)
+    start = end - timedelta(minutes=1)
+    newest_time = end - timedelta(seconds=1)
+    older_time = end - timedelta(seconds=2)
+    first_rows = [
+        {
+            "id": f"span-{index:06d}",
+            "start_time": newest_time,
+        }
+        for index in range(3000, 1000, -1)
+    ]
+    second_rows = [
+        {"id": "span-002000", "start_time": older_time},
+        *[
+            {
+                "id": f"span-{index:06d}",
+                "start_time": older_time,
+            }
+            for index in range(1000, 498, -1)
+        ],
+    ]
+    analytics = _Analytics([first_rows, second_rows])
+
+    result, complete, full_window = _execute_bounded_span_filter_prefix(
+        _builder(start, end, page_number=3, page_size=500),
+        analytics,
+        clock=lambda: 0,
+    )
+
+    ids = [row["id"] for row in result.data]
+    assert ids[:3] == ["span-003000", "span-002999", "span-002998"]
+    assert ids[1999:2002] == [
+        "span-001001",
+        "span-001000",
+        "span-000999",
+    ]
+    assert ids.count("span-002000") == 1
+    assert len(ids) == 2502
+    assert complete is True
+    assert full_window is True
+    assert len(analytics.calls) == 2
+    continuation_params = analytics.calls[1][1]
+    assert continuation_params["keyset_start_time"] == newest_time
+    assert continuation_params["keyset_id"] == "span-001001"
+
+
+def test_deep_page_deadline_returns_exact_incomplete_prefix():
+    end = datetime(2026, 7, 30, 12, 1)
+    start = end - timedelta(minutes=1)
+    first_rows = [
+        {
+            "id": f"span-{index:06d}",
+            "start_time": end - timedelta(milliseconds=index),
+        }
+        for index in range(2000)
+    ]
+    analytics = _Analytics([first_rows])
+
+    result, complete, full_window = _execute_bounded_span_filter_prefix(
+        _builder(start, end, page_number=3, page_size=500),
+        analytics,
+        clock=_Clock(0, 0, 0.901, 0.902),
+    )
+
+    assert result.data == first_rows
+    assert len(analytics.calls) == 1
     assert complete is False
     assert full_window is False
 
