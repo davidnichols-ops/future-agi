@@ -328,8 +328,10 @@ class TestTracesOfSessionPagination:
         assert status == "ok"
         # The sentinel row must be trimmed — exactly page_size, not page_size + 1.
         assert len(payload["table"]) == page_size
-        # total_rows comes from the (correct) uniq() count, unchanged by the trim.
-        assert payload["metadata"]["total_rows"] == total
+        # A date-only request outside rollup coverage must not run the broad raw
+        # count. The proven prefix is returned as an honest lower bound.
+        assert payload["metadata"]["total_rows"] == page_size + 1
+        assert payload["metadata"]["total_rows_is_lower_bound"] is True
 
     def test_task_preview_uses_two_hard_budgeted_prefix_queries(self):
         """Trace task preview seeds exact root IDs, hydrates, then skips enrichment."""
@@ -484,7 +486,8 @@ class TestTracesOfSessionPagination:
         assert "candidate_trace_ids" not in seed_params
         assert seed_params["start_date"] == now - timedelta(days=7)
         assert seed_params["end_date"] == now
-        assert f"mapContains(attrs_string, '{root_attribute}')" not in seed_query
+        assert f"mapContains(attrs_string, '{root_attribute}')" in seed_query
+        assert "argMax(" not in seed_query
         assert "FINAL" not in seed_query
         assert "trace_id IN (SELECT trace_id FROM spans" not in seed_query
         assert seed_kwargs["timeout_ms"] <= 750
@@ -576,7 +579,8 @@ class TestTracesOfSessionPagination:
         query, params, kwargs = calls[0]
         assert params["start_date"] == now - timedelta(days=7)
         assert params["end_date"] == now
-        assert "mapContains(attrs_string, 'final_status')" not in query
+        assert "mapContains(attrs_string, 'final_status')" in query
+        assert "argMax(" not in query
         assert "FINAL" not in query
         assert "trace_id IN (SELECT trace_id FROM spans" not in query
         assert kwargs["timeout_ms"] <= 750
@@ -670,7 +674,7 @@ class TestTracesOfSessionPagination:
         assert calls[1][2]["timeout_ms"] <= 750
         assert calls[2][2]["timeout_ms"] <= 750
 
-    def test_unsupported_mixed_attribute_filter_fails_closed_without_ch_read(self):
+    def test_mixed_attribute_and_trace_tag_filter_uses_candidate_classifier(self):
         """An unsupported mixed shape must not fall back to ``spans FINAL``."""
         from tracer.services.clickhouse.v2.query_builders.trace_list import (
             TraceListQueryBuilderV2,
@@ -720,9 +724,8 @@ class TestTracesOfSessionPagination:
 
         assert status == "ok"
         assert payload["table"] == []
-        assert payload["metadata"]["query_complete"] is False
-        assert payload["metadata"]["query_status"] == "degraded"
-        analytics.execute_ch_query.assert_not_called()
+        assert "query_error_code" not in payload["metadata"]
+        analytics.execute_ch_query.assert_called()
 
     def test_candidate_seed_scans_adjacent_windows_in_newest_first_order(self):
         """The projection seed never turns the request into one broad scan."""
@@ -884,6 +887,301 @@ class TestTracesOfSessionPagination:
         )
         assert payload["metadata"].get("query_complete", True) is True
         assert all("future_tail_start" not in params for _, params, _ in calls)
+
+    def test_root_attribute_no_match_proves_the_full_window_without_classifying_roots(
+        self,
+    ):
+        """A selective root predicate traverses bounded empty slices directly."""
+
+        from tracer.services.clickhouse.v2.query_builders.trace_list import (
+            TraceListQueryBuilderV2,
+        )
+
+        view = self._make_view()
+        request = self._make_request(page_size=50)
+        end = datetime(2026, 7, 31, 8, 30)
+        start = end - timedelta(days=14)
+        calls = []
+
+        def _execute(query, params=None, **kwargs):
+            params = dict(params or {})
+            calls.append((query, params, kwargs))
+            assert "candidate_trace_ids" not in params
+            return SimpleNamespace(data=[])
+
+        analytics = mock.MagicMock()
+        analytics.execute_ch_query.side_effect = _execute
+        filters = [
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "filter_type": "datetime",
+                    "filter_op": "between",
+                    "filter_value": [start, end],
+                },
+            },
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "__definitely_absent__",
+                },
+            },
+        ]
+
+        with mock.patch(
+            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+            return_value=TraceListQueryBuilderV2,
+        ):
+            status, payload = view._list_traces_of_session_clickhouse(
+                request,
+                project_id=str(uuid.uuid4()),
+                validated_data={
+                    "filters": filters,
+                    "page_number": 0,
+                    "page_size": 50,
+                    "preview": True,
+                },
+                analytics=analytics,
+                org_project_ids=None,
+                org=request.organization,
+            )
+
+        assert status == "ok"
+        assert payload["table"] == []
+        assert payload["metadata"].get("query_complete", True) is True
+        assert len(calls) <= 24
+        assert calls[0][1]["root_seed_slice_end"] == end
+        assert calls[-1][1]["root_seed_slice_start"] == start
+        seed_calls = [call for call in calls if "root_seed_limit" in call[1]]
+        assert seed_calls == calls
+        assert all(
+            "mapContains(attrs_string, 'final_status')" in call[0]
+            for call in seed_calls
+        )
+        assert all("argMax(" not in call[0] for call in seed_calls)
+        assert all(
+            calls[index + 1][1]["root_seed_slice_end"]
+            == calls[index][1]["root_seed_slice_start"]
+            for index in range(len(calls) - 1)
+        )
+
+    def test_root_filter_value_survives_without_per_span_enrichment_rows(self):
+        """The canonical hydration owns root attrs; grouped child attrs stay bounded."""
+
+        from tracer.services.clickhouse.v2.query_builders.trace_list import (
+            TraceListQueryBuilderV2,
+        )
+
+        view = self._make_view()
+        request = self._make_request(page_size=5)
+        end = datetime(2026, 7, 31, 8, 30)
+        start = end - timedelta(days=7)
+        trace_rows = [
+            {
+                **self._trace_row(uuid.uuid4(), end - timedelta(seconds=index + 1)),
+                "attrs_string": {"final_status": "Rechazado"},
+                "attrs_number": {},
+                "attrs_bool": {},
+                "attributes_extra": "{}",
+            }
+            for index in range(6)
+        ]
+        calls = []
+
+        def _execute(query, params=None, **kwargs):
+            params = dict(params or {})
+            calls.append((query, params, kwargs))
+            if "root_seed_limit" in params:
+                return SimpleNamespace(data=list(trace_rows))
+            if "candidate_trace_ids" in params:
+                ids = list(params["candidate_trace_ids"])
+                if "latest_trace_name AS trace_name" not in query:
+                    return SimpleNamespace(
+                        data=[{"trace_id": trace_id} for trace_id in ids]
+                    )
+                by_id = {row["trace_id"]: row for row in trace_rows}
+                return SimpleNamespace(data=[by_id[trace_id] for trace_id in ids])
+            if "content_trace_ids" in params:
+                return SimpleNamespace(
+                    data=[
+                        {"trace_id": trace_id, "metadata": "{}"}
+                        for trace_id in params["content_trace_ids"]
+                    ]
+                )
+            if "attr_trace_ids" in params:
+                return SimpleNamespace(
+                    data=[
+                        {
+                            "trace_id": trace_id,
+                            "root_attribute_row": (
+                                "{}",
+                                {
+                                    "final_status": "Rechazado",
+                                    "root_marker": "exact",
+                                },
+                                {},
+                                {},
+                            ),
+                            "root_attribute_count": 1,
+                            "attribute_rows": [
+                                (
+                                    "{}",
+                                    {
+                                        "child_only": "value",
+                                        "final_status": "must-not-widen-root",
+                                    },
+                                    {},
+                                    {},
+                                )
+                            ],
+                            "attribute_row_count": 1,
+                        }
+                        for trace_id in params["attr_trace_ids"]
+                    ]
+                )
+            return SimpleNamespace(data=[])
+
+        analytics = mock.MagicMock()
+        analytics.execute_ch_query.side_effect = _execute
+        filters = [
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "filter_type": "datetime",
+                    "filter_op": "between",
+                    "filter_value": [start, end],
+                },
+            },
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": ["Rechazado"],
+                },
+            },
+        ]
+
+        with (
+            mock.patch(
+                "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+                return_value=TraceListQueryBuilderV2,
+            ),
+            mock.patch("tracer.views.trace.CustomEvalConfig") as mock_cfg,
+            mock.patch(
+                "tracer.views.trace.get_annotation_labels_for_project",
+                return_value=[],
+            ),
+        ):
+            mock_cfg.objects.filter.return_value.select_related.return_value = []
+            status, payload = view._list_traces_of_session_clickhouse(
+                request,
+                project_id=str(uuid.uuid4()),
+                validated_data={
+                    "filters": filters,
+                    "page_number": 0,
+                    "page_size": 5,
+                },
+                analytics=analytics,
+                org_project_ids=None,
+                org=request.organization,
+            )
+
+        assert status == "ok"
+        assert len(payload["table"]) == 5
+        assert payload["metadata"].get("query_complete", True) is True
+        assert all(row["final_status"] == "Rechazado" for row in payload["table"])
+        assert all(row["root_marker"] == "exact" for row in payload["table"])
+        assert all(row["child_only"] == "value" for row in payload["table"])
+        attr_calls = [call for call in calls if "attr_trace_ids" in call[1]]
+        assert len(attr_calls) == 1
+        assert "groupArrayIf(128)(tuple(" in attr_calls[0][0]
+
+    def test_whale_attribute_enrichment_is_explicitly_degraded_but_keeps_root(self):
+        """A capped child sample is never exposed as if it were complete."""
+
+        view = self._make_view()
+        request = self._make_request(page_size=5)
+        now = datetime(2026, 7, 31, 8, 30)
+        trace_row = self._trace_row(uuid.uuid4(), now - timedelta(seconds=1))
+        content_row = {"trace_id": trace_row["trace_id"], "metadata": "{}"}
+        analytics = self._routing_analytics(
+            trace_rows=[trace_row],
+            total=1,
+            content_rows=[content_row],
+        )
+        fallback_execute = analytics.execute_ch_query.side_effect
+        calls = []
+
+        def _execute(query, params=None, **kwargs):
+            params = dict(params or {})
+            calls.append((query, params, kwargs))
+            if "attr_trace_ids" in params:
+                return SimpleNamespace(
+                    data=[
+                        {
+                            "trace_id": trace_row["trace_id"],
+                            "root_attribute_row": (
+                                "{}",
+                                {
+                                    "final_status": "Rechazado",
+                                    "root_marker": "exact",
+                                },
+                                {},
+                                {},
+                            ),
+                            "root_attribute_count": 1,
+                            "attribute_rows": [
+                                (
+                                    "{}",
+                                    {"partial_child": f"value-{index}"},
+                                    {},
+                                    {},
+                                )
+                                for index in range(128)
+                            ],
+                            "attribute_row_count": 129,
+                        }
+                    ]
+                )
+            return fallback_execute(query, params, **kwargs)
+
+        analytics.execute_ch_query.side_effect = _execute
+        with (
+            mock.patch("tracer.views.trace.CustomEvalConfig") as mock_cfg,
+            mock.patch(
+                "tracer.views.trace.get_annotation_labels_for_project",
+                return_value=[],
+            ),
+        ):
+            mock_cfg.objects.filter.return_value.select_related.return_value = []
+            status, payload = view._list_traces_of_session_clickhouse(
+                request,
+                project_id=str(uuid.uuid4()),
+                validated_data={
+                    "filters": [],
+                    "page_number": 0,
+                    "page_size": 5,
+                },
+                analytics=analytics,
+                org_project_ids=None,
+                org=request.organization,
+            )
+
+        assert status == "ok"
+        assert len(payload["table"]) == 1
+        assert payload["metadata"]["query_complete"] is False
+        assert payload["metadata"]["query_status"] == "degraded"
+        assert payload["metadata"]["query_error_code"] == "query_failed"
+        assert payload["table"][0]["final_status"] == "Rechazado"
+        assert payload["table"][0]["root_marker"] == "exact"
+        assert "partial_child" not in payload["table"][0]
+        attr_call = next(call for call in calls if "attr_trace_ids" in call[1])
+        assert attr_call[2]["settings"]["max_result_bytes"] == 16 * 1024 * 1024
 
     def test_future_skewed_root_fails_closed_without_using_partial_page(self):
         view = self._make_view()
@@ -1137,6 +1435,7 @@ class TestTracesOfSessionPagination:
         assert payload["metadata"] == {
             "total_rows": 0,
             "total_rows_is_lower_bound": True,
+            "has_more": False,
             "query_complete": False,
             "query_status": "degraded",
             "query_error_code": "read_budget_exceeded",

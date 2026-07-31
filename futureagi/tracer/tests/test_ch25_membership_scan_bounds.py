@@ -259,22 +259,25 @@ class TestTraceRootAttributeFastPath:
 
 
 class TestTimeSeriesAttrFilterScope:
-    def test_attr_candidate_join_is_project_scoped_and_time_bounded(self):
+    def test_attr_candidate_discovery_is_project_scoped_time_bounded_and_capped(self):
         builder = TimeSeriesQueryBuilder(
             project_id=PROJECT_ID,
             filters=[DATETIME_FILTER, SPAN_ATTR_FILTER],
             interval="day",
         )
         sql, params = builder.build()
-        assert "AS graph_attr_candidates USING (trace_id)" in sql
+        assert builder.query_source == "trace_candidate_plan"
+        assert "FROM spans FINAL" in sql
+        assert "project_id = %(project_id)s" in sql
+        assert "start_time >= %(start_date)s" in sql
+        assert "start_time < %(end_date)s" in sql
+        assert "graph_candidate_attr_0_attr_1" in sql
+        assert params["graph_candidate_attr_0_attr_1"] == 26065846.0
+        assert "LIMIT %(graph_trace_candidate_limit)s" in sql
         assert "trace_id IN (" not in sql
-        sub = sql.split("INNER JOIN (", 1)[1].split(") AS graph_attr_candidates", 1)[0]
-        assert "project_id = %(project_id)s" in sub
-        assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in sub
-        assert "start_time < %(end_date)s + INTERVAL 1 DAY" in sub
-        assert "1 = 1" not in sub
         assert params["project_id"] == PROJECT_ID
         assert "start_date" in params
+        assert params["graph_trace_candidate_limit"] == 1
 
 
 STR_EQ_FILTER = {
@@ -312,11 +315,12 @@ def _with_op(op, value):
 
 
 class TestLoweredStringValueCompanion:
-    """Text equality/IN must emit a companion predicate matching
+    """ASCII text equality/IN may emit a companion predicate matching
     idx_attrs_str_values (bloom over arrayMap(x -> lower(x),
     mapValues(attrs_string))) — the lower()-wrapped comparison alone can
     never engage a skip index. The companion is implied by the real
-    predicate, so result sets are unchanged."""
+    predicate, so result sets are unchanged. Unicode-aware substring
+    predicates cannot use the ASCII-lowered ngram companion safely."""
 
     def test_equals_emits_lowered_has_companion(self):
         sql, params = _v2_sql(STR_EQ_FILTER)
@@ -337,14 +341,10 @@ class TestLoweredStringValueCompanion:
         sql, _ = _v2_sql(_with_op("not_equals", "Checkout Flow"))
         assert "arrayMap(x -> lower(x)" not in sql
 
-    def test_contains_emits_ngram_companion(self):
-        # Positive substrings of at least four ASCII characters can use the
-        # ngram index through its exact indexed expression. This companion is
-        # implied by the selected map value and preserves the result set.
+    def test_contains_omits_ascii_only_ngram_companion(self):
         sql, _ = _v2_sql(_with_op("contains", "heckout"))
-        assert (
-            "arrayStringConcat(arrayMap(x -> lower(x), mapValues(attrs_string)))" in sql
-        )
+        assert "positionUTF8(lowerUTF8" in sql
+        assert "arrayStringConcat" not in sql
 
     def test_number_equality_unchanged(self):
         sql, _ = _v2_sql(SPAN_ATTR_FILTER)

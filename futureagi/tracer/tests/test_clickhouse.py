@@ -1255,7 +1255,7 @@ class TestClickHouseFilterBuilder:
         assert "span_attr_bool" in where
 
     def test_translate_span_attribute_contains(self):
-        """SPAN_ATTRIBUTE contains filter should use LIKE with percent wildcards."""
+        """SPAN_ATTRIBUTE contains should bind a literal UTF-8 needle."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -1273,8 +1273,9 @@ class TestClickHouseFilterBuilder:
             }
         ]
         where, params = builder.translate(filters)
-        assert "LIKE" in where
-        assert any("%" in str(v) for v in params.values())
+        assert "positionUTF8(lowerUTF8" in where
+        assert " LIKE " not in where
+        assert "gpt" in params.values()
 
     def test_translate_span_attribute_is_null(self):
         """SPAN_ATTRIBUTE is_null filter should check mapContains with NOT."""
@@ -1779,10 +1780,11 @@ class TestClickHouseFilterBuilder:
             ]
         )
 
-        assert "arrayExists(x -> x ILIKE" in where
+        assert "arrayExists(x -> positionUTF8(lowerUTF8" in where
+        assert "arrayExists(x -> startsWith(lowerUTF8" in where
         assert "JSONExtract(output_str_list, 'Array(String)')" in where
-        assert "%fear%" in params.values()
-        assert "joy%" in params.values()
+        assert "fear" in params.values()
+        assert "joy" in params.values()
 
     def test_translate_annotation_filter(self):
         """ANNOTATION filter should produce a subquery against annotation tables."""
@@ -2829,6 +2831,73 @@ class TestTraceListQueryBuilder:
 class TestSessionListQueryBuilder:
     """Test session list query builder."""
 
+    def test_candidate_session_scope_is_raw_alias_predicate(self):
+        """Bounded preview scopes the physical scan to expanded id aliases."""
+        from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
+
+        aliases = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        )
+        builder = SessionListQueryBuilder(
+            project_id="test-project-id",
+            filters=[
+                {
+                    "column_id": "final_status",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "Rechazado",
+                    },
+                }
+            ],
+            page_number=0,
+            page_size=10,
+            candidate_session_ids=aliases,
+        )
+
+        query, params = builder.build()
+
+        assert "trace_session_id IN %(candidate_session_ids)s" in query
+        assert params["candidate_session_ids"] == aliases
+        assert "FROM spans FINAL" in query
+        assert "is_deleted = 0" not in query
+        # Session rows retain trace any-span semantics.  The membership scan is
+        # acceptable only because it is FINAL and bounded to the same expanded
+        # old/new session aliases as the outer aggregation.
+        assert "trace_id IN (SELECT trace_id FROM spans FINAL" in query
+        assert query.count("trace_session_id IN %(candidate_session_ids)s") >= 2
+
+    def test_v2_candidate_session_final_disables_mutable_skip_indexes(self):
+        from tracer.services.clickhouse.v2.query_builders.session_list import (
+            SessionListQueryBuilderV2,
+        )
+
+        builder = SessionListQueryBuilderV2(
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=[
+                {
+                    "column_id": "final_status",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "Rechazado",
+                    },
+                }
+            ],
+            candidate_session_ids=["22222222-2222-4222-8222-222222222222"],
+        )
+
+        query, _ = builder.build()
+
+        assert "FROM spans FINAL" in query
+        assert "is_deleted = 0" not in query
+        assert "mapContains(attrs_string, 'final_status')" in query
+        assert "use_skip_indexes_if_final = 0" in query
+        assert "use_skip_indexes_if_final = 1" not in query
+
     def test_build_query(self):
         """build() should produce a session list query with GROUP BY."""
         from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
@@ -3096,9 +3165,50 @@ class TestSessionListQueryBuilder:
         count_query, _ = builder.build_count_query()
 
         assert "argMin(input, start_time) AS first_message" in query
-        assert "HAVING first_message ILIKE %(having_" in query
-        assert "%recursion%" in params.values()
+        assert "HAVING positionUTF8(lowerUTF8(" in query
+        assert "toString(first_message)" in query
+        assert "recursion" in params.values()
+        assert "%recursion%" not in params.values()
         assert "argMin(input, start_time) AS first_message" in count_query
+
+    @pytest.mark.parametrize(
+        "filter_op, expected_function",
+        [
+            ("contains", "positionUTF8"),
+            ("not_contains", "positionUTF8"),
+            ("starts_with", "startsWith"),
+            ("ends_with", "endsWith"),
+        ],
+    )
+    def test_message_text_filter_treats_wildcards_as_literals(
+        self,
+        filter_op,
+        expected_function,
+    ):
+        from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
+
+        needle = "%_\\O'Reilly café東京"
+        builder = SessionListQueryBuilder(
+            project_id="test-project-id",
+            filters=[
+                {
+                    "column_id": "first_message",
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": filter_op,
+                        "filter_value": needle,
+                        "col_type": "SYSTEM_METRIC",
+                    },
+                }
+            ],
+        )
+
+        query, params = builder.build()
+
+        assert expected_function in query
+        assert "ILIKE" not in query
+        assert needle in params.values()
+        assert needle not in query
 
     def test_first_message_sort_projects_message_aggregates(self):
         from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
@@ -3740,7 +3850,9 @@ class TestEvalMetricsQueryBuilder:
 
         query, params = builder.build()
 
-        assert "attrs_string['customer.tier'] ILIKE" in query
+        assert "positionUTF8(lowerUTF8" in query
+        assert "attrs_string['customer.tier']" in query
+        assert " ILIKE " not in query
         assert "span_attr_str" not in query
         assert query.count("SELECT DISTINCT trace_id FROM spans") == 1
         assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in query
@@ -4739,7 +4851,7 @@ class TestTraceListQueryBuilderComprehensive:
         assert "00000000-0000-0000-0000-000000000000" in query
 
     def test_build_with_contains_filter(self):
-        """Contains filter should produce LIKE with percent wildcards."""
+        """Contains filter should bind a literal UTF-8 needle."""
         from tracer.services.clickhouse.query_builders import TraceListQueryBuilder
 
         builder = TraceListQueryBuilder(
@@ -4757,8 +4869,9 @@ class TestTraceListQueryBuilderComprehensive:
             ],
         )
         query, params = builder.build()
-        assert "LIKE" in query
-        assert any("%" in str(v) for v in params.values())
+        assert "positionUTF8(lowerUTF8" in query
+        assert " LIKE " not in query
+        assert "gpt" in params.values()
 
     def test_build_with_between_filter(self):
         """Between filter should produce BETWEEN clause."""
@@ -6093,7 +6206,7 @@ class TestFilterBuilderEdgeCases:
         assert "!=" in where
 
     def test_not_contains_filter(self):
-        """not_contains should produce NOT ILIKE (case-insensitive)."""
+        """not_contains should use a literal case-insensitive predicate."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -6110,11 +6223,13 @@ class TestFilterBuilderEdgeCases:
                 },
             }
         ]
-        where, _ = builder.translate(filters)
-        assert "NOT ILIKE" in where
+        where, params = builder.translate(filters)
+        assert "positionUTF8(lowerUTF8" in where
+        assert "= 0" in where
+        assert "gpt" in params.values()
 
     def test_starts_with_filter(self):
-        """starts_with should produce LIKE with trailing %."""
+        """starts_with should use a literal case-insensitive prefix."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -6132,13 +6247,11 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, params = builder.translate(filters)
-        assert "LIKE" in where
-        assert any(
-            str(v).endswith("%") and not str(v).startswith("%") for v in params.values()
-        )
+        assert "startsWith(lowerUTF8" in where
+        assert "gpt" in params.values()
 
     def test_ends_with_filter(self):
-        """ends_with should produce LIKE with leading %."""
+        """ends_with should use a literal case-insensitive suffix."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -6156,11 +6269,8 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, params = builder.translate(filters)
-        assert "LIKE" in where
-        assert any(
-            str(v).startswith("%") and not str(v).endswith("%%")
-            for v in params.values()
-        )
+        assert "endsWith(lowerUTF8" in where
+        assert "turbo" in params.values()
 
     def test_not_between_filter(self):
         """not_between should produce NOT BETWEEN clause. (Canonical op
@@ -6237,7 +6347,7 @@ class TestFilterBuilderEdgeCases:
         assert "<=" in where
 
     def test_span_attr_not_contains(self):
-        """SPAN_ATTRIBUTE not_contains should produce NOT ILIKE (case-insensitive)."""
+        """SPAN_ATTRIBUTE not_contains should bind a literal UTF-8 needle."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -6254,9 +6364,11 @@ class TestFilterBuilderEdgeCases:
                 },
             }
         ]
-        where, _ = builder.translate(filters)
-        assert "NOT ILIKE" in where
+        where, params = builder.translate(filters)
+        assert "positionUTF8(lowerUTF8" in where
+        assert "= 0" in where
         assert "span_attr_str" in where
+        assert "azure" in params.values()
 
     def test_span_attr_between(self):
         """SPAN_ATTRIBUTE between should produce BETWEEN clause."""
@@ -6534,8 +6646,8 @@ class TestFilterBuilderEdgeCases:
                     "filter_value": "needs",
                     "col_type": "ANNOTATION",
                 },
-                ["JSONExtractString", "'text'", "ILIKE"],
-                {"needs%"},
+                ["JSONExtractString", "'text'", "startsWith(lowerUTF8"],
+                {"needs"},
             ),
             (
                 {
@@ -7026,7 +7138,8 @@ class TestVoiceCallListQueryBuilder:
         query, _ = builder.build()
 
         assert "mapContains(span_attr_str, 'ended_reason')" in query
-        assert "span_attr_str['ended_reason'] ILIKE" in query
+        assert "positionUTF8(lowerUTF8" in query
+        assert "span_attr_str['ended_reason']" in query
 
 
 @pytest.mark.unit
@@ -7451,7 +7564,7 @@ class TestVoiceCallListQueryBuilderComprehensive:
         assert "trace_id IN" in query
 
     def test_contains_filter(self):
-        """LIKE-based contains filter should work."""
+        """Literal UTF-8 contains filter should work."""
         from tracer.services.clickhouse.query_builders.voice_call_list import (
             VoiceCallListQueryBuilder,
         )
@@ -7471,9 +7584,9 @@ class TestVoiceCallListQueryBuilderComprehensive:
             ],
         )
         query, params = builder.build()
-        assert "LIKE" in query
-        # Value should be wrapped in %
-        assert any("%phone%" == v for v in params.values())
+        assert "positionUTF8(lowerUTF8" in query
+        assert " LIKE " not in query
+        assert "phone" in params.values()
 
     def test_multiple_filters_combined(self):
         """Multiple filters should be ANDed together."""
@@ -9013,14 +9126,14 @@ class TestSpanAttrConditionContract:
         assert "NOT mapContains" not in where
         assert ("voicemail", "assistant-ended-call") in params.values()
 
-    def test_text_contains_wildcard(self):
+    def test_text_contains_literal(self):
         where, params = _translate_one(
             _span_attr_filter(
                 "k", filter_type="text", filter_op="contains", filter_value="abc"
             )
         )
-        assert "LIKE" in where
-        assert "%abc%" in params.values()
+        assert "positionUTF8(lowerUTF8" in where
+        assert "abc" in params.values()
 
     def test_text_not_contains_uses_exists_and(self):
         where, params = _translate_one(
@@ -9028,25 +9141,28 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="not_contains", filter_value="abc"
             )
         )
-        assert "AND span_attr_str['k'] NOT ILIKE" in where
+        assert "AND positionUTF8(lowerUTF8" in where
+        assert "= 0" in where
         assert "NOT mapContains" not in where
-        assert "%abc%" in params.values()
+        assert "abc" in params.values()
 
     def test_text_starts_with(self):
-        _, params = _translate_one(
+        where, params = _translate_one(
             _span_attr_filter(
                 "k", filter_type="text", filter_op="starts_with", filter_value="abc"
             )
         )
-        assert "abc%" in params.values()
+        assert "startsWith(lowerUTF8" in where
+        assert "abc" in params.values()
 
     def test_text_ends_with(self):
-        _, params = _translate_one(
+        where, params = _translate_one(
             _span_attr_filter(
                 "k", filter_type="text", filter_op="ends_with", filter_value="abc"
             )
         )
-        assert "%abc" in params.values()
+        assert "endsWith(lowerUTF8" in where
+        assert "abc" in params.values()
 
     def test_text_is_null(self):
         where, _ = _translate_one(

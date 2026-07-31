@@ -40,6 +40,7 @@ from tracer.services.clickhouse.query_builders.filters import (
     ClickHouseFilterBuilder,
     _coerce_strict_bool,
     _sanitize_key,
+    build_literal_text_predicate,
 )
 from tracer.services.clickhouse.query_service import (
     GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES,
@@ -446,20 +447,17 @@ class ClickHouseFilterBuilderV2(ClickHouseFilterBuilder):
             and attribute_key in self._TRACE_ROOT_ATTRIBUTE_KEYS
         ):
             return inner
-        # idx_attrs_str_values is a bloom over arrayMap(x -> lower(x),
-        # mapValues(attrs_string)); the lower()-wrapped equality alone can
-        # never engage it, so equality/IN gain a companion predicate in the
-        # index's exact expression shape. The companion is implied by the
-        # real predicate (a matching row necessarily carries the lowered
-        # value), so result sets are unchanged. ClickHouse lower() is
-        # ASCII-only while ILIKE is UTF-8 aware, so non-ASCII values must skip
-        # the companion or it could turn a true match into a false negative.
         if (
             not inner
             or not case_insensitive
             or map_column not in ("span_attr_str", cols.ATTRS_STRING)
         ):
             return inner
+
+        # Exact ASCII text comparisons use the same ASCII ``lower()`` contract
+        # as idx_attrs_str_values, so these equality/IN companions are truly
+        # implied and may safely retain bloom-index pruning. Non-ASCII exact
+        # needles use the lowerUTF8 branch above and deliberately skip them.
         lowered_values = f"arrayMap(x -> lower(x), mapValues({map_column}))"
         if filter_op == "equals":
             if isinstance(normalized_value, str) and not normalized_value.isascii():
@@ -484,26 +482,12 @@ class ClickHouseFilterBuilderV2(ClickHouseFilterBuilder):
                 bound.append(f"%({param})s")
             return f"{inner} AND hasAny({lowered_values}, [{', '.join(bound)}])"
 
-        # idx_attrs_str_ngram is defined over this exact expression. ILIKE on
-        # one map element does not engage it, so positive substring operations
-        # gain a logically-implied companion over all lowered values. Prefix
-        # and suffix checks deliberately use an unanchored companion: if the
-        # selected value starts/ends with the needle, the concatenated map
-        # values contain it somewhere. ngrambf_v1(4, ...) cannot use shorter
-        # needles, and negations must never receive a positive companion.
-        if (
-            filter_op not in ("contains", "starts_with", "ends_with")
-            or not isinstance(normalized_value, str)
-            or len(normalized_value) < 4
-            or not normalized_value.isascii()
-        ):
-            return inner
-        ngram_values = (
-            f"arrayStringConcat(arrayMap(x -> lower(x), mapValues({map_column})))"
-        )
-        param = self._next_param("attr_ngram")
-        self._params[param] = f"%{normalized_value.lower()}%"
-        return f"{inner} AND {ngram_values} LIKE %({param})s"
+        # Substring/prefix/suffix predicates are Unicode-aware regardless of
+        # whether the needle itself is ASCII. The deployed ngram index is
+        # ASCII-lowered, so a companion over it can reject a valid row such as
+        # ``KELVIN`` for the needle ``kelvin``. Keep only the authoritative
+        # literal predicate; an optimisation must never narrow the result set.
+        return inner
 
     def _build_span_attr_condition(
         self,
@@ -587,15 +571,17 @@ class ClickHouseFilterBuilderV2(ClickHouseFilterBuilder):
                 return f"notEmpty({tags_array}) AND NOT ({predicate})"
             return predicate
 
-        pattern_by_op = {
-            "contains": f"%{scalar}%",
-            "not_contains": f"%{scalar}%",
-            "starts_with": f"{scalar}%",
-            "ends_with": f"%{scalar}",
-        }
-        if filter_op in pattern_by_op:
-            self._params[param] = pattern_by_op[filter_op]
-            predicate = f"arrayExists(x -> x ILIKE %({param})s, {tags_array})"
+        if filter_op in {"contains", "not_contains", "starts_with", "ends_with"}:
+            self._params[param] = str(scalar)
+            # ``not_contains`` negates the complete any-tag match below.
+            match_op = "contains" if filter_op == "not_contains" else filter_op
+            match = build_literal_text_predicate(
+                "x",
+                param,
+                match_op,
+                case_insensitive=True,
+            )
+            predicate = f"arrayExists(x -> {match}, {tags_array})"
             if filter_op == "not_contains":
                 return f"notEmpty({tags_array}) AND NOT ({predicate})"
             return predicate

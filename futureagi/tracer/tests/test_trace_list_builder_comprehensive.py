@@ -528,8 +528,8 @@ class TestBuildCountQuery:
         builder = TraceListQueryBuilder(project_id=project_id, search="boom")
         builder.build()
         query, params = builder.build_count_query()
-        assert "trace_name ILIKE %(search)s" in query
-        assert params["search"] == "%boom%"
+        assert "positionUTF8(lowerUTF8(" in query
+        assert params["search"] == "boom"
 
     def test_start_time_window_no_created_at_skew(self, project_id):
         builder = TraceListQueryBuilder(project_id=project_id)

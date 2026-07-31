@@ -85,9 +85,12 @@ from tracer.services.clickhouse.query_builders import (
     AgentGraphQueryBuilder,
 )
 from tracer.services.clickhouse.query_builders.base import NIL_UUID
-from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.filters import (
+    ClickHouseFilterBuilder,
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.query_builders.latest_attributes import (
-    is_latest_trace_probe_filter,
+    is_latest_trace_root_probe_filter,
 )
 from tracer.services.clickhouse.query_service import (
     GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES,
@@ -143,6 +146,13 @@ _TRACE_CANDIDATE_READ_SETTINGS = {
     **_BOUNDED_ANALYTICS_SETTINGS,
     "max_threads": 1,
     "max_block_size": 8192,
+}
+_TRACE_ATTRIBUTE_READ_SETTINGS = {
+    **_BOUNDED_ANALYTICS_SETTINGS,
+    # The builder caps bundles per trace; this is the second guard for a
+    # pathological single Map/root bundle. Throwing yields an explicit
+    # degraded enrichment instead of returning an enormous response.
+    "max_result_bytes": 16 * 1024 * 1024,
 }
 
 
@@ -3810,14 +3820,25 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # keyset-paginated skinny stream; ``traces.created_at`` is not used as
         # a proxy for root ``start_time`` because ingestion delay can reorder
         # or omit a trace.
-        candidate_filter_scan_used = _requires_candidate_filter_scan(filters)
-        root_attribute_slice_scan_used = _requires_root_attribute_slice_scan(filters)
-        bounded_filter_scan_used = (
-            candidate_filter_scan_used or root_attribute_slice_scan_used
-        )
-        candidate_scan_used = bounded_filter_scan_used or (
-            not org_scope and _has_only_time_filters(filters)
-        )
+        # All trace pages now share the same projection-backed root seed and
+        # point-scoped latest-state classifier.  Keeping an indexed-looking
+        # root/session/tag filter on the raw non-FINAL path could still expose
+        # a stopped-merge stale version or skip a multi-root trace on deep pages.
+        if not builder.supports_latest_filter_match(filters):
+            return self._gm.success_response(
+                {
+                    "metadata": {
+                        "total_rows": 0,
+                        "total_rows_is_lower_bound": True,
+                        "has_more": False,
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "unsupported_filter_shape",
+                    },
+                    "table": [],
+                    "config": get_default_trace_config(),
+                }
+            )
         candidate_scan_complete = True
 
         def _execute_candidate_batched_page():
@@ -3865,16 +3886,30 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # below; this is required for mutable session and root metrics.
             # Unsupported mixed shapes fail closed rather than issuing the old
             # candidate ``FINAL`` query (Code 241 family).
-            scalar_probe_supported = all(
-                is_latest_trace_probe_filter(item) for item in probe_filters
-            )
+            scalar_probe_supported = builder.supports_latest_filter_match(probe_filters)
             if not scalar_probe_supported:
                 logger.warning(
                     "unsupported trace filter shape skipped unsafe latest-state read",
                     project_id=str(project_id) if project_id else None,
                 )
                 return QueryResult([], 0, "clickhouse", 0), False
-            candidate_batch = _FILTERED_TRACE_CANDIDATE_BATCH
+            # Canonical-root predicates can safely narrow the physical seed:
+            # every latest matching root necessarily has a matching physical
+            # version, while stale versions are removed by the full-window
+            # scalar classifier below.  This turns a no-match final_status
+            # request from "classify every trace" into a bounded set of empty
+            # partition reads. Any-span predicates retain the unfiltered root
+            # frontier because child-span time cannot establish trace order.
+            root_filtered_seed = bool(probe_filters) and all(
+                is_latest_trace_root_probe_filter(item) for item in probe_filters
+            )
+            candidate_batch = min(
+                200,
+                max(
+                    _FILTERED_TRACE_CANDIDATE_BATCH,
+                    prefix_needed,
+                ),
+            )
 
             def _trace_order_key(row):
                 value = row.get("start_time")
@@ -4014,14 +4049,22 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     request_start,
                     seed_slice_end - seed_slice_width,
                 )
-                candidate_query, candidate_params = (
-                    builder.build_root_candidate_seed_page(
-                        slice_start=seed_slice_start,
-                        slice_end=seed_slice_end,
-                        limit=candidate_batch,
-                        before_start_time=before_start_time,
-                        before_trace_id=before_trace_id,
-                    )
+                seed_method = (
+                    builder.build_filtered_root_candidate_seed_page
+                    if root_filtered_seed
+                    else builder.build_root_candidate_seed_page
+                )
+                seed_kwargs = {
+                    "slice_start": seed_slice_start,
+                    "slice_end": seed_slice_end,
+                    "limit": candidate_batch,
+                    "before_start_time": before_start_time,
+                    "before_trace_id": before_trace_id,
+                }
+                if root_filtered_seed:
+                    seed_kwargs["filters"] = probe_filters
+                candidate_query, candidate_params = seed_method(
+                    **seed_kwargs,
                 )
                 try:
                     candidate_result = analytics.execute_ch_query(
@@ -4099,24 +4142,27 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
             return last_result, scan_complete
 
-        # Attribute and date-only pages use projection-backed root keysets,
-        # scalar latest-state probes, and page-only hydration. Other indexed
-        # root filters retain the single top-K query. Every path shares hard
-        # resource settings and never exposes a ClickHouse exception.
+        # Every list page uses projection-backed root keysets, latest-state
+        # probes, and page-only hydration.  There is deliberately no fallback
+        # to the broad non-FINAL list query: that path can expose stale rows and
+        # loses the exact de-duplicated pagination prefix when merges stop.
         try:
-            if candidate_scan_used:
-                result, candidate_scan_complete = _execute_candidate_batched_page()
-            else:
-                query, params = builder.build(since=None)
-                result = analytics.execute_ch_query(
-                    query,
-                    params,
-                    timeout_ms=750,
-                    settings={
-                        **_BOUNDED_ANALYTICS_SETTINGS,
-                        **({"max_result_rows": 64} if preview else {}),
+            result, candidate_scan_complete = _execute_candidate_batched_page()
+        except UnsupportedFilterShapeError:
+            return self._gm.success_response(
+                {
+                    "metadata": {
+                        "total_rows": 0,
+                        "total_rows_is_lower_bound": True,
+                        "has_more": False,
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "unsupported_filter_shape",
                     },
-                )
+                    "table": [],
+                    "config": get_default_trace_config(),
+                }
+            )
         except Exception as exc:
             if not is_read_budget_error(exc):
                 raise
@@ -4130,6 +4176,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     "metadata": {
                         "total_rows": 0,
                         "total_rows_is_lower_bound": True,
+                        "has_more": False,
                         "query_complete": False,
                         "query_status": "degraded",
                         "query_error_code": "read_budget_exceeded",
@@ -4185,11 +4232,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
             metadata = {
                 "total_rows": (
-                    candidate_proven_match_count
-                    if candidate_scan_used
-                    else len(table_data) + (1 if has_more else 0)
+                    len(table_data) + (1 if has_more else 0)
+                    if candidate_scan_complete
+                    else candidate_proven_match_count
                 ),
                 "total_rows_is_lower_bound": True,
+                "has_more": has_more,
             }
             if not candidate_scan_complete:
                 metadata.update(
@@ -4219,64 +4267,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             result.data, "trace_id", page_number, page_size
         )
 
-        # Exact count is optional pagination enrichment. Give filtered raw
-        # counts a strict budget; on timeout return a monotonic lower bound so
-        # the data page stays usable and the cluster never spends tens of
-        # seconds/GBs merely computing a footer.
-        total_count_is_lower_bound = bounded_filter_scan_used
-        if bounded_filter_scan_used:
-            # Re-running the full-window Map predicate just to render a footer
-            # would undo the bounded page fix. The page can be exact while its
-            # display count remains an honest monotonic lower bound. Use every
-            # match the candidate scan actually proved, including the prefix
-            # preceding a deep page. Never synthesize a page offset when the
-            # scan stopped before proving that prefix.
-            total_count = candidate_proven_match_count
-        else:
-            count_query, count_params = builder.build_count_query()
-            cache_params = {
-                key: (
-                    value.replace(second=0, microsecond=0)
-                    if isinstance(value, datetime)
-                    else value
-                )
-                for key, value in count_params.items()
-                if key != "limit"
-            }
-            count_cache_key = (
-                "trace_list_count:"
-                + hashlib.sha256(
-                    (count_query + repr(sorted(cache_params.items(), key=str))).encode()
-                ).hexdigest()
-            )
-            cached_total = django_cache.get(count_cache_key)
-            if cached_total is not None:
-                total_count = cached_total
-            else:
-                try:
-                    count_result = analytics.execute_ch_query(
-                        count_query,
-                        count_params,
-                        timeout_ms=750,
-                        settings=_BOUNDED_ANALYTICS_SETTINGS,
-                    )
-                    total_count = (
-                        count_result.data[0].get("total", 0) if count_result.data else 0
-                    )
-                    django_cache.set(count_cache_key, total_count, timeout=60)
-                except Exception as exc:
-                    total_count = (
-                        page_number * page_size
-                        + len(result.data)
-                        + (1 if has_more else 0)
-                    )
-                    total_count_is_lower_bound = True
-                    logger.warning(
-                        "trace count exceeded latency budget; using lower bound",
-                        project_id=str(project_id) if project_id else None,
-                        lower_bound=total_count,
-                        error=str(exc)[:200],
-                    )
+        # The candidate executor proves the exact prefix plus one sentinel.
+        # A second full-window count would reintroduce the failure mode this
+        # endpoint is avoiding, so expose the monotonic proven lower bound and
+        # let ``has_more`` drive pagination.
+        total_count = (
+            page_number * page_size + len(result.data) + (1 if has_more else 0)
+            if candidate_scan_complete
+            else candidate_proven_match_count
+        )
+        total_count_is_lower_bound = True
 
         # Phase 1b: Fetch heavy columns (input/output/attrs) for the page
         trace_ids = [str(row.get("trace_id", "")) for row in result.data]
@@ -4322,19 +4322,24 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         requested=len(trace_ids),
                         project_id=str(project_id) if project_id else None,
                     )
+        content_merge_keys = ["input", "output", "trace_tags"]
+        # The CH25 compact ``traces`` content source intentionally has no span
+        # attribute Maps. Do not let absent keys overwrite the canonical root
+        # attributes already returned by candidate hydration. Legacy content
+        # rows that really carry those fields still merge them as before.
+        for key in (
+            "attrs_string",
+            "attrs_number",
+            "attrs_bool",
+            "attributes_extra",
+        ):
+            if any(key in content_row for content_row in content_rows):
+                content_merge_keys.append(key)
         content_map = merge_content_rows(
             result.data,
             content_rows,
             id_key="trace_id",
-            keys=(
-                "input",
-                "output",
-                "attrs_string",
-                "attrs_number",
-                "attrs_bool",
-                "attributes_extra",
-                "trace_tags",
-            ),
+            keys=content_merge_keys,
         )
 
         # metadata needs JSON-parsing from the raw CH column
@@ -4436,40 +4441,108 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         attr_query,
                         attr_params,
                         timeout_ms=750,
-                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                        settings=_TRACE_ATTRIBUTE_READ_SETTINGS,
                     )
-                    for attr_row in attr_result.data:
-                        tid = str(attr_row.get("trace_id", ""))
-                        # Use the same precedence as span detail everywhere:
-                        # typed string/number/bool Maps are merged first and
-                        # overflow JSON explicitly wins on duplicate keys.
+
+                    def _merge_attribute_row(
+                        trace_id: str,
+                        attribute_row,
+                        *,
+                        is_root: bool | None,
+                    ) -> None:
+                        if (
+                            not isinstance(attribute_row, (list, tuple))
+                            or len(attribute_row) != 4
+                        ):
+                            return
+                        raw, str_map, num_map, bool_map = attribute_row
                         attrs = merge_span_attributes(
-                            attr_row.get("attrs_string"),
-                            attr_row.get("attrs_number"),
-                            attr_row.get("attrs_bool"),
-                            attr_row.get("attributes_extra", "{}"),
+                            str_map,
+                            num_map,
+                            bool_map,
+                            raw,
                         )
-                        if tid not in aggregated_attrs:
-                            aggregated_attrs[tid] = {}
                         for key, value in attrs.items():
                             if key.startswith(_SKIP_ATTR_PREFIXES):
                                 continue
+                            if (
+                                is_root is False
+                                and key in GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES
+                            ):
+                                # final_status and the other guaranteed-root
+                                # fields are owned by the canonical root. A
+                                # child value must never override or widen it.
+                                continue
                             if isinstance(value, str) and len(value) > 500:
                                 continue
-                            if key not in aggregated_attrs[tid]:
-                                aggregated_attrs[tid][key] = (
+                            if key not in aggregated_attrs[trace_id]:
+                                aggregated_attrs[trace_id][key] = (
                                     set()
                                     if isinstance(value, (str, int, float, bool))
                                     else []
                                 )
                             if isinstance(value, (str, int, float, bool)):
-                                aggregated_attrs[tid][key].add(
+                                aggregated_attrs[trace_id][key].add(
                                     value
                                     if not isinstance(value, bool)
                                     else str(value).lower()
                                 )
                             elif isinstance(value, (list, dict)):
                                 pass  # skip complex values for aggregation
+
+                    for attr_row in attr_result.data:
+                        tid = str(attr_row.get("trace_id", ""))
+                        attribute_rows = attr_row.get("attribute_rows")
+                        new_bounded_shape = "attribute_row_count" in attr_row
+                        if attribute_rows is None:
+                            # Legacy/v1 result shape: one span bundle per row.
+                            attribute_rows = [
+                                (
+                                    attr_row.get("attributes_extra", "{}"),
+                                    attr_row.get("attrs_string"),
+                                    attr_row.get("attrs_number"),
+                                    attr_row.get("attrs_bool"),
+                                )
+                            ]
+                        if tid not in aggregated_attrs:
+                            aggregated_attrs[tid] = {}
+                        if new_bounded_shape:
+                            root_count = int(attr_row.get("root_attribute_count") or 0)
+                            root_row = attr_row.get("root_attribute_row")
+                            if root_count and root_row is not None:
+                                _merge_attribute_row(tid, root_row, is_root=True)
+
+                            retained_count = len(attribute_rows or [])
+                            contributing_count = int(
+                                attr_row.get("attribute_row_count") or 0
+                            )
+                            if contributing_count > retained_count:
+                                # Never expose a silent arbitrary child sample.
+                                # The canonical root was returned separately,
+                                # so required final_status/root attributes stay
+                                # exact while the metadata reports degradation.
+                                enrichment_error_codes.add("query_failed")
+                                logger.warning(
+                                    "trace span attribute aggregation truncated",
+                                    trace_id=tid,
+                                    contributing=contributing_count,
+                                    retained=retained_count,
+                                )
+                                continue
+                            for attribute_row in attribute_rows or []:
+                                _merge_attribute_row(
+                                    tid,
+                                    attribute_row,
+                                    is_root=False,
+                                )
+                        else:
+                            # Legacy/v1 rows do not identify root-vs-child.
+                            for attribute_row in attribute_rows or []:
+                                _merge_attribute_row(
+                                    tid,
+                                    attribute_row,
+                                    is_root=None,
+                                )
             except Exception as exc:
                 enrichment_error_codes.add(
                     "read_budget_exceeded"
@@ -4575,7 +4648,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             table_data.append(entry)
 
-        response_metadata = {"total_rows": total_count}
+        response_metadata = {"total_rows": total_count, "has_more": has_more}
         if total_count_is_lower_bound:
             response_metadata["total_rows_is_lower_bound"] = True
         if not candidate_scan_complete:

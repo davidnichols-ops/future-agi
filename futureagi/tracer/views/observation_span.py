@@ -90,6 +90,9 @@ from tracer.services.clickhouse.graph_dispatch import (
     fetch_system_metric_graph_ch,
 )
 from tracer.services.clickhouse.page_dedup import paginate_deduped
+from tracer.services.clickhouse.query_builders.filters import (
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.query_service import (
     AnalyticsQueryService,
     QueryResult,
@@ -153,14 +156,20 @@ _SPAN_CONTENT_READ_SETTINGS = {
     "max_block_size": 8192,
 }
 
-# Match the trace list's bounded scan envelope while retaining a 750 ms ceiling
-# on every individual ClickHouse statement.
-_SPAN_FILTER_SCAN_BUDGET_MS = 1800
-_SPAN_FILTER_QUERY_TIMEOUT_MS = 750
+# Keep the complete list path below the API's three-second SLO while leaving
+# enough room for a bounded seed, local classification, and a skinny
+# cross-slice history proof. Most direct-write ids end there. Mutable ids alone
+# receive an eight-id full-window classifier: on CH25's 64 MiB granules, a
+# 50--75-id Map classifier can otherwise exceed the finite read envelope.
+_SPAN_FILTER_SCAN_BUDGET_MS = 2100
+_SPAN_FILTER_QUERY_TIMEOUT_MS = 600
 _SPAN_FILTER_SCAN_MIN_SLICE = timedelta(minutes=1)
-_SPAN_FILTER_SCAN_MAX_ATTEMPTS = 16
+_SPAN_FILTER_SCAN_MAX_ATTEMPTS = 24
 _SPAN_FILTER_SCAN_MIN_QUERY_MS = 25
 _SPAN_FILTER_MAX_FUTURE_SKEW = timedelta(minutes=5)
+_SPAN_FILTER_LOCAL_CLASSIFIER_BATCH_SIZE = 64
+_SPAN_FILTER_GLOBAL_CLASSIFIER_BATCH_SIZE = 8
+_SPAN_FILTER_CLASSIFIER_MAX_READS = 64
 
 
 def _execute_bounded_span_filter_prefix(
@@ -176,13 +185,15 @@ def _execute_bounded_span_filter_prefix(
     The all-span table has no projection ordered solely by project and time, so
     both raw Map predicates and an unfiltered multi-day top-K can exceed a
     per-query read budget. Adjacent slices start at one minute and grow
-    geometrically after completed empty or sparse reads. The common scalar path
-    first reads unfiltered physical ``(id, start_time)`` candidates, marks each
-    id seen, then classifies only that bounded id set against latest state over
-    the complete original request window. This prevents a newer key-clear,
-    non-match, or tombstone from being hidden in one slice and an older matching
-    version resurfacing from another. There is no speculative whole-window seed
-    and no timeout is used as normal control flow.
+    geometrically after completed empty or sparse reads. The scalar path uses a
+    physical ``(id, start_time)`` seed; attribute predicates are safe raw
+    prefilters, never final classifications. Each novel id is reduced to exact
+    latest state inside its slice, then a skinny ID/time probe proves whether
+    physical history exists elsewhere in the request. A direct-write id with
+    no outside history is already exact. Only cross-slice ids are reclassified
+    over the complete request, in proactive eight-id batches, so a newer key
+    clear, non-match, or tombstone still rejects an older match without making
+    every ordinary row pay for a wide Map scan.
 
     All slices share one wall-clock deadline.  A slice receives only the
     remaining timeout, and resource-limit failures never contribute partial
@@ -230,32 +241,23 @@ def _execute_bounded_span_filter_prefix(
         )
 
     deadline = started_at + max(int(budget_ms), 1) / 1000
-    initial_slice_limit = min(
-        max_result_rows,
-        prefix_limit + builder.page_size,
-    )
-    scalar_latest_page = builder.supports_latest_attribute_page()
-    base_query = None
-    base_params = None
+    scalar_latest_page = builder.supports_latest_candidate_page()
     if not scalar_latest_page:
-        # Legacy-only shapes (custom sort, end-user remap, eval/annotation
-        # filters) retain their existing compiler. The common unfiltered and
-        # span-attribute paths never enter this ``FINAL`` fallback.
-        base_query, base_params = builder.build(
-            since=start_date,
-            slice_end=end_date,
-            limit=initial_slice_limit,
-        )
-    else:
-        # Keep later content/enrichment phases scoped even if the deadline is
-        # exhausted before the first slice can execute.
-        builder.params["start_date"] = start_date
-        builder.params["end_date"] = end_date
+        # Never fall back to the raw non-FINAL list compiler. Unsupported
+        # eval/annotation/custom-sort shapes must be surfaced explicitly by the
+        # view instead of returning stale rows or an apparently valid empty page.
+        return QueryResult([], 0, "clickhouse", 0), False, False
+
+    # Keep later content/enrichment phases scoped even if the deadline is
+    # exhausted before the first slice can execute.
+    builder.params["start_date"] = start_date
+    builder.params["end_date"] = end_date
 
     rows: list[dict] = []
     seen_ids: set[str] = set()
     matched_ids: set[str] = set()
     prefix_proven = False
+    classifier_reads = 0
 
     def _span_order_key(row):
         value = row.get("start_time")
@@ -265,6 +267,98 @@ def _execute_bounded_span_filter_prefix(
         else:
             value = datetime.min
         return value, str(row.get("id", ""))
+
+    def _classify_candidates(
+        candidate_ids: list[str],
+        *,
+        batch_size: int,
+        window_start=None,
+        window_end=None,
+    ) -> tuple[list[dict], bool]:
+        nonlocal classifier_reads
+        classified_rows: list[dict] = []
+        for batch_offset in range(0, len(candidate_ids), batch_size):
+            candidate_batch = candidate_ids[batch_offset : batch_offset + batch_size]
+            if classifier_reads >= _SPAN_FILTER_CLASSIFIER_MAX_READS:
+                return classified_rows, False
+            remaining_ms = int((deadline - clock()) * 1000)
+            if remaining_ms < _SPAN_FILTER_SCAN_MIN_QUERY_MS:
+                return classified_rows, False
+            match_query, match_params = (
+                builder.build_latest_attribute_candidate_matches(
+                    candidate_batch,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+            )
+            try:
+                classifier_reads += 1
+                match_result = analytics.execute_ch_query(
+                    match_query,
+                    match_params,
+                    timeout_ms=min(_SPAN_FILTER_QUERY_TIMEOUT_MS, remaining_ms),
+                    settings={
+                        **_SPAN_PREFIX_READ_SETTINGS,
+                        "max_result_rows": len(candidate_batch),
+                    },
+                )
+            except Exception as exc:
+                if not is_read_budget_error(exc):
+                    raise
+                logger.warning(
+                    "bounded span candidate classification exceeded read budget",
+                    candidate_count=len(candidate_batch),
+                    error_type=type(exc).__name__,
+                )
+                return classified_rows, False
+            candidate_id_set = set(candidate_batch)
+            classified_rows.extend(
+                row
+                for row in match_result.data
+                if str(row.get("id", "")) in candidate_id_set
+            )
+        return classified_rows, True
+
+    def _cross_slice_ids(candidate_ids: list[str], *, slice_start, slice_end):
+        nonlocal classifier_reads
+        if not candidate_ids or (slice_start <= start_date and slice_end >= end_date):
+            return set(), True
+        if classifier_reads >= _SPAN_FILTER_CLASSIFIER_MAX_READS:
+            return set(), False
+        remaining_ms = int((deadline - clock()) * 1000)
+        if remaining_ms < _SPAN_FILTER_SCAN_MIN_QUERY_MS:
+            return set(), False
+        query, params = builder.build_cross_slice_candidate_ids(
+            candidate_ids,
+            slice_start=slice_start,
+            slice_end=slice_end,
+        )
+        try:
+            classifier_reads += 1
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=min(_SPAN_FILTER_QUERY_TIMEOUT_MS, remaining_ms),
+                settings={
+                    **_SPAN_PREFIX_READ_SETTINGS,
+                    "max_result_rows": len(candidate_ids),
+                },
+            )
+        except Exception as exc:
+            if not is_read_budget_error(exc):
+                raise
+            logger.warning(
+                "bounded span cross-slice proof exceeded read budget",
+                candidate_count=len(candidate_ids),
+                error_type=type(exc).__name__,
+            )
+            return set(), False
+        candidate_id_set = set(candidate_ids)
+        return {
+            str(row.get("id", ""))
+            for row in result.data
+            if str(row.get("id", "")) in candidate_id_set
+        }, True
 
     scan_now = timezone.now()
     if timezone.is_naive(end_date):
@@ -320,7 +414,7 @@ def _execute_bounded_span_filter_prefix(
             )
 
     for _ in range(max(int(max_slices), 0)):
-        if prefix_proven or (not scalar_latest_page and len(rows) >= prefix_limit):
+        if prefix_proven:
             break
         if cursor <= start_date:
             full_window_scanned = True
@@ -343,33 +437,17 @@ def _execute_bounded_span_filter_prefix(
                 prefix_limit - len(rows) + builder.page_size,
             ),
         )
-        if scalar_latest_page:
-            slice_query, slice_params = (
-                builder.build_latest_attribute_candidate_seed_page(
-                    slice_start=slice_start,
-                    slice_end=cursor,
-                    limit=slice_limit,
-                    before_start_time=keyset_start_time,
-                    before_id=keyset_id,
-                )
-            )
-        else:
-            if keyset_start_time is None:
-                slice_query = base_query
-                slice_params = {
-                    **base_params,
-                    "slice_start": slice_start,
-                    "slice_end": cursor,
-                    "limit": slice_limit,
-                }
-            else:
-                slice_query, slice_params = builder.build(
-                    since=slice_start,
-                    slice_end=cursor,
-                    limit=slice_limit,
-                    before_start_time=keyset_start_time,
-                    before_id=keyset_id,
-                )
+        # Keep the seed physical and narrow. The raw predicate is only a safe
+        # candidate prefilter: an older matching version remains provisional.
+        # The local latest-state classifier plus cross-slice proof below makes
+        # acceptance exact for attributes and physical system metrics alike.
+        slice_query, slice_params = builder.build_latest_attribute_candidate_seed_page(
+            slice_start=slice_start,
+            slice_end=cursor,
+            limit=slice_limit,
+            before_start_time=keyset_start_time,
+            before_id=keyset_id,
+        )
         slice_settings = {
             **_SPAN_PREFIX_READ_SETTINGS,
             "max_result_rows": slice_limit,
@@ -389,76 +467,77 @@ def _execute_bounded_span_filter_prefix(
                 slice_seconds=int((cursor - slice_start).total_seconds()),
                 error=str(exc)[:200],
             )
-            # Throw-mode failures contribute no rows. Stopping is the only
-            # honest response: retrying a narrower interval after a timeout
-            # makes failure part of the normal query plan and burns the shared
-            # deadline while obscuring an incomplete prefix.
+            # A sparse window may have widened geometrically after several
+            # cheap, completed reads. If that wider candidate query crosses a
+            # budget, retry only the still-unread interval at half the width;
+            # completed newer windows remain proven. At the minimum width we
+            # fail closed rather than returning a false-complete page.
+            if slice_width > _SPAN_FILTER_SCAN_MIN_SLICE:
+                slice_width = max(
+                    _SPAN_FILTER_SCAN_MIN_SLICE,
+                    slice_width / 2,
+                )
+                keyset_start_time = None
+                keyset_id = None
+                continue
             break
 
         slice_rows = list(slice_result.data)
-        if scalar_latest_page:
-            # The physical seed can contain several versions of one id. Its
-            # SQL is ordered, but restoring the order here makes the frontier
-            # proof robust to test doubles and distributed result merging.
-            slice_rows.sort(key=_span_order_key, reverse=True)
+        # The physical seed can contain several versions of one id. Its SQL is
+        # ordered, but restoring the order here makes the frontier proof robust
+        # to test doubles and distributed result merging.
+        slice_rows.sort(key=_span_order_key, reverse=True)
         slice_exhausted = len(slice_rows) < slice_limit
-        if scalar_latest_page:
-            candidate_ids: list[str] = []
-            for row in slice_rows[:slice_limit]:
-                span_id = str(row.get("id", ""))
-                if not span_id or span_id in seen_ids:
-                    continue
-                # Mark before classification. A non-match or tombstone is a
-                # conclusive classification for this request and must suppress
-                # every older physical version in subsequent slices.
-                seen_ids.add(span_id)
-                candidate_ids.append(span_id)
+        candidate_ids: list[str] = []
+        for row in slice_rows[:slice_limit]:
+            span_id = str(row.get("id", ""))
+            if not span_id or span_id in seen_ids:
+                continue
+            # Mark before classification. A non-match or tombstone is a
+            # conclusive classification for this request and must suppress
+            # every older physical version in subsequent slices.
+            seen_ids.add(span_id)
+            candidate_ids.append(span_id)
 
-            if candidate_ids:
-                remaining_ms = int((deadline - clock()) * 1000)
-                if remaining_ms < _SPAN_FILTER_SCAN_MIN_QUERY_MS:
-                    break
-                match_query, match_params = (
-                    builder.build_latest_attribute_candidate_matches(candidate_ids)
-                )
-                try:
-                    match_result = analytics.execute_ch_query(
-                        match_query,
-                        match_params,
-                        timeout_ms=min(_SPAN_FILTER_QUERY_TIMEOUT_MS, remaining_ms),
-                        settings={
-                            **_SPAN_PREFIX_READ_SETTINGS,
-                            "max_result_rows": len(candidate_ids),
-                        },
-                    )
-                except Exception as exc:
-                    if not is_read_budget_error(exc):
-                        raise
-                    logger.warning(
-                        "bounded span candidate classification exceeded read budget",
-                        candidate_count=len(candidate_ids),
-                        error_type=type(exc).__name__,
-                    )
-                    break
-
-                candidate_id_set = set(candidate_ids)
-                for row in match_result.data:
-                    span_id = str(row.get("id", ""))
-                    if (
-                        not span_id
-                        or span_id not in candidate_id_set
-                        or span_id in matched_ids
-                    ):
-                        continue
-                    matched_ids.add(span_id)
-                    rows.append(row)
-        else:
-            for row in slice_rows[:slice_limit]:
-                span_id = str(row.get("id", ""))
-                if span_id in seen_ids:
-                    continue
-                seen_ids.add(span_id)
-                rows.append(row)
+        # First classify inside this bounded slice. For an id with no physical
+        # history elsewhere in the request, that local result is already the
+        # exact global latest state. Only cross-slice ids pay for a full-window
+        # classifier.
+        local_rows, classifier_complete = _classify_candidates(
+            candidate_ids,
+            batch_size=_SPAN_FILTER_LOCAL_CLASSIFIER_BATCH_SIZE,
+            window_start=slice_start,
+            window_end=cursor,
+        )
+        if not classifier_complete:
+            break
+        cross_ids, cross_complete = _cross_slice_ids(
+            candidate_ids,
+            slice_start=slice_start,
+            slice_end=cursor,
+        )
+        if not cross_complete:
+            break
+        accepted_rows = [
+            row for row in local_rows if str(row.get("id", "")) not in cross_ids
+        ]
+        if cross_ids:
+            cross_candidates = [
+                span_id for span_id in candidate_ids if span_id in cross_ids
+            ]
+            global_rows, classifier_complete = _classify_candidates(
+                cross_candidates,
+                batch_size=_SPAN_FILTER_GLOBAL_CLASSIFIER_BATCH_SIZE,
+            )
+            if not classifier_complete:
+                break
+            accepted_rows.extend(global_rows)
+        for row in accepted_rows:
+            span_id = str(row.get("id", ""))
+            if not span_id or span_id in matched_ids:
+                continue
+            matched_ids.add(span_id)
+            rows.append(row)
 
         if slice_exhausted and slice_start <= start_date:
             # This statement proved the final half-open request slice empty
@@ -2049,72 +2128,65 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         # Map-backed predicates use the same exact executor. It returns an
         # explicit incomplete prefix when the proof cannot finish.
         bounded_filter_path = builder.requires_bounded_filter_scan()
-        # Attribute + custom-sort queries cannot use time-slice concatenation to
-        # prove a global sort order. Route them through the bounded executor too:
-        # it fails closed without issuing the legacy full-window ``FINAL`` query.
-        bounded_prefix_path = bounded_filter_path or not getattr(
-            builder, "sort_params", None
-        )
+        # Every supported request uses the bounded latest-state executor.  An
+        # unsupported shape must be explicit; silently falling back to the raw
+        # non-FINAL compiler can resurrect stale values and tombstoned spans.
+        bounded_prefix_path = True
+        if not builder.supports_latest_candidate_page():
+            return self._gm.success_response(
+                {
+                    "metadata": {
+                        "total_rows": 0,
+                        "total_rows_is_lower_bound": True,
+                        "has_more": False,
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "unsupported_filter_shape",
+                    },
+                    "table": [],
+                    "config": get_default_span_config(),
+                }
+            )
         phase1_query_complete = True
         phase1_full_window_scanned = False
-        if bounded_prefix_path:
+        try:
             (
                 result,
                 phase1_query_complete,
                 phase1_full_window_scanned,
             ) = _execute_bounded_span_filter_prefix(builder, analytics)
-        elif preview_mode:
-            try:
-                query, params = builder.build(since=None)
-                result = analytics.execute_ch_query(
-                    query,
-                    params,
-                    timeout_ms=750,
-                    settings={
-                        **_BOUNDED_ANALYTICS_SETTINGS,
-                        "max_result_rows": 64,
+        except UnsupportedFilterShapeError:
+            return self._gm.success_response(
+                {
+                    "metadata": {
+                        "total_rows": 0,
+                        "total_rows_is_lower_bound": True,
+                        "has_more": False,
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "unsupported_filter_shape",
                     },
-                )
-            except Exception as exc:
-                if not is_read_budget_error(exc):
-                    raise
-                logger.warning(
-                    "span task preview exceeded read budget; returning degraded",
-                    project_id=str(project_id) if project_id else None,
-                    error=str(exc)[:200],
-                )
-                return self._gm.success_response(
-                    {
-                        "metadata": {
-                            "total_rows": 0,
-                            "total_rows_is_lower_bound": True,
-                            "query_complete": False,
-                            "query_status": "degraded",
-                            "query_error_code": "read_budget_exceeded",
-                        },
-                        "table": [],
-                        "config": get_default_span_config(),
-                    }
-                )
-        else:
-            query, params = builder.build(since=None)
-            result = analytics.execute_ch_query(
-                query,
-                params,
-                timeout_ms=750,
-                settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    "table": [],
+                    "config": get_default_span_config(),
+                }
             )
+        phase1_proven_rows = len(
+            {str(row.get("id", "")) for row in result.data if row.get("id")}
+        )
 
-        phase1_distinct_rows = len({str(row.get("id", "")) for row in result.data})
-
-        # Prefix-dedup pagination: Phase 1 dropped `LIMIT 1 BY id` (its
-        # O(window) full sort OOM-crashed CH — see SpanListQueryBuilder.build)
-        # and instead fetched the sorted prefix [0, offset + 2*page_size).
-        # De-dup the prefix by span id and slice the page — every page is a
-        # disjoint slice of the same globally de-duplicated stream, so a span
-        # can never appear on two pages and none is skipped. See page_dedup.py.
+        # The executor replenishes saturated slices with a strict keyset until
+        # it proves the exact unique prefix plus a sentinel (or exhausts the
+        # window).  Slicing here therefore cannot skip rows even when physical
+        # ReplacingMergeTree versions exceed the historical duplicate margin.
         result.data, has_more = paginate_deduped(
             result.data, "id", query_page_number, query_page_size
+        )
+        total_count = (
+            query_page_number * query_page_size
+            + len(result.data)
+            + (1 if has_more else 0)
+            if phase1_query_complete
+            else phase1_proven_rows
         )
 
         span_ids = [str(row.get("id", "")) for row in result.data]
@@ -2268,11 +2340,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         annotation_error = None
         if preview_mode:
             content_rows, content_error = _fetch_preview_hydration()
-            total_count = phase1_distinct_rows
             eval_map = {}
             annotation_map = {}
         else:
-            total_count = phase1_distinct_rows
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
                 content_f = pool.submit(_fetch_content)
                 evals_f = pool.submit(_fetch_evals)
@@ -2491,7 +2561,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
             table_data.append(entry)
 
-        metadata = {"total_rows": total_count}
+        metadata = {"total_rows": total_count, "has_more": has_more}
         if (
             count_is_lower_bound
             or preview_mode
@@ -2587,33 +2657,50 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         # and indexed requests from doing a full-window top-K on the all-span
         # table, which has no project/time-ordered projection.
         bounded_filter_path = builder.requires_bounded_filter_scan()
-        bounded_prefix_path = bounded_filter_path or not getattr(
-            builder, "sort_params", None
-        )
+        bounded_prefix_path = True
+        if not builder.supports_latest_candidate_page():
+            return self._gm.success_response(
+                {
+                    "column_config": get_default_span_config(),
+                    "metadata": {
+                        "total_rows": 0,
+                        "total_rows_is_lower_bound": True,
+                        "has_more": False,
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "unsupported_filter_shape",
+                    },
+                    "table": [],
+                }
+            )
         phase1_query_complete = True
         phase1_full_window_scanned = False
-        if bounded_prefix_path:
+        try:
             (
                 result,
                 phase1_query_complete,
                 phase1_full_window_scanned,
             ) = _execute_bounded_span_filter_prefix(builder, analytics)
-        else:
-            query, params = builder.build()
-            result = analytics.execute_ch_query(
-                query,
-                params,
-                timeout_ms=750,
-                settings=_BOUNDED_ANALYTICS_SETTINGS,
+        except UnsupportedFilterShapeError:
+            return self._gm.success_response(
+                {
+                    "column_config": get_default_span_config(),
+                    "metadata": {
+                        "total_rows": 0,
+                        "total_rows_is_lower_bound": True,
+                        "has_more": False,
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "unsupported_filter_shape",
+                    },
+                    "table": [],
+                }
             )
-        phase1_distinct_rows = len({str(row.get("id", "")) for row in result.data})
-
-        # Prefix-dedup pagination: Phase 1 dropped `LIMIT 1 BY id` (its
-        # O(window) full sort OOM-crashed CH — see SpanListQueryBuilder.build)
-        # and instead fetched the sorted prefix [0, offset + 2*page_size).
-        # De-dup the prefix by span id and slice the page — every page is a
-        # disjoint slice of the same globally de-duplicated stream, so a span
-        # can never appear on two pages and none is skipped. See page_dedup.py.
+        phase1_proven_rows = len(
+            {str(row.get("id", "")) for row in result.data if row.get("id")}
+        )
+        # The bounded executor has already replenished an exact unique prefix
+        # plus sentinel under its shared deadline.
         result.data, has_more = paginate_deduped(
             result.data, "id", page_number, page_size
         )
@@ -2678,7 +2765,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         # Do not make task/eval setup wait for a second full-window scan merely
         # to render a footer. The proven prefix is an honest lower bound;
         # ``has_more`` remains the pagination signal.
-        total_count = phase1_distinct_rows
+        total_count = (
+            page_number * page_size + len(result.data) + (1 if has_more else 0)
+            if phase1_query_complete
+            else phase1_proven_rows
+        )
         count_is_lower_bound = True
 
         # Phase 2: Eval scores
@@ -2783,7 +2874,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
             table_data.append(entry)
 
-        metadata = {"total_rows": total_count}
+        metadata = {"total_rows": total_count, "has_more": has_more}
         if count_is_lower_bound or (
             bounded_filter_path and not phase1_full_window_scanned
         ):

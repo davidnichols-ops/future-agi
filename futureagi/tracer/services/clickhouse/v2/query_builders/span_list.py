@@ -25,6 +25,7 @@ from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.query_builders.filters import (
     ClickHouseFilterBuilderV2,
     _append_v2_settings,
+    rewrite_v1_sql_to_v2,
 )
 
 
@@ -48,12 +49,40 @@ class SpanListQueryBuilderV2(V2RewriteMixin, SpanListQueryBuilder):
             # bare-JSON compatibility transform is intentionally not applied
             # inside argMax expressions.
             "build_content_query",
+            # Candidate classification may join point-scoped FINAL relations
+            # over mutable state; keep their skip indexes disabled explicitly.
+            "build_latest_attribute_candidate_matches",
         }
     )
 
     # Use the v2 filter compiler so filters read the v2 dimension tables
     # (end_users, etc.) instead of the dropped legacy CDC tables.
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
+
+    def build_latest_attribute_candidate_matches(
+        self,
+        candidate_span_ids: list[str],
+        *,
+        window_start: Any = None,
+        window_end: Any = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Rewrite a bounded classifier without mutable FINAL skip indexes."""
+
+        query, params = super().build_latest_attribute_candidate_matches(
+            candidate_span_ids,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        if not query:
+            return query, params
+        query = _append_v2_settings(rewrite_v1_sql_to_v2(query))
+        return (
+            query.replace(
+                "use_skip_indexes_if_final = 1",
+                "use_skip_indexes_if_final = 0",
+            ),
+            params,
+        )
 
     def build_content_query(self, span_ids: list) -> tuple[str, dict[str, Any]]:
         """Hydrate the bounded page at latest version without table ``FINAL``."""

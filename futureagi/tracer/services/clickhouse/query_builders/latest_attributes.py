@@ -17,7 +17,10 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from tracer.services.clickhouse.query_builders.filters import normalize_filter_op
+from tracer.services.clickhouse.query_builders.filters import (
+    build_literal_text_predicate,
+    normalize_filter_op,
+)
 
 _SAFE_KEY = re.compile(r"^[a-zA-Z0-9._\-]+$")
 _MAP_BY_TYPE = {
@@ -48,6 +51,7 @@ _MAP_BY_TYPE = {
 # (for example ``name`` / token totals / latency) deliberately stay in the root
 # seed and are not listed here; ``span_name`` is the any-span alias for name.
 _ANY_SPAN_SYSTEM_COLUMNS = {
+    "service_name": "service_name",
     "model": "model",
     "provider": "provider",
     "status": "status",
@@ -64,6 +68,7 @@ _ANY_SPAN_SYSTEM_COLUMNS = {
 # can safely be reduced to scalar latest-version states.
 _ROOT_SYSTEM_COLUMNS = {
     "trace_id": ("trace_id", "text"),
+    "project_id": ("project_id", "text"),
     "session": ("trace_session_id", "text"),
     "session_id": ("trace_session_id", "text"),
     "trace_session_id": ("trace_session_id", "text"),
@@ -90,6 +95,52 @@ _ROOT_SYSTEM_COLUMNS = {
     "llm.token_count.completion": ("completion_tokens", "number"),
 }
 _NULLABLE_ROOT_SYSTEM_COLUMNS = {"trace_session_id"}
+
+# Physical columns rendered by the span list.  Unlike trace predicates these
+# are always evaluated on the selected span itself.  Nullable v1 columns are
+# wrapped in ``tuple`` by the scalar reducer so a later explicit NULL clears an
+# older value instead of being skipped by ``argMax``.  The same expressions are
+# valid against the non-null/defaulted v2 columns after the established rewrite.
+_SPAN_SYSTEM_COLUMNS = {
+    "id": ("id", "text", False),
+    "span_id": ("id", "text", False),
+    "trace_id": ("trace_id", "text", False),
+    "session": ("trace_session_id", "text", True),
+    "session_id": ("trace_session_id", "text", True),
+    "trace_session_id": ("trace_session_id", "text", True),
+    "user": ("end_user_id", "text", True),
+    "end_user_id": ("end_user_id", "text", True),
+    "name": ("name", "text", False),
+    "span_name": ("name", "text", False),
+    "trace_name": ("trace_name", "text", True),
+    "service_name": ("service_name", "text", False),
+    "model": ("model", "text", True),
+    "provider": ("provider", "text", True),
+    "status": ("status", "text", True),
+    "observation_type": ("observation_type", "text", False),
+    "span_kind": ("observation_type", "text", False),
+    "node_type": ("observation_type", "text", False),
+    "latency": ("latency_ms", "number", True),
+    "latency_ms": ("latency_ms", "number", True),
+    "avg_latency": ("latency_ms", "number", True),
+    "cost": ("cost", "number", True),
+    "avg_cost": ("cost", "number", True),
+    "tokens": ("total_tokens", "number", True),
+    "total_tokens": ("total_tokens", "number", True),
+    "gen_ai.usage.total_tokens": ("total_tokens", "number", True),
+    "llm.token_count.total": ("total_tokens", "number", True),
+    "input_tokens": ("prompt_tokens", "number", True),
+    "prompt_tokens": ("prompt_tokens", "number", True),
+    "gen_ai.usage.prompt_tokens": ("prompt_tokens", "number", True),
+    "gen_ai.usage.input_tokens": ("prompt_tokens", "number", True),
+    "llm.token_count.prompt": ("prompt_tokens", "number", True),
+    "output_tokens": ("completion_tokens", "number", True),
+    "completion_tokens": ("completion_tokens", "number", True),
+    "gen_ai.usage.completion_tokens": ("completion_tokens", "number", True),
+    "gen_ai.usage.output_tokens": ("completion_tokens", "number", True),
+    "llm.token_count.completion": ("completion_tokens", "number", True),
+}
+_SPAN_TAG_COLUMNS = frozenset({"tag", "tags"})
 
 
 @dataclass(frozen=True)
@@ -226,10 +277,11 @@ def _build_latest_scalar_column_predicate(
     lhs = alias
     if value_type == "text":
         lhs = f"lowerUTF8(toString({alias}))"
-        if isinstance(normalized, tuple):
-            normalized = tuple(str(value).lower() for value in normalized)
-        else:
-            normalized = str(normalized).lower()
+        if op in {"equals", "not_equals", "in", "not_in"}:
+            if isinstance(normalized, tuple):
+                normalized = tuple(str(value).lower() for value in normalized)
+            else:
+                normalized = str(normalized).lower()
 
     param = f"{alias_prefix}_param_{index}"
     if op == "equals":
@@ -247,16 +299,13 @@ def _build_latest_scalar_column_predicate(
     elif op in {"contains", "not_contains", "starts_with", "ends_with"}:
         if value_type != "text":
             raise ValueError("text operation requires a text column")
-        if op == "contains":
-            pattern, operator = f"%{normalized}%", "ILIKE"
-        elif op == "not_contains":
-            pattern, operator = f"%{normalized}%", "NOT ILIKE"
-        elif op == "starts_with":
-            pattern, operator = f"{normalized}%", "ILIKE"
-        else:
-            pattern, operator = f"%{normalized}", "ILIKE"
-        params[param] = pattern
-        predicate = f"toString({alias}) {operator} %({param})s"
+        params[param] = str(normalized)
+        predicate = build_literal_text_predicate(
+            alias,
+            param,
+            op,
+            case_insensitive=True,
+        )
     elif op in {"between", "not_between"}:
         lo_param = f"{param}_lo"
         hi_param = f"{param}_hi"
@@ -339,6 +388,124 @@ def build_latest_trace_probe_predicate(
     return build_latest_column_predicate(item, index=index)
 
 
+def build_latest_span_probe_predicate(
+    item: dict[str, Any],
+    *,
+    index: int,
+) -> LatestAttributePredicate:
+    """Compile one span-list predicate over the span's latest scalar state.
+
+    Known denormalised metrics use their physical column.  An unknown
+    ``SYSTEM_METRIC`` intentionally follows ``ClickHouseFilterBuilder``'s
+    compatibility rule and is treated as a typed span attribute.  Other
+    unknown column shapes fail closed instead of being interpreted as SQL.
+    """
+
+    key, config = _parts(item)
+    if key in {"created_at", "start_time"}:
+        raise ValueError("time bounds are compiled outside the scalar predicate")
+    col_type = str(config.get("col_type") or config.get("colType") or "").upper()
+
+    if key in _SPAN_TAG_COLUMNS:
+        if col_type not in {"", "NORMAL", "SYSTEM_METRIC", "SPAN_ATTRIBUTE"}:
+            raise ValueError("latest-state span tags require SYSTEM_METRIC")
+        filter_type = str(
+            config.get("filter_type") or config.get("filterType") or ""
+        ).lower()
+        if filter_type not in {"text", "string"}:
+            raise ValueError("latest-state span tags require a text filter")
+        op = normalize_filter_op(
+            str(config.get("filter_op") or config.get("filterOp") or "")
+        )
+        raw_value = config.get("filter_value", config.get("filterValue"))
+        alias = f"latest_span_tags_{index}"
+        aggregates = (f"argMax(tags, _peerdb_version) AS {alias}",)
+        tags_array = f"JSONExtract({alias}, 'Array(String)')"
+        params: dict[str, Any] = {}
+        if op == "is_null":
+            predicate = f"empty({tags_array})"
+        elif op == "is_not_null":
+            predicate = f"notEmpty({tags_array})"
+        elif op in {"in", "not_in"}:
+            if not isinstance(raw_value, list) or not raw_value:
+                raise ValueError(f"{op} requires a non-empty list")
+            param = f"latest_span_tags_param_{index}"
+            params[param] = tuple(str(value).lower() for value in raw_value)
+            member = (
+                f"arrayExists(value -> lowerUTF8(value) IN %({param})s, {tags_array})"
+            )
+            predicate = (
+                f"notEmpty({tags_array}) AND NOT ({member})"
+                if op == "not_in"
+                else member
+            )
+        else:
+            if raw_value is None or isinstance(raw_value, list):
+                raise ValueError(f"{op} requires one text value")
+            param = f"latest_span_tags_param_{index}"
+            if op in {"equals", "not_equals"}:
+                params[param] = str(raw_value).lower()
+                member = (
+                    f"arrayExists(value -> lowerUTF8(value) = %({param})s, "
+                    f"{tags_array})"
+                )
+            elif op in {"contains", "not_contains", "starts_with", "ends_with"}:
+                params[param] = str(raw_value)
+                match_op = "contains" if op == "not_contains" else op
+                literal = build_literal_text_predicate(
+                    "value",
+                    param,
+                    match_op,
+                    case_insensitive=True,
+                )
+                member = f"arrayExists(value -> {literal}, {tags_array})"
+            else:
+                raise ValueError("unsupported latest-state span tag operation")
+            predicate = (
+                f"notEmpty({tags_array}) AND NOT ({member})"
+                if op in {"not_equals", "not_contains"}
+                else member
+            )
+        return LatestAttributePredicate(aggregates, predicate, params)
+
+    physical = _SPAN_SYSTEM_COLUMNS.get(key)
+    if physical is not None:
+        if col_type not in {"", "NORMAL", "SYSTEM_METRIC", "SPAN_ATTRIBUTE"}:
+            raise ValueError("latest-state span column requires SYSTEM_METRIC")
+        column, value_type, nullable = physical
+        return _build_latest_scalar_column_predicate(
+            item,
+            index=index,
+            column=column,
+            value_type=value_type,
+            alias_prefix="latest_span_column_value",
+            nullable=nullable,
+        )
+
+    if is_span_attribute_filter(item):
+        return build_latest_attribute_predicate(item, index=index)
+    if col_type == "SYSTEM_METRIC":
+        # Unknown system metrics are attribute-backed in the canonical filter
+        # compiler.  Change only the routing tag; preserve type/op/value.
+        attribute_item = dict(item)
+        attribute_config = dict(config)
+        attribute_config["col_type"] = "SPAN_ATTRIBUTE"
+        attribute_item["filter_config"] = attribute_config
+        attribute_item.pop("filterConfig", None)
+        return build_latest_attribute_predicate(attribute_item, index=index)
+    raise ValueError("unsupported latest-state span probe filter")
+
+
+def is_latest_span_probe_filter(item: dict[str, Any]) -> bool:
+    """Whether ``item`` is exactly representable by the span scalar probe."""
+
+    try:
+        build_latest_span_probe_predicate(item, index=0)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def build_latest_attribute_predicate(
     item: dict[str, Any],
     *,
@@ -418,16 +585,13 @@ def build_latest_attribute_predicate(
             params[param] = normalized
             comparison = f"{lhs} NOT IN %({param})s"
         elif op in {"contains", "not_contains", "starts_with", "ends_with"}:
-            if op == "contains":
-                pattern, operator = f"%{normalized}%", "ILIKE"
-            elif op == "not_contains":
-                pattern, operator = f"%{normalized}%", "NOT ILIKE"
-            elif op == "starts_with":
-                pattern, operator = f"{normalized}%", "ILIKE"
-            else:
-                pattern, operator = f"%{normalized}", "ILIKE"
-            params[param] = pattern
-            comparison = f"{value_alias} {operator} %({param})s"
+            params[param] = str(normalized)
+            comparison = build_literal_text_predicate(
+                value_alias,
+                param,
+                op,
+                case_insensitive=True,
+            )
         elif op in {"between", "not_between"}:
             lo_param = f"{param}_lo"
             hi_param = f"{param}_hi"
@@ -459,7 +623,9 @@ __all__ = [
     "build_latest_attribute_predicate",
     "build_latest_column_predicate",
     "build_latest_root_column_predicate",
+    "build_latest_span_probe_predicate",
     "build_latest_trace_probe_predicate",
+    "is_latest_span_probe_filter",
     "is_latest_trace_probe_filter",
     "is_latest_trace_root_probe_filter",
     "is_span_attribute_filter",

@@ -18,12 +18,14 @@ CH25 close-out (2026-05-28): cut over from the legacy ``span_metrics_hourly``
 the legacy CDC-based aggregate.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
-from django.conf import settings
-
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
+from tracer.services.clickhouse.query_builders.filters import (
+    build_literal_text_predicate,
+    normalize_filter_op,
+)
 
 
 class TimeSeriesQueryBuilder(BaseQueryBuilder):
@@ -59,9 +61,21 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
     AGG_TABLE = "spans_hourly_rollup"
     # Denormalized raw table (for filtered queries)
     RAW_TABLE = "spans"
-    ATTR_ROLLUP_TABLE = "dashboard_attr_rollup"
-    ATTR_ROLLUP_KEYS = frozenset({"final_status"})
-    ATTR_ROLLUP_INTERVALS = frozenset({"hour", "day", "week", "month"})
+    LATEST_STATE_ATTRIBUTE_KEYS = frozenset({"final_status"})
+    LATEST_STATE_TEXT_OPS = frozenset(
+        {
+            "equals",
+            "not_equals",
+            "in",
+            "not_in",
+            "contains",
+            "not_contains",
+            "starts_with",
+            "ends_with",
+            "is_null",
+            "is_not_null",
+        }
+    )
 
     def __init__(
         self,
@@ -82,7 +96,11 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         self.observe_type = str(observe_type or "trace").strip().lower()
         self.metric_id = metric_id
         self.single_metric = bool(single_metric)
-        self.allow_attr_rollup = bool(allow_attr_rollup)
+        # Kept as a constructor compatibility argument for callers/tests from
+        # the former hybrid implementation. Append-only attribute rollups are
+        # never eligible for a success response because later updates, key
+        # clears, and tombstones cannot be retracted from their aggregate state.
+        _ = allow_attr_rollup
         self.start_date: datetime | None = None
         self.end_date: datetime | None = None
         self.query_source = ""
@@ -94,9 +112,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         # membership semantics. The attribute builder sets this flag only
         # after it has compiled the complete filter shape.
         self.raw_segmentation_safe = False
-        self.rollup_window_adjusted = False
-        self.rollup_window_start: datetime | None = None
-        self.rollup_window_end: datetime | None = None
+        self.trace_candidate_condition = ""
 
     # ------------------------------------------------------------------
     # Public API
@@ -117,14 +133,12 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         self.params["start_date"] = self.start_date
         self.params["end_date"] = self.end_date
 
-        rollup_filter = self._safe_attr_rollup_filter()
-        if (
-            self.allow_attr_rollup
-            and rollup_filter is not None
-            and self._attr_rollup_window_covered()
-        ):
-            self.query_source = "attribute_rollup"
-            return self._build_attr_rollup_query(*rollup_filter)
+        latest_state_filter = self._safe_latest_state_attribute_filter()
+        if latest_state_filter is not None:
+            self.query_source = "raw_latest_state"
+            self.attribute_filtered = True
+            self.raw_segmentation_safe = True
+            return self._build_latest_state_attribute_query(*latest_state_filter)
 
         attribute_filters, remaining_filters = self._partition_attribute_filters()
         if attribute_filters:
@@ -288,6 +302,8 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             return "", outer_conditions
 
         any_match = " OR ".join(f"({condition})" for condition in candidate_conditions)
+        if len(candidate_conditions) == 1 and not outer_conditions:
+            self.trace_candidate_condition = candidate_conditions[0]
         having = ""
         if len(candidate_conditions) > 1:
             all_matches = " AND ".join(
@@ -360,24 +376,128 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             )
             outer_conditions.extend(root_conditions)
 
-        # Splitting a raw graph is exact only when the compiled predicate has
-        # no relation whose membership is scoped by the request's full time
-        # range. ``candidate_join`` is the filter-first relation for arbitrary
-        # trace attributes; other typed filters (for example model/end-user)
-        # can compile to SELECT membership subqueries in ``remaining_where``.
-        # Keep either shape as one full-window, hard-bounded statement. Span
-        # attributes and guaranteed-root trace attributes remain row-local and
-        # can be summed/weighted across non-overlapping chunks exactly.
-        self.raw_segmentation_safe = not candidate_join and (
-            "SELECT" not in remaining_where.upper()
-        )
+        # A trace-level arbitrary attribute is an any-span relation over the
+        # complete request window. Segmenting membership changes semantics, and
+        # the old one-shot candidate join could build a project-wide set. One
+        # scalar attribute predicate therefore uses bounded slice discovery,
+        # full-window candidate verification, then root hydration. More complex
+        # membership shapes fail closed until they have an equally exact bounded
+        # protocol. Span and guaranteed-root trace attributes remain row-local
+        # and use exact FINAL reads in adjacent 12-hour segments.
+        if candidate_join and self.trace_candidate_condition and not remaining_where:
+            self.query_source = "trace_candidate_plan"
+            self.raw_segmentation_safe = False
+            return self.build_trace_candidate_discovery_query(
+                start=self.start_date,
+                end=self.end_date,
+                limit=1,
+            )
+
+        if candidate_join or "SELECT" in remaining_where.upper():
+            raise ValueError(
+                "graph filter shape requires unsupported full-window membership"
+            )
+
+        self.query_source = "raw_latest_state"
+        self.raw_segmentation_safe = True
 
         return self._build_raw_query(
             " AND ".join(f"({condition})" for condition in outer_conditions)
             if outer_conditions
             else "1 = 1",
-            candidate_join=candidate_join,
+            latest_state=True,
         )
+
+    def build_trace_candidate_discovery_query(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Discover a capped any-span trace set inside one exact time slice."""
+
+        if not self.trace_candidate_condition or limit <= 0:
+            raise ValueError("trace candidate discovery plan is unavailable")
+        params = {
+            **self.params,
+            "start_date": start,
+            "end_date": end,
+            "graph_trace_candidate_limit": int(limit),
+        }
+        query = f"""
+        SELECT trace_id
+        FROM {self.RAW_TABLE} FINAL
+        PREWHERE {self.project_filter_sql()}
+          AND start_time >= %(start_date)s
+          AND start_time < %(end_date)s
+        WHERE {self.trace_candidate_condition}
+        GROUP BY trace_id
+        LIMIT %(graph_trace_candidate_limit)s
+        """
+        return query, params
+
+    def build_trace_candidate_verification_query(
+        self,
+        candidate_trace_ids: list[str],
+    ) -> tuple[str, dict[str, Any]]:
+        """Recheck slice candidates against latest state in the whole window."""
+
+        if (
+            not self.trace_candidate_condition
+            or self.start_date is None
+            or self.end_date is None
+            or not candidate_trace_ids
+        ):
+            raise ValueError("trace candidate verification plan is unavailable")
+        params = {
+            **self.params,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "graph_trace_candidate_ids": tuple(candidate_trace_ids),
+        }
+        query = f"""
+        SELECT trace_id
+        FROM {self.RAW_TABLE} FINAL
+        PREWHERE {self.project_filter_sql()}
+          AND start_time >= %(start_date)s
+          AND start_time < %(end_date)s
+          AND trace_id IN %(graph_trace_candidate_ids)s
+        WHERE {self.trace_candidate_condition}
+        GROUP BY trace_id
+        """
+        return query, params
+
+    def build_trace_candidate_hydration_query(
+        self,
+        candidate_trace_ids: list[str],
+    ) -> tuple[str, dict[str, Any]]:
+        """Aggregate canonical roots for one independently verified trace set."""
+
+        if self.start_date is None or self.end_date is None or not candidate_trace_ids:
+            raise ValueError("trace candidate hydration plan is unavailable")
+        params = {
+            **self.params,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "graph_trace_candidate_ids": tuple(candidate_trace_ids),
+        }
+        bucket_fn = self.time_bucket_expr(self.interval)
+        metric_selects = self._select_list(self._metric_selects(aggregate_source=False))
+        query = f"""
+        SELECT
+            {bucket_fn}(start_time) AS time_bucket,
+            {metric_selects}
+        FROM {self.RAW_TABLE} FINAL
+        PREWHERE {self.project_filter_sql()}
+          AND start_time >= %(start_date)s
+          AND start_time < %(end_date)s
+          AND trace_id IN %(graph_trace_candidate_ids)s
+        WHERE (parent_span_id IS NULL OR parent_span_id = '')
+        GROUP BY time_bucket
+        ORDER BY time_bucket
+        """
+        return query, params
 
     @staticmethod
     def _filter_parts(filter_item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -435,35 +555,31 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
                     end_date = parsed_end
         return start_date, end_date
 
-    def _safe_attr_rollup_filter(self) -> tuple[str, tuple[str, ...]] | None:
-        """Return the one root-attribute predicate the rollup can answer exactly.
+    def _safe_latest_state_attribute_filter(
+        self,
+    ) -> tuple[str, str, object] | None:
+        """Recognize one final_status text predicate for bounded FINAL reads.
 
-        Only ``final_status`` has positive production parity evidence for this
-        incident path. It is guaranteed to live on trace-root spans, so the
-        root-only rollup is exact for both trace and span latency/traffic
-        graphs: in
-        span mode, the rows matching ``final_status`` are precisely those same
-        root rows. Date filters are handled by :meth:`parse_time_range`; any
-        other filter forces the raw spans path. Empty values are rejected
-        because the rollup cannot distinguish an absent Map key from a present
-        key whose value is empty.
+        The append-only attribute rollup cannot retract an updated value, a
+        cleared key, or a tombstone. This narrow path therefore reads the raw
+        ReplacingMergeTree's latest state. Every text operator accepted by the
+        public filter contract is supported with literal, case-insensitive
+        semantics; negative operators still require the Map key to exist.
+        Any additional predicate is handled by the generic row-local path (or
+        rejected explicitly when it requires full-window membership).
         """
-        if (
-            self.observe_type not in {"trace", "span"}
-            or self.metric_id not in {"latency", "traffic"}
-            or self.interval not in self.ATTR_ROLLUP_INTERVALS
-        ):
+        if self.observe_type not in {"trace", "span"}:
             return None
 
-        attr_filter: tuple[str, tuple[str, ...]] | None = None
+        attr_filter: tuple[str, str, object] | None = None
         for filter_item in self.filters:
             column_id, config = self._filter_parts(filter_item)
             filter_type = str(
                 config.get("filter_type") or config.get("filterType") or ""
             ).lower()
-            filter_op = str(
-                config.get("filter_op") or config.get("filterOp") or ""
-            ).lower()
+            filter_op = normalize_filter_op(
+                str(config.get("filter_op") or config.get("filterOp") or "").lower()
+            )
             filter_value = config.get("filter_value", config.get("filterValue"))
             col_type = str(
                 config.get("col_type") or config.get("colType") or ""
@@ -480,130 +596,100 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
 
             if (
                 attr_filter is not None
-                or column_id not in self.ATTR_ROLLUP_KEYS
+                or column_id not in self.LATEST_STATE_ATTRIBUTE_KEYS
                 or col_type != "SPAN_ATTRIBUTE"
                 or filter_type not in ("text", "string")
-                or filter_op not in ("equals", "in")
+                or filter_op not in self.LATEST_STATE_TEXT_OPS
             ):
                 return None
 
-            if filter_op == "equals":
-                if isinstance(filter_value, list):
-                    return None
-                values = (filter_value,)
-            else:
+            if filter_op in {"is_null", "is_not_null"}:
+                normalized: object = None
+            elif filter_op in {"in", "not_in"}:
                 if not isinstance(filter_value, list) or not filter_value:
-                    return None
-                values = tuple(filter_value)
-
-            if any(not isinstance(value, str) or not value for value in values):
-                return None
-            attr_filter = (
-                column_id,
-                tuple(value.lower() for value in values),
-            )
+                    raise ValueError(f"{filter_op} requires a non-empty text list")
+                if any(not isinstance(value, str) for value in filter_value):
+                    raise ValueError(f"{filter_op} requires only text values")
+                normalized = tuple(value.lower() for value in filter_value)
+            else:
+                if not isinstance(filter_value, str):
+                    raise ValueError(f"{filter_op} requires one text value")
+                normalized = (
+                    filter_value.lower()
+                    if filter_op in {"equals", "not_equals"}
+                    else filter_value
+                )
+            attr_filter = (column_id, str(filter_op), normalized)
 
         return attr_filter
 
-    def _attr_rollup_window_covered(self) -> bool:
-        """Fail closed until the existing dashboard rollup is backfilled."""
-        if not getattr(settings, "TRACE_GRAPH_ATTR_ROLLUP_ENABLED", False):
-            return False
-        covered_since = getattr(settings, "DASHBOARD_ATTR_ROLLUP_COVERED_SINCE", None)
-        if not isinstance(covered_since, datetime) or self.start_date is None:
-            return False
-
-        # Compare the first complete rollup hour, not the raw request start.
-        # Explicit request offsets were normalized to naive UTC above; retain
-        # defensive handling for direct builder callers that inject datetimes.
-        effective_start = self._ceil_hour(self.start_date)
-        if effective_start.tzinfo is not None:
-            effective_start = effective_start.astimezone(UTC).replace(tzinfo=None)
-        if covered_since.tzinfo is not None:
-            covered_since = covered_since.astimezone(UTC).replace(tzinfo=None)
-        return effective_start >= covered_since
-
-    @staticmethod
-    def _floor_hour(value: datetime) -> datetime:
-        return value.replace(minute=0, second=0, microsecond=0)
-
-    @classmethod
-    def _ceil_hour(cls, value: datetime) -> datetime:
-        floored = cls._floor_hour(value)
-        return floored if floored == value else floored + timedelta(hours=1)
-
-    def _build_attr_rollup_query(
+    def _build_latest_state_attribute_query(
         self,
         attr_key: str,
-        attr_values: tuple[str, ...],
+        filter_op: str,
+        normalized_value: object,
     ) -> tuple[str, dict[str, Any]]:
-        """Read the existing root-span rollup using its hourly window policy.
+        """Aggregate newest live rows without update/delete resurrection.
 
-        Only complete hourly buckets are included. A raw boundary-hour union is
-        unsafe on whale tenants (one hour can exceed the 1 GiB read budget), so
-        an adjusted window is exposed to the caller instead of silently
-        presenting boundary data as exact.
+        ``FINAL`` applies before the mutable attribute predicate. The
+        ReplacingMergeTree's two-argument engine removes newest tombstones, so
+        an explicit ``is_deleted = 0`` predicate is both unnecessary and unsafe
+        with FINAL skip indexes. Graph dispatch additionally disables all skip
+        indexes under FINAL because the Map key/value itself can change.
         """
-        assert self.start_date is not None and self.end_date is not None
-        # Ceil the start so the result never includes data preceding the
-        # requested range; floor the end to omit the incomplete trailing hour.
-        rollup_start = self._ceil_hour(self.start_date)
-        rollup_end = self._floor_hour(self.end_date)
-        if rollup_start >= rollup_end:
-            # A sub-hour range has no complete rollup bucket.
-            from tracer.services.clickhouse.v2.query_builders.filters import (
-                ClickHouseFilterBuilderV2,
+        self.params["latest_attr_key"] = attr_key
+        exists = "mapContains(attrs_string, %(latest_attr_key)s)"
+        value = "attrs_string[%(latest_attr_key)s]"
+        if filter_op == "is_null":
+            attribute_predicate = f"NOT {exists}"
+        elif filter_op == "is_not_null":
+            attribute_predicate = exists
+        elif filter_op in {"equals", "not_equals"}:
+            self.params["latest_attr_value"] = normalized_value
+            operator = "=" if filter_op == "equals" else "!="
+            attribute_predicate = (
+                f"{exists} AND lowerUTF8({value}) {operator} %(latest_attr_value)s"
             )
-
-            filter_builder = ClickHouseFilterBuilderV2(
-                table=self.RAW_TABLE,
-                project_id=self.project_id,
-                project_ids=self.project_ids,
-                span_date_scope=True,
-                query_mode=(
-                    ClickHouseFilterBuilderV2.QUERY_MODE_SPAN
-                    if self.observe_type == "span"
-                    else ClickHouseFilterBuilderV2.QUERY_MODE_TRACE
-                ),
+        elif filter_op in {"in", "not_in"}:
+            self.params["latest_attr_values"] = normalized_value
+            operator = "IN" if filter_op == "in" else "NOT IN"
+            attribute_predicate = (
+                f"{exists} AND lowerUTF8({value}) {operator} %(latest_attr_values)s"
             )
-            extra_where, extra_params = filter_builder.translate(self.filters)
-            self.params.update(extra_params)
-            self.query_source = "raw"
-            self.attribute_filtered = True
-            return self._build_raw_query(extra_where)
+        elif filter_op in {
+            "contains",
+            "not_contains",
+            "starts_with",
+            "ends_with",
+        }:
+            self.params["latest_attr_value"] = normalized_value
+            comparison = build_literal_text_predicate(
+                value,
+                "latest_attr_value",
+                filter_op,
+                case_insensitive=True,
+            )
+            attribute_predicate = f"{exists} AND {comparison}"
+        else:  # pragma: no cover - guarded by the recognizer
+            raise ValueError("unsupported latest-state text operator")
 
-        self.rollup_window_adjusted = (
-            rollup_start != self.start_date or rollup_end != self.end_date
-        )
-        self.rollup_window_start = rollup_start
-        self.rollup_window_end = rollup_end
-        self.params.update(
-            {
-                "attr_key": attr_key,
-                "attr_values": attr_values,
-                "rollup_start": rollup_start,
-                "rollup_end": rollup_end,
-            }
-        )
         bucket_fn = self.time_bucket_expr(self.interval)
-
+        metric_selects = self._select_list(self._metric_selects(aggregate_source=False))
+        entity_scope = (
+            "AND (parent_span_id IS NULL OR parent_span_id = '')"
+            if self.observe_type == "trace"
+            else ""
+        )
         query = f"""
         SELECT
-            {bucket_fn}(hour) AS time_bucket,
-            sumMerge(latency_sum) /
-                greatest(countMerge(n), 1) AS avg_latency,
-            0 AS total_tokens,
-            0 AS avg_cost,
-            countMerge(n) AS traffic_count,
-            0 AS prompt_tokens,
-            0 AS completion_tokens,
-            0 AS error_rate
-        FROM {self.ATTR_ROLLUP_TABLE}
-        WHERE project_id = %(project_id)s
-          AND attr_key = %(attr_key)s
-          AND hour >= %(rollup_start)s
-          AND hour < %(rollup_end)s
-          AND lowerUTF8(attr_value) IN %(attr_values)s
+            {bucket_fn}(start_time) AS time_bucket,
+            {metric_selects}
+        FROM {self.RAW_TABLE} FINAL
+        PREWHERE {self.project_filter_sql()}
+          AND start_time >= %(start_date)s
+          AND start_time < %(end_date)s
+        WHERE {attribute_predicate}
+          {entity_scope}
         GROUP BY time_bucket
         ORDER BY time_bucket
         """
@@ -627,15 +713,8 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             Dict with keys ``latency``, ``tokens``, ``cost``, ``traffic``.
         """
         assert self.start_date is not None and self.end_date is not None
-        series_start_date = self.rollup_window_start or self.start_date
-        # The SQL end bound is exclusive. Base zero-filling is inclusive, so
-        # keep it inside the disclosed rollup window instead of appending a
-        # synthetic zero point exactly at ``rollup_window_end``.
-        series_end_date = (
-            self.rollup_window_end - timedelta(microseconds=1)
-            if self.rollup_window_end is not None
-            else self.end_date
-        )
+        series_start_date = self.start_date
+        series_end_date = self.end_date
 
         # Build per-metric data lists
         latency_data: list[dict[str, Any]] = []
@@ -874,28 +953,31 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         extra_where: str,
         *,
         candidate_join: str = "",
+        latest_state: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Build a query against the raw ``spans`` table with filters applied."""
         bucket_fn = self.time_bucket_expr(self.interval)
         metric_selects = self._select_list(self._metric_selects(aggregate_source=False))
-        entity_scope = (
-            "AND (parent_span_id IS NULL OR parent_span_id = '')"
-            if self.observe_type == "trace"
-            else ""
-        )
+        where_conditions = []
+        if not latest_state:
+            where_conditions.append("is_deleted = 0")
+        if self.observe_type == "trace":
+            where_conditions.append("(parent_span_id IS NULL OR parent_span_id = '')")
+        where_conditions.append(extra_where)
+        where_clause = "\n          AND ".join(where_conditions)
+
+        table = f"{self.RAW_TABLE} FINAL" if latest_state else self.RAW_TABLE
 
         query = f"""
         SELECT
             {bucket_fn}(start_time) AS time_bucket,
             {metric_selects}
-        FROM {self.RAW_TABLE}
+        FROM {table}
         {candidate_join}
         PREWHERE {self.project_filter_sql()}
           AND start_time >= %(start_date)s
           AND start_time < %(end_date)s
-        WHERE is_deleted = 0
-          {entity_scope}
-          AND {extra_where}
+        WHERE {where_clause}
         GROUP BY time_bucket
         ORDER BY time_bucket
         """

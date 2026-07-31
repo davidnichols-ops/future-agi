@@ -51,6 +51,10 @@ import TaskConfirmDialog from "./TaskConfirmBox";
 import TaskLogsView from "../TaskLogsView";
 import { EvalPickerDrawer, serializeEvalConfig } from "../../EvalPicker";
 import { buildEvalTaskEditFilters } from "./editTaskFilters";
+import {
+  fetchEvalAttributeList,
+  getEvalAttributeListQueryKey,
+} from "../evalAttributeListRequest";
 
 // ── Configured Eval Card ──
 
@@ -211,20 +215,13 @@ const EditTaskDrawerV2Content = ({
   }, [configuredEvalList, replace]);
 
   // Fetch eval attributes for variable mapping
-  const {
-    data: evalAttributeResponse,
-    isError: evalAttributesRequestFailed,
-  } = useQuery({
-    queryKey: ["eval-attributes", rowType, filters],
-    queryFn: () =>
-      axios.get(endpoints.project.getEvalAttributeList(), {
-        params: {
-          row_type: rowType,
-          filters: JSON.stringify(filters),
-        },
-      }),
-    select: (d) => d.data,
-  });
+  const { data: evalAttributeResponse, isError: evalAttributesRequestFailed } =
+    useQuery({
+      queryKey: getEvalAttributeListQueryKey(project, rowType),
+      queryFn: () => fetchEvalAttributeList(project, rowType),
+      select: (d) => d.data,
+      enabled: !!project,
+    });
   const evalAttributes = evalAttributeResponse?.result;
   const evalAttributesDegraded =
     evalAttributesRequestFailed ||

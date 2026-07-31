@@ -1,7 +1,8 @@
 import concurrent.futures
 import copy
+import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from model_hub.models.choices import AnnotationTypeChoices
@@ -26,26 +27,43 @@ GRAPH_READ_SETTINGS = {
 
 # Raw system-metric graphs are the one graph shape that must aggregate a
 # project/time slice of ``spans`` after applying arbitrary row predicates.
-# Production evidence shows this shape staying below the 256 MiB memory cap
-# while narrowly exhausting the generic 750 ms / 1 GiB read limits. Keep eval
-# and annotation graphs on the tighter defaults; grant only this shape bounded
-# headroom after the builder has pruned unused metric columns.
-SYSTEM_GRAPH_READ_TIMEOUT_MS = 1250
+# Production evidence shows this shape narrowly exhausting the generic
+# 750 ms / 1 GiB read limits. Keep eval and annotation graphs on the tighter
+# defaults; grant only this shape bounded headroom after the builder has pruned
+# unused metric columns.
+SYSTEM_GRAPH_READ_TIMEOUT_MS = 1750
 SYSTEM_GRAPH_READ_SETTINGS = {
     **GRAPH_READ_SETTINGS,
+    # Keep a hard ceiling for the remaining non-segmented system-graph shapes.
+    # Selective trace-any-span filters use the tighter candidate protocol below
+    # rather than building a full-window membership set under this allowance.
+    "max_memory_usage": 512 * 1024 * 1024,
+    "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
+}
+
+SEGMENTED_GRAPH_READ_SETTINGS = {
+    **GRAPH_READ_SETTINGS,
+    "max_execution_time": 1.5,
+    "max_memory_usage": 512 * 1024 * 1024,
     "max_bytes_to_read": 1536 * 1024 * 1024,
+    # final_status is mutable. Enabling secondary skip indexes under FINAL can
+    # prune a newest key-clear/value-change version and resurrect an older
+    # matching version. Project/time primary-key and partition pruning remain.
+    "use_skip_indexes_if_final": 0,
 }
 
 # Raw attribute graphs are the only system-graph shape that still has to read
 # typed Maps.  One 14/30-day statement can cross the byte or memory guard even
-# when each UTC day is cheap.  Execute non-overlapping day windows with a small
+# when each UTC day is cheap. Execute non-overlapping 12-hour windows with a
 # fixed fan-out and one shared deadline; every ClickHouse statement remains
 # independently bounded and the original builder performs the final zero-fill.
 SEGMENTED_GRAPH_MAX_WORKERS = 4
-SEGMENTED_GRAPH_MAX_WINDOWS = 32
-SEGMENTED_GRAPH_QUERY_TIMEOUT_MS = 1000
-SEGMENTED_GRAPH_WALL_SECONDS = 2.2
-SEGMENTED_GRAPH_WINDOW = timedelta(days=1)
+SEGMENTED_GRAPH_MAX_WINDOWS = 64
+SEGMENTED_GRAPH_QUERY_TIMEOUT_MS = 1500
+SEGMENTED_GRAPH_WALL_SECONDS = 5.0
+SEGMENTED_GRAPH_WINDOW = timedelta(hours=12)
+TRACE_GRAPH_CANDIDATE_LIMIT = 48
+_SEGMENTED_GRAPH_READ_SLOTS = threading.BoundedSemaphore(SEGMENTED_GRAPH_MAX_WORKERS)
 
 
 def degraded_graph_response(metric_id: str, exc: Exception) -> dict[str, Any]:
@@ -58,15 +76,6 @@ def degraded_graph_response(metric_id: str, exc: Exception) -> dict[str, Any]:
         "query_status": "degraded",
         "query_error_code": error_code,
     }
-
-
-def _utc_iso(value: datetime) -> str:
-    """Serialize ClickHouse's naive-UTC boundaries without timezone ambiguity."""
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    else:
-        value = value.astimezone(UTC)
-    return value.isoformat().replace("+00:00", "Z")
 
 
 def normalize_eval_graph_output_type(req_data_config: dict[str, Any]) -> str:
@@ -234,17 +243,25 @@ def _segmented_graph_filters(
 def _segmented_graph_windows(
     start: datetime,
     end: datetime,
+    *,
+    window: timedelta = SEGMENTED_GRAPH_WINDOW,
 ) -> list[tuple[datetime, datetime]]:
-    """Partition a UTC request into non-overlapping midnight-aligned days."""
+    """Partition a UTC request into adjacent UTC day/half-day windows."""
     if start >= end:
         return []
+    if window not in {timedelta(hours=12), timedelta(days=1)}:
+        raise ValueError("unsupported graph segmentation window")
     windows: list[tuple[datetime, datetime]] = []
     cursor = start
     while cursor < end:
-        next_midnight = cursor.replace(hour=0, minute=0, second=0, microsecond=0)
-        if next_midnight <= cursor:
-            next_midnight += SEGMENTED_GRAPH_WINDOW
-        window_end = min(end, next_midnight)
+        midnight = cursor.replace(hour=0, minute=0, second=0, microsecond=0)
+        midday = midnight + timedelta(hours=12)
+        next_boundary = (
+            midday
+            if window == timedelta(hours=12) and cursor < midday
+            else midnight + timedelta(days=1)
+        )
+        window_end = min(end, next_boundary)
         windows.append((cursor, window_end))
         cursor = window_end
         if len(windows) > SEGMENTED_GRAPH_MAX_WINDOWS:
@@ -257,14 +274,39 @@ def _fetch_segmented_attribute_graph_rows(
     analytics,
     builder: TimeSeriesQueryBuilder,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Execute exact raw-attribute buckets under one bounded wall deadline."""
+    """Execute every exact raw latest-state window and merge aggregate states."""
     if builder.start_date is None or builder.end_date is None:
         raise ValueError("graph builder did not parse a bounded time range")
 
-    windows = _segmented_graph_windows(builder.start_date, builder.end_date)
-    if not windows:
+    raw_windows = _segmented_graph_windows(builder.start_date, builder.end_date)
+    if not raw_windows:
         return [], []
     deadline = time.monotonic() + SEGMENTED_GRAPH_WALL_SECONDS
+
+    def execute_with_slot(
+        query: str,
+        params: dict[str, Any],
+        *,
+        timeout_cap_ms: int,
+        settings: dict[str, Any],
+    ):
+        acquired = _SEGMENTED_GRAPH_READ_SLOTS.acquire(
+            timeout=max((deadline - time.monotonic()), 0)
+        )
+        if not acquired:
+            raise TimeoutError("attribute graph read capacity is busy")
+        try:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms < 25:
+                raise TimeoutError("attribute graph shared deadline expired")
+            return analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=min(timeout_cap_ms, remaining_ms),
+                settings=settings,
+            )
+        finally:
+            _SEGMENTED_GRAPH_READ_SLOTS.release()
 
     def execute_window(index: int, window: tuple[datetime, datetime]):
         remaining_ms = int((deadline - time.monotonic()) * 1000)
@@ -280,31 +322,35 @@ def _fetch_segmented_attribute_graph_rows(
             observe_type=builder.observe_type,
             metric_id=builder.metric_id,
             single_metric=builder.single_metric,
-            # Once the parent selected the raw path, every segment must cover
-            # its complete half-open window. A rollup segment can omit partial
-            # boundary hours and would make the merged response incomplete.
+            # Retained for constructor compatibility. The builder no longer
+            # selects the append-only attribute rollup for a success response.
             allow_attr_rollup=False,
         )
         query, params = chunk_builder.build()
-        if chunk_builder.query_source != "raw" or not chunk_builder.attribute_filtered:
+        if (
+            chunk_builder.query_source != builder.query_source
+            or chunk_builder.query_source not in {"raw", "raw_latest_state"}
+            or not chunk_builder.attribute_filtered
+        ):
             raise RuntimeError(
                 "segmented graph did not remain on the raw attribute path"
             )
-        result = analytics.execute_ch_query(
+        result = execute_with_slot(
             query,
             params,
-            timeout_ms=min(SEGMENTED_GRAPH_QUERY_TIMEOUT_MS, remaining_ms),
-            settings=SYSTEM_GRAPH_READ_SETTINGS,
+            timeout_cap_ms=SEGMENTED_GRAPH_QUERY_TIMEOUT_MS,
+            settings=SEGMENTED_GRAPH_READ_SETTINGS,
         )
         return index, result
 
-    results: list[Any] = [None] * len(windows)
+    work_count = len(raw_windows)
+    results: list[Any] = [None] * work_count
     executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(SEGMENTED_GRAPH_MAX_WORKERS, len(windows))
+        max_workers=min(SEGMENTED_GRAPH_MAX_WORKERS, work_count)
     )
     futures = [
         executor.submit(execute_window, index, window)
-        for index, window in enumerate(windows)
+        for index, window in enumerate(raw_windows)
     ]
     completed = False
     try:
@@ -318,7 +364,11 @@ def _fetch_segmented_attribute_graph_rows(
     except concurrent.futures.TimeoutError as exc:
         raise TimeoutError("attribute graph shared deadline expired") from exc
     finally:
-        executor.shutdown(wait=completed, cancel_futures=True)
+        # Never leave ClickHouse requests running in background threads after
+        # the API has returned a degraded response. Queries have their own
+        # bounded timeout, so waiting here is finite and protects the cluster
+        # from accumulating abandoned work under dashboard auto-refresh.
+        executor.shutdown(wait=True, cancel_futures=True)
 
     if not completed:
         raise TimeoutError("attribute graph did not complete every window")
@@ -372,6 +422,136 @@ def _fetch_segmented_attribute_graph_rows(
     return [rows_by_bucket[key] for key in sorted(rows_by_bucket)], columns
 
 
+def _fetch_trace_candidate_graph_rows(
+    *,
+    analytics,
+    builder: TimeSeriesQueryBuilder,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Resolve a selective any-span trace filter without a full-window Set.
+
+    Every 12-hour discovery statement has a ``limit + 1`` sentinel. The union
+    must remain under one process-local cap, then a single candidate-scoped
+    whole-window read removes stale slice matches before a second point-scoped
+    read hydrates root metrics. Any incomplete phase raises; callers return the
+    sanitized degraded graph contract instead of partial or incorrect data.
+    """
+
+    if builder.start_date is None or builder.end_date is None:
+        raise ValueError("trace candidate graph has no bounded time range")
+    windows = _segmented_graph_windows(builder.start_date, builder.end_date)
+    if not windows:
+        return [], []
+    deadline = time.monotonic() + SEGMENTED_GRAPH_WALL_SECONDS
+
+    def execute(query: str, params: dict[str, Any], *, result_cap: int | None = None):
+        acquired = _SEGMENTED_GRAPH_READ_SLOTS.acquire(
+            timeout=max(deadline - time.monotonic(), 0)
+        )
+        if not acquired:
+            raise TimeoutError("trace candidate graph read capacity is busy")
+        try:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms < 25:
+                raise TimeoutError("trace candidate graph shared deadline expired")
+            settings = dict(SEGMENTED_GRAPH_READ_SETTINGS)
+            if result_cap is not None:
+                settings.update(
+                    {
+                        "max_result_rows": result_cap,
+                        "result_overflow_mode": "throw",
+                    }
+                )
+            return analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=min(SEGMENTED_GRAPH_QUERY_TIMEOUT_MS, remaining_ms),
+                settings=settings,
+            )
+        finally:
+            _SEGMENTED_GRAPH_READ_SLOTS.release()
+
+    sentinel = TRACE_GRAPH_CANDIDATE_LIMIT + 1
+
+    def discover(index: int, window: tuple[datetime, datetime]):
+        query, params = builder.build_trace_candidate_discovery_query(
+            start=window[0],
+            end=window[1],
+            limit=sentinel,
+        )
+        return index, execute(query, params, result_cap=sentinel)
+
+    results: list[Any] = [None] * len(windows)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(SEGMENTED_GRAPH_MAX_WORKERS, len(windows))
+    )
+    futures = [
+        executor.submit(discover, index, window) for index, window in enumerate(windows)
+    ]
+    completed = False
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("trace candidate graph shared deadline expired")
+        for future in concurrent.futures.as_completed(futures, timeout=remaining):
+            index, result = future.result()
+            results[index] = result
+        completed = all(result is not None for result in results)
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError("trace candidate graph shared deadline expired") from exc
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    if not completed:
+        raise TimeoutError("trace candidate discovery did not complete")
+
+    candidate_ids: list[str] = []
+    seen: set[str] = set()
+    for result in results:
+        if len(result.data) >= sentinel:
+            raise TimeoutError("trace attribute matches require a narrower range")
+        for row in result.data:
+            if not isinstance(row, dict) or not row.get("trace_id"):
+                raise RuntimeError("trace candidate discovery returned an invalid row")
+            trace_id = str(row["trace_id"])
+            if trace_id in seen:
+                continue
+            seen.add(trace_id)
+            candidate_ids.append(trace_id)
+            if len(candidate_ids) > TRACE_GRAPH_CANDIDATE_LIMIT:
+                raise TimeoutError("trace attribute matches require a narrower range")
+
+    if not candidate_ids:
+        return [], []
+
+    verify_query, verify_params = builder.build_trace_candidate_verification_query(
+        candidate_ids
+    )
+    verified_result = execute(
+        verify_query,
+        verify_params,
+        result_cap=TRACE_GRAPH_CANDIDATE_LIMIT,
+    )
+    verified: list[str] = []
+    verified_seen: set[str] = set()
+    allowed = set(candidate_ids)
+    for row in verified_result.data:
+        if not isinstance(row, dict) or not row.get("trace_id"):
+            raise RuntimeError("trace candidate verification returned an invalid row")
+        trace_id = str(row["trace_id"])
+        if trace_id not in allowed:
+            raise RuntimeError("trace candidate verification escaped its ID scope")
+        if trace_id not in verified_seen:
+            verified_seen.add(trace_id)
+            verified.append(trace_id)
+    if not verified:
+        return [], []
+
+    hydrate_query, hydrate_params = builder.build_trace_candidate_hydration_query(
+        verified
+    )
+    hydrated = execute(hydrate_query, hydrate_params)
+    return list(hydrated.data), list(hydrated.columns or [])
+
+
 def annotation_output_type(label: AnnotationsLabels, requested: str = None) -> str:
     if requested:
         return requested
@@ -406,8 +586,13 @@ def fetch_system_metric_graph_ch(
         single_metric=True,
     )
     query, params = builder.build()
-    if (
-        builder.query_source == "raw"
+    if builder.query_source == "trace_candidate_plan":
+        rows, columns = _fetch_trace_candidate_graph_rows(
+            analytics=analytics,
+            builder=builder,
+        )
+    elif (
+        builder.query_source in {"raw", "raw_latest_state"}
         and builder.attribute_filtered
         and builder.raw_segmentation_safe
     ):
@@ -424,20 +609,7 @@ def fetch_system_metric_graph_ch(
         )
         rows, columns = result.data, result.columns or []
     ch_data = builder.format_result(rows, columns)
-    response = format_system_metric_graph(ch_data, metric_id)
-    if builder.rollup_window_adjusted:
-        assert builder.rollup_window_start is not None
-        assert builder.rollup_window_end is not None
-        response.update(
-            {
-                "query_complete": True,
-                "query_status": "adjusted",
-                "query_window_adjusted": True,
-                "query_window_start": _utc_iso(builder.rollup_window_start),
-                "query_window_end": _utc_iso(builder.rollup_window_end),
-            }
-        )
-    return response
+    return format_system_metric_graph(ch_data, metric_id)
 
 
 def fetch_eval_graph_ch(

@@ -420,7 +420,7 @@ def test_span_attribute_exact_key_probe_is_parameterized_latest_state_and_limite
     assert verify["params"]["slice_end"] == datetime(2026, 7, 30, 12, 35, tzinfo=UTC)
     assert 25 <= verify["timeout_ms"] <= 250
     assert verify["settings"]["max_result_rows"] == 1
-    assert verify["settings"]["use_skip_indexes_if_final"] == 1
+    assert verify["settings"]["use_skip_indexes_if_final"] == 0
 
 
 def test_span_attribute_exact_probe_discards_partial_verification_on_error(

@@ -930,6 +930,8 @@ class TestObservationSpanListSpansObserveAPI:
                     backend_used="clickhouse",
                     query_time_ms=1,
                 )
+            if "cross_slice_span_ids" in (params or {}):
+                return QueryResult([], 0, "clickhouse", 1)
             return QueryResult(
                 data=[
                     {
@@ -976,7 +978,7 @@ class TestObservationSpanListSpansObserveAPI:
         )
 
         assert response.status_code == status.HTTP_200_OK
-        assert len(calls) == 3
+        assert len(calls) == 4
         query, params, timeout_ms, settings = calls[0]
         assert 0 < timeout_ms <= 750
         assert settings["max_threads"] == 1
@@ -993,11 +995,18 @@ class TestObservationSpanListSpansObserveAPI:
             "candidate_slice_start"
         ] == timedelta(minutes=1)
         assert timeout_ms <= 750
-        classifier_query, classifier_params, _, _ = calls[1]
-        assert "id IN %(candidate_span_ids)s" in classifier_query
-        assert "start_time >= %(start_date)s" in classifier_query
-        assert classifier_params["candidate_span_ids"]
-        hydration_query, hydration_params, _, _ = calls[2]
+        classifier_calls = [
+            call for call in calls if "candidate_span_ids" in (call[1] or {})
+        ]
+        assert len(classifier_calls) == 1
+        assert all(
+            len(call[1]["candidate_span_ids"]) <= 64 for call in classifier_calls
+        )
+        for classifier_query, classifier_params, _, _ in classifier_calls:
+            assert "id IN %(candidate_span_ids)s" in classifier_query
+            assert "start_time >= %(start_date)s" in classifier_query
+            assert classifier_params["candidate_span_ids"]
+        hydration_query, hydration_params, _, _ = calls[-1]
         assert "id IN %(preview_span_ids)s" in hydration_query
         assert "argMax(input" not in hydration_query
         assert "argMax(output" not in hydration_query
@@ -1062,6 +1071,8 @@ class TestObservationSpanListSpansObserveAPI:
                     backend_used="clickhouse",
                     query_time_ms=1,
                 )
+            if "cross_slice_span_ids" in (params or {}):
+                return QueryResult([], 0, "clickhouse", 1)
             return QueryResult(
                 data=[
                     {
@@ -1117,9 +1128,16 @@ class TestObservationSpanListSpansObserveAPI:
         )
 
         assert response.status_code == status.HTTP_200_OK
-        assert len(calls) == 3
+        assert len(calls) == 4
         query, params, timeout_ms, settings = calls[0]
-        classifier_query, classifier_params, classifier_timeout, _ = calls[1]
+        classifier_calls = [
+            call for call in calls if "candidate_span_ids" in (call[1] or {})
+        ]
+        assert len(classifier_calls) == 1
+        assert all(
+            len(call[1]["candidate_span_ids"]) <= 64 for call in classifier_calls
+        )
+        classifier_query, classifier_params, classifier_timeout, _ = classifier_calls[0]
         assert "span_attr_bool" in classifier_query or "attrs_bool" in classifier_query
         boolean_params = [
             value
@@ -1128,6 +1146,7 @@ class TestObservationSpanListSpansObserveAPI:
         ]
         assert boolean_params == [1]
         assert "argMax(" not in query
+        assert "span_attr_bool" in query
         assert "start_time >= %(candidate_slice_start)s" in query
         assert "start_time < %(candidate_slice_end)s" in query
         assert "latest_is_deleted = 0" in classifier_query
@@ -1136,13 +1155,141 @@ class TestObservationSpanListSpansObserveAPI:
         assert 0 < classifier_timeout <= timeout_ms <= 750
         assert settings["timeout_overflow_mode"] == "throw"
         assert settings["read_overflow_mode"] == "throw"
-        hydration_query, hydration_params, _, _ = calls[2]
+        hydration_query, hydration_params, _, _ = calls[-1]
         assert "mapFilter(" in hydration_query
         assert "AS attrs_bool" in hydration_query
         assert hydration_params["preview_boolean_keys"] == ("customer_boolean_flag",)
         result = get_result(response)
         assert result["table"][0]["span_id"] == "boolean-preview-span-19"
         assert result["table"][0]["customer_boolean_flag"] is True
+        assert result["metadata"]["query_complete"] is True
+
+    def test_prompt_slug_in_task_preview_returns_attribute_for_mapping(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """The customer task filter returns a row and its mapping attribute."""
+        from tracer.services.clickhouse.query_service import (
+            AnalyticsQueryService,
+            QueryResult,
+        )
+
+        calls = []
+        now = timezone.now()
+        expected_slug = "agent_2_identity_disclosure"
+
+        def fake_execute(self, query, params=None, timeout_ms=10000, settings=None):
+            calls.append((query, params, timeout_ms, settings))
+            if "preview_span_ids" in (params or {}):
+                return QueryResult(
+                    data=[
+                        {
+                            "id": span_id,
+                            "trace_id": str(uuid.uuid4()),
+                            "name": "preview",
+                            "observation_type": "llm",
+                            "status": "OK",
+                            "start_time": now,
+                            "end_time": now,
+                            "latency_ms": 1,
+                            "cost": 0,
+                            "total_tokens": 1,
+                            "prompt_tokens": 1,
+                            "completion_tokens": 0,
+                            "model": "",
+                            "provider": "",
+                            "end_user_id": None,
+                            "created_at": now,
+                            "attrs_string": {"prompt_slug": expected_slug},
+                        }
+                        for span_id in params["preview_span_ids"]
+                    ],
+                    row_count=len(params["preview_span_ids"]),
+                    backend_used="clickhouse",
+                    query_time_ms=1,
+                )
+            if "candidate_span_ids" in (params or {}):
+                return QueryResult(
+                    data=[
+                        {
+                            "id": span_id,
+                            "start_time": now,
+                            "created_at": now,
+                        }
+                        for span_id in params["candidate_span_ids"]
+                    ],
+                    row_count=len(params["candidate_span_ids"]),
+                    backend_used="clickhouse",
+                    query_time_ms=1,
+                )
+            if "cross_slice_span_ids" in (params or {}):
+                return QueryResult([], 0, "clickhouse", 1)
+            return QueryResult(
+                data=[
+                    {"id": "prompt-slug-preview-span", "start_time": now},
+                ],
+                row_count=1,
+                backend_used="clickhouse",
+                query_time_ms=1,
+            )
+
+        monkeypatch.setattr(
+            AnalyticsQueryService,
+            "execute_ch_query",
+            fake_execute,
+        )
+
+        response = auth_client.get(
+            "/tracer/observation-span/list_spans_observe/",
+            {
+                "project_id": str(observe_project.id),
+                "page_number": 0,
+                "page_size": 50,
+                "preview": "true",
+                "filters": json.dumps(
+                    [
+                        {
+                            "column_id": "prompt_slug",
+                            "filter_config": {
+                                "filter_type": "text",
+                                "filter_op": "in",
+                                "filter_value": [expected_slug],
+                                "col_type": "SPAN_ATTRIBUTE",
+                            },
+                        },
+                        {
+                            "column_id": "created_at",
+                            "filter_config": {
+                                "filter_type": "datetime",
+                                "filter_op": "between",
+                                "filter_value": [
+                                    (now - timedelta(days=7)).isoformat(),
+                                    now.isoformat(),
+                                ],
+                                "col_type": "SYSTEM_METRIC",
+                            },
+                        },
+                    ]
+                ),
+            },
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        classifier_query, classifier_params, _, _ = next(
+            call for call in calls if "candidate_span_ids" in (call[1] or {})
+        )
+        assert "latest_attr_value_0" in classifier_query
+        assert any(
+            value == (expected_slug,)
+            for key, value in classifier_params.items()
+            if key.startswith("latest_attr_param_")
+        )
+        hydration_query, hydration_params, _, _ = calls[-1]
+        assert "mapFilter(" in hydration_query
+        assert "AS attrs_string" in hydration_query
+        assert hydration_params["preview_text_keys"] == ("prompt_slug",)
+        result = get_result(response)
+        assert result["table"][0]["span_id"] == "prompt-slug-preview-span"
+        assert result["table"][0]["prompt_slug"] == expected_slug
         assert result["metadata"]["query_complete"] is True
 
     def test_string_filtered_grid_does_not_repeat_a_full_window_count(
@@ -1243,7 +1390,11 @@ class TestObservationSpanListSpansObserveAPI:
         assert content_calls[0][3]["max_block_size"] == 8192
         result = get_result(response)
         assert len(result["table"]) == 2
-        assert result["metadata"]["total_rows"] == 4
+        # Exact COUNT is intentionally skipped on the bounded filtered path.
+        # The lower bound is the visible page plus one sentinel proving that a
+        # following page exists, not the total number of matching rows.
+        assert result["metadata"]["total_rows"] == 3
+        assert result["metadata"]["has_more"] is True
         assert result["metadata"]["total_rows_is_lower_bound"] is True
         assert result["metadata"]["query_complete"] is True
 

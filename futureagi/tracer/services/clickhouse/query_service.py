@@ -393,7 +393,13 @@ class AnalyticsQueryService:
         verify_settings = {
             **_BOUNDED_READ_SETTINGS,
             "max_result_rows": 1,
-            "use_skip_indexes_if_final": 1,
+            # Map-key skip indexes are evaluated on physical versions.  When
+            # merges are stopped, enabling them with FINAL can prune the newer
+            # version that removed a key and resurrect the obsolete value.
+            # Exact discovery must prefer latest-state correctness over that
+            # unsafe optimisation; the five-minute/id candidate scope keeps
+            # this verification bounded without it.
+            "use_skip_indexes_if_final": 0,
         }
         for slice_start in sorted(candidate_slices, reverse=True):
             verify_result = self.execute_ch_query(

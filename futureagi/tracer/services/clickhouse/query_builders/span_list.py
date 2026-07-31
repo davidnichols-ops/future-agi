@@ -23,16 +23,34 @@ from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.eval_status import (
     non_terminal_eval_marker,
 )
-from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.filters import (
+    ClickHouseFilterBuilder,
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.query_builders.latest_attributes import (
-    build_latest_attribute_predicate,
-    is_span_attribute_filter,
-    only_time_and_span_attribute_filters,
+    build_latest_span_probe_predicate,
+    is_latest_span_probe_filter,
 )
 from tracer.services.clickhouse.v2.id_remap_sql import (
     remap_left_join,
     resolved_id_expr,
 )
+
+_CANDIDATE_EXTERNAL_SPAN_COLUMNS = frozenset(
+    {"my_annotations", "annotator", "has_annotation"}
+)
+
+
+def _is_candidate_external_span_filter(item: dict[str, Any]) -> bool:
+    """Whether a filter is exact in a candidate-scoped secondary lookup."""
+
+    column_id = str(item.get("column_id") or item.get("columnId") or "")
+    config = item.get("filter_config") or item.get("filterConfig") or {}
+    col_type = str(config.get("col_type") or config.get("colType") or "").upper()
+    return column_id in _CANDIDATE_EXTERNAL_SPAN_COLUMNS or col_type in {
+        "EVAL_METRIC",
+        "ANNOTATION",
+    }
 
 
 class SpanListQueryBuilder(BaseQueryBuilder):
@@ -660,11 +678,49 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         return query, params
 
     def supports_latest_attribute_page(self) -> bool:
-        """Whether a scalar latest-state page can represent this request."""
+        """Whether a scalar latest-state page can represent this request.
+
+        The historical name is retained for callers, but the bounded reducer is
+        no longer attribute-only.  Every supported physical system metric is
+        reduced with the same per-id ``argMax`` state as typed attributes, so a
+        later value change, explicit NULL, or tombstone cannot resurrect an
+        older matching span.
+        """
+        active_filters = [
+            item
+            for item in self.filters
+            if (item.get("column_id") or item.get("columnId"))
+            not in {"created_at", "start_time"}
+        ]
         return (
             not self.sort_params
             and self.end_user_id is None
-            and only_time_and_span_attribute_filters(self.filters)
+            and all(is_latest_span_probe_filter(item) for item in active_filters)
+        )
+
+    def supports_latest_candidate_page(self) -> bool:
+        """Whether bounded candidates can represent every active filter.
+
+        Eval and annotation filters do not live on ``spans`` and therefore
+        cannot be scalar ``argMax`` states.  They are still exact once a small
+        span-id batch has been selected: the classifier scopes the secondary
+        FINAL lookup to that batch and combines it with the scalar predicates.
+        """
+
+        active_filters = [
+            item
+            for item in self.filters
+            if (item.get("column_id") or item.get("columnId"))
+            not in {"created_at", "start_time"}
+        ]
+        return (
+            not self.sort_params
+            and self.end_user_id is None
+            and all(
+                is_latest_span_probe_filter(item)
+                or _is_candidate_external_span_filter(item)
+                for item in active_filters
+            )
         )
 
     def build_latest_attribute_page(
@@ -705,9 +761,12 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             }
         )
         plans = [
-            build_latest_attribute_predicate(item, index=index)
+            build_latest_span_probe_predicate(item, index=index)
             for index, item in enumerate(
-                item for item in self.filters if is_span_attribute_filter(item)
+                item
+                for item in self.filters
+                if (item.get("column_id") or item.get("columnId"))
+                not in {"created_at", "start_time"}
             )
         ]
         for plan in plans:
@@ -842,9 +901,12 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             "limit": int(limit),
         }
         plans = [
-            build_latest_attribute_predicate(item, index=index)
+            build_latest_span_probe_predicate(item, index=index)
             for index, item in enumerate(
-                item for item in self.filters if is_span_attribute_filter(item)
+                item
+                for item in self.filters
+                if (item.get("column_id") or item.get("columnId"))
+                not in {"created_at", "start_time"}
             )
         ]
         for plan in plans:
@@ -919,19 +981,21 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         before_start_time: Any = None,
         before_id: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Return an unfiltered physical candidate page for bounded lists.
+        """Return a physical candidate page for bounded list verification.
 
         This query establishes only identity and an upper-bound ordering key.
-        It deliberately does not evaluate tombstones, project versions, or
-        attribute predicates inside the slice: doing so could hide a newer
-        non-match/key-clear/tombstone and let an older matching version of the
-        same span resurface from a later slice. Callers must mark every seeded
-        id seen and classify it with
-        :meth:`build_latest_attribute_candidate_matches` across the complete
-        original request window.
+        Attribute predicates are applied to physical versions as a safe
+        candidate prefilter: every latest matching span necessarily has a
+        matching physical version, while an older stale match remains only a
+        false-positive. It deliberately does not evaluate tombstones or trust
+        the physical match as final. Callers must mark every seeded id seen,
+        classify it inside the slice, and prove whether physical history exists
+        outside that slice. Cross-slice ids must then be classified across the
+        complete request window so a newer key clear, non-match, or tombstone
+        rejects an older raw match.
         """
 
-        if not self.supports_latest_attribute_page():
+        if not self.supports_latest_candidate_page():
             raise ValueError("latest scalar span seed does not support this request")
         if int(limit) <= 0:
             raise ValueError("limit must be greater than zero")
@@ -965,6 +1029,25 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             "candidate_slice_end": slice_end,
             "candidate_seed_limit": int(limit),
         }
+        attribute_filters = [
+            item
+            for item in self.filters
+            if (item.get("column_id") or item.get("columnId"))
+            not in {"created_at", "start_time"}
+            and is_latest_span_probe_filter(item)
+        ]
+        filter_fragment = ""
+        if attribute_filters:
+            fb = self._FILTER_BUILDER_CLS(
+                table=self.TABLE,
+                query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_SPAN,
+                project_id=self.project_id,
+                project_ids=self.project_ids,
+            )
+            physical_where, physical_params = fb.translate(attribute_filters)
+            params.update(physical_params)
+            if physical_where:
+                filter_fragment = f"AND ({physical_where})"
         keyset_fragment = ""
         if before_start_time is not None:
             before_start_time = _without_timezone(before_start_time)
@@ -990,6 +1073,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         PREWHERE {self.project_filter_sql()}
           AND start_time >= %(candidate_slice_start)s
           AND start_time < %(candidate_slice_end)s
+          {filter_fragment}
           {keyset_fragment}
         ORDER BY start_time DESC, id DESC
         LIMIT %(candidate_seed_limit)s
@@ -999,16 +1083,20 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     def build_latest_attribute_candidate_matches(
         self,
         candidate_span_ids: list[str],
+        *,
+        window_start: Any = None,
+        window_end: Any = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Classify bounded candidates against full-window latest state.
+        """Classify bounded candidates against latest state in one window.
 
-        Each candidate id is reduced once over the complete original request
-        window before tombstone, project-version, and requested attribute
-        predicates are applied. The returned ordering key is therefore the
-        canonical latest key, not a potentially stale physical seed key.
+        By default the window is the complete original request. Callers may
+        provide a contained local slice and separately prove that an accepted
+        id has no physical history outside it. Each candidate is reduced once
+        before tombstone, project-version, and attribute predicates are
+        applied, so the returned ordering key is canonical for that window.
         """
 
-        if not self.supports_latest_attribute_page():
+        if not self.supports_latest_candidate_page():
             raise ValueError(
                 "latest scalar span classifier does not support this request"
             )
@@ -1022,17 +1110,39 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         request_end = self.params.get("end_date")
         if request_start is None or request_end is None:
             request_start, request_end = self.parse_time_range(self.filters)
+        classifier_start = request_start if window_start is None else window_start
+        classifier_end = request_end if window_end is None else window_end
+        if getattr(classifier_start, "tzinfo", None) is not None:
+            classifier_start = classifier_start.replace(tzinfo=None)
+        if getattr(classifier_end, "tzinfo", None) is not None:
+            classifier_end = classifier_end.replace(tzinfo=None)
+        if (
+            classifier_start < request_start
+            or classifier_end > request_end
+            or classifier_start >= classifier_end
+        ):
+            raise ValueError("candidate classifier must stay inside request window")
         params: dict[str, Any] = {
             **self.params,
-            "start_date": request_start,
-            "end_date": request_end,
+            "start_date": classifier_start,
+            "end_date": classifier_end,
             "candidate_span_ids": tuple(bounded_ids),
         }
+        active_filters = [
+            item
+            for item in self.filters
+            if (item.get("column_id") or item.get("columnId"))
+            not in {"created_at", "start_time"}
+        ]
+        scalar_filters = [
+            item for item in active_filters if is_latest_span_probe_filter(item)
+        ]
+        external_filters = [
+            item for item in active_filters if _is_candidate_external_span_filter(item)
+        ]
         plans = [
-            build_latest_attribute_predicate(item, index=index)
-            for index, item in enumerate(
-                item for item in self.filters if is_span_attribute_filter(item)
-            )
+            build_latest_span_probe_predicate(item, index=index)
+            for index, item in enumerate(scalar_filters)
         ]
         for plan in plans:
             params.update(plan.params)
@@ -1055,31 +1165,115 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         predicate_fragment = (
             " AND " + " AND ".join(plan.predicate for plan in plans) if plans else ""
         )
+        external_predicate = ""
+        if external_filters:
+            filter_builder = self._FILTER_BUILDER_CLS(
+                table=self.TABLE,
+                annotation_label_ids=self.annotation_label_ids,
+                query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_SPAN,
+                project_id=self.project_id,
+                project_ids=self.project_ids,
+                score_date_scope=True,
+                span_date_scope=True,
+                span_latest_state=True,
+                candidate_entity_scope=True,
+            )
+            try:
+                external_predicate, external_params = filter_builder.translate(
+                    external_filters
+                )
+            except (TypeError, ValueError) as exc:
+                raise UnsupportedFilterShapeError(
+                    "unsupported span filter shape"
+                ) from exc
+            params.update(external_params)
+        external_fragment = f"WHERE {external_predicate}" if external_predicate else ""
 
         query = f"""
         SELECT
-            grouped_id AS id,
-            latest_start_time AS start_time,
-            latest_created_at AS created_at
+            id,
+            start_time,
+            created_at
         FROM (
             SELECT
-                id AS grouped_id,
-                argMax(tuple(start_time), _peerdb_version).1 AS latest_start_time,
-                argMax(created_at, _peerdb_version) AS latest_created_at,
-                argMax(is_deleted, _peerdb_version) AS latest_is_deleted
-                {aggregate_fragment}
-            FROM {self.TABLE}
-            PREWHERE {self.project_filter_sql()}
-              AND id IN %(candidate_span_ids)s
-              AND start_time >= %(start_date)s
-              AND start_time < %(end_date)s
-            GROUP BY id
+                grouped_id AS id,
+                latest_start_time AS start_time,
+                latest_created_at AS created_at
+            FROM (
+                SELECT
+                    id AS grouped_id,
+                    argMax(tuple(start_time), _peerdb_version).1
+                        AS latest_start_time,
+                    argMax(created_at, _peerdb_version) AS latest_created_at,
+                    argMax(is_deleted, _peerdb_version) AS latest_is_deleted
+                    {aggregate_fragment}
+                FROM {self.TABLE}
+                PREWHERE {self.project_filter_sql()}
+                  AND id IN %(candidate_span_ids)s
+                  AND start_time >= %(start_date)s
+                  AND start_time < %(end_date)s
+                GROUP BY id
+            )
+            WHERE latest_is_deleted = 0
+              {predicate_fragment}
+              {project_version_fragment}
         )
-        WHERE latest_is_deleted = 0
-          {predicate_fragment}
-          {project_version_fragment}
-        ORDER BY latest_start_time DESC, grouped_id DESC
+        {external_fragment}
+        ORDER BY start_time DESC, id DESC
         LIMIT {len(bounded_ids)}
+        """
+        return query, params
+
+    def build_cross_slice_candidate_ids(
+        self,
+        candidate_span_ids: list[str],
+        *,
+        slice_start: Any,
+        slice_end: Any,
+    ) -> tuple[str, dict[str, Any]]:
+        """Find candidates with physical history outside one classified slice."""
+        bounded_ids = list(
+            dict.fromkeys(str(span_id) for span_id in candidate_span_ids if span_id)
+        )
+        if not bounded_ids:
+            return "", {}
+        request_start = self.params.get("start_date")
+        request_end = self.params.get("end_date")
+        if request_start is None or request_end is None:
+            request_start, request_end = self.parse_time_range(self.filters)
+
+        def _without_timezone(value):
+            return (
+                value.replace(tzinfo=None) if getattr(value, "tzinfo", None) else value
+            )
+
+        slice_start = _without_timezone(slice_start)
+        slice_end = _without_timezone(slice_end)
+        if (
+            slice_start < request_start
+            or slice_end > request_end
+            or slice_start >= slice_end
+        ):
+            raise ValueError("cross-slice probe must stay inside request window")
+        params: dict[str, Any] = {
+            **self.params,
+            "cross_slice_span_ids": tuple(bounded_ids),
+            "cross_slice_request_start": request_start,
+            "cross_slice_request_end": request_end,
+            "cross_slice_start": slice_start,
+            "cross_slice_end": slice_end,
+            "cross_slice_limit": len(bounded_ids),
+        }
+        query = f"""
+        SELECT DISTINCT id
+        FROM {self.TABLE}
+        PREWHERE {self.project_filter_sql()}
+          AND id IN %(cross_slice_span_ids)s
+          AND start_time >= %(cross_slice_request_start)s
+          AND start_time < %(cross_slice_request_end)s
+        WHERE start_time < %(cross_slice_start)s
+           OR start_time >= %(cross_slice_end)s
+        LIMIT %(cross_slice_limit)s
         """
         return query, params
 
@@ -1122,7 +1316,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 "sampling_salt and sampling_rate must be provided together"
             )
 
-        request_start, request_end = self.parse_time_range(self.filters)
+        request_start = self.params.get("start_date")
+        request_end = self.params.get("end_date")
+        if request_start is None or request_end is None:
+            request_start, request_end = self.parse_time_range(self.filters)
         if slice_start < request_start or slice_end > request_end:
             raise ValueError(
                 "latest scalar span id page must stay inside request window"
@@ -1138,9 +1335,12 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         if limit is not None:
             params["latest_span_limit"] = int(limit)
         plans = [
-            build_latest_attribute_predicate(item, index=index)
+            build_latest_span_probe_predicate(item, index=index)
             for index, item in enumerate(
-                item for item in self.filters if is_span_attribute_filter(item)
+                item
+                for item in self.filters
+                if (item.get("column_id") or item.get("columnId"))
+                not in {"created_at", "start_time"}
             )
         ]
         for plan in plans:

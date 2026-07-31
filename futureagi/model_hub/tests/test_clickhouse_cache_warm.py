@@ -97,7 +97,9 @@ def _warmup_sql(monkeypatch, *, drops_legacy_chain: bool) -> list[str]:
         lambda: drops_legacy_chain,
     )
     client = Mock()
-    existing = {"traces"} if drops_legacy_chain else {"tracer_trace"}
+    existing = (
+        {"traces"} if drops_legacy_chain else {"tracer_trace", "span_metrics_hourly"}
+    )
     client.table_exists.side_effect = lambda table: table in existing
     ModelHubConfig._warm_ch_cache(client)
     return [call.args[0] for call in client.execute_read.call_args_list]
@@ -115,6 +117,45 @@ def test_legacy_cache_warm_keeps_cdc_trace_table(monkeypatch):
 
     assert any("FROM tracer_trace " in query for query in queries)
     assert not any("FROM traces " in query for query in queries)
+    assert any("FROM span_metrics_hourly " in query for query in queries)
+
+
+def test_legacy_cache_warm_skips_dropped_metrics_table(monkeypatch):
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.schema.should_drop_legacy_chain",
+        lambda: False,
+    )
+    client = Mock()
+    client.table_exists.side_effect = lambda table: table == "tracer_trace"
+
+    ModelHubConfig._warm_ch_cache(client)
+
+    queries = [call.args[0] for call in client.execute_read.call_args_list]
+    assert any("FROM tracer_trace " in query for query in queries)
+    assert not any("FROM span_metrics_hourly " in query for query in queries)
+
+
+def test_legacy_cache_warm_skips_metrics_query_when_table_probe_fails(monkeypatch):
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.schema.should_drop_legacy_chain",
+        lambda: False,
+    )
+    client = Mock()
+
+    def table_exists(table):
+        if table == "tracer_trace":
+            return True
+        if table == "span_metrics_hourly":
+            raise RuntimeError("schema probe unavailable")
+        return False
+
+    client.table_exists.side_effect = table_exists
+
+    ModelHubConfig._warm_ch_cache(client)
+
+    queries = [call.args[0] for call in client.execute_read.call_args_list]
+    assert any("FROM tracer_trace " in query for query in queries)
+    assert not any("FROM span_metrics_hourly " in query for query in queries)
 
 
 def test_cache_warm_is_bounded_to_subsecond_reads(monkeypatch):

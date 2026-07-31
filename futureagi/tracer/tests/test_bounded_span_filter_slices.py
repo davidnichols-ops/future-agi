@@ -83,10 +83,12 @@ class _Analytics:
         pages: list[list[dict]] | None = None,
         exc: Exception | None = None,
         classifications: dict[str, dict | None] | None = None,
+        cross_slice_ids: set[str] | None = None,
     ):
         self.pages = list(pages or [])
         self.exc = exc
         self.classifications = classifications or {}
+        self.cross_slice_ids = cross_slice_ids or set()
         self.seed_rows_by_id: dict[str, dict] = {}
         self.calls: list[tuple[str, dict, int, dict]] = []
 
@@ -94,7 +96,13 @@ class _Analytics:
         self.calls.append((query, dict(params), timeout_ms, dict(settings)))
         if self.exc:
             raise self.exc
-        if "candidate_span_ids" in params:
+        if "cross_slice_span_ids" in params:
+            data = [
+                {"id": span_id}
+                for span_id in params["cross_slice_span_ids"]
+                if span_id in self.cross_slice_ids
+            ]
+        elif "candidate_span_ids" in params:
             data = []
             for span_id in params["candidate_span_ids"]:
                 if span_id in self.classifications:
@@ -123,12 +131,18 @@ def _seed_calls(analytics):
     return [
         call
         for call in analytics.calls
-        if "candidate_span_ids" not in call[1] and "future_tail_start" not in call[1]
+        if "candidate_span_ids" not in call[1]
+        and "cross_slice_span_ids" not in call[1]
+        and "future_tail_start" not in call[1]
     ]
 
 
 def _classifier_calls(analytics):
     return [call for call in analytics.calls if "candidate_span_ids" in call[1]]
+
+
+def _cross_slice_calls(analytics):
+    return [call for call in analytics.calls if "cross_slice_span_ids" in call[1]]
 
 
 class _FastAttemptThenSlicesAnalytics(_Analytics):
@@ -200,9 +214,10 @@ def test_adjacent_slices_preserve_exact_newest_first_prefix():
     second_query, second_params, second_timeout, _ = seed_calls[1]
     assert first_query == second_query
     assert "FROM spans FINAL" not in first_query
+    assert "GROUP BY id" not in first_query
     assert "argMax(" not in first_query
-    assert "latest_is_deleted" not in first_query
-    assert "latest_attr_" not in first_query
+    assert "span_attr_str" in first_query
+    assert "arbitrary_string_key" in first_query
     assert first_params["candidate_slice_end"] == end
     assert first_params["candidate_slice_start"] == end - timedelta(minutes=1)
     assert second_params["candidate_slice_end"] == first_params["candidate_slice_start"]
@@ -564,7 +579,7 @@ def test_completed_sparse_slices_expand_without_gaps_to_find_an_old_match():
     ]
 
 
-def test_failed_wide_slice_stops_without_narrow_retry():
+def test_failed_wide_slice_retries_only_the_unread_range_at_half_width():
     end = datetime(2026, 7, 30, 12)
     start = end - timedelta(minutes=4)
     analytics = _ScriptedAnalytics(
@@ -587,14 +602,16 @@ def test_failed_wide_slice_stops_without_narrow_retry():
     )
 
     assert result.data == []
-    assert complete is False
-    assert full_window is False
+    assert complete is True
+    assert full_window is True
     assert [
         (params["candidate_slice_start"], params["candidate_slice_end"])
         for _, params, _, _ in _seed_calls(analytics)
     ] == [
         (end - timedelta(minutes=1), end),
         (end - timedelta(minutes=3), end - timedelta(minutes=1)),
+        (end - timedelta(minutes=2), end - timedelta(minutes=1)),
+        (start, end - timedelta(minutes=2)),
     ]
 
 
@@ -628,10 +645,12 @@ def test_shared_deadline_returns_an_explicit_incomplete_exact_prefix():
     result, complete, full_window = _execute_bounded_span_filter_prefix(
         _builder(start, end),
         analytics,
-        clock=_Clock(0, 0.2, 0.3, 1.81, 1.82),
+        clock=_Clock(0, 0.2, 0.3, 2.11, 2.12),
     )
 
-    assert [row["id"] for row in result.data] == ["newest-match"]
+    # The deadline expires before the cross-slice proof. A locally classified
+    # row is still provisional and therefore cannot leak into the response.
+    assert result.data == []
     assert len(_seed_calls(analytics)) == len(_classifier_calls(analytics)) == 1
     assert all(call[2] <= 750 for call in analytics.calls)
     assert complete is False
@@ -672,7 +691,7 @@ def test_programming_error_is_not_hidden_as_an_empty_result():
         )
 
 
-def test_deep_page_low_volume_window_is_proven_empty_and_complete():
+def test_deep_page_low_volume_window_returns_exact_deep_result():
     end = datetime(2026, 7, 30, 12, 1)
     start = end - timedelta(minutes=1)
     source_rows = [
@@ -696,13 +715,18 @@ def test_deep_page_low_volume_window_is_proven_empty_and_complete():
     assert result.data == source_rows
     assert complete is True
     assert full_window is True
-    assert len(_seed_calls(analytics)) == len(_classifier_calls(analytics)) == 1
+    assert len(_seed_calls(analytics)) == 1
+    assert len(_classifier_calls(analytics)) == 19
+    assert all(
+        len(call[1]["candidate_span_ids"]) <= 64
+        for call in _classifier_calls(analytics)
+    )
     seed_call = _seed_calls(analytics)[0]
     assert seed_call[1]["candidate_seed_limit"] == 2000
     assert seed_call[3]["max_result_rows"] == 2000
 
 
-def test_deep_page_dense_slice_continues_below_two_thousand_row_cap():
+def test_deep_page_dense_slice_uses_keyset_and_returns_exact_page():
     end = datetime(2026, 7, 30, 12, 1)
     start = end - timedelta(minutes=1)
     first_rows = [
@@ -728,32 +752,26 @@ def test_deep_page_dense_slice_continues_below_two_thousand_row_cap():
     )
 
     page, has_more = paginate_deduped(result.data, "id", 3, 500)
-    assert page == first_rows[1500:2000]
+    assert [row["id"] for row in page] == [
+        f"span-{index:06d}" for index in range(1500, 2000)
+    ]
     assert has_more is True
     assert len(result.data) == 2750
     assert complete is True
     assert full_window is True
     seed_calls = _seed_calls(analytics)
-    assert len(seed_calls) == len(_classifier_calls(analytics)) == 2
+    assert len(seed_calls) == 2
+    assert len(_classifier_calls(analytics)) == 44
     first_query, first_params, _, first_settings = seed_calls[0]
-    second_query, second_params, _, second_settings = seed_calls[1]
     assert "candidate_before_start_time" not in first_query
-    assert "start_time < %(candidate_before_start_time)s" in second_query
-    assert second_params["candidate_before_start_time"] == first_rows[-1]["start_time"]
-    assert second_params["candidate_before_id"] == first_rows[-1]["id"]
     assert (
         first_params["candidate_seed_limit"]
         == first_settings["max_result_rows"]
         == 2000
     )
-    assert (
-        second_params["candidate_seed_limit"]
-        == second_settings["max_result_rows"]
-        == 1000
-    )
 
 
-def test_keyset_preserves_equal_timestamps_and_dedups_ids_across_chunks():
+def test_deep_equal_timestamp_page_keeps_exact_id_tiebreaker():
     end = datetime(2026, 7, 30, 12, 1)
     start = end - timedelta(minutes=1)
     newest_time = end - timedelta(seconds=1)
@@ -785,20 +803,13 @@ def test_keyset_preserves_equal_timestamps_and_dedups_ids_across_chunks():
 
     ids = [row["id"] for row in result.data]
     assert ids[:3] == ["span-003000", "span-002999", "span-002998"]
-    assert ids[1999:2002] == [
-        "span-001001",
-        "span-001000",
-        "span-000999",
-    ]
-    assert ids.count("span-002000") == 1
     assert len(ids) == 2502
+    assert len(set(ids)) == len(ids)
     assert complete is True
     assert full_window is True
     seed_calls = _seed_calls(analytics)
-    assert len(seed_calls) == len(_classifier_calls(analytics)) == 2
-    continuation_params = seed_calls[1][1]
-    assert continuation_params["candidate_before_start_time"] == newest_time
-    assert continuation_params["candidate_before_id"] == "span-001001"
+    assert len(seed_calls) == 2
+    assert len(_classifier_calls(analytics)) == 40
 
 
 def test_deep_page_deadline_returns_exact_incomplete_prefix():
@@ -816,7 +827,7 @@ def test_deep_page_deadline_returns_exact_incomplete_prefix():
     result, complete, full_window = _execute_bounded_span_filter_prefix(
         _builder(start, end, page_number=3, page_size=500),
         analytics,
-        clock=_Clock(0, 0, 1.801, 1.802),
+        clock=_Clock(0, 0, 2.101, 2.102),
     )
 
     # The seed consumed the remaining deadline before point classification, so

@@ -501,12 +501,17 @@ const SpanGrid = React.forwardRef(
               }
 
               const rows = res?.table || [];
-              const totalRows = res?.metadata?.total_rows;
+              const metadata = res?.metadata || {};
+              const totalRows = metadata.total_rows;
               params.api.totalRowCount = totalRows;
+              params.api.totalRowCountIsLowerBound =
+                metadata.total_rows_is_lower_bound === true;
               useSpanGridStore.setState({ totalRowCount: totalRows || 0 });
 
               // Infinite-scroll: don't expose total upfront → scrollbar grows as you scroll
-              const isLastPage = rows.length < ROWS_LIMIT;
+              const isLastPage =
+                metadata.has_more === false ||
+                (metadata.has_more == null && rows.length < ROWS_LIMIT);
               const lastRow = isLastPage ? request.startRow + rows.length : -1;
 
               params.success({

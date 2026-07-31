@@ -84,11 +84,11 @@ def _long_window_filters(string_filter: dict) -> list[dict]:
         (
             "contains",
             "synthetic_prompt",
-            "arrayStringConcat(arrayMap(x -> lower(x), mapValues(attrs_string))) LIKE",
+            "positionUTF8(lowerUTF8",
         ),
     ],
 )
-def test_long_window_string_filters_are_time_scoped_index_assisted_and_topk(
+def test_long_window_string_filters_are_time_scoped_bounded_and_topk(
     builder_cls, is_trace, op, value, expected_index_expr
 ):
     builder = builder_cls(
@@ -106,6 +106,8 @@ def test_long_window_string_filters_are_time_scoped_index_assisted_and_topk(
     assert "start_time >= %(start_date)s" in compact_sql
     assert "start_time < %(end_date)s" in compact_sql
     assert expected_index_expr in compact_sql
+    if op == "contains":
+        assert "arrayStringConcat" not in compact_sql
     assert "LIMIT %(limit)s" in compact_sql
     assert params["limit"] == 50
     assert "LIMIT 1 BY" not in compact_sql

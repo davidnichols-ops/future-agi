@@ -14,7 +14,10 @@ from datetime import datetime
 from typing import Any
 
 from tracer.services.clickhouse.query_builders.base import NIL_UUID, BaseQueryBuilder
-from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.filters import (
+    ClickHouseFilterBuilder,
+    build_literal_text_predicate,
+)
 from tracer.services.clickhouse.query_builders.session_filters import (
     SESSION_ID_FILTER_COLS,
     build_session_id_filter_clause,
@@ -95,6 +98,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         filters: list[dict] | None = None,
         sort_params: list[dict] | None = None,
         user_id: str | None = None,
+        candidate_session_ids: list[str] | tuple[str, ...] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id=project_id, project_ids=project_ids, **kwargs)
@@ -103,6 +107,11 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         self.filters = filters or []
         self.sort_params = sort_params or []
         self.user_id = user_id
+        self.candidate_session_ids = tuple(
+            str(session_id)
+            for session_id in (candidate_session_ids or ())
+            if session_id
+        )
         self.start_date: datetime | None = None
         self.end_date: datetime | None = None
 
@@ -123,6 +132,13 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             table=self.TABLE,
             project_id=self.project_id,
             project_ids=self.project_ids,
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_TRACE,
+            # Candidate sessions still need the ordinary list's any-span
+            # semantics. Scope each trace-membership subquery to the bounded
+            # old/new session aliases and resolve latest versions there; this
+            # avoids both a project-wide Map scan and root-only approximation.
+            span_session_id_scope=bool(self.candidate_session_ids),
+            span_latest_state=bool(self.candidate_session_ids),
         )
         extra_where, extra_params = fb.translate(span_filters)
         self.params.update(extra_params)
@@ -135,7 +151,9 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             self.sort_params, field_map=self.SORT_FIELD_MAP
         )
         if not order_clause:
-            order_clause = "ORDER BY session_start DESC"
+            # A deterministic tie-breaker keeps OFFSET pages and the bounded
+            # root-frontier implementation on the same exact order.
+            order_clause = "ORDER BY session_start DESC, session_id DESC"
 
         # Pagination
         offset = self.page_number * self.page_size
@@ -746,12 +764,36 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         nothing → the wrapped scan is a transparent pass-through, byte-identical
         (result-set) to the committed bare scan.
         """
-        base_predicates = f"""{self.project_where()}
+        # Candidate aggregation is the only session path that opts into FINAL.
+        # Its alias tuple and time/project window keep the read bounded. The
+        # two-argument ReplacingMergeTree drops newest tombstones under FINAL;
+        # an explicit mutable `is_deleted = 0` predicate is unsafe when FINAL
+        # skip indexes are enabled, so this path emits only project scope and
+        # disables those indexes at both the SQL and client-settings layers.
+        span_source = (
+            f"{self.TABLE} FINAL" if self.candidate_session_ids else self.TABLE
+        )
+        project_where = (
+            f"WHERE {self.project_filter_sql()}"
+            if self.candidate_session_ids
+            else self.project_where()
+        )
+        base_predicates = f"""{project_where}
           AND trace_session_id IS NOT NULL
           AND trace_session_id != toUUID('{NIL_UUID}')
           AND (parent_span_id IS NULL OR parent_span_id = '')
           {time_where}
           {filter_fragment}"""
+
+        if self.candidate_session_ids:
+            # Internal bounded-preview scope. Callers expand every canonical
+            # session to all of its old/new aliases before constructing this
+            # builder, so the raw predicate remains exact across the remap
+            # cutover while allowing the trace_session_id skip index to prune.
+            params["candidate_session_ids"] = self.candidate_session_ids
+            base_predicates += (
+                "\n          AND trace_session_id IN %(candidate_session_ids)s"
+            )
 
         resolved_session_clause = self._build_resolved_session_clause(params)
         user_membership_clause = self._build_session_user_membership_clause(params)
@@ -785,7 +827,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 {outer_select_sql}
             FROM (
                 SELECT {inner_cols}
-                FROM {self.TABLE}
+                FROM {span_source}
                 {base_predicates}
             ) AS rs
             {ts_join}
@@ -819,27 +861,36 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                         else f"({ch_col} IS NOT NULL AND {ch_col} != '')"
                     )
                     continue
-                text_op = {
-                    "equals": "=",
-                    "not_equals": "!=",
-                    "contains": "ILIKE",
-                    "not_contains": "NOT ILIKE",
-                    "starts_with": "ILIKE",
-                    "ends_with": "ILIKE",
-                }.get(filter_op)
-                if text_op is None:
+                if filter_op not in {
+                    "equals",
+                    "not_equals",
+                    "contains",
+                    "not_contains",
+                    "starts_with",
+                    "ends_with",
+                }:
                     conditions.append("0 = 1")
                     continue
                 param_counter += 1
                 param_name = f"having_{param_counter}"
-                if filter_op in ("contains", "not_contains"):
-                    filter_value = f"%{filter_value}%"
-                elif filter_op == "starts_with":
-                    filter_value = f"{filter_value}%"
-                elif filter_op == "ends_with":
-                    filter_value = f"%{filter_value}"
                 self.params[param_name] = filter_value
-                conditions.append(f"{ch_col} {text_op} %({param_name})s")
+                if filter_op in {
+                    "contains",
+                    "not_contains",
+                    "starts_with",
+                    "ends_with",
+                }:
+                    conditions.append(
+                        build_literal_text_predicate(
+                            ch_col,
+                            param_name,
+                            filter_op,
+                            case_insensitive=True,
+                        )
+                    )
+                else:
+                    text_op = "=" if filter_op == "equals" else "!="
+                    conditions.append(f"{ch_col} {text_op} %({param_name})s")
                 continue
 
             op_map = {

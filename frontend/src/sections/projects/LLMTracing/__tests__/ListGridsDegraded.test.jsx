@@ -3,21 +3,25 @@ import PropTypes from "prop-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, waitFor } from "src/utils/test-utils";
 
-const { getMock, enqueueSnackbarMock } = vi.hoisted(() => ({
-  getMock: vi.fn(),
-  enqueueSnackbarMock: vi.fn(),
-}));
+const { getMock, enqueueSnackbarMock, successMock, gridApi } = vi.hoisted(
+  () => ({
+    getMock: vi.fn(),
+    enqueueSnackbarMock: vi.fn(),
+    successMock: vi.fn(),
+    gridApi: {
+      hideOverlay: vi.fn(),
+      showNoRowsOverlay: vi.fn(),
+      forEachNode: vi.fn(),
+    },
+  }),
+);
 
 function MockAgGridReact({ serverSideDatasource }) {
   React.useEffect(() => {
     serverSideDatasource?.getRows?.({
       request: { startRow: 0, endRow: 25 },
-      api: {
-        hideOverlay: vi.fn(),
-        showNoRowsOverlay: vi.fn(),
-        forEachNode: vi.fn(),
-      },
-      success: vi.fn(),
+      api: gridApi,
+      success: successMock,
       fail: vi.fn(),
     });
   }, [serverSideDatasource]);
@@ -155,6 +159,9 @@ describe("Observe list grids degraded response contract", () => {
   beforeEach(() => {
     getMock.mockReset();
     enqueueSnackbarMock.mockReset();
+    successMock.mockReset();
+    delete gridApi.totalRowCount;
+    delete gridApi.totalRowCountIsLowerBound;
   });
 
   it("surfaces a safe warning for an incomplete trace-list response", async () => {
@@ -216,4 +223,36 @@ describe("Observe list grids degraded response contract", () => {
       "DB::Exception",
     );
   });
+
+  it.each([
+    ["trace", TraceGrid, { projectId: "project-1" }],
+    ["span", SpanGrid, {}],
+  ])(
+    "uses explicit has_more for a full final %s page and preserves lower-bound state",
+    async (_kind, Grid, extraProps) => {
+      getMock.mockResolvedValue({
+        data: {
+          result: {
+            metadata: {
+              total_rows: 25,
+              total_rows_is_lower_bound: true,
+              has_more: false,
+            },
+            table: Array.from({ length: 25 }, (_, index) => ({ id: index })),
+            config: [],
+          },
+        },
+      });
+
+      render(<Grid {...sharedProps} {...extraProps} />);
+
+      await waitFor(() =>
+        expect(successMock).toHaveBeenCalledWith(
+          expect.objectContaining({ rowCount: 25 }),
+        ),
+      );
+      expect(gridApi.totalRowCount).toBe(25);
+      expect(gridApi.totalRowCountIsLowerBound).toBe(true);
+    },
+  );
 });

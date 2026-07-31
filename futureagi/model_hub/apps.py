@@ -299,15 +299,24 @@ class ModelHubConfig(AppConfig):
             warmup_queries.insert(1, trace_warmup)
 
         # When the legacy chain is retained (prod default), also warm
-        # the legacy aggregate so it stays hot until the cutover.
+        # the legacy aggregate so it stays hot until the cutover. The
+        # rollout flag is not proof that the table still exists: during a
+        # staggered CH25 cutover the aggregate may already have been removed
+        # while an old worker still has the flag disabled. Probe the actual
+        # read-only schema first so startup never issues a guaranteed
+        # UNKNOWN_TABLE query.
         if not should_drop_legacy_chain():
-            warmup_queries.append(
-                (
-                    "SELECT count() FROM span_metrics_hourly "
-                    "WHERE hour >= now() - INTERVAL 7 DAY",
-                    "span_metrics_hourly (7d, legacy)",
-                )
-            )
+            try:
+                if ch.table_exists("span_metrics_hourly"):
+                    warmup_queries.append(
+                        (
+                            "SELECT count() FROM span_metrics_hourly "
+                            "WHERE hour >= now() - INTERVAL 7 DAY",
+                            "span_metrics_hourly (7d, legacy)",
+                        )
+                    )
+            except Exception as e:
+                logger.warning("CH legacy metrics cache-warm table probe failed: %s", e)
         for query, label in warmup_queries:
             try:
                 ch.execute_read(

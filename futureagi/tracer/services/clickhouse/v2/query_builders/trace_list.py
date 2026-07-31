@@ -30,6 +30,7 @@ from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.query_builders.filters import (
     ClickHouseFilterBuilderV2,
     _append_v2_settings,
+    rewrite_v1_sql_to_v2,
 )
 
 
@@ -51,6 +52,10 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
             # JSON compatibility rewrite inside argMax would produce invalid
             # SQL, so this complete statement appends v2 settings itself.
             "build_span_attributes_query",
+            # Candidate classifiers can contain point-scoped FINAL subqueries
+            # over mutable span/eval/annotation state. They disable FINAL skip
+            # indexes explicitly below so an older value cannot be resurrected.
+            "build_latest_filter_match_query",
         }
     )
 
@@ -65,10 +70,47 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
     # superset seed; the view performs full-window scalar latest-state checks.
     ROOT_SEED_PARENT_PREDICATE = "parent_span_id = ''"
 
+    # A trace can contain millions of spans. Keep the aggregate state and wire
+    # payload bounded; the query separately returns the canonical root bundle,
+    # so truncation can fail explicitly without losing final_status/root attrs.
+    ATTRIBUTE_ROWS_PER_TRACE = 128
+
+    def build_latest_filter_match_query(
+        self,
+        candidate_trace_ids: list[str],
+        *,
+        filters: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Rewrite a bounded classifier without mutable FINAL skip indexes."""
+
+        query, params = super().build_latest_filter_match_query(
+            candidate_trace_ids,
+            filters=filters,
+        )
+        if not query:
+            return query, params
+        query = _append_v2_settings(rewrite_v1_sql_to_v2(query))
+        return (
+            query.replace(
+                "use_skip_indexes_if_final = 1",
+                "use_skip_indexes_if_final = 0",
+            ),
+            params,
+        )
+
     def build_span_attributes_query(
         self, trace_ids: list[str]
     ) -> tuple[str, dict[str, Any]]:
-        """Read latest attributes for only the visible trace page, sans ``FINAL``."""
+        """Read bounded latest attributes for the visible page per trace.
+
+        Returning one row per live span made a single 25-trace page exceed the
+        endpoint's 2,000-result-row guard. An unbounded ``groupArray`` moved the
+        same whale into one enormous row, retaining every Map in aggregate
+        memory and on the wire. Cap the array, report the exact contributing
+        row count, and return the newest live root bundle independently. The
+        view uses all rows only when the count proves no truncation; otherwise
+        it marks enrichment degraded and exposes only exact root attributes.
+        """
 
         bounded_ids = [str(trace_id) for trace_id in trace_ids if trace_id]
         if not bounded_ids:
@@ -81,14 +123,46 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
         query = f"""
         SELECT
             grouped_trace_id AS trace_id,
-            latest_attributes_extra AS attributes_extra,
-            latest_attrs_string AS attrs_string,
-            latest_attrs_number AS attrs_number,
-            latest_attrs_bool AS attrs_bool
+            argMaxIf(
+                tuple(
+                    latest_attributes_extra,
+                    latest_attrs_string,
+                    latest_attrs_number,
+                    latest_attrs_bool
+                ),
+                tuple(latest_start_time, grouped_id),
+                latest_parent_span_id = ''
+            ) AS root_attribute_row,
+            countIf(latest_parent_span_id = '') AS root_attribute_count,
+            groupArrayIf({self.ATTRIBUTE_ROWS_PER_TRACE})(tuple(
+                latest_attributes_extra,
+                latest_attrs_string,
+                latest_attrs_number,
+                latest_attrs_bool
+            ),
+                latest_parent_span_id != ''
+                AND (
+                    latest_attributes_extra != '{{}}'
+                    OR notEmpty(latest_attrs_string)
+                    OR notEmpty(latest_attrs_number)
+                    OR notEmpty(latest_attrs_bool)
+                )
+            ) AS attribute_rows,
+            countIf(
+                latest_parent_span_id != ''
+                AND (
+                    latest_attributes_extra != '{{}}'
+                    OR notEmpty(latest_attrs_string)
+                    OR notEmpty(latest_attrs_number)
+                    OR notEmpty(latest_attrs_bool)
+                )
+            ) AS attribute_row_count
         FROM (
             SELECT
                 trace_id AS grouped_trace_id,
                 id AS grouped_id,
+                argMax(parent_span_id, _version) AS latest_parent_span_id,
+                argMax(start_time, _version) AS latest_start_time,
                 argMax(toJSONString(attributes_extra), _version)
                     AS latest_attributes_extra,
                 argMax(attrs_string, _version) AS latest_attrs_string,
@@ -102,12 +176,7 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
             GROUP BY trace_id, id
         )
         WHERE latest_is_deleted = 0
-          AND (
-              latest_attributes_extra != '{{}}'
-              OR notEmpty(latest_attrs_string)
-              OR notEmpty(latest_attrs_number)
-              OR notEmpty(latest_attrs_bool)
-          )
+        GROUP BY grouped_trace_id
         """
         return _append_v2_settings(query), params
 

@@ -1063,6 +1063,23 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return f"%{escaped}%"
 
+    @staticmethod
+    def _can_use_ascii_attr_ngram_companion(search):
+        """Whether the ASCII value-index predicate is Unicode-equivalent.
+
+        ``idx_attrs_str_ngram`` indexes ``lower(...)`` while the authoritative
+        predicate uses ``lowerUTF8(...)``.  The companion is therefore only a
+        safe necessary condition for an ASCII needle of at least one index
+        ngram whose characters cannot be introduced by Unicode lowercasing.
+        In ClickHouse's supported Unicode mapping, U+212A KELVIN SIGN lowers to
+        the ASCII ``k``; adding the companion for such a needle would reject a
+        real Unicode match.  U+0130 lowers to ``i`` plus a combining mark, so it
+        cannot produce a matching four-character ASCII substring containing
+        that ``i``.  Needles shorter than four characters cannot prune this
+        ngram index and do not justify the extra predicate.
+        """
+        return len(search) >= 4 and search.isascii() and "k" not in search.casefold()
+
     # Throw on budget overrun so callers can distinguish an unavailable,
     # incomplete suggestion query from a legitimate empty value set. The API
     # converts the exception to safe structured 200 metadata; raw ClickHouse
@@ -1570,13 +1587,14 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 if search:
                     attr_params["search_pattern"] = self._like_pattern(search)
                     attr_search_clause = (
-                        "AND attrs_string[%(attr_key)s] ILIKE %(search_pattern)s "
+                        "AND lowerUTF8(attrs_string[%(attr_key)s]) "
+                        "LIKE lowerUTF8(%(search_pattern)s) "
                     )
-                    if search.isascii():
-                        # Companion for idx_attrs_str_ngram (023): the ILIKE on
-                        # one map element does not engage the index. The index
-                        # uses ASCII-only lower(), so a Unicode search must skip
-                        # this companion or it can introduce false negatives.
+                    if self._can_use_ascii_attr_ngram_companion(search):
+                        # Companion for idx_attrs_str_ngram (023): the Unicode
+                        # predicate on one map element does not engage the index.
+                        # Only append the ASCII lower() condition when it is a
+                        # necessary condition of the authoritative predicate.
                         attr_params["search_pattern_lower"] = self._like_pattern(
                             search
                         ).lower()

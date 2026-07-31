@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from django.utils import timezone
 
+from tracer.constants.eval_tasks import MAX_BOUNDED_HISTORICAL_SPAN_TRACE_ROWS
 from tracer.models.eval_task import RowType, RunType
 from tracer.services.clickhouse.read_budget import (
     FUTURE_TAIL_PROBE_SETTINGS,
@@ -65,22 +66,29 @@ _EVAL_TASK_READ_SETTINGS = {
 # whole-window attempt and every fallback slice: splitting one unsafe query
 # must not accidentally turn it into an unbounded sequence of individually
 # bounded queries.
-_EVAL_TASK_TOTAL_READ_SECONDS = 10.0
+_EVAL_TASK_TOTAL_READ_SECONDS = 4.5
 _EVAL_TASK_COARSE_SLICE = timedelta(minutes=5)
-_EVAL_TASK_MAX_COARSE_SLICE = timedelta(days=1)
+_EVAL_TASK_MAX_COARSE_SLICE = timedelta(days=2)
 _EVAL_TASK_FINE_SLICE = timedelta(minutes=1)
 _EVAL_TASK_MAX_READ_ATTEMPTS = 128
 _EVAL_TASK_MAX_FUTURE_SKEW = timedelta(minutes=5)
-_EVAL_TASK_SLICE_PAGE_SIZE = 50
-_EVAL_TASK_TRACE_CANDIDATE_PAGE_SIZE = 50
+_EVAL_TASK_SLICE_PAGE_SIZE = 256
+_EVAL_TASK_TRACE_CANDIDATE_PAGE_SIZE = 256
+_EVAL_TASK_SPAN_CLASSIFIER_BATCH_SIZE = 48
+_EVAL_TASK_TRACE_CLASSIFIER_BATCH_SIZE = 48
+_EVAL_TASK_WHOLE_WINDOW_MAX = timedelta(hours=1)
 # Exact fallback resolution buffers ids until the whole requested set is
 # proven. Keep that safety property for ordinary task sizes without allowing a
-# valid million-row task to allocate multiple million-entry Python containers.
-# Larger tasks retain the established one-query streaming path.
-_EVAL_TASK_BUFFERED_ID_LIMIT = 100_000
+# valid task to allocate multiple million-entry Python containers.
+_EVAL_TASK_BUFFERED_ID_LIMIT = MAX_BOUNDED_HISTORICAL_SPAN_TRACE_ROWS
 _SAFE_READ_BUDGET_MESSAGE = (
     "Evaluation task row selection exceeded its read budget. "
     "Narrow the time range and retry."
+)
+_SAFE_ROW_LIMIT_MESSAGE = (
+    "Historical span and trace evaluation tasks support at most "
+    f"{MAX_BOUNDED_HISTORICAL_SPAN_TRACE_ROWS} rows. "
+    "Reduce the row limit and retry."
 )
 
 
@@ -93,6 +101,18 @@ def iter_desired_rows(
 ) -> Iterator[list[str]]:
     # Row limit applies to historical tasks only; continuous runs forever.
     limit = task.spans_limit if task.run_type == RunType.HISTORICAL else None
+    if (
+        task.run_type == RunType.HISTORICAL
+        and task.row_type in (RowType.SPANS, RowType.TRACES)
+        and limit is not None
+        and int(limit) > MAX_BOUNDED_HISTORICAL_SPAN_TRACE_ROWS
+    ):
+        # Do not silently fall back to the legacy whole-window stream.  Apart
+        # from exposing raw CH budget failures on large tenants, that path
+        # bypasses the exact sliced resolver's shared deadline and bounded
+        # latest-state classification.  Existing tasks created under the old
+        # million-row API contract fail before a reader/client is opened.
+        raise EvalTaskReadBudgetExceeded(_SAFE_ROW_LIMIT_MESSAGE)
     sampling_rate = task.sampling_rate if task.sampling_rate is not None else 100.0
 
     continuous_floor = _continuous_floor(task)
@@ -177,19 +197,22 @@ def _resolve_bounded_historical_span_ids(
 ) -> list[str]:
     """Resolve an exact bounded historical span/trace set without a wide scan.
 
-    Both the whole-window fast path and fallback use the same canonical
+    The short-window fast path and bounded resolver use the same canonical
     ``(start minute DESC, id ASC)`` order. This makes the selected ids
-    independent of whether the first query happens to finish under load.
-    If the whole-window query hits a CH read limit (or duplicate versions fill
-    its candidate margin), scan adjacent five-minute candidate windows
-    newest-to-oldest. A window that reaches its bounded sentinel is refined
-    into one-minute keyset pages; a sparse window is classified in one batch.
+    independent of which path executes. Multi-hour tasks skip the speculative
+    whole-window query: on a large tenant that query is known to exceed the
+    256 MiB / 1 GiB read guards before producing a row. Adjacent five-minute
+    candidate windows run newest-to-oldest; a saturated window is refined into
+    one-minute keyset pages and sparse windows widen geometrically.
 
-    Attribute predicates are never applied independently to fallback windows.
-    The fallback first discovers unfiltered ids, marks them seen, and then
-    classifies their latest state against the original full task window. This
-    prevents an older matching span/root from resurfacing after a newer
-    tombstone, key clear, or non-matching version in another window.
+    Supported scalar predicates are applied as exact latest-state filters in
+    each candidate window, avoiding hundreds of unrelated ids for a rare
+    value. Each candidate is marked seen, then a skinny ID/time probe checks
+    for physical history outside that locally classified window. Direct-write
+    candidates with no outside history are already exact; only cross-slice ids
+    need full-window classification. This still prevents an older match from
+    resurfacing after a newer tombstone, key clear, or non-match, while keeping
+    ordinary point reads below the table's 64 MiB-granule envelope.
 
     If the shared deadline expires before either the requested cap is filled or
     the full time window is exhausted, raise a safe explicit failure. Returning
@@ -209,34 +232,12 @@ def _resolve_bounded_historical_span_ids(
         if read_attempts > _EVAL_TASK_MAX_READ_ATTEMPTS:
             raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
 
-    try:
-        reserve_read_attempt()
-        whole_window_prefix, whole_window_raw_count = _collect_unique_query_ids(
-            reader,
-            sql,
-            params,
-            batch_size=batch_size,
-            settings=_read_settings_before(deadline),
-            max_unique=limit,
-        )
-    except Exception as exc:
-        if not is_read_budget_error(exc):
-            raise
-    else:
-        candidate_limit = int(
-            params.get("lim")
-            or params.get("id_limit")
-            or params.get("latest_root_limit")
-            or params.get("latest_span_limit")
-            or 0
-        )
-        # Reaching the requested unique-id cap proves the canonical prefix.
-        # Duplicate-margin exhaustion matters only when it did not.
-        if len(whole_window_prefix) >= limit:
-            return whole_window_prefix
-        # A short bounded result proves CH exhausted the whole filtered window.
-        if candidate_limit and whole_window_raw_count < candidate_limit:
-            return whole_window_prefix
+    start_date = params.get("start_date")
+    end_date = params.get("end_date")
+    if not isinstance(start_date, datetime) or not isinstance(end_date, datetime):
+        raise ValueError("Historical span query did not bind a valid time window")
+    if start_date >= end_date:
+        return []
 
     # Trace identity is always rooted in the newest canonical root, and trace
     # filters may intentionally match a child far away from that root. Span
@@ -245,6 +246,44 @@ def _resolve_bounded_historical_span_ids(
     point_verify_candidates = row_type == RowType.TRACES or (
         row_type == RowType.SPANS and _span_candidate_verification_is_supported(filters)
     )
+
+    # The one-statement path is valuable for a genuinely small interval. For a
+    # multi-hour production task, however, the same query is guaranteed to
+    # consume most of the selector budget before failing with Code 241/307.
+    # Route those requests directly to the bounded plan.
+    if (
+        end_date - start_date <= _EVAL_TASK_WHOLE_WINDOW_MAX
+        or not point_verify_candidates
+    ):
+        try:
+            reserve_read_attempt()
+            whole_window_prefix, whole_window_raw_count = _collect_unique_query_ids(
+                reader,
+                sql,
+                params,
+                batch_size=batch_size,
+                settings=_read_settings_before(deadline),
+                max_unique=limit,
+            )
+        except Exception as exc:
+            if not is_read_budget_error(exc):
+                raise
+        else:
+            candidate_limit = int(
+                params.get("lim")
+                or params.get("id_limit")
+                or params.get("latest_root_limit")
+                or params.get("latest_span_limit")
+                or 0
+            )
+            # Reaching the requested unique-id cap proves the canonical prefix.
+            # Duplicate-margin exhaustion matters only when it did not.
+            if len(whole_window_prefix) >= limit:
+                return whole_window_prefix
+            # A short bounded result proves CH exhausted the filtered window.
+            if candidate_limit and whole_window_raw_count < candidate_limit:
+                return whole_window_prefix
+
     if row_type == RowType.SPANS and not point_verify_candidates:
         # The whole-window builder remains available for every legacy/system
         # filter shape. If that exact statement exceeds its budget, do not
@@ -253,13 +292,6 @@ def _resolve_bounded_historical_span_ids(
         # resurface from another. Extend the point classifier before enabling a
         # fallback for additional shapes; until then this path fails closed.
         raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
-
-    start_date = params.get("start_date")
-    end_date = params.get("end_date")
-    if not isinstance(start_date, datetime) or not isinstance(end_date, datetime):
-        raise ValueError("Historical span query did not bind a valid time window")
-    if start_date >= end_date:
-        return []
 
     selected: list[str] = []
     seen: set[str] = set()
@@ -312,6 +344,7 @@ def _resolve_bounded_historical_span_ids(
                 project_id=project_id,
                 salt=salt,
                 sampling_rate=sampling_rate,
+                filters=filters,
                 start=page_start,
                 end=page_end,
                 after_id=after_id,
@@ -322,6 +355,7 @@ def _resolve_bounded_historical_span_ids(
                 project_id=project_id,
                 salt=salt,
                 sampling_rate=sampling_rate,
+                filters=filters,
                 start=page_start,
                 end=page_end,
                 after_id=after_id,
@@ -355,7 +389,12 @@ def _resolve_bounded_historical_span_ids(
         )
         return page_ids
 
-    def accept_candidates(candidate_ids: list[str]) -> bool:
+    def accept_candidates(
+        candidate_ids: list[str],
+        *,
+        candidate_start: datetime,
+        candidate_end: datetime,
+    ) -> bool:
         # Record every candidate before filtering. A later/older window must
         # never get a second chance to resurrect a rejected identity.
         novel_ids = [row_id for row_id in candidate_ids if row_id not in seen]
@@ -363,7 +402,59 @@ def _resolve_bounded_historical_span_ids(
         if not novel_ids:
             return False
 
-        if point_verify_candidates and row_type == RowType.TRACES:
+        locally_classified = row_type == RowType.SPANS or (
+            row_type == RowType.TRACES and _trace_seed_is_slice_complete(filters)
+        )
+        if point_verify_candidates and locally_classified:
+            if candidate_start <= start_date and candidate_end >= end_date:
+                cross_slice_ids: set[str] = set()
+            else:
+                cross_slice_ids = _find_cross_slice_candidates(
+                    reader,
+                    candidate_ids=novel_ids,
+                    project_id=project_id,
+                    row_type=row_type,
+                    request_start=start_date,
+                    request_end=end_date,
+                    slice_start=candidate_start,
+                    slice_end=candidate_end,
+                    batch_size=batch_size,
+                    deadline=deadline,
+                    reserve_read_attempt=reserve_read_attempt,
+                )
+            matching_ids = set(novel_ids) - cross_slice_ids
+            candidates_to_verify = [
+                row_id for row_id in novel_ids if row_id in cross_slice_ids
+            ]
+            if row_type == RowType.TRACES:
+                matching_ids.update(
+                    _verify_trace_candidates(
+                        reader,
+                        candidate_ids=candidates_to_verify,
+                        project_id=project_id,
+                        salt=salt,
+                        sampling_rate=sampling_rate,
+                        filters=filters,
+                        batch_size=batch_size,
+                        deadline=deadline,
+                        reserve_read_attempt=reserve_read_attempt,
+                    )
+                )
+            else:
+                matching_ids.update(
+                    _verify_span_candidates(
+                        reader,
+                        candidate_ids=candidates_to_verify,
+                        project_id=project_id,
+                        filters=filters,
+                        start_date=start_date,
+                        end_date=end_date,
+                        batch_size=batch_size,
+                        deadline=deadline,
+                        reserve_read_attempt=reserve_read_attempt,
+                    )
+                )
+        elif point_verify_candidates and row_type == RowType.TRACES:
             matching_ids = _verify_trace_candidates(
                 reader,
                 candidate_ids=novel_ids,
@@ -408,10 +499,14 @@ def _resolve_bounded_historical_span_ids(
         # is refined before any provisional ids are accepted.
         refine_window = not point_verify_candidates
         if point_verify_candidates:
-            candidate_cap = (
+            configured_cap = (
                 _EVAL_TASK_TRACE_CANDIDATE_PAGE_SIZE
                 if row_type == RowType.TRACES
                 else _EVAL_TASK_SLICE_PAGE_SIZE
+            )
+            candidate_cap = min(
+                configured_cap,
+                max(limit - len(selected), 1),
             )
             try:
                 coarse_ids = read_page(
@@ -422,12 +517,26 @@ def _resolve_bounded_historical_span_ids(
             except Exception as exc:
                 if not is_read_budget_error(exc):
                     raise
-                # A five-minute read can be dense even when its component
-                # minutes are safe. Refine it under the same shared deadline.
+                if coarse_width > _EVAL_TASK_COARSE_SLICE:
+                    # A geometrically widened sparse read crossed its budget.
+                    # Retry the same unread frontier at half-width; refining an
+                    # entire one/two-day interval into minute reads would turn
+                    # one timeout into thousands of statements.
+                    coarse_width = max(
+                        _EVAL_TASK_COARSE_SLICE,
+                        coarse_width / 2,
+                    )
+                    continue
+                # The minimum coarse read is dense; refine just these five
+                # minutes into bounded one-minute keysets.
                 refine_window = True
             else:
                 refine_window = len(coarse_ids) > candidate_cap
-                if not refine_window and accept_candidates(coarse_ids):
+                if not refine_window and accept_candidates(
+                    coarse_ids,
+                    candidate_start=coarse_start,
+                    candidate_end=coarse_end,
+                ):
                     return selected
 
         if refine_window:
@@ -436,17 +545,14 @@ def _resolve_bounded_historical_span_ids(
                 fine_start = max(coarse_start, fine_end - _EVAL_TASK_FINE_SLICE)
                 after_id: str | None = None
                 while len(selected) < limit:
-                    page_cap = (
-                        (
-                            _EVAL_TASK_TRACE_CANDIDATE_PAGE_SIZE
-                            if row_type == RowType.TRACES
-                            else _EVAL_TASK_SLICE_PAGE_SIZE
-                        )
-                        if point_verify_candidates
-                        else min(
-                            _EVAL_TASK_SLICE_PAGE_SIZE,
-                            limit - len(selected),
-                        )
+                    configured_page_cap = (
+                        _EVAL_TASK_TRACE_CANDIDATE_PAGE_SIZE
+                        if row_type == RowType.TRACES
+                        else _EVAL_TASK_SLICE_PAGE_SIZE
+                    )
+                    page_cap = min(
+                        configured_page_cap,
+                        max(limit - len(selected), 1),
                     )
                     try:
                         page_ids = read_page(
@@ -464,7 +570,11 @@ def _resolve_bounded_historical_span_ids(
 
                     if not page_ids:
                         break
-                    if accept_candidates(page_ids):
+                    if accept_candidates(
+                        page_ids,
+                        candidate_start=fine_start,
+                        candidate_end=fine_end,
+                    ):
                         return selected
                     if len(page_ids) < page_cap:
                         break
@@ -493,32 +603,121 @@ def _resolve_bounded_historical_span_ids(
 def _span_candidate_verification_is_supported(filters: dict | None) -> bool:
     """Whether a span fallback can use the scalar latest-state point probe.
 
-    The SOS path deliberately covers the task shape responsible for the live
-    failures: an optional time range plus arbitrary typed span attributes. A
-    legacy sibling constraint or physical-column filter keeps its established
-    sliced builder path rather than being silently approximated here.
+    Historical selectors may mix typed attributes, supported physical system
+    metrics, and their legacy identity/observation-type sibling constraints.
+    Every accepted shape is compiled by the same scalar plan used for both the
+    slice seed and full-window candidate verification.  Anything else remains
+    on the exact whole-window path and fails closed if that path exceeds budget.
     """
     from tracer.services.clickhouse.query_builders.latest_attributes import (
-        is_span_attribute_filter,
+        is_latest_span_probe_filter,
     )
 
+    try:
+        active_filters = _normalized_span_candidate_filters(filters)
+    except (TypeError, ValueError):
+        return False
+    return all(is_latest_span_probe_filter(item) for item in active_filters)
+
+
+def _normalized_span_candidate_filters(
+    filters: dict | None,
+) -> list[dict[str, Any]]:
+    """Return the exact UI-equivalent non-time filters for a span task.
+
+    ``_build_sample_query`` historically accepts a few task-level sibling
+    fields in addition to ``filters``.  The bounded path must carry those same
+    constraints; silently looking only at the nested list would select rows the
+    task did not request.
+    """
+
     task_filters = filters or {}
+    if not isinstance(task_filters, dict):
+        raise TypeError("task filters must be a mapping")
+    allowed_keys = {
+        "date_range",
+        "filters",
+        "span_id",
+        "trace_id",
+        "session_id",
+        "created_at",
+        "observation_type",
+    }
+    empty_values = (None, "", [], (), {}, set())
     for key, value in task_filters.items():
-        if key not in {"date_range", "filters"} and value not in (
-            None,
-            "",
-            [],
-            (),
-            {},
-        ):
-            return False
-    active_filters = [
-        item
-        for item in task_filters.get("filters") or []
-        if (item.get("column_id") or item.get("columnId"))
-        not in {"created_at", "start_time"}
+        if key not in allowed_keys and value not in empty_values:
+            raise ValueError("unsupported bounded span task filter shape")
+
+    raw_nested = task_filters.get("filters") or []
+    if not isinstance(raw_nested, list | tuple):
+        raise TypeError("nested task filters must be a list")
+    active: list[dict[str, Any]] = []
+    for item in raw_nested:
+        if not isinstance(item, dict):
+            raise TypeError("task filter items must be mappings")
+        if (item.get("column_id") or item.get("columnId")) in {
+            "created_at",
+            "start_time",
+        }:
+            continue
+        active.append(item)
+
+    for task_key, column_id in (
+        ("span_id", "span_id"),
+        ("trace_id", "trace_id"),
+        ("session_id", "session_id"),
+    ):
+        raw_values = task_filters.get(task_key)
+        if raw_values is None:
+            continue
+        values = (
+            [str(value) for value in raw_values if value not in (None, "")]
+            if isinstance(raw_values, list | tuple | set)
+            else [str(raw_values)]
+        )
+        if values:
+            active.append(
+                {
+                    "column_id": column_id,
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "in",
+                        "filter_value": values,
+                    },
+                }
+            )
+
+    raw_observation_types = task_filters.get("observation_type")
+    observation_types = (
+        [str(value) for value in raw_observation_types if value not in (None, "")]
+        if isinstance(raw_observation_types, list | tuple | set)
+        else ([str(raw_observation_types)] if raw_observation_types else [])
+    )
+    if observation_types:
+        active.append(
+            {
+                "column_id": "observation_type",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": observation_types,
+                },
+            }
+        )
+    return active
+
+
+def _build_span_scalar_plans(filters: dict | None):
+    from tracer.services.clickhouse.query_builders.latest_attributes import (
+        build_latest_span_probe_predicate,
+    )
+
+    return [
+        build_latest_span_probe_predicate(item, index=index)
+        for index, item in enumerate(_normalized_span_candidate_filters(filters))
     ]
-    return all(is_span_attribute_filter(item) for item in active_filters)
 
 
 def _build_span_candidate_seed_query(
@@ -526,39 +725,80 @@ def _build_span_candidate_seed_query(
     project_id: str,
     salt: str,
     sampling_rate: float,
+    filters: dict,
     start: datetime,
     end: datetime,
     after_id: str | None,
     limit: int,
 ) -> tuple[str, dict[str, Any]]:
-    """Page live span IDs without applying the task's attribute predicates."""
-    from tracer.services.clickhouse.v2.dispatch import get_v2_class
+    """Page exact slice-local scalar matches for bounded verification.
+
+    Pushing the saved attribute predicate into a bounded slice avoids feeding
+    dozens of unrelated ids to the expensive full-window classifier. Callers
+    mark every returned id seen and probe for history outside the slice; only
+    those mutable ids require original-window reclassification.
+    """
+    from tracer.services.clickhouse.v2.query_builders.filters import (
+        _append_v2_settings,
+        rewrite_v1_sql_to_v2,
+    )
 
     if limit <= 0:
         raise ValueError("Span candidate limit must be greater than zero")
     if not 0 <= sampling_rate <= 100:
         raise ValueError("sampling_rate must be between 0 and 100")
 
-    time_filter = {
-        "column_id": "start_time",
-        "filter_config": {
-            "col_type": "SYSTEM_METRIC",
-            "filter_type": "datetime",
-            "filter_op": "between",
-            "filter_value": [start, end],
-        },
+    plans = _build_span_scalar_plans(filters)
+    params: dict[str, Any] = {
+        "latest_span_project_id": str(project_id),
+        "latest_span_slice_start": start,
+        "latest_span_slice_end": end,
+        "latest_span_limit": int(limit),
+        "latest_span_sampling_salt": str(salt),
+        "latest_span_sampling_rate": float(sampling_rate),
     }
-    builder = get_v2_class("SPAN_LIST")(
-        project_id=str(project_id),
-        filters=[time_filter],
+    for plan in plans:
+        params.update(plan.params)
+    aggregate_fragment = "".join(
+        f",\n                {aggregate}"
+        for plan in plans
+        for aggregate in plan.aggregates
     )
-    return builder.build_latest_attribute_id_page(
-        slice_start=start,
-        slice_end=end,
-        limit=int(limit),
-        sampling_salt=str(salt),
-        sampling_rate=float(sampling_rate),
-        after_span_id=after_id,
+    predicate_fragment = "".join(f"\n      AND {plan.predicate}" for plan in plans)
+    keyset_fragment = ""
+    if after_id is not None:
+        if end - start > _EVAL_TASK_FINE_SLICE:
+            raise ValueError("span-id keyset requires a one-minute slice")
+        params["latest_span_after_id"] = str(after_id)
+        keyset_fragment = "\n      AND grouped_id > %(latest_span_after_id)s"
+    query = f"""
+    SELECT
+        grouped_id AS id,
+        latest_start_time AS eval_order_start_time
+    FROM (
+        SELECT
+            id AS grouped_id,
+            argMax(tuple(start_time), _peerdb_version).1 AS latest_start_time,
+            argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
+            {aggregate_fragment}
+        FROM spans
+        PREWHERE project_id = %(latest_span_project_id)s
+          AND start_time >= %(latest_span_slice_start)s
+          AND start_time < %(latest_span_slice_end)s
+        GROUP BY id
+    )
+    WHERE latest_is_deleted = 0
+      {predicate_fragment}
+      AND modulo(
+          cityHash64(%(latest_span_sampling_salt)s, toString(grouped_id)), 100
+      ) < %(latest_span_sampling_rate)s
+      {keyset_fragment}
+    ORDER BY toStartOfMinute(latest_start_time) DESC, grouped_id ASC
+    LIMIT %(latest_span_limit)s
+    """
+    return (
+        _append_v2_settings(rewrite_v1_sql_to_v2(query)),
+        params,
     )
 
 
@@ -571,10 +811,6 @@ def _build_span_candidate_match_query(
     end_date: datetime,
 ) -> tuple[str, dict[str, Any]]:
     """Classify point-scoped spans at latest state over the task window."""
-    from tracer.services.clickhouse.query_builders.latest_attributes import (
-        build_latest_attribute_predicate,
-        is_span_attribute_filter,
-    )
     from tracer.services.clickhouse.v2.query_builders.filters import (
         _append_v2_settings,
         rewrite_v1_sql_to_v2,
@@ -583,19 +819,7 @@ def _build_span_candidate_match_query(
     normalized_ids = [str(span_id) for span_id in candidate_ids if span_id]
     if not normalized_ids:
         return "", {}
-    active_filters = [
-        item
-        for item in (filters or {}).get("filters") or []
-        if (item.get("column_id") or item.get("columnId"))
-        not in {"created_at", "start_time"}
-    ]
-    if not all(is_span_attribute_filter(item) for item in active_filters):
-        raise ValueError("unsupported latest-state span probe filter")
-
-    plans = [
-        build_latest_attribute_predicate(item, index=index)
-        for index, item in enumerate(active_filters)
-    ]
+    plans = _build_span_scalar_plans(filters)
     params: dict[str, Any] = {
         "candidate_project_id": str(project_id),
         "candidate_span_ids": tuple(normalized_ids),
@@ -648,6 +872,34 @@ def _verify_span_candidates(
     if not candidate_ids:
         return set()
 
+    # CH25's span table uses 64 MiB index granules. Keep each point classifier
+    # below a finite 512 MiB / 2 GiB envelope and split *before* issuing it;
+    # recursive splitting only after a guaranteed Code 241/307 wastes both
+    # time and read attempts.
+    if len(candidate_ids) > _EVAL_TASK_SPAN_CLASSIFIER_BATCH_SIZE:
+        matching: set[str] = set()
+        for offset in range(
+            0,
+            len(candidate_ids),
+            _EVAL_TASK_SPAN_CLASSIFIER_BATCH_SIZE,
+        ):
+            matching.update(
+                _verify_span_candidates(
+                    reader,
+                    candidate_ids=candidate_ids[
+                        offset : offset + _EVAL_TASK_SPAN_CLASSIFIER_BATCH_SIZE
+                    ],
+                    project_id=project_id,
+                    filters=filters,
+                    start_date=start_date,
+                    end_date=end_date,
+                    batch_size=batch_size,
+                    deadline=deadline,
+                    reserve_read_attempt=reserve_read_attempt,
+                )
+            )
+        return matching
+
     probe_sql, probe_params = _build_span_candidate_match_query(
         candidate_ids=candidate_ids,
         project_id=project_id,
@@ -666,6 +918,7 @@ def _verify_span_candidates(
             settings=_bounded_result_settings(
                 deadline,
                 max_result_rows=len(candidate_ids),
+                point_read=True,
             ),
             max_unique=len(candidate_ids),
         )
@@ -699,22 +952,169 @@ def _verify_span_candidates(
     return set(matching_ids)
 
 
+def _trace_seed_is_slice_complete(filters: dict | None) -> bool:
+    """Whether the trace seed evaluated every saved predicate on its root."""
+    from tracer.services.clickhouse.query_builders.latest_attributes import (
+        is_latest_trace_root_probe_filter,
+    )
+
+    active_filters = [
+        item
+        for item in (filters or {}).get("filters") or []
+        if (item.get("column_id") or item.get("columnId"))
+        not in {"created_at", "start_time"}
+    ]
+    return all(is_latest_trace_root_probe_filter(item) for item in active_filters)
+
+
+def _build_cross_slice_candidate_query(
+    *,
+    candidate_ids: list[str],
+    project_id: str,
+    row_type: str,
+    request_start: datetime,
+    request_end: datetime,
+    slice_start: datetime,
+    slice_end: datetime,
+) -> tuple[str, dict[str, Any]]:
+    """Find candidates whose physical history escapes the classified slice.
+
+    The slice seed already performed latest-state/tombstone/filter resolution
+    inside its interval. If an id has no physical row elsewhere in the request
+    window, that local result is also the exact full-window result and no
+    expensive Map classifier is needed. For traces this deliberately probes
+    every row, not only roots: a newer physical version can turn a former root
+    into a child, so finding any outside row must force full-window resolution.
+    """
+    from tracer.services.clickhouse.v2.query_builders.filters import (
+        _append_v2_settings,
+        rewrite_v1_sql_to_v2,
+    )
+
+    normalized_ids = list(dict.fromkeys(str(value) for value in candidate_ids if value))
+    if not normalized_ids:
+        return "", {}
+    if row_type == RowType.SPANS:
+        identity_column = "id"
+        candidate_param = "cross_slice_span_ids"
+    elif row_type == RowType.TRACES:
+        identity_column = "trace_id"
+        candidate_param = "cross_slice_trace_ids"
+    else:  # pragma: no cover - callers are statically limited above
+        raise ValueError("cross-slice probe supports only spans and traces")
+
+    params: dict[str, Any] = {
+        "cross_slice_project_id": str(project_id),
+        candidate_param: tuple(normalized_ids),
+        "cross_slice_request_start": request_start,
+        "cross_slice_request_end": request_end,
+        "cross_slice_start": slice_start,
+        "cross_slice_end": slice_end,
+        "cross_slice_limit": len(normalized_ids),
+    }
+    query = f"""
+    SELECT DISTINCT {identity_column}
+    FROM spans
+    PREWHERE project_id = %(cross_slice_project_id)s
+      AND {identity_column} IN %({candidate_param})s
+      AND start_time >= %(cross_slice_request_start)s
+      AND start_time < %(cross_slice_request_end)s
+    WHERE start_time < %(cross_slice_start)s
+       OR start_time >= %(cross_slice_end)s
+    LIMIT %(cross_slice_limit)s
+    """
+    return _append_v2_settings(rewrite_v1_sql_to_v2(query)), params
+
+
+def _find_cross_slice_candidates(
+    reader,
+    *,
+    candidate_ids: list[str],
+    project_id: str,
+    row_type: str,
+    request_start: datetime,
+    request_end: datetime,
+    slice_start: datetime,
+    slice_end: datetime,
+    batch_size: int,
+    deadline: float,
+    reserve_read_attempt: Callable[[], None] | None = None,
+) -> set[str]:
+    """Return ids that still require a full-window latest-state classifier."""
+    if not candidate_ids:
+        return set()
+    query, params = _build_cross_slice_candidate_query(
+        candidate_ids=candidate_ids,
+        project_id=project_id,
+        row_type=row_type,
+        request_start=request_start,
+        request_end=request_end,
+        slice_start=slice_start,
+        slice_end=slice_end,
+    )
+    try:
+        if reserve_read_attempt is not None:
+            reserve_read_attempt()
+        cross_ids, _ = _collect_unique_query_ids(
+            reader,
+            query,
+            params,
+            batch_size=batch_size,
+            settings=_bounded_result_settings(
+                deadline,
+                max_result_rows=len(candidate_ids),
+                point_read=True,
+            ),
+            max_unique=len(candidate_ids),
+        )
+    except Exception as exc:
+        if not is_read_budget_error(exc):
+            raise
+        if len(candidate_ids) > 1:
+            midpoint = len(candidate_ids) // 2
+            common = {
+                "reader": reader,
+                "project_id": project_id,
+                "row_type": row_type,
+                "request_start": request_start,
+                "request_end": request_end,
+                "slice_start": slice_start,
+                "slice_end": slice_end,
+                "batch_size": batch_size,
+                "deadline": deadline,
+                "reserve_read_attempt": reserve_read_attempt,
+            }
+            return _find_cross_slice_candidates(
+                candidate_ids=candidate_ids[:midpoint],
+                **common,
+            ) | _find_cross_slice_candidates(
+                candidate_ids=candidate_ids[midpoint:],
+                **common,
+            )
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
+    return set(cross_ids).intersection(candidate_ids)
+
+
 def _build_trace_candidate_seed_query(
     *,
     project_id: str,
     salt: str,
     sampling_rate: float,
+    filters: dict,
     start: datetime,
     end: datetime,
     after_id: str | None,
     limit: int,
 ) -> tuple[str, dict[str, Any]]:
-    """Page current root trace IDs in one minute without user predicates.
+    """Page current root IDs, prefiltering only canonical-root predicates.
 
-    User predicates are intentionally deferred to
-    :func:`_verify_trace_candidates`, which evaluates them against the original
-    task window. Sampling is safe to push into this seed because it is a pure,
-    deterministic function of ``trace_id``.
+    A root-only predicate such as ``final_status`` can safely reduce the slice
+    candidate set; a skinny all-row history probe identifies candidate trace
+    identities that still need original-window classification. The probe must
+    include children because a newer version can change a former root into a
+    child. Any-span predicates remain deferred because a matching child can be
+    far from its root. Sampling is safe to push into either seed because it is
+    a pure deterministic function of ``trace_id``.
     """
     from tracer.services.clickhouse.v2.dispatch import get_v2_class
 
@@ -732,9 +1132,16 @@ def _build_trace_candidate_seed_query(
             "filter_value": [start, end],
         },
     }
+    active_filters = [
+        item
+        for item in (filters or {}).get("filters") or []
+        if (item.get("column_id") or item.get("columnId"))
+        not in {"created_at", "start_time"}
+    ]
+    seed_filters = active_filters if _trace_seed_is_slice_complete(filters) else []
     builder = get_v2_class("TRACE_LIST")(
         project_id=str(project_id),
-        filters=[time_filter],
+        filters=[*seed_filters, time_filter],
     )
     return builder.build_latest_root_id_page(
         slice_start=start,
@@ -767,6 +1174,34 @@ def _verify_trace_candidates(
     if not candidate_ids:
         return set()
 
+    # Proactively stay below a finite 512 MiB / 2 GiB point-read envelope. The
+    # former 50-id statement ran under only 256 MiB / 1 GiB, failed first, and
+    # then recursively retried, multiplying one selector into as many as 127
+    # reads. Forty-eight ids remains bounded without that failed first attempt.
+    if len(candidate_ids) > _EVAL_TASK_TRACE_CLASSIFIER_BATCH_SIZE:
+        matching: set[str] = set()
+        for offset in range(
+            0,
+            len(candidate_ids),
+            _EVAL_TASK_TRACE_CLASSIFIER_BATCH_SIZE,
+        ):
+            matching.update(
+                _verify_trace_candidates(
+                    reader,
+                    candidate_ids=candidate_ids[
+                        offset : offset + _EVAL_TASK_TRACE_CLASSIFIER_BATCH_SIZE
+                    ],
+                    project_id=project_id,
+                    salt=salt,
+                    sampling_rate=sampling_rate,
+                    filters=filters,
+                    batch_size=batch_size,
+                    deadline=deadline,
+                    reserve_read_attempt=reserve_read_attempt,
+                )
+            )
+        return matching
+
     probe_sql, probe_params = _build_sample_query(
         project_id=project_id,
         row_type=RowType.TRACES,
@@ -790,6 +1225,7 @@ def _verify_trace_candidates(
             settings=_bounded_result_settings(
                 deadline,
                 max_result_rows=len(candidate_ids),
+                point_read=True,
             ),
             max_unique=len(candidate_ids),
         )
@@ -877,9 +1313,21 @@ def _bounded_result_settings(
     deadline: float,
     *,
     max_result_rows: int,
+    point_read: bool = False,
 ) -> dict[str, Any]:
     """Clamp one read to both the shared deadline and its expected row cap."""
     settings = _read_settings_before(deadline)
+    if point_read:
+        # A point lookup may touch one 64 MiB granule per unrelated id. Keep
+        # the cap finite but large enough for the proactive <=48-id classifier
+        # batch that replaced the failing 50-id / 256 MiB attempt.
+        settings.update(
+            {
+                "max_memory_usage": 512 * 1024 * 1024,
+                "max_bytes_before_external_sort": 256 * 1024 * 1024,
+                "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
+            }
+        )
     settings["max_result_rows"] = max(int(max_result_rows), 1)
     settings["result_overflow_mode"] = "throw"
     settings["use_skip_indexes_if_final"] = 1
@@ -1281,6 +1729,13 @@ def _build_sample_query(
             scalar_start, scalar_end = continuous_span_builder.parse_time_range(
                 continuous_scalar_filters
             )
+            # Preserve the exact parse used for the requested slice. Calling
+            # ``parse_time_range`` again inside the builder advances a default
+            # ``now`` window by a few microseconds and can incorrectly reject
+            # its own slice as outside the request.
+            continuous_span_builder.params.update(
+                {"start_date": scalar_start, "end_date": scalar_end}
+            )
             return continuous_span_builder.build_latest_attribute_id_page(
                 slice_start=scalar_start,
                 slice_end=scalar_end,
@@ -1298,6 +1753,11 @@ def _build_sample_query(
     ):
         request_start, request_end = span_scalar_builder.parse_time_range(
             span_scalar_filters
+        )
+        # Reuse one parsed request window end-to-end. This matters for filters
+        # without an explicit date range, whose default end is ``now``.
+        span_scalar_builder.params.update(
+            {"start_date": request_start, "end_date": request_end}
         )
         scalar_start, scalar_end = time_window or (request_start, request_end)
         return span_scalar_builder.build_latest_attribute_id_page(

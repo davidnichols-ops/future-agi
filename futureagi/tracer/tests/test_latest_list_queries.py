@@ -8,7 +8,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from tracer.services.clickhouse.query_builders.filters import (
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.query_service import QueryResult
+from tracer.services.clickhouse.v2.query_builders.session_list import (
+    SessionListQueryBuilderV2,
+)
 from tracer.services.clickhouse.v2.query_builders.span_list import (
     SpanListQueryBuilderV2,
 )
@@ -115,7 +121,7 @@ def test_span_list_prefix_keeps_slice_aggregation_skinny_and_stable():
     assert params["limit"] == 50
 
 
-def test_span_candidate_seed_is_unfiltered_physical_and_keyset_stable():
+def test_span_candidate_seed_uses_safe_raw_prefilter_and_stable_keyset():
     builder = SpanListQueryBuilderV2(
         project_id="11111111-1111-1111-1111-111111111111",
         filters=[_time_filter(), _attr("final_status", "approved")],
@@ -136,6 +142,8 @@ def test_span_candidate_seed_is_unfiltered_physical_and_keyset_stable():
     assert "latest_is_deleted" not in sql
     assert "latest_attr_" not in sql
     assert "project_version_id" not in sql
+    assert "span_attr_str" in sql or "attrs_string" in sql
+    assert "final_status" in sql
     assert "SELECT\n            id,\n            start_time" in sql
     assert "start_time >= %(candidate_slice_start)s" in sql
     assert "start_time < %(candidate_slice_end)s" in sql
@@ -169,10 +177,95 @@ def test_span_candidate_classifier_uses_full_request_latest_state():
     assert "latest_attr_value_0" in sql
     assert "argMax(tuple(project_version_id), _version).1" in sql
     assert "latest_project_version_id = %(project_version_id)s" in sql
-    assert "ORDER BY latest_start_time DESC, grouped_id DESC" in sql
+    assert "ORDER BY start_time DESC, id DESC" in sql
     assert params["candidate_span_ids"] == ("span-a", "span-b")
     assert params["start_date"] == _START.replace(tzinfo=None)
     assert params["end_date"] == _END.replace(tzinfo=None)
+
+
+def test_span_candidate_classifier_combines_scalar_and_annotation_filters():
+    label_id = "33333333-3333-3333-3333-333333333333"
+    annotation_filter = {
+        "column_id": label_id,
+        "filter_config": {
+            "col_type": "ANNOTATION",
+            "filter_type": "text",
+            "filter_op": "equals",
+            "filter_value": "approved",
+        },
+    }
+    builder = SpanListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[_time_filter(), _attr("final_status", "approved"), annotation_filter],
+        annotation_label_ids=[label_id],
+    )
+
+    assert builder.supports_latest_attribute_page() is False
+    assert builder.supports_latest_candidate_page() is True
+
+    seed_sql, _ = builder.build_latest_attribute_candidate_seed_page(
+        slice_start=_START,
+        slice_end=_END,
+        limit=25,
+    )
+    match_sql, match_params = builder.build_latest_attribute_candidate_matches(
+        ["span-a", "span-b"]
+    )
+
+    assert "model_hub_score" not in seed_sql
+    assert "latest_attr_value_0" in match_sql
+    assert "FROM model_hub_score AS s FINAL" in match_sql
+    assert "candidate_span_ids" in match_sql
+    assert match_params["candidate_span_ids"] == ("span-a", "span-b")
+    assert "use_skip_indexes_if_final = 0" in match_sql
+    assert "use_skip_indexes_if_final = 1" not in match_sql
+
+
+def test_trace_candidate_classifier_combines_attribute_and_trace_tag():
+    tag_filter = {
+        "column_id": "tags",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "text",
+            "filter_op": "equals",
+            "filter_value": "production",
+        },
+    }
+    builder = TraceListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[_time_filter(), _attr("customer_tier", "enterprise"), tag_filter],
+    )
+
+    assert builder.supports_latest_filter_match() is True
+    sql, params = builder.build_latest_filter_match_query(["trace-a", "trace-b"])
+
+    assert "latest_attr_value_0" in sql
+    assert "dictGetOrDefault('trace_dict', 'tags'" in sql
+    assert "candidate_trace_ids" in sql
+    assert params["candidate_trace_ids"] == ("trace-a", "trace-b")
+    assert "use_skip_indexes_if_final = 0" in sql
+    assert "use_skip_indexes_if_final = 1" not in sql
+
+
+def test_trace_candidate_classifier_rejects_unsafe_unknown_metric():
+    builder = TraceListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[
+            _time_filter(),
+            {
+                "column_id": "unsafe') OR 1 = 1 --",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "x",
+                },
+            },
+        ],
+    )
+
+    with pytest.raises(UnsupportedFilterShapeError):
+        builder.build_latest_filter_match_query(["trace-a"])
 
 
 def test_span_point_content_hydrates_light_columns_for_only_page_ids():
@@ -311,6 +404,46 @@ def test_trace_root_candidate_seed_is_ch25_projection_compatible_and_keyset_stab
     assert params["root_seed_limit"] == 100
 
 
+def test_trace_filtered_root_seed_is_a_bounded_physical_superset():
+    builder = TraceListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[_time_filter(), _attr("final_status", "approved")],
+    )
+    slice_start = _END - timedelta(minutes=5)
+
+    sql, params = builder.build_filtered_root_candidate_seed_page(
+        slice_start=slice_start,
+        slice_end=_END,
+        limit=100,
+    )
+
+    assert "FINAL" not in sql
+    assert "argMax(" not in sql
+    assert "GROUP BY" not in sql
+    assert "parent_span_id = ''" in sql
+    assert "mapContains(attrs_string, 'final_status')" in sql
+    assert "start_time >= %(root_seed_slice_start)s" in sql
+    assert "start_time < %(root_seed_slice_end)s" in sql
+    assert "ORDER BY start_time DESC, trace_id DESC" in sql
+    assert params["root_seed_slice_start"] == slice_start.replace(tzinfo=None)
+    assert params["root_seed_slice_end"] == _END.replace(tzinfo=None)
+    assert params["root_seed_limit"] == 100
+
+
+def test_trace_filtered_root_seed_rejects_any_span_predicates():
+    builder = TraceListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[_time_filter(), _attr("arbitrary_child_attribute", "approved")],
+    )
+
+    with pytest.raises(ValueError, match="root-only"):
+        builder.build_filtered_root_candidate_seed_page(
+            slice_start=_END - timedelta(minutes=5),
+            slice_end=_END,
+            limit=100,
+        )
+
+
 def test_trace_matcher_keeps_root_and_any_span_semantics_separate():
     builder = TraceListQueryBuilderV2(
         project_id="11111111-1111-1111-1111-111111111111",
@@ -364,6 +497,8 @@ def test_trace_hydration_selects_canonical_latest_live_root():
     assert "latest_is_deleted = 0" in sql
     assert "LIMIT 1 BY grouped_trace_id" in sql
     assert "ORDER BY latest_start_time DESC" in sql
+    assert "latest_attrs_string AS attrs_string" in sql
+    assert "argMax(attrs_string, _version) AS latest_attrs_string" in sql
     assert params["candidate_start_date"] == _START.replace(tzinfo=None)
     assert params["candidate_end_date"] == _END.replace(tzinfo=None)
 
@@ -400,6 +535,10 @@ def test_trace_attribute_hydration_keeps_request_time_pruning():
 
     assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in sql
     assert "start_time < %(end_date)s + INTERVAL 1 DAY" in sql
+    assert "groupArrayIf(128)(tuple(" in sql
+    assert "AS root_attribute_row" in sql
+    assert "AS attribute_row_count" in sql
+    assert "GROUP BY grouped_trace_id" in sql
     assert params["start_date"] == _START.replace(tzinfo=None)
     assert params["end_date"] == _END.replace(tzinfo=None)
 
@@ -635,7 +774,11 @@ def test_span_bounded_executor_does_not_resurface_cross_slice_stale_match(
         for _, params in analytics.calls
         for span_id in params.get("candidate_span_ids", ())
     ]
-    assert all(classified_ids.count(span_id) == 1 for span_id in stale_ids)
+    # Every raw seed is classified locally. The three mutable ids then appear
+    # in the skinny cross-slice history probe and receive one additional exact
+    # full-window classification; the direct-write live id needs only local
+    # classification.
+    assert all(classified_ids.count(span_id) == 2 for span_id in stale_ids)
     assert classified_ids.count(live_id) == 1
     assert complete is True
     assert full_window is True
@@ -733,6 +876,281 @@ def test_trace_root_candidate_seed_real_ch_is_ordered_safe_superset(latest_query
 
 
 @pytest.mark.integration
+def test_trace_attribute_enrichment_is_bounded_to_one_result_row_per_trace(
+    latest_query_ch,
+):
+    """A >2k-span trace must stay below the endpoint result-row guard."""
+
+    client = latest_query_ch
+    project = uuid.uuid4()
+    trace_id = "large-trace"
+    when = _START + timedelta(hours=1)
+    rows = [
+        [
+            project,
+            trace_id,
+            f"large-span-{index}",
+            "" if index == 0 else "large-span-0",
+            "large-trace",
+            "span",
+            "llm",
+            "OK",
+            when + timedelta(microseconds=index),
+            when + timedelta(microseconds=index),
+            when + timedelta(microseconds=index),
+            None,
+            None,
+            {"attribute": f"value-{index}"},
+            {},
+            {},
+            0,
+            1,
+        ]
+        for index in range(2001)
+    ]
+    _insert(client, rows)
+    builder = TraceListQueryBuilderV2(
+        project_id=str(project),
+        filters=[_time_filter()],
+    )
+    builder.build()
+    sql, params = builder.build_span_attributes_query([trace_id])
+
+    result = client.query(
+        sql,
+        parameters=params,
+        settings={
+            "max_result_rows": 2000,
+            "result_overflow_mode": "throw",
+        },
+    )
+
+    assert len(result.result_rows) == 1
+    root_attribute_row = result.result_rows[0][1]
+    root_attribute_count = result.result_rows[0][2]
+    attribute_rows = result.result_rows[0][3]
+    attribute_row_count = result.result_rows[0][4]
+    assert root_attribute_count == 1
+    assert root_attribute_row[1] == {"attribute": "value-0"}
+    assert len(attribute_rows) == 128
+    assert attribute_row_count == 2000
+
+
+@pytest.mark.integration
+def test_session_candidate_final_is_exact_with_stopped_merges(latest_query_ch):
+    """Candidate preview dedups updates/key-clears/tombstones before filtering."""
+
+    client = latest_query_ch
+    table = f"session_candidate_spans_{uuid.uuid4().hex[:8]}"
+    client.command(
+        f"""
+        CREATE TABLE {table} (
+            project_id UUID,
+            trace_id String,
+            id String,
+            parent_span_id String DEFAULT '',
+            start_time DateTime64(6, 'UTC'),
+            end_time Nullable(DateTime64(6, 'UTC')),
+            cost Float64 DEFAULT 0,
+            total_tokens Int32 DEFAULT 0,
+            trace_session_id Nullable(UUID),
+            created_at DateTime64(6, 'UTC'),
+            attrs_string Map(String, String),
+            attrs_number Map(String, Float64),
+            attrs_bool Map(String, UInt8),
+            is_deleted UInt8 DEFAULT 0,
+            _version UInt64
+        ) ENGINE = ReplacingMergeTree(_version, is_deleted)
+        PARTITION BY toDate(start_time)
+        ORDER BY (project_id, toStartOfHour(start_time), trace_id, id)
+        """
+    )
+    client.command(
+        """
+        CREATE TABLE IF NOT EXISTS trace_session_id_remap (
+            old_id UUID,
+            new_id UUID,
+            version DateTime64(6, 'UTC') DEFAULT now64(6, 'UTC')
+        ) ENGINE = ReplacingMergeTree(version)
+        ORDER BY old_id
+        """
+    )
+    # Every version stays in a separate part. FINAL must be what makes the
+    # result exact; a background merge cannot accidentally make the test pass.
+    client.command(f"SYSTEM STOP MERGES {table}")
+
+    project = uuid.uuid4()
+    old_session = uuid.uuid4()
+    new_session = uuid.uuid4()
+    client.insert(
+        "trace_session_id_remap",
+        [[old_session, new_session]],
+        column_names=["old_id", "new_id"],
+    )
+    columns = [
+        "project_id",
+        "trace_id",
+        "id",
+        "parent_span_id",
+        "start_time",
+        "end_time",
+        "cost",
+        "total_tokens",
+        "trace_session_id",
+        "created_at",
+        "attrs_string",
+        "attrs_number",
+        "attrs_bool",
+        "is_deleted",
+        "_version",
+    ]
+    base_time = _START + timedelta(minutes=20)
+
+    def row(
+        trace_id,
+        *,
+        session_id=old_session,
+        attrs=None,
+        cost=0,
+        tokens=0,
+        deleted=0,
+        version=1,
+        offset=0,
+    ):
+        when = base_time + timedelta(seconds=offset)
+        return [
+            project,
+            trace_id,
+            f"root-{trace_id}",
+            "",
+            when,
+            when + timedelta(seconds=1),
+            cost,
+            tokens,
+            session_id,
+            when,
+            attrs or {},
+            {},
+            {},
+            deleted,
+            version,
+        ]
+
+    # Separate inserts create distinct parts while merges are stopped.
+    client.insert(
+        table,
+        [
+            row("updated", attrs={"final_status": "Rechazado"}, cost=100, tokens=100),
+            row(
+                "cleared",
+                attrs={"final_status": "Rechazado"},
+                cost=10,
+                tokens=10,
+                offset=1,
+            ),
+            row(
+                "changed",
+                attrs={"final_status": "Rechazado"},
+                cost=20,
+                tokens=20,
+                offset=2,
+            ),
+            row(
+                "deleted",
+                attrs={"final_status": "Rechazado"},
+                cost=30,
+                tokens=30,
+                offset=3,
+            ),
+            row(
+                "new-alias",
+                session_id=new_session,
+                attrs={"final_status": "Rechazado"},
+                cost=3,
+                tokens=4,
+                offset=4,
+            ),
+            row(
+                "moved-alias",
+                attrs={"final_status": "Rechazado"},
+                cost=40,
+                tokens=40,
+                offset=5,
+            ),
+        ],
+        column_names=columns,
+    )
+    client.insert(
+        table,
+        [
+            row(
+                "updated",
+                attrs={"final_status": "Rechazado"},
+                cost=1,
+                tokens=2,
+                version=2,
+            ),
+            row("cleared", attrs={}, cost=99, tokens=99, version=2, offset=1),
+            row(
+                "changed",
+                attrs={"final_status": "Aceptado"},
+                cost=99,
+                tokens=99,
+                version=2,
+                offset=2,
+            ),
+            row(
+                "deleted",
+                attrs={"final_status": "Rechazado"},
+                cost=30,
+                tokens=30,
+                deleted=1,
+                version=2,
+                offset=3,
+            ),
+            row(
+                "moved-alias",
+                session_id=new_session,
+                attrs={"final_status": "Rechazado"},
+                cost=5,
+                tokens=6,
+                version=2,
+                offset=5,
+            ),
+        ],
+        column_names=columns,
+    )
+
+    CandidateBuilder = type(
+        "CandidateSessionListQueryBuilderV2",
+        (SessionListQueryBuilderV2,),
+        {"TABLE": table},
+    )
+    builder = CandidateBuilder(
+        project_id=str(project),
+        filters=[_time_filter(), _attr("final_status", "Rechazado")],
+        page_number=0,
+        page_size=10,
+        candidate_session_ids=[str(old_session), str(new_session)],
+    )
+    sql, params = builder.build()
+
+    raw_count = client.query(f"SELECT count() FROM {table}").result_rows[0][0]
+    final_count = client.query(f"SELECT count() FROM {table} FINAL").result_rows[0][0]
+    rows = _query(client, sql, params)
+
+    assert raw_count == 11
+    assert final_count == 5
+    assert "use_skip_indexes_if_final = 0" in sql
+    assert "is_deleted = 0" not in sql
+    assert len(rows) == 1
+    assert str(rows[0]["session_id"]) == str(old_session)
+    assert rows[0]["total_cost"] == pytest.approx(9.0)
+    assert rows[0]["total_tokens"] == 12
+    assert rows[0]["traces_count"] == 3
+
+
+@pytest.mark.integration
 def test_latest_list_queries_real_ch_semantics(latest_query_ch):
     client = latest_query_ch
     project = uuid.uuid4()
@@ -800,6 +1218,57 @@ def test_latest_list_queries_real_ch_semantics(latest_query_ch):
                 root_new,
                 {"final_status": "approved"},
                 name="new",
+            ),
+            # The filtered physical root seed may retain these historical
+            # matches. Full-window classification must reject all three.
+            row(
+                project,
+                "root-status-change",
+                "root-status-change",
+                root_old,
+                {"final_status": "approved"},
+                version=1,
+            ),
+            row(
+                project,
+                "root-status-change",
+                "root-status-change",
+                root_old,
+                {"final_status": "rejected"},
+                version=2,
+            ),
+            row(
+                project,
+                "root-status-cleared",
+                "root-status-cleared",
+                root_old,
+                {"final_status": "approved"},
+                version=1,
+            ),
+            row(
+                project,
+                "root-status-cleared",
+                "root-status-cleared",
+                root_old,
+                {},
+                version=2,
+            ),
+            row(
+                project,
+                "root-status-deleted",
+                "root-status-deleted",
+                root_old,
+                {"final_status": "approved"},
+                version=1,
+            ),
+            row(
+                project,
+                "root-status-deleted",
+                "root-status-deleted",
+                root_old,
+                {"final_status": "approved"},
+                deleted=1,
+                version=2,
             ),
             # Generic attributes may live on independent child spans.
             row(project, "generic", "generic-root", root_old, {}, name="generic-root"),
@@ -1017,6 +1486,32 @@ def test_latest_list_queries_real_ch_semantics(latest_query_ch):
         key=lambda row: (row["start_time"], row["trace_id"]),
         reverse=True,
     )
+    filtered_seed_sql, filtered_seed_params = (
+        approved_builder.build_filtered_root_candidate_seed_page(
+            slice_start=_START,
+            slice_end=_END,
+            limit=100,
+        )
+    )
+    filtered_seed_ids = {
+        row["trace_id"]
+        for row in _query(client, filtered_seed_sql, filtered_seed_params)
+    }
+    assert {
+        "multi-root",
+        "root-status-change",
+        "root-status-cleared",
+        "root-status-deleted",
+    }.issubset(filtered_seed_ids)
+    filtered_match_sql, filtered_match_params = (
+        approved_builder.build_latest_filter_match_query(
+            sorted(filtered_seed_ids),
+            filters=[_attr("final_status", "approved")],
+        )
+    )
+    assert _query(client, filtered_match_sql, filtered_match_params) == [
+        {"trace_id": "multi-root"}
+    ]
     stale_hydration_sql, stale_hydration_params = (
         approved_builder.build_candidate_hydration_query(["deleted"])
     )
@@ -1053,7 +1548,9 @@ def test_latest_list_queries_real_ch_semantics(latest_query_ch):
         slice_end=_END,
         limit=25,
     )
-    assert _query(client, rejected_id_sql, rejected_id_params) == []
+    assert {
+        row["trace_id"] for row in _query(client, rejected_id_sql, rejected_id_params)
+    } == {"root-status-change"}
 
     generic_builder = TraceListQueryBuilderV2(
         project_id=str(project),
@@ -1100,6 +1597,16 @@ def test_latest_list_queries_real_ch_semantics(latest_query_ch):
     assert len(hydrated) == 1
     assert hydrated[0]["span_name"] == "new"
     assert hydrated[0]["start_time"].replace(tzinfo=UTC) == root_new
+    assert hydrated[0]["attrs_string"]["final_status"] == "approved"
+
+    attr_sql, attr_params = approved_builder.build_span_attributes_query(["multi-root"])
+    attribute_rows = _query(client, attr_sql, attr_params)
+    assert len(attribute_rows) == 1
+    assert attribute_rows[0]["trace_id"] == "multi-root"
+    assert attribute_rows[0]["root_attribute_count"] == 2
+    assert attribute_rows[0]["root_attribute_row"][1] == {"final_status": "approved"}
+    assert attribute_rows[0]["attribute_rows"] == []
+    assert attribute_rows[0]["attribute_row_count"] == 0
 
 
 @pytest.mark.integration

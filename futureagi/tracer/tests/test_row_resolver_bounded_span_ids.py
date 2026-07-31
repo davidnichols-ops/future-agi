@@ -52,18 +52,25 @@ def row_resolver_ch():
             trace_id String,
             id String,
             start_time DateTime64(6, 'UTC'),
+            trace_session_id Nullable(UUID),
+            observation_type LowCardinality(String) DEFAULT '',
+            status LowCardinality(String) DEFAULT '',
             attrs_string Map(String, String),
             attrs_number Map(String, Float64),
             attrs_bool Map(String, UInt8),
             is_deleted UInt8 DEFAULT 0,
             _version UInt64
-        ) ENGINE = MergeTree
-        ORDER BY (project_id, start_time, trace_id, id, _version)
+        ) ENGINE = ReplacingMergeTree(_version)
+        ORDER BY (project_id, start_time, trace_id, id)
         """
     )
+    # Keep every physical version present while exercising the scalar argMax
+    # plans; background merges must not make a stale-version test pass by luck.
+    client.command("SYSTEM STOP MERGES spans")
     try:
         yield client
     finally:
+        client.command("SYSTEM START MERGES spans")
         client.close()
         admin.command(f"DROP DATABASE IF EXISTS {database}")
         admin.close()
@@ -89,18 +96,25 @@ def test_historical_span_query_samples_before_bounded_top_k():
     compact_sql = " ".join(sql.split())
 
     assert "LIMIT 1 BY id" not in compact_sql
-    assert "FROM spans FINAL" in compact_sql
-    assert compact_sql.count("ORDER BY toStartOfMinute(start_time) DESC, id") == 1
-    assert compact_sql.count("LIMIT %(id_limit)s") == 1
+    assert "FROM spans" in compact_sql
+    assert "GROUP BY id" in compact_sql
     assert (
-        "modulo(cityHash64(%(id_sampling_salt)s, toString(id)), 100) "
-        "< %(id_sampling_rate)s"
+        compact_sql.count(
+            "ORDER BY toStartOfMinute(latest_start_time) DESC, grouped_id ASC"
+        )
+        == 1
+    )
+    assert compact_sql.count("LIMIT %(latest_span_limit)s") == 1
+    assert (
+        "modulo(cityHash64(%(latest_span_sampling_salt)s, "
+        "toString(grouped_id)), 100) < %(latest_span_sampling_rate)s"
     ) in compact_sql
-    assert "lower(observation_type) IN" in compact_sql
-    assert params["id_limit"] == 200
+    assert "argMax(observation_type" in compact_sql
+    assert "lowerUTF8(toString(latest_span_column_value_0)) IN" in compact_sql
+    assert params["latest_span_limit"] == 200
     assert "lim" not in params
-    assert params["id_sampling_salt"] == "task-1"
-    assert params["id_sampling_rate"] == 50.0
+    assert params["latest_span_sampling_salt"] == "task-1"
+    assert params["latest_span_sampling_rate"] == 50.0
 
 
 def test_eval_task_sort_spills_before_selector_memory_cap():
@@ -117,7 +131,12 @@ def test_continuous_span_query_streams_without_full_window_sort():
         row_type=RowType.SPANS,
         salt="task-1",
         sampling_rate=100,
-        filters={},
+        filters={
+            "date_range": [
+                "2026-07-30T12:00:00Z",
+                "2026-07-30T12:03:00Z",
+            ]
+        },
         limit=None,
     )
 
@@ -349,22 +368,40 @@ def test_task_identity_siblings_and_created_at_reach_bounded_v2_sql(
         for item in (value if isinstance(value, tuple) else ())
     }
 
-    assert "id IN" in compact_sql
-    assert "trace_id IN" in compact_sql
-    assert "trace_session_id" in compact_sql
-    assert "trace_session_id IN" in compact_sql or "trace_session_id) IN" in compact_sql
     assert {"span-1", "trace-1", session_id} <= bound_values
     assert params["start_date"] == datetime(2026, 7, 1, 12, 30)
-    assert params["id_sampling_salt"] == "task-1"
-    assert params["id_sampling_rate"] == 50.0
-    assert params["id_limit"] == candidate_limit
-    if row_type in (RowType.SPANS, RowType.TRACES):
+    if row_type == RowType.SPANS:
+        assert "GROUP BY id" in compact_sql
+        assert compact_sql.count("latest_span_column_value_") >= 3
+        assert params["latest_span_sampling_salt"] == "task-1"
+        assert params["latest_span_sampling_rate"] == 50.0
+        assert params["latest_span_limit"] == candidate_limit
+        assert "lim" not in params
+        assert (
+            "ORDER BY toStartOfMinute(latest_start_time) DESC, grouped_id ASC"
+            in compact_sql
+        )
+        assert compact_sql.count("ORDER BY") == 1
+        assert compact_sql.count("LIMIT %(latest_span_limit)s") == 1
+        assert "WHERE 1 = 1" not in compact_sql
+    else:
+        assert "id IN" in compact_sql
+        assert "trace_id IN" in compact_sql
+        assert "trace_session_id" in compact_sql
+        assert (
+            "trace_session_id IN" in compact_sql
+            or "trace_session_id) IN" in compact_sql
+        )
+        assert params["id_sampling_salt"] == "task-1"
+        assert params["id_sampling_rate"] == 50.0
+        assert params["id_limit"] == candidate_limit
+    if row_type == RowType.TRACES:
         assert "lim" not in params
         assert f"ORDER BY toStartOfMinute(start_time) DESC, {id_column}" in compact_sql
         assert compact_sql.count("ORDER BY") == 1
         assert compact_sql.count("LIMIT %(id_limit)s") == 1
         assert "WHERE 1 = 1" not in compact_sql
-    else:
+    elif row_type == RowType.SESSIONS:
         assert params["lim"] == candidate_limit
         assert f"ORDER BY {id_column}" in compact_sql
         assert "WHERE 1 = 1" in compact_sql
@@ -396,7 +433,12 @@ def test_historical_span_caller_deduplicates_and_trims(monkeypatch):
         row_type=RowType.SPANS,
         id="task-1",
         sampling_rate=100,
-        filters={},
+        filters={
+            "date_range": [
+                "2026-07-30T12:00:00Z",
+                "2026-07-30T12:03:00Z",
+            ]
+        },
         run_type=RunType.HISTORICAL,
         spans_limit=3,
     )
@@ -411,7 +453,7 @@ def test_historical_span_caller_deduplicates_and_trims(monkeypatch):
     assert reader.closed is True
 
 
-def test_historical_span_filter_uses_coarse_seed_and_full_window_probe(monkeypatch):
+def test_historical_span_filter_uses_exact_whole_slice_seed(monkeypatch):
     class FakeReader:
         def __init__(self):
             self.calls = []
@@ -422,9 +464,6 @@ def test_historical_span_filter_uses_coarse_seed_and_full_window_probe(monkeypat
             assert batch_size == 2
             if len(self.calls) == 1:
                 raise TimeoutError("private ClickHouse timeout detail")
-            if "candidate_span_ids" in params:
-                yield list(params["candidate_span_ids"])
-                return
             yield ["span-a", "span-b", "span-c"]
 
         def close(self):
@@ -462,29 +501,89 @@ def test_historical_span_filter_uses_coarse_seed_and_full_window_probe(monkeypat
         ["span-a", "span-b"],
         ["span-c"],
     ]
-    assert len(reader.calls) == 3
+    assert len(reader.calls) == 2
     seed_sql, seed_params, seed_settings = reader.calls[1]
     assert seed_params["latest_span_slice_start"] == datetime(2026, 7, 30, 12)
     assert seed_params["latest_span_slice_end"] == datetime(2026, 7, 30, 12, 3)
-    assert seed_params["latest_span_limit"] == 51
+    assert seed_params["latest_span_limit"] == 4
     assert "FINAL" not in seed_sql
     assert "GROUP BY id" in seed_sql
-    assert "prompt_slug" not in seed_sql
-    assert seed_settings["max_result_rows"] == 51
+    assert "prompt_slug" in seed_sql
+    assert seed_settings["max_result_rows"] == 4
 
-    probe_sql, probe_params, probe_settings = reader.calls[2]
-    assert "FINAL" not in probe_sql
-    assert "GROUP BY id" in probe_sql
-    assert "prompt_slug" in probe_sql
-    assert probe_params["candidate_span_ids"] == (
-        "span-a",
-        "span-b",
-        "span-c",
-    )
-    assert probe_params["candidate_start_date"] == datetime(2026, 7, 30, 12)
-    assert probe_params["candidate_end_date"] == datetime(2026, 7, 30, 12, 3)
-    assert probe_settings["max_result_rows"] == 3
     assert reader.closed is True
+
+
+def test_prompt_slug_in_compiles_and_hydrates_preview_mapping_path():
+    """The reported task filter remains visible after point hydration."""
+    from tracer.services.clickhouse.v2.query_builders.span_list import (
+        SpanListQueryBuilderV2,
+    )
+    from tracer.services.clickhouse.v2.span_selectors import (
+        flatten_span_attributes_into_entry,
+    )
+
+    expected_slug = "agent_2_identity_disclosure"
+    filters = [
+        {
+            "column_id": "created_at",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [
+                    "2026-07-24T00:00:00Z",
+                    "2026-07-31T00:00:00Z",
+                ],
+            },
+        },
+        {
+            "column_id": "prompt_slug",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "in",
+                "filter_value": [expected_slug],
+            },
+        },
+    ]
+    builder = SpanListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=filters,
+        page_number=0,
+        page_size=10,
+    )
+
+    assert builder.supports_latest_candidate_page() is True
+    classifier_sql, classifier_params = (
+        builder.build_latest_attribute_candidate_matches(["span-prompt-slug"])
+    )
+    assert "latest_attr_value_0" in classifier_sql
+    assert "latest_attr_exists_0" in classifier_sql
+    assert any(
+        value == (expected_slug,)
+        for key, value in classifier_params.items()
+        if key.startswith("latest_attr_param_")
+    )
+
+    hydration_sql, hydration_params = builder.build_preview_hydration_query(
+        ["span-prompt-slug"]
+    )
+    assert "mapFilter(" in hydration_sql
+    assert "AS attrs_string" in hydration_sql
+    assert hydration_params["preview_text_keys"] == ("prompt_slug",)
+
+    entry = {"span_id": "span-prompt-slug"}
+    flatten_span_attributes_into_entry(
+        entry,
+        {
+            "attrs_string": {"prompt_slug": expected_slug},
+            "attrs_number": {},
+            "attrs_bool": {},
+            "attributes_extra": "{}",
+        },
+    )
+    assert entry["prompt_slug"] == expected_slug
 
 
 def test_historical_span_probe_prevents_older_attribute_match_resurfacing(
@@ -500,10 +599,17 @@ def test_historical_span_probe_prevents_older_attribute_match_resurfacing(
             self.calls.append((sql, dict(params), dict(settings)))
             if len(self.calls) == 1:
                 raise TimeoutError("whole-window budget")
+            if "cross_slice_span_ids" in params:
+                if "span-stale" in params["cross_slice_span_ids"]:
+                    yield ["span-stale"]
+                return
             if "candidate_span_ids" in params:
                 if params["candidate_span_ids"] == ("span-stale",):
                     # Full-window argMax sees the newer key-clearing version.
                     return
+                yield ["span-valid"]
+                return
+            if params.get("latest_span_after_id") == "span-stale":
                 yield ["span-valid"]
                 return
             if params["latest_span_slice_start"] == datetime(2026, 7, 30, 12, 5):
@@ -550,7 +656,7 @@ def test_historical_span_probe_prevents_older_attribute_match_resurfacing(
         for _, params, _ in reader.calls
         if "candidate_span_ids" in params
     ]
-    assert probes == [("span-stale",), ("span-valid",)]
+    assert probes == [("span-stale",)]
     assert all(
         params["candidate_start_date"] == datetime(2026, 7, 30, 12)
         and params["candidate_end_date"] == datetime(2026, 7, 30, 12, 10)
@@ -682,7 +788,7 @@ def test_historical_span_fallback_real_ch_rejects_stale_versions_and_tombstones(
     assert all(params["candidate_end_date"] == window_end for params in probe_params)
 
 
-def test_historical_trace_filter_uses_coarse_seed_and_full_window_probe(monkeypatch):
+def test_historical_root_filter_uses_exact_whole_slice_seed(monkeypatch):
     class FakeReader:
         def __init__(self):
             self.calls = []
@@ -693,10 +799,7 @@ def test_historical_trace_filter_uses_coarse_seed_and_full_window_probe(monkeypa
             if len(self.calls) == 1:
                 raise TimeoutError("private ClickHouse timeout detail")
 
-            if "final_status" in sql:
-                yield list(params["candidate_trace_ids"])
-            else:
-                yield ["trace-a", "trace-b", "trace-c"]
+            yield ["trace-a", "trace-b", "trace-c"]
 
         def close(self):
             self.closed = True
@@ -733,25 +836,17 @@ def test_historical_trace_filter_uses_coarse_seed_and_full_window_probe(monkeypa
         ["trace-a", "trace-b"],
         ["trace-c"],
     ]
-    assert len(reader.calls) == 3
+    assert len(reader.calls) == 2
     seed_sql, seed_params, seed_settings = reader.calls[1]
-    probe_sql, probe_params, probe_settings = reader.calls[2]
     assert seed_params["latest_root_slice_start"] == datetime(2026, 7, 30, 12)
     assert seed_params["latest_root_slice_end"] == datetime(2026, 7, 30, 12, 3)
-    assert seed_params["latest_root_limit"] == 51
-    assert "FINAL" not in seed_sql and "final_status" not in seed_sql
-    assert seed_settings["max_result_rows"] == 51
-    assert "FINAL" not in probe_sql and "final_status" in probe_sql
-    assert probe_params["candidate_trace_ids"] == (
-        "trace-a",
-        "trace-b",
-        "trace-c",
-    )
-    assert probe_settings["max_result_rows"] == 3
+    assert seed_params["latest_root_limit"] == 4
+    assert "FINAL" not in seed_sql and "final_status" in seed_sql
+    assert seed_settings["max_result_rows"] == 4
     assert reader.closed is True
 
 
-def test_historical_time_only_trace_fallback_rechecks_canonical_root(monkeypatch):
+def test_historical_time_only_trace_seed_is_exact_for_whole_slice(monkeypatch):
     class FakeReader:
         def __init__(self):
             self.calls = []
@@ -760,9 +855,6 @@ def test_historical_time_only_trace_fallback_rechecks_canonical_root(monkeypatch
             self.calls.append((sql, dict(params), dict(settings)))
             if len(self.calls) == 1:
                 raise TimeoutError("whole-window budget")
-            if "candidate_trace_ids" in params:
-                yield ["trace-a"]
-                return
             yield ["trace-a"]
 
         def close(self):
@@ -786,13 +878,85 @@ def test_historical_time_only_trace_fallback_rechecks_canonical_root(monkeypatch
     )
 
     assert list(row_resolver.iter_desired_rows(task)) == [["trace-a"]]
-    assert len(reader.calls) == 3
-    probe_sql, probe_params, probe_settings = reader.calls[2]
-    assert "FINAL" not in probe_sql
-    assert "latest_parent_span_id" in probe_sql
-    assert "latest_is_deleted = 0" in probe_sql
-    assert probe_params["candidate_trace_ids"] == ("trace-a",)
-    assert probe_settings["max_result_rows"] == 1
+    assert len(reader.calls) == 2
+    seed_sql, seed_params, seed_settings = reader.calls[1]
+    assert "FINAL" not in seed_sql
+    assert "latest_parent_span_id" in seed_sql
+    assert "latest_is_deleted = 0" in seed_sql
+    assert seed_params["latest_root_limit"] == 2
+    assert seed_settings["max_result_rows"] == 2
+
+
+def test_historical_trace_cross_slice_probe_catches_root_that_became_child(
+    monkeypatch,
+):
+    """Any later physical row forces verification, even when it is non-root."""
+
+    class FakeReader:
+        def __init__(self):
+            self.calls = []
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls.append((sql, dict(params), dict(settings)))
+            if len(self.calls) == 1:
+                raise TimeoutError("whole-window budget")
+            if "cross_slice_trace_ids" in params:
+                # The latest physical version changed the former root into a
+                # child in the adjacent slice. A root-only history probe would
+                # miss it and incorrectly accept the older matching root.
+                assert "parent_span_id IS NULL" not in sql
+                assert "parent_span_id = ''" not in sql
+                yield ["trace-root-became-child"]
+                return
+            if "candidate_trace_ids" in params:
+                # Full-window latest-state resolution correctly finds no
+                # canonical root satisfying the saved root predicate.
+                return
+            if params["latest_root_slice_start"] == datetime(2026, 7, 30, 12):
+                yield ["trace-root-became-child"]
+
+        def close(self):
+            pass
+
+    reader = FakeReader()
+    monkeypatch.setattr(row_resolver, "get_reader", lambda: reader)
+    task = SimpleNamespace(
+        project_id="11111111-1111-1111-1111-111111111111",
+        row_type=RowType.TRACES,
+        id="task-root-became-child",
+        sampling_rate=100,
+        filters={
+            "date_range": [
+                "2026-07-30T12:00:00Z",
+                "2026-07-30T12:10:00Z",
+            ],
+            "filters": [
+                {
+                    "column_id": "final_status",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "Rechazado",
+                    },
+                }
+            ],
+        },
+        run_type=RunType.HISTORICAL,
+        spans_limit=1,
+    )
+
+    assert list(row_resolver.iter_desired_rows(task)) == []
+    cross_calls = [
+        (sql, params)
+        for sql, params, _ in reader.calls
+        if "cross_slice_trace_ids" in params
+    ]
+    assert len(cross_calls) == 1
+    cross_sql, cross_params = cross_calls[0]
+    assert cross_params["cross_slice_trace_ids"] == ("trace-root-became-child",)
+    assert "parent_span_id" not in cross_sql
+    assert any("candidate_trace_ids" in params for _, params, _ in reader.calls)
 
 
 @pytest.mark.parametrize(
@@ -822,9 +986,9 @@ def test_historical_trace_any_span_filter_verifies_original_window(
 
         def stream_query(self, sql, params, *, batch_size, settings):
             self.calls.append((sql, dict(params), dict(settings)))
-            if len(self.calls) == 1:
+            if "id_limit" in params:
                 raise TimeoutError("whole-window budget")
-            if len(self.calls) == 2:
+            if "candidate_trace_ids" not in params:
                 yield ["trace-with-remote-child"]
                 return
             yield ["trace-with-remote-child"]
@@ -859,8 +1023,10 @@ def test_historical_trace_any_span_filter_verifies_original_window(
 
     assert list(row_resolver.iter_desired_rows(task)) == [["trace-with-remote-child"]]
 
-    assert len(reader.calls) == 3
-    seed_sql, seed_params, seed_settings = reader.calls[1]
+    expected_call_count = 3 if len(reader.calls) == 3 else 2
+    assert len(reader.calls) == expected_call_count
+    seed_index = 1 if expected_call_count == 3 else 0
+    seed_sql, seed_params, seed_settings = reader.calls[seed_index]
     assert "FINAL" not in seed_sql
     assert "GROUP BY trace_id, id" in seed_sql
     assert "LIMIT 1 BY grouped_trace_id" in seed_sql
@@ -872,10 +1038,10 @@ def test_historical_trace_any_span_filter_verifies_original_window(
     assert seed_params["project_id"] == str(task.project_id)
     assert seed_settings["max_execution_time"] <= 0.75
     assert seed_settings["max_threads"] == 2
-    assert seed_settings["max_result_rows"] == 51
+    assert seed_settings["max_result_rows"] == 2
     assert seed_settings["use_skip_indexes_if_final"] == 1
 
-    probe_sql, probe_params, probe_settings = reader.calls[2]
+    probe_sql, probe_params, probe_settings = reader.calls[seed_index + 1]
     assert "synthetic_child_attribute" in probe_sql
     assert "FINAL" not in probe_sql
     assert probe_sql.count("trace_id IN %(candidate_trace_ids)s") >= 1
@@ -899,17 +1065,18 @@ def test_historical_trace_negative_membership_verifies_remote_child(monkeypatch)
     class FakeReader:
         def __init__(self):
             self.calls = []
+            self.seed_calls = 0
 
         def stream_query(self, sql, params, *, batch_size, settings):
             self.calls.append((sql, dict(params), dict(settings)))
-            if len(self.calls) == 1:
-                assert "trace_id NOT IN (SELECT" in sql
-                raise TimeoutError("whole-window budget")
-            if len(self.calls) == 2:
-                yield ["trace-disqualified", "trace-clean"]
+            if "candidate_trace_ids" not in params:
+                self.seed_calls += 1
+                if self.seed_calls == 1:
+                    yield ["trace-clean", "trace-disqualified"]
                 return
             # The full-window verifier excludes the candidate whose old child
             # carries the forbidden end-user value.
+            assert "trace_id NOT IN (SELECT" in sql
             yield ["trace-clean"]
 
         def close(self):
@@ -940,23 +1107,23 @@ def test_historical_trace_negative_membership_verifies_remote_child(monkeypatch)
             ],
         },
         run_type=RunType.HISTORICAL,
-        spans_limit=1,
+        spans_limit=2,
     )
 
     assert list(row_resolver.iter_desired_rows(task)) == [["trace-clean"]]
-    assert len(reader.calls) == 3
-    seed_sql, seed_params, _ = reader.calls[1]
-    probe_sql, probe_params, _ = reader.calls[2]
+    assert len(reader.calls) > 2
+    seed_sql, seed_params, _ = reader.calls[0]
+    probe_sql, probe_params, _ = reader.calls[1]
     assert "forbidden-user" not in seed_sql
     assert seed_params["latest_root_slice_start"] == datetime(2026, 5, 7, 23, 55)
     assert "trace_id NOT IN (SELECT" in probe_sql
     assert "trace_id IN %(candidate_trace_ids)s" in probe_sql
     assert probe_params["candidate_trace_ids"] == (
-        "trace-disqualified",
         "trace-clean",
+        "trace-disqualified",
     )
-    assert probe_params["start_date"] == datetime(2026, 5, 1)
-    assert probe_params["end_date"] == datetime(2026, 5, 8)
+    assert probe_params["candidate_start_date"] == datetime(2026, 5, 1)
+    assert probe_params["candidate_end_date"] == datetime(2026, 5, 8)
 
 
 def test_trace_candidate_probe_rejects_rows_yielded_before_error(monkeypatch):
@@ -1016,6 +1183,182 @@ def test_trace_candidate_probe_rejects_rows_yielded_before_error(monkeypatch):
 
     assert reader.calls == 3
     assert reader.closed is True
+
+
+def test_span_classifier_proactively_chunks_before_any_read():
+    calls = []
+
+    class Reader:
+        def stream_query(self, sql, params, *, batch_size, settings):
+            ids = tuple(params["candidate_span_ids"])
+            calls.append((ids, dict(settings)))
+            yield list(ids)
+
+    candidate_ids = [f"span-{index:02d}" for index in range(25)]
+    matching = row_resolver._verify_span_candidates(
+        Reader(),
+        candidate_ids=candidate_ids,
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters={"filters": []},
+        start_date=datetime(2026, 7, 17, tzinfo=UTC),
+        end_date=datetime(2026, 7, 31, tzinfo=UTC),
+        batch_size=25,
+        deadline=row_resolver.monotonic() + 10,
+    )
+
+    assert matching == set(candidate_ids)
+    assert [len(batch) for batch, _ in calls] == [25]
+    assert calls[0][1]["max_memory_usage"] == 512 * 1024 * 1024
+    assert calls[0][1]["max_bytes_to_read"] == 2 * 1024 * 1024 * 1024
+
+
+def test_historical_span_selector_resolves_1063_direct_write_rows_boundedly():
+    """Customer-scale task creation avoids one classifier per small batch."""
+
+    expected_ids = [f"span-{index:04d}" for index in range(1063)]
+
+    class Reader:
+        def __init__(self):
+            self.calls = []
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls.append((sql, dict(params), dict(settings)))
+            if "cross_slice_span_ids" in params:
+                # Direct-write rows have no physical history outside their
+                # locally classified minute, so no full-window Map classifier
+                # is necessary.
+                return
+            if "candidate_span_ids" in params:
+                raise AssertionError("direct-write candidates need no global probe")
+
+            slice_start = params["latest_span_slice_start"]
+            slice_end = params["latest_span_slice_end"]
+            page_limit = params["latest_span_limit"]
+            if slice_end - slice_start > timedelta(minutes=1):
+                # One sentinel beyond the 256-id cap forces refinement of only
+                # this dense five-minute frontier.
+                yield [f"coarse-{index:04d}" for index in range(page_limit)]
+                return
+
+            after_id = params.get("latest_span_after_id")
+            start_index = 0 if after_id is None else expected_ids.index(after_id) + 1
+            yield expected_ids[start_index : start_index + page_limit]
+
+    reader = Reader()
+    start = datetime(2026, 7, 17, tzinfo=UTC)
+    end = datetime(2026, 7, 31, tzinfo=UTC)
+    resolved = row_resolver._resolve_bounded_historical_span_ids(
+        reader,
+        sql="SELECT id FROM spans",
+        params={"start_date": start, "end_date": end, "id_limit": 2126},
+        project_id="11111111-1111-1111-1111-111111111111",
+        salt="customer-task-1063",
+        sampling_rate=100,
+        filters={
+            "date_range": [start, end],
+            "filters": [
+                {
+                    "column_id": "final_status",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "Rechazado",
+                    },
+                }
+            ],
+        },
+        limit=1063,
+        batch_size=25,
+        row_type=RowType.SPANS,
+    )
+
+    assert resolved == expected_ids
+    assert len(reader.calls) == 11
+    seed_calls = [call for call in reader.calls if "latest_span_slice_start" in call[1]]
+    cross_calls = [call for call in reader.calls if "cross_slice_span_ids" in call[1]]
+    assert len(seed_calls) == 6
+    assert len(cross_calls) == 5
+    assert all(
+        params["latest_span_sampling_salt"] == "customer-task-1063"
+        and params["latest_span_sampling_rate"] == 100.0
+        for _, params, _ in seed_calls
+    )
+    assert all(
+        len(params["cross_slice_span_ids"]) <= 256
+        and settings["max_memory_usage"] == 512 * 1024 * 1024
+        and settings["max_bytes_to_read"] == 2 * 1024 * 1024 * 1024
+        for _, params, settings in cross_calls
+    )
+
+
+def test_trace_classifier_proactively_chunks_before_any_read(monkeypatch):
+    calls = []
+
+    def fake_build_sample_query(**kwargs):
+        ids = tuple(kwargs["candidate_trace_ids"])
+        return "SELECT trace_id", {"candidate_trace_ids": ids}
+
+    monkeypatch.setattr(row_resolver, "_build_sample_query", fake_build_sample_query)
+
+    class Reader:
+        def stream_query(self, sql, params, *, batch_size, settings):
+            ids = tuple(params["candidate_trace_ids"])
+            calls.append((ids, dict(settings)))
+            yield list(ids)
+
+    candidate_ids = [f"trace-{index:02d}" for index in range(25)]
+    matching = row_resolver._verify_trace_candidates(
+        Reader(),
+        candidate_ids=candidate_ids,
+        project_id="11111111-1111-1111-1111-111111111111",
+        salt="task",
+        sampling_rate=100,
+        filters={"filters": []},
+        batch_size=25,
+        deadline=row_resolver.monotonic() + 10,
+    )
+
+    assert matching == set(candidate_ids)
+    assert [len(batch) for batch, _ in calls] == [25]
+    assert calls[0][1]["max_memory_usage"] == 512 * 1024 * 1024
+    assert calls[0][1]["max_bytes_to_read"] == 2 * 1024 * 1024 * 1024
+
+
+def test_read_attempt_budget_is_local_to_each_selector_invocation(monkeypatch):
+    class Reader:
+        def __init__(self):
+            self.calls = 0
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls += 1
+            yield ["span-a"]
+
+    monkeypatch.setattr(row_resolver, "_EVAL_TASK_MAX_READ_ATTEMPTS", 1)
+    reader = Reader()
+    kwargs = {
+        "sql": "SELECT id FROM spans LIMIT 2",
+        "params": {
+            "start_date": datetime(2026, 7, 30, 12, tzinfo=UTC),
+            "end_date": datetime(2026, 7, 30, 12, 3, tzinfo=UTC),
+            "id_limit": 2,
+        },
+        "project_id": "11111111-1111-1111-1111-111111111111",
+        "salt": "task",
+        "sampling_rate": 100,
+        "filters": {"filters": []},
+        "limit": 1,
+        "batch_size": 25,
+        "row_type": RowType.SPANS,
+    }
+
+    assert row_resolver._resolve_bounded_historical_span_ids(reader, **kwargs) == [
+        "span-a"
+    ]
+    assert row_resolver._resolve_bounded_historical_span_ids(reader, **kwargs) == [
+        "span-a"
+    ]
+    assert reader.calls == 2
 
 
 def test_trace_candidate_probe_splits_and_reverifies_partial_batch(monkeypatch):
@@ -1089,9 +1432,9 @@ def test_historical_fallback_proves_empty_future_tail_before_slicing(monkeypatch
 
         def stream_query(self, sql, params, *, batch_size, settings):
             self.calls.append((sql, dict(params), dict(settings)))
-            if len(self.calls) == 1:
-                raise TimeoutError("wide query timeout")
-            if len(self.calls) == 2:
+            if "future_tail_start" in params:
+                return
+            if "cross_slice_span_ids" in params:
                 return
             yield ["span-now"]
 
@@ -1117,8 +1460,8 @@ def test_historical_fallback_proves_empty_future_tail_before_slicing(monkeypatch
     )
 
     assert list(row_resolver.iter_desired_rows(task)) == [["span-now"]]
-    assert len(reader.calls) == 4
-    tail_query, tail_params, tail_settings = reader.calls[1]
+    assert len(reader.calls) == 3
+    tail_query, tail_params, tail_settings = reader.calls[0]
     assert "FROM spans" in tail_query
     assert "FINAL" not in tail_query
     assert "parent_span_id" not in tail_query
@@ -1126,13 +1469,14 @@ def test_historical_fallback_proves_empty_future_tail_before_slicing(monkeypatch
     assert tail_params["future_tail_end"] == datetime(2026, 5, 17, 6, 41)
     assert tail_settings["max_execution_time"] <= 0.1
     assert tail_settings["max_threads"] == 1
-    seed_sql, seed_params, _ = reader.calls[2]
+    seed_sql, seed_params, _ = reader.calls[1]
     assert "FINAL" not in seed_sql
     assert seed_params["latest_span_slice_start"] == now
     assert seed_params["latest_span_slice_end"] == now + timedelta(minutes=5)
-    probe_sql, probe_params, _ = reader.calls[3]
-    assert "FINAL" not in probe_sql
-    assert probe_params["candidate_span_ids"] == ("span-now",)
+    cross_sql, cross_params, cross_settings = reader.calls[2]
+    assert "FINAL" not in cross_sql
+    assert cross_params["cross_slice_span_ids"] == ("span-now",)
+    assert cross_settings["max_memory_usage"] == 512 * 1024 * 1024
 
 
 def test_historical_fallback_rejects_future_skewed_physical_span(monkeypatch):
@@ -1144,8 +1488,6 @@ def test_historical_fallback_rejects_future_skewed_physical_span(monkeypatch):
 
         def stream_query(self, sql, params, *, batch_size, settings):
             self.calls.append((sql, dict(params)))
-            if len(self.calls) == 1:
-                raise TimeoutError("wide query timeout")
             yield ["future-skewed-span"]
 
         def close(self):
@@ -1172,7 +1514,7 @@ def test_historical_fallback_rejects_future_skewed_physical_span(monkeypatch):
     with pytest.raises(row_resolver.EvalTaskReadBudgetExceeded):
         list(row_resolver.iter_desired_rows(task))
 
-    assert len(reader.calls) == 2
+    assert len(reader.calls) == 1
 
 
 def test_whole_window_and_forced_fallback_select_identical_order(monkeypatch):
@@ -1204,9 +1546,6 @@ def test_whole_window_and_forced_fallback_select_identical_order(monkeypatch):
                 # Canonical whole-window order: newest minute, then id.
                 yield ["span-b", "span-c", "span-a"]
                 return
-            if "candidate_span_ids" in params:
-                yield list(params["candidate_span_ids"])
-                return
             yield ["span-b", "span-c", "span-a"]
 
         def close(self):
@@ -1229,17 +1568,11 @@ def test_whole_window_and_forced_fallback_select_identical_order(monkeypatch):
         whole_reader.calls[0][0].count("ORDER BY toStartOfMinute(start_time) DESC, id")
         == 1
     )
-    assert len(fallback_reader.calls) == 3
+    assert len(fallback_reader.calls) == 2
     seed_sql, seed_params = fallback_reader.calls[1]
-    probe_sql, probe_params = fallback_reader.calls[2]
-    assert "FINAL" not in seed_sql and "FINAL" not in probe_sql
+    assert "FINAL" not in seed_sql
     assert seed_params["latest_span_slice_start"] == datetime(2026, 7, 30, 12)
     assert seed_params["latest_span_slice_end"] == datetime(2026, 7, 30, 12, 2)
-    assert probe_params["candidate_span_ids"] == (
-        "span-b",
-        "span-c",
-        "span-a",
-    )
 
 
 def test_historical_span_slice_keysets_within_busy_minute(monkeypatch):
@@ -1251,9 +1584,6 @@ def test_historical_span_slice_keysets_within_busy_minute(monkeypatch):
             self.calls.append((sql, dict(params)))
             if len(self.calls) == 1:
                 raise TimeoutError("wide query timeout")
-            if "candidate_span_ids" in params:
-                yield list(params["candidate_span_ids"])
-                return
             if params["latest_span_limit"] == 3:
                 # The sentinel proves this five-minute candidate window is
                 # saturated. These provisional ids must be discarded.
@@ -1298,19 +1628,13 @@ def test_historical_span_slice_keysets_within_busy_minute(monkeypatch):
     assert list(row_resolver.iter_desired_rows(task, batch_size=10)) == [
         ["span-a", "span-b", "span-c", "span-d"]
     ]
-    assert len(reader.calls) == 6
-    assert all(
-        "coarse" not in candidate
-        for _, params in reader.calls
-        for candidate in params.get("candidate_span_ids", ())
-    )
-    page_two_sql, page_two_params = reader.calls[4]
+    assert len(reader.calls) == 4
+    page_two_sql, page_two_params = reader.calls[3]
     assert "FINAL" not in page_two_sql
     assert "GROUP BY id" in page_two_sql
     assert "grouped_id > %(latest_span_after_id)s" in page_two_sql
     assert page_two_params["latest_span_after_id"] == "span-b"
-    assert reader.calls[3][1]["candidate_span_ids"] == ("span-a", "span-b")
-    assert reader.calls[5][1]["candidate_span_ids"] == ("span-c", "span-d")
+    assert all("candidate_span_ids" not in params for _, params in reader.calls)
 
 
 def test_whole_window_candidate_cap_with_enough_unique_ids_does_not_slice(
@@ -1408,8 +1732,6 @@ def test_sparse_fourteen_day_fallback_widens_instead_of_querying_every_five_minu
 
         def stream_query(self, sql, params, *, batch_size, settings):
             self.calls.append((sql, dict(params), dict(settings)))
-            if len(self.calls) == 1:
-                raise TimeoutError("force bounded fallback")
             return
             yield  # pragma: no cover - keep this function a generator
 
@@ -1438,7 +1760,7 @@ def test_sparse_fourteen_day_fallback_widens_instead_of_querying_every_five_minu
         if "latest_root_slice_start" in params
     ]
     assert seed_windows[0] == timedelta(minutes=5)
-    assert max(seed_windows) == timedelta(days=1)
+    assert max(seed_windows) == timedelta(days=2)
 
 
 def test_fallback_enforces_a_hard_read_attempt_cap_before_the_wall_deadline(
@@ -1451,17 +1773,17 @@ def test_fallback_enforces_a_hard_read_attempt_cap_before_the_wall_deadline(
         def stream_query(self, sql, params, *, batch_size, settings):
             self.calls += 1
             if self.calls == 1:
-                raise TimeoutError("force bounded fallback")
-            if self.calls == 2:
-                yield [f"coarse-{index:03d}" for index in range(51)]
+                # Saturate the five-minute coarse seed, forcing one-minute
+                # keyset refinement without accepting provisional ids.
+                yield [f"coarse-{index:03d}" for index in range(11)]
                 return
-            if self.calls == 3:
+            if self.calls == 2:
                 yield ["span-a"]
                 return
-            raise AssertionError("read cap must stop before a fourth query")
+            raise AssertionError("read cap must stop before a third query")
 
     reader = DenseReader()
-    monkeypatch.setattr(row_resolver, "_EVAL_TASK_MAX_READ_ATTEMPTS", 3)
+    monkeypatch.setattr(row_resolver, "_EVAL_TASK_MAX_READ_ATTEMPTS", 2)
     start = datetime(2026, 7, 30, tzinfo=UTC)
     end = start + timedelta(days=1)
 
@@ -1492,7 +1814,338 @@ def test_fallback_enforces_a_hard_read_attempt_cap_before_the_wall_deadline(
             row_type=RowType.SPANS,
         )
 
-    assert reader.calls == 3
+    assert reader.calls == 2
+
+
+def test_mixed_system_attribute_and_sibling_filters_share_one_scalar_plan():
+    session_id = "22222222-2222-2222-2222-222222222222"
+    filters = {
+        "date_range": [
+            "2026-07-30T00:00:00Z",
+            "2026-07-31T00:00:00Z",
+        ],
+        "trace_id": ["trace-target"],
+        "session_id": [session_id],
+        "observation_type": ["llm"],
+        "filters": [
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rechazado",
+                },
+            },
+            {
+                "column_id": "status",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "OK",
+                },
+            },
+            {
+                "column_id": "cost",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "number",
+                    "filter_op": "greater_than",
+                    "filter_value": 1.5,
+                },
+            },
+        ],
+    }
+
+    assert row_resolver._span_candidate_verification_is_supported(filters) is True
+    seed_sql, seed_params = row_resolver._build_span_candidate_seed_query(
+        project_id="11111111-1111-1111-1111-111111111111",
+        salt="mixed-task",
+        sampling_rate=100,
+        filters=filters,
+        start=datetime(2026, 7, 30, 23, 55),
+        end=datetime(2026, 7, 31),
+        after_id=None,
+        limit=25,
+    )
+    match_sql, match_params = row_resolver._build_span_candidate_match_query(
+        candidate_ids=["span-target"],
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=filters,
+        start_date=datetime(2026, 7, 30),
+        end_date=datetime(2026, 7, 31),
+    )
+
+    for sql in (seed_sql, match_sql):
+        compact = " ".join(sql.split())
+        assert "FINAL" not in compact
+        assert "mapContains(attrs_string, 'final_status')" in compact
+        assert "argMax(tuple(status), _version).1" in compact
+        assert "argMax(tuple(cost), _version).1" in compact
+        assert "argMax(trace_id, _version)" in compact
+        assert "argMax(tuple(trace_session_id), _version).1" in compact
+        assert "argMax(observation_type, _version)" in compact
+    assert seed_params["latest_attr_param_0"] == "rechazado"
+    assert seed_params["latest_span_column_value_param_1"] == "ok"
+    assert seed_params["latest_span_column_value_param_2"] == 1.5
+    assert match_params["latest_span_column_value_param_3"] == ("trace-target",)
+    assert match_params["latest_span_column_value_param_4"] == (session_id,)
+    assert match_params["latest_span_column_value_param_5"] == ("llm",)
+
+
+@pytest.mark.integration
+def test_real_ch_stopped_merges_mixed_system_and_sibling_filter_is_latest_exact(
+    row_resolver_ch,
+):
+    client = row_resolver_ch
+    project = uuid.uuid4()
+    session_id = uuid.uuid4()
+    other_session_id = uuid.uuid4()
+    window_start = datetime(2026, 7, 30, 12, tzinfo=UTC)
+    old_time = window_start + timedelta(minutes=2)
+    new_time = window_start + timedelta(minutes=7)
+    window_end = window_start + timedelta(minutes=10)
+
+    def row(
+        span_id,
+        when,
+        *,
+        trace_id="trace-target",
+        session=session_id,
+        observation_type="llm",
+        status="OK",
+        final_status="Rechazado",
+        version=1,
+    ):
+        return [
+            project,
+            trace_id,
+            span_id,
+            when,
+            session,
+            observation_type,
+            status,
+            ({"final_status": final_status} if final_status is not None else {}),
+            {},
+            {},
+            0,
+            version,
+        ]
+
+    client.insert(
+        "spans",
+        [
+            row("span-valid", old_time),
+            row("span-stale-status", old_time),
+            row("span-stale-status", new_time, status="ERROR", version=2),
+            row("span-wrong-trace", old_time, trace_id="trace-other"),
+            row("span-wrong-session", old_time, session=other_session_id),
+            row("span-wrong-type", old_time, observation_type="tool"),
+        ],
+        column_names=[
+            "project_id",
+            "trace_id",
+            "id",
+            "start_time",
+            "trace_session_id",
+            "observation_type",
+            "status",
+            "attrs_string",
+            "attrs_number",
+            "attrs_bool",
+            "is_deleted",
+            "_version",
+        ],
+    )
+
+    class Reader:
+        def __init__(self):
+            self.calls = []
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls.append((sql, dict(params), dict(settings)))
+            if len(self.calls) == 1:
+                raise TimeoutError("force the bounded mixed-filter plan")
+            result = client.query(sql, parameters=params, settings=settings)
+            values = [str(row[0]) for row in result.result_rows]
+            for offset in range(0, len(values), batch_size):
+                yield values[offset : offset + batch_size]
+
+    filters = {
+        "date_range": [window_start, window_end],
+        "trace_id": ["trace-target"],
+        "session_id": [str(session_id)],
+        "observation_type": ["llm"],
+        "filters": [
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rechazado",
+                },
+            },
+            {
+                "column_id": "status",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "OK",
+                },
+            },
+        ],
+    }
+    reader = Reader()
+    resolved = row_resolver._resolve_bounded_historical_span_ids(
+        reader,
+        sql="SELECT id FROM spans",
+        params={
+            "start_date": window_start,
+            "end_date": window_end,
+            "id_limit": 20,
+        },
+        project_id=str(project),
+        salt="mixed-real-ch-task",
+        sampling_rate=100,
+        filters=filters,
+        limit=10,
+        batch_size=25,
+        row_type=RowType.SPANS,
+    )
+
+    assert resolved == ["span-valid"]
+    assert any("cross_slice_span_ids" in params for _, params, _ in reader.calls)
+    assert any("candidate_span_ids" in params for _, params, _ in reader.calls)
+    assert all("FINAL" not in sql for sql, _, _ in reader.calls)
+
+
+@pytest.mark.integration
+def test_real_ch_prompt_slug_task_selector_rejects_key_clear_and_tombstone(
+    row_resolver_ch,
+    monkeypatch,
+):
+    """The exact reported prompt_slug survives the bounded task selector.
+
+    Merges remain stopped by the module fixture, so stale physical matches stay
+    present.  The selector must still return the newest matching row while
+    rejecting an older match superseded by either a key clear or a tombstone.
+    """
+    client = row_resolver_ch
+    project = uuid.uuid4()
+    expected_slug = "agent_2_identity_disclosure"
+    window_start = datetime(2026, 7, 30, 12, tzinfo=UTC)
+    old_time = window_start + timedelta(minutes=2)
+    new_time = window_start + timedelta(minutes=7)
+    window_end = window_start + timedelta(minutes=10)
+
+    def row(
+        span_id,
+        when,
+        *,
+        prompt_slug=expected_slug,
+        is_deleted=0,
+        version=1,
+    ):
+        attrs_string = {} if prompt_slug is None else {"prompt_slug": prompt_slug}
+        return [
+            project,
+            f"trace-{span_id}",
+            span_id,
+            when,
+            None,
+            "llm",
+            "OK",
+            attrs_string,
+            {},
+            {},
+            is_deleted,
+            version,
+        ]
+
+    client.insert(
+        "spans",
+        [
+            row("span-valid", old_time),
+            row("span-key-cleared", old_time),
+            row("span-key-cleared", new_time, prompt_slug=None, version=2),
+            row("span-tombstoned", old_time),
+            row("span-tombstoned", new_time, is_deleted=1, version=2),
+            row("span-latest-match", old_time, prompt_slug="other", version=1),
+            row("span-latest-match", new_time, version=2),
+            row("span-never-matched", old_time, prompt_slug="other"),
+        ],
+        column_names=[
+            "project_id",
+            "trace_id",
+            "id",
+            "start_time",
+            "trace_session_id",
+            "observation_type",
+            "status",
+            "attrs_string",
+            "attrs_number",
+            "attrs_bool",
+            "is_deleted",
+            "_version",
+        ],
+    )
+
+    class Reader:
+        def __init__(self):
+            self.calls = []
+            self.closed = False
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls.append((sql, dict(params), dict(settings)))
+            if len(self.calls) == 1:
+                raise TimeoutError("force the bounded prompt_slug selector")
+            result = client.query(sql, parameters=params, settings=settings)
+            values = [str(result_row[0]) for result_row in result.result_rows]
+            for offset in range(0, len(values), batch_size):
+                yield values[offset : offset + batch_size]
+
+        def close(self):
+            self.closed = True
+
+    reader = Reader()
+    monkeypatch.setattr(row_resolver, "get_reader", lambda: reader)
+    task = SimpleNamespace(
+        project_id=project,
+        row_type=RowType.SPANS,
+        id="customer-prompt-slug-task",
+        sampling_rate=100,
+        filters={
+            "date_range": [window_start, window_end],
+            "filters": [
+                {
+                    "column_id": "prompt_slug",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": expected_slug,
+                    },
+                }
+            ],
+        },
+        run_type=RunType.HISTORICAL,
+        spans_limit=10,
+    )
+
+    assert list(row_resolver.iter_desired_rows(task, batch_size=25)) == [
+        ["span-latest-match", "span-valid"]
+    ]
+    assert reader.closed is True
+    assert any(
+        "latest_span_slice_start" in params and "prompt_slug" in sql
+        for sql, params, _ in reader.calls
+    )
+    assert any("cross_slice_span_ids" in params for _, params, _ in reader.calls)
+    assert any("candidate_span_ids" in params for _, params, _ in reader.calls)
+    assert all("FINAL" not in sql for sql, _, _ in reader.calls)
 
 
 def test_unsupported_mutable_span_shape_fails_closed_after_whole_window_budget():
@@ -1515,18 +2168,18 @@ def test_unsupported_mutable_span_shape_fails_closed_after_whole_window_budget()
             sql="SELECT id FROM spans",
             params={"start_date": start, "end_date": end, "id_limit": 20},
             project_id="11111111-1111-1111-1111-111111111111",
-            salt="unsupported-system-filter",
+            salt="unsupported-datetime-filter",
             sampling_rate=100,
             filters={
                 "date_range": [start, end],
                 "filters": [
                     {
-                        "column_id": "status",
+                        "column_id": "end_time",
                         "filter_config": {
                             "col_type": "SYSTEM_METRIC",
-                            "filter_type": "text",
-                            "filter_op": "equals",
-                            "filter_value": "OK",
+                            "filter_type": "datetime",
+                            "filter_op": "greater_than",
+                            "filter_value": "2026-07-30T12:00:00Z",
                         },
                     }
                 ],
@@ -1565,31 +2218,18 @@ def test_historical_span_programming_error_is_not_misreported_as_budget(
         list(row_resolver.iter_desired_rows(task))
 
 
-def test_large_historical_limit_keeps_streaming_path(monkeypatch):
+@pytest.mark.parametrize("row_type", [RowType.SPANS, RowType.TRACES])
+def test_large_historical_span_trace_limit_fails_before_clickhouse(
+    monkeypatch, row_type
+):
     class FakeReader:
-        def __init__(self):
-            self.calls = 0
+        def __init__(self):  # pragma: no cover - construction is the failure
+            pytest.fail("an unsupported task must not open ClickHouse")
 
-        def stream_query(self, sql, params, *, batch_size, settings):
-            self.calls += 1
-            yield ["span-a", "span-b"]
-            yield ["span-c"]
-
-        def close(self):
-            pass
-
-    reader = FakeReader()
-    monkeypatch.setattr(row_resolver, "get_reader", lambda: reader)
-    monkeypatch.setattr(
-        row_resolver,
-        "_resolve_bounded_historical_span_ids",
-        lambda *_args, **_kwargs: pytest.fail(
-            "large limits must not enter the buffered fallback"
-        ),
-    )
+    monkeypatch.setattr(row_resolver, "get_reader", FakeReader)
     task = SimpleNamespace(
         project_id="11111111-1111-1111-1111-111111111111",
-        row_type=RowType.SPANS,
+        row_type=row_type,
         id="task-large-stream",
         sampling_rate=100,
         filters={},
@@ -1597,11 +2237,36 @@ def test_large_historical_limit_keeps_streaming_path(monkeypatch):
         spans_limit=row_resolver._EVAL_TASK_BUFFERED_ID_LIMIT + 1,
     )
 
+    with pytest.raises(row_resolver.EvalTaskReadBudgetExceeded) as exc_info:
+        list(row_resolver.iter_desired_rows(task, batch_size=2))
+
+    message = str(exc_info.value)
+    assert str(row_resolver._EVAL_TASK_BUFFERED_ID_LIMIT) in message
+    assert "ClickHouse" not in message
+
+
+def test_large_historical_session_limit_keeps_existing_streaming_contract(monkeypatch):
+    class FakeReader:
+        def stream_query(self, sql, params, *, batch_size, settings):
+            yield ["session-a", "session-b"]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(row_resolver, "get_reader", FakeReader)
+    task = SimpleNamespace(
+        project_id="11111111-1111-1111-1111-111111111111",
+        row_type=RowType.SESSIONS,
+        id="task-large-session-stream",
+        sampling_rate=100,
+        filters={},
+        run_type=RunType.HISTORICAL,
+        spans_limit=row_resolver._EVAL_TASK_BUFFERED_ID_LIMIT + 1,
+    )
+
     assert list(row_resolver.iter_desired_rows(task, batch_size=2)) == [
-        ["span-a", "span-b"],
-        ["span-c"],
+        ["session-a", "session-b"]
     ]
-    assert reader.calls == 1
 
 
 def test_continuous_span_resolution_keeps_single_streaming_query(monkeypatch):

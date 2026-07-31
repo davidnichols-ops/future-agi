@@ -11,8 +11,10 @@ Covers:
 """
 
 import json
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlencode
 
@@ -105,6 +107,59 @@ def sample_query_config():
         "filters": [],
         "breakdowns": [],
     }
+
+
+@pytest.fixture(scope="module")
+def dashboard_filter_values_ch():
+    """Isolated local ClickHouse table for Unicode picker semantics."""
+    if os.environ.get("FUTUREAGI_TEST_ALLOW_LOCAL_CH_DDL") != "1":
+        pytest.skip("local ClickHouse DDL integration test requires explicit opt-in")
+    clickhouse_connect = pytest.importorskip("clickhouse_connect")
+    host = os.environ.get("CH25_HOST") or os.environ.get("CH_HOST") or "localhost"
+    if host not in {"localhost", "127.0.0.1", "::1"}:
+        pytest.fail("local ClickHouse DDL test refuses a non-loopback host")
+    port = int(
+        os.environ.get("CH25_HTTP_PORT") or os.environ.get("CH_HTTP_PORT") or 18124
+    )
+    database = f"test_dashboard_filter_values_{uuid.uuid4().hex[:8]}"
+    try:
+        admin = clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            username=os.environ.get("CH_USER", "default"),
+            password=os.environ.get("CH_PASSWORD", ""),
+        )
+        admin.command("SELECT 1")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f"ClickHouse not available: {exc!r}")
+
+    admin.command(f"CREATE DATABASE {database}")
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        username=os.environ.get("CH_USER", "default"),
+        password=os.environ.get("CH_PASSWORD", ""),
+        database=database,
+    )
+    client.command(
+        """
+        CREATE TABLE spans (
+            project_id UUID,
+            id String,
+            trace_id String,
+            start_time DateTime64(6, 'UTC'),
+            attrs_string Map(String, String),
+            is_deleted UInt8 DEFAULT 0
+        ) ENGINE = MergeTree
+        ORDER BY (project_id, start_time, trace_id, id)
+        """
+    )
+    try:
+        yield client
+    finally:
+        client.close()
+        admin.command(f"DROP DATABASE IF EXISTS {database}")
+        admin.close()
 
 
 # ===========================================================================
@@ -1371,7 +1426,10 @@ class TestMetricsEndpoint:
             mock_analytics_cls.return_value.execute_ch_query.call_args[0][0],
             mock_analytics_cls.return_value.execute_ch_query.call_args[0][1],
         )
-        assert "ILIKE %(search_pattern)s" in sql_arg
+        assert (
+            "lowerUTF8(attrs_string[%(attr_key)s]) "
+            "LIKE lowerUTF8(%(search_pattern)s)" in sql_arg
+        )
         assert "LIMIT %(sample_limit)s" in sql_arg
         assert "DISTINCT" not in sql_arg
         assert "ORDER BY val" not in sql_arg
@@ -1415,7 +1473,7 @@ class TestMetricsEndpoint:
         )
         assert "start_time >= now() - INTERVAL %(win_lookback_days)s DAY" in sql_arg
         assert params["win_lookback_days"] == 7
-        assert "ILIKE %(search_pattern)s" in sql_arg
+        assert "LIKE lowerUTF8(%(search_pattern)s)" in sql_arg
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
@@ -1446,6 +1504,8 @@ class TestMetricsEndpoint:
         )
         assert "start_time >= now() - INTERVAL %(win_lookback_days)s DAY" in sql_arg
         assert params["win_lookback_days"] == 7
+        assert "arrayStringConcat" not in sql_arg
+        assert "search_pattern_lower" not in params
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
@@ -1477,6 +1537,40 @@ class TestMetricsEndpoint:
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
     @patch("tracer.views.dashboard.AnalyticsQueryService")
+    def test_filter_values_ascii_kelvin_search_skips_unsafe_ngram_companion(
+        self,
+        mock_analytics_cls,
+        _mock_ch_enabled,
+        auth_client,
+        observe_project,
+    ):
+        """An ASCII needle can still have a non-ASCII lowerUTF8 equivalent."""
+        mock_result = MagicMock()
+        mock_result.data = [{"val": "KELVIN"}]
+        mock_analytics_cls.return_value.execute_ch_query.return_value = mock_result
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=customer_tier&metric_type=custom_attribute"
+            f"&project_ids={observe_project.id}&source=traces"
+            "&search=kelvin"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["result"]["values"] == [
+            {"value": "KELVIN", "label": "KELVIN"}
+        ]
+        sql, params = (
+            mock_analytics_cls.return_value.execute_ch_query.call_args[0][0],
+            mock_analytics_cls.return_value.execute_ch_query.call_args[0][1],
+        )
+        assert "LIKE lowerUTF8(%(search_pattern)s)" in sql
+        assert "arrayStringConcat" not in sql
+        assert "search_pattern_lower" not in params
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
+    @patch("tracer.views.dashboard.AnalyticsQueryService")
     def test_filter_values_unicode_search_skips_ascii_ngram_companion(
         self,
         mock_analytics_cls,
@@ -1499,9 +1593,94 @@ class TestMetricsEndpoint:
             mock_analytics_cls.return_value.execute_ch_query.call_args[0][0],
             mock_analytics_cls.return_value.execute_ch_query.call_args[0][1],
         )
-        assert "ILIKE %(search_pattern)s" in sql
+        assert "LIKE lowerUTF8(%(search_pattern)s)" in sql
         assert "arrayStringConcat" not in sql
         assert "search_pattern_lower" not in params
+
+    @pytest.mark.integration
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        ("stored_value", "search", "expects_companion"),
+        [
+            ("KELVIN", "kelvin", False),
+            ("AgEnT_identity_disclosure", "agent", True),
+        ],
+    )
+    def test_filter_values_search_matches_real_ch_unicode_and_ascii_values(
+        self,
+        dashboard_filter_values_ch,
+        auth_client,
+        observe_project,
+        stored_value,
+        search,
+        expects_companion,
+    ):
+        """The emitted picker query preserves Unicode and indexed ASCII matches."""
+        client = dashboard_filter_values_ch
+        client.insert(
+            "spans",
+            [
+                [
+                    observe_project.id,
+                    f"span-{uuid.uuid4()}",
+                    f"trace-{uuid.uuid4()}",
+                    datetime.now(UTC),
+                    {"customer_tier": stored_value},
+                    0,
+                ]
+            ],
+            column_names=[
+                "project_id",
+                "id",
+                "trace_id",
+                "start_time",
+                "attrs_string",
+                "is_deleted",
+            ],
+        )
+
+        class LocalAnalytics:
+            def __init__(self):
+                self.queries = []
+
+            def execute_ch_query(
+                self, query, params=None, timeout_ms=10000, settings=None
+            ):
+                self.queries.append((query, dict(params or {}), timeout_ms, settings))
+                result = client.query(
+                    query,
+                    parameters=params or {},
+                    settings=settings or {},
+                )
+                return SimpleNamespace(
+                    data=[
+                        dict(zip(result.column_names, row, strict=True))
+                        for row in result.result_rows
+                    ]
+                )
+
+        analytics = LocalAnalytics()
+        with (
+            patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True),
+            patch(
+                "tracer.views.dashboard.AnalyticsQueryService",
+                return_value=analytics,
+            ),
+        ):
+            response = auth_client.get(
+                "/tracer/dashboard/filter_values/"
+                "?metric_name=customer_tier&metric_type=custom_attribute"
+                f"&project_ids={observe_project.id}&source=traces"
+                f"&search={search}"
+            )
+
+        assert response.status_code == 200
+        assert response.json()["result"]["values"] == [
+            {"value": stored_value, "label": stored_value}
+        ]
+        assert len(analytics.queries) == 1
+        sql = analytics.queries[0][0]
+        assert ("arrayStringConcat" in sql) is expects_companion
 
     @pytest.mark.django_db
     def test_filter_values_does_not_leak_other_workspace_annotation_settings(

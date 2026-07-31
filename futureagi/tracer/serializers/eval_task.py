@@ -1,5 +1,6 @@
 from rest_framework import serializers
 
+from tracer.constants.eval_tasks import MAX_BOUNDED_HISTORICAL_SPAN_TRACE_ROWS
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.models.eval_task import (
     EvalTask,
@@ -212,11 +213,27 @@ class EvalTaskSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        run_type = attrs.get("run_type")
-        spans_limit = attrs.get("spans_limit")
+        instance = self.instance
+        run_type = attrs.get("run_type", getattr(instance, "run_type", None))
+        row_type = attrs.get("row_type", getattr(instance, "row_type", RowType.SPANS))
+        spans_limit = attrs.get("spans_limit", getattr(instance, "spans_limit", None))
         if run_type == RunType.HISTORICAL and not spans_limit:
             raise serializers.ValidationError(
                 {"spans_limit": "spans_limit is required for historical runs."}
+            )
+        if (
+            run_type == RunType.HISTORICAL
+            and row_type in (RowType.SPANS, RowType.TRACES)
+            and spans_limit is not None
+            and int(spans_limit) > MAX_BOUNDED_HISTORICAL_SPAN_TRACE_ROWS
+        ):
+            raise serializers.ValidationError(
+                {
+                    "spans_limit": (
+                        "Historical span and trace tasks support at most "
+                        f"{MAX_BOUNDED_HISTORICAL_SPAN_TRACE_ROWS} rows."
+                    )
+                }
             )
         if run_type == RunType.CONTINUOUS:
             attrs.pop("spans_limit", None)
