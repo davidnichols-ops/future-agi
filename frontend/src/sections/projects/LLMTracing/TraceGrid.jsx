@@ -37,6 +37,7 @@ import { REPLAY_MODULES } from "../SessionsView/ReplaySessions/configurations";
 import { useShallowToggleAnnotationsStore } from "../../agents/store";
 import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
+import { enqueueSnackbar } from "notistack";
 
 const ROWS_LIMIT = 25;
 const EMPTY_EXTRA_FILTERS = [];
@@ -94,6 +95,7 @@ const TraceGrid = React.forwardRef(
 
     // Prefetch cache: stores next page data so scroll feels instant
     const prefetchCache = useRef(new Map());
+    const degradedRequestKeyRef = useRef(null);
     const { showMetricsIds, reset: resetMetricIds } =
       useShallowToggleAnnotationsStore((state) => ({
         showMetricsIds: state.showMetricsIds,
@@ -248,6 +250,22 @@ const TraceGrid = React.forwardRef(
                 ));
 
               const res = results?.data?.result;
+              const isDegraded =
+                res?.metadata?.query_complete === false ||
+                res?.metadata?.query_status === "degraded" ||
+                res?.metadata?.query_error_code === "read_budget_exceeded";
+              if (
+                isDegraded &&
+                degradedRequestKeyRef.current !== filterRequestKey
+              ) {
+                degradedRequestKeyRef.current = filterRequestKey;
+                enqueueSnackbar(
+                  "Some matching traces could not be loaded. Narrow the time range and retry.",
+                  { variant: "warning" },
+                );
+              } else if (!isDegraded && pageNumber === 0) {
+                degradedRequestKeyRef.current = null;
+              }
               const newCols = normalizeConfigKeys(res?.config);
 
               // Use ref to get latest columns for comparison without triggering dataSource recreation
@@ -368,6 +386,7 @@ const TraceGrid = React.forwardRef(
         hasEvalFilter,
         enabled,
         dateInterval,
+        filterRequestKey,
       ],
     );
 

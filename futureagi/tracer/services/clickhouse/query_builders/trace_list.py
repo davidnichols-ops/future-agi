@@ -95,6 +95,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         search: str | None = None,
         columns: list[str] | None = None,
         annotation_label_ids: list[str] | None = None,
+        candidate_trace_ids: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id=project_id, project_ids=project_ids, **kwargs)
@@ -107,6 +108,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self.search = search.strip() if search else None
         self.columns = columns
         self.annotation_label_ids = annotation_label_ids or []
+        self.candidate_trace_ids = [
+            str(trace_id) for trace_id in (candidate_trace_ids or []) if trace_id
+        ]
         self.start_date: datetime | None = None
         self.end_date: datetime | None = None
 
@@ -132,14 +136,23 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     # Phase 1: Paginated trace list
     # ------------------------------------------------------------------
 
-    def build(self) -> tuple[str, dict[str, Any]]:
+    def build(self, since: datetime | None = None) -> tuple[str, dict[str, Any]]:
         """Build the Phase-1 query for paginated root-span trace data.
+
+        ``since`` narrows only the page read to a recent prefix. Because the
+        default order is newest-first, a slice that fills the requested prefix
+        is also the exact global prefix; the caller can avoid scanning older
+        partitions. Attribute-membership subqueries share ``start_date``, so
+        they are narrowed with the outer root-span scan as well.
 
         Returns:
             A ``(query_string, params)`` tuple.  The query returns one row
             per trace with root-span metadata.
         """
-        self.start_date, self.end_date = self.parse_time_range(self.filters)
+        requested_start, self.end_date = self.parse_time_range(self.filters)
+        self.start_date = (
+            max(requested_start, since) if since is not None else requested_start
+        )
         self.params["start_date"] = self.start_date
         self.params["end_date"] = self.end_date
 
@@ -155,6 +168,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             # span history. Safe here: this builder always binds
             # %(start_date)s before translate(). See filters.py.
             span_date_scope=True,
+            # Candidate-batched filtered pages must apply the same trace-id
+            # bound inside any-span membership subqueries. Without this, the
+            # outer page is small but ClickHouse still builds a project-wide
+            # raw attribute set before intersecting it.
+            span_trace_id_scope=bool(self.candidate_trace_ids),
+            span_latest_state=bool(self.candidate_trace_ids),
         )
         extra_where, extra_params = fb.translate(self.filters)
         self.params.update(extra_params)
@@ -164,7 +183,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             self.sort_params, field_map=self.SORT_FIELD_MAP
         )
         if not order_clause:
-            order_clause = "ORDER BY start_time DESC"
+            order_clause = "ORDER BY start_time DESC, trace_id DESC"
 
         # Prefix-fetch pagination: read the sorted prefix [0, offset +
         # 2*page_size) in ONE bounded top-K pass and let the view dedup by
@@ -178,6 +197,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         # Build optional filter fragment
         filter_fragment = f"AND {extra_where}" if extra_where else ""
+
+        candidate_fragment = ""
+        candidate_dedup_fragment = ""
+        if self.candidate_trace_ids:
+            self.params["candidate_trace_ids"] = tuple(self.candidate_trace_ids)
+            candidate_fragment = "AND trace_id IN %(candidate_trace_ids)s"
+            # Candidate probes contain at most 50 point-scoped trace IDs. It is
+            # therefore safe to deduplicate root versions here, and necessary:
+            # otherwise duplicate versions for one trace can consume the
+            # bounded LIMIT and hide another matching candidate.
+            candidate_dedup_fragment = "LIMIT 1 BY trace_id"
 
         # Optional project_version_id filter (used by prototype tab)
         pv_fragment = ""
@@ -236,26 +266,38 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # (multi-root traces, un-merged ReplacingMergeTree versions) are
         # rare; the view dedups the returned page by trace_id in Python,
         # keeping the first occurrence — the same row `LIMIT 1 BY` kept.
+        span_source = f"{self.TABLE} FINAL" if self.candidate_trace_ids else self.TABLE
         query = f"""
         SELECT
             {select_clause}
-        FROM {self.TABLE}
+        FROM {span_source}
         {self.project_where()}
           AND (parent_span_id IS NULL OR parent_span_id = '')
           AND {TIME_FILTER_COLUMN} >= %(start_date)s
           AND {TIME_FILTER_COLUMN} < %(end_date)s
+          {candidate_fragment}
           {pv_fragment}
           {search_fragment}
           {filter_fragment}
         {order_clause}
+        {candidate_dedup_fragment}
         LIMIT %(limit)s
         """
         return query, self.params
 
-    def build_id_query(self) -> tuple[str, dict[str, Any]]:
+    def build_id_query(
+        self,
+        *,
+        limit: int | None = None,
+        sampling_salt: str | None = None,
+        sampling_rate: float | None = None,
+        order_by_recent_minute: bool = False,
+        latest_state: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
         """Filtered trace ids only — same root-span predicate/window as build(),
-        no pagination/order. Lets the eval resolver select the same traces this
-        list endpoint returns."""
+        no pagination/order by default. The eval resolver can request a sampled,
+        bounded newest-minute top-K so a historical task never materializes
+        every matching trace id before applying its row limit."""
         self.start_date, self.end_date = self.parse_time_range(self.filters)
         self.params["start_date"] = self.start_date
         self.params["end_date"] = self.end_date
@@ -271,10 +313,19 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             # span history. Safe here: this builder always binds
             # %(start_date)s before translate(). See filters.py.
             span_date_scope=True,
+            # Eval-task fallback probes pass a bounded trace-id candidate set.
+            # Apply that same bound inside any-span membership subqueries.
+            span_trace_id_scope=bool(self.candidate_trace_ids),
+            span_latest_state=latest_state or bool(self.candidate_trace_ids),
         )
         extra_where, extra_params = fb.translate(self.filters)
         self.params.update(extra_params)
         filter_fragment = f"AND {extra_where}" if extra_where else ""
+
+        candidate_fragment = ""
+        if self.candidate_trace_ids:
+            self.params["candidate_trace_ids"] = tuple(self.candidate_trace_ids)
+            candidate_fragment = "AND trace_id IN %(candidate_trace_ids)s"
 
         pv_fragment = ""
         if self.project_version_id:
@@ -286,17 +337,65 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             search_fragment = "AND trace_name ILIKE %(search)s"
             self.params["search"] = f"%{self.search}%"
 
+        if (sampling_salt is None) != (sampling_rate is None):
+            raise ValueError(
+                "sampling_salt and sampling_rate must be provided together"
+            )
+        sampling_fragment = ""
+        if sampling_rate is not None:
+            rate = float(sampling_rate)
+            if not 0 <= rate <= 100:
+                raise ValueError("sampling_rate must be between 0 and 100")
+            self.params["id_sampling_salt"] = str(sampling_salt)
+            self.params["id_sampling_rate"] = rate
+            sampling_fragment = (
+                "AND modulo("
+                "cityHash64(%(id_sampling_salt)s, toString(trace_id)), 100"
+                ") < %(id_sampling_rate)s"
+            )
+
+        if limit is not None:
+            if int(limit) <= 0:
+                raise ValueError("limit must be greater than zero")
+            self.params["id_limit"] = int(limit)
+            # Avoid LIMIT 1 BY for the bounded path: it retains a key for every
+            # matching trace before applying LIMIT. A small duplicate margin is
+            # fetched and de-duplicated by the eval row resolver instead.
+            dedup_fragment = ""
+            order_fragment = (
+                "ORDER BY toStartOfMinute(start_time) DESC, trace_id"
+                if order_by_recent_minute
+                else "ORDER BY trace_id"
+            )
+            order_limit_fragment = f"{order_fragment}\n        LIMIT %(id_limit)s"
+        else:
+            dedup_fragment = "LIMIT 1 BY trace_id"
+            order_limit_fragment = ""
+
+        select_fragment = (
+            "trace_id, start_time AS eval_order_start_time"
+            if order_by_recent_minute
+            else "trace_id"
+        )
+        span_source = (
+            f"{self.TABLE} FINAL"
+            if latest_state or self.candidate_trace_ids
+            else self.TABLE
+        )
         query = f"""
-        SELECT trace_id
-        FROM {self.TABLE}
+        SELECT {select_fragment}
+        FROM {span_source}
         {self.project_where()}
           AND (parent_span_id IS NULL OR parent_span_id = '')
           AND {TIME_FILTER_COLUMN} >= %(start_date)s
           AND {TIME_FILTER_COLUMN} < %(end_date)s
+          {candidate_fragment}
           {pv_fragment}
           {search_fragment}
           {filter_fragment}
-        LIMIT 1 BY trace_id
+          {sampling_fragment}
+        {dedup_fragment}
+        {order_limit_fragment}
         """
         return query, self.params
 
@@ -326,7 +425,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             attributes_extra,
             toJSONString(metadata) AS metadata,
             dictGetOrDefault('trace_dict', 'tags', toUUID(trace_id), '[]') AS trace_tags
-        FROM {self.TABLE}
+        FROM {self.TABLE} FINAL
         PREWHERE trace_id IN %(content_trace_ids)s
         WHERE {self.project_filter_sql()}
           AND is_deleted = 0
@@ -353,7 +452,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         SELECT
             trace_id,
             attributes_extra
-        FROM {self.TABLE}
+        FROM {self.TABLE} FINAL
         PREWHERE trace_id IN %(attr_trace_ids)s
         WHERE {self.project_filter_sql()}
           AND is_deleted = 0
@@ -369,6 +468,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         Returns:
             A ``(query_string, params)`` tuple returning a single count.
         """
+        # ``build(since=...)`` may have narrowed ``self.params`` for
+        # progressive page lookup. Counts always cover the user's original
+        # requested range, so re-parse and overwrite those bindings here.
+        count_start, count_end = self.parse_time_range(self.filters)
+
         fb = self._FILTER_BUILDER_CLS(
             table=self.TABLE,
             annotation_label_ids=self.annotation_label_ids,
@@ -384,6 +488,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         extra_where, extra_params = fb.translate(self.filters)
         # Merge params -- reuse the same start/end dates
         params = dict(self.params)
+        params["start_date"] = count_start
+        params["end_date"] = count_end
         params.update(extra_params)
 
         filter_fragment = f"AND {extra_where}" if extra_where else ""
@@ -690,7 +796,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if not user_query:
             return {}
 
-        result = analytics.execute_ch_query(user_query, user_params, timeout_ms=10000)
+        result = analytics.execute_ch_query(
+            user_query,
+            user_params,
+            timeout_ms=750,
+            settings={"max_threads": 2, "max_result_rows": 2000},
+        )
 
         # Build trace_id → user_id mapping (filter already applied in query)
         user_id_map = {

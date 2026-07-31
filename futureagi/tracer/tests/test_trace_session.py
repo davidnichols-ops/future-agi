@@ -341,6 +341,57 @@ class TestTraceSessionListAPI:
         )
         assert response.status_code == status.HTTP_200_OK
 
+    def test_list_sessions_marks_read_budget_failure_as_degraded(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """A timeout is not a valid empty session list."""
+        from clickhouse_driver.errors import ErrorCodes, ServerException
+
+        def fail_clickhouse(self, *args, **kwargs):
+            raise ServerException(
+                "ClickHouse query exceeded execution time",
+                code=ErrorCodes.TIMEOUT_EXCEEDED,
+            )
+
+        monkeypatch.setattr(
+            TraceSessionView,
+            "_list_sessions_clickhouse",
+            fail_clickhouse,
+        )
+
+        response = auth_client.get(
+            "/tracer/trace-session/list_sessions/",
+            {"project_id": str(observe_project.id)},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        result = get_result(response)
+        assert result["table"] == []
+        assert result["metadata"]["total_rows_is_lower_bound"] is True
+        assert result["metadata"]["query_complete"] is False
+        assert result["metadata"]["query_status"] == "degraded"
+        assert result["metadata"]["query_error_code"] == "read_budget_exceeded"
+
+    def test_list_sessions_does_not_hide_programming_error_as_empty_page(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """Only bounded-read failures qualify for the degraded 200 contract."""
+
+        def fail_clickhouse(self, *args, **kwargs):
+            raise RuntimeError("session query contract bug")
+
+        monkeypatch.setattr(
+            TraceSessionView,
+            "_list_sessions_clickhouse",
+            fail_clickhouse,
+        )
+
+        with pytest.raises(RuntimeError, match="session query contract bug"):
+            auth_client.get(
+                "/tracer/trace-session/list_sessions/",
+                {"project_id": str(observe_project.id)},
+            )
+
     def test_list_sessions_filter_bookmarked(self, auth_client, observe_project):
         """Filter sessions by bookmarked status."""
         # Create bookmarked session
@@ -631,6 +682,34 @@ class TestTraceSessionWorkspaceScopeAPI:
         assert "GROUP BY val_id" in query
         assert "toString(val_id) AS val" in query
 
+    @pytest.mark.parametrize("column", ["session_id", "user_id"])
+    def test_session_filter_values_timeout_is_explicitly_degraded(
+        self, auth_client, observe_project, column
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = TimeoutError(
+            "Code 159 private ClickHouse details"
+        )
+
+        with mock.patch(
+            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+            return_value=analytics,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/get_session_filter_values/",
+                {"project_id": str(observe_project.id), "column": column},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        payload = get_result(response)
+        assert payload == {
+            "values": [],
+            "query_complete": False,
+            "query_status": "degraded",
+            "query_error_code": "read_budget_exceeded",
+        }
+        assert b"private ClickHouse" not in response.content
+
     def test_generic_delete_cascades_session_traces_spans_and_eval_logs(
         self, auth_client, observe_project
     ):
@@ -833,8 +912,9 @@ class TestTraceSessionOverlayWritePath:
         bound_session_ids = []
         analytics = mock.Mock()
 
-        def execute_ch_query(query, params, timeout_ms):
+        def execute_ch_query(query, params, timeout_ms, settings=None):
             if "WHERE any_id IN %(ids)s" in query:
+                assert settings["timeout_overflow_mode"] == "throw"
                 return mock.Mock(
                     data=[{"any_id": requested_id, "survivor_id": survivor_id}]
                 )
@@ -887,8 +967,9 @@ class TestTraceSessionOverlayWritePath:
         captured_span_scan_params = []
         analytics = mock.Mock()
 
-        def execute_ch_query(query, params, timeout_ms):
+        def execute_ch_query(query, params, timeout_ms, settings=None):
             if "WHERE any_id IN %(ids)s" in query:
+                assert settings["timeout_overflow_mode"] == "throw"
                 return mock.Mock(data=[])
             # Session-id canonicalization scan (_expand_session_group): no
             # aliases, so the requested id stands alone.

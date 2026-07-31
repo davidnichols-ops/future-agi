@@ -175,10 +175,16 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         """
         return query, self.params
 
-    def build_id_query(self) -> tuple[str, dict[str, Any]]:
+    def build_id_query(
+        self,
+        *,
+        limit: int | None = None,
+        sampling_salt: str | None = None,
+        sampling_rate: float | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         """Filtered session ids only — same grouped, remap-aware scan as build(),
-        no pagination/order. Lets the eval resolver select the same sessions this
-        list endpoint returns."""
+        no pagination/order by default. The eval resolver can request a sampled,
+        deterministic top-K so only its bounded candidate set leaves ClickHouse."""
         self.start_date, self.end_date = self.parse_time_range(self.filters)
         self.params["start_date"] = self.start_date
         self.params["end_date"] = self.end_date
@@ -192,11 +198,37 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         extra_where, extra_params = fb.translate(span_filters)
         self.params.update(extra_params)
 
-        having_clauses = self._build_having_clauses()
+        having_conditions = [self._build_having_clauses()]
         if self.user_id:
             self.params["user_id"] = self.user_id
 
+        if (sampling_salt is None) != (sampling_rate is None):
+            raise ValueError(
+                "sampling_salt and sampling_rate must be provided together"
+            )
+        if sampling_rate is not None:
+            rate = float(sampling_rate)
+            if not 0 <= rate <= 100:
+                raise ValueError("sampling_rate must be between 0 and 100")
+            self.params["id_sampling_salt"] = str(sampling_salt)
+            self.params["id_sampling_rate"] = rate
+            having_conditions.append(
+                "modulo(cityHash64("
+                "%(id_sampling_salt)s, toString(trace_session_id)"
+                "), 100) < %(id_sampling_rate)s"
+            )
+
+        order_limit_fragment = ""
+        if limit is not None:
+            if int(limit) <= 0:
+                raise ValueError("limit must be greater than zero")
+            self.params["id_limit"] = int(limit)
+            order_limit_fragment = "ORDER BY session_id\n        LIMIT %(id_limit)s"
+
         filter_fragment = f"AND {extra_where}" if extra_where else ""
+        having_clauses = " AND ".join(
+            condition for condition in having_conditions if condition
+        )
         having_fragment = f"HAVING {having_clauses}" if having_clauses else ""
         message_select = self._message_aggregate_select()
         time_where = "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
@@ -214,6 +246,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         {from_where}
         GROUP BY trace_session_id
         {having_fragment}
+        {order_limit_fragment}
         """
         return query, self.params
 

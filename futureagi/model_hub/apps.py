@@ -183,6 +183,32 @@ class ModelHubConfig(AppConfig):
         """
         from tracer.services.clickhouse.schema import should_drop_legacy_chain
 
+        # Do not infer the live table shape from a rollout flag. During the
+        # US CH25 cutover the legacy table had already been removed while
+        # CH25_DROP_LEGACY_CDC_CHAIN was false in some backend workers. Every
+        # worker startup consequently emitted UNKNOWN_TABLE for tracer_trace.
+        # Probe the actual read-only schema and warm whichever table exists.
+        trace_warmup = None
+        try:
+            if ch.table_exists("traces"):
+                trace_warmup = (
+                    "SELECT project_id, count() FROM traces "
+                    "WHERE is_deleted = 0 "
+                    "AND created_at >= now() - INTERVAL 7 DAY "
+                    "GROUP BY project_id",
+                    "traces (7d)",
+                )
+            elif ch.table_exists("tracer_trace"):
+                trace_warmup = (
+                    "SELECT project_id, count() FROM tracer_trace "
+                    "WHERE _peerdb_is_deleted = 0 "
+                    "AND created_at >= now() - INTERVAL 7 DAY "
+                    "GROUP BY project_id",
+                    "tracer_trace (7d)",
+                )
+        except Exception as e:
+            logger.warning("CH trace cache-warm table probe failed: %s", e)
+
         warmup_queries = [
             # Warm spans index + light columns for recent data. The v2
             # spans table uses `is_deleted`; pre-cutover prod still
@@ -195,14 +221,9 @@ class ModelHubConfig(AppConfig):
                 "GROUP BY project_id",
                 "spans (7d)",
             ),
-            # Warm tracer_trace for recent data
-            (
-                "SELECT project_id, count() FROM tracer_trace "
-                "WHERE _peerdb_is_deleted = 0 "
-                "AND created_at >= now() - INTERVAL 7 DAY "
-                "GROUP BY project_id",
-                "tracer_trace (7d)",
-            ),
+            # CH25 reads trace metadata from the canonical `traces` table.
+            # Warming a table that does not exist used to emit four 30-second
+            # failures on every backend rollout in the US cluster.
             # Warm usage_apicalllog for eval metrics
             (
                 "SELECT organization_id, count() FROM usage_apicalllog "
@@ -221,6 +242,8 @@ class ModelHubConfig(AppConfig):
                 "spans_hourly_rollup (7d)",
             ),
         ]
+        if trace_warmup is not None:
+            warmup_queries.insert(1, trace_warmup)
 
         # When the legacy chain is retained (prod default), also warm
         # the legacy aggregate so it stays hot until the cutover.
@@ -234,7 +257,19 @@ class ModelHubConfig(AppConfig):
             )
         for query, label in warmup_queries:
             try:
-                ch.execute_read(query, timeout_ms=30000)
+                ch.execute_read(
+                    query,
+                    timeout_ms=750,
+                    settings={
+                        "max_threads": 2,
+                        "max_memory_usage": 128 * 1024 * 1024,
+                        "max_bytes_to_read": 512 * 1024 * 1024,
+                        "read_overflow_mode": "break",
+                        "max_result_rows": 2000,
+                        "result_overflow_mode": "break",
+                        "timeout_overflow_mode": "break",
+                    },
+                )
                 logger.info(f"CH cache warmed: {label}")
             except Exception as e:
                 logger.warning(f"CH cache warm failed for {label}: {e}")

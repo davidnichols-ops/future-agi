@@ -13,9 +13,9 @@ from django.utils import timezone
 from rest_framework import status
 
 from accounts.models.workspace import Workspace
+from model_hub.models.ai_model import AIModel
 from model_hub.models.choices import AnnotationTypeChoices, FeedbackSourceChoices
 from model_hub.models.develop_annotations import AnnotationsLabels
-from model_hub.models.ai_model import AIModel
 from model_hub.models.evals_metric import Feedback
 from tracer.models.observation_span import ObservationSpan
 from tracer.models.project import Project
@@ -76,7 +76,13 @@ def make_same_org_other_workspace_span(organization, user, trace_type="observe")
         latency_ms=250,
         status="OK",
     )
-    return other_workspace, other_project, other_project_version, other_trace, other_span
+    return (
+        other_workspace,
+        other_project,
+        other_project_version,
+        other_trace,
+        other_span,
+    )
 
 
 @pytest.mark.integration
@@ -108,6 +114,157 @@ class TestObservationSpanRetrieveAPI:
         data = get_result(response)
         # Should include eval_metrics field even if empty
         assert isinstance(data, dict)
+
+    def test_retrieve_preview_reads_ch_only_span_once(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """Task mapping can hydrate a span that has no PostgreSQL span row."""
+        from tracer.services.clickhouse.query_service import (
+            AnalyticsQueryService,
+            QueryResult,
+        )
+
+        calls = []
+        span_id = f"ch-only-{uuid.uuid4().hex[:16]}"
+        trace_id = str(uuid.uuid4())
+        now = timezone.now()
+
+        def fake_execute(self, query, params=None, timeout_ms=10000, settings=None):
+            calls.append((query, params, timeout_ms, settings))
+            return QueryResult(
+                data=[
+                    {
+                        "id": span_id,
+                        "project_id": str(observe_project.id),
+                        "project_version_id": None,
+                        "trace_id": trace_id,
+                        "parent_span_id": None,
+                        "name": "CH-only mapping span",
+                        "observation_type": "llm",
+                        "start_time": now,
+                        "end_time": now,
+                        "input": '{"prompt":"hello"}',
+                        "output": '{"answer":"world"}',
+                        "model": "test-model",
+                        "model_parameters": "{}",
+                        "latency_ms": 1,
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                        "cost": 0,
+                        "status": "OK",
+                        "status_message": "",
+                        "tags": [],
+                        "span_attributes": "{}",
+                        "span_events": [],
+                        "provider": "",
+                        "metadata_json": "{}",
+                        "custom_eval_config_id": None,
+                        "attrs_string": {"prompt_slug": "synthetic_prompt_v2"},
+                        "attrs_number": {},
+                        "attrs_bool": {},
+                    }
+                ],
+                row_count=1,
+                backend_used="clickhouse",
+                query_time_ms=1,
+            )
+
+        monkeypatch.setattr(
+            AnalyticsQueryService,
+            "execute_ch_query",
+            fake_execute,
+        )
+
+        response = auth_client.get(
+            f"/tracer/observation-span/{span_id}/",
+            {"preview": "true"},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        result = get_result(response)
+        assert result["observation_span"]["id"] == span_id
+        assert result["observation_span"]["span_attributes"] == {
+            "prompt_slug": "synthetic_prompt_v2"
+        }
+        assert result["evals_metrics"] == {}
+        assert len(calls) == 1
+        assert calls[0][2] == 750
+        assert calls[0][3]["max_threads"] == 2
+
+    def test_retrieve_keeps_base_span_when_eval_schema_lags(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """Optional eval lifecycle columns cannot take down span detail."""
+        from tracer.services.clickhouse.query_service import (
+            AnalyticsQueryService,
+            QueryResult,
+        )
+
+        span_id = f"ch-only-{uuid.uuid4().hex[:16]}"
+        trace_id = str(uuid.uuid4())
+        now = timezone.now()
+        base_row = {
+            "id": span_id,
+            "project_id": str(observe_project.id),
+            "project_version_id": None,
+            "trace_id": trace_id,
+            "parent_span_id": None,
+            "name": "CH-only span",
+            "observation_type": "llm",
+            "start_time": now,
+            "end_time": now,
+            "input": '{"prompt":"hello"}',
+            "output": '{"answer":"world"}',
+            "model": "test-model",
+            "model_parameters": "{}",
+            "latency_ms": 1,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+            "cost": 0,
+            "status": "OK",
+            "status_message": "",
+            "tags": [],
+            "span_attributes": "{}",
+            "span_events": [],
+            "provider": "",
+            "metadata_json": "{}",
+            "custom_eval_config_id": None,
+            "attrs_string": {},
+            "attrs_number": {},
+            "attrs_bool": {},
+        }
+
+        def fake_execute(self, query, params=None, timeout_ms=10000, settings=None):
+            data = [{"id": span_id}] if "SELECT DISTINCT id" in query else [base_row]
+            return QueryResult(
+                data=data,
+                row_count=len(data),
+                backend_used="clickhouse",
+                query_time_ms=1,
+            )
+
+        monkeypatch.setattr(
+            AnalyticsQueryService,
+            "execute_ch_query",
+            fake_execute,
+        )
+        monkeypatch.setattr(
+            AnalyticsQueryService,
+            "get_children_eval_metrics_ch",
+            lambda self, span_ids: (_ for _ in ()).throw(
+                RuntimeError("Unknown identifier status")
+            ),
+        )
+
+        response = auth_client.get(f"/tracer/observation-span/{span_id}/")
+
+        assert response.status_code == status.HTTP_200_OK
+        result = get_result(response)
+        assert result["observation_span"]["id"] == span_id
+        assert result["evals_metrics"] == {}
+        assert result["evals_metrics_degraded"] is True
 
     def test_retrieve_span_not_found(self, auth_client):
         """Retrieve non-existent span returns error."""
@@ -195,10 +352,8 @@ class TestObservationSpanWorkspaceScopeAPI:
     def test_list_and_index_reject_same_org_other_workspace_project_version(
         self, auth_client, organization, user
     ):
-        _, _, other_project_version, _, other_span = (
-            make_same_org_other_workspace_span(
-                organization, user, trace_type="experiment"
-            )
+        _, _, other_project_version, _, other_span = make_same_org_other_workspace_span(
+            organization, user, trace_type="experiment"
         )
 
         list_response = auth_client.get(
@@ -578,27 +733,26 @@ class TestObservationSpanListSpansAPI:
 
         assert response.status_code == status.HTTP_400_BAD_REQUEST
 
-    def test_list_spans_falls_back_to_postgres_when_clickhouse_fails(
-        self, auth_client, project_version, observation_span, monkeypatch
+    def test_list_spans_marks_read_budget_failure_as_degraded(
+        self, auth_client, project_version, monkeypatch
     ):
-        """Unlike the fail-closed observe sibling, the experiment/prototype
-        `list_spans` path keeps the PG fallback: a CH error returns PG rows
-        rather than 400ing the prototype span list."""
-        from tracer.services.clickhouse.query_service import QueryType
+        """Direct-to-CH telemetry must not fall back to stale PostgreSQL rows."""
+        from clickhouse_driver.errors import ErrorCodes, ServerException
+
         from tracer.views.observation_span import ObservationSpanView
 
-        observation_span.project_version = project_version
-        observation_span.save(update_fields=["project_version"])
-
-        monkeypatch.setattr(
-            "tracer.views.observation_span.AnalyticsQueryService.should_use_clickhouse",
-            lambda self, query_type: query_type == QueryType.SPAN_LIST,
-        )
-
         def fail_clickhouse(
-            self, request, project_version_id, project_version, analytics, validated_data
+            self,
+            request,
+            project_version_id,
+            project_version,
+            analytics,
+            validated_data,
         ):
-            raise RuntimeError("clickhouse unavailable")
+            raise ServerException(
+                "ClickHouse query exceeded execution time",
+                code=ErrorCodes.TIMEOUT_EXCEEDED,
+            )
 
         monkeypatch.setattr(
             ObservationSpanView,
@@ -612,8 +766,39 @@ class TestObservationSpanListSpansAPI:
         )
 
         assert response.status_code == status.HTTP_200_OK
-        rows = get_result(response).get("table", [])
-        assert any(row["span_id"] == observation_span.id for row in rows)
+        result = get_result(response)
+        assert result["table"] == []
+        assert result["metadata"]["total_rows_is_lower_bound"] is True
+        assert result["metadata"]["query_complete"] is False
+        assert result["metadata"]["query_status"] == "degraded"
+        assert result["metadata"]["query_error_code"] == "read_budget_exceeded"
+
+    def test_list_spans_does_not_hide_programming_error_as_empty_page(
+        self, auth_client, project_version, monkeypatch
+    ):
+        from tracer.views.observation_span import ObservationSpanView
+
+        def fail_clickhouse(
+            self,
+            request,
+            project_version_id,
+            project_version,
+            analytics,
+            validated_data,
+        ):
+            raise RuntimeError("span query contract bug")
+
+        monkeypatch.setattr(
+            ObservationSpanView,
+            "_list_spans_non_observe_clickhouse",
+            fail_clickhouse,
+        )
+
+        with pytest.raises(RuntimeError, match="span query contract bug"):
+            auth_client.get(
+                "/tracer/observation-span/list_spans/",
+                {"project_version_id": str(project_version.id), "filters": "[]"},
+            )
 
 
 @pytest.mark.integration
@@ -639,7 +824,7 @@ class TestObservationSpanListSpansObserveAPI:
     ):
         """List spans for observe project."""
         # Create a span for the observe project
-        span = ObservationSpan.objects.create(
+        ObservationSpan.objects.create(
             id=f"observe_span_{uuid.uuid4().hex[:8]}",
             project=observe_project,
             trace=session_trace,
@@ -655,11 +840,305 @@ class TestObservationSpanListSpansObserveAPI:
         )
         assert response.status_code == status.HTTP_200_OK
 
-    def test_list_spans_observe_fails_closed_when_clickhouse_fails(
+    def test_task_preview_skips_count_content_and_metric_queries(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """A cheap exact whole-window read fills the task preview.
+
+        Exact counts, content hydration, eval discovery, and annotation pivots
+        are grid concerns. A healthy low-volume tenant can prove the requested
+        window under a small sub-budget; high-volume requests fall back to
+        minute slices under the same shared deadline.
+        """
+        from tracer.services.clickhouse.query_service import (
+            AnalyticsQueryService,
+            QueryResult,
+        )
+
+        calls = []
+        now = timezone.now()
+
+        def fake_execute(self, query, params=None, timeout_ms=10000, settings=None):
+            calls.append((query, params, timeout_ms, settings))
+            return QueryResult(
+                data=[
+                    {
+                        "id": f"preview-span-{index:02d}",
+                        "trace_id": str(uuid.uuid4()),
+                        "name": "preview",
+                        "observation_type": "llm",
+                        "status": "OK",
+                        "start_time": now,
+                        "end_time": now,
+                        "latency_ms": 1,
+                        "cost": 0,
+                        "total_tokens": 1,
+                        "prompt_tokens": 1,
+                        "completion_tokens": 0,
+                        "model": "",
+                        "provider": "",
+                        "end_user_id": None,
+                        "created_at": now,
+                    }
+                    for index in range(20)
+                ],
+                row_count=20,
+                backend_used="clickhouse",
+                query_time_ms=1,
+            )
+
+        monkeypatch.setattr(
+            AnalyticsQueryService,
+            "execute_ch_query",
+            fake_execute,
+        )
+
+        response = auth_client.get(
+            "/tracer/observation-span/list_spans_observe/",
+            {
+                "project_id": str(observe_project.id),
+                "page_number": 0,
+                "page_size": 50,
+                "preview": "true",
+                "filters": json.dumps(
+                    [
+                        {
+                            "column_id": "prompt_slug",
+                            "filter_config": {
+                                "filter_type": "text",
+                                "filter_op": "equals",
+                                "filter_value": "synthetic_prompt_v2",
+                                "col_type": "SPAN_ATTRIBUTE",
+                            },
+                        },
+                        {
+                            "column_id": "created_at",
+                            "filter_config": {
+                                "filter_type": "datetime",
+                                "filter_op": "between",
+                                "filter_value": [
+                                    (now - timedelta(days=180)).isoformat(),
+                                    now.isoformat(),
+                                ],
+                                "col_type": "SYSTEM_METRIC",
+                            },
+                        },
+                    ]
+                ),
+            },
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert len(calls) == 1
+        query, params, timeout_ms, settings = calls[0]
+        assert 0 < timeout_ms <= 750
+        assert settings["max_threads"] == 2
+        assert settings["max_result_rows"] == 30
+        assert "ORDER BY start_time DESC" in query
+        assert "start_time >= %(slice_start)s" in query
+        assert "start_time < %(slice_end)s" in query
+        assert "LIMIT %(limit)s" in query
+        assert "count(" not in query.lower()
+        assert params["slice_end"] - params["slice_start"] == timedelta(days=180)
+        assert timeout_ms == 250
+        result = get_result(response)
+        assert result["table"][0]["span_id"] == "preview-span-00"
+        assert result["metadata"]["query_complete"] is True
+
+    def test_boolean_attribute_task_preview_uses_bounded_list_path(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """Boolean attributes use the same bounded endpoint path as text."""
+        from tracer.services.clickhouse.query_service import (
+            AnalyticsQueryService,
+            QueryResult,
+        )
+
+        calls = []
+        now = timezone.now()
+
+        def fake_execute(self, query, params=None, timeout_ms=10000, settings=None):
+            calls.append((query, params, timeout_ms, settings))
+            return QueryResult(
+                data=[
+                    {
+                        "id": "boolean-preview-span",
+                        "trace_id": str(uuid.uuid4()),
+                        "name": "preview",
+                        "observation_type": "llm",
+                        "status": "OK",
+                        "start_time": now,
+                        "end_time": now,
+                        "latency_ms": 1,
+                        "cost": 0,
+                        "total_tokens": 1,
+                        "prompt_tokens": 1,
+                        "completion_tokens": 0,
+                        "model": "",
+                        "provider": "",
+                        "end_user_id": None,
+                        "created_at": now,
+                    }
+                ],
+                row_count=1,
+                backend_used="clickhouse",
+                query_time_ms=1,
+            )
+
+        monkeypatch.setattr(
+            AnalyticsQueryService,
+            "execute_ch_query",
+            fake_execute,
+        )
+
+        response = auth_client.get(
+            "/tracer/observation-span/list_spans_observe/",
+            {
+                "project_id": str(observe_project.id),
+                "page_number": 0,
+                "page_size": 50,
+                "preview": "true",
+                "filters": json.dumps(
+                    [
+                        {
+                            "column_id": "customer_boolean_flag",
+                            "filter_config": {
+                                "filter_type": "boolean",
+                                "filter_op": "equals",
+                                "filter_value": True,
+                                "col_type": "SPAN_ATTRIBUTE",
+                            },
+                        },
+                        {
+                            "column_id": "created_at",
+                            "filter_config": {
+                                "filter_type": "datetime",
+                                "filter_op": "between",
+                                "filter_value": [
+                                    (now - timedelta(days=1)).isoformat(),
+                                    now.isoformat(),
+                                ],
+                                "col_type": "SYSTEM_METRIC",
+                            },
+                        },
+                    ]
+                ),
+            },
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert len(calls) == 1
+        query, params, timeout_ms, settings = calls[0]
+        assert "span_attr_bool" in query or "attrs_bool" in query
+        boolean_params = [
+            value for key, value in params.items() if key.startswith("attr_")
+        ]
+        assert boolean_params == [1]
+        assert "start_time >= %(slice_start)s" in query
+        assert "start_time < %(slice_end)s" in query
+        assert timeout_ms == 250
+        assert settings["timeout_overflow_mode"] == "throw"
+        assert settings["read_overflow_mode"] == "throw"
+        result = get_result(response)
+        assert result["table"][0]["span_id"] == "boolean-preview-span"
+        assert result["metadata"]["query_complete"] is True
+
+    def test_string_filtered_grid_does_not_repeat_a_full_window_count(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """The list page uses the proven unique prefix as its count lower bound."""
+        from tracer.services.clickhouse.query_service import (
+            AnalyticsQueryService,
+            QueryResult,
+        )
+
+        calls = []
+        now = timezone.now()
+
+        def fake_execute(self, query, params=None, timeout_ms=10000, settings=None):
+            calls.append((query, params, timeout_ms, settings))
+            if "ORDER BY start_time DESC" in query:
+                data = [
+                    {
+                        "id": f"grid-span-{index}",
+                        "trace_id": str(uuid.uuid4()),
+                        "name": "grid",
+                        "observation_type": "llm",
+                        "status": "OK",
+                        "start_time": now - timedelta(seconds=index),
+                        "end_time": now,
+                        "latency_ms": index,
+                        "cost": 0,
+                        "total_tokens": 1,
+                        "prompt_tokens": 1,
+                        "completion_tokens": 0,
+                        "model": "",
+                        "provider": "",
+                        "end_user_id": None,
+                        "created_at": now,
+                    }
+                    for index in range(4)
+                ]
+            else:
+                # Content enrichment is allowed; the regression is specifically
+                # that no wide string-filter COUNT is issued.
+                data = []
+            return QueryResult(data, len(data), "clickhouse", 1)
+
+        monkeypatch.setattr(
+            AnalyticsQueryService,
+            "execute_ch_query",
+            fake_execute,
+        )
+
+        response = auth_client.get(
+            "/tracer/observation-span/list_spans_observe/",
+            {
+                "project_id": str(observe_project.id),
+                "page_number": 0,
+                "page_size": 2,
+                "filters": json.dumps(
+                    [
+                        {
+                            "column_id": "arbitrary_customer_attribute",
+                            "filter_config": {
+                                "filter_type": "text",
+                                "filter_op": "equals",
+                                "filter_value": "arbitrary-value",
+                                "col_type": "SPAN_ATTRIBUTE",
+                            },
+                        },
+                        {
+                            "column_id": "start_time",
+                            "filter_config": {
+                                "filter_type": "datetime",
+                                "filter_op": "between",
+                                "filter_value": [
+                                    (now - timedelta(minutes=5)).isoformat(),
+                                    now.isoformat(),
+                                ],
+                                "col_type": "SYSTEM_METRIC",
+                            },
+                        },
+                    ]
+                ),
+            },
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert not any("count()" in query.lower() for query, *_ in calls)
+        result = get_result(response)
+        assert len(result["table"]) == 2
+        assert result["metadata"]["total_rows"] == 4
+        assert result["metadata"]["total_rows_is_lower_bound"] is True
+        assert result["metadata"]["query_complete"] is True
+
+    def test_list_spans_observe_fails_open_when_clickhouse_fails(
         self, auth_client, observe_project, session_trace, monkeypatch
     ):
-        """CH is authoritative post-migration: a CH error surfaces as 400
-        rather than falling back to the dropped-table PG path."""
+        """CH is authoritative, but an analytics outage must not become 400."""
+        from clickhouse_driver.errors import ErrorCodes, ServerException
+
         from tracer.services.clickhouse.query_service import QueryType
         from tracer.views.observation_span import ObservationSpanView
 
@@ -681,7 +1160,10 @@ class TestObservationSpanListSpansObserveAPI:
         def fail_clickhouse(
             self, request, project_id, validated_data, analytics, **kwargs
         ):
-            raise RuntimeError("clickhouse unavailable")
+            raise ServerException(
+                "ClickHouse query exceeded execution time",
+                code=ErrorCodes.TIMEOUT_EXCEEDED,
+            )
 
         monkeypatch.setattr(
             ObservationSpanView,
@@ -694,7 +1176,36 @@ class TestObservationSpanListSpansObserveAPI:
             {"project_id": str(observe_project.id), "filters": "[]"},
         )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_200_OK
+        result = get_result(response)
+        assert result["table"] == []
+        assert result["metadata"]["total_rows_is_lower_bound"] is True
+        assert result["metadata"]["query_complete"] is False
+        assert result["metadata"]["query_status"] == "degraded"
+        assert result["metadata"]["query_error_code"] == "read_budget_exceeded"
+
+    def test_list_spans_does_not_hide_programming_error_as_empty_page(
+        self, auth_client, observe_project, monkeypatch
+    ):
+        """Only bounded-read failures qualify for the degraded 200 contract."""
+        from tracer.views.observation_span import ObservationSpanView
+
+        def fail_clickhouse(
+            self, request, project_id, validated_data, analytics, **kwargs
+        ):
+            raise RuntimeError("query contract bug")
+
+        monkeypatch.setattr(
+            ObservationSpanView,
+            "_list_spans_clickhouse",
+            fail_clickhouse,
+        )
+
+        with pytest.raises(RuntimeError, match="query contract bug"):
+            auth_client.get(
+                "/tracer/observation-span/list_spans_observe/",
+                {"project_id": str(observe_project.id), "filters": "[]"},
+            )
 
 
 @pytest.mark.integration
@@ -1032,9 +1543,7 @@ class TestObservationSpanCreateOtelSpanAPI:
         self, auth_client, observe_project, organization, user
     ):
         """OTEL create must not attach spans to an existing trace from another project."""
-        _, _, _, other_trace, _ = make_same_org_other_workspace_span(
-            organization, user
-        )
+        _, _, _, other_trace, _ = make_same_org_other_workspace_span(organization, user)
         span_id = f"otel_cross_workspace_{uuid.uuid4().hex[:8]}"
         now_ns = int(timezone.now().timestamp() * 1_000_000_000)
 

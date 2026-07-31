@@ -199,6 +199,150 @@ class TestClickHouseFilterBuilderV2:
         assert meta["boolean"][0] == cols.ATTRS_BOOL
 
 
+class TestV2IndexedTextAndSystemFilters:
+    @staticmethod
+    def _translate(
+        column_id: str,
+        filter_op: str,
+        filter_value=None,
+        *,
+        col_type: str = "SPAN_ATTRIBUTE",
+        query_mode: str = ClickHouseFilterBuilderV2.QUERY_MODE_SPAN,
+    ):
+        config = {
+            "col_type": col_type,
+            "filter_type": "text",
+            "filter_op": filter_op,
+        }
+        if filter_value is not None:
+            config["filter_value"] = filter_value
+        return ClickHouseFilterBuilderV2(
+            table="spans",
+            query_mode=query_mode,
+        ).translate([{"column_id": column_id, "filter_config": config}])
+
+    @pytest.mark.parametrize("filter_op", ["contains", "starts_with", "ends_with"])
+    def test_positive_attribute_substring_uses_ngram_index_expression(self, filter_op):
+        sql, params = self._translate("customer.tier", filter_op, "PrEmIuM")
+
+        assert (
+            "arrayStringConcat(arrayMap(x -> lower(x), "
+            "mapValues(attrs_string))) LIKE" in sql
+        )
+        ngram_params = [
+            value for key, value in params.items() if key.startswith("attr_ngram")
+        ]
+        assert ngram_params == ["%premium%"]
+
+    def test_short_attribute_substring_has_no_ngram_companion(self):
+        sql, params = self._translate("customer.tier", "contains", "pro")
+
+        assert "arrayStringConcat" not in sql
+        assert not any(key.startswith("attr_ngram") for key in params)
+
+    @pytest.mark.parametrize(
+        ("filter_op", "filter_value"),
+        [
+            ("equals", "ÉLITE"),
+            ("in", ["premium", "ÉLITE"]),
+            ("contains", "ÉLITE"),
+        ],
+    )
+    def test_non_ascii_text_has_no_ascii_lower_index_companion(
+        self, filter_op, filter_value
+    ):
+        sql, params = self._translate("customer.tier", filter_op, filter_value)
+
+        assert "arrayMap(x -> lower(x), mapValues(attrs_string))" not in sql
+        assert "arrayStringConcat" not in sql
+        if filter_op in ("equals", "in"):
+            assert "lowerUTF8(attrs_string['customer.tier'])" in sql
+        assert not any(
+            key.startswith(("attrv", "attr_ngram")) for key in params
+        )
+
+    def test_negative_attribute_substring_has_no_positive_companion(self):
+        sql, params = self._translate("customer.tier", "not_contains", "premium")
+
+        assert "NOT ILIKE" in sql
+        assert "arrayStringConcat" not in sql
+        assert not any(key.startswith("attr_ngram") for key in params)
+
+    def test_service_name_targets_physical_column(self):
+        sql, params = self._translate(
+            "service_name",
+            "in",
+            ["Checkout", "Billing"],
+            col_type="SYSTEM_METRIC",
+        )
+
+        assert "lower(service_name) IN" in sql
+        assert "attrs_string['service_name']" not in sql
+        assert ("checkout", "billing") in params.values()
+
+    def test_tag_exact_filter_reads_json_array_elements(self):
+        sql, params = self._translate(
+            "tag", "in", ["Production", "Canary"], col_type="SYSTEM_METRIC"
+        )
+
+        assert "JSONExtract(tags, 'Array(String)')" in sql
+        assert "arrayExists(x -> lowerUTF8(x) IN" in sql
+        assert "attrs_string['tag']" not in sql
+        assert ("production", "canary") in params.values()
+
+    def test_tag_exact_filter_uses_unicode_aware_casefold(self):
+        sql, params = self._translate(
+            "tag", "equals", "ÉLITE", col_type="SYSTEM_METRIC"
+        )
+
+        assert "arrayExists(x -> lowerUTF8(x) =" in sql
+        assert "élite" in params.values()
+
+    def test_trace_tag_filter_reads_trace_dictionary_without_span_membership_set(self):
+        sql, params = self._translate(
+            "tag",
+            "equals",
+            "Production",
+            col_type="SYSTEM_METRIC",
+            query_mode=ClickHouseFilterBuilderV2.QUERY_MODE_TRACE,
+        )
+
+        assert "dictGetOrDefault('trace_dict', 'tags', toUUID(trace_id), '[]')" in sql
+        assert "JSONExtract(tags, 'Array(String)')" not in sql
+        assert "trace_id IN (SELECT" not in sql
+        assert "production" in params.values()
+
+    def test_tag_contains_and_negation_apply_per_array_element(self):
+        contains_sql, _ = self._translate(
+            "tag", "contains", "prod", col_type="SYSTEM_METRIC"
+        )
+        negated_sql, _ = self._translate(
+            "tag", "not_contains", "prod", col_type="SYSTEM_METRIC"
+        )
+
+        assert "arrayExists(x -> x ILIKE" in contains_sql
+        assert "JSONExtract(tags, 'Array(String)')" in contains_sql
+        assert "notEmpty(JSONExtract(tags, 'Array(String)'))" in negated_sql
+        assert "NOT (arrayExists(x -> x ILIKE" in negated_sql
+
+    @pytest.mark.parametrize(
+        ("filter_op", "filter_value"),
+        [
+            ("not_equals", "production"),
+            ("not_in", ["production", "canary"]),
+        ],
+    )
+    def test_negative_tag_filters_require_a_non_empty_array(
+        self, filter_op, filter_value
+    ):
+        sql, _ = self._translate(
+            "tag", filter_op, filter_value, col_type="SYSTEM_METRIC"
+        )
+
+        assert "notEmpty(JSONExtract(tags, 'Array(String)'))" in sql
+        assert "AND NOT (arrayExists(" in sql
+
+
 class TestEndUserDimensionSource:
     """Pin the v1→v2 end-user dimension swap on the user/user_id filter path.
 

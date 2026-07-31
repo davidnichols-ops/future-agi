@@ -23,6 +23,7 @@ vi.mock("src/utils/axios", () => ({
         `/tracer/dashboard/${dashboardId}/widgets/reorder/`,
       widgetDuplicate: (dashboardId, widgetId) =>
         `/tracer/dashboard/${dashboardId}/widgets/${widgetId}/duplicate/`,
+      filterValues: "/tracer/dashboard/filter_values/",
     },
   },
 }));
@@ -33,6 +34,7 @@ import {
   useDeleteWidget,
   useReorderWidgets,
   useDuplicateWidget,
+  useDashboardFilterValues,
 } from "../useDashboards";
 
 const DASHBOARD_LIST_KEY = ["dashboards", "list"];
@@ -175,5 +177,65 @@ describe("useDashboards widget mutations", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: DASHBOARD_LIST_KEY,
     });
+  });
+});
+
+describe("useDashboardFilterValues", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns a legitimate empty value set as a successful query", async () => {
+    mocks.get.mockResolvedValueOnce({
+      data: { result: { values: [] } },
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    const { result } = renderHook(
+      () =>
+        useDashboardFilterValues({
+          metricName: "final_status",
+          metricType: "custom_attribute",
+          projectIds: ["project-1"],
+        }),
+      { wrapper: createQueryWrapper(queryClient) },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual([]);
+  });
+
+  it("surfaces a degraded response without exposing backend details", async () => {
+    mocks.get.mockResolvedValueOnce({
+      data: {
+        result: {
+          values: [],
+          query_complete: false,
+          query_status: "degraded",
+          message: "Code: 159. DB::Exception: private stack",
+        },
+      },
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    const { result } = renderHook(
+      () =>
+        useDashboardFilterValues({
+          metricName: "final_status",
+          metricType: "custom_attribute",
+          projectIds: ["project-1"],
+        }),
+      { wrapper: createQueryWrapper(queryClient) },
+    );
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error.message).toBe(
+      "Filter values are temporarily unavailable",
+    );
+    expect(result.current.error.message).not.toMatch(/DB::Exception/i);
   });
 });

@@ -7,9 +7,13 @@ Endpoints:
 3. GET /api/traces/span-attribute-detail/<key>/ - Full detail for a specific attribute key
 """
 
+from collections import Counter
 from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 
 import structlog
+from django.conf import settings
+from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -26,11 +30,34 @@ from tracer.serializers.span_attributes import (
     SpanAttributeValuesResponseSerializer,
 )
 from tracer.services.clickhouse.client import ClickHouseClient, is_clickhouse_enabled
+from tracer.services.clickhouse.query_service import (
+    merge_guaranteed_span_attribute_keys,
+)
+from tracer.services.clickhouse.read_budget import is_read_budget_error
 from tracer.services.clickhouse.span_attribute_lookups import (
+    find_attribute_key_for_project,
     list_attribute_keys_for_project,
 )
+from tracer.utils.workspace_scope import project_queryset_for_request
 
 logger = structlog.get_logger(__name__)
+
+SPAN_ATTRIBUTE_VALUES_LOOKBACK_DAYS = 7
+SPAN_ATTRIBUTE_READ_TIMEOUT_MS = 750
+# The existing aggregate contains more keys, but this endpoint discovers
+# values across all spans. Only verified root attributes are semantically
+# equivalent to the root-span rollup.
+SPAN_ATTRIBUTE_ROLLUP_KEYS = frozenset({"final_status"})
+SPAN_ATTRIBUTE_VALUE_SAMPLE_MAX_ROWS = 2000
+SPAN_ATTRIBUTE_READ_SETTINGS = {
+    "timeout_overflow_mode": "throw",
+    "max_threads": 2,
+    "max_memory_usage": 256 * 1024 * 1024,
+    "max_bytes_to_read": 1024 * 1024 * 1024,
+    "read_overflow_mode": "throw",
+    "max_result_rows": SPAN_ATTRIBUTE_VALUE_SAMPLE_MAX_ROWS,
+    "result_overflow_mode": "throw",
+}
 
 ERROR_RESPONSES = {
     400: ApiTextErrorResponseSerializer,
@@ -40,14 +67,84 @@ ERROR_RESPONSES = {
 }
 
 
+def _project_is_in_request_scope(request, project_id: str) -> bool:
+    """Fail closed unless the project belongs to the active org/workspace."""
+    return project_queryset_for_request(request).filter(id=project_id).exists()
+
+
+def _attribute_values_lookback_days() -> int:
+    """Use the shared picker lookback while keeping bad config safely bounded."""
+    configured = getattr(
+        settings,
+        "FILTER_VALUES_DEFAULT_LOOKBACK_DAYS",
+        SPAN_ATTRIBUTE_VALUES_LOOKBACK_DAYS,
+    )
+    try:
+        return min(max(int(configured), 1), 30)
+    except (TypeError, ValueError):
+        return SPAN_ATTRIBUTE_VALUES_LOOKBACK_DAYS
+
+
+def _attribute_values_window() -> tuple[datetime, datetime]:
+    window_end = timezone.now().astimezone(UTC)
+    return window_end - timedelta(days=_attribute_values_lookback_days()), window_end
+
+
+def _covered_attribute_rollup_window(
+    window_start: datetime, window_end: datetime
+) -> tuple[datetime, datetime] | None:
+    """Return the exact complete-hour interval covered by the picker rollup."""
+    if not getattr(settings, "TRACE_FILTER_VALUES_ATTR_ROLLUP_ENABLED", False):
+        return None
+
+    covered_since = getattr(settings, "DASHBOARD_ATTR_ROLLUP_COVERED_SINCE", None)
+    if not isinstance(covered_since, datetime):
+        return None
+    if covered_since.tzinfo is None:
+        covered_since = covered_since.replace(tzinfo=UTC)
+    else:
+        covered_since = covered_since.astimezone(UTC)
+
+    # The MV updates the active hourly aggregate as spans arrive. Comparing the
+    # bucket timestamp with the real request end includes that active hour, so a
+    # newly ingested value does not disappear from the picker until the next
+    # hour. Keep the real end in response metadata rather than claiming future
+    # coverage by rounding it up.
+    rollup_end = window_end
+    rollup_start = window_start.replace(minute=0, second=0, microsecond=0)
+    if rollup_start < covered_since or rollup_start >= rollup_end:
+        return None
+    return rollup_start, rollup_end
+
+
+def _escaped_like_pattern(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _attribute_root_span_clause(key: str) -> str:
+    if key in SPAN_ATTRIBUTE_ROLLUP_KEYS:
+        return "AND (parent_span_id IS NULL OR parent_span_id = '') "
+    return ""
+
+
+def _utc_iso(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _attribute_key_payload(key) -> dict:
+    payload = asdict(key)
+    return {name: value for name, value in payload.items() if value is not None}
+
+
 class SpanAttributeKeysView(APIView):
     """
-    Discover all span attribute keys for a project.
+    Browse or exactly probe span attribute keys for a project.
 
-    Returns every distinct key across the string, number, and boolean attribute
-    maps together with its inferred type and occurrence count.
+    The default response is a bounded sample across the three typed Maps.
+    Supplying ``q`` performs an exact key-existence/type probe.
 
-    GET /api/traces/span-attribute-keys/?project_id=<uuid>
+    GET /api/traces/span-attribute-keys/?project_id=<uuid>[&q=<exact_key>]
     """
 
     permission_classes = [IsAuthenticated]
@@ -58,22 +155,81 @@ class SpanAttributeKeysView(APIView):
         responses={200: SpanAttributeKeysResponseSerializer, **ERROR_RESPONSES},
     )
     def get(self, request, *args, **kwargs):
+        query_params = request.validated_query_data
+        project_id = str(query_params["project_id"])
+        exact_key = query_params.get("q")
+        if not _project_is_in_request_scope(request, project_id):
+            return self._gm.not_found("Project not found")
+
         if not is_clickhouse_enabled():
             return self._gm.custom_error_response(503, "ClickHouse is not enabled")
 
-        project_id = str(request.validated_query_data["project_id"])
-
+        window_start, window_end = _attribute_values_window()
         try:
-            keys = list_attribute_keys_for_project(project_id)
+            if exact_key:
+                key = find_attribute_key_for_project(
+                    project_id,
+                    exact_key,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+                return Response(
+                    {
+                        "result": [_attribute_key_payload(key)] if key else [],
+                        "query_complete": True,
+                        "query_status": "complete",
+                        "query_window_start": _utc_iso(window_start),
+                        "query_window_end": _utc_iso(window_end),
+                    },
+                    status=200,
+                )
+
+            keys = list_attribute_keys_for_project(
+                project_id,
+                window_start=window_start,
+                window_end=window_end,
+            )
             return Response(
-                {"result": [asdict(k) for k in keys]}, status=200
+                {
+                    "result": [_attribute_key_payload(k) for k in keys],
+                    # Discovery deliberately samples at most 10k rows from
+                    # each typed Map so a whale tenant cannot trigger the
+                    # Code 396/159 full-map explosion. Guaranteed root keys
+                    # (including final_status) and saved eval mappings are
+                    # merged separately, but arbitrary rare keys may still be
+                    # outside this sample; never label it as exhaustive.
+                    "query_complete": False,
+                    "query_status": "sampled",
+                    "query_error_code": "sample_limit",
+                    "query_window_start": _utc_iso(window_start),
+                    "query_window_end": _utc_iso(window_end),
+                },
+                status=200,
             )
         except Exception as e:
-            logger.error(
+            logger.warning(
                 "span_attribute_keys_failed",
                 project_id=project_id,
-                error=str(e),
+                error_type=type(e).__name__,
             )
+            if is_read_budget_error(e):
+                return Response(
+                    {
+                        "result": (
+                            []
+                            if exact_key
+                            else merge_guaranteed_span_attribute_keys(
+                                [], include_counts=True
+                            )
+                        ),
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "read_budget_exceeded",
+                        "query_window_start": _utc_iso(window_start),
+                        "query_window_end": _utc_iso(window_end),
+                    },
+                    status=200,
+                )
             return self._gm.internal_server_error_response(
                 "Failed to fetch span attribute keys"
             )
@@ -97,51 +253,110 @@ class SpanAttributeValuesView(APIView):
         responses={200: SpanAttributeValuesResponseSerializer, **ERROR_RESPONSES},
     )
     def get(self, request, *args, **kwargs):
-        if not is_clickhouse_enabled():
-            return self._gm.custom_error_response(503, "ClickHouse is not enabled")
-
         query_params = request.validated_query_data
         project_id = str(query_params["project_id"])
         key = query_params["key"]
         q = query_params.get("q")
         limit = query_params.get("limit", 50)
 
+        if not _project_is_in_request_scope(request, project_id):
+            return self._gm.not_found("Project not found")
+
+        if not is_clickhouse_enabled():
+            return self._gm.custom_error_response(503, "ClickHouse is not enabled")
+
+        window_start, window_end = _attribute_values_window()
         params = {
             "project_id": project_id,
             "key": key,
             "limit": limit,
+            "window_start": window_start,
+            "window_end": window_end,
         }
+        used_rollup = False
 
+        search_clause = ""
         if q:
-            query = """
-                SELECT attrs_string[%(key)s] AS value, count() AS cnt
-                FROM spans
-                WHERE project_id = %(project_id)s
-                  AND mapContains(attrs_string, %(key)s)
-                  AND attrs_string[%(key)s] != ''
-                  AND attrs_string[%(key)s] LIKE %(q_pattern)s
-                GROUP BY value
-                ORDER BY cnt DESC
-                LIMIT %(limit)s
-            """
-            params["q_pattern"] = f"%{q}%"
+            params["q_pattern"] = _escaped_like_pattern(q)
+            search_clause = "AND attrs_string[%(key)s] LIKE %(q_pattern)s "
+
+        rollup_window = (
+            _covered_attribute_rollup_window(window_start, window_end)
+            if key in SPAN_ATTRIBUTE_ROLLUP_KEYS
+            else None
+        )
+        if rollup_window is not None:
+            used_rollup = True
+            rollup_start, rollup_end = rollup_window
+            params = {
+                "project_id": project_id,
+                "key": key,
+                "limit": limit,
+                "window_start": rollup_start,
+                "window_end": rollup_end,
+            }
+            rollup_search_clause = ""
+            if q:
+                params["q_pattern"] = _escaped_like_pattern(q)
+                rollup_search_clause = "AND attr_value LIKE %(q_pattern)s "
+            query = (
+                "SELECT attr_value AS value, countMerge(n) AS cnt "
+                "FROM dashboard_attr_rollup "
+                "WHERE project_id = %(project_id)s "
+                "AND attr_key = %(key)s "
+                "AND hour >= %(window_start)s "
+                "AND hour < %(window_end)s "
+                "AND attr_value != '' "
+                f"{rollup_search_clause}"
+                "GROUP BY value "
+                "ORDER BY cnt DESC, value "
+                "LIMIT %(limit)s"
+            )
         else:
-            query = """
-                SELECT attrs_string[%(key)s] AS value, count() AS cnt
-                FROM spans
-                WHERE project_id = %(project_id)s
-                  AND mapContains(attrs_string, %(key)s)
-                  AND attrs_string[%(key)s] != ''
-                GROUP BY value
-                ORDER BY cnt DESC
-                LIMIT %(limit)s
-            """
+            sample_limit = max(
+                1000,
+                min(limit * 10, SPAN_ATTRIBUTE_VALUE_SAMPLE_MAX_ROWS),
+            )
+            params["sample_limit"] = sample_limit
+            root_clause = _attribute_root_span_clause(key)
+            query = (
+                "SELECT attrs_string[%(key)s] AS value "
+                "FROM spans "
+                "PREWHERE project_id = %(project_id)s "
+                "AND start_time >= %(window_start)s "
+                "AND start_time < %(window_end)s "
+                "AND is_deleted = 0 "
+                "WHERE mapContains(attrs_string, %(key)s) "
+                "AND attrs_string[%(key)s] != '' "
+                f"{root_clause}"
+                f"{search_clause}"
+                "LIMIT %(sample_limit)s"
+            )
 
         try:
             client = ClickHouseClient()
-            rows, column_types, query_time_ms = client.execute_read(query, params)
+            rows, _, query_time_ms = client.execute_read(
+                query,
+                params,
+                timeout_ms=SPAN_ATTRIBUTE_READ_TIMEOUT_MS,
+                settings=SPAN_ATTRIBUTE_READ_SETTINGS,
+            )
 
-            result = [{"value": row[0], "count": row[1]} for row in rows]
+            if used_rollup:
+                result = [{"value": row[0], "count": row[1]} for row in rows]
+                query_complete = True
+            else:
+                counts = Counter(
+                    str(row[0]) for row in rows if row and row[0] not in (None, "")
+                )
+                result = [
+                    {"value": value, "count": count}
+                    for value, count in sorted(
+                        counts.items(),
+                        key=lambda item: (-item[1], item[0].casefold()),
+                    )[:limit]
+                ]
+                query_complete = len(rows) < params["sample_limit"]
 
             logger.info(
                 "span_attribute_values_fetched",
@@ -151,15 +366,36 @@ class SpanAttributeValuesView(APIView):
                 query_time_ms=query_time_ms,
             )
 
-            return Response({"result": result}, status=200)
+            return Response(
+                {
+                    "result": result,
+                    "query_complete": query_complete,
+                    "query_status": ("complete" if query_complete else "degraded"),
+                    "query_window_start": _utc_iso(params["window_start"]),
+                    "query_window_end": _utc_iso(params["window_end"]),
+                },
+                status=200,
+            )
 
         except Exception as e:
-            logger.error(
+            logger.warning(
                 "span_attribute_values_failed",
                 project_id=project_id,
                 key=key,
-                error=str(e),
+                error_type=type(e).__name__,
             )
+            if is_read_budget_error(e):
+                return Response(
+                    {
+                        "result": [],
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "read_budget_exceeded",
+                        "query_window_start": _utc_iso(params["window_start"]),
+                        "query_window_end": _utc_iso(params["window_end"]),
+                    },
+                    status=200,
+                )
             return self._gm.internal_server_error_response(
                 "Failed to fetch span attribute values"
             )
@@ -186,15 +422,25 @@ class SpanAttributeDetailView(APIView):
         responses={200: SpanAttributeDetailResponseSerializer, **ERROR_RESPONSES},
     )
     def get(self, request, *args, **kwargs):
-        if not is_clickhouse_enabled():
-            return self._gm.custom_error_response(503, "ClickHouse is not enabled")
-
         query_params = request.validated_query_data
         project_id = str(query_params["project_id"])
         key = query_params["key"]
 
-        params = {"project_id": project_id, "key": key}
+        if not _project_is_in_request_scope(request, project_id):
+            return self._gm.not_found("Project not found")
 
+        if not is_clickhouse_enabled():
+            return self._gm.custom_error_response(503, "ClickHouse is not enabled")
+
+        window_start, window_end = _attribute_values_window()
+        params = {
+            "project_id": project_id,
+            "key": key,
+            "window_start": window_start,
+            "window_end": window_end,
+        }
+
+        attr_type = None
         try:
             client = ClickHouseClient()
             attr_type = self._detect_type(client, params)
@@ -209,27 +455,49 @@ class SpanAttributeDetailView(APIView):
                 return self._gm.not_found(f"Attribute key '{key}' not found in project")
 
         except Exception as e:
-            logger.error(
+            logger.warning(
                 "span_attribute_detail_failed",
                 project_id=project_id,
                 key=key,
-                error=str(e),
+                error_type=type(e).__name__,
             )
+            if is_read_budget_error(e):
+                payload = {
+                    "key": key,
+                    "query_complete": False,
+                    "query_status": "degraded",
+                    "query_error_code": "read_budget_exceeded",
+                    "query_window_start": _utc_iso(window_start),
+                    "query_window_end": _utc_iso(window_end),
+                }
+                if attr_type is not None:
+                    payload["type"] = attr_type
+                return Response(payload, status=200)
             return self._gm.internal_server_error_response(
                 "Failed to fetch span attribute detail"
             )
 
     def _detect_type(self, client: ClickHouseClient, params: dict) -> str | None:
         """Determine which attribute map contains the given key."""
-        type_query = """
+        root_clause = _attribute_root_span_clause(params["key"])
+        type_query = f"""
             SELECT
                 countIf(mapContains(attrs_string, %(key)s))  AS str_cnt,
                 countIf(mapContains(attrs_number, %(key)s))  AS num_cnt,
                 countIf(mapContains(attrs_bool, %(key)s)) AS bool_cnt
             FROM spans
-            WHERE project_id = %(project_id)s
+            PREWHERE project_id = %(project_id)s
+              AND start_time >= %(window_start)s
+              AND start_time < %(window_end)s
+              AND is_deleted = 0
+              {root_clause}
         """
-        rows, _, _ = client.execute_read(type_query, params)
+        rows, _, _ = client.execute_read(
+            type_query,
+            params,
+            timeout_ms=SPAN_ATTRIBUTE_READ_TIMEOUT_MS,
+            settings=SPAN_ATTRIBUTE_READ_SETTINGS,
+        )
 
         if not rows:
             return None
@@ -247,20 +515,32 @@ class SpanAttributeDetailView(APIView):
 
     def _string_detail(self, client: ClickHouseClient, params: dict) -> Response:
         """Return top values with percentages for a string attribute."""
-        query = """
+        root_clause = _attribute_root_span_clause(params["key"])
+        query = f"""
             SELECT
                 attrs_string[%(key)s] AS value,
                 count() AS cnt
             FROM spans
-            WHERE project_id = %(project_id)s
-              AND mapContains(attrs_string, %(key)s)
+            PREWHERE project_id = %(project_id)s
+              AND start_time >= %(window_start)s
+              AND start_time < %(window_end)s
+              AND is_deleted = 0
+              {root_clause}
+            WHERE mapContains(attrs_string, %(key)s)
               AND attrs_string[%(key)s] != ''
             GROUP BY value
-            ORDER BY cnt DESC
-            LIMIT 100
+            ORDER BY cnt DESC, value
+            LIMIT 101
         """
-        rows, _, query_time_ms = client.execute_read(query, params)
+        rows, _, query_time_ms = client.execute_read(
+            query,
+            params,
+            timeout_ms=SPAN_ATTRIBUTE_READ_TIMEOUT_MS,
+            settings=SPAN_ATTRIBUTE_READ_SETTINGS,
+        )
 
+        sampled = len(rows) > 100
+        rows = rows[:100]
         total_count = sum(row[1] for row in rows)
         unique_values = len(rows)
         top_values = [
@@ -282,20 +562,25 @@ class SpanAttributeDetailView(APIView):
             query_time_ms=query_time_ms,
         )
 
-        return Response(
-            {
-                "key": params["key"],
-                "type": "string",
-                "count": total_count,
-                "unique_values": unique_values,
-                "top_values": top_values,
-            },
-            status=200,
-        )
+        payload = {
+            "key": params["key"],
+            "type": "string",
+            "count": total_count,
+            "unique_values": unique_values,
+            "top_values": top_values,
+            "query_complete": not sampled,
+            "query_status": "sampled" if sampled else "complete",
+            "query_window_start": _utc_iso(params["window_start"]),
+            "query_window_end": _utc_iso(params["window_end"]),
+        }
+        if sampled:
+            payload["query_error_code"] = "sample_limit"
+        return Response(payload, status=200)
 
     def _number_detail(self, client: ClickHouseClient, params: dict) -> Response:
         """Return numeric statistics for a number attribute."""
-        query = """
+        root_clause = _attribute_root_span_clause(params["key"])
+        query = f"""
             SELECT
                 count()                                          AS cnt,
                 min(attrs_number[%(key)s])                      AS min_val,
@@ -304,10 +589,19 @@ class SpanAttributeDetailView(APIView):
                 quantile(0.50)(attrs_number[%(key)s])           AS p50,
                 quantile(0.95)(attrs_number[%(key)s])           AS p95
             FROM spans
-            WHERE project_id = %(project_id)s
-              AND mapContains(attrs_number, %(key)s)
+            PREWHERE project_id = %(project_id)s
+              AND start_time >= %(window_start)s
+              AND start_time < %(window_end)s
+              AND is_deleted = 0
+              {root_clause}
+            WHERE mapContains(attrs_number, %(key)s)
         """
-        rows, _, query_time_ms = client.execute_read(query, params)
+        rows, _, query_time_ms = client.execute_read(
+            query,
+            params,
+            timeout_ms=SPAN_ATTRIBUTE_READ_TIMEOUT_MS,
+            settings=SPAN_ATTRIBUTE_READ_SETTINGS,
+        )
 
         if not rows:
             return self._gm.not_found("No data found for this attribute")
@@ -332,23 +626,37 @@ class SpanAttributeDetailView(APIView):
                 "avg": round(row[3], 4) if row[3] is not None else None,
                 "p50": round(row[4], 4) if row[4] is not None else None,
                 "p95": round(row[5], 4) if row[5] is not None else None,
+                "query_complete": True,
+                "query_status": "complete",
+                "query_window_start": _utc_iso(params["window_start"]),
+                "query_window_end": _utc_iso(params["window_end"]),
             },
             status=200,
         )
 
     def _boolean_detail(self, client: ClickHouseClient, params: dict) -> Response:
         """Return true/false distribution for a boolean attribute."""
-        query = """
+        root_clause = _attribute_root_span_clause(params["key"])
+        query = f"""
             SELECT
                 attrs_bool[%(key)s] AS value,
                 count() AS cnt
             FROM spans
-            WHERE project_id = %(project_id)s
-              AND mapContains(attrs_bool, %(key)s)
+            PREWHERE project_id = %(project_id)s
+              AND start_time >= %(window_start)s
+              AND start_time < %(window_end)s
+              AND is_deleted = 0
+              {root_clause}
+            WHERE mapContains(attrs_bool, %(key)s)
             GROUP BY value
-            ORDER BY cnt DESC
+            ORDER BY cnt DESC, value
         """
-        rows, _, query_time_ms = client.execute_read(query, params)
+        rows, _, query_time_ms = client.execute_read(
+            query,
+            params,
+            timeout_ms=SPAN_ATTRIBUTE_READ_TIMEOUT_MS,
+            settings=SPAN_ATTRIBUTE_READ_SETTINGS,
+        )
 
         total_count = sum(row[1] for row in rows)
         top_values = [
@@ -377,6 +685,10 @@ class SpanAttributeDetailView(APIView):
                 "count": total_count,
                 "unique_values": len(rows),
                 "top_values": top_values,
+                "query_complete": True,
+                "query_status": "complete",
+                "query_window_start": _utc_iso(params["window_start"]),
+                "query_window_end": _utc_iso(params["window_end"]),
             },
             status=200,
         )

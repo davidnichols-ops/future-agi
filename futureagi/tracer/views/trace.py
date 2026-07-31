@@ -1,14 +1,18 @@
 import csv
+import hashlib
 import io
 import json
 import math
 import traceback
+from datetime import datetime, timedelta
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
 import pandas as pd
 import structlog
 from django.contrib.postgres.aggregates import ArrayAgg
+from django.core.cache import cache as django_cache
 from django.db import models
 from django.db.models import (
     Avg,
@@ -71,6 +75,7 @@ from tracer.serializers.trace import (
     UsersResponseSerializer,
 )
 from tracer.services.clickhouse.graph_dispatch import (
+    degraded_graph_response,
     fetch_annotation_graph_ch,
     fetch_eval_graph_ch,
     fetch_system_metric_graph_ch,
@@ -80,7 +85,13 @@ from tracer.services.clickhouse.query_builders import (
     AgentGraphQueryBuilder,
 )
 from tracer.services.clickhouse.query_builders.base import NIL_UUID
-from tracer.services.clickhouse.query_service import AnalyticsQueryService
+from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_service import AnalyticsQueryService, QueryResult
+from tracer.services.clickhouse.read_budget import (
+    FUTURE_TAIL_PROBE_SETTINGS,
+    build_future_tail_probe,
+    is_read_budget_error,
+)
 from tracer.services.clickhouse.v2.span_selectors import (
     flatten_span_attributes_into_entry,
     merge_content_rows,
@@ -105,6 +116,124 @@ from tracer.utils.otel import CallAttributes, ConversationAttributes
 from tracer.views.observation_span import get_observation_spans
 
 logger = structlog.get_logger(__name__)
+
+_BOUNDED_ANALYTICS_SETTINGS = {
+    "timeout_overflow_mode": "throw",
+    "max_threads": 2,
+    "max_memory_usage": 268_435_456,
+    "max_bytes_to_read": 1_073_741_824,
+    "read_overflow_mode": "throw",
+    "max_result_rows": 2000,
+    "result_overflow_mode": "throw",
+}
+
+_FILTERED_TRACE_SCAN_BUDGET_MS = 900
+_FILTERED_TRACE_CANDIDATE_BATCH = 50
+_FILTERED_TRACE_SEED_SLICE = timedelta(minutes=5)
+_FILTERED_TRACE_MAX_FUTURE_SKEW = timedelta(minutes=5)
+
+
+def _requires_candidate_filter_scan(filters):
+    """Return whether a trace page needs bounded trace-ID candidates.
+
+    Every span attribute can compile to an any-span raw-Map membership
+    subquery, whether its declared type is text, number, or boolean. Unknown
+    system metrics fall back to the same compiler path. Known root-only metrics,
+    IDs, sessions, tags, and time columns retain their direct/indexed path.
+    """
+
+    for item in filters or []:
+        column_id = item.get("column_id") or item.get("columnId")
+        if column_id in ("created_at", "start_time"):
+            continue
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        col_type = config.get("col_type") or config.get("colType")
+        normalized_col_type = str(col_type or "").strip().upper()
+        if normalized_col_type == "SPAN_ATTRIBUTE":
+            return True
+        if normalized_col_type != "SYSTEM_METRIC":
+            continue
+
+        mapped_column = ClickHouseFilterBuilder.SYSTEM_METRIC_MAP.get(column_id)
+        is_root_only = (
+            column_id in ClickHouseFilterBuilder.ROOT_ONLY_SYSTEM_METRICS
+            or (
+                column_id != "span_name"
+                and mapped_column in ClickHouseFilterBuilder.ROOT_ONLY_SYSTEM_METRICS
+            )
+        )
+        if is_root_only or column_id in {
+            "trace_id",
+            "session",
+            "session_id",
+            "trace_session_id",
+            "project_id",
+            "start_time",
+            "end_time",
+            "created_at",
+            "tag",
+            "tags",
+        }:
+            continue
+        # Known non-root columns (model/provider/status/observation type, etc.)
+        # and unknown keys both use any-span membership in trace mode.
+        if normalized_col_type == "SYSTEM_METRIC":
+            return True
+    return False
+
+
+def _has_only_time_filters(filters):
+    """Whether the compact trace table can seed the exact newest prefix."""
+    return all(
+        (item.get("column_id") or item.get("columnId")) in {"created_at", "start_time"}
+        for item in (filters or [])
+    )
+
+
+def _candidate_seed_filters(filters):
+    """Keep cheap root constraints while dropping the expensive predicate.
+
+    In particular, a session-scoped attribute request must seed candidates from
+    that session. Dropping ``trace_session_id`` here would search only the
+    project's newest roots and could falsely miss an older session. Root-only
+    system metrics and trace tags also compile directly against the already
+    root-scoped seed row; retaining them can reduce a large tenant to a small
+    candidate set before a generic any-span attribute membership probe. Every
+    raw Map attribute remains probe-only, including ``final_status``: applying
+    one to the whole seed window would recreate the incident's expensive scan.
+    """
+
+    def _is_direct_root_filter(item):
+        column_id = item.get("column_id") or item.get("columnId")
+        if column_id in {
+            "created_at",
+            "start_time",
+            "trace_id",
+            "session",
+            "session_id",
+            "trace_session_id",
+            "tag",
+            "tags",
+        }:
+            return True
+
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        normalized_col_type = (
+            str(config.get("col_type") or config.get("colType") or "").strip().upper()
+        )
+        if normalized_col_type == "SPAN_ATTRIBUTE":
+            return False
+        if normalized_col_type not in {"", "NORMAL", "SYSTEM_METRIC"}:
+            return False
+
+        mapped_column = ClickHouseFilterBuilder.SYSTEM_METRIC_MAP.get(column_id)
+        return column_id in ClickHouseFilterBuilder.ROOT_ONLY_SYSTEM_METRICS or (
+            column_id != "span_name"
+            and mapped_column in ClickHouseFilterBuilder.ROOT_ONLY_SYSTEM_METRICS
+        )
+
+    return [item for item in (filters or []) if _is_direct_root_filter(item)]
+
 
 ERROR_RESPONSES = {
     400: ApiErrorResponseSerializer,
@@ -1674,7 +1803,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 .first()
             )
             if not project_version:
-                raise Exception("Project version not found")  # noqa: B904
+                return self._gm.bad_request(
+                    "Project version not found or access denied"
+                )
 
             # CH-only path post-migration. D-027: the previous PG fallback
             # body (Trace.objects.filter + 6 ObservationSpan Subquery
@@ -1691,10 +1822,24 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
 
         except Exception as e:
-            logger.exception(f"Error in fetching the traces list: {str(e)}")
-
-            return self._gm.bad_request(
-                f"error fetching the traces list {get_error_message('ERROR_GETTING_TRACE_LIST')}"
+            if not is_read_budget_error(e):
+                raise
+            logger.warning(
+                "trace list exceeded read budget; returning an empty page",
+                error=str(e)[:200],
+            )
+            return self._gm.success_response(
+                {
+                    "metadata": {
+                        "total_rows": 0,
+                        "total_rows_is_lower_bound": True,
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "read_budget_exceeded",
+                    },
+                    "table": [],
+                    "config": get_default_trace_config(),
+                }
             )
 
     @validated_request(
@@ -1741,41 +1886,78 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # config error — surface it as a 400.
             analytics = AnalyticsQueryService()
             if type == "SYSTEM_METRIC":
-                return self._gm.success_response(
-                    fetch_system_metric_graph_ch(
-                        analytics=analytics,
-                        project_id=project_id,
-                        filters=filters,
-                        interval=interval,
-                        metric_id=req_data_config.get("id", "latency"),
+                metric_id = req_data_config.get("id", "latency")
+                try:
+                    return self._gm.success_response(
+                        fetch_system_metric_graph_ch(
+                            analytics=analytics,
+                            project_id=project_id,
+                            filters=filters,
+                            interval=interval,
+                            metric_id=metric_id,
+                            observe_type="trace",
+                        )
                     )
-                )
+                except Exception as exc:
+                    logger.warning(
+                        "trace graph query failed; returning degraded series",
+                        project_id=project_id,
+                        metric_id=metric_id,
+                        error=str(exc)[:200],
+                    )
+                    return self._gm.success_response(
+                        degraded_graph_response(metric_id, exc)
+                    )
             elif type == "EVAL":
-                return self._gm.success_response(
-                    fetch_eval_graph_ch(
-                        analytics=analytics,
-                        project_id=project_id,
-                        filters=filters,
-                        interval=interval,
-                        req_data_config=req_data_config,
+                metric_id = req_data_config.get("id", "")
+                try:
+                    return self._gm.success_response(
+                        fetch_eval_graph_ch(
+                            analytics=analytics,
+                            project_id=project_id,
+                            filters=filters,
+                            interval=interval,
+                            req_data_config=req_data_config,
+                        )
                     )
-                )
+                except Exception as exc:
+                    logger.warning(
+                        "trace eval graph query failed; returning degraded series",
+                        project_id=project_id,
+                        metric_id=metric_id,
+                        error=str(exc)[:200],
+                    )
+                    return self._gm.success_response(
+                        degraded_graph_response(metric_id, exc)
+                    )
             elif type == "ANNOTATION":
-                return self._gm.success_response(
-                    fetch_annotation_graph_ch(
-                        analytics=analytics,
-                        project_id=project_id,
-                        filters=filters,
-                        interval=interval,
-                        req_data_config=req_data_config,
-                        observe_type="trace",
+                metric_id = req_data_config.get("id", "")
+                try:
+                    return self._gm.success_response(
+                        fetch_annotation_graph_ch(
+                            analytics=analytics,
+                            project_id=project_id,
+                            filters=filters,
+                            interval=interval,
+                            req_data_config=req_data_config,
+                            observe_type="trace",
+                        )
                     )
-                )
+                except Exception as exc:
+                    logger.warning(
+                        "trace annotation graph query failed; returning degraded series",
+                        project_id=project_id,
+                        metric_id=metric_id,
+                        error=str(exc)[:200],
+                    )
+                    return self._gm.success_response(
+                        degraded_graph_response(metric_id, exc)
+                    )
             return self._gm.bad_request("Filter property type is not valid")
 
         except Exception as e:
             logger.exception(f"Error in get_graph_methods: {str(e)}")
-            return self._gm.bad_request(f"Error fetching graph data: {str(e)}")
+            return self._gm.bad_request("Error fetching graph data")
 
     @action(detail=False, methods=["post"])
     def bulk_create(self, request, *args, **kwargs):
@@ -2024,9 +2206,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                             ):
                                 total_eval_configs[
                                     str(metric["custom_eval_config_id"]) + "**" + choice
-                                ] = (
-                                    metric["custom_eval_config__name"] + " - " + choice
-                                )
+                                ] = metric["custom_eval_config__name"] + " - " + choice
                 else:
                     score = (
                         metric["avg_float_score"]
@@ -2440,7 +2620,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     _project_queryset_for_request(request).filter(id=project_id).first()
                 )
                 if not project or project.trace_type not in ("observe", "experiment"):
-                    raise Exception("Project should be of type observe or experiment")
+                    return self._gm.bad_request(
+                        "Project not found, access denied, or unsupported trace type"
+                    )
                 org_project_ids = None
 
             # CH-only path post-migration. D-027: the previous PG fallback
@@ -2466,10 +2648,24 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
 
         except Exception as e:
-            logger.exception(f"Error in fetching the traces list of observe: {str(e)}")
-
-            return self._gm.bad_request(
-                f"error fetching the traces list of observe {str(e)}"
+            if not is_read_budget_error(e):
+                raise
+            logger.warning(
+                "observe trace list exceeded read budget; returning an empty page",
+                error=str(e)[:200],
+            )
+            return self._gm.success_response(
+                {
+                    "metadata": {
+                        "total_rows": 0,
+                        "total_rows_is_lower_bound": True,
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "read_budget_exceeded",
+                    },
+                    "table": [],
+                    "config": get_default_trace_config(),
+                }
             )
 
     @action(detail=False, methods=["get"])
@@ -3002,7 +3198,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # Parse date range from filters.  The drawer does not forward the
         # date-range picker value, so we fall back to 1 year to avoid
         # excluding the current trace.
-        from datetime import datetime, timedelta
+        from datetime import datetime
 
         start_date, end_date = BaseQueryBuilder.parse_time_range(filters)
         has_explicit_date = any(
@@ -3120,9 +3316,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
 
         except Exception as e:
-            return self._gm.bad_request(
-                f"error fetching the trace id by index {str(e)}"
+            logger.exception("trace_index_navigation_failed", error=str(e))
+            response = self._gm.bad_request(
+                "Trace navigation could not be completed. Please try again."
             )
+            response.data["code"] = (
+                "read_budget_exceeded"
+                if is_read_budget_error(e)
+                else "query_failed"
+            )
+            return response
 
     @action(detail=False, methods=["get"])
     def get_trace_export_data(self, request, *args, **kwargs):
@@ -3423,9 +3626,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         """List traces-of-session using ClickHouse backend.
 
         When ``org_project_ids`` is provided (cross-project user-detail
-        mode), the builder is constructed with `project_ids=...` and the
-        view falls back to a PG-side EvalLogger lookup scoped to those
-        projects (the CH dict-lookup path requires a single project_id).
+        mode), the builder is constructed with `project_ids=...`. Optional
+        eval columns are omitted because the bounded config-discovery helper
+        currently accepts one project; telemetry must never fall back to
+        PostgreSQL.
 
         Builder class resolved via v1↔v2 dispatch — set
         CH25_QUERY_TYPES_V2_PRIMARY=TRACE_LIST to flip to CH 25.3.
@@ -3438,6 +3642,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         filters = list(validated_data.get("filters", []) or [])
         page_number = validated_data["page_number"]
         page_size = validated_data["page_size"]
+        preview = bool(validated_data.get("preview", False))
+        if preview:
+            page_number = 0
+            page_size = min(page_size, 10)
         session_id = (
             str(validated_data["session_id"])
             if validated_data.get("session_id")
@@ -3456,22 +3664,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 }
             )
 
-        # Get eval config IDs. Project mode uses a CH dict-lookup (fast);
-        # org mode uses a PG scan because the CH dict-lookup takes a single
-        # project_id — multi-project CH variant not implemented yet.
+        # Get eval config IDs. Project mode uses a bounded CH lookup. Org mode
+        # omits optional eval columns until a multi-project CH lookup exists;
+        # querying PG Trace/EvalLogger here was both stale and unbounded.
+        eval_configs = []
         eval_config_ids = []
-        if org_scope:
-            eval_configs = CustomEvalConfig.objects.filter(
-                id__in=EvalLogger.objects.filter(
-                    trace_id__in=Trace.objects.filter(
-                        project_id__in=org_project_ids
-                    ).values("id")
-                )
-                .values("custom_eval_config_id")
-                .distinct(),
-                deleted=False,
-            ).select_related("eval_template")
-            eval_config_ids = [str(c.id) for c in eval_configs]
+        enrichment_error_codes: set[str] = set()
+        if preview:
+            pass
+        elif org_scope:
+            pass
         else:
             # PERF: resolve this project's configs from PG first (indexed by
             # the project FK), then ask CH which of them have recent data via
@@ -3492,23 +3694,54 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # [start, now]), not a fixed 30 days — so configs with data anywhere
             # in the viewed range keep their columns. Bounded by candidate ids.
             window_days = BuilderCls.window_days_covering(filters)
-            ids_with_data = (
-                set(
-                    analytics.get_eval_config_ids_with_data_ch(
-                        str(project_id),
-                        timeout_ms=30000,
-                        candidate_config_ids=candidate_ids,
-                        window_days=window_days,
-                    )
+            ids_with_data: set[str] = set()
+            if candidate_ids:
+                eval_ids_cache_key = (
+                    "trace_list_eval_cfgs:"
+                    + hashlib.sha256(
+                        (
+                            str(project_id)
+                            + "|"
+                            + ",".join(sorted(candidate_ids))
+                            + f"|w={window_days}"
+                        ).encode()
+                    ).hexdigest()
                 )
-                if candidate_ids
-                else set()
-            )
+                cached_ids = django_cache.get(eval_ids_cache_key)
+                if cached_ids is not None:
+                    ids_with_data = set(cached_ids)
+                else:
+                    try:
+                        ids_with_data = set(
+                            analytics.get_eval_config_ids_with_data_ch(
+                                str(project_id),
+                                timeout_ms=750,
+                                candidate_config_ids=candidate_ids,
+                                window_days=window_days,
+                            )
+                        )
+                        django_cache.set(
+                            eval_ids_cache_key, list(ids_with_data), timeout=120
+                        )
+                    except Exception as exc:
+                        enrichment_error_codes.add(
+                            "read_budget_exceeded"
+                            if is_read_budget_error(exc)
+                            else "query_failed"
+                        )
+                        # Eval columns are optional enrichment. Never fail the
+                        # trace grid because discovery missed its latency
+                        # budget; the next request retries after CH recovers.
+                        logger.warning(
+                            "trace eval-column discovery exceeded budget",
+                            project_id=str(project_id),
+                            error=str(exc)[:200],
+                        )
             eval_configs = [c for c in project_configs if str(c.id) in ids_with_data]
             eval_config_ids = [str(c.id) for c in eval_configs]
 
         # Annotation labels — skip in org-scoped mode (deferred enhancement)
-        if org_scope:
+        if preview or org_scope:
             annotation_labels = []
         else:
             annotation_labels = get_annotation_labels_for_project(project_id)
@@ -3525,9 +3758,419 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             annotation_label_ids=annotation_label_ids,
         )
 
-        # Phase 1: Paginated traces (light columns only — no input/output)
-        query, params = builder.build()
-        result = analytics.execute_ch_query(query, params, timeout_ms=10000)
+        # The exact root stream is still the source of truth for unfiltered
+        # and date-only pagination.  A whole-window root top-K is not viable
+        # for whale tenants, so those requests use the same adjacent,
+        # newest-first five-minute slices as generic span-attribute filters.
+        # This deliberately avoids using ``traces.created_at`` as a proxy for
+        # the root span's ``start_time``: ingestion delay can make those clocks
+        # differ and silently reorder or omit a trace.
+        candidate_filter_scan_used = _requires_candidate_filter_scan(filters)
+        candidate_scan_used = candidate_filter_scan_used or (
+            not org_scope and _has_only_time_filters(filters)
+        )
+        candidate_scan_complete = True
+
+        def _remaining_scan_ms(deadline):
+            return max(0, int((deadline - monotonic()) * 1000))
+
+        def _execute_candidate_batched_page():
+            """Filter small, ordered trace-ID batches under one deadline.
+
+            Adjacent five-minute root slices establish the exact global order
+            without asking ClickHouse to top-K the tenant's entire historical
+            root stream. Within a dense hour, increasing prefix reads expose
+            each next candidate batch without OFFSET instability. Each filtered
+            probe then carries at most 50 new trace IDs in both the outer root
+            query and every any-span membership subquery.
+
+            All seed and probe reads share one 900 ms wall-clock deadline. We
+            only stop successfully after finding the complete requested prefix
+            or exhausting every adjacent slice in the requested window;
+            otherwise callers receive an explicit incomplete page instead of a
+            false empty result.
+            """
+
+            # Populate the main builder's time bounds for count/content helpers;
+            # this only compiles SQL and does not touch ClickHouse.
+            builder.build(since=None)
+
+            deadline = monotonic() + (_FILTERED_TRACE_SCAN_BUDGET_MS / 1000)
+            prefix_needed = (page_number * page_size) + 2 * page_size
+            seed_filters_without_time = [
+                item
+                for item in _candidate_seed_filters(filters)
+                if (item.get("column_id") or item.get("columnId"))
+                not in {"created_at", "start_time"}
+            ]
+            matched_rows = []
+            matched_ids = set()
+            seen_candidate_ids = set()
+            last_result = None
+            scan_complete = False
+            requested_start = builder.start_date
+            requested_end = builder.end_date
+            if requested_start is None or requested_end is None:
+                return QueryResult([], 0, "clickhouse", 0), False
+            # The observe toolbar commonly sends the end of the user's local
+            # day, which can be hours ahead of UTC "now". Starting the fallback
+            # at that future boundary burns one empty five-minute query per
+            # slice and can exhaust the shared deadline before reaching any
+            # ingested data. Keep the caller's requested range for the healthy
+            # whole-window attempt, but clamp the adjacent fallback to a small
+            # clock-skew allowance beyond now.
+            scan_now = timezone.now()
+            if timezone.is_naive(requested_end):
+                scan_now = scan_now.replace(tzinfo=None)
+            slice_end = min(
+                requested_end,
+                scan_now + _FILTERED_TRACE_MAX_FUTURE_SKEW,
+            )
+            batch_index = 0
+
+            def _probe_candidate_ids(candidate_ids):
+                nonlocal last_result
+                remaining_ms = _remaining_scan_ms(deadline)
+                if not candidate_ids or remaining_ms < 25:
+                    return False
+
+                filtered_builder = BuilderCls(
+                    project_id=None if org_scope else str(project_id),
+                    project_ids=(
+                        [str(p) for p in org_project_ids] if org_scope else None
+                    ),
+                    filters=filters,
+                    page_number=0,
+                    page_size=len(candidate_ids),
+                    candidate_trace_ids=candidate_ids,
+                )
+                filtered_query, filtered_params = filtered_builder.build(since=None)
+                try:
+                    filtered_result = analytics.execute_ch_query(
+                        filtered_query,
+                        filtered_params,
+                        timeout_ms=min(750, remaining_ms),
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                except Exception as exc:
+                    if not is_read_budget_error(exc):
+                        raise
+                    logger.warning(
+                        "bounded trace filter probe exceeded read budget",
+                        project_id=str(project_id) if project_id else None,
+                        error=str(exc)[:200],
+                    )
+                    return False
+
+                last_result = filtered_result
+                # Re-apply candidate order explicitly. It remains the source
+                # of truth even if ClickHouse parallelizes the point-filtered
+                # probe or returns duplicate span versions.
+                filtered_by_id = {}
+                for row in filtered_result.data:
+                    trace_id = str(row.get("trace_id", ""))
+                    if trace_id and trace_id not in filtered_by_id:
+                        filtered_by_id[trace_id] = row
+                for trace_id in candidate_ids:
+                    if trace_id in matched_ids or trace_id not in filtered_by_id:
+                        continue
+                    matched_ids.add(trace_id)
+                    matched_rows.append(filtered_by_id[trace_id])
+                return True
+
+            # Preserve exact behavior for a healthy low-volume project whose
+            # newest match is old: give the original whole-window root top-K a
+            # small sub-budget. On a whale tenant this attempt is killed before
+            # its historical scan reaches the 1 GiB request cap, leaving most
+            # of the shared deadline for adjacent five-minute slices.
+            fast_remaining_ms = _remaining_scan_ms(deadline)
+            fast_timeout_ms = min(250, max(fast_remaining_ms - 25, 0))
+            if fast_timeout_ms >= 25:
+                fast_builder = BuilderCls(
+                    project_id=None if org_scope else str(project_id),
+                    project_ids=(
+                        [str(p) for p in org_project_ids] if org_scope else None
+                    ),
+                    filters=_candidate_seed_filters(filters),
+                    page_number=0,
+                    page_size=_FILTERED_TRACE_CANDIDATE_BATCH // 2,
+                )
+                fast_query, fast_params = fast_builder.build(since=None)
+                try:
+                    fast_result = analytics.execute_ch_query(
+                        fast_query,
+                        fast_params,
+                        timeout_ms=fast_timeout_ms,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                except Exception as exc:
+                    if not is_read_budget_error(exc):
+                        raise
+                    logger.info(
+                        "whole-window trace seed exceeded sub-budget",
+                        project_id=str(project_id) if project_id else None,
+                    )
+                else:
+                    last_result = fast_result
+                    fast_candidate_ids = []
+                    for row in fast_result.data:
+                        trace_id = str(row.get("trace_id", ""))
+                        if not trace_id or trace_id in seen_candidate_ids:
+                            continue
+                        seen_candidate_ids.add(trace_id)
+                        fast_candidate_ids.append(trace_id)
+
+                    fast_probe_complete = _probe_candidate_ids(fast_candidate_ids)
+                    fast_stream_exhausted = len(fast_result.data) < int(
+                        fast_params["limit"]
+                    )
+                    if fast_stream_exhausted and not fast_candidate_ids:
+                        fast_result.data = []
+                        return fast_result, True
+                    if fast_probe_complete and (
+                        len(matched_rows) >= prefix_needed or fast_stream_exhausted
+                    ):
+                        # ClickHouse is free to return the point-filtered probe
+                        # in a different order. The root candidate stream is
+                        # authoritative for deterministic pagination.
+                        last_result.data = list(matched_rows)
+                        return last_result, True
+                    if not fast_probe_complete and fast_candidate_ids:
+                        last_result.data = list(matched_rows)
+                        return last_result, False
+
+                    # A saturated whole-window seed still proves every match
+                    # found within its ordered root prefix. Keep that evidence
+                    # while adjacent slices resume at the newest boundary.
+                    # ``seen_candidate_ids`` removes overlap, and an increasing
+                    # within-slice prefix exposes the first unseen root without
+                    # OFFSET instability.
+
+            if slice_end < requested_end:
+                remaining_ms = _remaining_scan_ms(deadline)
+                if remaining_ms < 25:
+                    return QueryResult([], 0, "clickhouse", 0), False
+                tail_query, tail_params = build_future_tail_probe(
+                    start=slice_end,
+                    end=requested_end,
+                    root_only=True,
+                    project_id=str(project_id) if project_id else None,
+                    project_ids=org_project_ids if org_scope else None,
+                )
+                try:
+                    tail_result = analytics.execute_ch_query(
+                        tail_query,
+                        tail_params,
+                        timeout_ms=min(100, remaining_ms),
+                        settings=FUTURE_TAIL_PROBE_SETTINGS,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "trace future-tail proof failed; returning degraded",
+                        project_id=str(project_id) if project_id else None,
+                        error_type=type(exc).__name__,
+                    )
+                    return QueryResult([], 0, "clickhouse", 0), False
+                tail_data = getattr(tail_result, "data", None)
+                if not isinstance(tail_data, list) or tail_data:
+                    return QueryResult([], 0, "clickhouse", 0), False
+
+            while len(matched_rows) < prefix_needed:
+                remaining_ms = _remaining_scan_ms(deadline)
+                if remaining_ms < 25:
+                    break
+                if slice_end <= requested_start:
+                    scan_complete = True
+                    break
+
+                slice_start = max(
+                    requested_start,
+                    slice_end - _FILTERED_TRACE_SEED_SLICE,
+                )
+                seed_filters = [
+                    *seed_filters_without_time,
+                    {
+                        "column_id": "start_time",
+                        "filter_config": {
+                            "col_type": "SYSTEM_METRIC",
+                            "filter_type": "datetime",
+                            "filter_op": "between",
+                            "filter_value": [slice_start, slice_end],
+                        },
+                    },
+                ]
+
+                # SpanList/TraceList builders fetch a 2x prefix. page_size=25
+                # and page_number=0,2,4,… therefore expose 50 new ordered root
+                # candidates per iteration without OFFSET instability. The
+                # bounded time filter makes every prefix local to one adjacent
+                # interval; once a short result proves that slice exhausted,
+                # the scan advances to the immediately preceding slice.
+                candidate_builder = BuilderCls(
+                    project_id=None if org_scope else str(project_id),
+                    project_ids=(
+                        [str(p) for p in org_project_ids] if org_scope else None
+                    ),
+                    filters=seed_filters,
+                    page_number=batch_index * 2,
+                    page_size=_FILTERED_TRACE_CANDIDATE_BATCH // 2,
+                )
+                candidate_query, candidate_params = candidate_builder.build(since=None)
+                try:
+                    candidate_result = analytics.execute_ch_query(
+                        candidate_query,
+                        candidate_params,
+                        timeout_ms=min(750, remaining_ms),
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                except Exception as exc:
+                    if not is_read_budget_error(exc):
+                        raise
+                    logger.warning(
+                        "trace candidate scan exceeded read budget",
+                        project_id=str(project_id) if project_id else None,
+                        error=str(exc)[:200],
+                    )
+                    break
+
+                last_result = candidate_result
+                raw_candidate_count = len(candidate_result.data)
+                requested_candidate_prefix = int(candidate_params["limit"])
+                candidate_ids = []
+                for row in candidate_result.data:
+                    trace_id = str(row.get("trace_id", ""))
+                    if not trace_id or trace_id in seen_candidate_ids:
+                        continue
+                    seen_candidate_ids.add(trace_id)
+                    candidate_ids.append(trace_id)
+
+                if candidate_ids and not _probe_candidate_ids(candidate_ids):
+                    break
+
+                if raw_candidate_count < requested_candidate_prefix:
+                    slice_end = slice_start
+                    batch_index = 0
+                else:
+                    batch_index += 1
+
+            if len(matched_rows) >= prefix_needed:
+                scan_complete = True
+            if last_result is None:
+                # A local scheduling shortfall must fail closed. Falling back
+                # to the original full-window filtered query here would undo
+                # the scan bound at exactly the point the deadline is spent.
+                last_result = QueryResult([], 0, "clickhouse", 0)
+            last_result.data = matched_rows
+            return last_result, scan_complete
+
+        # Generic span attributes and legacy string filters use bounded
+        # candidate batches. Date-only/unfiltered pages use those same exact
+        # root slices, while indexed root filters retain the single top-K
+        # query. Both paths share hard resource settings and never expose a
+        # ClickHouse exception.
+        try:
+            if candidate_scan_used:
+                result, candidate_scan_complete = _execute_candidate_batched_page()
+            else:
+                query, params = builder.build(since=None)
+                result = analytics.execute_ch_query(
+                    query,
+                    params,
+                    timeout_ms=750,
+                    settings={
+                        **_BOUNDED_ANALYTICS_SETTINGS,
+                        **({"max_result_rows": 64} if preview else {}),
+                    },
+                )
+        except Exception as exc:
+            if not is_read_budget_error(exc):
+                raise
+            logger.warning(
+                "trace list exceeded read budget; returning degraded",
+                project_id=str(project_id) if project_id else None,
+                error=str(exc)[:200],
+            )
+            return self._gm.success_response(
+                {
+                    "metadata": {
+                        "total_rows": 0,
+                        "total_rows_is_lower_bound": True,
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "read_budget_exceeded",
+                    },
+                    "table": [],
+                    "config": get_default_trace_config(),
+                }
+            )
+
+        candidate_proven_match_count = len(
+            {str(row.get("trace_id", "")) for row in result.data if row.get("trace_id")}
+        )
+
+        # Task preview deliberately skips every grid-only enrichment below.
+        if preview:
+            result.data, has_more = paginate_deduped(
+                result.data, "trace_id", 0, page_size
+            )
+            table_data = []
+            for row in result.data:
+                raw_cost = row.get("cost")
+                table_data.append(
+                    {
+                        "trace_id": str(row.get("trace_id", "")),
+                        "project_id": (
+                            str(row.get("project_id"))
+                            if row.get("project_id")
+                            else str(project_id)
+                            if project_id
+                            else None
+                        ),
+                        "created_at": (
+                            row.get("start_time").isoformat() + "Z"
+                            if row.get("start_time")
+                            else None
+                        ),
+                        "start_time": row.get("start_time"),
+                        "trace_name": row.get("trace_name")
+                        or row.get("span_name")
+                        or "",
+                        "node_type": row.get("observation_type", ""),
+                        "status": row.get("status"),
+                        "latency": row.get("latency_ms"),
+                        "total_tokens": row.get("total_tokens"),
+                        "cost": (
+                            round(raw_cost, 6)
+                            if isinstance(raw_cost, int | float)
+                            and not isinstance(raw_cost, bool)
+                            and math.isfinite(raw_cost)
+                            else 0
+                        ),
+                    }
+                )
+            metadata = {
+                "total_rows": (
+                    candidate_proven_match_count
+                    if candidate_scan_used
+                    else len(table_data) + (1 if has_more else 0)
+                ),
+                "total_rows_is_lower_bound": True,
+            }
+            if not candidate_scan_complete:
+                metadata.update(
+                    {
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "read_budget_exceeded",
+                    }
+                )
+            return self._gm.success_response(
+                {
+                    "metadata": metadata,
+                    "table": _sanitize_nonfinite_floats(table_data),
+                    "config": get_default_trace_config(),
+                }
+            )
 
         # Prefix-dedup pagination: Phase 1 dropped `LIMIT 1 BY trace_id` (its
         # O(roots-in-window) full sort OOM-crashed CH — see
@@ -3537,32 +4180,107 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # de-duplicated stream, so a trace (even a multi-root one whose roots
         # sort pages apart) can never appear on two pages and none is
         # skipped. See page_dedup.py.
-        result.data, _has_more = paginate_deduped(
+        result.data, has_more = paginate_deduped(
             result.data, "trace_id", page_number, page_size
         )
 
-        # Count
-        count_query, count_params = builder.build_count_query()
-        count_result = analytics.execute_ch_query(
-            count_query, count_params, timeout_ms=30000
-        )
-        total_count = count_result.data[0].get("total", 0) if count_result.data else 0
+        # Exact count is optional pagination enrichment. Give filtered raw
+        # counts a strict budget; on timeout return a monotonic lower bound so
+        # the data page stays usable and the cluster never spends tens of
+        # seconds/GBs merely computing a footer.
+        total_count_is_lower_bound = candidate_filter_scan_used
+        if candidate_filter_scan_used:
+            # Re-running the full-window Map predicate just to render a footer
+            # would undo the bounded page fix. The page can be exact while its
+            # display count remains an honest monotonic lower bound. Use every
+            # match the candidate scan actually proved, including the prefix
+            # preceding a deep page. Never synthesize a page offset when the
+            # scan stopped before proving that prefix.
+            total_count = candidate_proven_match_count
+        else:
+            count_query, count_params = builder.build_count_query()
+            cache_params = {
+                key: (
+                    value.replace(second=0, microsecond=0)
+                    if isinstance(value, datetime)
+                    else value
+                )
+                for key, value in count_params.items()
+                if key != "limit"
+            }
+            count_cache_key = (
+                "trace_list_count:"
+                + hashlib.sha256(
+                    (count_query + repr(sorted(cache_params.items(), key=str))).encode()
+                ).hexdigest()
+            )
+            cached_total = django_cache.get(count_cache_key)
+            if cached_total is not None:
+                total_count = cached_total
+            else:
+                try:
+                    count_result = analytics.execute_ch_query(
+                        count_query,
+                        count_params,
+                        timeout_ms=750,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                    total_count = (
+                        count_result.data[0].get("total", 0) if count_result.data else 0
+                    )
+                    django_cache.set(count_cache_key, total_count, timeout=60)
+                except Exception as exc:
+                    total_count = (
+                        page_number * page_size
+                        + len(result.data)
+                        + (1 if has_more else 0)
+                    )
+                    total_count_is_lower_bound = True
+                    logger.warning(
+                        "trace count exceeded latency budget; using lower bound",
+                        project_id=str(project_id) if project_id else None,
+                        lower_bound=total_count,
+                        error=str(exc)[:200],
+                    )
 
         # Phase 1b: Fetch heavy columns (input/output/attrs) for the page
         trace_ids = [str(row.get("trace_id", "")) for row in result.data]
         content_rows = []
+        content_query_succeeded = False
         if trace_ids:
             content_query, content_params = builder.build_content_query(trace_ids)
             if content_query:
-                content_result = analytics.execute_ch_query(
-                    content_query, content_params, timeout_ms=10000
-                )
-                content_rows = content_result.data
-                # Every in-window trace has a root span, so a shortfall means
-                # spans fell outside the 1-day window buffer (a trace running
-                # longer than the buffer, clock skew, or backfilled
-                # timestamps) and enrichment silently dropped them.
-                if len(content_rows) < len(trace_ids):
+                try:
+                    content_result = analytics.execute_ch_query(
+                        content_query,
+                        content_params,
+                        timeout_ms=750,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                    content_rows = content_result.data
+                    content_query_succeeded = True
+                except Exception as exc:
+                    enrichment_error_codes.add(
+                        "read_budget_exceeded"
+                        if is_read_budget_error(exc)
+                        else "query_failed"
+                    )
+                    logger.warning(
+                        "trace content enrichment exceeded budget",
+                        project_id=str(project_id) if project_id else None,
+                        error=str(exc)[:200],
+                    )
+                # Content is optional enrichment; a transient shortfall must
+                # not hide the light trace page.
+                returned_trace_ids = {
+                    str(row.get("trace_id", ""))
+                    for row in content_rows
+                    if row.get("trace_id")
+                }
+                if content_query_succeeded and not set(trace_ids).issubset(
+                    returned_trace_ids
+                ):
+                    enrichment_error_codes.add("query_failed")
                     logger.warning(
                         "trace content enrichment returned fewer traces than requested",
                         returned=len(content_rows),
@@ -3596,38 +4314,77 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             else:
                 row["metadata"] = raw_meta or {}
 
-        user_id_map = builder.resolve_user_ids(trace_ids, analytics)
+        try:
+            user_id_map = builder.resolve_user_ids(trace_ids, analytics)
+        except Exception as exc:
+            user_id_map = {}
+            enrichment_error_codes.add(
+                "read_budget_exceeded"
+                if is_read_budget_error(exc)
+                else "query_failed"
+            )
+            logger.warning(
+                "trace user enrichment exceeded budget",
+                project_id=str(project_id) if project_id else None,
+                error=str(exc)[:200],
+            )
 
         # Phase 2: Eval scores
         eval_map = {}
         if trace_ids and eval_config_ids:
             eval_query, eval_params = builder.build_eval_query(trace_ids)
             if eval_query:
-                eval_result = analytics.execute_ch_query(
-                    eval_query, eval_params, timeout_ms=30000
-                )
-                eval_map = builder.pivot_eval_results(
-                    [(list(row.values())) for row in eval_result.data],
-                    list(eval_result.data[0].keys()) if eval_result.data else [],
-                )
+                try:
+                    eval_result = analytics.execute_ch_query(
+                        eval_query,
+                        eval_params,
+                        timeout_ms=750,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                    eval_map = builder.pivot_eval_results(
+                        [(list(row.values())) for row in eval_result.data],
+                        list(eval_result.data[0].keys()) if eval_result.data else [],
+                    )
+                except Exception as exc:
+                    enrichment_error_codes.add(
+                        "read_budget_exceeded"
+                        if is_read_budget_error(exc)
+                        else "query_failed"
+                    )
+                    logger.warning(
+                        "trace page eval enrichment exceeded budget",
+                        project_id=str(project_id) if project_id else None,
+                        error=str(exc)[:200],
+                    )
 
         # Phase 3: Annotations — PG values, span->trace resolved via CH.
         # In org-scoped mode the page spans multiple projects, so scope the
         # map on the window only (a single project_id would drop other
         # projects' spans).
-        span_trace_map = (
-            analytics.get_span_trace_map(
-                trace_ids,
-                project_id=None if org_scope else str(project_id),
-                start_date=builder.params.get("start_date"),
-                end_date=builder.params.get("end_date"),
-            )
-            if trace_ids and annotation_label_ids
-            else {}
-        )
-        annotation_map = _build_annotation_map_from_scores(
-            trace_ids, annotation_label_ids, label_types, span_trace_map
-        )
+        span_trace_map = {}
+        annotation_map = {}
+        if trace_ids and annotation_label_ids:
+            try:
+                span_trace_map = analytics.get_span_trace_map(
+                    trace_ids,
+                    project_id=None if org_scope else str(project_id),
+                    start_date=builder.params.get("start_date"),
+                    end_date=builder.params.get("end_date"),
+                )
+                annotation_map = _build_annotation_map_from_scores(
+                    trace_ids, annotation_label_ids, label_types, span_trace_map
+                )
+            except Exception as exc:
+                enrichment_error_codes.add(
+                    "read_budget_exceeded"
+                    if is_read_budget_error(exc)
+                    else "query_failed"
+                )
+                logger.warning(
+                    "trace annotation enrichment exceeded budget",
+                    project_id=str(project_id) if project_id else None,
+                    error=str(exc)[:200],
+                )
 
         # Phase 4: Aggregated span attributes for custom columns
         _SKIP_ATTR_PREFIXES = (
@@ -3643,7 +4400,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 attr_query, attr_params = builder.build_span_attributes_query(trace_ids)
                 if attr_query:
                     attr_result = analytics.execute_ch_query(
-                        attr_query, attr_params, timeout_ms=30000
+                        attr_query,
+                        attr_params,
+                        timeout_ms=750,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
                     )
                     for attr_row in attr_result.data:
                         tid = str(attr_row.get("trace_id", ""))
@@ -3685,8 +4445,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                                 )
                             elif isinstance(value, (list, dict)):
                                 pass  # skip complex values for aggregation
-            except Exception as e:
-                logger.warning(f"Span attribute aggregation failed: {e}")
+            except Exception as exc:
+                enrichment_error_codes.add(
+                    "read_budget_exceeded"
+                    if is_read_budget_error(exc)
+                    else "query_failed"
+                )
+                logger.warning(
+                    "trace span attribute aggregation failed",
+                    project_id=str(project_id) if project_id else None,
+                    error=str(exc)[:200],
+                )
 
         # Build column config — get_default_trace_config() already includes
         # all standard columns (latency, tokens, cost, user_id, etc.)
@@ -3781,8 +4550,31 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             table_data.append(entry)
 
+        response_metadata = {"total_rows": total_count}
+        if total_count_is_lower_bound:
+            response_metadata["total_rows_is_lower_bound"] = True
+        if not candidate_scan_complete:
+            response_metadata.update(
+                {
+                    "query_complete": False,
+                    "query_status": "degraded",
+                    "query_error_code": "read_budget_exceeded",
+                }
+            )
+        if enrichment_error_codes:
+            response_metadata.update(
+                {
+                    "query_complete": False,
+                    "query_status": "degraded",
+                    "query_error_code": (
+                        "query_failed"
+                        if "query_failed" in enrichment_error_codes
+                        else "read_budget_exceeded"
+                    ),
+                }
+            )
         response = {
-            "metadata": {"total_rows": total_count},
+            "metadata": response_metadata,
             "table": _sanitize_nonfinite_floats(table_data),
             "config": column_config,
         }
@@ -3794,16 +4586,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     ):
         """List voice calls using ClickHouse backend.
 
-        Builder classes resolved via v1↔v2 dispatch — flip with
-        CH25_QUERY_TYPES_V2_PRIMARY=VOICE_CALL_LIST,TRACE_LIST.
+        The production store is CH25-only. This call site must not fall back
+        to the legacy builder, whose ``span_attr_str`` predicates do not exist
+        on the live ``spans`` table.
         """
         from tracer.services.clickhouse.query_builders import VoiceCallListQueryBuilder
         from tracer.services.clickhouse.query_builders.trace_list import (
             TraceListQueryBuilder,
         )
-        from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-
-        VoiceBuilderCls = get_query_builder_class("VOICE_CALL_LIST")  # noqa: N806
+        from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+            VoiceCallListQueryBuilderV2,
+        )
 
         filters = validated_data.get("filters", [])
         page = validated_data.get("page", 1)
@@ -3823,7 +4616,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             remove_simulation_calls
         ).lower() not in ("false", "0", "")
 
-        builder = VoiceBuilderCls(
+        builder = VoiceCallListQueryBuilderV2(
             project_id=str(project_id),
             filters=filters,
             page_number=page_number,
@@ -3847,14 +4640,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         #      common-case typed attributes (gen_ai.* keys for LLM spans).
         # We SELECT all three and reconstruct the flat dict on the Python side,
         # matching the pattern used by the trace-tree fetch above (~line 1195).
-        # Dedup via `FINAL` + `use_skip_indexes_if_final = 1` (the CHSpanReader
-        # idiom): bare `FINAL` without the setting disables the `idx_id` skip
-        # index and full-scans the table; with it the skip index prunes. NB: no
-        # `is_deleted = 0` predicate — the two-arg ReplacingMergeTree(_version,
-        # is_deleted) engine already drops tombstones under FINAL, and pairing
-        # that predicate with the setting arms a resurrection bug (the is_deleted
-        # minmax index prunes tombstone granules before the merge). See
-        # `_FINAL_SKIP_INDEX_SETTINGS` in services/clickhouse/v2/span_reader.py.
+        # Resolve the newest version with argMax over only the page IDs. The
+        # prior ``FINAL`` point read still timed out on wide voice rows in
+        # production despite re-enabling skip indexes. Keeping ``is_deleted``
+        # in the argMax HAVING clause preserves tombstones without resurrecting
+        # an older live version, while the fixed ID set bounds aggregation.
         # The ~900 KB `call_logs` blob lands in `attrs_string` (collector path,
         # a JSON string) or in `attributes_extra` (backfill path, a list in the
         # JSON overflow) — strip it from both at read so it's never transferred.
@@ -3865,21 +4655,36 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         ]
         attrs_map = {}
         if span_ids:
-            attrs_result = analytics.execute_ch_query(
-                "SELECT id, provider, "
-                "concat('{', arrayStringConcat(arrayMap("
-                "kv -> concat('\"', kv.1, '\":', kv.2), "
-                "arrayFilter(kv -> kv.1 != 'call_logs', "
-                "JSONExtractKeysAndValuesRaw(attributes_extra))), ','), '}') "
-                "AS span_attributes, "
-                "mapFilter((k, v) -> k != 'call_logs', attrs_string) AS attrs_string, "
-                "attrs_number, attrs_bool "
-                "FROM spans FINAL "
-                "PREWHERE id IN %(span_ids)s AND project_id = %(project_id)s "
-                "SETTINGS use_skip_indexes_if_final = 1",
-                {"span_ids": tuple(span_ids), "project_id": str(project_id)},
-                timeout_ms=10000,
-            )
+            try:
+                attrs_result = analytics.execute_ch_query(
+                    "SELECT id, argMax(provider, _version) AS provider, "
+                    "concat('{', arrayStringConcat(arrayMap("
+                    "kv -> concat('\"', kv.1, '\":', kv.2), "
+                    "arrayFilter(kv -> kv.1 != 'call_logs', "
+                    "JSONExtractKeysAndValuesRaw("
+                    "argMax(attributes_extra, _version)))), ','), '}') "
+                    "AS span_attributes, "
+                    "mapFilter((k, v) -> k != 'call_logs', "
+                    "argMax(attrs_string, _version)) AS attrs_string, "
+                    "argMax(attrs_number, _version) AS attrs_number, "
+                    "argMax(attrs_bool, _version) AS attrs_bool "
+                    "FROM spans "
+                    "PREWHERE id IN %(span_ids)s AND project_id = %(project_id)s "
+                    "GROUP BY id "
+                    "HAVING argMax(is_deleted, _version) = 0",
+                    {"span_ids": tuple(span_ids), "project_id": str(project_id)},
+                    timeout_ms=750,
+                    settings=_BOUNDED_ANALYTICS_SETTINGS,
+                )
+            except Exception as exc:
+                # Attributes are optional list enrichment. A bounded miss must
+                # not fail the whole voice-call page or expose CH internals.
+                logger.warning(
+                    "voice call attribute hydration exceeded budget",
+                    project_id=str(project_id),
+                    error=str(exc)[:200],
+                )
+                attrs_result = QueryResult([], 0, "clickhouse", 0)
             for arow in attrs_result.data:
                 sid = str(arow.get("id", ""))
                 raw = arow.get("span_attributes", "{}")
@@ -4048,14 +4853,18 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # provider_transcript / fi.conversation.transcript / metrics_data are
             # detail-only transcript payloads — never in a list row.
             for key, value in span_attrs.items():
-                if key in (
-                    "raw_log",
-                    "call",
-                    "call_logs",
-                    "provider_transcript",
-                    "fi.conversation.transcript",
-                    "metrics_data",
-                ) or key in entry:
+                if (
+                    key
+                    in (
+                        "raw_log",
+                        "call",
+                        "call_logs",
+                        "provider_transcript",
+                        "fi.conversation.transcript",
+                        "metrics_data",
+                    )
+                    or key in entry
+                ):
                     continue
                 if isinstance(value, (str, int, float, bool)):
                     entry[key] = value
@@ -4216,18 +5025,23 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # not a fixed 30 days — so configs with data anywhere in the viewed range
         # keep their columns. Bounded by candidate ids.
         window_days = BuilderCls.window_days_covering(filters)
-        ids_with_data = (
-            set(
-                analytics.get_eval_config_ids_with_data_ch(
-                    str(project_id),
-                    timeout_ms=30000,
-                    candidate_config_ids=candidate_ids,
-                    window_days=window_days,
+        ids_with_data = set()
+        if candidate_ids:
+            try:
+                ids_with_data = set(
+                    analytics.get_eval_config_ids_with_data_ch(
+                        str(project_id),
+                        timeout_ms=750,
+                        candidate_config_ids=candidate_ids,
+                        window_days=window_days,
+                    )
                 )
-            )
-            if candidate_ids
-            else set()
-        )
+            except Exception as exc:
+                logger.warning(
+                    "prototype trace eval discovery exceeded budget",
+                    project_id=project_id,
+                    error=str(exc)[:200],
+                )
         eval_configs = [c for c in project_configs if str(c.id) in ids_with_data]
         eval_config_ids = [str(c.id) for c in eval_configs]
 
@@ -4250,12 +5064,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         # Phase 1: Get paginated traces
         query, params = builder.build()
-        result = analytics.execute_ch_query(query, params, timeout_ms=10000)
+        result = analytics.execute_ch_query(
+            query,
+            params,
+            timeout_ms=750,
+            settings=_BOUNDED_ANALYTICS_SETTINGS,
+        )
 
         # Prefix-dedup pagination (Phase 1 fetches the sorted prefix
         # [0, offset + 2*page_size); dedup by trace id + slice — see
         # TraceListQueryBuilder.build and page_dedup.py).
-        result.data, _has_more = paginate_deduped(
+        result.data, has_more = paginate_deduped(
             result.data, "trace_id", page_number, page_size
         )
 
@@ -4265,30 +5084,56 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         if page_trace_ids:
             content_query, content_params = builder.build_content_query(page_trace_ids)
             if content_query:
-                content_result = analytics.execute_ch_query(
-                    content_query, content_params, timeout_ms=10000
-                )
-                merge_content_rows(
-                    result.data,
-                    content_result.data,
-                    id_key="trace_id",
-                    keys=(
-                        "input",
-                        "output",
-                        "trace_tags",
-                        "attrs_string",
-                        "attrs_number",
-                        "attrs_bool",
-                        "attributes_extra",
-                    ),
-                )
+                try:
+                    content_result = analytics.execute_ch_query(
+                        content_query,
+                        content_params,
+                        timeout_ms=750,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                    merge_content_rows(
+                        result.data,
+                        content_result.data,
+                        id_key="trace_id",
+                        keys=(
+                            "input",
+                            "output",
+                            "trace_tags",
+                            "attrs_string",
+                            "attrs_number",
+                            "attrs_bool",
+                            "attributes_extra",
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "prototype trace content enrichment exceeded budget",
+                        project_id=project_id,
+                        error=str(exc)[:200],
+                    )
 
         # Get count
         count_query, count_params = builder.build_count_query()
-        count_result = analytics.execute_ch_query(
-            count_query, count_params, timeout_ms=30000
-        )
-        total_count = count_result.data[0].get("total", 0) if count_result.data else 0
+        try:
+            count_result = analytics.execute_ch_query(
+                count_query,
+                count_params,
+                timeout_ms=750,
+                settings=_BOUNDED_ANALYTICS_SETTINGS,
+            )
+            total_count = (
+                count_result.data[0].get("total", 0) if count_result.data else 0
+            )
+        except Exception as exc:
+            total_count = (
+                page_number * page_size + len(result.data) + (1 if has_more else 0)
+            )
+            logger.warning(
+                "prototype trace count exceeded budget; using lower bound",
+                project_id=project_id,
+                lower_bound=total_count,
+                error=str(exc)[:200],
+            )
 
         # Phase 2: Get eval scores for this page
         trace_ids = [str(row.get("trace_id", "")) for row in result.data]
@@ -4296,13 +5141,23 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         if trace_ids and eval_config_ids:
             eval_query, eval_params = builder.build_eval_query(trace_ids)
             if eval_query:
-                eval_result = analytics.execute_ch_query(
-                    eval_query, eval_params, timeout_ms=30000
-                )
-                eval_map = builder.pivot_eval_results(
-                    [(list(row.values())) for row in eval_result.data],
-                    list(eval_result.data[0].keys()) if eval_result.data else [],
-                )
+                try:
+                    eval_result = analytics.execute_ch_query(
+                        eval_query,
+                        eval_params,
+                        timeout_ms=750,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                    eval_map = builder.pivot_eval_results(
+                        [(list(row.values())) for row in eval_result.data],
+                        list(eval_result.data[0].keys()) if eval_result.data else [],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "prototype trace eval enrichment exceeded budget",
+                        project_id=project_id,
+                        error=str(exc)[:200],
+                    )
 
         # Phase 3: Annotations — fetch from PG Score (unified annotation system)
         annotation_map = _build_annotation_map_from_scores(
@@ -4314,7 +5169,15 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             end_date=builder.params.get("end_date"),
         )
 
-        user_id_map = builder.resolve_user_ids(trace_ids, analytics)
+        try:
+            user_id_map = builder.resolve_user_ids(trace_ids, analytics)
+        except Exception as exc:
+            user_id_map = {}
+            logger.warning(
+                "prototype trace user enrichment exceeded budget",
+                project_id=project_id,
+                error=str(exc)[:200],
+            )
 
         # Build column config
         column_config = get_default_trace_config()
@@ -4513,7 +5376,7 @@ class UsersView(APIView):
 
         except Exception as e:
             logger.exception(f"ERROR {e}")
-            return self._gm.bad_request(f"error fetching users: {str(e)}")
+            return self._gm.bad_request("error fetching users")
 
 
 class GetUserCodeExampleView(APIView):

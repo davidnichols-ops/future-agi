@@ -6,6 +6,7 @@ import {
   useFormState,
 } from "react-hook-form";
 import {
+  Alert,
   Box,
   Typography,
   Button,
@@ -246,7 +247,10 @@ const NewTaskDrawerV2 = ({
   };
 
   // Fetch eval attributes for variable mapping
-  const { data: evalAttributes } = useQuery({
+  const {
+    data: evalAttributeResponse,
+    isError: evalAttributesRequestFailed,
+  } = useQuery({
     queryKey: ["eval-attributes", project, rowType, filtersWithoutDate],
     queryFn: () =>
       axios.get(endpoints.project.getEvalAttributeList(), {
@@ -256,9 +260,13 @@ const NewTaskDrawerV2 = ({
           filters: JSON.stringify(filtersWithoutDate),
         },
       }),
-    select: (data) => data.data?.result,
+    select: (data) => data.data,
     enabled: isProjectSelected,
   });
+  const evalAttributes = evalAttributeResponse?.result;
+  const evalAttributesDegraded =
+    evalAttributesRequestFailed ||
+    evalAttributeResponse?.query_status === "degraded";
 
   const { data: projectsList } = useQuery({
     queryKey: ["project-list"],
@@ -469,6 +477,18 @@ const NewTaskDrawerV2 = ({
                   />
                 )}
 
+                {(evalAttributesRequestFailed ||
+                  evalAttributeResponse?.query_complete === false) && (
+                  <Alert
+                    severity={evalAttributesDegraded ? "error" : "info"}
+                    data-testid="eval-attribute-query-status"
+                  >
+                    {evalAttributesDegraded
+                      ? "Attributes could not be loaded completely. Retry before configuring filters or evaluation mappings."
+                      : "Attributes are from a bounded recent sample; rare attributes may not appear in this list."}
+                  </Alert>
+                )}
+
                 {/* Filters */}
                 <FilterErrorBoundary>
                   <Accordion defaultExpanded>
@@ -514,7 +534,7 @@ const NewTaskDrawerV2 = ({
                       <Button
                         variant="outlined"
                         size="small"
-                        disabled={!isProjectSelected}
+                        disabled={!isProjectSelected || evalAttributesDegraded}
                         onClick={() => setEvalPickerOpen(true)}
                         startIcon={
                           <Iconify icon="mingcute:add-line" width={16} />
@@ -594,6 +614,7 @@ const NewTaskDrawerV2 = ({
                   type="submit"
                   variant="contained"
                   color="primary"
+                  disabled={evalAttributesDegraded}
                   sx={{ width: "200px" }}
                 >
                   Save Task

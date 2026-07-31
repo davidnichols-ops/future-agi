@@ -8,6 +8,7 @@ import {
   TextField,
   InputAdornment,
   Chip,
+  Button,
 } from "@mui/material";
 import Iconify from "src/components/iconify";
 
@@ -17,11 +18,20 @@ const TYPE_COLORS = {
   boolean: "success",
 };
 
-const AttributeKeyList = ({ keys, selectedKey, onSelectKey }) => {
+const AttributeKeyList = ({
+  keys,
+  selectedKey,
+  onSelectKey,
+  allowManualEntry,
+}) => {
   const [search, setSearch] = useState("");
+  const manualKey = search.trim();
 
   const filtered = keys.filter((k) =>
     k.key.toLowerCase().includes(search.toLowerCase()),
+  );
+  const hasExactMatch = keys.some(
+    (key) => key.key.toLowerCase() === manualKey.toLowerCase(),
   );
 
   return (
@@ -53,6 +63,16 @@ const AttributeKeyList = ({ keys, selectedKey, onSelectKey }) => {
             ),
           }}
         />
+        {allowManualEntry && manualKey && !hasExactMatch && (
+          <Button
+            size="small"
+            fullWidth
+            sx={{ mt: 1, justifyContent: "flex-start" }}
+            onClick={() => onSelectKey(manualKey)}
+          >
+            Use &quot;{manualKey}&quot;
+          </Button>
+        )}
       </Box>
       <List sx={{ overflow: "auto", flex: 1, p: 1 }} dense>
         {filtered.map(({ key, type, count }) => (
@@ -64,7 +84,11 @@ const AttributeKeyList = ({ keys, selectedKey, onSelectKey }) => {
           >
             <ListItemText
               primary={key}
-              secondary={count.toLocaleString() + " spans"}
+              secondary={
+                typeof count === "number"
+                  ? count.toLocaleString() + " spans"
+                  : "Count unavailable"
+              }
               primaryTypographyProps={{
                 variant: "body2",
                 fontWeight: selectedKey === key ? 600 : 400,
@@ -101,6 +125,7 @@ AttributeKeyList.propTypes = {
   ).isRequired,
   selectedKey: PropTypes.string,
   onSelectKey: PropTypes.func.isRequired,
+  allowManualEntry: PropTypes.bool,
 };
 
 export default AttributeKeyList;

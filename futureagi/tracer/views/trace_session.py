@@ -1,6 +1,5 @@
 import io
 import json
-import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -66,6 +65,7 @@ from tracer.serializers.trace_session import (
     TraceSessionSerializer,
 )
 from tracer.services.clickhouse.graph_dispatch import (
+    degraded_graph_response,
     fetch_annotation_graph_ch,
     fetch_eval_graph_ch,
 )
@@ -73,6 +73,7 @@ from tracer.services.clickhouse.query_builders.base import NIL_UUID
 from tracer.services.clickhouse.query_builders.eval_status import (
     non_terminal_eval_marker,
 )
+from tracer.services.clickhouse.read_budget import is_read_budget_error
 from tracer.utils.filters import FilterEngine, apply_created_at_filters
 from tracer.utils.helper import (
     FieldConfig,
@@ -87,6 +88,16 @@ from tracer.utils.session import get_session_navigation
 # call-sites that historically used each.
 logger = structlog.get_logger(__name__)
 session_logger = structlog.get_logger(__name__)
+
+_BOUNDED_ANALYTICS_SETTINGS = {
+    "timeout_overflow_mode": "throw",
+    "max_threads": 2,
+    "max_memory_usage": 268_435_456,
+    "max_bytes_to_read": 1_073_741_824,
+    "read_overflow_mode": "throw",
+    "max_result_rows": 2000,
+    "result_overflow_mode": "throw",
+}
 
 
 def _resolve_session_ids_to_canonical(analytics, session_ids):
@@ -108,7 +119,12 @@ def _resolve_session_ids_to_canonical(analytics, session_ids):
         f"FROM ({survivor_map_subquery('trace_session_id_remap')}) "
         "WHERE any_id IN %(ids)s"
     )
-    res = analytics.execute_ch_query(q, {"ids": tuple(ids)}, timeout_ms=5000)
+    res = analytics.execute_ch_query(
+        q,
+        {"ids": tuple(ids)},
+        timeout_ms=750,
+        settings=_BOUNDED_ANALYTICS_SETTINGS,
+    )
     id_to_survivor = {}
     for row in res.data or []:
         if isinstance(row, dict):
@@ -138,7 +154,10 @@ def _expand_session_group(analytics, canonical_session_id: str) -> tuple[str, ..
         "WHERE old_id = %(canonical_id)s"
     )
     res = analytics.execute_ch_query(
-        q, {"canonical_id": canonical_session_id}, timeout_ms=3000
+        q,
+        {"canonical_id": canonical_session_id},
+        timeout_ms=750,
+        settings=_BOUNDED_ANALYTICS_SETTINGS,
     )
     ids = {canonical_session_id}
     for row in res.data or []:
@@ -333,6 +352,25 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         return self._gm.success_response(
             {
                 "metadata": {"total_rows": 0},
+                "table": [],
+                "config": (
+                    (project.session_config if project else None)
+                    or get_default_project_session_config()
+                ),
+            }
+        )
+
+    def _degraded_session_list_response(self, project=None):
+        """Return an explicit bounded-read failure, never a false empty result."""
+        return self._gm.success_response(
+            {
+                "metadata": {
+                    "total_rows": 0,
+                    "total_rows_is_lower_bound": True,
+                    "query_complete": False,
+                    "query_status": "degraded",
+                    "query_error_code": "read_budget_exceeded",
+                },
                 "table": [],
                 "config": (
                     (project.session_config if project else None)
@@ -633,7 +671,8 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         agg_result = analytics.execute_ch_query(
             agg_query,
             {"project_id": str(project_id), "session_group_ids": session_group_ids},
-            timeout_ms=5000,
+            timeout_ms=750,
+            settings=_BOUNDED_ANALYTICS_SETTINGS,
         )
 
         agg = agg_result.data[0] if agg_result.data else {}
@@ -703,7 +742,8 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 "limit": page_size + 1,
                 "offset": page_start,
             },
-            timeout_ms=10000,
+            timeout_ms=750,
+            settings=_BOUNDED_ANALYTICS_SETTINGS,
         )
 
         has_next = len(trace_result.data) > page_size
@@ -880,6 +920,20 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
             analytics = AnalyticsQueryService()
 
+            def _degraded_values(exc):
+                return self._gm.success_response(
+                    {
+                        "values": [],
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": (
+                            "read_budget_exceeded"
+                            if is_read_budget_error(exc)
+                            else "query_failed"
+                        ),
+                    }
+                )
+
             if ch_column == "trace_session_id":
                 from tracer.services.clickhouse.v2.id_remap_sql import (
                     remap_left_join,
@@ -923,16 +977,24 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 ORDER BY label, val
                 LIMIT %(limit)s OFFSET %(offset)s
                 """
-                result = analytics.execute_ch_query(
-                    query,
-                    {
-                        "project_id": project_id,
-                        "limit": page_size,
-                        "offset": page * page_size,
-                        **({"search": f"%{search}%"} if search else {}),
-                    },
-                    timeout_ms=5000,
-                )
+                try:
+                    result = analytics.execute_ch_query(
+                        query,
+                        {
+                            "project_id": project_id,
+                            "limit": page_size,
+                            "offset": page * page_size,
+                            **({"search": f"%{search}%"} if search else {}),
+                        },
+                        timeout_ms=750,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                except Exception as exc:
+                    session_logger.warning(
+                        "CH session-id filter values exceeded budget",
+                        error=str(exc)[:200],
+                    )
+                    return _degraded_values(exc)
                 session_ids = [str(row["val"]) for row in result.data]
                 from tracer.services.clickhouse.v2.trace_session_dict_reader import (
                     resolve_session_fields,
@@ -952,7 +1014,13 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         or value
                     )
                     values.append({"value": value, "label": str(label)})
-                return self._gm.success_response({"values": values})
+                return self._gm.success_response(
+                    {
+                        "values": values,
+                        "query_complete": True,
+                        "query_status": "complete",
+                    }
+                )
 
             # Session and message values are derived from remap-resolved spans.
             # User labels come from the curated CH end_users dimension.
@@ -1020,20 +1088,33 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 params["search"] = f"%{search}%"
 
             try:
-                result = analytics.execute_ch_query(query, params, timeout_ms=5000)
+                result = analytics.execute_ch_query(
+                    query,
+                    params,
+                    timeout_ms=750,
+                    settings=_BOUNDED_ANALYTICS_SETTINGS,
+                )
                 values = [
                     str(row.get("val", "") if isinstance(row, dict) else row[0])
                     for row in result.data
                     if (row.get("val") if isinstance(row, dict) else row[0])
                 ]
-                return self._gm.success_response({"values": values})
+                return self._gm.success_response(
+                    {
+                        "values": values,
+                        "query_complete": True,
+                        "query_status": "complete",
+                    }
+                )
             except Exception as e:
-                session_logger.warning("CH session filter values failed", error=str(e))
-                return self._gm.success_response({"values": []})
+                session_logger.warning(
+                    "CH session filter values failed", error=str(e)[:200]
+                )
+                return _degraded_values(e)
 
         except Exception as e:
             session_logger.exception(f"Error in get_session_filter_values: {e}")
-            return self._gm.bad_request(str(e))
+            return self._gm.bad_request("Error fetching session filter values")
 
     @validated_request(request_serializer=TraceSessionGraphDataRequestSerializer)
     @action(detail=False, methods=["post"])
@@ -1082,7 +1163,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         interval=interval,
                     )
                     query, params = builder.build()
-                    result = analytics.execute_ch_query(query, params, timeout_ms=10000)
+                    result = analytics.execute_ch_query(
+                        query,
+                        params,
+                        timeout_ms=750,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
                     ch_data = builder.format_result(result.data, result.columns or [])
 
                     metric_key = metric_id if metric_id in ch_data else "session_count"
@@ -1107,10 +1193,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     return self._gm.success_response(graph_data)
                 except Exception as e:
                     session_logger.warning(
-                        "CH session time-series failed",
-                        error=str(e),
+                        "CH session time-series exceeded read budget; returning empty",
+                        error=str(e)[:200],
                     )
-                    session_logger.warning("Falling back to Postgres session graph")
+                    return self._gm.success_response(
+                        degraded_graph_response(metric_id, e)
+                    )
 
             # --- EVAL / ANNOTATION: delegate to shared helpers ---
             # Filter traces to only those belonging to sessions
@@ -1139,11 +1227,14 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                             )
                         )
                     except Exception as e:
-                        session_logger.exception(
-                            "ClickHouse session eval graph failed",
-                            error=str(e),
+                        session_logger.warning(
+                            "ClickHouse session eval graph exceeded read budget; "
+                            "returning empty",
+                            error=str(e)[:200],
                         )
-                        session_logger.warning("Falling back to Postgres session graph")
+                        return self._gm.success_response(
+                            degraded_graph_response(metric_id, e)
+                        )
 
                 if metric_type == "ANNOTATION":
                     try:
@@ -1158,46 +1249,14 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                             )
                         )
                     except Exception as e:
-                        session_logger.exception(
-                            "ClickHouse session annotation graph failed",
-                            error=str(e),
+                        session_logger.warning(
+                            "ClickHouse session annotation graph exceeded read budget; "
+                            "returning empty",
+                            error=str(e)[:200],
                         )
-                        session_logger.warning("Falling back to Postgres session graph")
-
-                from tracer.utils.graphs_optimized import (
-                    get_annotation_graph_data,
-                    get_eval_graph_data,
-                )
-
-                session_trace_qs = Trace.objects.filter(
-                    project_id=project_id,
-                    session__isnull=False,
-                )
-
-                if metric_type == "EVAL":
-                    graph_data = get_eval_graph_data(
-                        interval=interval,
-                        filters=filters,
-                        property=body["property"],
-                        observe_type="trace",
-                        req_data_config=req_data_config,
-                        eval_logger_filters={"trace_ids_queryset": session_trace_qs},
-                    )
-                else:
-                    graph_data = get_annotation_graph_data(
-                        interval=interval,
-                        filters=filters,
-                        property=body["property"],
-                        observe_type="trace",
-                        req_data_config=req_data_config,
-                        annotation_logger_filters={
-                            "trace_ids_queryset": session_trace_qs
-                        },
-                    )
-
-                return self._gm.success_response(
-                    graph_data or {"metric_name": metric_id, "data": []}
-                )
+                        return self._gm.success_response(
+                            degraded_graph_response(metric_id, e)
+                        )
 
             # Fallback: empty
             return self._gm.success_response({"metric_name": metric_id, "data": []})
@@ -1205,7 +1264,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.bad_request("Project not found")
         except Exception as e:
             session_logger.exception(f"Error in get_session_graph_data: {str(e)}")
-            return self._gm.bad_request(f"Error fetching session graph data: {str(e)}")
+            return self._gm.bad_request("Error fetching session graph data")
 
     @validated_request(query_serializer=TraceSessionListQuerySerializer)
     @action(detail=False, methods=["get"])
@@ -1282,11 +1341,13 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     bookmark_filter=bookmark_filter,
                 )
             except Exception as e:
-                logger.exception(
-                    "ClickHouse session-list failed",
-                    error=str(e),
+                if not is_read_budget_error(e):
+                    raise
+                logger.warning(
+                    "ClickHouse session-list exceeded read budget; returning degraded",
+                    error=str(e)[:200],
                 )
-                logger.warning("Falling back to Postgres session list")
+                return self._degraded_session_list_response(project)
 
             filters = validated_data.get("filters", [])
             sort_params = validated_data.get("sort_params", [])
@@ -1624,9 +1685,13 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
             return self._gm.success_response(response)
 
-        except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(f"Error fetching the traces list: {str(e)}")
+        except Project.DoesNotExist:
+            return self._gm.bad_request("Project not found or access denied")
+        except Exception:
+            # Authentication/input validation has already produced a concrete
+            # response above. Do not convert query/programming failures into a
+            # plausible empty-list 400; DRF's error handler must surface them.
+            raise
 
     @staticmethod
     def _build_row(span, needs_first_last, end_user_map, session_name_map=None):
@@ -1846,7 +1911,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             WHERE session_id IN %(session_ids)s
             GROUP BY session_id
         """
-        result = analytics.execute_ch_query(eu_by_session_q, params, timeout_ms=10000)
+        result = analytics.execute_ch_query(
+            eu_by_session_q,
+            params,
+            timeout_ms=750,
+            settings=_BOUNDED_ANALYTICS_SETTINGS,
+        )
 
         eu_by_canonical: dict[str, str] = {}
         for row in result.data:
@@ -2032,7 +2102,13 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
         BuilderCls = get_query_builder_class("SESSION_LIST")  # noqa: N806
 
-        org_scope = bool(org_project_ids)
+        # ``[]`` is still a valid organization-scoped request: it means the
+        # workspace has no eligible projects and must return an empty page
+        # without issuing a ClickHouse query.  Truthiness would misclassify it
+        # as project-scoped and bind the string ``"None"`` as a UUID.
+        org_scope = org_project_ids is not None
+        if org_scope and not org_project_ids:
+            return self._empty_session_list_response(project)
         # Organization in scope — the canonical resolver used across this view
         # (request is a param here; the helper is pure getattr, no query). Needed
         # by the user_id → end_user_id resolution below.
@@ -2041,6 +2117,19 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         sort_params = validated_data.get("sort_params", [])
         page_number = validated_data.get("page_number", 0)
         page_size = validated_data.get("page_size", 30)
+        preview = bool(validated_data.get("preview", False))
+        if preview:
+            page_number = 0
+            page_size = min(page_size, 10)
+        enrichment_error_codes: set[str] = set()
+
+        def _enrichment_error_code(exc: Exception) -> str:
+            return (
+                "read_budget_exceeded"
+                if is_read_budget_error(exc)
+                else "query_failed"
+            )
+
         user_id_qp = validated_data.get("user_id") or getattr(
             request, "query_params", {}
         ).get("user_id")
@@ -2176,11 +2265,56 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
         # Phase 1: Light aggregation (no input column)
         query, params = builder.build()
-        result = analytics.execute_ch_query(query, params, timeout_ms=10000)
+        try:
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=750,
+                settings=(
+                    {
+                        **_BOUNDED_ANALYTICS_SETTINGS,
+                        "max_result_rows": 64,
+                    }
+                    if preview
+                    else _BOUNDED_ANALYTICS_SETTINGS
+                ),
+            )
+        except Exception as exc:
+            if not is_read_budget_error(exc):
+                raise
+            if not preview:
+                raise
+            session_logger.warning(
+                "session task preview exceeded read budget; returning degraded",
+                project_id=str(project_id) if project_id else None,
+                error=str(exc)[:200],
+            )
+            return self._degraded_session_list_response(project)
 
         # Trim the +1 sentinel row used for has_more detection
         has_more = len(result.data) > page_size
         actual_data = result.data[:page_size]
+
+        if preview:
+            formatted = builder.format_sessions(
+                [(list(row.values())) for row in actual_data],
+                list(actual_data[0].keys()) if actual_data else [],
+            )
+            for entry in formatted:
+                entry["created_at"] = entry.get("start_time")
+            return self._gm.success_response(
+                {
+                    "metadata": {
+                        "total_rows": len(formatted) + (1 if has_more else 0),
+                        "total_rows_is_lower_bound": True,
+                    },
+                    "table": formatted,
+                    "config": (
+                        (project.session_config if project else None)
+                        or get_default_project_session_config()
+                    ),
+                }
+            )
 
         # Phase 1b: Fetch first/last messages for the page
         session_ids_page = [str(row.get("session_id", "")) for row in actual_data]
@@ -2188,8 +2322,29 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         if session_ids_page:
             cq, cp = builder.build_content_query(session_ids_page)
             if cq:
-                cr = analytics.execute_ch_query(cq, cp, timeout_ms=10000)
-                content_map = {str(r.get("session_id", "")): r for r in cr.data}
+                try:
+                    cr = analytics.execute_ch_query(
+                        cq,
+                        cp,
+                        timeout_ms=750,
+                        settings=_BOUNDED_ANALYTICS_SETTINGS,
+                    )
+                    content_map = {str(r.get("session_id", "")): r for r in cr.data}
+                    if not set(session_ids_page).issubset(content_map):
+                        enrichment_error_codes.add("query_failed")
+                        logger.warning(
+                            "session content enrichment returned fewer sessions than requested",
+                            returned=len(content_map),
+                            requested=len(session_ids_page),
+                            project_id=str(project_id) if project_id else None,
+                        )
+                except Exception as exc:
+                    enrichment_error_codes.add(_enrichment_error_code(exc))
+                    logger.warning(
+                        "session content enrichment exceeded budget",
+                        project_id=str(project_id) if project_id else None,
+                        error=str(exc)[:200],
+                    )
         for row in actual_data:
             sid = str(row.get("session_id", ""))
             c = content_map.get(sid, {})
@@ -2198,18 +2353,34 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
         # Get total count — skip the expensive count query when we can infer
         # the total from the Phase 1 result size.
+        count_is_lower_bound = False
         if not has_more and page_number == 0:
             total_count = len(actual_data)
         elif not has_more:
             total_count = (page_number * page_size) + len(actual_data)
         else:
             count_query, count_params = builder.build_count_query()
-            count_result = analytics.execute_ch_query(
-                count_query, count_params, timeout_ms=5000
-            )
-            total_count = (
-                count_result.data[0].get("total", 0) if count_result.data else 0
-            )
+            try:
+                count_result = analytics.execute_ch_query(
+                    count_query,
+                    count_params,
+                    timeout_ms=750,
+                    settings=_BOUNDED_ANALYTICS_SETTINGS,
+                )
+                total_count = (
+                    count_result.data[0].get("total", 0) if count_result.data else 0
+                )
+            except Exception as exc:
+                total_count = (
+                    page_number * page_size + len(actual_data) + (1 if has_more else 0)
+                )
+                count_is_lower_bound = True
+                logger.warning(
+                    "session count exceeded budget; using lower bound",
+                    project_id=str(project_id) if project_id else None,
+                    lower_bound=total_count,
+                    error=str(exc)[:200],
+                )
 
         formatted = builder.format_sessions(
             [(list(row.values())) for row in actual_data],
@@ -2228,13 +2399,19 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 try:
                     aq, ap = builder.build_span_attributes_query(session_ids_page)
                     if aq:
-                        ar = analytics.execute_ch_query(aq, ap, timeout_ms=5000)
-                        return ar.data
+                        ar = analytics.execute_ch_query(
+                            aq,
+                            ap,
+                            timeout_ms=750,
+                            settings=_BOUNDED_ANALYTICS_SETTINGS,
+                        )
+                        return ar.data, None
                 except Exception as exc:
                     logger.warning(
                         "session_enrichment_attrs_failed", error=str(exc)[:200]
                     )
-                return []
+                    return [], _enrichment_error_code(exc)
+                return [], None
 
             # Submit the slow attrs query to a background thread (uses only
             # the thread-safe clickhouse_driver connection pool). Run the fast
@@ -2248,6 +2425,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         session_ids_page, _curated_project_ids
                     )
                 except Exception as exc:
+                    enrichment_error_codes.add(_enrichment_error_code(exc))
                     logger.warning(
                         "session_enrichment_names_failed", error=str(exc)[:200]
                     )
@@ -2256,10 +2434,13 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         session_ids_page, analytics, _curated_project_ids
                     )
                 except Exception as exc:
+                    enrichment_error_codes.add(_enrichment_error_code(exc))
                     logger.warning(
                         "session_enrichment_end_user_failed", error=str(exc)[:200]
                     )
-                attr_result_data = f_attrs.result()
+                attr_result_data, attr_error = f_attrs.result()
+                if attr_error is not None:
+                    enrichment_error_codes.add(attr_error)
 
             for entry in formatted:
                 sid = str(entry.get("session_id", ""))
@@ -2350,8 +2531,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                                 entry[key] = vals[0] if len(vals) == 1 else vals
                             else:
                                 entry[key] = values
-            except Exception as e:
-                logger.warning(f"Session span attribute aggregation failed: {e}")
+            except Exception as exc:
+                enrichment_error_codes.add(_enrichment_error_code(exc))
+                logger.warning(
+                    "session span attribute aggregation failed",
+                    error=str(exc)[:200],
+                )
 
         # Build config with annotation metric columns (mirrors the PG path)
         config = (
@@ -2383,12 +2568,29 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         for label in annotation_labels:
                             lid = str(label.id)
                             entry[lid] = session_scores.get(lid)
-                except Exception:
+                except Exception as exc:
+                    enrichment_error_codes.add(_enrichment_error_code(exc))
                     logger.exception("Failed to fetch session scores (CH path)")
+
+        metadata = {"total_rows": total_count}
+        if count_is_lower_bound:
+            metadata["total_rows_is_lower_bound"] = True
+        if enrichment_error_codes:
+            metadata.update(
+                {
+                    "query_complete": False,
+                    "query_status": "degraded",
+                    "query_error_code": (
+                        "query_failed"
+                        if "query_failed" in enrichment_error_codes
+                        else "read_budget_exceeded"
+                    ),
+                }
+            )
 
         return self._gm.success_response(
             {
-                "metadata": {"total_rows": total_count},
+                "metadata": metadata,
                 "table": formatted,
                 "config": config,
             }
@@ -2606,8 +2808,16 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             return response
 
         except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(f"Error fetching the traces list: {str(e)}")
+            logger.exception("session_export_failed", error=str(e))
+            response = self._gm.bad_request(
+                "Session export could not be completed. Please try again."
+            )
+            response.data["code"] = (
+                "read_budget_exceeded"
+                if is_read_budget_error(e)
+                else "query_failed"
+            )
+            return response
 
     @action(detail=True, methods=["get"])
     def eval_logs(self, request, *args, **kwargs):
@@ -2826,4 +3036,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             )
         except Exception as e:
             logger.exception(f"Error in fetching session eval logs: {str(e)}")
-            return self._gm.bad_request(f"Error fetching session eval logs: {str(e)}")
+            response = self._gm.bad_request(
+                "Session evaluation logs could not be loaded. Please try again."
+            )
+            response.data["code"] = (
+                "read_budget_exceeded"
+                if is_read_budget_error(e)
+                else "query_failed"
+            )
+            return response

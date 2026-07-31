@@ -408,9 +408,9 @@ class TestClickHouseSchema:
         assert names.index("span_metrics_hourly_mv") < names.index(
             "span_metrics_hourly"
         ), "MV must drop before its source table"
-        assert names.index("spans_mv") < names.index(
-            "tracer_observation_span"
-        ), "spans_mv must drop before tracer_observation_span"
+        assert names.index("spans_mv") < names.index("tracer_observation_span"), (
+            "spans_mv must drop before tracer_observation_span"
+        )
         # Idempotency: every drop wraps IF EXISTS so reruns are no-ops.
         for _, sql in drops:
             assert "IF EXISTS" in sql, f"drop must be idempotent: {sql}"
@@ -2320,6 +2320,80 @@ class TestTimeSeriesQueryBuilder:
         assert params["start_date"] is not None
         assert params["end_date"] is not None
 
+    def test_filtered_span_eval_matches_observation_ids_not_whole_traces(self):
+        from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
+            EvalMetricsQueryBuilderV2,
+        )
+
+        builder = EvalMetricsQueryBuilderV2(
+            project_id="test-project-id",
+            custom_eval_config_id="00000000-0000-0000-0000-000000000001",
+            eval_output_type="SCORE",
+            observe_type="span",
+            filters=[
+                {
+                    "column_id": "customer.tier",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "premium",
+                    },
+                }
+            ],
+        )
+
+        query, _ = builder.build()
+
+        assert "observation_span_id IN (" in query
+        assert "SELECT DISTINCT id FROM spans" in query
+        assert "trace_id IN (SELECT DISTINCT trace_id FROM spans" not in query
+
+    @pytest.mark.parametrize(
+        ("observe_type", "expected_tag_source", "unexpected_tag_source"),
+        [
+            (
+                "trace",
+                "dictGetOrDefault('trace_dict', 'tags', toUUID(trace_id), '[]')",
+                "JSONExtract(tags, 'Array(String)')",
+            ),
+            (
+                "span",
+                "JSONExtract(tags, 'Array(String)')",
+                "dictGetOrDefault('trace_dict', 'tags', toUUID(trace_id), '[]')",
+            ),
+        ],
+    )
+    def test_filtered_eval_uses_tag_source_for_observed_entity(
+        self, observe_type, expected_tag_source, unexpected_tag_source
+    ):
+        from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
+            EvalMetricsQueryBuilderV2,
+        )
+
+        builder = EvalMetricsQueryBuilderV2(
+            project_id="test-project-id",
+            custom_eval_config_id="00000000-0000-0000-0000-000000000001",
+            eval_output_type="SCORE",
+            observe_type=observe_type,
+            filters=[
+                {
+                    "column_id": "tag",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "production",
+                    },
+                }
+            ],
+        )
+
+        query, _ = builder.build()
+
+        assert expected_tag_source in query
+        assert unexpected_tag_source not in query
+
     def test_build_query_contains_groupby_and_orderby(self):
         """Generated query should include GROUP BY and ORDER BY."""
         from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
@@ -2702,8 +2776,7 @@ class TestTraceListQueryBuilder:
         assert "SELECT" in query
         assert "trace_id" in query
         assert (
-            "dictGetOrDefault('enduser_dict', 'user_id', any(end_user_id), '')"
-            in query
+            "dictGetOrDefault('enduser_dict', 'user_id', any(end_user_id), '')" in query
         )
         assert "GROUP BY trace_id" in query
         assert "PREWHERE trace_id IN" in query
@@ -3642,6 +3715,121 @@ class TestEvalMetricsQueryBuilder:
         assert "SELECT DISTINCT trace_id FROM spans" in query
         assert "lower(status) =" in query
         assert "ok" in params.values()
+
+    def test_filtered_eval_uses_v2_attribute_columns_and_span_window(self):
+        from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
+            EvalMetricsQueryBuilderV2,
+        )
+
+        builder = EvalMetricsQueryBuilderV2(
+            project_id="test-project-id",
+            custom_eval_config_id="00000000-0000-0000-0000-000000000001",
+            eval_output_type="SCORE",
+            filters=[
+                {
+                    "column_id": "customer.tier",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "contains",
+                        "filter_value": "premium",
+                    },
+                }
+            ],
+        )
+
+        query, params = builder.build()
+
+        assert "attrs_string['customer.tier'] ILIKE" in query
+        assert "span_attr_str" not in query
+        assert query.count("SELECT DISTINCT trace_id FROM spans") == 1
+        assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in query
+        assert "start_time < %(end_date)s + INTERVAL 1 DAY" in query
+        assert params["start_date"] is not None
+        assert params["end_date"] is not None
+
+    def test_unfiltered_v2_eval_uses_configured_raw_logger_not_legacy_rollup(self):
+        from django.test import override_settings
+
+        from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
+            EvalMetricsQueryBuilderV2,
+        )
+
+        for table in ("tracer_eval_logger", "tracer_eval_logger_v2"):
+            with override_settings(CH25_EVAL_LOGGER_TABLE=table):
+                builder = EvalMetricsQueryBuilderV2(
+                    project_id="test-project-id",
+                    custom_eval_config_id="00000000-0000-0000-0000-000000000001",
+                    eval_output_type="SCORE",
+                )
+                query, _ = builder.build()
+
+            assert f"FROM {table} FINAL" in query
+            assert "eval_metrics_hourly" not in query
+
+    def test_filtered_eval_base_builder_keeps_legacy_span_columns(self):
+        from tracer.services.clickhouse.query_builders import EvalMetricsQueryBuilder
+
+        builder = EvalMetricsQueryBuilder(
+            project_id="test-project-id",
+            custom_eval_config_id="00000000-0000-0000-0000-000000000001",
+            eval_output_type="SCORE",
+            filters=[
+                {
+                    "column_id": "customer.tier",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "contains",
+                        "filter_value": "premium",
+                    },
+                }
+            ],
+        )
+
+        query, _ = builder.build()
+
+        assert "span_attr_str['customer.tier']" in query
+        assert "_peerdb_is_deleted = 0" in query
+        assert "created_at >= %(start_date)s - INTERVAL 1 DAY" in query
+        assert "attrs_string" not in query
+        assert "start_time >=" not in query
+
+    def test_filtered_eval_uses_project_ids_scope_in_outer_and_span_queries(self):
+        from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
+            EvalMetricsQueryBuilderV2,
+        )
+
+        project_ids = [
+            "00000000-0000-0000-0000-000000000010",
+            "00000000-0000-0000-0000-000000000011",
+        ]
+        builder = EvalMetricsQueryBuilderV2(
+            project_id=None,
+            project_ids=project_ids,
+            custom_eval_config_id="00000000-0000-0000-0000-000000000001",
+            eval_output_type="SCORE",
+            filters=[
+                {
+                    "column_id": "status",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "OK",
+                    },
+                }
+            ],
+        )
+
+        query, params = builder.build()
+
+        assert query.count("project_id IN %(project_ids)s") == 1
+        assert query.count("IN %(project_ids)s") >= 2
+        assert "project_id = %(project_id)s" not in query
+        assert params["project_ids"] == tuple(project_ids)
+        assert "project_id" not in params
+        assert "dictGetOrDefault('trace_dict', 'project_id'" in query
 
     def test_build_with_filters_forces_raw_eval_query(self):
         """Filtered eval graphs cannot use pre-aggregated rows."""
@@ -6901,38 +7089,17 @@ class TestVoiceCallListPhase1bMigration:
         )
 
     def test_phase_1b_reads_v2_spans_table(self):
-        """Phase 1b must read v2 `spans` FINAL with the skip-index setting.
-
-        `FROM spans FINAL` dedupes ReplacingMergeTree versions; bare `FINAL`
-        disables the `idx_id` skip index and full-scans the table (~194M rows),
-        so it MUST be paired with `use_skip_indexes_if_final = 1` (the
-        CHSpanReader idiom) to prune the scan.
-        """
+        """Phase 1b must dedup only the bounded page IDs without FINAL."""
         import re
 
         src = self._voice_list_source()
-        # Reads the v2 `spans FINAL` (not the legacy `tracer_observation_span`).
-        assert re.search(
-            r"FROM\s+spans\s+FINAL", src
-        ), "_list_voice_calls_clickhouse must hydrate from v2 `spans FINAL`."
-        # FINAL without the setting full-scans; the setting re-enables idx_id.
-        assert "use_skip_indexes_if_final = 1" in src, (
-            "Phase 1b `FINAL` must set `use_skip_indexes_if_final = 1`, else it "
-            "disables the idx_id skip index and full-scans `spans`."
-        )
-        # The Phase-1b block must NOT carry `is_deleted = 0`: with the skip-index
-        # setting it prunes tombstone granules before the FINAL merge and
-        # resurrects deleted spans (the two-arg ReplacingMergeTree engine already
-        # drops tombstones under FINAL). See `_FINAL_SKIP_INDEX_SETTINGS`. Slice
-        # the block so the page/count queries — which legitimately keep
-        # `is_deleted = 0` — don't trip this.
-        start = src.index("AS span_attributes")
-        phase_1b_block = src[start : start + 400]
-        assert "is_deleted = 0" not in phase_1b_block, (
-            "Phase 1b must NOT pair `is_deleted = 0` with "
-            "`use_skip_indexes_if_final = 1` — resurrection bug "
-            "(see _FINAL_SKIP_INDEX_SETTINGS)."
-        )
+        assert not re.search(r"FROM\s+spans\s+FINAL", src)
+        assert "argMax(attributes_extra, _version)" in src
+        assert "argMax(attrs_string, _version)" in src
+        assert "GROUP BY id" in src
+        assert "HAVING argMax(is_deleted, _version) = 0" in src
+        assert "timeout_ms=750" in src
+        assert "settings=_BOUNDED_ANALYTICS_SETTINGS" in src
 
     def test_phase_1b_selects_typed_map_columns_for_reconstruction(self):
         """The Phase 1b query must SELECT the typed Maps + attributes_extra.
@@ -6948,7 +7115,8 @@ class TestVoiceCallListPhase1bMigration:
         # query actually fails this test.
         assert "AS span_attributes" in src  # attributes_extra rebuild alias
         assert "AS attrs_string" in src  # mapFilter alias
-        assert "attrs_number, attrs_bool" in src  # SELECT column-list tail
+        assert "AS attrs_number" in src
+        assert "AS attrs_bool" in src
         assert "attributes_extra" in src  # the rebuild reads the overflow column
 
     def test_phase_1b_python_fallback_merges_typed_maps(self):
@@ -7377,9 +7545,9 @@ class TestVoiceCallListQueryBuilderComprehensive:
         # Each phone number is still recognised as a simulator call in Python.
         for phone in VAPI_PHONE_NUMBERS:
             span_attrs = {"raw_log": {"customer": {"number": phone}}}
-            assert VoiceCallListQueryBuilder.is_simulator_call(
-                span_attrs, "vapi"
-            ), f"Missing phone number: {phone}"
+            assert VoiceCallListQueryBuilder.is_simulator_call(span_attrs, "vapi"), (
+                f"Missing phone number: {phone}"
+            )
 
     def test_simulation_filter_uses_json_extract(self):
         """Simulation filtering is now Python-side against parsed raw_log.
@@ -7804,9 +7972,11 @@ class TestAnnotationGraphQueryBuilder:
             columns = []
 
         class Analytics:
-            def execute_ch_query(self, query, params, timeout_ms):
+            def execute_ch_query(self, query, params, timeout_ms, settings=None):
                 self.query = query
                 self.params = params
+                self.timeout_ms = timeout_ms
+                self.settings = settings
                 return Result()
 
         self_label_id = self.LABEL_ID
@@ -7827,6 +7997,8 @@ class TestAnnotationGraphQueryBuilder:
 
         lookup.assert_called_once_with("project-with-shared-label")
         assert analytics.params["label_id"] == self.LABEL_ID
+        assert analytics.timeout_ms == 750
+        assert analytics.settings["max_threads"] == 2
         assert result["name"] == "Score-backed label"
 
     def test_build_bool_query(self):
@@ -8138,7 +8310,7 @@ class TestMonitorMetricsQueryBuilder:
             "error_free_session_rates", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
         assert "session_id" in query
-        assert "GROUP BY session_id" in query
+        assert "GROUP BY trace_session_id" in query
 
     def test_service_provider_error_rates_query(self):
         """SERVICE_PROVIDER_ERROR_RATES should group by provider."""

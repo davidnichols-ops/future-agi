@@ -12,6 +12,7 @@ import {
   Paper,
   LinearProgress,
   Chip,
+  Alert,
 } from "@mui/material";
 import { useQuery } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
@@ -65,27 +66,38 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
 
   return (
     <Box sx={{ flex: 1, p: 2.5, overflow: "auto" }}>
+      {detail.query_complete === false && (
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          Attribute statistics are temporarily incomplete. No zero counts were
+          inferred; try again shortly.
+        </Alert>
+      )}
+
       <Box sx={{ mb: 3 }}>
         <Typography variant="h6" sx={{ mb: 0.5, wordBreak: "break-all" }}>
           {detail.key}
         </Typography>
         <Box sx={{ display: "flex", gap: 1.5, alignItems: "center" }}>
-          <Chip
-            label={detail.type}
-            size="small"
-            variant="outlined"
-            color={
-              detail.type === "string"
-                ? "info"
-                : detail.type === "number"
-                  ? "warning"
-                  : "success"
-            }
-          />
-          <Typography variant="body2" color="text.secondary">
-            {detail.count?.toLocaleString()} spans
-          </Typography>
-          {detail.unique_values && (
+          {detail.type && (
+            <Chip
+              label={detail.type}
+              size="small"
+              variant="outlined"
+              color={
+                detail.type === "string"
+                  ? "info"
+                  : detail.type === "number"
+                    ? "warning"
+                    : "success"
+              }
+            />
+          )}
+          {typeof detail.count === "number" && (
+            <Typography variant="body2" color="text.secondary">
+              {detail.count.toLocaleString()} spans
+            </Typography>
+          )}
+          {typeof detail.unique_values === "number" && (
             <Typography variant="body2" color="text.secondary">
               {detail.unique_values} unique values
             </Typography>

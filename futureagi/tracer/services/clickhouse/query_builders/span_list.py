@@ -89,19 +89,70 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     # Phase 1: Paginated span list
     # ------------------------------------------------------------------
 
-    def build(self, since: Any = None) -> tuple[str, dict[str, Any]]:
+    def requires_bounded_filter_scan(self) -> bool:
+        """Return whether this request should use bounded time slices.
+
+        Every span-attribute value lives in a raw Map column, regardless of
+        whether its declared type is text, number, or boolean. Those predicates
+        can turn a multi-day list request into a wide Map scan, so route all of
+        them through the bounded executor. Unknown SYSTEM_METRIC keys also fall
+        back to span attributes in the filter compiler and need the same bound.
+        Physical IDs and denormalized system columns stay on their direct,
+        indexed query path.
+        """
+        for filter_item in self.filters:
+            column_id = filter_item.get("column_id") or filter_item.get("columnId")
+            if column_id in {"created_at", "start_time"}:
+                continue
+            config = (
+                filter_item.get("filter_config")
+                or filter_item.get("filterConfig")
+                or {}
+            )
+            col_type = config.get("col_type") or config.get("colType")
+            normalized_col_type = str(col_type or "").strip().upper()
+            if normalized_col_type == "SPAN_ATTRIBUTE":
+                return True
+            if (
+                normalized_col_type == "SYSTEM_METRIC"
+                and column_id not in self._FILTER_BUILDER_CLS.SYSTEM_METRIC_MAP
+                and column_id not in self._FILTER_BUILDER_CLS.VOICE_SYSTEM_METRIC_EXPRS
+                and column_id
+                not in self._FILTER_BUILDER_CLS.VOICE_SYSTEM_METRIC_STR_MAP
+                and column_id
+                not in self._FILTER_BUILDER_CLS.VOICE_SYSTEM_METRIC_STR_EXPRS
+                and column_id not in self._FILTER_BUILDER_CLS._ENDUSER_STRING_COLUMNS
+            ):
+                return True
+        return False
+
+    def has_string_filter(self) -> bool:
+        """Backward-compatible alias for older internal callers and tests."""
+        return self.requires_bounded_filter_scan()
+
+    def build(
+        self,
+        since: Any = None,
+        *,
+        slice_end: Any = None,
+        limit: int | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         """Build the Phase-1 query for paginated span data.
 
         Args:
             since: Optional narrowed window start (datetime) for progressive
-                time-slice pagination. When set, an additional
-                ``start_time >= %(slice_start)s`` predicate restricts the scan
-                to the newest slice — because the sort is ``start_time DESC``,
-                every row in a newer slice sorts before every older row, so a
-                slice that yields the full prefix IS the global prefix and the
-                caller can stop without scanning the whole window. The regular
-                ``start_date``/``end_date`` params are left untouched so
-                ``build_count_query()`` still counts the full window.
+                time-slice pagination.
+            slice_end: Optional exclusive window end. Together with ``since``
+                this produces one adjacent ``[slice_start, slice_end)`` slice.
+                Every row in a newer slice sorts before every row in an older
+                one, so concatenating complete slices in newest-first order
+                preserves the exact global prefix.
+            limit: Optional raw-prefix limit for this slice. The bounded
+                executor lowers it as rows are collected so it never transfers
+                more than the one global prefix needed for the requested page.
+
+        The regular ``start_date``/``end_date`` params remain bound to the full
+        requested window so the count query still describes the full request.
         """
         start_date, end_date = self.parse_time_range(self.filters)
         self.params["start_date"] = start_date
@@ -113,6 +164,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             annotation_label_ids=self.annotation_label_ids,
             project_id=self.project_id,
             project_ids=self.project_ids,
+            span_latest_state=self.requires_bounded_filter_scan(),
         )
         extra_where, extra_params = fb.translate(self.filters)
         self.params.update(extra_params)
@@ -129,10 +181,17 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             # the progressive-slice prefix (see `since`) reproducible.
             order_clause = "ORDER BY start_time DESC, id DESC"
 
+        self.params.pop("slice_start", None)
+        self.params.pop("slice_end", None)
         slice_fragment = ""
         if since is not None:
             self.params["slice_start"] = since
             slice_fragment = "AND start_time >= %(slice_start)s"
+            if slice_end is not None:
+                self.params["slice_end"] = slice_end
+                slice_fragment += " AND start_time < %(slice_end)s"
+        elif slice_end is not None:
+            raise ValueError("slice_end requires since")
 
         # Prefix-fetch pagination: read the sorted prefix [0, offset +
         # 2*page_size) in ONE bounded top-K pass and let the view dedup by
@@ -143,7 +202,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         # page_size margin keeps pages exact for up to page_size duplicate
         # rows in the prefix. No SQL OFFSET — slicing happens in Python.
         offset = self.page_number * self.page_size
-        self.params["limit"] = offset + 2 * self.page_size
+        prefix_limit = offset + 2 * self.page_size if limit is None else int(limit)
+        if prefix_limit <= 0:
+            raise ValueError("limit must be greater than zero")
+        self.params["limit"] = prefix_limit
 
         filter_fragment = f"AND {extra_where}" if extra_where else ""
 
@@ -177,6 +239,11 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         if self.end_user_id:
             remap_join = remap_left_join("rs.end_user_id", "end_user_id_remap")
             resolved_eu = resolved_id_expr("rs.end_user_id")
+            span_source = (
+                f"{self.TABLE} FINAL"
+                if self.requires_bounded_filter_scan()
+                else self.TABLE
+            )
             inner_scan = f"""
             SELECT
                 id,
@@ -195,7 +262,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 provider,
                 end_user_id,
                 created_at
-            FROM {self.TABLE}
+            FROM {span_source}
             {self.project_where()}
               AND created_at >= %(start_date)s - INTERVAL 1 DAY
               AND start_time >= %(start_date)s
@@ -233,7 +300,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             {order_clause}
             LIMIT %(limit)s
             """
-            return query, self.params
+            return query, dict(self.params)
 
         # Light columns only — input/output fetched via build_content_query().
         #
@@ -247,6 +314,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         # (collapsed on the next merge); the view dedups the returned page by
         # span_id in Python to keep one row per span. `is_deleted = 0` (from
         # project_where) still excludes soft-deleted rows.
+        span_source = (
+            f"{self.TABLE} FINAL" if self.requires_bounded_filter_scan() else self.TABLE
+        )
         query = f"""
         SELECT
             id,
@@ -265,7 +335,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             provider,
             end_user_id,
             created_at
-        FROM {self.TABLE}
+        FROM {span_source}
         {self.project_where()}
           AND created_at >= %(start_date)s - INTERVAL 1 DAY
           AND start_time >= %(start_date)s
@@ -277,16 +347,31 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         {order_clause}
         LIMIT %(limit)s
         """
-        return query, self.params
+        return query, dict(self.params)
 
-    def build_id_query(self, *, limit: int | None = None) -> tuple[str, dict[str, Any]]:
-        """Filtered span ids only — same filter/time window as build(), no pivots.
+    def build_id_query(
+        self,
+        *,
+        limit: int | None = None,
+        sampling_salt: str | None = None,
+        sampling_rate: float | None = None,
+        order_by_recent_minute: bool = False,
+        latest_state: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        """Filtered span ids only — same filter/time window as ``build()``.
 
-        With ``limit=None`` (default) the full matching id set is returned
-        unordered, which is what the eval resolver wants. Pass ``limit`` for a
-        capped "select all matching" resolve: the ids are then ordered
-        newest-first (``start_time DESC, id DESC`` — same as the observe list and
-        the PG bulk-select) so the cap keeps the most recent rows deterministically.
+        A capped query is a deterministic bounded top-K. The default order is
+        by id; eval-task resolution can request a newest-minute/id order that
+        composes exactly with its adjacent minute fallback. It deliberately
+        does not use ``LIMIT 1 BY id``: ClickHouse applies that de-duplication
+        before the plain ``LIMIT``, forcing a full-window sort/materialization.
+        The eval-task caller fetches a bounded duplicate margin and
+        de-duplicates ids in Python instead.
+
+        Optional deterministic hash sampling is applied before the top-K. This
+        lets task row limits retain their "sample matching rows, then stop at
+        the limit" semantics without over-scanning by ``1 / sampling_rate``.
+        With ``limit=None`` the query remains streaming and unordered.
         """
         start_date, end_date = self.parse_time_range(self.filters)
         self.params["start_date"] = start_date
@@ -298,6 +383,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             annotation_label_ids=self.annotation_label_ids,
             project_id=self.project_id,
             project_ids=self.project_ids,
+            span_latest_state=latest_state,
         )
         extra_where, extra_params = fb.translate(self.filters)
         self.params.update(extra_params)
@@ -308,24 +394,53 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             pv_fragment = "AND project_version_id = %(project_version_id)s"
             self.params["project_version_id"] = self.project_version_id
 
+        if (sampling_salt is None) != (sampling_rate is None):
+            raise ValueError(
+                "sampling_salt and sampling_rate must be provided together"
+            )
+        sampling_fragment = ""
+        if sampling_rate is not None:
+            rate = float(sampling_rate)
+            if not 0 <= rate <= 100:
+                raise ValueError("sampling_rate must be between 0 and 100")
+            self.params["id_sampling_salt"] = str(sampling_salt)
+            self.params["id_sampling_rate"] = rate
+            sampling_fragment = (
+                "AND modulo("
+                "cityHash64(%(id_sampling_salt)s, toString(id)), 100"
+                ") < %(id_sampling_rate)s"
+            )
+
         order_fragment = ""
         limit_fragment = ""
         if limit is not None:
-            order_fragment = "ORDER BY start_time DESC, id DESC"
+            if int(limit) <= 0:
+                raise ValueError("limit must be greater than zero")
+            order_fragment = (
+                "ORDER BY toStartOfMinute(start_time) DESC, id"
+                if order_by_recent_minute
+                else "ORDER BY id"
+            )
             limit_fragment = "LIMIT %(id_limit)s"
             self.params["id_limit"] = int(limit)
 
+        select_fragment = (
+            "id, start_time AS eval_order_start_time"
+            if order_by_recent_minute
+            else "id"
+        )
+        span_source = f"{self.TABLE} FINAL" if latest_state else self.TABLE
         query = f"""
-        SELECT id
-        FROM {self.TABLE}
+        SELECT {select_fragment}
+        FROM {span_source}
         {self.project_where()}
           AND created_at >= %(start_date)s - INTERVAL 1 DAY
           AND start_time >= %(start_date)s
           AND start_time < %(end_date)s
           {pv_fragment}
           {filter_fragment}
+          {sampling_fragment}
         {order_fragment}
-        LIMIT 1 BY id
         {limit_fragment}
         """
         return query, self.params
@@ -373,6 +488,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         )
         extra_where, extra_params = fb.translate(self.filters)
         params = dict(self.params)
+        params.pop("slice_start", None)
+        params.pop("slice_end", None)
         params.update(extra_params)
 
         filter_fragment = f"AND {extra_where}" if extra_where else ""

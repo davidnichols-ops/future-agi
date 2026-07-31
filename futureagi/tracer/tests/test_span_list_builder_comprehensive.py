@@ -212,7 +212,9 @@ class TestBuildIdQuery:
         sql, _ = _make_builder().build_id_query()
         assert "SELECT id" in sql
         assert "FROM spans" in sql
-        assert "LIMIT 1 BY id" in sql
+        # No full-window de-dup sort. Streaming callers handle the rare
+        # ReplacingMergeTree duplicate id without materializing the window.
+        assert "LIMIT 1 BY id" not in sql
         # No page LIMIT / OFFSET / ORDER — it mirrors the filter window only.
         assert "LIMIT %(limit)s" not in sql
         assert "OFFSET %(offset)s" not in sql
@@ -231,15 +233,31 @@ class TestBuildIdQuery:
 
     def test_limit_adds_ordered_cap(self):
         sql, params = _make_builder().build_id_query(limit=5)
-        # Capped resolve orders newest-first and caps via a bound param, on top
-        # of the existing per-id dedup.
-        assert "ORDER BY start_time DESC, id DESC" in sql
-        assert "LIMIT 1 BY id" in sql
+        # Capped resolve is a bounded id-ordered top-K. De-duplication happens
+        # in the task resolver after a bounded duplicate margin is fetched.
+        assert "ORDER BY id" in sql
+        assert "LIMIT 1 BY id" not in sql
         assert "LIMIT %(id_limit)s" in sql
         assert params["id_limit"] == 5
-        # Clause order: ORDER BY, then LIMIT n BY, then the plain LIMIT.
-        assert sql.index("ORDER BY") < sql.index("LIMIT 1 BY id")
-        assert sql.index("LIMIT 1 BY id") < sql.index("LIMIT %(id_limit)s")
+        assert sql.index("ORDER BY id") < sql.index("LIMIT %(id_limit)s")
+
+    def test_sampling_is_applied_before_the_bounded_top_k(self):
+        sql, params = _make_builder().build_id_query(
+            limit=200,
+            sampling_salt="task-1",
+            sampling_rate=50,
+        )
+
+        sampling = (
+            "modulo(cityHash64(%(id_sampling_salt)s, toString(id)), 100) "
+            "< %(id_sampling_rate)s"
+        )
+        assert sampling in " ".join(sql.split())
+        assert sql.index("id_sampling_rate") < sql.index("ORDER BY")
+        assert sql.index("ORDER BY") < sql.index("LIMIT %(id_limit)s")
+        assert params["id_sampling_salt"] == "task-1"
+        assert params["id_sampling_rate"] == 50.0
+        assert params["id_limit"] == 200
 
     def test_default_limit_is_unbounded_and_unordered(self):
         # The eval-resolver caller passes no limit — behaviour must be unchanged.

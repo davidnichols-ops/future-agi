@@ -132,6 +132,104 @@ class TestListSessionsClickHouseOrgScope:
         # absent data the count is inferred without a second CH call.
         assert analytics.execute_ch_query.call_count >= 1
 
+    def test_task_preview_is_one_hard_budgeted_base_query(self):
+        """Session preview omits content, exact count, and enrichments."""
+        view = self._make_view()
+        request = self._make_request()
+        analytics = mock.MagicMock()
+        now = __import__("datetime").datetime.now()
+        analytics.execute_ch_query.return_value = SimpleNamespace(
+            data=[
+                {
+                    "session_id": str(uuid.uuid4()),
+                    "session_start": now,
+                    "session_end": now,
+                    "duration": 0,
+                    "total_cost": 0,
+                    "total_tokens": 1,
+                    "traces_count": 1,
+                }
+            ]
+        )
+        project = SimpleNamespace(session_config=None)
+
+        status, payload = view._list_sessions_clickhouse(
+            request,
+            project_id=str(uuid.uuid4()),
+            project=project,
+            analytics=analytics,
+            validated_data={
+                "filters": [],
+                "sort_params": [],
+                "page_number": 0,
+                "page_size": 50,
+                "preview": True,
+            },
+            org_project_ids=None,
+        )
+
+        assert status == "ok"
+        assert len(payload["table"]) == 1
+        assert payload["metadata"]["total_rows_is_lower_bound"] is True
+        assert analytics.execute_ch_query.call_count == 1
+        assert analytics.execute_ch_query.call_args.kwargs["timeout_ms"] == 750
+        assert analytics.execute_ch_query.call_args.kwargs["settings"]["max_threads"] == 2
+
+    def test_count_timeout_marks_total_as_lower_bound(self):
+        view = self._make_view()
+        request = self._make_request()
+        analytics = mock.MagicMock()
+        now = __import__("datetime").datetime.now()
+        rows = [
+            {
+                "session_id": str(uuid.uuid4()),
+                "session_start": now,
+                "session_end": now,
+                "duration": 0,
+                "total_cost": 0,
+                "total_tokens": 1,
+                "traces_count": 1,
+            }
+            for _ in range(2)
+        ]
+
+        def _execute(query, *_args, **_kwargs):
+            compact = " ".join(query.split())
+            if compact.startswith("SELECT count("):
+                raise TimeoutError("Code 159 private ClickHouse details")
+            if "LIMIT %(limit)s OFFSET %(offset)s" in compact:
+                return SimpleNamespace(data=rows)
+            return SimpleNamespace(data=[])
+
+        analytics.execute_ch_query.side_effect = _execute
+        project = SimpleNamespace(session_config=None)
+
+        with (
+            mock.patch.object(view, "_fetch_session_names", return_value={}),
+            mock.patch.object(view, "_fetch_end_user_info", return_value={}),
+            self._patch_annotation_labels(),
+        ):
+            response_status, payload = view._list_sessions_clickhouse(
+                request,
+                project_id=str(uuid.uuid4()),
+                project=project,
+                analytics=analytics,
+                validated_data={
+                    "filters": [],
+                    "sort_params": [],
+                    "page_number": 0,
+                    "page_size": 1,
+                },
+                org_project_ids=None,
+            )
+
+        assert response_status == "ok"
+        assert payload["metadata"] == {
+            "total_rows": 2,
+            "total_rows_is_lower_bound": True,
+        }
+        assert len(payload["table"]) == 1
+
     def test_synthetic_end_user_id_filter_is_injected(self):
         """The user_id query param must surface as a synthetic
         ``end_user_id IN (...)`` filter on the builder."""
@@ -409,3 +507,29 @@ class TestListSessionsClickHouseOrgScope:
             )
 
         assert filter_mock.call_count == 0
+
+
+def test_resolve_session_fields_scopes_multi_project_lookup(monkeypatch):
+    from tracer.services.clickhouse.v2 import trace_session_dict_reader
+
+    project_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    fake_client = mock.Mock()
+    fake_client.query.return_value = SimpleNamespace(result_rows=[])
+    monkeypatch.setattr(
+        trace_session_dict_reader,
+        "_get_client",
+        lambda: fake_client,
+    )
+
+    assert (
+        trace_session_dict_reader.resolve_session_fields(
+            [str(uuid.uuid4())],
+            project_ids=project_ids,
+        )
+        == {}
+    )
+
+    query = fake_client.query.call_args.args[0]
+    params = fake_client.query.call_args.kwargs["parameters"]
+    assert "ts.project_id IN %(pids)s" in query
+    assert set(params["pids"]) == set(project_ids)

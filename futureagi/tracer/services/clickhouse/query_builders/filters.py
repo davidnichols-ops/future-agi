@@ -11,7 +11,6 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.utils.constants import (
     LIST_OPS,
     NO_VALUE_OPS,
@@ -333,6 +332,9 @@ class ClickHouseFilterBuilder:
         project_ids: list[str] | None = None,
         score_date_scope: bool = True,
         span_date_scope: bool = False,
+        span_trace_id_scope: bool = False,
+        span_latest_state: bool = False,
+        tag_query_mode: str | None = None,
     ) -> None:
         self.table = table
         self.annotation_label_ids = annotation_label_ids or []
@@ -367,15 +369,40 @@ class ClickHouseFilterBuilder:
         # legitimately-matching trace is dropped. Opt-in (default False) so
         # builders that don't bind ``%(start_date)s`` keep byte-identical SQL.
         self.span_date_scope = span_date_scope
+        # Candidate-batched trace lists bind a small tuple of trace IDs before
+        # compiling their any-span membership predicates.  Keeping the same
+        # bound inside every ``trace_id IN (SELECT … FROM spans)`` subquery is
+        # what turns an unbounded raw-Map scan into a point lookup that can use
+        # the trace-id bloom index.  The outer TraceListQueryBuilder owns and
+        # validates the ``candidate_trace_ids`` parameter; this flag only emits
+        # the fixed placeholder name.
+        self.span_trace_id_scope = span_trace_id_scope
+        # FINAL is prohibitively expensive on an unbounded ReplacingMergeTree
+        # scan, but candidate/slice callers can request it after reducing the
+        # read to a small trace-id set or time interval. This prevents an older
+        # live version (or a pre-tombstone attribute value) from matching after
+        # the latest version changed or was deleted.
+        self.span_latest_state = span_latest_state
+        # Some callers filter a span relation to obtain trace IDs. In that
+        # shape, ordinary predicates must stay in SPAN mode while the `tag`
+        # dimension still follows the outer entity's semantics (Trace.tags
+        # versus ObservationSpan.tags).
+        self.tag_query_mode = tag_query_mode or query_mode
         self._param_counter: int = 0
         self._params: dict[str, Any] = {}
+
+    def _span_table_source(self) -> str:
+        return f"{self.table} FINAL" if self.span_latest_state else self.table
 
     def _span_membership_date_filter(self) -> str:
         """Lower-bound ``created_at`` fragment for trace-membership span
         subqueries; empty unless the caller opted in via ``span_date_scope``."""
-        if not self.span_date_scope:
-            return ""
-        return " AND created_at >= %(start_date)s - INTERVAL 1 DAY"
+        fragments = []
+        if self.span_date_scope:
+            fragments.append(" AND created_at >= %(start_date)s - INTERVAL 1 DAY")
+        if self.span_trace_id_scope:
+            fragments.append(" AND trace_id IN %(candidate_trace_ids)s")
+        return "".join(fragments)
 
     def _score_date_filter(self, alias: str = "s") -> str:
         """Return a lower-bound ``created_at`` filter for ``model_hub_score``.
@@ -450,7 +477,8 @@ class ClickHouseFilterBuilder:
         else:
             id_filter = ""
         return (
-            f"(SELECT {select_cols} FROM spans "
+            f"(SELECT {select_cols} FROM "
+            f"{'spans FINAL' if self.span_latest_state else 'spans'} "
             f"WHERE {project_pred} "
             f"{date_pred} "
             f"AND is_deleted = 0"
@@ -833,7 +861,7 @@ class ClickHouseFilterBuilder:
             comparison_op = "=" if filter_op == "is_null" else "!="
             return (
                 f"trace_id IN ("
-                f"SELECT trace_id FROM {self.table} "
+                f"SELECT trace_id FROM {self._span_table_source()} "
                 f"WHERE end_user_id {comparison_op} toUUID('00000000-0000-0000-0000-000000000000') "
                 f"AND _peerdb_is_deleted = 0{self._span_membership_date_filter()})"
             )
@@ -865,7 +893,7 @@ class ClickHouseFilterBuilder:
         # Curated EndUser dimension is the ``end_users`` RMT.
         return (
             f"trace_id {outer_op} ("
-            f"SELECT trace_id FROM {self.table} "
+            f"SELECT trace_id FROM {self._span_table_source()} "
             f"WHERE end_user_id IN ("
             f"SELECT {self._ENDUSER_DIM_ID_COL} FROM {self._ENDUSER_DIM_TABLE} FINAL "
             f"WHERE {inner} "
@@ -947,7 +975,7 @@ class ClickHouseFilterBuilder:
         )
         return (
             f"trace_id IN ("
-            f"SELECT trace_id FROM {self.table} "
+            f"SELECT trace_id FROM {self._span_table_source()} "
             f"WHERE {project_pred} AND _peerdb_is_deleted = 0"
             f"{self._span_membership_date_filter()} "
             f"{root_clause}"
@@ -991,7 +1019,7 @@ class ClickHouseFilterBuilder:
             return inner_predicate
         return (
             f"trace_id IN ("
-            f"SELECT trace_id FROM {self.table} "
+            f"SELECT trace_id FROM {self._span_table_source()} "
             f"WHERE {self._project_scope_predicate()} "
             f"AND is_deleted = 0"
             f"{self._span_membership_date_filter()} "
