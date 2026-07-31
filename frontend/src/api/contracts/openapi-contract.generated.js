@@ -99007,6 +99007,10 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Total rows is lower bound",
           "type": "boolean"
         },
+        "has_more": {
+          "title": "Has more",
+          "type": "boolean"
+        },
         "query_complete": {
           "title": "Query complete",
           "type": "boolean"
@@ -99023,7 +99027,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "read_budget_exceeded",
-            "query_failed"
+            "query_failed",
+            "unsupported_filter_shape"
           ]
         }
       }

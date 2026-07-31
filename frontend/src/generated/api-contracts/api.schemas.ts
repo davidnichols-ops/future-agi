@@ -21657,11 +21657,13 @@ export type TraceObserveListMetadataApiQueryErrorCode = typeof TraceObserveListM
 export const TraceObserveListMetadataApiQueryErrorCode = {
   read_budget_exceeded: 'read_budget_exceeded',
   query_failed: 'query_failed',
+  unsupported_filter_shape: 'unsupported_filter_shape',
 } as const;
 
 export interface TraceObserveListMetadataApi {
   total_rows: number;
   total_rows_is_lower_bound?: boolean;
+  has_more?: boolean;
   query_complete?: boolean;
   query_status?: TraceObserveListMetadataApiQueryStatus;
   query_error_code?: TraceObserveListMetadataApiQueryErrorCode;

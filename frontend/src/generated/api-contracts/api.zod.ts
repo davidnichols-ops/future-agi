@@ -42277,9 +42277,10 @@ export const TracerTraceListTracesOfSessionResponse = zod.object({
   "metadata": zod.object({
   "total_rows": zod.number(),
   "total_rows_is_lower_bound": zod.boolean().optional(),
+  "has_more": zod.boolean().optional(),
   "query_complete": zod.boolean().optional(),
   "query_status": zod.enum(['degraded']).optional(),
-  "query_error_code": zod.enum(['read_budget_exceeded', 'query_failed']).optional()
+  "query_error_code": zod.enum(['read_budget_exceeded', 'query_failed', 'unsupported_filter_shape']).optional()
 }),
   "table": zod.array(zod.record(zod.string(), zod.object({
 
