@@ -1,7 +1,16 @@
+import os
+
 import structlog
 from django.apps import AppConfig
 
 logger = structlog.get_logger(__name__)
+
+
+def startup_db_mutations_disabled() -> bool:
+    value = os.getenv("NO_STARTUP_DB_MUTATIONS", "false").strip().lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError("NO_STARTUP_DB_MUTATIONS must be exactly 'true' or 'false'")
+    return value == "true"
 
 
 class ModelHubConfig(AppConfig):
@@ -19,6 +28,12 @@ class ModelHubConfig(AppConfig):
             return
 
         if "pytest" in sys.modules:
+            return
+
+        if startup_db_mutations_disabled():
+            logger.info(
+                "Startup database mutations disabled; skipping seed and schema setup"
+            )
             return
 
         # Seed system eval templates from YAML (idempotent)

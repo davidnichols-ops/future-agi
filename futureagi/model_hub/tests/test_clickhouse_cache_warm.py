@@ -1,6 +1,29 @@
 from unittest.mock import Mock
 
-from model_hub.apps import ModelHubConfig
+import pytest
+
+from model_hub.apps import ModelHubConfig, startup_db_mutations_disabled
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", " true "])
+def test_startup_db_mutation_gate_disables_mutations(monkeypatch, value):
+    monkeypatch.setenv("NO_STARTUP_DB_MUTATIONS", value)
+
+    assert startup_db_mutations_disabled() is True
+
+
+@pytest.mark.parametrize("value", ["false", "FALSE", " false "])
+def test_startup_db_mutation_gate_preserves_default_startup(monkeypatch, value):
+    monkeypatch.setenv("NO_STARTUP_DB_MUTATIONS", value)
+
+    assert startup_db_mutations_disabled() is False
+
+
+def test_startup_db_mutation_gate_fails_closed_on_invalid_value(monkeypatch):
+    monkeypatch.setenv("NO_STARTUP_DB_MUTATIONS", "maybe")
+
+    with pytest.raises(RuntimeError, match="must be exactly"):
+        startup_db_mutations_disabled()
 
 
 def _warmup_sql(monkeypatch, *, drops_legacy_chain: bool) -> list[str]:
