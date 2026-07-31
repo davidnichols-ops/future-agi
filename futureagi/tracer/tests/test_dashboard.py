@@ -1304,8 +1304,44 @@ class TestMetricsEndpoint:
                 {"value": "payment", "label": "payment"},
             ],
             "query_complete": False,
-            "query_status": "degraded",
+            "query_status": "sampled",
+            "query_error_code": "sample_limit",
         }
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
+    @patch("tracer.views.dashboard.AnalyticsQueryService")
+    def test_filter_values_final_status_span_sample_remains_usable(
+        self,
+        mock_analytics_cls,
+        _mock_ch_enabled,
+        auth_client,
+        observe_project,
+    ):
+        mock_result = MagicMock()
+        mock_result.data = [{"val": "Rechazado"}] * 1000
+        mock_analytics_cls.return_value.execute_ch_query.return_value = mock_result
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=final_status&metric_type=custom_attribute"
+            f"&project_ids={observe_project.id}&source=spans"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["result"] == {
+            "values": [{"value": "Rechazado", "label": "Rechazado"}],
+            "query_complete": False,
+            "query_status": "sampled",
+            "query_error_code": "sample_limit",
+        }
+        sql, params = mock_analytics_cls.return_value.execute_ch_query.call_args.args[
+            :2
+        ]
+        assert "FROM spans" in sql
+        assert "mapContains(attrs_string, %(attr_key)s)" in sql
+        assert params["attr_key"] == "final_status"
+        assert params["sample_limit"] == 1000
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)

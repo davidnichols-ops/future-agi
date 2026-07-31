@@ -259,14 +259,16 @@ class TestTraceRootAttributeFastPath:
 
 
 class TestTimeSeriesAttrFilterScope:
-    def test_attr_subquery_is_project_scoped_and_time_bounded(self):
+    def test_attr_candidate_join_is_project_scoped_and_time_bounded(self):
         builder = TimeSeriesQueryBuilder(
             project_id=PROJECT_ID,
             filters=[DATETIME_FILTER, SPAN_ATTR_FILTER],
             interval="day",
         )
         sql, params = builder.build()
-        sub = _membership_subquery(sql)
+        assert "AS graph_attr_candidates USING (trace_id)" in sql
+        assert "trace_id IN (" not in sql
+        sub = sql.split("INNER JOIN (", 1)[1].split(") AS graph_attr_candidates", 1)[0]
         assert "project_id = %(project_id)s" in sub
         assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in sub
         assert "start_time < %(end_date)s + INTERVAL 1 DAY" in sub

@@ -34367,8 +34367,8 @@ export const TracerDashboardFilterValuesResponse = zod.object({
 
 }).passthrough()),
   "query_complete": zod.boolean().optional(),
-  "query_status": zod.enum(['complete', 'degraded']).optional(),
-  "query_error_code": zod.enum(['read_budget_exceeded', 'query_failed']).optional()
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
+  "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional()
 })
 })
 

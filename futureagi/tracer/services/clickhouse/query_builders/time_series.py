@@ -108,6 +108,14 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         if rollup_filter is not None and self._attr_rollup_window_covered():
             return self._build_attr_rollup_query(*rollup_filter)
 
+        attribute_filters, remaining_filters = self._partition_attribute_filters()
+        if attribute_filters:
+            return self._build_attribute_filtered_query(
+                ClickHouseFilterBuilder,
+                attribute_filters=attribute_filters,
+                remaining_filters=remaining_filters,
+            )
+
         # Determine if we have attribute filters that prevent using the
         # pre-aggregated table.
         # Project + window scope must reach the filter compiler: without them
@@ -131,6 +139,211 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             return self._build_raw_query(extra_where)
         else:
             return self._build_agg_query()
+
+    def _partition_attribute_filters(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split explicit span-attribute predicates from all other filters.
+
+        Trace graphs need a different SQL shape for arbitrary attributes:
+        filtering the root-row aggregate with ``trace_id IN (SELECT …)`` makes
+        ClickHouse materialize a potentially project-wide Set before reading
+        the outer table.  On high-volume projects that Set construction is the
+        source of the 30-second ``FutureSetFromSubquery`` timeout.  Keeping the
+        split here lets :meth:`_build_attribute_filtered_query` use a
+        filter-first candidate relation while the canonical filter compiler
+        still owns every operator/value rule.
+        """
+        attribute_filters: list[dict[str, Any]] = []
+        remaining_filters: list[dict[str, Any]] = []
+        for filter_item in self.filters:
+            column_id, config = self._filter_parts(filter_item)
+            col_type = str(
+                config.get("col_type") or config.get("colType") or ""
+            ).upper()
+            if (
+                column_id not in ("created_at", "start_time")
+                and col_type == "SPAN_ATTRIBUTE"
+            ):
+                attribute_filters.append(filter_item)
+            else:
+                remaining_filters.append(filter_item)
+        return attribute_filters, remaining_filters
+
+    @staticmethod
+    def _prefix_condition_params(
+        condition: str,
+        params: dict[str, Any],
+        *,
+        prefix: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Namespace one independently compiled filter's bound parameters."""
+        prefixed: dict[str, Any] = {}
+        for name, value in params.items():
+            prefixed_name = f"{prefix}_{name}"
+            condition = condition.replace(
+                f"%({name})s",
+                f"%({prefixed_name})s",
+            )
+            prefixed[prefixed_name] = value
+        return condition, prefixed
+
+    def _compile_attribute_condition(
+        self,
+        filter_builder_cls,
+        filters: list[dict[str, Any]],
+        *,
+        prefix: str,
+    ) -> str:
+        """Compile row-level span attributes through the canonical contract."""
+        filter_builder = filter_builder_cls(
+            table=self.RAW_TABLE,
+            project_id=self.project_id,
+            project_ids=self.project_ids,
+            query_mode=filter_builder_cls.QUERY_MODE_SPAN,
+        )
+        condition, params = filter_builder.translate(filters)
+        condition, params = self._prefix_condition_params(
+            condition,
+            params,
+            prefix=prefix,
+        )
+        self.params.update(params)
+        return condition
+
+    def _build_trace_attribute_candidate_join(
+        self,
+        filter_builder_cls,
+        attribute_filters: list[dict[str, Any]],
+    ) -> tuple[str, list[str]]:
+        """Build one exact filter-first trace candidate relation.
+
+        Every arbitrary attribute filter is compiled independently, matching
+        the existing trace semantics: filter A and filter B may be satisfied
+        by different spans in the same trace.  The grouped relation intersects
+        those per-filter matches with ``countIf`` and exposes each trace ID
+        once, so the outer root aggregate cannot be multiplied by child rows.
+
+        Attributes guaranteed to live on the trace root are returned as direct
+        outer predicates.  This avoids both the candidate scan and the old
+        project-wide Set for common root attributes, while retaining generic
+        any-span behavior for every other key.
+        """
+        root_keys = frozenset(filter_builder_cls._TRACE_ROOT_ATTRIBUTE_KEYS)
+        root_filters: list[dict[str, Any]] = []
+        any_span_filters: list[dict[str, Any]] = []
+        for filter_item in attribute_filters:
+            column_id, _config = self._filter_parts(filter_item)
+            if column_id in root_keys:
+                root_filters.append(filter_item)
+            else:
+                any_span_filters.append(filter_item)
+
+        outer_conditions: list[str] = []
+        if root_filters:
+            root_condition = self._compile_attribute_condition(
+                filter_builder_cls,
+                root_filters,
+                prefix="graph_root_attr",
+            )
+            if root_condition:
+                outer_conditions.append(root_condition)
+
+        if not any_span_filters:
+            return "", outer_conditions
+
+        candidate_conditions: list[str] = []
+        for index, filter_item in enumerate(any_span_filters):
+            condition = self._compile_attribute_condition(
+                filter_builder_cls,
+                [filter_item],
+                prefix=f"graph_candidate_attr_{index}",
+            )
+            if condition:
+                candidate_conditions.append(condition)
+
+        if not candidate_conditions:
+            return "", outer_conditions
+
+        any_match = " OR ".join(f"({condition})" for condition in candidate_conditions)
+        having = ""
+        if len(candidate_conditions) > 1:
+            all_matches = " AND ".join(
+                f"countIf({condition}) > 0" for condition in candidate_conditions
+            )
+            having = f"HAVING {all_matches}"
+
+        # The candidate scan is project- and time-pruned before reading Map
+        # values.  The one-day skew buffer exactly matches the prior
+        # trace-membership subquery contract, so this is a SQL-shape change,
+        # not a result-set change.
+        candidate_join = f"""
+        INNER JOIN (
+            SELECT trace_id
+            FROM {self.RAW_TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND start_time >= %(start_date)s - INTERVAL 1 DAY
+              AND start_time < %(end_date)s + INTERVAL 1 DAY
+            WHERE is_deleted = 0
+              AND ({any_match})
+            GROUP BY trace_id
+            {having}
+        ) AS graph_attr_candidates USING (trace_id)
+        """
+        return candidate_join, outer_conditions
+
+    def _build_attribute_filtered_query(
+        self,
+        filter_builder_cls,
+        *,
+        attribute_filters: list[dict[str, Any]],
+        remaining_filters: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Build an exact raw graph query without an unbounded attribute Set."""
+        remaining_builder = filter_builder_cls(
+            table=self.RAW_TABLE,
+            project_id=self.project_id,
+            project_ids=self.project_ids,
+            span_date_scope=True,
+            query_mode=(
+                filter_builder_cls.QUERY_MODE_SPAN
+                if self.observe_type == "span"
+                else filter_builder_cls.QUERY_MODE_TRACE
+            ),
+        )
+        remaining_where, remaining_params = remaining_builder.translate(
+            remaining_filters
+        )
+        self.params.update(remaining_params)
+
+        candidate_join = ""
+        outer_conditions: list[str] = []
+        if remaining_where:
+            outer_conditions.append(remaining_where)
+
+        if self.observe_type == "span":
+            attribute_condition = self._compile_attribute_condition(
+                filter_builder_cls,
+                attribute_filters,
+                prefix="graph_span_attr",
+            )
+            if attribute_condition:
+                outer_conditions.append(attribute_condition)
+        else:
+            candidate_join, root_conditions = (
+                self._build_trace_attribute_candidate_join(
+                    filter_builder_cls,
+                    attribute_filters,
+                )
+            )
+            outer_conditions.extend(root_conditions)
+
+        return self._build_raw_query(
+            " AND ".join(f"({condition})" for condition in outer_conditions)
+            if outer_conditions
+            else "1 = 1",
+            candidate_join=candidate_join,
+        )
 
     @staticmethod
     def _filter_parts(filter_item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -561,7 +774,12 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         """
         return query, self.params
 
-    def _build_raw_query(self, extra_where: str) -> tuple[str, dict[str, Any]]:
+    def _build_raw_query(
+        self,
+        extra_where: str,
+        *,
+        candidate_join: str = "",
+    ) -> tuple[str, dict[str, Any]]:
         """Build a query against the raw ``spans`` table with filters applied."""
         bucket_fn = self.time_bucket_expr(self.interval)
         entity_scope = (
@@ -582,9 +800,11 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             countIf(status = 'ERROR') * 100.0 / greatest(count(), 1)
                 AS error_rate
         FROM {self.RAW_TABLE}
-        {self.project_where()}
+        {candidate_join}
+        PREWHERE {self.project_filter_sql()}
           AND start_time >= %(start_date)s
           AND start_time < %(end_date)s
+        WHERE is_deleted = 0
           {entity_scope}
           AND {extra_where}
         GROUP BY time_bucket

@@ -440,11 +440,11 @@ class DashboardFilterValuesResultSerializer(serializers.Serializer):
     values = serializers.ListField(child=serializers.JSONField())
     query_complete = serializers.BooleanField(required=False)
     query_status = serializers.ChoiceField(
-        choices=["complete", "degraded"],
+        choices=["complete", "sampled", "degraded"],
         required=False,
     )
     query_error_code = serializers.ChoiceField(
-        choices=["read_budget_exceeded", "query_failed"],
+        choices=["sample_limit", "read_budget_exceeded", "query_failed"],
         required=False,
     )
 

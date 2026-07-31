@@ -78469,6 +78469,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
+            "sampled",
             "degraded"
           ]
         },
@@ -78476,6 +78477,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Query error code",
           "type": "string",
           "enum": [
+            "sample_limit",
             "read_budget_exceeded",
             "query_failed"
           ]

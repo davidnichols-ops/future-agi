@@ -207,6 +207,38 @@ describe("useDashboardFilterValues", () => {
     expect(result.current.data).toEqual([]);
   });
 
+  it("keeps bounded sampled filter suggestions usable", async () => {
+    mocks.get.mockResolvedValueOnce({
+      data: {
+        result: {
+          values: [{ value: "Rechazado", label: "Rechazado" }],
+          query_complete: false,
+          query_status: "sampled",
+          query_error_code: "sample_limit",
+        },
+      },
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    const { result } = renderHook(
+      () =>
+        useDashboardFilterValues({
+          metricName: "final_status",
+          metricType: "custom_attribute",
+          projectIds: ["project-1"],
+          source: "spans",
+        }),
+      { wrapper: createQueryWrapper(queryClient) },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual([
+      { value: "Rechazado", label: "Rechazado" },
+    ]);
+  });
+
   it("surfaces a degraded response without exposing backend details", async () => {
     mocks.get.mockResolvedValueOnce({
       data: {

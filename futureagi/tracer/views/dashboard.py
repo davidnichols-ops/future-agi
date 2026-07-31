@@ -1628,14 +1628,17 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         error=str(e)[:200],
                     )
                     return self._degraded_filter_values_response(e)
-                query_complete = len(result.data) < attr_params["sample_limit"]
-                return self._gm.success_response(
-                    {
-                        "values": values,
-                        "query_complete": query_complete,
-                        "query_status": ("complete" if query_complete else "degraded"),
-                    }
-                )
+                sampled = len(result.data) >= attr_params["sample_limit"]
+                response_payload = {
+                    "values": values,
+                    # Keep the established completeness signal: a bounded
+                    # sample is usable for suggestions but is not exhaustive.
+                    "query_complete": not sampled,
+                    "query_status": "sampled" if sampled else "complete",
+                }
+                if sampled:
+                    response_payload["query_error_code"] = "sample_limit"
+                return self._gm.success_response(response_payload)
             else:
                 values = []
 
@@ -2220,9 +2223,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "Dashboard query could not be completed. Please try again."
             )
             response.data["code"] = (
-                "read_budget_exceeded"
-                if is_read_budget_error(e)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(e) else "query_failed"
             )
             return response
 
@@ -2250,8 +2251,6 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "Dashboard query could not be completed. Please try again."
             )
             response.data["code"] = (
-                "read_budget_exceeded"
-                if is_read_budget_error(e)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(e) else "query_failed"
             )
             return response

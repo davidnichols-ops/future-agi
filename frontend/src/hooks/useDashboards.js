@@ -283,9 +283,19 @@ export function useDashboardFilterValues({
           ...(search ? { search } : {}),
         },
       });
-      if (res.data?.result?.query_complete === false) {
+      const result = res.data?.result;
+      const sampled =
+        result?.query_status === "sampled" ||
+        result?.query_error_code === "sample_limit";
+      const degraded =
+        result?.query_status === "degraded" ||
+        result?.query_error_code === "read_budget_exceeded" ||
+        result?.query_error_code === "query_failed" ||
+        (result?.query_complete === false && !sampled);
+      if (degraded) {
         // Keep backend details out of the UI while letting pickers distinguish
-        // an unavailable query from a legitimate empty value set.
+        // an unavailable query from a legitimate empty or bounded sampled
+        // value set.
         throw new Error("Filter values are temporarily unavailable");
       }
       return res;

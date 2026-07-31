@@ -14,6 +14,7 @@ from tracer.services.clickhouse.query_builders.time_series import (
 
 PROJECT_ID = "11111111-2222-4333-8444-555555555555"
 COVERED_SINCE = datetime(2020, 1, 1, tzinfo=UTC)
+_UNSET = object()
 
 
 def _date_filter(start="2026-07-23T00:00:00Z", end="2026-07-30T00:00:00Z"):
@@ -31,9 +32,9 @@ def _attr_filter(
     key="final_status",
     *,
     op="in",
-    value=None,
+    value=_UNSET,
 ):
-    if value is None:
+    if value is _UNSET:
         value = ["completed"]
     return {
         "column_id": key,
@@ -78,7 +79,7 @@ class TestTraceGraphAttributeRollup:
         assert params["attr_values"] == ("completed", "failed")
         assert params["project_id"] == PROJECT_ID
 
-    def test_unverified_country_falls_back_to_raw_spans(self, settings):
+    def test_arbitrary_country_uses_filter_first_trace_candidates(self, settings):
         self._enable(settings)
 
         query, _ = _builder(
@@ -88,6 +89,12 @@ class TestTraceGraphAttributeRollup:
         assert "FROM dashboard_attr_rollup" not in query
         assert "FROM spans" in query
         assert "mapContains(attrs_string, 'country')" in query
+        assert "INNER JOIN (" in query
+        assert "AS graph_attr_candidates USING (trace_id)" in query
+        assert "PREWHERE project_id = %(project_id)s" in query
+        assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in query
+        assert "start_time < %(end_date)s + INTERVAL 1 DAY" in query
+        assert "trace_id IN (SELECT trace_id" not in query
         assert "(parent_span_id IS NULL OR parent_span_id = '')" in query
 
     def test_unaligned_window_stays_rollup_only_and_is_marked_adjusted(self, settings):
@@ -294,8 +301,102 @@ class TestTraceGraphAttributeRollup:
 
         assert "dashboard_attr_rollup" not in query
         assert "mapContains(attrs_string, 'prompt_slug')" in query
+        assert "INNER JOIN (" not in query
         assert "trace_id IN (SELECT trace_id" not in query
         assert "(parent_span_id IS NULL OR parent_span_id = '')" not in query
+        assert "PREWHERE project_id = %(project_id)s" in query
+
+    @pytest.mark.parametrize(
+        ("op", "value", "expected_sql"),
+        [
+            ("in", ["support", "success"], "lower(attrs_string['team']) IN"),
+            ("not_equals", "internal", "lower(attrs_string['team']) !="),
+            ("not_in", ["internal", "sandbox"], "lower(attrs_string['team']) NOT IN"),
+            ("contains", "support", "attrs_string['team'] ILIKE"),
+            ("not_contains", "sandbox", "attrs_string['team'] NOT ILIKE"),
+            ("starts_with", "supp", "attrs_string['team'] ILIKE"),
+            ("ends_with", "port", "attrs_string['team'] ILIKE"),
+            ("is_null", None, "NOT mapContains(attrs_string, 'team')"),
+            ("is_not_null", None, "mapContains(attrs_string, 'team')"),
+        ],
+    )
+    def test_general_trace_text_operators_use_exact_candidate_join(
+        self,
+        settings,
+        op,
+        value,
+        expected_sql,
+    ):
+        self._enable(settings)
+
+        query, _ = _builder(
+            [_date_filter(), _attr_filter("team", op=op, value=value)]
+        ).build()
+
+        assert "AS graph_attr_candidates USING (trace_id)" in query
+        assert expected_sql in query
+        assert "trace_id IN (SELECT trace_id" not in query
+
+    def test_multiple_trace_attributes_intersect_per_filter_candidate_sets(
+        self, settings
+    ):
+        self._enable(settings)
+
+        query, params = _builder(
+            [
+                _date_filter(),
+                _attr_filter("team", op="equals", value="support"),
+                _attr_filter("region", op="contains", value="latam"),
+            ]
+        ).build()
+
+        assert query.count("AS graph_attr_candidates USING (trace_id)") == 1
+        assert "WHERE is_deleted = 0" in query
+        assert " OR " in query
+        having_clause = query.split("HAVING", 1)[1].split(
+            ") AS graph_attr_candidates", 1
+        )[0]
+        assert having_clause.count("countIf(") == 2
+        assert "trace_id IN (SELECT trace_id" not in query
+        assert params["graph_candidate_attr_0_attr_1"] == "support"
+        assert params["graph_candidate_attr_1_attr_1"] == "%latam%"
+
+    def test_multiple_span_attributes_stay_on_the_same_span_row(self, settings):
+        self._enable(settings)
+
+        query, params = _builder(
+            [
+                _date_filter(),
+                _attr_filter("team", op="not_equals", value="internal"),
+                _attr_filter("region", op="is_not_null", value=None),
+            ],
+            observe_type="span",
+        ).build()
+
+        assert "AS graph_attr_candidates USING (trace_id)" not in query
+        assert "HAVING countIf" not in query
+        assert "lower(attrs_string['team']) !=" in query
+        assert "mapContains(attrs_string, 'region')" in query
+        assert params["graph_span_attr_attr_1"] == "internal"
+
+    def test_root_and_any_span_attributes_use_direct_and_candidate_predicates(
+        self, settings
+    ):
+        self._enable(settings)
+
+        query, params = _builder(
+            [
+                _date_filter(),
+                _attr_filter("final_status", op="contains", value="reject"),
+                _attr_filter("region", op="equals", value="latam"),
+            ]
+        ).build()
+
+        assert query.count("AS graph_attr_candidates USING (trace_id)") == 1
+        assert "attrs_string['final_status'] ILIKE" in query
+        assert "attrs_string['region']" in query
+        assert params["graph_root_attr_attr_1"] == "%reject%"
+        assert params["graph_candidate_attr_0_attr_1"] == "latam"
 
     def test_rollup_flag_or_coverage_must_be_ready(self, settings):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = True

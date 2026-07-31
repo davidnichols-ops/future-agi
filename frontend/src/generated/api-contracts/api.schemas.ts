@@ -18652,6 +18652,7 @@ export type DashboardFilterValuesResultApiQueryStatus = typeof DashboardFilterVa
 
 export const DashboardFilterValuesResultApiQueryStatus = {
   complete: 'complete',
+  sampled: 'sampled',
   degraded: 'degraded',
 } as const;
 
@@ -18659,6 +18660,7 @@ export type DashboardFilterValuesResultApiQueryErrorCode = typeof DashboardFilte
 
 
 export const DashboardFilterValuesResultApiQueryErrorCode = {
+  sample_limit: 'sample_limit',
   read_budget_exceeded: 'read_budget_exceeded',
   query_failed: 'query_failed',
 } as const;
