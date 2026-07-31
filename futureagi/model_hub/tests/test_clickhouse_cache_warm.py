@@ -1,8 +1,13 @@
+import sys
 from unittest.mock import Mock
 
 import pytest
 
-from model_hub.apps import ModelHubConfig, startup_db_mutations_disabled
+from model_hub.apps import (
+    ModelHubConfig,
+    guarded_management_command,
+    startup_db_mutations_disabled,
+)
 
 
 @pytest.mark.parametrize("value", ["true", "TRUE", " true "])
@@ -24,6 +29,53 @@ def test_startup_db_mutation_gate_fails_closed_on_invalid_value(monkeypatch):
 
     with pytest.raises(RuntimeError, match="must be exactly"):
         startup_db_mutations_disabled()
+
+
+def test_ready_skips_clickhouse_schema_setup_when_mutations_disabled(monkeypatch):
+    monkeypatch.setenv("NO_STARTUP_DB_MUTATIONS", "true")
+    monkeypatch.setattr(sys, "argv", ["manage.py", "runserver"])
+    create_tables = Mock()
+    ensure_schema = Mock()
+    monkeypatch.setattr(
+        ModelHubConfig, "check_and_create_clickhouse_tables", create_tables
+    )
+    monkeypatch.setattr(ModelHubConfig, "_ensure_analytics_schema", ensure_schema)
+
+    ModelHubConfig("model_hub", sys.modules["model_hub"]).ready()
+
+    create_tables.assert_not_called()
+    ensure_schema.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ch25_apply_schema",
+        "createcachetable",
+        "future_schema_command",
+        "makemigrations",
+        "migrate",
+        "seed_system_evals",
+    ],
+)
+def test_ready_rejects_schema_mutation_commands_when_disabled(monkeypatch, command):
+    monkeypatch.setenv("NO_STARTUP_DB_MUTATIONS", "true")
+    monkeypatch.setattr(sys, "argv", ["manage.py", command])
+
+    with pytest.raises(RuntimeError, match=rf"^{command} is disabled"):
+        ModelHubConfig("model_hub", sys.modules["model_hub"]).ready()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["manage.py", "check", "--database", "default"],
+        ["/app/backend/manage.py", "collectstatic", "--noinput"],
+        ["granian", "--interface", "asgi", "tfc.asgi:application"],
+    ],
+)
+def test_management_command_guard_allows_only_startup_commands(argv):
+    assert guarded_management_command(argv) is None
 
 
 def _warmup_sql(monkeypatch, *, drops_legacy_chain: bool) -> list[str]:

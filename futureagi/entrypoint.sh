@@ -262,7 +262,11 @@ else
     echo "FAST_STARTUP mode: skipping DB checks, migrations, and static collection"
 fi
 
-python manage.py register_temporal_schedules || echo "WARNING: Temporal schedule registration failed (non-fatal), continuing startup..."
+if [ "$NO_STARTUP_DB_MUTATIONS" = "true" ]; then
+    echo "Startup mutations disabled: skipping Temporal schedule registration"
+else
+    python manage.py register_temporal_schedules || echo "WARNING: Temporal schedule registration failed (non-fatal), continuing startup..."
+fi
 
 # Start the appropriate service based on SERVICE_TYPE
 case "$SERVICE_TYPE" in

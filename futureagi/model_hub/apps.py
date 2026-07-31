@@ -5,12 +5,31 @@ from django.apps import AppConfig
 
 logger = structlog.get_logger(__name__)
 
+STARTUP_SAFE_MANAGEMENT_COMMANDS = frozenset(
+    {
+        "check",
+        "collectstatic",
+        "grpcrunaioserver",
+        "runserver",
+        "start_temporal_worker",
+    }
+)
+
 
 def startup_db_mutations_disabled() -> bool:
     value = os.getenv("NO_STARTUP_DB_MUTATIONS", "false").strip().lower()
     if value not in {"true", "false"}:
         raise RuntimeError("NO_STARTUP_DB_MUTATIONS must be exactly 'true' or 'false'")
     return value == "true"
+
+
+def guarded_management_command(argv: list[str]) -> str | None:
+    if len(argv) < 2 or os.path.basename(argv[0]) != "manage.py":
+        return None
+    command = argv[1]
+    if command in STARTUP_SAFE_MANAGEMENT_COMMANDS:
+        return None
+    return command
 
 
 class ModelHubConfig(AppConfig):
@@ -24,16 +43,20 @@ class ModelHubConfig(AppConfig):
 
         import model_hub.signals  # noqa: F401
 
+        if startup_db_mutations_disabled():
+            if command := guarded_management_command(sys.argv):
+                raise RuntimeError(
+                    f"{command} is disabled while NO_STARTUP_DB_MUTATIONS=true"
+                )
+            logger.info(
+                "Startup database mutations disabled; skipping seed and schema setup"
+            )
+            return
+
         if "migrate" in sys.argv or "makemigrations" in sys.argv:
             return
 
         if "pytest" in sys.modules:
-            return
-
-        if startup_db_mutations_disabled():
-            logger.info(
-                "Startup database mutations disabled; skipping seed and schema setup"
-            )
             return
 
         # Seed system eval templates from YAML (idempotent)
