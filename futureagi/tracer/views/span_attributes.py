@@ -366,16 +366,16 @@ class SpanAttributeValuesView(APIView):
                 query_time_ms=query_time_ms,
             )
 
-            return Response(
-                {
-                    "result": result,
-                    "query_complete": query_complete,
-                    "query_status": ("complete" if query_complete else "degraded"),
-                    "query_window_start": _utc_iso(params["window_start"]),
-                    "query_window_end": _utc_iso(params["window_end"]),
-                },
-                status=200,
-            )
+            payload = {
+                "result": result,
+                "query_complete": query_complete,
+                "query_status": "complete" if query_complete else "sampled",
+                "query_window_start": _utc_iso(params["window_start"]),
+                "query_window_end": _utc_iso(params["window_end"]),
+            }
+            if not query_complete:
+                payload["query_error_code"] = "sample_limit"
+            return Response(payload, status=200)
 
         except Exception as e:
             logger.warning(

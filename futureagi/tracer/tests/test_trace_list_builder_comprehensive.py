@@ -114,6 +114,7 @@ class TestBuildContentQuery:
         assert "FROM spans" not in query
         assert "attrs_string" not in query
         assert "attributes_extra" not in query
+        assert "WHERE is_deleted = 0" in query
         assert params["content_trace_ids"] == tuple(
             uuid.UUID(trace_id) for trace_id in trace_ids
         )

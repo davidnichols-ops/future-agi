@@ -149,6 +149,15 @@ except ImportError:
     APICallLog = None
 
 
+def _eval_query_error_response(exc, message):
+    """Return a stable public query error without exposing backend details."""
+    response = GeneralMethods().bad_request(message)
+    response.data["code"] = (
+        "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+    )
+    return response
+
+
 def apply_filters(row_data, filters):
     filtered_data = row_data
 
@@ -1820,7 +1829,10 @@ class GetEvalTemplateNameView(APIView):
             return self._gm.success_response(eval_template_names)
         except Exception as e:
             logger.exception(f"Error getting eval template names: {str(e)}")
-            return self._gm.bad_request(str(e))
+            return _eval_query_error_response(
+                e,
+                "Evaluation template names could not be loaded. Please try again.",
+            )
 
 
 @workspace_read_only
@@ -2108,7 +2120,10 @@ class EvalTemplateListView(APIView):
             logger.error(
                 f"Error in EvalTemplateListView: {str(e)}\n{traceback.format_exc()}"
             )
-            return self._gm.bad_request(str(e))
+            return _eval_query_error_response(
+                e,
+                "Evaluation templates could not be loaded. Please try again.",
+            )
 
 
 @workspace_read_only
@@ -3065,7 +3080,10 @@ class EvalTemplateDetailView(APIView):
             logger.error(
                 f"Error in EvalTemplateDetailView: {str(e)}\n{traceback.format_exc()}"
             )
-            return self._gm.bad_request(str(e))
+            return _eval_query_error_response(
+                e,
+                "Evaluation template details could not be loaded. Please try again.",
+            )
 
 
 class EvalTemplateUpdateView(APIView):
@@ -3517,7 +3535,10 @@ class EvalTemplateVersionListView(APIView):
             logger.error(
                 f"Error in EvalTemplateVersionListView: {str(e)}\n{traceback.format_exc()}"
             )
-            return self._gm.bad_request(str(e))
+            return _eval_query_error_response(
+                e,
+                "Evaluation template versions could not be loaded. Please try again.",
+            )
 
 
 class EvalTemplateVersionCreateView(APIView):

@@ -93,7 +93,7 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
         FROM traces FINAL
         PREWHERE {self.project_filter_sql()}
           AND id IN %(content_trace_ids)s
-        WHERE 1
+        WHERE is_deleted = 0
           {time_fragment}
         """
         return query, params

@@ -10,7 +10,10 @@ from accounts.models.workspace import Workspace
 from model_hub.models.ai_model import AIModel
 from tfc.constants.roles import OrganizationRoles
 from tracer.models.project import Project
-from tracer.serializers.span_attributes import SpanAttributeDetailResponseSerializer
+from tracer.serializers.span_attributes import (
+    SpanAttributeDetailResponseSerializer,
+    SpanAttributeValuesResponseSerializer,
+)
 from tracer.services.clickhouse.query_service import AnalyticsQueryService, QueryResult
 from tracer.services.clickhouse.span_attribute_lookups import AttributeKey
 from tracer.views import span_attributes
@@ -612,6 +615,38 @@ def test_country_values_do_not_use_root_only_rollup(
     assert "mapContains(attrs_string, %(key)s)" in query
     assert "parent_span_id" not in query
     assert params["key"] == "country"
+
+
+@pytest.mark.django_db
+def test_span_attribute_values_full_bounded_sample_is_usable_sampled_data(
+    auth_client,
+    observe_project,
+    monkeypatch,
+):
+    rows = [(f"value-{index:04d}",) for index in range(1000)]
+    client = MagicMock()
+    client.execute_read.return_value = (rows, [("value", "String")], 5.0)
+    monkeypatch.setattr(span_attributes, "ClickHouseClient", lambda: client)
+    monkeypatch.setattr(span_attributes, "is_clickhouse_enabled", lambda: True)
+    monkeypatch.setattr(span_attributes.timezone, "now", lambda: NOW)
+
+    response = auth_client.get(
+        VALUES_PATH,
+        data={
+            "project_id": str(observe_project.id),
+            "key": "customer_stage",
+            "limit": 50,
+        },
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    payload = response.json()
+    assert len(payload["result"]) == 50
+    assert payload["query_complete"] is False
+    assert payload["query_status"] == "sampled"
+    assert payload["query_error_code"] == "sample_limit"
+    serializer = SpanAttributeValuesResponseSerializer(data=payload)
+    assert serializer.is_valid(), serializer.errors
 
 
 @pytest.mark.django_db

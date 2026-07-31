@@ -54,6 +54,15 @@ _EVAL_TASK_SAVE_FAILED_MESSAGE = (
 )
 
 
+def _eval_task_query_error_response(exc, message):
+    """Return a stable public error contract without exposing backend details."""
+    response = GeneralMethods().bad_request(message)
+    response.data["code"] = (
+        "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+    )
+    return response
+
+
 class _RegexpReplace(Func):
     """
     PostgreSQL `regexp_replace(string, pattern, replacement, flags)`.
@@ -193,9 +202,7 @@ def _hydrate_usage_sources(logs, *, project_id):
                 )
         except Exception as exc:
             enrichment_error_codes.append(
-                "read_budget_exceeded"
-                if is_read_budget_error(exc)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
             )
             logger.warning(
                 "eval task usage span hydration failed open",
@@ -228,9 +235,7 @@ def _hydrate_usage_sources(logs, *, project_id):
                 )
         except Exception as exc:
             enrichment_error_codes.append(
-                "read_budget_exceeded"
-                if is_read_budget_error(exc)
-                else "query_failed"
+                "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
             )
             logger.warning(
                 "eval task usage session hydration failed open",
@@ -687,8 +692,11 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.success_response(response)
 
         except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(f"error fetching the eval tasks list {str(e)}")
+            logger.exception("eval_task_list_failed", error=str(e))
+            return _eval_task_query_error_response(
+                e,
+                "Evaluation tasks could not be loaded. Please try again.",
+            )
 
     # Maximum number of distinct error groups returned per task. Most tasks
     # produce 1-5 distinct error types; this cap is a safety net for tasks
@@ -854,8 +862,11 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.bad_request(f"EvalTask with id {eval_task_id} not found.")
 
         except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(str(e))
+            logger.exception("eval_task_logs_failed", error=str(e))
+            return _eval_task_query_error_response(
+                e,
+                "Evaluation task logs could not be loaded. Please try again.",
+            )
 
     # ──────────────────────────────────────────────────────────────────
     # GET /tracer/eval-task/get_usage/?eval_task_id=<id>&period=<>&...
@@ -1300,13 +1311,16 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.success_response(response)
 
         except Exception as e:
-            traceback.print_exc()
             logger.error(
                 "eval_task.get_usage failed",
                 error=str(e),
                 eval_task_id=request.query_params.get("eval_task_id"),
+                exc_info=True,
             )
-            return self._gm.bad_request(str(e))
+            return _eval_task_query_error_response(
+                e,
+                "Evaluation task usage could not be loaded. Please try again.",
+            )
 
     @validated_request(
         request_serializer=EvalTaskDeleteRequestSerializer,
@@ -1514,8 +1528,11 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.success_response(response)
 
         except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(f"error fetching the traces list {str(e)}")
+            logger.exception("eval_task_project_list_failed", error=str(e))
+            return _eval_task_query_error_response(
+                e,
+                "Evaluation tasks could not be loaded. Please try again.",
+            )
 
     @validated_request(
         request_serializer=EvalTaskUpdateRequestSerializer,
@@ -1743,5 +1760,8 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
         except EvalTask.DoesNotExist:
             return self._gm.not_found("Eval task not found")
         except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(f"Error fetching eval task details {str(e)}")
+            logger.exception("eval_task_details_failed", error=str(e))
+            return _eval_task_query_error_response(
+                e,
+                "Evaluation task details could not be loaded. Please try again.",
+            )
