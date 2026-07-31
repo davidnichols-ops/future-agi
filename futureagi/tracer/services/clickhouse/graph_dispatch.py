@@ -1,4 +1,7 @@
-from datetime import UTC, datetime
+import concurrent.futures
+import copy
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from model_hub.models.choices import AnnotationTypeChoices
@@ -32,6 +35,17 @@ SYSTEM_GRAPH_READ_SETTINGS = {
     **GRAPH_READ_SETTINGS,
     "max_bytes_to_read": 1536 * 1024 * 1024,
 }
+
+# Raw attribute graphs are the only system-graph shape that still has to read
+# typed Maps.  One 14/30-day statement can cross the byte or memory guard even
+# when each UTC day is cheap.  Execute non-overlapping day windows with a small
+# fixed fan-out and one shared deadline; every ClickHouse statement remains
+# independently bounded and the original builder performs the final zero-fill.
+SEGMENTED_GRAPH_MAX_WORKERS = 4
+SEGMENTED_GRAPH_MAX_WINDOWS = 32
+SEGMENTED_GRAPH_QUERY_TIMEOUT_MS = 1000
+SEGMENTED_GRAPH_WALL_SECONDS = 2.2
+SEGMENTED_GRAPH_WINDOW = timedelta(days=1)
 
 
 def degraded_graph_response(metric_id: str, exc: Exception) -> dict[str, Any]:
@@ -190,6 +204,174 @@ def format_system_metric_graph(
     }
 
 
+def _segmented_graph_filters(
+    filters: list[dict[str, Any]],
+    *,
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    """Replace the request's time predicates with one exact half-open window."""
+    scoped = [
+        copy.deepcopy(item)
+        for item in filters
+        if str(item.get("column_id") or item.get("columnId") or "")
+        not in {"created_at", "start_time"}
+    ]
+    scoped.append(
+        {
+            "column_id": "created_at",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [start, end],
+            },
+        }
+    )
+    return scoped
+
+
+def _segmented_graph_windows(
+    start: datetime,
+    end: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """Partition a UTC request into non-overlapping midnight-aligned days."""
+    if start >= end:
+        return []
+    windows: list[tuple[datetime, datetime]] = []
+    cursor = start
+    while cursor < end:
+        next_midnight = cursor.replace(hour=0, minute=0, second=0, microsecond=0)
+        if next_midnight <= cursor:
+            next_midnight += SEGMENTED_GRAPH_WINDOW
+        window_end = min(end, next_midnight)
+        windows.append((cursor, window_end))
+        cursor = window_end
+        if len(windows) > SEGMENTED_GRAPH_MAX_WINDOWS:
+            raise TimeoutError("attribute graph exceeds the bounded window count")
+    return windows
+
+
+def _fetch_segmented_attribute_graph_rows(
+    *,
+    analytics,
+    builder: TimeSeriesQueryBuilder,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Execute exact raw-attribute buckets under one bounded wall deadline."""
+    if builder.start_date is None or builder.end_date is None:
+        raise ValueError("graph builder did not parse a bounded time range")
+
+    windows = _segmented_graph_windows(builder.start_date, builder.end_date)
+    if not windows:
+        return [], []
+    deadline = time.monotonic() + SEGMENTED_GRAPH_WALL_SECONDS
+
+    def execute_window(index: int, window: tuple[datetime, datetime]):
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms < 25:
+            raise TimeoutError("attribute graph shared deadline expired")
+        start, end = window
+        chunk_builder = TimeSeriesQueryBuilder(
+            project_id=builder.project_id,
+            project_ids=builder.project_ids,
+            filters=_segmented_graph_filters(builder.filters, start=start, end=end),
+            interval=builder.interval,
+            system_metric_filters=builder.system_metric_filters,
+            observe_type=builder.observe_type,
+            metric_id=builder.metric_id,
+            single_metric=builder.single_metric,
+            # Once the parent selected the raw path, every segment must cover
+            # its complete half-open window. A rollup segment can omit partial
+            # boundary hours and would make the merged response incomplete.
+            allow_attr_rollup=False,
+        )
+        query, params = chunk_builder.build()
+        if chunk_builder.query_source != "raw" or not chunk_builder.attribute_filtered:
+            raise RuntimeError(
+                "segmented graph did not remain on the raw attribute path"
+            )
+        result = analytics.execute_ch_query(
+            query,
+            params,
+            timeout_ms=min(SEGMENTED_GRAPH_QUERY_TIMEOUT_MS, remaining_ms),
+            settings=SYSTEM_GRAPH_READ_SETTINGS,
+        )
+        return index, result
+
+    results: list[Any] = [None] * len(windows)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(SEGMENTED_GRAPH_MAX_WORKERS, len(windows))
+    )
+    futures = [
+        executor.submit(execute_window, index, window)
+        for index, window in enumerate(windows)
+    ]
+    completed = False
+    try:
+        for future in concurrent.futures.as_completed(
+            futures,
+            timeout=SEGMENTED_GRAPH_WALL_SECONDS,
+        ):
+            index, result = future.result()
+            results[index] = result
+        completed = all(result is not None for result in results)
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError("attribute graph shared deadline expired") from exc
+    finally:
+        executor.shutdown(wait=completed, cancel_futures=True)
+
+    if not completed:
+        raise TimeoutError("attribute graph did not complete every window")
+    columns = list(results[0].columns or [])
+    rows_by_bucket: dict[Any, dict[str, Any]] = {}
+    weighted_fields = ("avg_latency", "avg_cost", "error_rate")
+    summed_fields = (
+        "total_tokens",
+        "traffic_count",
+        "prompt_tokens",
+        "completion_tokens",
+    )
+    for result in results:
+        if list(result.columns or []) != columns:
+            raise RuntimeError("attribute graph window columns did not match")
+        for row in result.data:
+            if not isinstance(row, dict):
+                raise RuntimeError("attribute graph window returned an invalid row")
+            bucket = row.get("time_bucket")
+            if bucket is None:
+                raise RuntimeError("attribute graph window omitted its bucket")
+            existing = rows_by_bucket.get(bucket)
+            if existing is None:
+                copied = dict(row)
+                traffic = float(copied.get("traffic_count") or 0)
+                copied["_segment_weight"] = traffic
+                for field in weighted_fields:
+                    copied[f"_{field}_weighted"] = (
+                        float(copied.get(field) or 0) * traffic
+                    )
+                rows_by_bucket[bucket] = copied
+                continue
+
+            # Day chunks are already disjoint for hour/day graphs. Week/month/
+            # year graphs intentionally produce the same outer bucket in
+            # adjacent chunks; merge their aggregate states exactly. The raw
+            # spans schema keeps latency and cost non-nullable, so traffic is
+            # the denominator for both averages and for error-rate percentage.
+            traffic = float(row.get("traffic_count") or 0)
+            existing["_segment_weight"] += traffic
+            for field in weighted_fields:
+                existing[f"_{field}_weighted"] += float(row.get(field) or 0) * traffic
+            for field in summed_fields:
+                existing[field] = (existing.get(field) or 0) + (row.get(field) or 0)
+
+    for row in rows_by_bucket.values():
+        weight = row.pop("_segment_weight")
+        for field in weighted_fields:
+            weighted = row.pop(f"_{field}_weighted")
+            row[field] = weighted / weight if weight else 0
+    return [rows_by_bucket[key] for key in sorted(rows_by_bucket)], columns
+
+
 def annotation_output_type(label: AnnotationsLabels, requested: str = None) -> str:
     if requested:
         return requested
@@ -224,13 +406,24 @@ def fetch_system_metric_graph_ch(
         single_metric=True,
     )
     query, params = builder.build()
-    result = analytics.execute_ch_query(
-        query,
-        params,
-        timeout_ms=timeout_ms,
-        settings=SYSTEM_GRAPH_READ_SETTINGS,
-    )
-    ch_data = builder.format_result(result.data, result.columns or [])
+    if (
+        builder.query_source == "raw"
+        and builder.attribute_filtered
+        and builder.raw_segmentation_safe
+    ):
+        rows, columns = _fetch_segmented_attribute_graph_rows(
+            analytics=analytics,
+            builder=builder,
+        )
+    else:
+        result = analytics.execute_ch_query(
+            query,
+            params,
+            timeout_ms=timeout_ms,
+            settings=SYSTEM_GRAPH_READ_SETTINGS,
+        )
+        rows, columns = result.data, result.columns or []
+    ch_data = builder.format_result(rows, columns)
     response = format_system_metric_graph(ch_data, metric_id)
     if builder.rollup_window_adjusted:
         assert builder.rollup_window_start is not None

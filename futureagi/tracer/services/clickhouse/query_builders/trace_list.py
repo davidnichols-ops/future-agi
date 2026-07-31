@@ -49,6 +49,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
     TABLE = "spans"
     EVAL_TABLE = "tracer_eval_logger"
+    # The legacy table admitted both NULL and the empty string for a root.
+    # CH25 overrides this with the physical, non-nullable representation.  The
+    # candidate seed deliberately reads only this predicate plus project/time:
+    # it is a cheap superset whose mutable/deleted rows are revalidated by the
+    # point-scoped latest-state query before anything reaches the response.
+    ROOT_SEED_PARENT_PREDICATE = "(parent_span_id IS NULL OR parent_span_id = '')"
     # Filter compiler class; the v2 list builder overrides this to the v2
     # builder so it reads the v2 dimension tables (end_users, etc.).
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
@@ -314,6 +320,95 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         LIMIT %(limit)s
         """
         return query, self.params
+
+    def build_root_candidate_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        before_start_time: datetime | None = None,
+        before_trace_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Build a skinny, bounded root-candidate page.
+
+        This is an ordering/identity seed, not a latest-state result.  It must
+        remain compatible with the root projection, so it intentionally reads
+        only physical project/root/delete/time columns and returns only
+        ``trace_id`` plus ``start_time``.  ReplacingMergeTree versions can make
+        the result a superset; callers must point-verify every candidate across
+        the complete request window before returning it.
+
+        Adjacent slices are traversed newest first.  A saturated slice resumes
+        with the exact ``(start_time, trace_id)`` descending keyset, including a
+        deterministic trace-id tie breaker.
+        """
+
+        if int(limit) <= 0:
+            raise ValueError("limit must be greater than zero")
+        if (before_start_time is None) != (before_trace_id is None):
+            raise ValueError(
+                "before_start_time and before_trace_id must be provided together"
+            )
+
+        def _without_timezone(value: datetime) -> datetime:
+            return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+        slice_start = _without_timezone(slice_start)
+        slice_end = _without_timezone(slice_end)
+        if slice_start >= slice_end:
+            raise ValueError("slice_start must be before slice_end")
+
+        if self.start_date is not None and self.end_date is not None:
+            request_start, request_end = self.start_date, self.end_date
+        else:
+            request_start, request_end = self.parse_time_range(self.filters)
+        if slice_start < request_start or slice_end > request_end:
+            raise ValueError("root candidate slice must stay inside request window")
+
+        self.start_date = request_start
+        self.end_date = request_end
+        self.params["start_date"] = request_start
+        self.params["end_date"] = request_end
+        params: dict[str, Any] = {
+            **self.params,
+            "root_seed_slice_start": slice_start,
+            "root_seed_slice_end": slice_end,
+            "root_seed_limit": int(limit),
+        }
+
+        keyset_fragment = ""
+        if before_start_time is not None:
+            before_start_time = _without_timezone(before_start_time)
+            if not slice_start <= before_start_time < slice_end:
+                raise ValueError("root candidate keyset must stay inside its slice")
+            params["root_seed_before_start_time"] = before_start_time
+            params["root_seed_before_trace_id"] = str(before_trace_id)
+            keyset_fragment = """
+              AND (
+                  start_time < %(root_seed_before_start_time)s
+                  OR (
+                      start_time = %(root_seed_before_start_time)s
+                      AND trace_id < %(root_seed_before_trace_id)s
+                  )
+              )
+            """
+
+        query = f"""
+        SELECT
+            trace_id,
+            start_time
+        FROM {self.TABLE}
+        PREWHERE {self.project_filter_sql()}
+          AND is_deleted = 0
+          AND {self.ROOT_SEED_PARENT_PREDICATE}
+        WHERE start_time >= %(root_seed_slice_start)s
+          AND start_time < %(root_seed_slice_end)s
+          {keyset_fragment}
+        ORDER BY start_time DESC, trace_id DESC
+        LIMIT %(root_seed_limit)s
+        """
+        return query, params
 
     def build_latest_filter_match_query(
         self,

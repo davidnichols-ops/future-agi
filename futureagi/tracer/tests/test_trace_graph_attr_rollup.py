@@ -5,8 +5,10 @@ import pytest
 from tracer.serializers.filters import ObserveGraphDataResultSerializer
 from tracer.services.clickhouse.graph_dispatch import (
     GRAPH_READ_SETTINGS,
+    SEGMENTED_GRAPH_QUERY_TIMEOUT_MS,
     SYSTEM_GRAPH_READ_SETTINGS,
     SYSTEM_GRAPH_READ_TIMEOUT_MS,
+    _segmented_graph_windows,
     degraded_graph_response,
     fetch_system_metric_graph_ch,
     format_system_metric_graph,
@@ -445,6 +447,62 @@ class TestTraceGraphAttributeRollup:
         query, _ = _builder([_date_filter(), _attr_filter()]).build()
         assert "dashboard_attr_rollup" not in query
 
+    def test_builder_exposes_the_selected_query_source(self, settings):
+        self._enable(settings)
+        rollup = _builder([_date_filter(), _attr_filter()])
+        rollup.build()
+        assert rollup.query_source == "attribute_rollup"
+        assert rollup.attribute_filtered is False
+
+        raw = _builder(
+            [_date_filter(), _attr_filter("country", value=["CO"])],
+        )
+        raw.build()
+        assert raw.query_source == "raw"
+        assert raw.attribute_filtered is True
+        assert raw.raw_segmentation_safe is False
+
+        span_raw = _builder(
+            [_date_filter(), _attr_filter("country", value=["CO"])],
+            observe_type="span",
+        )
+        span_raw.build()
+        assert span_raw.query_source == "raw"
+        assert span_raw.attribute_filtered is True
+        assert span_raw.raw_segmentation_safe is True
+
+        forced_raw = TimeSeriesQueryBuilder(
+            project_id=PROJECT_ID,
+            filters=[_date_filter(), _attr_filter()],
+            interval="day",
+            metric_id="latency",
+            allow_attr_rollup=False,
+        )
+        query, _ = forced_raw.build()
+        assert forced_raw.query_source == "raw"
+        assert forced_raw.attribute_filtered is True
+        assert forced_raw.raw_segmentation_safe is True
+        assert "dashboard_attr_rollup" not in query
+
+    def test_sub_hour_rollup_fallback_is_labeled_as_raw(self, settings):
+        self._enable(settings)
+        builder = _builder(
+            [
+                _date_filter(
+                    "2026-07-30T12:15:00Z",
+                    "2026-07-30T12:45:00Z",
+                ),
+                _attr_filter(),
+            ],
+            interval="hour",
+        )
+
+        query, _ = builder.build()
+
+        assert "FROM spans" in query
+        assert builder.query_source == "raw"
+        assert builder.attribute_filtered is True
+
         settings.TRACE_GRAPH_ATTR_ROLLUP_ENABLED = True
         settings.DASHBOARD_ATTR_ROLLUP_COVERED_SINCE = datetime(2026, 7, 24, tzinfo=UTC)
         query, _ = _builder([_date_filter(), _attr_filter()]).build()
@@ -527,25 +585,155 @@ class TestGraphReadFailureContract:
             observe_type="span",
         )
 
+        assert len(calls) == 7
+        assert sorted(
+            (params["start_date"], params["end_date"]) for _, params, _, _ in calls
+        ) == [
+            (
+                datetime(2026, 7, day, tzinfo=UTC).replace(tzinfo=None),
+                datetime(2026, 7, day + 1, tzinfo=UTC).replace(tzinfo=None),
+            )
+            for day in range(23, 30)
+        ]
+        for query, _, timeout_ms, settings in calls:
+            assert "FROM spans" in query
+            assert "avg(latency_ms) AS avg_latency" in query
+            assert "count() AS traffic_count" in query
+            assert "0 AS total_tokens" in query
+            assert "0 AS avg_cost" in query
+            assert "0 AS prompt_tokens" in query
+            assert "0 AS completion_tokens" in query
+            assert "0 AS error_rate" in query
+            assert "sum(total_tokens)" not in query
+            assert "avg(cost)" not in query
+            assert "sum(prompt_tokens)" not in query
+            assert "sum(completion_tokens)" not in query
+            assert "countIf(status = 'ERROR')" not in query
+            assert 0 < timeout_ms <= SEGMENTED_GRAPH_QUERY_TIMEOUT_MS
+            assert settings == SYSTEM_GRAPH_READ_SETTINGS
+            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 1536 * 1024 * 1024
+        assert SYSTEM_GRAPH_READ_TIMEOUT_MS == 1250
+
+    def test_trace_any_span_graph_keeps_global_membership_in_one_bounded_query(self):
+        calls = []
+
+        class Result:
+            data = []
+            columns = []
+
+        class Analytics:
+            def execute_ch_query(self, query, params, timeout_ms, settings):
+                calls.append((query, dict(params), timeout_ms, settings))
+                return Result()
+
+        fetch_system_metric_graph_ch(
+            analytics=Analytics(),
+            project_id=PROJECT_ID,
+            filters=[
+                _date_filter(),
+                _attr_filter("country", op="equals", value="CO"),
+            ],
+            interval="day",
+            metric_id="latency",
+            observe_type="trace",
+        )
+
         assert len(calls) == 1
-        query, _, timeout_ms, settings = calls[0]
-        assert "FROM spans" in query
-        assert "avg(latency_ms) AS avg_latency" in query
-        assert "count() AS traffic_count" in query
-        assert "0 AS total_tokens" in query
-        assert "0 AS avg_cost" in query
-        assert "0 AS prompt_tokens" in query
-        assert "0 AS completion_tokens" in query
-        assert "0 AS error_rate" in query
-        assert "sum(total_tokens)" not in query
-        assert "avg(cost)" not in query
-        assert "sum(prompt_tokens)" not in query
-        assert "sum(completion_tokens)" not in query
-        assert "countIf(status = 'ERROR')" not in query
-        assert timeout_ms == SYSTEM_GRAPH_READ_TIMEOUT_MS == 1250
+        query, params, timeout_ms, settings = calls[0]
+        assert "AS graph_attr_candidates USING (trace_id)" in query
+        assert params["start_date"] == datetime(2026, 7, 23)
+        assert params["end_date"] == datetime(2026, 7, 30)
+        assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in query
+        assert "start_time < %(end_date)s + INTERVAL 1 DAY" in query
+        assert timeout_ms == SYSTEM_GRAPH_READ_TIMEOUT_MS
         assert settings == SYSTEM_GRAPH_READ_SETTINGS
-        assert settings["max_memory_usage"] == 256 * 1024 * 1024
-        assert settings["max_bytes_to_read"] == 1536 * 1024 * 1024
+
+    def test_root_attr_plus_any_span_system_filter_is_not_segmented(self):
+        filters = [
+            _date_filter(),
+            _attr_filter("final_status", op="equals", value="completed"),
+            {
+                "column_id": "model",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "gpt-4o",
+                },
+            },
+        ]
+        builder = _builder(filters)
+
+        query, _ = builder.build()
+
+        assert "trace_id IN (SELECT trace_id FROM spans" in " ".join(query.split())
+        assert builder.query_source == "raw"
+        assert builder.attribute_filtered is True
+        assert builder.raw_segmentation_safe is False
+
+    def test_segmented_graph_windows_are_exact_half_open_utc_days(self):
+        start = datetime(2026, 7, 23, 12, 34, 56)
+        end = datetime(2026, 7, 25, 3, 4, 5)
+
+        assert _segmented_graph_windows(start, end) == [
+            (start, datetime(2026, 7, 24)),
+            (datetime(2026, 7, 24), datetime(2026, 7, 25)),
+            (datetime(2026, 7, 25), end),
+        ]
+
+    def test_segmented_week_graph_merges_daily_aggregate_states_exactly(self):
+        calls = []
+        columns = [
+            "time_bucket",
+            "avg_latency",
+            "total_tokens",
+            "avg_cost",
+            "traffic_count",
+            "prompt_tokens",
+            "completion_tokens",
+            "error_rate",
+        ]
+
+        class Result:
+            def __init__(self, day):
+                self.data = [
+                    {
+                        "time_bucket": datetime(2026, 7, 20),
+                        "avg_latency": float(day),
+                        "total_tokens": 0,
+                        "avg_cost": 0,
+                        "traffic_count": 2,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "error_rate": 0,
+                    }
+                ]
+                self.columns = columns
+
+        class Analytics:
+            def execute_ch_query(self, query, params, timeout_ms, settings):
+                calls.append((query, dict(params), timeout_ms, settings))
+                return Result(params["start_date"].day - 19)
+
+        result = fetch_system_metric_graph_ch(
+            analytics=Analytics(),
+            project_id=PROJECT_ID,
+            filters=[
+                _date_filter("2026-07-20T00:00:00Z", "2026-07-27T00:00:00Z"),
+                _attr_filter("country", value=["CO"]),
+            ],
+            interval="week",
+            metric_id="latency",
+            observe_type="span",
+        )
+
+        assert len(calls) == 7
+        assert result["data"][0] == {
+            "timestamp": "2026-07-20T00:00:00",
+            "value": 4.0,
+            "primary_traffic": 14,
+        }
 
     @pytest.mark.parametrize(
         ("exc", "expected_code"),

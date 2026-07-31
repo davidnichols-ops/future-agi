@@ -340,7 +340,7 @@ class TestTracesOfSessionPagination:
             {
                 "trace_id": str(uuid.uuid4()),
                 "project_id": str(uuid.uuid4()),
-                "start_time": now,
+                "start_time": now - timedelta(microseconds=idx),
                 "trace_name": f"trace-{idx}",
                 "observation_type": "llm",
                 "status": "OK",
@@ -590,7 +590,7 @@ class TestTracesOfSessionPagination:
             {
                 "trace_id": str(uuid.uuid4()),
                 "project_id": str(uuid.uuid4()),
-                "start_time": now,
+                "start_time": now - timedelta(microseconds=idx),
                 "trace_name": f"trace-{idx}",
                 "observation_type": "llm",
                 "status": "OK",
@@ -661,8 +661,11 @@ class TestTracesOfSessionPagination:
             row["trace_id"] for row in candidate_rows[:10]
         ]
         assert len(calls) == 3
-        assert "trace_session_id" in calls[0][0]
-        assert str(session_id) in calls[0][1].values()
+        # The projection seed is intentionally filter-free; mutable session
+        # membership is checked by the full-window scalar latest-state probe.
+        assert "trace_session_id" not in calls[0][0]
+        assert "trace_session_id" in calls[1][0]
+        assert str(session_id) in calls[1][1].values()
         assert calls[0][2]["settings"]["max_memory_usage"] == 268_435_456
         assert calls[1][2]["timeout_ms"] <= 750
         assert calls[2][2]["timeout_ms"] <= 750
@@ -721,8 +724,8 @@ class TestTracesOfSessionPagination:
         assert payload["metadata"]["query_status"] == "degraded"
         analytics.execute_ch_query.assert_not_called()
 
-    def test_candidate_seed_scans_full_window_once_in_newest_first_order(self):
-        """The projection-backed seed covers the requested window without retries."""
+    def test_candidate_seed_scans_adjacent_windows_in_newest_first_order(self):
+        """The projection seed never turns the request into one broad scan."""
         view = self._make_view()
         request = self._make_request(page_size=50)
         end = datetime(2026, 7, 30, 12)
@@ -750,7 +753,15 @@ class TestTracesOfSessionPagination:
                 return SimpleNamespace(data=list(reversed(candidates.values())))
             assert params["start_date"] == start
             assert params["end_date"] == end
-            return SimpleNamespace(data=[*newest, *older])
+            return SimpleNamespace(
+                data=[
+                    row
+                    for row in [*newest, *older]
+                    if params["root_seed_slice_start"]
+                    <= row["start_time"]
+                    < params["root_seed_slice_end"]
+                ]
+            )
 
         analytics = mock.MagicMock()
         analytics.execute_ch_query.side_effect = _execute
@@ -775,12 +786,19 @@ class TestTracesOfSessionPagination:
         ]
         assert payload["metadata"].get("query_complete", True) is True
         seed_calls = [call for call in calls if "candidate_trace_ids" not in call[1]]
-        assert len(seed_calls) == 1
-        assert seed_calls[0][1]["start_date"] == start
-        assert seed_calls[0][1]["end_date"] == end
-        assert len(calls) == 3
+        assert len(seed_calls) == 2
+        newest_seed, older_seed = seed_calls
+        assert newest_seed[1]["root_seed_slice_start"] == end - timedelta(minutes=5)
+        assert newest_seed[1]["root_seed_slice_end"] == end
+        assert older_seed[1]["root_seed_slice_start"] == start
+        assert older_seed[1]["root_seed_slice_end"] == end - timedelta(minutes=5)
+        assert all(call[1]["root_seed_limit"] == 100 for call in seed_calls)
+        point_calls = [call for call in calls if "candidate_trace_ids" in call[1]]
+        assert all(call[1]["candidate_start_date"] == start for call in point_calls)
+        assert all(call[1]["candidate_end_date"] == end for call in point_calls)
+        assert len(calls) == 6
 
-    def test_end_of_local_day_range_is_covered_by_the_single_seed(self):
+    def test_end_of_local_day_range_is_covered_by_adjacent_seed_slices(self):
         view = self._make_view()
         request = self._make_request(page_size=50)
         now = datetime(2026, 7, 31, 2, 50)
@@ -802,7 +820,15 @@ class TestTracesOfSessionPagination:
                 return SimpleNamespace(data=list(candidates))
             assert params["start_date"] == requested_start
             assert params["end_date"] == requested_end
-            return SimpleNamespace(data=list(candidates))
+            return SimpleNamespace(
+                data=[
+                    row
+                    for row in candidates
+                    if params["root_seed_slice_start"]
+                    <= row["start_time"]
+                    < params["root_seed_slice_end"]
+                ]
+            )
 
         analytics = mock.MagicMock()
         analytics.execute_ch_query.side_effect = _execute
@@ -843,7 +869,19 @@ class TestTracesOfSessionPagination:
 
         assert status == "ok"
         assert len(payload["table"]) == 10
-        assert len(calls) == 3
+        seed_calls = [call for call in calls if "candidate_trace_ids" not in call[1]]
+        assert len(seed_calls) == 6
+        assert len(calls) == 8
+        assert seed_calls[0][1]["root_seed_slice_end"] == requested_end
+        assert [
+            call[1]["root_seed_slice_end"] - call[1]["root_seed_slice_start"]
+            for call in seed_calls
+        ] == [timedelta(minutes=minutes) for minutes in (5, 10, 20, 40, 80, 160)]
+        assert all(
+            seed_calls[index + 1][1]["root_seed_slice_end"]
+            == seed_calls[index][1]["root_seed_slice_start"]
+            for index in range(len(seed_calls) - 1)
+        )
         assert payload["metadata"].get("query_complete", True) is True
         assert all("future_tail_start" not in params for _, params, _ in calls)
 
@@ -906,16 +944,16 @@ class TestTracesOfSessionPagination:
             params = dict(params or {})
             calls.append((query, params, kwargs))
             if "candidate_trace_ids" not in params:
-                if "keyset_trace_id" in params:
+                if "root_seed_before_trace_id" in params:
                     offset = next(
                         index + 1
                         for index, row in enumerate(candidates)
-                        if row["trace_id"] == params["keyset_trace_id"]
+                        if row["trace_id"] == params["root_seed_before_trace_id"]
                     )
                 else:
                     offset = 0
                 return SimpleNamespace(
-                    data=list(candidates[offset : offset + params["limit"]])
+                    data=list(candidates[offset : offset + params["root_seed_limit"]])
                 )
 
             candidate_ids = list(params["candidate_trace_ids"])
@@ -947,10 +985,15 @@ class TestTracesOfSessionPagination:
             row["trace_id"] for row in candidates[:10]
         ]
         seed_calls = [call for call in calls if "candidate_trace_ids" not in call[1]]
-        assert [call[1]["limit"] for call in seed_calls] == [100, 100]
-        assert "keyset_start_time" not in seed_calls[0][1]
-        assert seed_calls[1][1]["keyset_start_time"] == candidates[99]["start_time"]
-        assert seed_calls[1][1]["keyset_trace_id"] == candidates[99]["trace_id"]
+        assert [call[1]["root_seed_limit"] for call in seed_calls] == [100, 100]
+        assert "root_seed_before_start_time" not in seed_calls[0][1]
+        assert (
+            seed_calls[1][1]["root_seed_before_start_time"]
+            == candidates[99]["start_time"]
+        )
+        assert (
+            seed_calls[1][1]["root_seed_before_trace_id"] == candidates[99]["trace_id"]
+        )
         probe_calls = [call for call in calls if "candidate_trace_ids" in call[1]]
         assert len(probe_calls) == 4
         assert list(probe_calls[0][1]["candidate_trace_ids"]) == [

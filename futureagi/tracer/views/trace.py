@@ -4,7 +4,7 @@ import io
 import json
 import math
 import traceback
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
 from uuid import UUID
@@ -134,10 +134,11 @@ _BOUNDED_ANALYTICS_SETTINGS = {
 _FILTERED_TRACE_CANDIDATE_BATCH = 100
 _FILTERED_TRACE_MAX_BATCHES = 24
 _FILTERED_TRACE_SCAN_BUDGET_MS = 1800
+_TRACE_ROOT_SEED_SLICE = timedelta(minutes=5)
+_TRACE_ROOT_SEED_MAX_SLICE = timedelta(days=2)
 # The seed stream establishes only order and identity; the point-scoped probe
 # below hydrates full light rows. Keeping this select inside ``proj_root_spans``
 # avoids falling back to a wide base-table scan for date-only/unfiltered pages.
-_TRACE_CANDIDATE_SEED_COLUMNS = ["trace_id", "start_time"]
 _TRACE_CANDIDATE_READ_SETTINGS = {
     **_BOUNDED_ANALYTICS_SETTINGS,
     "max_threads": 1,
@@ -3820,18 +3821,30 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         candidate_scan_complete = True
 
         def _execute_candidate_batched_page():
-            """Read a projection-backed root stream, then point-probe it.
+            """Read adjacent projection-backed root slices, then point-probe.
 
-            The root query contains only ``trace_id`` and ``start_time`` and
-            advances with a stable keyset. Attribute Maps are never present in
-            this stage. A second, point-scoped query resolves only the requested
-            Map element with scalar ``argMax`` states, and a third query
-            hydrates only matched roots. No expected timeout controls the scan.
+            The newest interval starts at five minutes and contains only
+            physical root/delete predicates, returning ``trace_id`` plus
+            ``start_time``. Saturated slices advance with the exact descending
+            ``(start_time, trace_id)`` keyset. Exhausted sparse slices move to the
+            immediately adjacent older interval and widen geometrically, capped
+            at two days, so low-volume projects can cross a long date range
+            without turning the first query into a whole-window scan. Attribute
+            Maps are never present in this stage. Every candidate is then
+            reclassified and hydrated with scalar latest-state queries across
+            the complete user-requested window. No broad whole-window seed or
+            timeout-driven retry is issued.
             """
 
-            builder.build(since=None)
+            request_start, request_end = builder.parse_time_range(filters)
+            builder.start_date = request_start
+            builder.end_date = request_end
+            builder.params["start_date"] = request_start
+            builder.params["end_date"] = request_end
             deadline = monotonic() + (_FILTERED_TRACE_SCAN_BUDGET_MS / 1000)
-            prefix_needed = (page_number * page_size) + 2 * page_size
+            # Candidates are de-duplicated across the complete seed stream, so
+            # one row past the requested page is the exact has-more sentinel.
+            prefix_needed = ((page_number + 1) * page_size) + 1
             matched_rows: list[dict] = []
             matched_ids: set[str] = set()
             seen_candidate_ids: set[str] = set()
@@ -3839,7 +3852,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             scan_complete = False
             before_start_time = None
             before_trace_id = None
-            seed_filters = _candidate_seed_filters(filters)
+            seed_slice_end = request_end
+            seed_slice_width = _TRACE_ROOT_SEED_SLICE
             probe_filters = [
                 item
                 for item in filters
@@ -3847,10 +3861,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 not in {"created_at", "start_time"}
             ]
             # The non-FINAL seed establishes only candidate order. Every
-            # non-time predicate retained in that seed is revalidated against
-            # scalar latest state below; this is required for mutable session
-            # and root metrics. Unsupported mixed shapes fail closed rather
-            # than issuing the old candidate ``FINAL`` query (Code 241 family).
+            # non-time predicate is revalidated against scalar latest state
+            # below; this is required for mutable session and root metrics.
+            # Unsupported mixed shapes fail closed rather than issuing the old
+            # candidate ``FINAL`` query (Code 241 family).
             scalar_probe_supported = all(
                 is_latest_trace_probe_filter(item) for item in probe_filters
             )
@@ -3861,6 +3875,34 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
                 return QueryResult([], 0, "clickhouse", 0), False
             candidate_batch = _FILTERED_TRACE_CANDIDATE_BATCH
+
+            def _trace_order_key(row):
+                value = row.get("start_time")
+                if isinstance(value, datetime):
+                    if value.tzinfo is not None:
+                        value = value.astimezone(UTC).replace(tzinfo=None)
+                else:
+                    value = datetime.min
+                return value, str(row.get("trace_id", ""))
+
+            def _has_proven_page_prefix(raw_rows, *, slice_exhausted):
+                """Whether no unseen seed can sort ahead of the page sentinel."""
+
+                if len(matched_rows) < prefix_needed:
+                    return False
+                ordered_matches = sorted(
+                    matched_rows,
+                    key=_trace_order_key,
+                    reverse=True,
+                )
+                cutoff_key = _trace_order_key(ordered_matches[prefix_needed - 1])
+                if slice_exhausted:
+                    frontier_key = (seed_slice_start, "")
+                else:
+                    if not raw_rows:
+                        return False
+                    frontier_key = _trace_order_key(raw_rows[-1])
+                return cutoff_key >= frontier_key
 
             def _probe_and_hydrate(candidate_ids):
                 nonlocal last_result
@@ -3965,20 +4007,21 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 remaining_ms = max(0, int((deadline - monotonic()) * 1000))
                 if remaining_ms < 25:
                     break
-                candidate_builder = BuilderCls(
-                    project_id=None if org_scope else str(project_id),
-                    project_ids=(
-                        [str(p) for p in org_project_ids] if org_scope else None
-                    ),
-                    filters=seed_filters,
-                    page_number=0,
-                    page_size=candidate_batch // 2,
-                    columns=_TRACE_CANDIDATE_SEED_COLUMNS,
+                if seed_slice_end <= request_start:
+                    scan_complete = True
+                    break
+                seed_slice_start = max(
+                    request_start,
+                    seed_slice_end - seed_slice_width,
                 )
-                candidate_query, candidate_params = candidate_builder.build(
-                    since=None,
-                    before_start_time=before_start_time,
-                    before_trace_id=before_trace_id,
+                candidate_query, candidate_params = (
+                    builder.build_root_candidate_seed_page(
+                        slice_start=seed_slice_start,
+                        slice_end=seed_slice_end,
+                        limit=candidate_batch,
+                        before_start_time=before_start_time,
+                        before_trace_id=before_trace_id,
+                    )
                 )
                 try:
                     candidate_result = analytics.execute_ch_query(
@@ -3998,7 +4041,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     break
 
                 last_result = candidate_result
-                raw_rows = list(candidate_result.data)
+                raw_rows = sorted(
+                    candidate_result.data,
+                    key=_trace_order_key,
+                    reverse=True,
+                )
                 candidate_ids = []
                 for row in raw_rows:
                     trace_id = str(row.get("trace_id", ""))
@@ -4009,23 +4056,47 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
                 if not _probe_and_hydrate(candidate_ids):
                     break
-                if len(matched_rows) >= prefix_needed:
+                slice_exhausted = len(raw_rows) < int(
+                    candidate_params["root_seed_limit"]
+                )
+                if _has_proven_page_prefix(
+                    raw_rows,
+                    slice_exhausted=slice_exhausted,
+                ):
                     scan_complete = True
                     break
-                if len(raw_rows) < int(candidate_params["limit"]):
-                    scan_complete = True
-                    break
-                last_seed_row = raw_rows[-1]
-                next_start_time = last_seed_row.get("start_time")
-                next_trace_id = str(last_seed_row.get("trace_id", ""))
-                if next_start_time is None or not next_trace_id:
-                    break
-                next_keyset = (next_start_time, next_trace_id)
-                if next_keyset == (before_start_time, before_trace_id):
-                    break
-                before_start_time, before_trace_id = next_keyset
+                if not slice_exhausted:
+                    last_seed_row = raw_rows[-1]
+                    next_start_time = last_seed_row.get("start_time")
+                    next_trace_id = str(last_seed_row.get("trace_id", ""))
+                    if next_start_time is None or not next_trace_id:
+                        break
+                    next_keyset = (next_start_time, next_trace_id)
+                    if next_keyset == (before_start_time, before_trace_id):
+                        break
+                    before_start_time, before_trace_id = next_keyset
+                    continue
 
-            last_result.data = matched_rows
+                # This half-open slice is exhausted. Move to the immediately
+                # adjacent older slice and reset its within-slice keyset.
+                if seed_slice_start <= request_start:
+                    scan_complete = True
+                    break
+                seed_slice_end = seed_slice_start
+                seed_slice_width = min(
+                    seed_slice_width * 2,
+                    _TRACE_ROOT_SEED_MAX_SLICE,
+                )
+                before_start_time = None
+                before_trace_id = None
+
+            # Point queries are free to return rows in any order. Restore the
+            # canonical list order, including a deterministic same-time tie.
+            last_result.data = sorted(
+                matched_rows,
+                key=_trace_order_key,
+                reverse=True,
+            )
             return last_result, scan_complete
 
         # Attribute and date-only pages use projection-backed root keysets,

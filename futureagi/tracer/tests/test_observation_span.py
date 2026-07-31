@@ -875,7 +875,7 @@ class TestObservationSpanListSpansObserveAPI:
         )
         assert response.status_code == status.HTTP_200_OK
 
-    def test_unfiltered_task_preview_uses_bounded_prefix_and_skips_enrichment(
+    def test_unfiltered_task_preview_uses_skinny_prefix_and_point_hydration(
         self, auth_client, observe_project, monkeypatch
     ):
         """An unfiltered preview uses the bounded scalar-latest prefix path."""
@@ -889,25 +889,52 @@ class TestObservationSpanListSpansObserveAPI:
 
         def fake_execute(self, query, params=None, timeout_ms=10000, settings=None):
             calls.append((query, params, timeout_ms, settings))
+            if "preview_span_ids" in (params or {}):
+                return QueryResult(
+                    data=[
+                        {
+                            "id": span_id,
+                            "trace_id": str(uuid.uuid4()),
+                            "name": "preview",
+                            "observation_type": "llm",
+                            "status": "OK",
+                            "start_time": now,
+                            "end_time": now,
+                            "latency_ms": 1,
+                            "cost": 0,
+                            "total_tokens": 1,
+                            "prompt_tokens": 1,
+                            "completion_tokens": 0,
+                            "model": "",
+                            "provider": "",
+                            "end_user_id": None,
+                            "created_at": now,
+                        }
+                        for span_id in params["preview_span_ids"]
+                    ],
+                    row_count=len(params["preview_span_ids"]),
+                    backend_used="clickhouse",
+                    query_time_ms=1,
+                )
+            if "candidate_span_ids" in (params or {}):
+                return QueryResult(
+                    data=[
+                        {
+                            "id": span_id,
+                            "start_time": now,
+                            "created_at": now,
+                        }
+                        for span_id in params["candidate_span_ids"]
+                    ],
+                    row_count=len(params["candidate_span_ids"]),
+                    backend_used="clickhouse",
+                    query_time_ms=1,
+                )
             return QueryResult(
                 data=[
                     {
                         "id": f"preview-span-{index:02d}",
-                        "trace_id": str(uuid.uuid4()),
-                        "name": "preview",
-                        "observation_type": "llm",
-                        "status": "OK",
                         "start_time": now,
-                        "end_time": now,
-                        "latency_ms": 1,
-                        "cost": 0,
-                        "total_tokens": 1,
-                        "prompt_tokens": 1,
-                        "completion_tokens": 0,
-                        "model": "",
-                        "provider": "",
-                        "end_user_id": None,
-                        "created_at": now,
                     }
                     for index in range(20)
                 ],
@@ -949,21 +976,34 @@ class TestObservationSpanListSpansObserveAPI:
         )
 
         assert response.status_code == status.HTTP_200_OK
-        assert len(calls) == 1
+        assert len(calls) == 3
         query, params, timeout_ms, settings = calls[0]
         assert 0 < timeout_ms <= 750
         assert settings["max_threads"] == 1
         assert settings["max_block_size"] == 8192
         assert settings["max_result_rows"] == 30
-        assert "ORDER BY latest_start_time DESC" in query
-        assert "start_time >= %(slice_start)s" in query
-        assert "start_time < %(slice_end)s" in query
-        assert "LIMIT %(limit)s" in query
+        assert "ORDER BY start_time DESC, id DESC" in query
+        assert "start_time >= %(candidate_slice_start)s" in query
+        assert "start_time < %(candidate_slice_end)s" in query
+        assert "LIMIT %(candidate_seed_limit)s" in query
+        assert "argMax(trace_id" not in query
+        assert "argMax(" not in query
         assert "count(" not in query.lower()
-        assert params["slice_end"] - params["slice_start"] == timedelta(minutes=1)
+        assert params["candidate_slice_end"] - params[
+            "candidate_slice_start"
+        ] == timedelta(minutes=1)
         assert timeout_ms <= 750
+        classifier_query, classifier_params, _, _ = calls[1]
+        assert "id IN %(candidate_span_ids)s" in classifier_query
+        assert "start_time >= %(start_date)s" in classifier_query
+        assert classifier_params["candidate_span_ids"]
+        hydration_query, hydration_params, _, _ = calls[2]
+        assert "id IN %(preview_span_ids)s" in hydration_query
+        assert "argMax(input" not in hydration_query
+        assert "argMax(output" not in hydration_query
+        assert len(hydration_params["preview_span_ids"]) == 10
         result = get_result(response)
-        assert result["table"][0]["span_id"] == "preview-span-00"
+        assert result["table"][0]["span_id"] == "preview-span-19"
         assert result["metadata"]["query_complete"] is True
 
     def test_boolean_attribute_task_preview_uses_bounded_list_path(
@@ -980,25 +1020,53 @@ class TestObservationSpanListSpansObserveAPI:
 
         def fake_execute(self, query, params=None, timeout_ms=10000, settings=None):
             calls.append((query, params, timeout_ms, settings))
+            if "preview_span_ids" in (params or {}):
+                return QueryResult(
+                    data=[
+                        {
+                            "id": span_id,
+                            "trace_id": str(uuid.uuid4()),
+                            "name": "preview",
+                            "observation_type": "llm",
+                            "status": "OK",
+                            "start_time": now,
+                            "end_time": now,
+                            "latency_ms": 1,
+                            "cost": 0,
+                            "total_tokens": 1,
+                            "prompt_tokens": 1,
+                            "completion_tokens": 0,
+                            "model": "",
+                            "provider": "",
+                            "end_user_id": None,
+                            "created_at": now,
+                            "attrs_bool": {"customer_boolean_flag": 1},
+                        }
+                        for span_id in params["preview_span_ids"]
+                    ],
+                    row_count=len(params["preview_span_ids"]),
+                    backend_used="clickhouse",
+                    query_time_ms=1,
+                )
+            if "candidate_span_ids" in (params or {}):
+                return QueryResult(
+                    data=[
+                        {
+                            "id": span_id,
+                            "start_time": now,
+                            "created_at": now,
+                        }
+                        for span_id in params["candidate_span_ids"]
+                    ],
+                    row_count=len(params["candidate_span_ids"]),
+                    backend_used="clickhouse",
+                    query_time_ms=1,
+                )
             return QueryResult(
                 data=[
                     {
                         "id": f"boolean-preview-span-{index:02d}",
-                        "trace_id": str(uuid.uuid4()),
-                        "name": "preview",
-                        "observation_type": "llm",
-                        "status": "OK",
                         "start_time": now,
-                        "end_time": now,
-                        "latency_ms": 1,
-                        "cost": 0,
-                        "total_tokens": 1,
-                        "prompt_tokens": 1,
-                        "completion_tokens": 0,
-                        "model": "",
-                        "provider": "",
-                        "end_user_id": None,
-                        "created_at": now,
                     }
                     for index in range(20)
                 ],
@@ -1049,22 +1117,32 @@ class TestObservationSpanListSpansObserveAPI:
         )
 
         assert response.status_code == status.HTTP_200_OK
-        assert len(calls) == 1
+        assert len(calls) == 3
         query, params, timeout_ms, settings = calls[0]
-        assert "span_attr_bool" in query or "attrs_bool" in query
+        classifier_query, classifier_params, classifier_timeout, _ = calls[1]
+        assert "span_attr_bool" in classifier_query or "attrs_bool" in classifier_query
         boolean_params = [
             value
-            for key, value in params.items()
+            for key, value in classifier_params.items()
             if key.startswith(("attr_", "latest_attr_param_"))
         ]
         assert boolean_params == [1]
-        assert "start_time >= %(slice_start)s" in query
-        assert "start_time < %(slice_end)s" in query
-        assert timeout_ms <= 750
+        assert "argMax(" not in query
+        assert "start_time >= %(candidate_slice_start)s" in query
+        assert "start_time < %(candidate_slice_end)s" in query
+        assert "latest_is_deleted = 0" in classifier_query
+        assert "latest_attr_value_0" in classifier_query
+        assert "latest_attr_exists_0" in classifier_query
+        assert 0 < classifier_timeout <= timeout_ms <= 750
         assert settings["timeout_overflow_mode"] == "throw"
         assert settings["read_overflow_mode"] == "throw"
+        hydration_query, hydration_params, _, _ = calls[2]
+        assert "mapFilter(" in hydration_query
+        assert "AS attrs_bool" in hydration_query
+        assert hydration_params["preview_boolean_keys"] == ("customer_boolean_flag",)
         result = get_result(response)
-        assert result["table"][0]["span_id"] == "boolean-preview-span-00"
+        assert result["table"][0]["span_id"] == "boolean-preview-span-19"
+        assert result["table"][0]["customer_boolean_flag"] is True
         assert result["metadata"]["query_complete"] is True
 
     def test_string_filtered_grid_does_not_repeat_a_full_window_count(
@@ -1094,25 +1172,20 @@ class TestObservationSpanListSpansObserveAPI:
                     }
                     for span_id in params["content_span_ids"]
                 ]
-            elif "ORDER BY latest_start_time DESC" in query:
+            elif "candidate_span_ids" in (params or {}):
+                data = [
+                    {
+                        "id": span_id,
+                        "start_time": now - timedelta(seconds=index),
+                        "created_at": now,
+                    }
+                    for index, span_id in enumerate(params["candidate_span_ids"])
+                ]
+            elif "candidate_seed_limit" in (params or {}):
                 data = [
                     {
                         "id": f"grid-span-{index}",
-                        "trace_id": str(uuid.uuid4()),
-                        "name": "grid",
-                        "observation_type": "llm",
-                        "status": "OK",
                         "start_time": now - timedelta(seconds=index),
-                        "end_time": now,
-                        "latency_ms": index,
-                        "cost": 0,
-                        "total_tokens": 1,
-                        "prompt_tokens": 1,
-                        "completion_tokens": 0,
-                        "model": "",
-                        "provider": "",
-                        "end_user_id": None,
-                        "created_at": now,
                     }
                     for index in range(4)
                 ]

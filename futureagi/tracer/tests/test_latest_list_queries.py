@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from tracer.services.clickhouse.query_service import QueryResult
 from tracer.services.clickhouse.v2.query_builders.span_list import (
     SpanListQueryBuilderV2,
 )
@@ -15,6 +16,7 @@ from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.span_reader import merge_span_attributes
+from tracer.views.observation_span import _execute_bounded_span_filter_prefix
 
 _START = datetime(2026, 7, 30, 11, tzinfo=UTC)
 _END = datetime(2026, 7, 30, 13, tzinfo=UTC)
@@ -82,6 +84,141 @@ def test_span_latest_page_compiles_same_row_and_tombstone_predicates():
     assert params["project_id"] == "11111111-1111-1111-1111-111111111111"
 
 
+def test_span_list_prefix_keeps_slice_aggregation_skinny_and_stable():
+    builder = SpanListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[_time_filter(), _attr("final_status", "approved")],
+        page_size=25,
+    )
+
+    sql, params = builder.build_latest_attribute_list_ids(
+        slice_start=_START,
+        slice_end=_END,
+        limit=50,
+        before_start_time=_END - timedelta(minutes=1),
+        before_id="span-b",
+    )
+
+    assert "FINAL" not in sql
+    assert "grouped_id AS id" in sql
+    assert "latest_start_time AS start_time" in sql
+    assert "argMax(tuple(start_time), _version).1" in sql
+    assert "latest_is_deleted = 0" in sql
+    assert "latest_attr_value_0" in sql
+    assert "ORDER BY latest_start_time DESC, grouped_id DESC" in sql
+    assert "latest_start_time = %(keyset_start_time)s" in sql
+    # Display/content states must never be retained for every id in the slice.
+    assert "argMax(trace_id" not in sql
+    assert "argMax(name" not in sql
+    assert "argMax(input" not in sql
+    assert "argMax(output" not in sql
+    assert params["limit"] == 50
+
+
+def test_span_candidate_seed_is_unfiltered_physical_and_keyset_stable():
+    builder = SpanListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[_time_filter(), _attr("final_status", "approved")],
+        page_size=25,
+    )
+
+    sql, params = builder.build_latest_attribute_candidate_seed_page(
+        slice_start=_START,
+        slice_end=_END,
+        limit=50,
+        before_start_time=_END - timedelta(minutes=1),
+        before_id="span-b",
+    )
+
+    assert "FINAL" not in sql
+    assert "GROUP BY" not in sql
+    assert "argMax(" not in sql
+    assert "latest_is_deleted" not in sql
+    assert "latest_attr_" not in sql
+    assert "project_version_id" not in sql
+    assert "SELECT\n            id,\n            start_time" in sql
+    assert "start_time >= %(candidate_slice_start)s" in sql
+    assert "start_time < %(candidate_slice_end)s" in sql
+    assert "start_time < %(candidate_before_start_time)s" in sql
+    assert "id < %(candidate_before_id)s" in sql
+    assert "ORDER BY start_time DESC, id DESC" in sql
+    assert params["candidate_seed_limit"] == 50
+
+
+def test_span_candidate_classifier_uses_full_request_latest_state():
+    project_version_id = "22222222-2222-2222-2222-222222222222"
+    builder = SpanListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        project_version_id=project_version_id,
+        filters=[_time_filter(), _attr("final_status", "approved")],
+        page_size=25,
+    )
+
+    sql, params = builder.build_latest_attribute_candidate_matches(
+        ["span-a", "span-b", "span-a"]
+    )
+
+    assert "FINAL" not in sql
+    assert "id IN %(candidate_span_ids)s" in sql
+    assert "start_time >= %(start_date)s" in sql
+    assert "start_time < %(end_date)s" in sql
+    assert "candidate_slice_start" not in sql
+    assert "GROUP BY id" in sql
+    assert "latest_is_deleted = 0" in sql
+    assert "latest_attr_exists_0" in sql
+    assert "latest_attr_value_0" in sql
+    assert "argMax(tuple(project_version_id), _version).1" in sql
+    assert "latest_project_version_id = %(project_version_id)s" in sql
+    assert "ORDER BY latest_start_time DESC, grouped_id DESC" in sql
+    assert params["candidate_span_ids"] == ("span-a", "span-b")
+    assert params["start_date"] == _START.replace(tzinfo=None)
+    assert params["end_date"] == _END.replace(tzinfo=None)
+
+
+def test_span_point_content_hydrates_light_columns_for_only_page_ids():
+    builder = SpanListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[_time_filter()],
+    )
+
+    sql, params = builder.build_content_query(["span-a", "span-b"])
+
+    assert "id IN %(content_span_ids)s" in sql
+    assert "GROUP BY id" in sql
+    assert "latest_is_deleted = 0" in sql
+    for column in (
+        "trace_id",
+        "name",
+        "observation_type",
+        "status",
+        "start_time",
+        "latency_ms",
+        "created_at",
+    ):
+        assert f"AS {column}" in sql
+    assert params["content_span_ids"] == ("span-a", "span-b")
+
+
+def test_span_preview_hydrates_only_selected_typed_attributes():
+    builder = SpanListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[_time_filter(), _attr("final_status", "approved")],
+    )
+
+    sql, params = builder.build_preview_hydration_query(["span-a"])
+
+    assert "id IN %(preview_span_ids)s" in sql
+    assert "mapFilter(" in sql
+    assert "AS attrs_string" in sql
+    assert "AS attrs_number" not in sql
+    assert "AS attrs_bool" not in sql
+    assert "argMax(input" not in sql
+    assert "argMax(output" not in sql
+    assert "attributes_extra" not in sql
+    assert params["preview_text_keys"] == ("final_status",)
+    assert params["preview_span_ids"] == ("span-a",)
+
+
 def test_span_latest_id_page_applies_sampling_exclusion_and_keyset_before_limit():
     builder = SpanListQueryBuilderV2(
         project_id="11111111-1111-1111-1111-111111111111",
@@ -109,6 +246,7 @@ def test_span_latest_id_page_applies_sampling_exclusion_and_keyset_before_limit(
     assert params["latest_span_sampling_rate"] == 50.0
     assert params["latest_span_excluded_ids"] == ("span-a",)
     assert params["latest_span_after_id"] == "span-b"
+    assert sql.upper().count("PREWHERE") == 1
 
 
 def test_trace_latest_root_id_page_selects_canonical_root_before_final_status():
@@ -131,6 +269,46 @@ def test_trace_latest_root_id_page_selects_canonical_root_before_final_status():
     assert "argMax(tuple(parent_span_id), _version).1" in sql
     assert "argMax(tuple(start_time), _version).1" in sql
     assert params["latest_root_limit"] == 25
+
+
+def test_trace_root_candidate_seed_is_ch25_projection_compatible_and_keyset_stable():
+    builder = TraceListQueryBuilderV2(
+        project_id="11111111-1111-1111-1111-111111111111",
+        filters=[_time_filter(), _attr("final_status", "approved")],
+    )
+    slice_start = _END - timedelta(minutes=5)
+    marker_time = _END - timedelta(minutes=2)
+
+    sql, params = builder.build_root_candidate_seed_page(
+        slice_start=slice_start,
+        slice_end=_END,
+        limit=100,
+        before_start_time=marker_time,
+        before_trace_id="trace-b",
+    )
+
+    select_clause = sql.split("FROM", 1)[0]
+    assert "trace_id" in select_clause
+    assert "start_time" in select_clause
+    assert "attrs_string" not in select_clause
+    assert "FINAL" not in sql
+    assert "GROUP BY" not in sql
+    assert "PREWHERE project_id = %(project_id)s" in sql
+    assert "is_deleted = 0" in sql
+    assert "parent_span_id = ''" in sql
+    assert "parent_span_id IS NULL" not in sql
+    assert "start_time >= %(root_seed_slice_start)s" in sql
+    assert "start_time < %(root_seed_slice_end)s" in sql
+    assert "start_time < %(root_seed_before_start_time)s" in sql
+    assert "trace_id < %(root_seed_before_trace_id)s" in sql
+    assert "ORDER BY start_time DESC, trace_id DESC" in sql
+    assert "LIMIT %(root_seed_limit)s" in sql
+    assert "optimize_use_projections = 1" in sql
+    assert params["root_seed_slice_start"] == slice_start.replace(tzinfo=None)
+    assert params["root_seed_slice_end"] == _END.replace(tzinfo=None)
+    assert params["root_seed_before_start_time"] == marker_time.replace(tzinfo=None)
+    assert params["root_seed_before_trace_id"] == "trace-b"
+    assert params["root_seed_limit"] == 100
 
 
 def test_trace_matcher_keeps_root_and_any_span_semantics_separate():
@@ -179,13 +357,15 @@ def test_trace_hydration_selects_canonical_latest_live_root():
         project_id="11111111-1111-1111-1111-111111111111",
         filters=[_time_filter()],
     )
-    sql, _ = builder.build_candidate_hydration_query(["trace-a"])
+    sql, params = builder.build_candidate_hydration_query(["trace-a"])
 
     assert "FINAL" not in sql
     assert "GROUP BY trace_id, id" in sql
     assert "latest_is_deleted = 0" in sql
     assert "LIMIT 1 BY grouped_trace_id" in sql
     assert "ORDER BY latest_start_time DESC" in sql
+    assert params["candidate_start_date"] == _START.replace(tzinfo=None)
+    assert params["candidate_end_date"] == _END.replace(tzinfo=None)
 
 
 def test_span_latest_page_keeps_project_version_in_scalar_latest_state():
@@ -350,6 +530,206 @@ def _query(client, sql, params):
     return [
         dict(zip(result.column_names, row, strict=False)) for row in result.result_rows
     ]
+
+
+class _LocalClickHouseAnalytics:
+    """Small adapter for exercising the real bounded-list executor locally."""
+
+    def __init__(self, client):
+        self.client = client
+        self.calls: list[tuple[str, dict]] = []
+
+    def execute_ch_query(self, query, params, timeout_ms, settings):
+        self.calls.append((query, dict(params)))
+        rows = _query(self.client, query, params)
+        return QueryResult(rows, len(rows), "clickhouse", 0)
+
+
+@pytest.mark.integration
+def test_span_bounded_executor_does_not_resurface_cross_slice_stale_match(
+    latest_query_ch,
+):
+    """Newer nonmatches/key-clears/tombstones suppress older slice matches."""
+
+    project = uuid.uuid4()
+    older_time = _START + timedelta(minutes=5)
+    newer_time = _END - timedelta(minutes=5)
+
+    def row(span_id, when, attrs, *, deleted=0, version=1):
+        return [
+            project,
+            span_id,
+            span_id,
+            "",
+            "cross-slice",
+            "span",
+            "llm",
+            "OK",
+            when,
+            when,
+            when,
+            None,
+            None,
+            attrs,
+            {},
+            {},
+            deleted,
+            version,
+        ]
+
+    stale_ids = {
+        "cross-slice-key-clear",
+        "cross-slice-nonmatch",
+        "cross-slice-tombstone",
+    }
+    live_id = "cross-slice-current-match"
+    rows = [
+        row(span_id, older_time, {"final_status": "approved"}, version=1)
+        for span_id in stale_ids
+    ]
+    rows.extend(
+        [
+            row("cross-slice-key-clear", newer_time, {}, version=2),
+            row(
+                "cross-slice-nonmatch",
+                newer_time - timedelta(seconds=1),
+                {"final_status": "rejected"},
+                version=2,
+            ),
+            row(
+                "cross-slice-tombstone",
+                newer_time - timedelta(seconds=2),
+                {"final_status": "approved"},
+                deleted=1,
+                version=2,
+            ),
+            row(
+                live_id,
+                newer_time - timedelta(seconds=3),
+                {"final_status": "approved"},
+                version=2,
+            ),
+        ]
+    )
+    _insert(latest_query_ch, rows)
+    builder = SpanListQueryBuilderV2(
+        project_id=str(project),
+        page_number=0,
+        page_size=1,
+        filters=[_time_filter(), _attr("final_status", "approved")],
+    )
+    analytics = _LocalClickHouseAnalytics(latest_query_ch)
+
+    result, complete, full_window = _execute_bounded_span_filter_prefix(
+        builder,
+        analytics,
+        budget_ms=30_000,
+        max_slices=16,
+        clock=lambda: 0,
+    )
+
+    assert [row["id"] for row in result.data] == [live_id]
+    assert stale_ids.isdisjoint(row["id"] for row in result.data)
+    classified_ids = [
+        span_id
+        for _, params in analytics.calls
+        for span_id in params.get("candidate_span_ids", ())
+    ]
+    assert all(classified_ids.count(span_id) == 1 for span_id in stale_ids)
+    assert classified_ids.count(live_id) == 1
+    assert complete is True
+    assert full_window is True
+
+
+@pytest.mark.integration
+def test_trace_root_candidate_seed_real_ch_is_ordered_safe_superset(latest_query_ch):
+    client = latest_query_ch
+    project = uuid.uuid4()
+    other_project = uuid.uuid4()
+    same_time = _END - timedelta(minutes=1)
+    older_time = _END - timedelta(minutes=2)
+
+    def row(pid, trace_id, span_id, when, *, parent="", deleted=0, version=1):
+        return [
+            pid,
+            trace_id,
+            span_id,
+            parent,
+            f"trace-{trace_id}",
+            "root",
+            "llm",
+            "OK",
+            when,
+            when,
+            when,
+            None,
+            None,
+            {"final_status": "approved"},
+            {},
+            {},
+            deleted,
+            version,
+        ]
+
+    _insert(
+        client,
+        [
+            row(project, "trace-z", "root-z", same_time),
+            row(project, "trace-a", "root-a", same_time),
+            row(project, "trace-old", "root-old", older_time),
+            # A non-FINAL ``is_deleted = 0`` seed may include this historical
+            # live version. Full-window hydration must remove the tombstone.
+            row(project, "trace-deleted", "root-deleted", older_time, version=1),
+            row(
+                project,
+                "trace-deleted",
+                "root-deleted",
+                older_time,
+                deleted=1,
+                version=2,
+            ),
+            row(
+                project,
+                "trace-child-only",
+                "child",
+                same_time,
+                parent="parent",
+            ),
+            row(other_project, "trace-other-tenant", "root-other", same_time),
+        ],
+    )
+
+    builder = TraceListQueryBuilderV2(
+        project_id=str(project),
+        filters=[_time_filter(), _attr("final_status", "approved")],
+    )
+    first_sql, first_params = builder.build_root_candidate_seed_page(
+        slice_start=_START,
+        slice_end=_END,
+        limit=2,
+    )
+    first_page = _query(client, first_sql, first_params)
+    assert [row["trace_id"] for row in first_page] == ["trace-z", "trace-a"]
+
+    second_sql, second_params = builder.build_root_candidate_seed_page(
+        slice_start=_START,
+        slice_end=_END,
+        limit=10,
+        before_start_time=first_page[-1]["start_time"],
+        before_trace_id=first_page[-1]["trace_id"],
+    )
+    second_page = _query(client, second_sql, second_params)
+    assert [row["trace_id"] for row in second_page] == [
+        "trace-old",
+        "trace-deleted",
+    ]
+    assert "trace-child-only" not in {row["trace_id"] for row in second_page}
+    assert "trace-other-tenant" not in {row["trace_id"] for row in second_page}
+
+    hydration_sql, hydration_params = builder.build_candidate_hydration_query(
+        ["trace-deleted"]
+    )
+    assert _query(client, hydration_sql, hydration_params) == []
 
 
 @pytest.mark.integration
@@ -553,6 +933,32 @@ def test_latest_list_queries_real_ch_semantics(latest_query_ch):
     span_rows = _query(client, span_sql, span_params)
     assert {row["id"] for row in span_rows} == {"span-a"}
 
+    list_id_sql, list_id_params = span_builder.build_latest_attribute_list_ids(
+        slice_start=_START,
+        slice_end=_END,
+        limit=25,
+    )
+    assert _query(client, list_id_sql, list_id_params) == [
+        {
+            "id": "span-a",
+            "start_time": same_time.replace(tzinfo=None),
+            "created_at": same_time.replace(tzinfo=None),
+        }
+    ]
+
+    content_sql, content_params = span_builder.build_content_query(["span-a"])
+    hydrated = _query(client, content_sql, content_params)
+    assert len(hydrated) == 1
+    assert hydrated[0]["id"] == "span-a"
+    assert hydrated[0]["trace_id"] == "span-a"
+    assert hydrated[0]["attrs_string"]["a"] == "x"
+
+    preview_sql, preview_params = span_builder.build_preview_hydration_query(["span-a"])
+    preview = _query(client, preview_sql, preview_params)
+    assert len(preview) == 1
+    assert preview[0]["attrs_string"] == {"a": "x", "b": "y"}
+    assert "input" not in preview[0]
+
     span_id_sql, span_id_params = span_builder.build_latest_attribute_id_page(
         slice_start=_START,
         slice_end=_END,
@@ -594,6 +1000,28 @@ def test_latest_list_queries_real_ch_semantics(latest_query_ch):
         project_id=str(project),
         filters=[_time_filter(), _attr("final_status", "approved")],
     )
+    seed_sql, seed_params = approved_builder.build_root_candidate_seed_page(
+        slice_start=_START,
+        slice_end=_END,
+        limit=100,
+    )
+    seed_rows = _query(client, seed_sql, seed_params)
+    seed_ids = {row["trace_id"] for row in seed_rows}
+    # The non-FINAL physical seed is intentionally a superset: an older live
+    # version of a tombstoned root may appear, but child spans and another
+    # tenant may not. The full-window hydration below removes that stale row.
+    assert "deleted" in seed_ids
+    assert "other" not in seed_ids
+    assert seed_rows == sorted(
+        seed_rows,
+        key=lambda row: (row["start_time"], row["trace_id"]),
+        reverse=True,
+    )
+    stale_hydration_sql, stale_hydration_params = (
+        approved_builder.build_candidate_hydration_query(["deleted"])
+    )
+    assert _query(client, stale_hydration_sql, stale_hydration_params) == []
+
     approved_sql, approved_params = approved_builder.build_latest_filter_match_query(
         ["multi-root"],
         filters=[_attr("final_status", "approved")],

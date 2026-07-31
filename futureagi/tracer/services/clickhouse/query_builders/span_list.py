@@ -479,7 +479,13 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         return query, self.params
 
     def build_content_query(self, span_ids: list) -> tuple[str, dict[str, Any]]:
-        """Fetch latest input/output + typed attrs for only the page IDs."""
+        """Point-hydrate the visible page from latest span versions.
+
+        Phase 1 deliberately selects only ``(id, start_time)``. Keeping the
+        display columns out of the slice-wide ``GROUP BY`` matters on ingest
+        heavy projects: a minute can contain hundreds of thousands of ids,
+        while a visible page contains only a few dozen.
+        """
         if not span_ids:
             return "", {}
         if "start_date" not in self.params or "end_date" not in self.params:
@@ -490,6 +496,21 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         query = f"""
         SELECT
                id,
+               argMax(trace_id, _peerdb_version) AS trace_id,
+               argMax(name, _peerdb_version) AS name,
+               argMax(observation_type, _peerdb_version) AS observation_type,
+               argMax(status, _peerdb_version) AS status,
+               argMax(start_time, _peerdb_version) AS start_time,
+               argMax(tuple(end_time), _peerdb_version).1 AS end_time,
+               argMax(latency_ms, _peerdb_version) AS latency_ms,
+               argMax(cost, _peerdb_version) AS cost,
+               argMax(total_tokens, _peerdb_version) AS total_tokens,
+               argMax(prompt_tokens, _peerdb_version) AS prompt_tokens,
+               argMax(completion_tokens, _peerdb_version) AS completion_tokens,
+               argMax(model, _peerdb_version) AS model,
+               argMax(provider, _peerdb_version) AS provider,
+               argMax(tuple(end_user_id), _peerdb_version).1 AS end_user_id,
+               argMax(created_at, _peerdb_version) AS created_at,
                argMax(input, _peerdb_version) AS input,
                argMax(output, _peerdb_version) AS output,
                argMax(attributes_extra, _peerdb_version) AS attributes_extra,
@@ -503,6 +524,138 @@ class SpanListQueryBuilder(BaseQueryBuilder):
           AND start_time < %(end_date)s + INTERVAL 1 DAY
         GROUP BY id
         HAVING argMax(is_deleted, _peerdb_version) = 0
+        """
+        return query, params
+
+    def build_preview_hydration_query(
+        self, span_ids: list[str]
+    ) -> tuple[str, dict[str, Any]]:
+        """Hydrate preview rows without unrelated content or attributes.
+
+        Task creation needs the selected filter attributes in the preview so
+        the mapping can be verified. It does not need input/output or every
+        custom attribute. The id set is page-bounded (preview caps it at ten),
+        and returned maps contain only the typed keys present in the filters.
+        """
+        bounded_ids = [str(span_id) for span_id in span_ids if span_id]
+        if not bounded_ids:
+            return "", {}
+        if "start_date" not in self.params or "end_date" not in self.params:
+            start_date, end_date = self.parse_time_range(self.filters)
+            self.params["start_date"] = start_date
+            self.params["end_date"] = end_date
+
+        keys_by_type: dict[str, list[str]] = {
+            "text": [],
+            "number": [],
+            "boolean": [],
+        }
+        for item in self.filters:
+            key = item.get("column_id") or item.get("columnId")
+            if not key or key in {"created_at", "start_time"}:
+                continue
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            col_type = str(
+                config.get("col_type") or config.get("colType") or ""
+            ).upper()
+            if col_type != "SPAN_ATTRIBUTE":
+                continue
+            filter_type = str(
+                config.get("filter_type") or config.get("filterType") or ""
+            ).lower()
+            normalized_type = "text" if filter_type == "string" else filter_type
+            if (
+                normalized_type in keys_by_type
+                and str(key) not in keys_by_type[normalized_type]
+            ):
+                keys_by_type[normalized_type].append(str(key))
+
+        params: dict[str, Any] = {
+            **self.params,
+            "preview_span_ids": tuple(bounded_ids),
+        }
+        selected_map_aggregates: list[str] = []
+        selected_map_projections: list[str] = []
+        for filter_type, source_column, alias in (
+            ("text", "span_attr_str", "attrs_string"),
+            ("number", "span_attr_num", "attrs_number"),
+            ("boolean", "span_attr_bool", "attrs_bool"),
+        ):
+            keys = keys_by_type[filter_type]
+            if not keys:
+                continue
+            param_name = f"preview_{filter_type}_keys"
+            params[param_name] = tuple(keys)
+            latest_alias = f"latest_{alias}"
+            selected_map_aggregates.append(
+                "mapFilter((key, value) -> key IN "
+                f"%({param_name})s, argMax({source_column}, _peerdb_version)) "
+                f"AS {latest_alias}"
+            )
+            selected_map_projections.append(f"{latest_alias} AS {alias}")
+        selected_map_aggregate_fragment = (
+            ",\n                    "
+            + ",\n                    ".join(selected_map_aggregates)
+            if selected_map_aggregates
+            else ""
+        )
+        selected_map_projection_fragment = (
+            ",\n               " + ",\n               ".join(selected_map_projections)
+            if selected_map_projections
+            else ""
+        )
+
+        query = f"""
+        SELECT
+               grouped_id AS id,
+               latest_trace_id AS trace_id,
+               latest_name AS name,
+               latest_observation_type AS observation_type,
+               latest_status AS status,
+               latest_start_time AS start_time,
+               latest_end_time AS end_time,
+               latest_latency_ms AS latency_ms,
+               latest_cost AS cost,
+               latest_total_tokens AS total_tokens,
+               latest_prompt_tokens AS prompt_tokens,
+               latest_completion_tokens AS completion_tokens,
+               latest_model AS model,
+               latest_provider AS provider,
+               latest_end_user_id AS end_user_id,
+               latest_created_at AS created_at
+               {selected_map_projection_fragment}
+        FROM (
+            SELECT
+                    id AS grouped_id,
+                    argMax(trace_id, _peerdb_version) AS latest_trace_id,
+                    argMax(name, _peerdb_version) AS latest_name,
+                    argMax(observation_type, _peerdb_version)
+                        AS latest_observation_type,
+                    argMax(status, _peerdb_version) AS latest_status,
+                    argMax(tuple(start_time), _peerdb_version).1
+                        AS latest_start_time,
+                    argMax(tuple(end_time), _peerdb_version).1 AS latest_end_time,
+                    argMax(latency_ms, _peerdb_version) AS latest_latency_ms,
+                    argMax(cost, _peerdb_version) AS latest_cost,
+                    argMax(total_tokens, _peerdb_version) AS latest_total_tokens,
+                    argMax(prompt_tokens, _peerdb_version) AS latest_prompt_tokens,
+                    argMax(completion_tokens, _peerdb_version)
+                        AS latest_completion_tokens,
+                    argMax(model, _peerdb_version) AS latest_model,
+                    argMax(provider, _peerdb_version) AS latest_provider,
+                    argMax(tuple(end_user_id), _peerdb_version).1
+                        AS latest_end_user_id,
+                    argMax(created_at, _peerdb_version) AS latest_created_at,
+                    argMax(is_deleted, _peerdb_version) AS latest_is_deleted
+                    {selected_map_aggregate_fragment}
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND id IN %(preview_span_ids)s
+              AND start_time >= %(start_date)s - INTERVAL 1 DAY
+              AND start_time < %(end_date)s + INTERVAL 1 DAY
+            GROUP BY id
+        )
+        WHERE latest_is_deleted = 0
         """
         return query, params
 
@@ -538,7 +691,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 "before_start_time and before_id must be provided together"
             )
 
-        request_start, request_end = self.parse_time_range(self.filters)
+        request_start = self.params.get("start_date")
+        request_end = self.params.get("end_date")
+        if request_start is None or request_end is None:
+            request_start, request_end = self.parse_time_range(self.filters)
         self.params.update(
             {
                 "start_date": request_start,
@@ -645,6 +801,287 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         LIMIT %(limit)s
         """
         return query, dict(self.params)
+
+    def build_latest_attribute_list_ids(
+        self,
+        *,
+        slice_start: Any,
+        slice_end: Any,
+        limit: int,
+        before_start_time: Any = None,
+        before_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return an exact, skinny newest-first list prefix.
+
+        Only the latest ordering timestamp, creation timestamp, tombstone, and
+        requested scalar attributes are retained per id. ``created_at`` keeps
+        the page-bounded eval/annotation reads partition-pruned; every display
+        and content column is point-hydrated after the bounded prefix has been
+        selected, instead of retaining sixteen aggregate states for every id
+        in a high-volume time slice.
+        """
+        if not self.supports_latest_attribute_page():
+            raise ValueError("latest scalar span page does not support this request")
+        if int(limit) <= 0:
+            raise ValueError("limit must be greater than zero")
+        if (before_start_time is None) != (before_id is None):
+            raise ValueError(
+                "before_start_time and before_id must be provided together"
+            )
+
+        request_start = self.params.get("start_date")
+        request_end = self.params.get("end_date")
+        if request_start is None or request_end is None:
+            request_start, request_end = self.parse_time_range(self.filters)
+        params: dict[str, Any] = {
+            **self.params,
+            "start_date": request_start,
+            "end_date": request_end,
+            "slice_start": slice_start,
+            "slice_end": slice_end,
+            "limit": int(limit),
+        }
+        plans = [
+            build_latest_attribute_predicate(item, index=index)
+            for index, item in enumerate(
+                item for item in self.filters if is_span_attribute_filter(item)
+            )
+        ]
+        for plan in plans:
+            params.update(plan.params)
+
+        aggregates = [aggregate for plan in plans for aggregate in plan.aggregates]
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = str(self.project_version_id)
+            aggregates.append(
+                "argMax(tuple(project_version_id), _peerdb_version).1 "
+                "AS latest_project_version_id"
+            )
+            project_version_fragment = (
+                " AND latest_project_version_id = %(project_version_id)s"
+            )
+        aggregate_fragment = (
+            ",\n                    " + ",\n                    ".join(aggregates)
+            if aggregates
+            else ""
+        )
+        predicate_fragment = (
+            " AND " + " AND ".join(plan.predicate for plan in plans) if plans else ""
+        )
+        keyset_fragment = ""
+        if before_start_time is not None:
+            params["keyset_start_time"] = before_start_time
+            params["keyset_id"] = str(before_id)
+            keyset_fragment = """
+              AND (
+                  latest_start_time < %(keyset_start_time)s
+                  OR (
+                      latest_start_time = %(keyset_start_time)s
+                      AND grouped_id < %(keyset_id)s
+                  )
+              )
+            """
+
+        query = f"""
+        SELECT
+            grouped_id AS id,
+            latest_start_time AS start_time,
+            latest_created_at AS created_at
+        FROM (
+            SELECT
+                id AS grouped_id,
+                argMax(tuple(start_time), _peerdb_version).1 AS latest_start_time,
+                argMax(created_at, _peerdb_version) AS latest_created_at,
+                argMax(is_deleted, _peerdb_version) AS latest_is_deleted
+                {aggregate_fragment}
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND start_time >= %(slice_start)s
+              AND start_time < %(slice_end)s
+            GROUP BY id
+        )
+        WHERE latest_is_deleted = 0
+          {predicate_fragment}
+          {project_version_fragment}
+          {keyset_fragment}
+        ORDER BY latest_start_time DESC, grouped_id DESC
+        LIMIT %(limit)s
+        """
+        return query, params
+
+    def build_latest_attribute_candidate_seed_page(
+        self,
+        *,
+        slice_start: Any,
+        slice_end: Any,
+        limit: int,
+        before_start_time: Any = None,
+        before_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return an unfiltered physical candidate page for bounded lists.
+
+        This query establishes only identity and an upper-bound ordering key.
+        It deliberately does not evaluate tombstones, project versions, or
+        attribute predicates inside the slice: doing so could hide a newer
+        non-match/key-clear/tombstone and let an older matching version of the
+        same span resurface from a later slice. Callers must mark every seeded
+        id seen and classify it with
+        :meth:`build_latest_attribute_candidate_matches` across the complete
+        original request window.
+        """
+
+        if not self.supports_latest_attribute_page():
+            raise ValueError("latest scalar span seed does not support this request")
+        if int(limit) <= 0:
+            raise ValueError("limit must be greater than zero")
+        if (before_start_time is None) != (before_id is None):
+            raise ValueError(
+                "before_start_time and before_id must be provided together"
+            )
+
+        request_start = self.params.get("start_date")
+        request_end = self.params.get("end_date")
+        if request_start is None or request_end is None:
+            request_start, request_end = self.parse_time_range(self.filters)
+
+        def _without_timezone(value):
+            return (
+                value.replace(tzinfo=None) if getattr(value, "tzinfo", None) else value
+            )
+
+        slice_start = _without_timezone(slice_start)
+        slice_end = _without_timezone(slice_end)
+        if slice_start >= slice_end:
+            raise ValueError("slice_start must be before slice_end")
+        if slice_start < request_start or slice_end > request_end:
+            raise ValueError("candidate slice must stay inside request window")
+
+        params: dict[str, Any] = {
+            **self.params,
+            "start_date": request_start,
+            "end_date": request_end,
+            "candidate_slice_start": slice_start,
+            "candidate_slice_end": slice_end,
+            "candidate_seed_limit": int(limit),
+        }
+        keyset_fragment = ""
+        if before_start_time is not None:
+            before_start_time = _without_timezone(before_start_time)
+            if not slice_start <= before_start_time < slice_end:
+                raise ValueError("candidate keyset must stay inside its slice")
+            params["candidate_before_start_time"] = before_start_time
+            params["candidate_before_id"] = str(before_id)
+            keyset_fragment = """
+              AND (
+                  start_time < %(candidate_before_start_time)s
+                  OR (
+                      start_time = %(candidate_before_start_time)s
+                      AND id < %(candidate_before_id)s
+                  )
+              )
+            """
+
+        query = f"""
+        SELECT
+            id,
+            start_time
+        FROM {self.TABLE}
+        PREWHERE {self.project_filter_sql()}
+          AND start_time >= %(candidate_slice_start)s
+          AND start_time < %(candidate_slice_end)s
+          {keyset_fragment}
+        ORDER BY start_time DESC, id DESC
+        LIMIT %(candidate_seed_limit)s
+        """
+        return query, params
+
+    def build_latest_attribute_candidate_matches(
+        self,
+        candidate_span_ids: list[str],
+    ) -> tuple[str, dict[str, Any]]:
+        """Classify bounded candidates against full-window latest state.
+
+        Each candidate id is reduced once over the complete original request
+        window before tombstone, project-version, and requested attribute
+        predicates are applied. The returned ordering key is therefore the
+        canonical latest key, not a potentially stale physical seed key.
+        """
+
+        if not self.supports_latest_attribute_page():
+            raise ValueError(
+                "latest scalar span classifier does not support this request"
+            )
+        bounded_ids = list(
+            dict.fromkeys(str(span_id) for span_id in candidate_span_ids if span_id)
+        )
+        if not bounded_ids:
+            return "", {}
+
+        request_start = self.params.get("start_date")
+        request_end = self.params.get("end_date")
+        if request_start is None or request_end is None:
+            request_start, request_end = self.parse_time_range(self.filters)
+        params: dict[str, Any] = {
+            **self.params,
+            "start_date": request_start,
+            "end_date": request_end,
+            "candidate_span_ids": tuple(bounded_ids),
+        }
+        plans = [
+            build_latest_attribute_predicate(item, index=index)
+            for index, item in enumerate(
+                item for item in self.filters if is_span_attribute_filter(item)
+            )
+        ]
+        for plan in plans:
+            params.update(plan.params)
+        aggregates = [aggregate for plan in plans for aggregate in plan.aggregates]
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = str(self.project_version_id)
+            aggregates.append(
+                "argMax(tuple(project_version_id), _peerdb_version).1 "
+                "AS latest_project_version_id"
+            )
+            project_version_fragment = (
+                " AND latest_project_version_id = %(project_version_id)s"
+            )
+        aggregate_fragment = (
+            ",\n                    " + ",\n                    ".join(aggregates)
+            if aggregates
+            else ""
+        )
+        predicate_fragment = (
+            " AND " + " AND ".join(plan.predicate for plan in plans) if plans else ""
+        )
+
+        query = f"""
+        SELECT
+            grouped_id AS id,
+            latest_start_time AS start_time,
+            latest_created_at AS created_at
+        FROM (
+            SELECT
+                id AS grouped_id,
+                argMax(tuple(start_time), _peerdb_version).1 AS latest_start_time,
+                argMax(created_at, _peerdb_version) AS latest_created_at,
+                argMax(is_deleted, _peerdb_version) AS latest_is_deleted
+                {aggregate_fragment}
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND id IN %(candidate_span_ids)s
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+            GROUP BY id
+        )
+        WHERE latest_is_deleted = 0
+          {predicate_fragment}
+          {project_version_fragment}
+        ORDER BY latest_start_time DESC, grouped_id DESC
+        LIMIT {len(bounded_ids)}
+        """
+        return query, params
 
     def build_latest_attribute_id_page(
         self,

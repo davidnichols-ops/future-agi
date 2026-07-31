@@ -6,7 +6,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import asdict
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import structlog
@@ -176,11 +176,13 @@ def _execute_bounded_span_filter_prefix(
     The all-span table has no projection ordered solely by project and time, so
     both raw Map predicates and an unfiltered multi-day top-K can exceed a
     per-query read budget. Adjacent slices start at one minute and grow
-    geometrically after completed empty or sparse reads. Attribute pages reduce
-    each requested Map element to scalar latest-version states before applying
-    the predicate. There is no speculative whole-window request and no timeout
-    is used as normal control flow. Newest-to-oldest concatenation exactly
-    preserves ``ORDER BY start_time DESC, id DESC``.
+    geometrically after completed empty or sparse reads. The common scalar path
+    first reads unfiltered physical ``(id, start_time)`` candidates, marks each
+    id seen, then classifies only that bounded id set against latest state over
+    the complete original request window. This prevents a newer key-clear,
+    non-match, or tombstone from being hidden in one slice and an older matching
+    version resurfacing from another. There is no speculative whole-window seed
+    and no timeout is used as normal control flow.
 
     All slices share one wall-clock deadline.  A slice receives only the
     remaining timeout, and resource-limit failures never contribute partial
@@ -252,6 +254,18 @@ def _execute_bounded_span_filter_prefix(
 
     rows: list[dict] = []
     seen_ids: set[str] = set()
+    matched_ids: set[str] = set()
+    prefix_proven = False
+
+    def _span_order_key(row):
+        value = row.get("start_time")
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                value = value.astimezone(UTC).replace(tzinfo=None)
+        else:
+            value = datetime.min
+        return value, str(row.get("id", ""))
+
     scan_now = timezone.now()
     if timezone.is_naive(end_date):
         scan_now = scan_now.replace(tzinfo=None)
@@ -306,7 +320,7 @@ def _execute_bounded_span_filter_prefix(
             )
 
     for _ in range(max(int(max_slices), 0)):
-        if len(rows) >= prefix_limit:
+        if prefix_proven or (not scalar_latest_page and len(rows) >= prefix_limit):
             break
         if cursor <= start_date:
             full_window_scanned = True
@@ -324,15 +338,20 @@ def _execute_bounded_span_filter_prefix(
         # executor stops incomplete rather than skipping to the older minute.
         slice_limit = min(
             max_result_rows,
-            prefix_limit - len(rows) + builder.page_size,
+            max(
+                builder.page_size,
+                prefix_limit - len(rows) + builder.page_size,
+            ),
         )
         if scalar_latest_page:
-            slice_query, slice_params = builder.build_latest_attribute_page(
-                slice_start=slice_start,
-                slice_end=cursor,
-                limit=slice_limit,
-                before_start_time=keyset_start_time,
-                before_id=keyset_id,
+            slice_query, slice_params = (
+                builder.build_latest_attribute_candidate_seed_page(
+                    slice_start=slice_start,
+                    slice_end=cursor,
+                    limit=slice_limit,
+                    before_start_time=keyset_start_time,
+                    before_id=keyset_id,
+                )
             )
         else:
             if keyset_start_time is None:
@@ -377,13 +396,93 @@ def _execute_bounded_span_filter_prefix(
             break
 
         slice_rows = list(slice_result.data)
+        if scalar_latest_page:
+            # The physical seed can contain several versions of one id. Its
+            # SQL is ordered, but restoring the order here makes the frontier
+            # proof robust to test doubles and distributed result merging.
+            slice_rows.sort(key=_span_order_key, reverse=True)
         slice_exhausted = len(slice_rows) < slice_limit
-        for row in slice_rows[:slice_limit]:
-            span_id = str(row.get("id", ""))
-            if span_id in seen_ids:
-                continue
-            seen_ids.add(span_id)
-            rows.append(row)
+        if scalar_latest_page:
+            candidate_ids: list[str] = []
+            for row in slice_rows[:slice_limit]:
+                span_id = str(row.get("id", ""))
+                if not span_id or span_id in seen_ids:
+                    continue
+                # Mark before classification. A non-match or tombstone is a
+                # conclusive classification for this request and must suppress
+                # every older physical version in subsequent slices.
+                seen_ids.add(span_id)
+                candidate_ids.append(span_id)
+
+            if candidate_ids:
+                remaining_ms = int((deadline - clock()) * 1000)
+                if remaining_ms < _SPAN_FILTER_SCAN_MIN_QUERY_MS:
+                    break
+                match_query, match_params = (
+                    builder.build_latest_attribute_candidate_matches(candidate_ids)
+                )
+                try:
+                    match_result = analytics.execute_ch_query(
+                        match_query,
+                        match_params,
+                        timeout_ms=min(_SPAN_FILTER_QUERY_TIMEOUT_MS, remaining_ms),
+                        settings={
+                            **_SPAN_PREFIX_READ_SETTINGS,
+                            "max_result_rows": len(candidate_ids),
+                        },
+                    )
+                except Exception as exc:
+                    if not is_read_budget_error(exc):
+                        raise
+                    logger.warning(
+                        "bounded span candidate classification exceeded read budget",
+                        candidate_count=len(candidate_ids),
+                        error_type=type(exc).__name__,
+                    )
+                    break
+
+                candidate_id_set = set(candidate_ids)
+                for row in match_result.data:
+                    span_id = str(row.get("id", ""))
+                    if (
+                        not span_id
+                        or span_id not in candidate_id_set
+                        or span_id in matched_ids
+                    ):
+                        continue
+                    matched_ids.add(span_id)
+                    rows.append(row)
+        else:
+            for row in slice_rows[:slice_limit]:
+                span_id = str(row.get("id", ""))
+                if span_id in seen_ids:
+                    continue
+                seen_ids.add(span_id)
+                rows.append(row)
+
+        if slice_exhausted and slice_start <= start_date:
+            # This statement proved the final half-open request slice empty
+            # below its returned rows, even if the prefix frontier lets us
+            # return before the cursor-update block below.
+            full_window_scanned = True
+
+        if scalar_latest_page and len(rows) >= prefix_limit:
+            ordered_matches = sorted(rows, key=_span_order_key, reverse=True)
+            cutoff_key = _span_order_key(ordered_matches[prefix_limit - 1])
+            if slice_exhausted:
+                normalized_slice_start = (
+                    slice_start.astimezone(UTC).replace(tzinfo=None)
+                    if getattr(slice_start, "tzinfo", None) is not None
+                    else slice_start
+                )
+                frontier_key = (normalized_slice_start, "")
+            elif slice_rows:
+                frontier_key = _span_order_key(slice_rows[-1])
+            else:  # pragma: no cover - saturated empty results are impossible
+                frontier_key = (datetime.max, "")
+            if cutoff_key >= frontier_key:
+                prefix_proven = True
+                break
 
         if slice_exhausted:
             # This completed query exhausted the whole half-open slice.
@@ -393,7 +492,7 @@ def _execute_bounded_span_filter_prefix(
             remaining_window = cursor - start_date
             if remaining_window > timedelta(0):
                 slice_width = min(slice_width * 2, remaining_window)
-        if len(rows) >= prefix_limit:
+        if not scalar_latest_page and len(rows) >= prefix_limit:
             break
         if not slice_exhausted:
             # Continue the exact same half-open time slice below its last
@@ -414,7 +513,13 @@ def _execute_bounded_span_filter_prefix(
 
     if cursor <= start_date:
         full_window_scanned = True
-    page_complete = len(rows) >= prefix_limit or full_window_scanned
+    if scalar_latest_page:
+        rows.sort(key=_span_order_key, reverse=True)
+    page_complete = (
+        prefix_proven
+        or (not scalar_latest_page and len(rows) >= prefix_limit)
+        or full_window_scanned
+    )
     elapsed_ms = max((clock() - started_at) * 1000, 0)
     return (
         QueryResult(rows, len(rows), "clickhouse", elapsed_ms),
@@ -2064,6 +2169,37 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 )
                 return [], _enrichment_error_code(exc)
 
+        def _fetch_preview_hydration():
+            """Read display fields plus only attributes selected by filters."""
+            if not span_ids:
+                return [], None
+            preview_query, preview_params = builder.build_preview_hydration_query(
+                span_ids
+            )
+            if not preview_query:
+                return [], None
+            try:
+                preview_rows = analytics.execute_ch_query(
+                    preview_query,
+                    preview_params,
+                    timeout_ms=750,
+                    settings=_SPAN_CONTENT_READ_SETTINGS,
+                ).data
+                returned_ids = {
+                    str(row.get("id", "")) for row in preview_rows if row.get("id")
+                }
+                preview_error = (
+                    None if set(span_ids).issubset(returned_ids) else "query_failed"
+                )
+                return preview_rows, preview_error
+            except Exception as exc:
+                logger.warning(
+                    "span preview hydration exceeded budget",
+                    project_id=str(project_id) if project_id else None,
+                    error_type=type(exc).__name__,
+                )
+                return [], _enrichment_error_code(exc)
+
         def _fetch_evals():
             if not (span_ids and eval_config_ids):
                 return {}, None
@@ -2117,10 +2253,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 )
                 return {}, _enrichment_error_code(exc)
 
-        # The task preview is deliberately lean. It immediately hydrates the
-        # selected span through trace detail and neither renders eval/annotation
-        # columns nor needs an exact total. Skipping all four secondary reads
-        # prevents a six-month count from blocking the variable-mapping picker.
+        # The task preview is deliberately lean. It point-hydrates display
+        # fields plus only the custom attributes selected by the request; it
+        # does not read span content, evals, annotations, or an exact count.
+        # Keeping those broad secondary reads out prevents a six-month request
+        # from blocking the variable-mapping picker.
         # Exact counts are intentionally outside the list request's critical
         # path. On the production whale tenant they consumed most of the 750ms
         # budget before content could start. The prefix length is an honest,
@@ -2130,7 +2267,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         eval_error = None
         annotation_error = None
         if preview_mode:
-            content_rows = []
+            content_rows, content_error = _fetch_preview_hydration()
             total_count = phase1_distinct_rows
             eval_map = {}
             annotation_map = {}
@@ -2162,6 +2299,21 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             content_rows,
             id_key="id",
             keys=(
+                "trace_id",
+                "name",
+                "observation_type",
+                "status",
+                "start_time",
+                "end_time",
+                "latency_ms",
+                "cost",
+                "total_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "model",
+                "provider",
+                "end_user_id",
+                "created_at",
                 "input",
                 "output",
                 "attributes_extra",
@@ -2487,10 +2639,34 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                             requested=len(span_ids),
                             project_id=project_id,
                         )
-                    for row in result.data:
-                        c = content_map.get(str(row.get("id", "")), {})
-                        row["input"] = c.get("input", "")
-                        row["output"] = c.get("output", "")
+                    merge_content_rows(
+                        result.data,
+                        content_result.data,
+                        id_key="id",
+                        keys=(
+                            "trace_id",
+                            "name",
+                            "observation_type",
+                            "status",
+                            "start_time",
+                            "end_time",
+                            "latency_ms",
+                            "cost",
+                            "total_tokens",
+                            "prompt_tokens",
+                            "completion_tokens",
+                            "model",
+                            "provider",
+                            "end_user_id",
+                            "created_at",
+                            "input",
+                            "output",
+                            "attributes_extra",
+                            "attrs_string",
+                            "attrs_number",
+                            "attrs_bool",
+                        ),
+                    )
                 except Exception as exc:
                     enrichment_error_codes.add(_enrichment_error_code(exc))
                     logger.warning(

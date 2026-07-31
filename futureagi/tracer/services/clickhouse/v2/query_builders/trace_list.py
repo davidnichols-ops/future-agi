@@ -58,6 +58,13 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
     # (end_users, etc.) instead of the dropped legacy CDC tables.
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
 
+    # ``parent_span_id`` is a non-nullable String on the direct-write CH25
+    # table.  Keeping the physical equality (instead of ``IS NULL OR``) and the
+    # physical ``is_deleted = 0`` predicate emitted by the inherited seed makes
+    # the skinny page eligible for ``proj_root_spans``.  It is still only a
+    # superset seed; the view performs full-window scalar latest-state checks.
+    ROOT_SEED_PARENT_PREDICATE = "parent_span_id = ''"
+
     def build_span_attributes_query(
         self, trace_ids: list[str]
     ) -> tuple[str, dict[str, Any]]:

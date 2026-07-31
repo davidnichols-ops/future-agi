@@ -1,5 +1,7 @@
 """Unit guards for bounded eval-task span identity resolution."""
 
+import os
+import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -9,6 +11,62 @@ from tracer.models.eval_task import RowType, RunType
 from tracer.selectors.eval_tasks import row_resolver
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(scope="module")
+def row_resolver_ch():
+    """Isolated loopback-only CH table for fallback latest-state semantics."""
+    if os.environ.get("FUTUREAGI_TEST_ALLOW_LOCAL_CH_DDL") != "1":
+        pytest.skip("local ClickHouse DDL integration test requires explicit opt-in")
+    clickhouse_connect = pytest.importorskip("clickhouse_connect")
+    host = os.environ.get("CH25_HOST") or os.environ.get("CH_HOST") or "localhost"
+    if host not in {"localhost", "127.0.0.1", "::1"}:
+        pytest.fail("local ClickHouse DDL test refuses a non-loopback host")
+    port = int(
+        os.environ.get("CH25_HTTP_PORT") or os.environ.get("CH_HTTP_PORT") or 18124
+    )
+    database = f"test_eval_selector_{uuid.uuid4().hex[:8]}"
+    try:
+        admin = clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            username=os.environ.get("CH_USER", "default"),
+            password=os.environ.get("CH_PASSWORD", ""),
+        )
+        admin.command("SELECT 1")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f"ClickHouse not available: {exc!r}")
+
+    admin.command(f"CREATE DATABASE {database}")
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        username=os.environ.get("CH_USER", "default"),
+        password=os.environ.get("CH_PASSWORD", ""),
+        database=database,
+    )
+    client.command(
+        """
+        CREATE TABLE spans (
+            project_id UUID,
+            trace_id String,
+            id String,
+            start_time DateTime64(6, 'UTC'),
+            attrs_string Map(String, String),
+            attrs_number Map(String, Float64),
+            attrs_bool Map(String, UInt8),
+            is_deleted UInt8 DEFAULT 0,
+            _version UInt64
+        ) ENGINE = MergeTree
+        ORDER BY (project_id, start_time, trace_id, id, _version)
+        """
+    )
+    try:
+        yield client
+    finally:
+        client.close()
+        admin.command(f"DROP DATABASE IF EXISTS {database}")
+        admin.close()
 
 
 def test_unix_nanoseconds_preserves_microsecond_cursor_exactly():
@@ -353,7 +411,7 @@ def test_historical_span_caller_deduplicates_and_trims(monkeypatch):
     assert reader.closed is True
 
 
-def test_historical_span_filter_falls_back_to_adjacent_newest_minutes(monkeypatch):
+def test_historical_span_filter_uses_coarse_seed_and_full_window_probe(monkeypatch):
     class FakeReader:
         def __init__(self):
             self.calls = []
@@ -364,13 +422,10 @@ def test_historical_span_filter_falls_back_to_adjacent_newest_minutes(monkeypatc
             assert batch_size == 2
             if len(self.calls) == 1:
                 raise TimeoutError("private ClickHouse timeout detail")
-
-            if params["latest_span_slice_start"] == datetime(2026, 7, 30, 12, 2):
-                yield ["span-a", "span-a", "span-b"]
-            elif params["latest_span_slice_start"] == datetime(2026, 7, 30, 12, 1):
-                yield ["span-c"]
-            else:  # pragma: no cover - makes an unexpected extra slice obvious
-                raise AssertionError(params["latest_span_slice_start"])
+            if "candidate_span_ids" in params:
+                yield list(params["candidate_span_ids"])
+                return
+            yield ["span-a", "span-b", "span-c"]
 
         def close(self):
             self.closed = True
@@ -408,36 +463,226 @@ def test_historical_span_filter_falls_back_to_adjacent_newest_minutes(monkeypatc
         ["span-c"],
     ]
     assert len(reader.calls) == 3
-    assert [
-        (call[1]["latest_span_slice_start"], call[1]["latest_span_slice_end"])
-        for call in reader.calls[1:]
-    ] == [
-        (
-            datetime(2026, 7, 30, 12, 2),
-            datetime(2026, 7, 30, 12, 3),
-        ),
-        (
-            datetime(2026, 7, 30, 12, 1),
-            datetime(2026, 7, 30, 12, 2),
-        ),
-    ]
-    assert all(
-        call[1]["start_date"] == datetime(2026, 7, 30, 12)
-        and call[1]["end_date"] == datetime(2026, 7, 30, 12, 3)
-        for call in reader.calls
+    seed_sql, seed_params, seed_settings = reader.calls[1]
+    assert seed_params["latest_span_slice_start"] == datetime(2026, 7, 30, 12)
+    assert seed_params["latest_span_slice_end"] == datetime(2026, 7, 30, 12, 3)
+    assert seed_params["latest_span_limit"] == 51
+    assert "FINAL" not in seed_sql
+    assert "GROUP BY id" in seed_sql
+    assert "prompt_slug" not in seed_sql
+    assert seed_settings["max_result_rows"] == 51
+
+    probe_sql, probe_params, probe_settings = reader.calls[2]
+    assert "FINAL" not in probe_sql
+    assert "GROUP BY id" in probe_sql
+    assert "prompt_slug" in probe_sql
+    assert probe_params["candidate_span_ids"] == (
+        "span-a",
+        "span-b",
+        "span-c",
     )
-    assert all(
-        "FINAL" not in call[0]
-        and "GROUP BY id" in call[0]
-        and "start_time >= %(latest_span_slice_start)s" in call[0]
-        and "start_time < %(latest_span_slice_end)s" in call[0]
-        for call in reader.calls[1:]
-    )
-    assert all("prompt_slug" in sql for sql, _, _ in reader.calls)
+    assert probe_params["candidate_start_date"] == datetime(2026, 7, 30, 12)
+    assert probe_params["candidate_end_date"] == datetime(2026, 7, 30, 12, 3)
+    assert probe_settings["max_result_rows"] == 3
     assert reader.closed is True
 
 
-def test_historical_trace_filter_falls_back_to_adjacent_newest_minutes(monkeypatch):
+def test_historical_span_probe_prevents_older_attribute_match_resurfacing(
+    monkeypatch,
+):
+    """A newer key clear rejects the id once, including in older windows."""
+
+    class FakeReader:
+        def __init__(self):
+            self.calls = []
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls.append((sql, dict(params), dict(settings)))
+            if len(self.calls) == 1:
+                raise TimeoutError("whole-window budget")
+            if "candidate_span_ids" in params:
+                if params["candidate_span_ids"] == ("span-stale",):
+                    # Full-window argMax sees the newer key-clearing version.
+                    return
+                yield ["span-valid"]
+                return
+            if params["latest_span_slice_start"] == datetime(2026, 7, 30, 12, 5):
+                yield ["span-stale"]
+            else:
+                # The older physical version still has the matching value, but
+                # the id was marked seen before the newer probe rejected it.
+                yield ["span-stale", "span-valid"]
+
+        def close(self):
+            pass
+
+    reader = FakeReader()
+    monkeypatch.setattr(row_resolver, "get_reader", lambda: reader)
+    task = SimpleNamespace(
+        project_id="11111111-1111-1111-1111-111111111111",
+        row_type=RowType.SPANS,
+        id="task-no-resurrection",
+        sampling_rate=100,
+        filters={
+            "date_range": [
+                "2026-07-30T12:00:00Z",
+                "2026-07-30T12:10:00Z",
+            ],
+            "filters": [
+                {
+                    "column_id": "final_status",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "Rechazado",
+                    },
+                }
+            ],
+        },
+        run_type=RunType.HISTORICAL,
+        spans_limit=1,
+    )
+
+    assert list(row_resolver.iter_desired_rows(task)) == [["span-valid"]]
+    probes = [
+        params["candidate_span_ids"]
+        for _, params, _ in reader.calls
+        if "candidate_span_ids" in params
+    ]
+    assert probes == [("span-stale",), ("span-valid",)]
+    assert all(
+        params["candidate_start_date"] == datetime(2026, 7, 30, 12)
+        and params["candidate_end_date"] == datetime(2026, 7, 30, 12, 10)
+        for _, params, _ in reader.calls
+        if "candidate_span_ids" in params
+    )
+
+
+@pytest.mark.integration
+def test_historical_span_fallback_real_ch_rejects_stale_versions_and_tombstones(
+    row_resolver_ch,
+):
+    """The actual fallback SQL classifies every seed over the full window."""
+    client = row_resolver_ch
+    project = uuid.uuid4()
+    other_project = uuid.uuid4()
+    window_start = datetime(2026, 7, 30, 12, tzinfo=UTC)
+    old_time = window_start + timedelta(minutes=2)
+    new_time = window_start + timedelta(minutes=7)
+    window_end = window_start + timedelta(minutes=10)
+
+    def row(
+        project_id,
+        span_id,
+        when,
+        final_status,
+        *,
+        deleted=0,
+        version=1,
+    ):
+        return [
+            project_id,
+            f"trace-{span_id}",
+            span_id,
+            when,
+            ({"final_status": final_status} if final_status is not None else {}),
+            {},
+            {},
+            deleted,
+            version,
+        ]
+
+    client.insert(
+        "spans",
+        [
+            row(project, "span-valid", old_time, "Rechazado"),
+            row(project, "span-cleared", old_time, "Rechazado"),
+            row(project, "span-cleared", new_time, None, version=2),
+            row(project, "span-nonmatch", old_time, "Rechazado"),
+            row(project, "span-nonmatch", new_time, "Aprobado", version=2),
+            row(project, "span-tombstone", old_time, "Rechazado"),
+            row(
+                project,
+                "span-tombstone",
+                new_time,
+                "Rechazado",
+                deleted=1,
+                version=2,
+            ),
+            row(other_project, "span-other-project", old_time, "Rechazado"),
+        ],
+        column_names=[
+            "project_id",
+            "trace_id",
+            "id",
+            "start_time",
+            "attrs_string",
+            "attrs_number",
+            "attrs_bool",
+            "is_deleted",
+            "_version",
+        ],
+    )
+
+    class ForcedFallbackReader:
+        def __init__(self):
+            self.calls = []
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls.append((sql, dict(params), dict(settings)))
+            if len(self.calls) == 1:
+                raise TimeoutError("force the bounded fallback")
+            result = client.query(sql, parameters=params, settings=settings)
+            values = [str(row[0]) for row in result.result_rows]
+            for offset in range(0, len(values), batch_size):
+                yield values[offset : offset + batch_size]
+
+    filters = {
+        "date_range": [window_start, window_end],
+        "filters": [
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rechazado",
+                },
+            }
+        ],
+    }
+    reader = ForcedFallbackReader()
+    resolved = row_resolver._resolve_bounded_historical_span_ids(
+        reader,
+        sql="SELECT id FROM spans",
+        params={
+            "start_date": window_start,
+            "end_date": window_end,
+            "id_limit": 20,
+        },
+        project_id=str(project),
+        salt="real-ch-task",
+        sampling_rate=100,
+        filters=filters,
+        limit=10,
+        batch_size=25,
+        row_type=RowType.SPANS,
+    )
+
+    assert resolved == ["span-valid"]
+    assert all("FINAL" not in sql for sql, _, _ in reader.calls[1:])
+    probe_params = [
+        params for _, params, _ in reader.calls if "candidate_span_ids" in params
+    ]
+    assert probe_params
+    assert all(
+        params["candidate_start_date"] == window_start for params in probe_params
+    )
+    assert all(params["candidate_end_date"] == window_end for params in probe_params)
+
+
+def test_historical_trace_filter_uses_coarse_seed_and_full_window_probe(monkeypatch):
     class FakeReader:
         def __init__(self):
             self.calls = []
@@ -450,12 +695,8 @@ def test_historical_trace_filter_falls_back_to_adjacent_newest_minutes(monkeypat
 
             if "final_status" in sql:
                 yield list(params["candidate_trace_ids"])
-            elif params["start_date"] == datetime(2026, 7, 30, 12, 2):
-                yield ["trace-a", "trace-b"]
-            elif params["start_date"] == datetime(2026, 7, 30, 12, 1):
-                yield ["trace-c"]
-            else:  # pragma: no cover
-                raise AssertionError(params)
+            else:
+                yield ["trace-a", "trace-b", "trace-c"]
 
         def close(self):
             self.closed = True
@@ -492,25 +733,66 @@ def test_historical_trace_filter_falls_back_to_adjacent_newest_minutes(monkeypat
         ["trace-a", "trace-b"],
         ["trace-c"],
     ]
-    assert len(reader.calls) == 5
-    assert [
-        (call[1]["start_date"], call[1]["end_date"])
-        for call in (reader.calls[1], reader.calls[3])
-    ] == [
-        (
-            datetime(2026, 7, 30, 12, 2),
-            datetime(2026, 7, 30, 12, 3),
-        ),
-        (
-            datetime(2026, 7, 30, 12, 1),
-            datetime(2026, 7, 30, 12, 2),
-        ),
-    ]
-    seeds = (reader.calls[1], reader.calls[3])
-    probes = (reader.calls[2], reader.calls[4])
-    assert all("FINAL" not in sql and "final_status" not in sql for sql, _, _ in seeds)
-    assert all("FINAL" not in sql and "final_status" in sql for sql, _, _ in probes)
+    assert len(reader.calls) == 3
+    seed_sql, seed_params, seed_settings = reader.calls[1]
+    probe_sql, probe_params, probe_settings = reader.calls[2]
+    assert seed_params["latest_root_slice_start"] == datetime(2026, 7, 30, 12)
+    assert seed_params["latest_root_slice_end"] == datetime(2026, 7, 30, 12, 3)
+    assert seed_params["latest_root_limit"] == 51
+    assert "FINAL" not in seed_sql and "final_status" not in seed_sql
+    assert seed_settings["max_result_rows"] == 51
+    assert "FINAL" not in probe_sql and "final_status" in probe_sql
+    assert probe_params["candidate_trace_ids"] == (
+        "trace-a",
+        "trace-b",
+        "trace-c",
+    )
+    assert probe_settings["max_result_rows"] == 3
     assert reader.closed is True
+
+
+def test_historical_time_only_trace_fallback_rechecks_canonical_root(monkeypatch):
+    class FakeReader:
+        def __init__(self):
+            self.calls = []
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls.append((sql, dict(params), dict(settings)))
+            if len(self.calls) == 1:
+                raise TimeoutError("whole-window budget")
+            if "candidate_trace_ids" in params:
+                yield ["trace-a"]
+                return
+            yield ["trace-a"]
+
+        def close(self):
+            pass
+
+    reader = FakeReader()
+    monkeypatch.setattr(row_resolver, "get_reader", lambda: reader)
+    task = SimpleNamespace(
+        project_id="11111111-1111-1111-1111-111111111111",
+        row_type=RowType.TRACES,
+        id="task-time-only-trace",
+        sampling_rate=100,
+        filters={
+            "date_range": [
+                "2026-07-30T12:00:00Z",
+                "2026-07-30T12:03:00Z",
+            ]
+        },
+        run_type=RunType.HISTORICAL,
+        spans_limit=1,
+    )
+
+    assert list(row_resolver.iter_desired_rows(task)) == [["trace-a"]]
+    assert len(reader.calls) == 3
+    probe_sql, probe_params, probe_settings = reader.calls[2]
+    assert "FINAL" not in probe_sql
+    assert "latest_parent_span_id" in probe_sql
+    assert "latest_is_deleted = 0" in probe_sql
+    assert probe_params["candidate_trace_ids"] == ("trace-a",)
+    assert probe_settings["max_result_rows"] == 1
 
 
 @pytest.mark.parametrize(
@@ -518,11 +800,11 @@ def test_historical_trace_filter_falls_back_to_adjacent_newest_minutes(monkeypat
     [
         (
             ["2026-07-30T12:00:00Z", "2026-07-30T12:03:00Z"],
-            datetime(2026, 7, 30, 12, 2),
+            datetime(2026, 7, 30, 12),
         ),
         (
             ["2026-05-01T00:00:00Z", "2026-05-08T00:00:00Z"],
-            datetime(2026, 5, 7, 23, 59),
+            datetime(2026, 5, 7, 23, 55),
         ),
     ],
 )
@@ -590,7 +872,7 @@ def test_historical_trace_any_span_filter_verifies_original_window(
     assert seed_params["project_id"] == str(task.project_id)
     assert seed_settings["max_execution_time"] <= 0.75
     assert seed_settings["max_threads"] == 2
-    assert seed_settings["max_result_rows"] == 50
+    assert seed_settings["max_result_rows"] == 51
     assert seed_settings["use_skip_indexes_if_final"] == 1
 
     probe_sql, probe_params, probe_settings = reader.calls[2]
@@ -666,7 +948,7 @@ def test_historical_trace_negative_membership_verifies_remote_child(monkeypatch)
     seed_sql, seed_params, _ = reader.calls[1]
     probe_sql, probe_params, _ = reader.calls[2]
     assert "forbidden-user" not in seed_sql
-    assert seed_params["latest_root_slice_start"] == datetime(2026, 5, 7, 23, 59)
+    assert seed_params["latest_root_slice_start"] == datetime(2026, 5, 7, 23, 55)
     assert "trace_id NOT IN (SELECT" in probe_sql
     assert "trace_id IN %(candidate_trace_ids)s" in probe_sql
     assert probe_params["candidate_trace_ids"] == (
@@ -835,7 +1117,7 @@ def test_historical_fallback_proves_empty_future_tail_before_slicing(monkeypatch
     )
 
     assert list(row_resolver.iter_desired_rows(task)) == [["span-now"]]
-    assert len(reader.calls) == 3
+    assert len(reader.calls) == 4
     tail_query, tail_params, tail_settings = reader.calls[1]
     assert "FROM spans" in tail_query
     assert "FINAL" not in tail_query
@@ -844,9 +1126,13 @@ def test_historical_fallback_proves_empty_future_tail_before_slicing(monkeypatch
     assert tail_params["future_tail_end"] == datetime(2026, 5, 17, 6, 41)
     assert tail_settings["max_execution_time"] <= 0.1
     assert tail_settings["max_threads"] == 1
-    _, slice_params, _ = reader.calls[2]
-    assert slice_params["eval_slice_start"] == now + timedelta(minutes=4)
-    assert slice_params["eval_slice_end"] == now + timedelta(minutes=5)
+    seed_sql, seed_params, _ = reader.calls[2]
+    assert "FINAL" not in seed_sql
+    assert seed_params["latest_span_slice_start"] == now
+    assert seed_params["latest_span_slice_end"] == now + timedelta(minutes=5)
+    probe_sql, probe_params, _ = reader.calls[3]
+    assert "FINAL" not in probe_sql
+    assert probe_params["candidate_span_ids"] == ("span-now",)
 
 
 def test_historical_fallback_rejects_future_skewed_physical_span(monkeypatch):
@@ -918,10 +1204,10 @@ def test_whole_window_and_forced_fallback_select_identical_order(monkeypatch):
                 # Canonical whole-window order: newest minute, then id.
                 yield ["span-b", "span-c", "span-a"]
                 return
-            if params["eval_slice_start"] == datetime(2026, 7, 30, 12, 1):
-                yield ["span-b", "span-c"]
-            elif params["eval_slice_start"] == datetime(2026, 7, 30, 12):
-                yield ["span-a"]
+            if "candidate_span_ids" in params:
+                yield list(params["candidate_span_ids"])
+                return
+            yield ["span-b", "span-c", "span-a"]
 
         def close(self):
             pass
@@ -943,9 +1229,16 @@ def test_whole_window_and_forced_fallback_select_identical_order(monkeypatch):
         whole_reader.calls[0][0].count("ORDER BY toStartOfMinute(start_time) DESC, id")
         == 1
     )
-    assert all(
-        "SELECT DISTINCT id" in sql and "ORDER BY id" in sql
-        for sql, _ in fallback_reader.calls[1:]
+    assert len(fallback_reader.calls) == 3
+    seed_sql, seed_params = fallback_reader.calls[1]
+    probe_sql, probe_params = fallback_reader.calls[2]
+    assert "FINAL" not in seed_sql and "FINAL" not in probe_sql
+    assert seed_params["latest_span_slice_start"] == datetime(2026, 7, 30, 12)
+    assert seed_params["latest_span_slice_end"] == datetime(2026, 7, 30, 12, 2)
+    assert probe_params["candidate_span_ids"] == (
+        "span-b",
+        "span-c",
+        "span-a",
     )
 
 
@@ -958,8 +1251,14 @@ def test_historical_span_slice_keysets_within_busy_minute(monkeypatch):
             self.calls.append((sql, dict(params)))
             if len(self.calls) == 1:
                 raise TimeoutError("wide query timeout")
-
-            if "span-b" in params.values():
+            if "candidate_span_ids" in params:
+                yield list(params["candidate_span_ids"])
+                return
+            if params["latest_span_limit"] == 3:
+                # The sentinel proves this five-minute candidate window is
+                # saturated. These provisional ids must be discarded.
+                yield ["coarse-a", "coarse-b", "coarse-c"]
+            elif params.get("latest_span_after_id") == "span-b":
                 yield ["span-c", "span-d"]
             else:
                 yield ["span-a", "span-b"]
@@ -999,12 +1298,19 @@ def test_historical_span_slice_keysets_within_busy_minute(monkeypatch):
     assert list(row_resolver.iter_desired_rows(task, batch_size=10)) == [
         ["span-a", "span-b", "span-c", "span-d"]
     ]
-    assert len(reader.calls) == 3
-    page_two_sql, page_two_params = reader.calls[2]
+    assert len(reader.calls) == 6
+    assert all(
+        "coarse" not in candidate
+        for _, params in reader.calls
+        for candidate in params.get("candidate_span_ids", ())
+    )
+    page_two_sql, page_two_params = reader.calls[4]
     assert "FINAL" not in page_two_sql
     assert "GROUP BY id" in page_two_sql
     assert "grouped_id > %(latest_span_after_id)s" in page_two_sql
     assert page_two_params["latest_span_after_id"] == "span-b"
+    assert reader.calls[3][1]["candidate_span_ids"] == ("span-a", "span-b")
+    assert reader.calls[5][1]["candidate_span_ids"] == ("span-c", "span-d")
 
 
 def test_whole_window_candidate_cap_with_enough_unique_ids_does_not_slice(
@@ -1059,7 +1365,7 @@ def test_historical_span_deadline_fails_explicitly_without_partial_rows(
             if self.calls == 1:
                 raise TimeoutError("DB::Exception private timeout")
             if self.calls == 2:
-                return
+                raise TimeoutError("dense five-minute window")
             raise AssertionError("deadline should stop before a third query")
             yield  # pragma: no cover - keep this a generator
 
@@ -1093,6 +1399,144 @@ def test_historical_span_deadline_fails_explicitly_without_partial_rows(
     assert "DB::Exception" not in str(exc_info.value)
     assert reader.calls == 2
     assert reader.closed is True
+
+
+def test_sparse_fourteen_day_fallback_widens_instead_of_querying_every_five_minutes():
+    class EmptyReader:
+        def __init__(self):
+            self.calls = []
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls.append((sql, dict(params), dict(settings)))
+            if len(self.calls) == 1:
+                raise TimeoutError("force bounded fallback")
+            return
+            yield  # pragma: no cover - keep this function a generator
+
+    reader = EmptyReader()
+    start = datetime(2026, 7, 17, tzinfo=UTC)
+    end = start + timedelta(days=14)
+
+    resolved = row_resolver._resolve_bounded_historical_span_ids(
+        reader,
+        sql="SELECT trace_id FROM spans",
+        params={"start_date": start, "end_date": end, "lim": 20},
+        project_id="11111111-1111-1111-1111-111111111111",
+        salt="sparse-window",
+        sampling_rate=100,
+        filters={"date_range": [start, end], "filters": []},
+        limit=10,
+        batch_size=25,
+        row_type=RowType.TRACES,
+    )
+
+    assert resolved == []
+    assert len(reader.calls) <= 26
+    seed_windows = [
+        params["latest_root_slice_end"] - params["latest_root_slice_start"]
+        for _, params, _ in reader.calls
+        if "latest_root_slice_start" in params
+    ]
+    assert seed_windows[0] == timedelta(minutes=5)
+    assert max(seed_windows) == timedelta(days=1)
+
+
+def test_fallback_enforces_a_hard_read_attempt_cap_before_the_wall_deadline(
+    monkeypatch,
+):
+    class DenseReader:
+        def __init__(self):
+            self.calls = 0
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("force bounded fallback")
+            if self.calls == 2:
+                yield [f"coarse-{index:03d}" for index in range(51)]
+                return
+            if self.calls == 3:
+                yield ["span-a"]
+                return
+            raise AssertionError("read cap must stop before a fourth query")
+
+    reader = DenseReader()
+    monkeypatch.setattr(row_resolver, "_EVAL_TASK_MAX_READ_ATTEMPTS", 3)
+    start = datetime(2026, 7, 30, tzinfo=UTC)
+    end = start + timedelta(days=1)
+
+    with pytest.raises(row_resolver.EvalTaskReadBudgetExceeded):
+        row_resolver._resolve_bounded_historical_span_ids(
+            reader,
+            sql="SELECT id FROM spans",
+            params={"start_date": start, "end_date": end, "id_limit": 20},
+            project_id="11111111-1111-1111-1111-111111111111",
+            salt="attempt-cap",
+            sampling_rate=100,
+            filters={
+                "date_range": [start, end],
+                "filters": [
+                    {
+                        "column_id": "final_status",
+                        "filter_config": {
+                            "col_type": "SPAN_ATTRIBUTE",
+                            "filter_type": "text",
+                            "filter_op": "equals",
+                            "filter_value": "approved",
+                        },
+                    }
+                ],
+            },
+            limit=10,
+            batch_size=25,
+            row_type=RowType.SPANS,
+        )
+
+    assert reader.calls == 3
+
+
+def test_unsupported_mutable_span_shape_fails_closed_after_whole_window_budget():
+    class FailingReader:
+        def __init__(self):
+            self.calls = 0
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls += 1
+            raise TimeoutError("whole-window budget")
+            yield  # pragma: no cover - keep this function a generator
+
+    reader = FailingReader()
+    start = datetime(2026, 7, 30, tzinfo=UTC)
+    end = start + timedelta(days=1)
+
+    with pytest.raises(row_resolver.EvalTaskReadBudgetExceeded):
+        row_resolver._resolve_bounded_historical_span_ids(
+            reader,
+            sql="SELECT id FROM spans",
+            params={"start_date": start, "end_date": end, "id_limit": 20},
+            project_id="11111111-1111-1111-1111-111111111111",
+            salt="unsupported-system-filter",
+            sampling_rate=100,
+            filters={
+                "date_range": [start, end],
+                "filters": [
+                    {
+                        "column_id": "status",
+                        "filter_config": {
+                            "col_type": "SYSTEM_METRIC",
+                            "filter_type": "text",
+                            "filter_op": "equals",
+                            "filter_value": "OK",
+                        },
+                    }
+                ],
+            },
+            limit=10,
+            batch_size=25,
+            row_type=RowType.SPANS,
+        )
+
+    assert reader.calls == 1
 
 
 def test_historical_span_programming_error_is_not_misreported_as_budget(

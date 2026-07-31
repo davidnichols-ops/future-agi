@@ -72,6 +72,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         observe_type: str = "trace",
         metric_id: str = "latency",
         single_metric: bool = False,
+        allow_attr_rollup: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id, **kwargs)
@@ -81,8 +82,18 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         self.observe_type = str(observe_type or "trace").strip().lower()
         self.metric_id = metric_id
         self.single_metric = bool(single_metric)
+        self.allow_attr_rollup = bool(allow_attr_rollup)
         self.start_date: datetime | None = None
         self.end_date: datetime | None = None
+        self.query_source = ""
+        self.attribute_filtered = False
+        # Raw graph queries can be split into adjacent outer-row windows only
+        # when every predicate is local to the row being aggregated. Trace
+        # any-span filters intentionally match a child anywhere in the full
+        # request window; replacing that window per chunk would change their
+        # membership semantics. The attribute builder sets this flag only
+        # after it has compiled the complete filter shape.
+        self.raw_segmentation_safe = False
         self.rollup_window_adjusted = False
         self.rollup_window_start: datetime | None = None
         self.rollup_window_end: datetime | None = None
@@ -107,11 +118,18 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         self.params["end_date"] = self.end_date
 
         rollup_filter = self._safe_attr_rollup_filter()
-        if rollup_filter is not None and self._attr_rollup_window_covered():
+        if (
+            self.allow_attr_rollup
+            and rollup_filter is not None
+            and self._attr_rollup_window_covered()
+        ):
+            self.query_source = "attribute_rollup"
             return self._build_attr_rollup_query(*rollup_filter)
 
         attribute_filters, remaining_filters = self._partition_attribute_filters()
         if attribute_filters:
+            self.query_source = "raw"
+            self.attribute_filtered = True
             return self._build_attribute_filtered_query(
                 ClickHouseFilterBuilder,
                 attribute_filters=attribute_filters,
@@ -138,8 +156,10 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         self.params.update(extra_params)
 
         if extra_where:
+            self.query_source = "raw"
             return self._build_raw_query(extra_where)
         else:
+            self.query_source = "aggregate_rollup"
             return self._build_agg_query()
 
     def _partition_attribute_filters(
@@ -340,6 +360,18 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             )
             outer_conditions.extend(root_conditions)
 
+        # Splitting a raw graph is exact only when the compiled predicate has
+        # no relation whose membership is scoped by the request's full time
+        # range. ``candidate_join`` is the filter-first relation for arbitrary
+        # trace attributes; other typed filters (for example model/end-user)
+        # can compile to SELECT membership subqueries in ``remaining_where``.
+        # Keep either shape as one full-window, hard-bounded statement. Span
+        # attributes and guaranteed-root trace attributes remain row-local and
+        # can be summed/weighted across non-overlapping chunks exactly.
+        self.raw_segmentation_safe = not candidate_join and (
+            "SELECT" not in remaining_where.upper()
+        )
+
         return self._build_raw_query(
             " AND ".join(f"({condition})" for condition in outer_conditions)
             if outer_conditions
@@ -536,6 +568,8 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             )
             extra_where, extra_params = filter_builder.translate(self.filters)
             self.params.update(extra_params)
+            self.query_source = "raw"
+            self.attribute_filtered = True
             return self._build_raw_query(extra_where)
 
         self.rollup_window_adjusted = (
