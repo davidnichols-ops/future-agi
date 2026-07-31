@@ -1,6 +1,6 @@
 """Unit guards for bounded eval-task span identity resolution."""
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +9,14 @@ from tracer.models.eval_task import RowType, RunType
 from tracer.selectors.eval_tasks import row_resolver
 
 pytestmark = pytest.mark.unit
+
+
+def test_unix_nanoseconds_preserves_microsecond_cursor_exactly():
+    value = datetime(2026, 7, 30, 12, 5, 6, 123456, tzinfo=UTC)
+    expected = 1_785_413_106_123_456_000
+
+    assert row_resolver._unix_nanoseconds(value) == expected
+    assert row_resolver._unix_nanoseconds(value.replace(tzinfo=None)) == expected
 
 
 def test_historical_span_query_samples_before_bounded_top_k():
@@ -62,6 +70,123 @@ def test_continuous_span_query_streams_without_full_window_sort():
     assert "lim" not in params
 
 
+@pytest.mark.parametrize(
+    ("row_type", "group_marker", "version_param"),
+    [
+        (RowType.SPANS, "GROUP BY id", "latest_span_changed_since_version"),
+        (
+            RowType.TRACES,
+            "LIMIT 1 BY grouped_trace_id",
+            "latest_root_changed_since_version",
+        ),
+    ],
+)
+def test_continuous_final_status_uses_no_final_latest_state_stream(
+    monkeypatch,
+    row_type,
+    group_marker,
+    version_param,
+):
+    class FakeReader:
+        def __init__(self):
+            self.calls = []
+
+        def stream_query(self, sql, params, *, batch_size, settings):
+            self.calls.append((sql, dict(params), dict(settings)))
+            yield ["changed-id"]
+
+        def close(self):
+            pass
+
+    reader = FakeReader()
+    monkeypatch.setattr(row_resolver, "get_reader", lambda: reader)
+    task_start = datetime(2026, 7, 30, 12)
+    cursor = datetime(2026, 7, 30, 12, 5)
+    task = SimpleNamespace(
+        project_id="11111111-1111-1111-1111-111111111111",
+        row_type=row_type,
+        id=f"continuous-{row_type}",
+        sampling_rate=100,
+        filters={
+            "date_range": [
+                "2026-07-30T12:00:00Z",
+                "2026-07-30T12:10:00Z",
+            ],
+            "filters": [
+                {
+                    "column_id": "final_status",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "approved",
+                    },
+                }
+            ],
+        },
+        run_type=RunType.CONTINUOUS,
+        spans_limit=None,
+        continuous_cursor=cursor,
+        start_time=task_start,
+        created_at=task_start,
+    )
+
+    assert list(row_resolver.iter_desired_rows(task)) == [["changed-id"]]
+    assert len(reader.calls) == 1
+    sql, params, settings = reader.calls[0]
+    compact_sql = " ".join(sql.split())
+    assert "FROM spans FINAL" not in compact_sql
+    assert group_marker in compact_sql
+    assert "final_status" in compact_sql
+    assert "_version >=" in compact_sql
+    assert params[version_param] == row_resolver._unix_nanoseconds(cursor)
+    # Candidate discovery uses the cursor, while latest-state classification
+    # retains the task's original start-time scope.
+    assert params["start_date"] == task_start
+    assert settings == row_resolver._EVAL_TASK_READ_SETTINGS
+    assert not any(key.endswith("_limit") for key in params)
+
+
+def test_continuous_mixed_filter_shape_keeps_established_streaming_path():
+    """The SOS scalar route must not approximate unsupported mixed semantics."""
+
+    sql, params = row_resolver._build_sample_query(
+        project_id="11111111-1111-1111-1111-111111111111",
+        row_type=RowType.SPANS,
+        salt="task-mixed",
+        sampling_rate=100,
+        filters={
+            "filters": [
+                {
+                    "column_id": "final_status",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "approved",
+                    },
+                },
+                {
+                    "column_id": "status",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "OK",
+                    },
+                },
+            ]
+        },
+        limit=None,
+        created_at_floor=datetime(2026, 7, 30, 12, 5),
+        continuous_start=datetime(2026, 7, 30, 12),
+    )
+
+    assert "latest_span_changed_since_version" not in params
+    assert "_version >=" not in sql
+    assert "ORDER BY" not in sql
+
+
 def test_trace_task_preview_filters_final_status_on_scoped_root_row():
     sql, params = row_resolver._build_sample_query(
         project_id="11111111-1111-1111-1111-111111111111",
@@ -90,15 +215,20 @@ def test_trace_task_preview_filters_final_status_on_scoped_root_row():
     compact_sql = " ".join(sql.split())
 
     assert "trace_id IN (SELECT trace_id FROM spans" not in compact_sql
-    assert "FROM spans FINAL" in compact_sql
-    assert "(parent_span_id IS NULL OR parent_span_id = '')" in compact_sql
+    assert "FINAL" not in compact_sql
+    assert "LIMIT 1 BY grouped_trace_id" in compact_sql
+    assert "latest_parent_span_id IS NULL" in compact_sql
+    assert compact_sql.index("LIMIT 1 BY grouped_trace_id") < compact_sql.rindex(
+        "latest_attr_exists_0"
+    )
     assert "mapContains(attrs_string, 'final_status')" in compact_sql
     assert "mapValues(attrs_string)" not in compact_sql
     assert "project_id = %(project_id)s" in compact_sql
-    assert "start_time >= %(start_date)s" in compact_sql
-    assert "start_time < %(end_date)s" in compact_sql
-    assert compact_sql.count("ORDER BY toStartOfMinute(start_time) DESC, trace_id") == 1
-    assert compact_sql.count("LIMIT %(id_limit)s") == 1
+    assert "start_time >= %(latest_root_slice_start)s" in compact_sql
+    assert "start_time < %(latest_root_slice_end)s" in compact_sql
+    assert "toStartOfMinute(latest_start_time) DESC" in compact_sql
+    assert compact_sql.count("LIMIT %(latest_root_limit)s") == 1
+    assert params["latest_root_limit"] == 200
     assert params["project_id"] == "11111111-1111-1111-1111-111111111111"
 
 
@@ -235,12 +365,12 @@ def test_historical_span_filter_falls_back_to_adjacent_newest_minutes(monkeypatc
             if len(self.calls) == 1:
                 raise TimeoutError("private ClickHouse timeout detail")
 
-            if params["eval_slice_start"] == datetime(2026, 7, 30, 12, 2):
+            if params["latest_span_slice_start"] == datetime(2026, 7, 30, 12, 2):
                 yield ["span-a", "span-a", "span-b"]
-            elif params["eval_slice_start"] == datetime(2026, 7, 30, 12, 1):
+            elif params["latest_span_slice_start"] == datetime(2026, 7, 30, 12, 1):
                 yield ["span-c"]
             else:  # pragma: no cover - makes an unexpected extra slice obvious
-                raise AssertionError(params["eval_slice_start"])
+                raise AssertionError(params["latest_span_slice_start"])
 
         def close(self):
             self.closed = True
@@ -279,7 +409,7 @@ def test_historical_span_filter_falls_back_to_adjacent_newest_minutes(monkeypatc
     ]
     assert len(reader.calls) == 3
     assert [
-        (call[1]["eval_slice_start"], call[1]["eval_slice_end"])
+        (call[1]["latest_span_slice_start"], call[1]["latest_span_slice_end"])
         for call in reader.calls[1:]
     ] == [
         (
@@ -297,9 +427,10 @@ def test_historical_span_filter_falls_back_to_adjacent_newest_minutes(monkeypatc
         for call in reader.calls
     )
     assert all(
-        "SELECT DISTINCT id" in call[0]
-        and "start_time >= %(eval_slice_start)s" in call[0]
-        and "start_time < %(eval_slice_end)s" in call[0]
+        "FINAL" not in call[0]
+        and "GROUP BY id" in call[0]
+        and "start_time >= %(latest_span_slice_start)s" in call[0]
+        and "start_time < %(latest_span_slice_end)s" in call[0]
         for call in reader.calls[1:]
     )
     assert all("prompt_slug" in sql for sql, _, _ in reader.calls)
@@ -317,7 +448,9 @@ def test_historical_trace_filter_falls_back_to_adjacent_newest_minutes(monkeypat
             if len(self.calls) == 1:
                 raise TimeoutError("private ClickHouse timeout detail")
 
-            if params["start_date"] == datetime(2026, 7, 30, 12, 2):
+            if "final_status" in sql:
+                yield list(params["candidate_trace_ids"])
+            elif params["start_date"] == datetime(2026, 7, 30, 12, 2):
                 yield ["trace-a", "trace-b"]
             elif params["start_date"] == datetime(2026, 7, 30, 12, 1):
                 yield ["trace-c"]
@@ -359,9 +492,10 @@ def test_historical_trace_filter_falls_back_to_adjacent_newest_minutes(monkeypat
         ["trace-a", "trace-b"],
         ["trace-c"],
     ]
-    assert len(reader.calls) == 3
+    assert len(reader.calls) == 5
     assert [
-        (call[1]["start_date"], call[1]["end_date"]) for call in reader.calls[1:]
+        (call[1]["start_date"], call[1]["end_date"])
+        for call in (reader.calls[1], reader.calls[3])
     ] == [
         (
             datetime(2026, 7, 30, 12, 2),
@@ -372,10 +506,10 @@ def test_historical_trace_filter_falls_back_to_adjacent_newest_minutes(monkeypat
             datetime(2026, 7, 30, 12, 2),
         ),
     ]
-    assert all(
-        "SELECT DISTINCT trace_id" in sql and "final_status" in sql
-        for sql, _, _ in reader.calls[1:]
-    )
+    seeds = (reader.calls[1], reader.calls[3])
+    probes = (reader.calls[2], reader.calls[4])
+    assert all("FINAL" not in sql and "final_status" not in sql for sql, _, _ in seeds)
+    assert all("FINAL" not in sql and "final_status" in sql for sql, _, _ in probes)
     assert reader.closed is True
 
 
@@ -445,13 +579,15 @@ def test_historical_trace_any_span_filter_verifies_original_window(
 
     assert len(reader.calls) == 3
     seed_sql, seed_params, seed_settings = reader.calls[1]
-    assert "SELECT DISTINCT trace_id" in seed_sql
+    assert "FINAL" not in seed_sql
+    assert "GROUP BY trace_id, id" in seed_sql
+    assert "LIMIT 1 BY grouped_trace_id" in seed_sql
     assert "synthetic_child_attribute" not in seed_sql
-    assert seed_params["candidate_start"] == expected_seed_start
-    assert seed_params["candidate_end"] == datetime.fromisoformat(
+    assert seed_params["latest_root_slice_start"] == expected_seed_start
+    assert seed_params["latest_root_slice_end"] == datetime.fromisoformat(
         date_range[1].replace("Z", "")
     )
-    assert seed_params["candidate_project_id"] == str(task.project_id)
+    assert seed_params["project_id"] == str(task.project_id)
     assert seed_settings["max_execution_time"] <= 0.75
     assert seed_settings["max_threads"] == 2
     assert seed_settings["max_result_rows"] == 50
@@ -459,12 +595,13 @@ def test_historical_trace_any_span_filter_verifies_original_window(
 
     probe_sql, probe_params, probe_settings = reader.calls[2]
     assert "synthetic_child_attribute" in probe_sql
-    assert probe_sql.count("trace_id IN %(candidate_trace_ids)s") >= 2
+    assert "FINAL" not in probe_sql
+    assert probe_sql.count("trace_id IN %(candidate_trace_ids)s") >= 1
     assert probe_params["candidate_trace_ids"] == ("trace-with-remote-child",)
-    assert probe_params["start_date"] == datetime.fromisoformat(
+    assert probe_params["candidate_start_date"] == datetime.fromisoformat(
         date_range[0].replace("Z", "")
     )
-    assert probe_params["end_date"] == datetime.fromisoformat(
+    assert probe_params["candidate_end_date"] == datetime.fromisoformat(
         date_range[1].replace("Z", "")
     )
     assert probe_settings["max_execution_time"] <= 0.75
@@ -529,7 +666,7 @@ def test_historical_trace_negative_membership_verifies_remote_child(monkeypatch)
     seed_sql, seed_params, _ = reader.calls[1]
     probe_sql, probe_params, _ = reader.calls[2]
     assert "forbidden-user" not in seed_sql
-    assert seed_params["candidate_start"] == datetime(2026, 5, 7, 23, 59)
+    assert seed_params["latest_root_slice_start"] == datetime(2026, 5, 7, 23, 59)
     assert "trace_id NOT IN (SELECT" in probe_sql
     assert "trace_id IN %(candidate_trace_ids)s" in probe_sql
     assert probe_params["candidate_trace_ids"] == (
@@ -864,9 +1001,10 @@ def test_historical_span_slice_keysets_within_busy_minute(monkeypatch):
     ]
     assert len(reader.calls) == 3
     page_two_sql, page_two_params = reader.calls[2]
-    assert "SELECT DISTINCT id" in page_two_sql
-    assert "id >" in page_two_sql
-    assert "span-b" in page_two_params.values()
+    assert "FINAL" not in page_two_sql
+    assert "GROUP BY id" in page_two_sql
+    assert "grouped_id > %(latest_span_after_id)s" in page_two_sql
+    assert page_two_params["latest_span_after_id"] == "span-b"
 
 
 def test_whole_window_candidate_cap_with_enough_unique_ids_does_not_slice(

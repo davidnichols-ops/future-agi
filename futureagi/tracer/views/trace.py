@@ -86,16 +86,16 @@ from tracer.services.clickhouse.query_builders import (
 )
 from tracer.services.clickhouse.query_builders.base import NIL_UUID
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.latest_attributes import (
+    is_latest_trace_probe_filter,
+)
 from tracer.services.clickhouse.query_service import (
     GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES,
     AnalyticsQueryService,
     QueryResult,
 )
-from tracer.services.clickhouse.read_budget import (
-    FUTURE_TAIL_PROBE_SETTINGS,
-    build_future_tail_probe,
-    is_read_budget_error,
-)
+from tracer.services.clickhouse.read_budget import is_read_budget_error
+from tracer.services.clickhouse.v2.span_reader import merge_span_attributes
 from tracer.services.clickhouse.v2.span_selectors import (
     flatten_span_attributes_into_entry,
     merge_content_rows,
@@ -131,10 +131,9 @@ _BOUNDED_ANALYTICS_SETTINGS = {
     "result_overflow_mode": "throw",
 }
 
-_FILTERED_TRACE_SCAN_BUDGET_MS = 900
-_FILTERED_TRACE_CANDIDATE_BATCH = 50
-_FILTERED_TRACE_SEED_SLICE = timedelta(minutes=5)
-_FILTERED_TRACE_MAX_FUTURE_SKEW = timedelta(minutes=5)
+_FILTERED_TRACE_CANDIDATE_BATCH = 100
+_FILTERED_TRACE_MAX_BATCHES = 24
+_FILTERED_TRACE_SCAN_BUDGET_MS = 1800
 # The seed stream establishes only order and identity; the point-scoped probe
 # below hydrates full light rows. Keeping this select inside ``proj_root_spans``
 # avoids falling back to a wide base-table scan for date-only/unfiltered pages.
@@ -259,7 +258,10 @@ def _candidate_seed_filters(filters):
             str(config.get("col_type") or config.get("colType") or "").strip().upper()
         )
         if normalized_col_type == "SPAN_ATTRIBUTE":
-            return column_id in GUARANTEED_ROOT_SPAN_ATTRIBUTE_TYPES
+            # Attribute Maps are never part of the projection-backed root
+            # seed. Guaranteed root attributes are verified by the same
+            # point-scoped scalar-latest probe as arbitrary attributes.
+            return False
         if normalized_col_type not in {"", "NORMAL", "SYSTEM_METRIC"}:
             return False
 
@@ -1820,9 +1822,18 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             return self._gm.success_response(configs)
 
-        except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(f"Failed to fetch evaluation names: {str(e)}")
+        except Exception as exc:
+            logger.exception(
+                "evaluation names read failed",
+                error_type=type(exc).__name__,
+            )
+            response = self._gm.bad_request(
+                "Evaluation names could not be loaded. Please try again."
+            )
+            response.data["code"] = (
+                "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+            )
+            return response
 
     @validated_request(query_serializer=TraceListQuerySerializer)
     @action(detail=False, methods=["get"])
@@ -3794,12 +3805,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         )
 
         # The exact root stream is still the source of truth for unfiltered
-        # and date-only pagination.  A whole-window root top-K is not viable
-        # for whale tenants, so those requests use the same adjacent,
-        # newest-first five-minute slices as generic span-attribute filters.
-        # This deliberately avoids using ``traces.created_at`` as a proxy for
-        # the root span's ``start_time``: ingestion delay can make those clocks
-        # differ and silently reorder or omit a trace.
+        # and date-only pagination. It is read as a projection-compatible,
+        # keyset-paginated skinny stream; ``traces.created_at`` is not used as
+        # a proxy for root ``start_time`` because ingestion delay can reorder
+        # or omit a trace.
         candidate_filter_scan_used = _requires_candidate_filter_scan(filters)
         root_attribute_slice_scan_used = _requires_root_attribute_slice_scan(filters)
         bounded_filter_scan_used = (
@@ -3810,69 +3819,56 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         )
         candidate_scan_complete = True
 
-        def _remaining_scan_ms(deadline):
-            return max(0, int((deadline - monotonic()) * 1000))
-
         def _execute_candidate_batched_page():
-            """Filter small, ordered trace-ID batches under one deadline.
+            """Read a projection-backed root stream, then point-probe it.
 
-            Adjacent five-minute root slices establish the exact global order
-            without asking ClickHouse to top-K the tenant's entire historical
-            root stream. Within a dense hour, increasing prefix reads expose
-            each next candidate batch without OFFSET instability. Each filtered
-            probe then carries at most 50 new trace IDs in both the outer root
-            query and every any-span membership subquery.
-
-            All seed and probe reads share one 900 ms wall-clock deadline. We
-            only stop successfully after finding the complete requested prefix
-            or exhausting every adjacent slice in the requested window;
-            otherwise callers receive an explicit incomplete page instead of a
-            false empty result.
+            The root query contains only ``trace_id`` and ``start_time`` and
+            advances with a stable keyset. Attribute Maps are never present in
+            this stage. A second, point-scoped query resolves only the requested
+            Map element with scalar ``argMax`` states, and a third query
+            hydrates only matched roots. No expected timeout controls the scan.
             """
 
-            # Populate the main builder's time bounds for count/content helpers;
-            # this only compiles SQL and does not touch ClickHouse.
             builder.build(since=None)
-
             deadline = monotonic() + (_FILTERED_TRACE_SCAN_BUDGET_MS / 1000)
             prefix_needed = (page_number * page_size) + 2 * page_size
-            seed_filters_without_time = [
+            matched_rows: list[dict] = []
+            matched_ids: set[str] = set()
+            seen_candidate_ids: set[str] = set()
+            last_result = QueryResult([], 0, "clickhouse", 0)
+            scan_complete = False
+            before_start_time = None
+            before_trace_id = None
+            seed_filters = _candidate_seed_filters(filters)
+            probe_filters = [
                 item
-                for item in _candidate_seed_filters(filters)
+                for item in filters
                 if (item.get("column_id") or item.get("columnId"))
                 not in {"created_at", "start_time"}
             ]
-            matched_rows = []
-            matched_ids = set()
-            seen_candidate_ids = set()
-            last_result = None
-            scan_complete = False
-            requested_start = builder.start_date
-            requested_end = builder.end_date
-            if requested_start is None or requested_end is None:
-                return QueryResult([], 0, "clickhouse", 0), False
-            # The observe toolbar commonly sends the end of the user's local
-            # day, which can be hours ahead of UTC "now". Starting the fallback
-            # at that future boundary burns one empty five-minute query per
-            # slice and can exhaust the shared deadline before reaching any
-            # ingested data. Keep the caller's requested range for the healthy
-            # whole-window attempt, but clamp the adjacent fallback to a small
-            # clock-skew allowance beyond now.
-            scan_now = timezone.now()
-            if timezone.is_naive(requested_end):
-                scan_now = scan_now.replace(tzinfo=None)
-            slice_end = min(
-                requested_end,
-                scan_now + _FILTERED_TRACE_MAX_FUTURE_SKEW,
+            # The non-FINAL seed establishes only candidate order. Every
+            # non-time predicate retained in that seed is revalidated against
+            # scalar latest state below; this is required for mutable session
+            # and root metrics. Unsupported mixed shapes fail closed rather
+            # than issuing the old candidate ``FINAL`` query (Code 241 family).
+            scalar_probe_supported = all(
+                is_latest_trace_probe_filter(item) for item in probe_filters
             )
-            batch_index = 0
+            if not scalar_probe_supported:
+                logger.warning(
+                    "unsupported trace filter shape skipped unsafe latest-state read",
+                    project_id=str(project_id) if project_id else None,
+                )
+                return QueryResult([], 0, "clickhouse", 0), False
+            candidate_batch = _FILTERED_TRACE_CANDIDATE_BATCH
 
-            def _probe_candidate_ids(candidate_ids):
+            def _probe_and_hydrate(candidate_ids):
                 nonlocal last_result
-                remaining_ms = _remaining_scan_ms(deadline)
-                if not candidate_ids or remaining_ms < 25:
+                if not candidate_ids:
+                    return True
+                remaining_ms = max(0, int((deadline - monotonic()) * 1000))
+                if remaining_ms < 25:
                     return False
-
                 filtered_builder = BuilderCls(
                     project_id=None if org_scope else str(project_id),
                     project_ids=(
@@ -3881,186 +3877,109 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     filters=filters,
                     page_number=0,
                     page_size=len(candidate_ids),
-                    candidate_trace_ids=candidate_ids,
                 )
-                filtered_query, filtered_params = filtered_builder.build(since=None)
-                try:
-                    filtered_result = analytics.execute_ch_query(
-                        filtered_query,
-                        filtered_params,
-                        timeout_ms=min(750, remaining_ms),
-                        settings=_TRACE_CANDIDATE_READ_SETTINGS,
+                match_query, match_params = (
+                    filtered_builder.build_latest_filter_match_query(
+                        candidate_ids,
+                        filters=probe_filters,
                     )
-                except Exception as exc:
-                    if not is_read_budget_error(exc):
-                        raise
-                    logger.warning(
-                        "bounded trace filter probe exceeded read budget",
-                        project_id=str(project_id) if project_id else None,
-                        error=str(exc)[:200],
-                    )
-                    return False
-
-                last_result = filtered_result
-                # Re-apply candidate order explicitly. It remains the source
-                # of truth even if ClickHouse parallelizes the point-filtered
-                # probe or returns duplicate span versions.
-                filtered_by_id = {}
-                for row in filtered_result.data:
-                    trace_id = str(row.get("trace_id", ""))
-                    if trace_id and trace_id not in filtered_by_id:
-                        filtered_by_id[trace_id] = row
-                for trace_id in candidate_ids:
-                    if trace_id in matched_ids or trace_id not in filtered_by_id:
-                        continue
-                    matched_ids.add(trace_id)
-                    matched_rows.append(filtered_by_id[trace_id])
-                return True
-
-            # Preserve exact behavior for a healthy low-volume project whose
-            # newest match is old: give the original whole-window root top-K a
-            # small sub-budget. On a whale tenant this attempt is killed before
-            # its historical scan reaches the 1 GiB request cap, leaving most
-            # of the shared deadline for adjacent five-minute slices.
-            fast_remaining_ms = _remaining_scan_ms(deadline)
-            fast_timeout_ms = min(250, max(fast_remaining_ms - 25, 0))
-            # A guaranteed root attribute is direct (no any-span membership),
-            # but it still scans a raw Map. Never spend even the fast
-            # sub-budget on the caller's whole window; start with the newest
-            # bounded root slice and keep the attribute in that seed.
-            if not root_attribute_slice_scan_used and fast_timeout_ms >= 25:
-                fast_builder = BuilderCls(
-                    project_id=None if org_scope else str(project_id),
-                    project_ids=(
-                        [str(p) for p in org_project_ids] if org_scope else None
-                    ),
-                    filters=_candidate_seed_filters(filters),
-                    page_number=0,
-                    page_size=_FILTERED_TRACE_CANDIDATE_BATCH // 2,
-                    columns=_TRACE_CANDIDATE_SEED_COLUMNS,
                 )
-                fast_query, fast_params = fast_builder.build(since=None)
-                try:
-                    fast_result = analytics.execute_ch_query(
-                        fast_query,
-                        fast_params,
-                        timeout_ms=fast_timeout_ms,
-                        settings=_TRACE_CANDIDATE_READ_SETTINGS,
-                    )
-                except Exception as exc:
-                    if not is_read_budget_error(exc):
-                        raise
-                    logger.info(
-                        "whole-window trace seed exceeded sub-budget",
-                        project_id=str(project_id) if project_id else None,
-                    )
-                else:
-                    last_result = fast_result
-                    fast_candidate_ids = []
-                    for row in fast_result.data:
-                        trace_id = str(row.get("trace_id", ""))
-                        if not trace_id or trace_id in seen_candidate_ids:
-                            continue
-                        seen_candidate_ids.add(trace_id)
-                        fast_candidate_ids.append(trace_id)
+                matched_candidate_ids = list(candidate_ids)
+                if match_query:
+                    remaining_ms = max(0, int((deadline - monotonic()) * 1000))
+                    if remaining_ms < 25:
+                        return False
+                    try:
+                        match_result = analytics.execute_ch_query(
+                            match_query,
+                            match_params,
+                            timeout_ms=min(750, remaining_ms),
+                            settings={
+                                **_TRACE_CANDIDATE_READ_SETTINGS,
+                                "max_result_rows": len(candidate_ids),
+                            },
+                        )
+                    except Exception as exc:
+                        if not is_read_budget_error(exc):
+                            raise
+                        logger.warning(
+                            "point-scoped trace attribute probe exceeded read budget",
+                            project_id=str(project_id) if project_id else None,
+                            error_type=type(exc).__name__,
+                        )
+                        return False
+                    matched_set = {
+                        str(row.get("trace_id", ""))
+                        for row in match_result.data
+                        if row.get("trace_id")
+                    }
+                    matched_candidate_ids = [
+                        trace_id
+                        for trace_id in candidate_ids
+                        if trace_id in matched_set
+                    ]
+                if not matched_candidate_ids:
+                    return True
 
-                    fast_probe_complete = _probe_candidate_ids(fast_candidate_ids)
-                    fast_stream_exhausted = len(fast_result.data) < int(
-                        fast_params["limit"]
-                    )
-                    if fast_stream_exhausted and not fast_candidate_ids:
-                        fast_result.data = []
-                        return fast_result, True
-                    if fast_probe_complete and (
-                        len(matched_rows) >= prefix_needed or fast_stream_exhausted
-                    ):
-                        # ClickHouse is free to return the point-filtered probe
-                        # in a different order. The root candidate stream is
-                        # authoritative for deterministic pagination.
-                        last_result.data = list(matched_rows)
-                        return last_result, True
-                    if not fast_probe_complete and fast_candidate_ids:
-                        last_result.data = list(matched_rows)
-                        return last_result, False
-
-                    # A saturated whole-window seed still proves every match
-                    # found within its ordered root prefix. Keep that evidence
-                    # while adjacent slices resume at the newest boundary.
-                    # ``seen_candidate_ids`` removes overlap, and an increasing
-                    # within-slice prefix exposes the first unseen root without
-                    # OFFSET instability.
-
-            if slice_end < requested_end:
-                remaining_ms = _remaining_scan_ms(deadline)
+                remaining_ms = max(0, int((deadline - monotonic()) * 1000))
                 if remaining_ms < 25:
-                    return QueryResult([], 0, "clickhouse", 0), False
-                tail_query, tail_params = build_future_tail_probe(
-                    start=slice_end,
-                    end=requested_end,
-                    root_only=True,
-                    project_id=str(project_id) if project_id else None,
-                    project_ids=org_project_ids if org_scope else None,
+                    return False
+                hydrate_query, hydrate_params = (
+                    filtered_builder.build_candidate_hydration_query(
+                        matched_candidate_ids
+                    )
                 )
                 try:
-                    tail_result = analytics.execute_ch_query(
-                        tail_query,
-                        tail_params,
-                        timeout_ms=min(100, remaining_ms),
-                        settings=FUTURE_TAIL_PROBE_SETTINGS,
+                    hydrated = analytics.execute_ch_query(
+                        hydrate_query,
+                        hydrate_params,
+                        timeout_ms=min(750, remaining_ms),
+                        settings={
+                            **_TRACE_CANDIDATE_READ_SETTINGS,
+                            "max_result_rows": len(matched_candidate_ids),
+                        },
                     )
                 except Exception as exc:
+                    if not is_read_budget_error(exc):
+                        raise
                     logger.warning(
-                        "trace future-tail proof failed; returning degraded",
+                        "point-scoped trace hydration exceeded read budget",
                         project_id=str(project_id) if project_id else None,
                         error_type=type(exc).__name__,
                     )
-                    return QueryResult([], 0, "clickhouse", 0), False
-                tail_data = getattr(tail_result, "data", None)
-                if not isinstance(tail_data, list) or tail_data:
-                    return QueryResult([], 0, "clickhouse", 0), False
+                    return False
+                last_result = hydrated
+                hydrated_by_id = {
+                    str(row.get("trace_id", "")): row
+                    for row in hydrated.data
+                    if row.get("trace_id")
+                }
+                for trace_id in matched_candidate_ids:
+                    if trace_id in matched_ids or trace_id not in hydrated_by_id:
+                        continue
+                    matched_ids.add(trace_id)
+                    matched_rows.append(hydrated_by_id[trace_id])
+                return True
 
-            while len(matched_rows) < prefix_needed:
-                remaining_ms = _remaining_scan_ms(deadline)
+            for _ in range(_FILTERED_TRACE_MAX_BATCHES):
+                remaining_ms = max(0, int((deadline - monotonic()) * 1000))
                 if remaining_ms < 25:
                     break
-                if slice_end <= requested_start:
-                    scan_complete = True
-                    break
-
-                slice_start = max(
-                    requested_start,
-                    slice_end - _FILTERED_TRACE_SEED_SLICE,
-                )
-                seed_filters = [
-                    *seed_filters_without_time,
-                    {
-                        "column_id": "start_time",
-                        "filter_config": {
-                            "col_type": "SYSTEM_METRIC",
-                            "filter_type": "datetime",
-                            "filter_op": "between",
-                            "filter_value": [slice_start, slice_end],
-                        },
-                    },
-                ]
-
-                # SpanList/TraceList builders fetch a 2x prefix. page_size=25
-                # and page_number=0,2,4,… therefore expose 50 new ordered root
-                # candidates per iteration without OFFSET instability. The
-                # bounded time filter makes every prefix local to one adjacent
-                # interval; once a short result proves that slice exhausted,
-                # the scan advances to the immediately preceding slice.
                 candidate_builder = BuilderCls(
                     project_id=None if org_scope else str(project_id),
                     project_ids=(
                         [str(p) for p in org_project_ids] if org_scope else None
                     ),
                     filters=seed_filters,
-                    page_number=batch_index * 2,
-                    page_size=_FILTERED_TRACE_CANDIDATE_BATCH // 2,
+                    page_number=0,
+                    page_size=candidate_batch // 2,
                     columns=_TRACE_CANDIDATE_SEED_COLUMNS,
                 )
-                candidate_query, candidate_params = candidate_builder.build(since=None)
+                candidate_query, candidate_params = candidate_builder.build(
+                    since=None,
+                    before_start_time=before_start_time,
+                    before_trace_id=before_trace_id,
+                )
                 try:
                     candidate_result = analytics.execute_ch_query(
                         candidate_query,
@@ -4072,48 +3991,47 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     if not is_read_budget_error(exc):
                         raise
                     logger.warning(
-                        "trace candidate scan exceeded read budget",
+                        "projection-backed trace seed exceeded read budget",
                         project_id=str(project_id) if project_id else None,
-                        error=str(exc)[:200],
+                        error_type=type(exc).__name__,
                     )
                     break
 
                 last_result = candidate_result
-                raw_candidate_count = len(candidate_result.data)
-                requested_candidate_prefix = int(candidate_params["limit"])
+                raw_rows = list(candidate_result.data)
                 candidate_ids = []
-                for row in candidate_result.data:
+                for row in raw_rows:
                     trace_id = str(row.get("trace_id", ""))
                     if not trace_id or trace_id in seen_candidate_ids:
                         continue
                     seen_candidate_ids.add(trace_id)
                     candidate_ids.append(trace_id)
 
-                if candidate_ids and not _probe_candidate_ids(candidate_ids):
+                if not _probe_and_hydrate(candidate_ids):
                     break
+                if len(matched_rows) >= prefix_needed:
+                    scan_complete = True
+                    break
+                if len(raw_rows) < int(candidate_params["limit"]):
+                    scan_complete = True
+                    break
+                last_seed_row = raw_rows[-1]
+                next_start_time = last_seed_row.get("start_time")
+                next_trace_id = str(last_seed_row.get("trace_id", ""))
+                if next_start_time is None or not next_trace_id:
+                    break
+                next_keyset = (next_start_time, next_trace_id)
+                if next_keyset == (before_start_time, before_trace_id):
+                    break
+                before_start_time, before_trace_id = next_keyset
 
-                if raw_candidate_count < requested_candidate_prefix:
-                    slice_end = slice_start
-                    batch_index = 0
-                else:
-                    batch_index += 1
-
-            if len(matched_rows) >= prefix_needed:
-                scan_complete = True
-            if last_result is None:
-                # A local scheduling shortfall must fail closed. Falling back
-                # to the original full-window filtered query here would undo
-                # the scan bound at exactly the point the deadline is spent.
-                last_result = QueryResult([], 0, "clickhouse", 0)
             last_result.data = matched_rows
             return last_result, scan_complete
 
-        # Generic span attributes and legacy string filters use bounded
-        # candidate batches. Guaranteed root attributes stay direct on the
-        # root row but use adjacent time slices, without an any-span membership
-        # subquery. Date-only/unfiltered pages use those same exact root slices;
-        # other indexed root filters retain the single top-K query. Every path
-        # shares hard resource settings and never exposes a ClickHouse exception.
+        # Attribute and date-only pages use projection-backed root keysets,
+        # scalar latest-state probes, and page-only hydration. Other indexed
+        # root filters retain the single top-K query. Every path shares hard
+        # resource settings and never exposes a ClickHouse exception.
         try:
             if candidate_scan_used:
                 result, candidate_scan_complete = _execute_candidate_batched_page()
@@ -4451,23 +4369,15 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     )
                     for attr_row in attr_result.data:
                         tid = str(attr_row.get("trace_id", ""))
-                        raw = attr_row.get("attributes_extra", "{}")
-                        try:
-                            attrs = (
-                                json.loads(raw) if isinstance(raw, str) else (raw or {})
-                            )
-                        except (json.JSONDecodeError, TypeError):
-                            attrs = {}
-                        # Fallback: merge from typed Map columns when raw is empty
-                        if not attrs:
-                            str_map = attr_row.get("attrs_string") or {}
-                            num_map = attr_row.get("attrs_number") or {}
-                            if isinstance(str_map, dict):
-                                attrs.update(str_map)
-                            if isinstance(num_map, dict):
-                                for k, v in num_map.items():
-                                    if k not in attrs:
-                                        attrs[k] = v
+                        # Use the same precedence as span detail everywhere:
+                        # typed string/number/bool Maps are merged first and
+                        # overflow JSON explicitly wins on duplicate keys.
+                        attrs = merge_span_attributes(
+                            attr_row.get("attrs_string"),
+                            attr_row.get("attrs_number"),
+                            attr_row.get("attrs_bool"),
+                            attr_row.get("attributes_extra", "{}"),
+                        )
                         if tid not in aggregated_attrs:
                             aggregated_attrs[tid] = {}
                         for key, value in attrs.items():

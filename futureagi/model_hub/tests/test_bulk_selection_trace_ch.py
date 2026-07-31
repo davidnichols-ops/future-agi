@@ -219,7 +219,9 @@ def test_trace_candidate_probe_uses_latest_state_and_rejects_stale_match(
     assert probe["params"]["candidate_trace_ids"] == ("stale", "live")
 
 
-def test_trace_root_attribute_filter_runs_directly_in_bounded_slice(monkeypatch):
+def test_trace_root_attribute_filter_uses_scalar_seed_and_full_window_probe(
+    monkeypatch,
+):
     calls = []
     now = datetime.utcnow().replace(microsecond=0)
     filters = [
@@ -257,10 +259,12 @@ def test_trace_root_attribute_filter_runs_directly_in_bounded_slice(monkeypatch)
     )
     assert res.ids == ["matched"]
     assert res.truncated is False
-    assert len(calls) == 2
-    assert "max(start_time) AS bulk_order_start_time" in calls[1]["query"]
-    assert "final_status" in calls[1]["query"]
-    assert "SELECT DISTINCT trace_id" not in calls[1]["query"]
+    assert len(calls) == 3
+    assert all("FINAL" not in call["query"] for call in calls)
+    assert "final_status" not in calls[1]["query"]
+    assert "LIMIT 1 BY grouped_trace_id" in calls[1]["query"]
+    assert "final_status" in calls[2]["query"]
+    assert calls[2]["params"]["candidate_trace_ids"] == ("matched",)
 
 
 @pytest.mark.django_db

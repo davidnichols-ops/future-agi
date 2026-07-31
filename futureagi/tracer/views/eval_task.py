@@ -1,5 +1,4 @@
 import json
-import traceback
 import uuid as uuid_module
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -1369,9 +1368,16 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 {"message": "Eval tasks marked as deleted successfully"}
             )
 
-        except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(str(e))
+        except Exception as exc:
+            logger.exception(
+                "eval_tasks_delete_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return _eval_task_query_error_response(
+                exc,
+                "Evaluation tasks could not be deleted. Please try again.",
+            )
 
     @validated_request(
         request_serializer=EmptyRequestSerializer,
@@ -1410,9 +1416,16 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 {"message": "Eval task paused successfully"}
             )
 
-        except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(str(e))
+        except Exception as exc:
+            logger.exception(
+                "eval_task_pause_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return _eval_task_query_error_response(
+                exc,
+                "Evaluation task could not be paused. Please try again.",
+            )
 
     @validated_request(
         request_serializer=EmptyRequestSerializer,
@@ -1450,9 +1463,16 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 {"message": "Eval task unpaused successfully"}
             )
 
-        except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(str(e))
+        except Exception as exc:
+            logger.exception(
+                "eval_task_unpause_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return _eval_task_query_error_response(
+                exc,
+                "Evaluation task could not be resumed. Please try again.",
+            )
 
     @action(detail=False, methods=["get"], pagination_class=None)
     @validated_request(query_serializer=EvalTaskListWithProjectNameQuerySerializer)

@@ -159,7 +159,9 @@ def test_adjacent_slices_preserve_exact_newest_first_prefix():
     first_query, first_params, first_timeout, first_settings = analytics.calls[0]
     second_query, second_params, second_timeout, _ = analytics.calls[1]
     assert first_query == second_query
-    assert "FROM spans FINAL" in first_query
+    assert "FROM spans FINAL" not in first_query
+    assert "argMax(" in first_query
+    assert "latest_is_deleted = 0" in first_query
     assert first_params["slice_end"] == end
     assert first_params["slice_start"] == end - timedelta(minutes=1)
     assert second_params["slice_end"] == first_params["slice_start"]
@@ -196,7 +198,7 @@ def test_unfiltered_span_prefix_uses_adjacent_low_memory_slices():
     assert len(analytics.calls) == 2
     for query, params, timeout_ms, settings in analytics.calls:
         assert "FROM spans FINAL" not in query
-        assert "ORDER BY start_time DESC, id DESC" in query
+        assert "ORDER BY latest_start_time DESC, grouped_id DESC" in query
         assert "start_time >= %(slice_start)s" in query
         assert "start_time < %(slice_end)s" in query
         assert params["limit"] > 0
@@ -276,7 +278,7 @@ def test_empty_result_is_conclusive_only_after_every_slice_completes():
     assert full_window is True
 
 
-def test_wide_low_volume_window_finds_old_match_with_exact_fast_attempt():
+def test_wide_low_volume_window_uses_only_adjacent_scalar_slices():
     end = datetime(2026, 7, 30, 12)
     start = end - timedelta(days=1)
     analytics = _Analytics([[{"id": "match-from-yesterday"}]])
@@ -290,16 +292,17 @@ def test_wide_low_volume_window_finds_old_match_with_exact_fast_attempt():
     assert [row["id"] for row in result.data] == ["match-from-yesterday"]
     assert complete is True
     assert full_window is True
-    assert len(analytics.calls) == 1
+    assert len(analytics.calls) > 1
     _, params, timeout_ms, settings = analytics.calls[0]
-    assert params["slice_start"] == start
+    assert params["slice_start"] == end - timedelta(minutes=1)
     assert params["slice_end"] == end
-    assert timeout_ms == 250
+    assert 0 < timeout_ms <= 750
+    assert all("FINAL" not in query for query, _, _, _ in analytics.calls)
     assert settings["timeout_overflow_mode"] == "throw"
     assert settings["read_overflow_mode"] == "throw"
 
 
-def test_wide_window_fast_attempt_timeout_falls_back_under_shared_deadline():
+def test_slice_timeout_stops_without_retrying_as_control_flow():
     end = datetime(2026, 7, 30, 12)
     start = end - timedelta(hours=1)
     analytics = _FastAttemptThenSlicesAnalytics(
@@ -317,35 +320,21 @@ def test_wide_window_fast_attempt_timeout_falls_back_under_shared_deadline():
         clock=lambda: 0,
     )
 
-    assert [row["id"] for row in result.data] == ["newest-match"]
+    assert result.data == []
     assert complete is False
     assert full_window is False
-    assert len(analytics.calls) == 3
-    _, fast_params, fast_timeout, _ = analytics.calls[0]
-    _, first_slice_params, first_slice_timeout, _ = analytics.calls[1]
-    _, second_slice_params, second_slice_timeout, _ = analytics.calls[2]
-    assert fast_params["slice_start"] == start
-    assert fast_params["slice_end"] == end
+    assert len(analytics.calls) == 1
+    _, first_slice_params, first_slice_timeout, _ = analytics.calls[0]
     assert first_slice_params["slice_start"] == end - timedelta(minutes=1)
     assert first_slice_params["slice_end"] == end
-    assert second_slice_params["slice_start"] == end - timedelta(minutes=3)
-    assert second_slice_params["slice_end"] == end - timedelta(minutes=1)
-    assert fast_timeout == 250
     assert 0 < first_slice_timeout <= 750
-    assert 0 < second_slice_timeout <= first_slice_timeout
 
 
 def test_empty_future_tail_is_proven_before_bounded_span_slices():
     now = datetime(2026, 7, 31, 2, 50)
     end = now + timedelta(hours=4)
     start = now - timedelta(hours=1)
-    analytics = _FastAttemptThenSlicesAnalytics(
-        ServerException(
-            "whole window exceeded sub-budget",
-            code=ErrorCodes.TIMEOUT_EXCEEDED,
-        ),
-        [[], []],
-    )
+    analytics = _Analytics([[], []])
 
     with mock.patch("tracer.views.observation_span.timezone.now", return_value=now):
         result, complete, full_window = _execute_bounded_span_filter_prefix(
@@ -358,11 +347,9 @@ def test_empty_future_tail_is_proven_before_bounded_span_slices():
     assert result.data == []
     assert complete is False
     assert full_window is False
-    assert len(analytics.calls) == 3
-    _, fast_params, _, _ = analytics.calls[0]
-    tail_query, tail_params, tail_timeout, tail_settings = analytics.calls[1]
-    _, first_slice_params, _, _ = analytics.calls[2]
-    assert fast_params["slice_end"] == end
+    assert len(analytics.calls) == 2
+    tail_query, tail_params, tail_timeout, tail_settings = analytics.calls[0]
+    _, first_slice_params, _, _ = analytics.calls[1]
     assert "FROM spans" in tail_query
     assert "FINAL" not in tail_query
     assert "parent_span_id" not in tail_query
@@ -379,13 +366,7 @@ def test_future_skewed_span_fails_closed_without_using_partial_fallback():
     now = datetime(2026, 7, 31, 2, 50)
     end = now + timedelta(hours=4)
     start = now - timedelta(hours=1)
-    analytics = _FastAttemptThenSlicesAnalytics(
-        ServerException(
-            "whole window exceeded sub-budget",
-            code=ErrorCodes.TIMEOUT_EXCEEDED,
-        ),
-        [[{"future_tail_row": 1}], [{"id": "must-not-be-used"}]],
-    )
+    analytics = _Analytics([[{"future_tail_row": 1}], [{"id": "must-not-be-used"}]])
 
     with mock.patch("tracer.views.observation_span.timezone.now", return_value=now):
         result, complete, full_window = _execute_bounded_span_filter_prefix(
@@ -398,7 +379,7 @@ def test_future_skewed_span_fails_closed_without_using_partial_fallback():
     assert result.data == []
     assert complete is False
     assert full_window is False
-    assert len(analytics.calls) == 2
+    assert len(analytics.calls) == 1
 
 
 def test_completed_sparse_slices_expand_without_gaps_to_find_an_old_match():
@@ -427,7 +408,7 @@ def test_completed_sparse_slices_expand_without_gaps_to_find_an_old_match():
     ]
 
 
-def test_failed_wide_slice_retries_same_cursor_at_minimum_width():
+def test_failed_wide_slice_stops_without_narrow_retry():
     end = datetime(2026, 7, 30, 12)
     start = end - timedelta(minutes=4)
     analytics = _ScriptedAnalytics(
@@ -450,16 +431,14 @@ def test_failed_wide_slice_retries_same_cursor_at_minimum_width():
     )
 
     assert result.data == []
-    assert complete is True
-    assert full_window is True
+    assert complete is False
+    assert full_window is False
     assert [
         (params["slice_start"], params["slice_end"])
         for _, params, _, _ in analytics.calls
     ] == [
         (end - timedelta(minutes=1), end),
         (end - timedelta(minutes=3), end - timedelta(minutes=1)),
-        (end - timedelta(minutes=2), end - timedelta(minutes=1)),
-        (end - timedelta(minutes=4), end - timedelta(minutes=2)),
     ]
 
 
@@ -493,12 +472,12 @@ def test_shared_deadline_returns_an_explicit_incomplete_exact_prefix():
     result, complete, full_window = _execute_bounded_span_filter_prefix(
         _builder(start, end),
         analytics,
-        clock=_Clock(0, 0.2, 0.91, 0.92),
+        clock=_Clock(0, 0.2, 1.81, 1.82),
     )
 
     assert [row["id"] for row in result.data] == ["newest-match"]
     assert len(analytics.calls) == 1
-    assert analytics.calls[0][2] < 750
+    assert analytics.calls[0][2] <= 750
     assert complete is False
     assert full_window is False
 
@@ -670,7 +649,7 @@ def test_deep_page_deadline_returns_exact_incomplete_prefix():
     result, complete, full_window = _execute_bounded_span_filter_prefix(
         _builder(start, end, page_number=3, page_size=500),
         analytics,
-        clock=_Clock(0, 0, 0.901, 0.902),
+        clock=_Clock(0, 0, 1.801, 1.802),
     )
 
     assert result.data == first_rows

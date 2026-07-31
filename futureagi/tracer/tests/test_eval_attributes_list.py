@@ -433,6 +433,12 @@ class TestEvalMappingCardinalityClickHouseOnly:
         assert result == (3, 2)
         assert "FROM spans" in captured["query"]
         assert "Trace.objects" not in captured["query"]
+        assert "LIMIT %(input_sample_rows)s" in captured["query"]
+        assert captured["query"].index("LIMIT %(input_sample_rows)s") < captured[
+            "query"
+        ].index("GROUP BY trace_id")
+        assert captured["params"]["input_sample_rows"] == 10_000
+        assert captured["params"]["sample_size"] == 100
         assert captured["timeout_ms"] == 750
         assert captured["settings"]["max_threads"] == 2
         assert captured["settings"]["max_memory_usage"] == 268_435_456

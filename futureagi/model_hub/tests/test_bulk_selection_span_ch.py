@@ -211,6 +211,78 @@ def test_cap_plus_one_truncation(monkeypatch):
     assert res.total_matching == 3
 
 
+def test_final_status_uses_scalar_latest_id_page_with_prelimit_exclusion(
+    monkeypatch,
+):
+    now = datetime.utcnow().replace(microsecond=0)
+    capture = {}
+
+    class _ScalarBuilder:
+        def __init__(self, *, filters, **kwargs):
+            self.filters = filters
+            capture["filters"] = filters
+
+        def supports_latest_attribute_page(self):
+            return True
+
+        def build_latest_attribute_id_page(self, **kwargs):
+            capture["scalar_kwargs"] = kwargs
+            return "SELECT id FROM spans GROUP BY id", {
+                "skip": tuple(sorted(kwargs["exclude_span_ids"]))
+            }
+
+        def build_id_query(self, **kwargs):  # pragma: no cover - safety tripwire
+            raise AssertionError("final_status must not use the FINAL id builder")
+
+    class _Analytics:
+        def execute_ch_query(self, query, params, timeout_ms=None, settings=None):
+            capture["query"] = query
+            capture["params"] = params
+            return _FakeResult([{"id": "matched"}])
+
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+        lambda name: _ScalarBuilder,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+        _Analytics,
+    )
+    filters = [
+        {
+            "column_id": "start_time",
+            "filter_config": {
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [now - timedelta(minutes=1), now],
+            },
+        },
+        {
+            "column_id": "final_status",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "approved",
+            },
+        },
+    ]
+
+    result = _resolve_span_ids_clickhouse(
+        project_id="p1",
+        filters=filters,
+        exclude_ids={"excluded"},
+        cap=2,
+        annotation_label_ids=[],
+    )
+
+    assert result.ids == ["matched"]
+    assert result.truncated is False
+    assert "FINAL" not in capture["query"]
+    assert capture["params"]["skip"] == ("excluded",)
+    assert capture["scalar_kwargs"]["limit"] == 3
+
+
 def test_ch_query_failure_propagates(monkeypatch):
     # CH is the sole backend — a failure must propagate, not silently resolve to
     # empty (there is no PG fallback).

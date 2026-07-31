@@ -66,11 +66,17 @@ class TestTraceGraphAttributeRollup:
         settings.TRACE_GRAPH_ATTR_ROLLUP_ENABLED = True
         settings.DASHBOARD_ATTR_ROLLUP_COVERED_SINCE = COVERED_SINCE
 
-    def test_exact_final_status_in_routes_to_root_rollup(self, settings):
+    @pytest.mark.parametrize("metric_id", ["latency", "traffic"])
+    @pytest.mark.parametrize("observe_type", ["trace", "span"])
+    def test_exact_final_status_in_routes_to_root_rollup(
+        self, settings, observe_type, metric_id
+    ):
         self._enable(settings)
 
         query, params = _builder(
-            [_date_filter(), _attr_filter(value=["completed", "failed"])]
+            [_date_filter(), _attr_filter(value=["completed", "failed"])],
+            observe_type=observe_type,
+            metric_id=metric_id,
         ).build()
 
         assert "FROM dashboard_attr_rollup" in query
@@ -119,6 +125,25 @@ class TestTraceGraphAttributeRollup:
         assert builder.rollup_window_adjusted is True
         assert params["rollup_start"] == datetime(2026, 7, 23, 13)
         assert params["rollup_end"] == datetime(2026, 7, 30, 18)
+
+    def test_sub_hour_span_window_falls_back_with_span_row_semantics(self, settings):
+        self._enable(settings)
+
+        query, _ = _builder(
+            [
+                _date_filter(
+                    "2026-07-30T12:15:00Z",
+                    "2026-07-30T12:45:00Z",
+                ),
+                _attr_filter(),
+            ],
+            observe_type="span",
+        ).build()
+
+        assert "FROM dashboard_attr_rollup" not in query
+        assert "FROM spans" in query
+        assert "attrs_string['final_status']" in query
+        assert "trace_id IN (SELECT trace_id" not in query
 
     def test_offset_window_is_normalized_before_rounding_and_coverage(self, settings):
         settings.TRACE_GRAPH_ATTR_ROLLUP_ENABLED = True
@@ -198,7 +223,8 @@ class TestTraceGraphAttributeRollup:
             "2026-07-23T14:00:00",
         ]
 
-    def test_adjusted_rollup_response_keeps_data_usable(self, settings):
+    @pytest.mark.parametrize("observe_type", ["trace", "span"])
+    def test_adjusted_rollup_response_keeps_data_usable(self, settings, observe_type):
         self._enable(settings)
 
         class Result:
@@ -243,7 +269,7 @@ class TestTraceGraphAttributeRollup:
             ],
             interval="day",
             metric_id="latency",
-            observe_type="trace",
+            observe_type=observe_type,
         )
 
         assert any(point["value"] == 42.0 for point in result["data"])
@@ -273,16 +299,27 @@ class TestTraceGraphAttributeRollup:
         assert "FROM spans" in query
         assert "status" in query
 
+    @pytest.mark.parametrize("observe_type", ["trace", "span"])
+    def test_trace_and_span_final_status_use_identical_rollup_query(
+        self, settings, observe_type
+    ):
+        self._enable(settings)
+        filters = [_date_filter(), _attr_filter(value=["completed", "failed"])]
+
+        query, params = _builder(filters, observe_type=observe_type).build()
+        trace_query, trace_params = _builder(filters, observe_type="trace").build()
+
+        assert query == trace_query
+        assert params == trace_params
+
     @pytest.mark.parametrize(
         ("observe_type", "metric_id"),
         [
-            ("span", "latency"),
             ("trace", "tokens"),
+            ("span", "tokens"),
         ],
     )
-    def test_non_trace_latency_graph_falls_back(
-        self, settings, observe_type, metric_id
-    ):
+    def test_non_latency_graph_falls_back(self, settings, observe_type, metric_id):
         self._enable(settings)
 
         query, _ = _builder(

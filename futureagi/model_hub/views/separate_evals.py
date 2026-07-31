@@ -143,6 +143,11 @@ except ImportError:
 
 logger = structlog.get_logger(__name__)
 
+_EVAL_CONTEXT_LOAD_FAILED_MESSAGE = (
+    "Evaluation context could not be loaded. Please try again."
+)
+_EVAL_EXECUTION_FAILED_MESSAGE = "Evaluation could not be completed. Please try again."
+
 try:
     from ee.usage.models.usage import APICallLog
 except ImportError:
@@ -155,6 +160,13 @@ def _eval_query_error_response(exc, message):
     response.data["code"] = (
         "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
     )
+    return response
+
+
+def _eval_execution_error_response():
+    """Return a stable public eval failure without exposing provider internals."""
+    response = GeneralMethods().bad_request(_EVAL_EXECUTION_FAILED_MESSAGE)
+    response.data["code"] = "evaluation_failed"
     return response
 
 
@@ -6826,13 +6838,17 @@ class TraceEvalView(APIView):
                     workspace=workspace,
                 )
             except Exception as exc:
-                logger.warning(
-                    "trace eval ClickHouse read exceeded budget",
+                logger.exception(
+                    "trace eval ClickHouse read failed",
                     trace_id=str(req.trace_id),
                     organization_id=str(organization.id),
-                    error=str(exc)[:200],
+                    error_type=type(exc).__name__,
+                    error=str(exc),
                 )
-                trace = None
+                return _eval_query_error_response(
+                    exc,
+                    _EVAL_CONTEXT_LOAD_FAILED_MESSAGE,
+                )
             if trace is None:
                 return self._gm.not_found("Trace not found.")
 
@@ -6896,18 +6912,26 @@ class TraceEvalView(APIView):
                 )
 
             except Exception as eval_error:
-                response = TraceEvalResponse(
+                logger.exception(
+                    "trace evaluation execution failed",
                     template_id=str(template_id),
-                    trace_id=req.trace_id,
-                    status="failed",
-                    reason=str(eval_error),
+                    trace_id=str(req.trace_id),
+                    organization_id=str(organization.id),
+                    error_type=type(eval_error).__name__,
+                    error=str(eval_error),
                 )
+                return _eval_execution_error_response()
 
             return self._gm.success_response(response.model_dump())
 
         except Exception as e:
-            logger.error(f"Error in TraceEvalView: {str(e)}\n{traceback.format_exc()}")
-            return self._gm.bad_request(str(e))
+            logger.exception(
+                "trace evaluation request failed",
+                template_id=str(template_id),
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            return _eval_execution_error_response()
 
 
 class VersionCompareView(APIView):
@@ -7560,12 +7584,18 @@ class EvalPlayGroundAPIView(APIView):
                             _chspan_to_eval_playground_view(_s)
                         )
                 except Exception as _e:
-                    logger.warning(
-                        "eval playground span context exceeded CH budget",
+                    logger.exception(
+                        "eval playground span context load failed",
                         span_id=str(_span_id),
                         error_type=type(_e).__name__,
-                        error=str(_e)[:200],
+                        error=str(_e),
                     )
+                    return _eval_query_error_response(
+                        _e,
+                        _EVAL_CONTEXT_LOAD_FAILED_MESSAGE,
+                    )
+                if span_context is None:
+                    return self._gm.not_found("Span not found.")
             if trace_context is None and _trace_id:
                 try:
                     trace_context = self._trace_context_from_clickhouse(
@@ -7577,11 +7607,18 @@ class EvalPlayGroundAPIView(APIView):
                         ),
                     )
                 except Exception as _e:
-                    logger.warning(
-                        "eval playground trace context exceeded CH budget",
+                    logger.exception(
+                        "eval playground trace context load failed",
                         trace_id=str(_trace_id),
-                        error=str(_e)[:200],
+                        error_type=type(_e).__name__,
+                        error=str(_e),
                     )
+                    return _eval_query_error_response(
+                        _e,
+                        _EVAL_CONTEXT_LOAD_FAILED_MESSAGE,
+                    )
+                if trace_context is None:
+                    return self._gm.not_found("Trace not found.")
             if session_context is None and _session_id:
                 try:
                     session_context = self._session_context_from_clickhouse(
@@ -7593,11 +7630,18 @@ class EvalPlayGroundAPIView(APIView):
                         ),
                     )
                 except Exception as _e:
-                    logger.warning(
-                        "eval playground session context exceeded CH budget",
+                    logger.exception(
+                        "eval playground session context load failed",
                         session_id=str(_session_id),
-                        error=str(_e)[:200],
+                        error_type=type(_e).__name__,
+                        error=str(_e),
                     )
+                    return _eval_query_error_response(
+                        _e,
+                        _EVAL_CONTEXT_LOAD_FAILED_MESSAGE,
+                    )
+                if session_context is None:
+                    return self._gm.not_found("Session not found.")
 
             # Resolve session-level dotted-path mapping server-side.
             # The TaskLivePreview session branch sends `mapping_paths`
@@ -7786,16 +7830,28 @@ class EvalPlayGroundAPIView(APIView):
                 )
             except Exception as e:
                 if UsageLimitExceeded is not None and isinstance(e, UsageLimitExceeded):
-                    logger.warning(f"Eval playground usage limit: {str(e)}")
+                    logger.warning(
+                        "eval playground usage limit",
+                        error_type=type(e).__name__,
+                        error=str(e),
+                    )
                     return self._gm.usage_limit_response(e.check_result)
-                logger.error(f"Error in run_eval_func: {str(e)}")
-                return self._gm.bad_request(
-                    f"Failed to run Eval due to the reason: {str(e)}"
+                logger.exception(
+                    "eval playground execution failed",
+                    template_id=str(template_id),
+                    organization_id=str(org.id),
+                    error_type=type(e).__name__,
+                    error=str(e),
                 )
+                return _eval_execution_error_response()
 
         except Exception as e:
-            logger.exception(f"Error in EvalPlayGroundAPIView: {str(e)}")
-            return self._gm.bad_request(f"Error in EvalPlayGroundAPIView: {str(e)}")
+            logger.exception(
+                "eval playground request failed",
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            return _eval_execution_error_response()
 
 
 class EvalCodeSnippetAPIView(APIView):

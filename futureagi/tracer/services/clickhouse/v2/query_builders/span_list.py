@@ -18,10 +18,13 @@ CDC'd `model_hub_score` with `_peerdb_is_deleted`.
 
 from __future__ import annotations
 
+from typing import Any
+
 from tracer.services.clickhouse.query_builders.span_list import SpanListQueryBuilder
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.query_builders.filters import (
     ClickHouseFilterBuilderV2,
+    _append_v2_settings,
 )
 
 
@@ -37,11 +40,63 @@ class SpanListQueryBuilderV2(V2RewriteMixin, SpanListQueryBuilder):
     until the operator promotes the query type to v2_primary or v2_only.
     """
 
-    _v2_rewrite_exclude = frozenset({"build_eval_query", "build_annotation_query"})
+    _v2_rewrite_exclude = frozenset(
+        {
+            "build_eval_query",
+            "build_annotation_query",
+            # Native typed-JSON aggregation below. The generic v1 rewriter's
+            # bare-JSON compatibility transform is intentionally not applied
+            # inside argMax expressions.
+            "build_content_query",
+        }
+    )
 
     # Use the v2 filter compiler so filters read the v2 dimension tables
     # (end_users, etc.) instead of the dropped legacy CDC tables.
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
+
+    def build_content_query(self, span_ids: list) -> tuple[str, dict[str, Any]]:
+        """Hydrate the bounded page at latest version without table ``FINAL``."""
+
+        if not span_ids:
+            return "", {}
+        start_date, end_date = self.parse_time_range(self.filters)
+        params: dict[str, Any] = {
+            **self.params,
+            "start_date": start_date,
+            "end_date": end_date,
+            "content_span_ids": tuple(str(span_id) for span_id in span_ids),
+        }
+        query = f"""
+        SELECT
+            grouped_id AS id,
+            latest_input AS input,
+            latest_output AS output,
+            latest_attributes_extra AS attributes_extra,
+            latest_attrs_string AS attrs_string,
+            latest_attrs_number AS attrs_number,
+            latest_attrs_bool AS attrs_bool
+        FROM (
+            SELECT
+                id AS grouped_id,
+                argMax(input, _version) AS latest_input,
+                argMax(output, _version) AS latest_output,
+                argMax(toJSONString(attributes_extra), _version)
+                    AS latest_attributes_extra,
+                argMax(attrs_string, _version) AS latest_attrs_string,
+                argMax(attrs_number, _version) AS latest_attrs_number,
+                argMax(attrs_bool, _version) AS latest_attrs_bool,
+                argMax(is_deleted, _version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND id IN %(content_span_ids)s
+              AND start_time >= %(start_date)s - INTERVAL 1 DAY
+              AND start_time < %(end_date)s + INTERVAL 1 DAY
+            GROUP BY id
+        )
+        WHERE latest_is_deleted = 0
+        """
+        return _append_v2_settings(query), params
 
 
 __all__ = ["SpanListQueryBuilderV2"]

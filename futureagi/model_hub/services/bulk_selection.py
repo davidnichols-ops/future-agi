@@ -349,6 +349,9 @@ def _resolve_trace_ids_clickhouse(
     from tracer.services.clickhouse.v2.query_builders.filters import (
         ClickHouseFilterBuilderV2,
     )
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
 
     if cap <= 0:
         return ResolveResult(ids=[], total_matching=0, truncated=False)
@@ -365,6 +368,20 @@ def _resolve_trace_ids_clickhouse(
     target = cap + 1
     excluded = {str(value) for value in exclude_ids if value}
     deadline = time.monotonic() + (_BULK_TRACE_TOTAL_READ_MS / 1000)
+
+    # The task-creation failure reported in production is a canonical-root
+    # ``final_status`` filter. Route only that fully-supported scalar shape to
+    # the no-FINAL latest-state builder. Mixed/unsupported filter shapes keep
+    # the established bounded path below instead of being approximated.
+    scalar_root_builder = TraceListQueryBuilderV2(
+        project_id=str(project_id),
+        filters=list(filters or []),
+    )
+    scalar_root_supported = (
+        any(_filter_column_id(item) == "final_status" for item in filters or [])
+        and scalar_root_builder.supports_latest_root_id_page()
+        and root_observation_type is None
+    )
 
     def _remaining_timeout_ms(*, maximum: int = _BULK_TRACE_QUERY_MAX_MS) -> int:
         remaining = int((deadline - time.monotonic()) * 1000)
@@ -461,32 +478,42 @@ def _resolve_trace_ids_clickhouse(
         if root_observation_type
         else ""
     )
-    fast_query = f"""
-    SELECT trace_id
-    FROM spans FINAL
-    PREWHERE project_id = %(project_id)s
-      AND start_time >= %(start_date)s
-      AND start_time < %(end_date)s
-    WHERE is_deleted = 0
-      AND (parent_span_id IS NULL OR parent_span_id = '')
-      {fast_exclude_fragment}
-      {root_observation_fragment}
-      {fast_filter_fragment}
-    GROUP BY trace_id
-    ORDER BY max(start_time) DESC, trace_id DESC
-    LIMIT %(bulk_target)s
-    """
-    fast_params = {
-        "project_id": str(project_id),
-        "start_date": requested_start,
-        "end_date": requested_end,
-        "bulk_target": target,
-        **fast_filter_params,
-    }
-    if excluded:
-        fast_params["bulk_excluded_trace_ids"] = tuple(sorted(excluded))
-    if root_observation_type:
-        fast_params["bulk_root_observation_type"] = root_observation_type
+    if scalar_root_supported:
+        fast_query, fast_params = scalar_root_builder.build_latest_root_id_page(
+            slice_start=requested_start,
+            slice_end=requested_end,
+            limit=target,
+            exclude_trace_ids=excluded,
+            trace_id_desc=True,
+            order_by_recent_minute=False,
+        )
+    else:
+        fast_query = f"""
+        SELECT trace_id
+        FROM spans FINAL
+        PREWHERE project_id = %(project_id)s
+          AND start_time >= %(start_date)s
+          AND start_time < %(end_date)s
+        WHERE is_deleted = 0
+          AND (parent_span_id IS NULL OR parent_span_id = '')
+          {fast_exclude_fragment}
+          {root_observation_fragment}
+          {fast_filter_fragment}
+        GROUP BY trace_id
+        ORDER BY max(start_time) DESC, trace_id DESC
+        LIMIT %(bulk_target)s
+        """
+        fast_params = {
+            "project_id": str(project_id),
+            "start_date": requested_start,
+            "end_date": requested_end,
+            "bulk_target": target,
+            **fast_filter_params,
+        }
+        if excluded:
+            fast_params["bulk_excluded_trace_ids"] = tuple(sorted(excluded))
+        if root_observation_type:
+            fast_params["bulk_root_observation_type"] = root_observation_type
 
     fast_ids: list[str] = []
     filtered_fast_ids: list[str] = []
@@ -529,7 +556,9 @@ def _resolve_trace_ids_clickhouse(
     # only when the shared filter compiler actually emitted its candidate
     # placeholder; a spans/eval join that cannot consume that scope would cost
     # the same on every split and belongs on the direct sliced path instead.
-    candidate_probe_needed = "%(candidate_trace_ids)s" in probe_where
+    candidate_probe_needed = (
+        scalar_root_supported or "%(candidate_trace_ids)s" in probe_where
+    )
     slice_filter_fragment = "" if candidate_probe_needed else fast_filter_fragment
     probe_query = f"""
     SELECT DISTINCT trace_id
@@ -549,22 +578,28 @@ def _resolve_trace_ids_clickhouse(
     def _probe_candidates(candidate_ids: list[str]) -> set[str]:
         if not candidate_ids:
             return set()
-        if not probe_where:
+        if not probe_where and not scalar_root_supported:
             return set(candidate_ids)
 
-        params = {
-            "project_id": str(project_id),
-            "start_date": requested_start,
-            "end_date": requested_end,
-            "candidate_trace_ids": tuple(candidate_ids),
-            "probe_limit": len(candidate_ids),
-            **probe_filter_params,
-        }
-        if root_observation_type:
-            params["bulk_root_observation_type"] = root_observation_type
+        if scalar_root_supported:
+            query, params = scalar_root_builder.build_latest_filter_match_query(
+                candidate_ids
+            )
+        else:
+            query = probe_query
+            params = {
+                "project_id": str(project_id),
+                "start_date": requested_start,
+                "end_date": requested_end,
+                "candidate_trace_ids": tuple(candidate_ids),
+                "probe_limit": len(candidate_ids),
+                **probe_filter_params,
+            }
+            if root_observation_type:
+                params["bulk_root_observation_type"] = root_observation_type
         try:
             result = analytics.execute_ch_query(
-                probe_query,
+                query,
                 params,
                 timeout_ms=_remaining_timeout_ms(),
                 settings=_settings(len(candidate_ids)),
@@ -664,9 +699,33 @@ def _resolve_trace_ids_clickhouse(
             }
             if root_observation_type:
                 seed_params["bulk_root_observation_type"] = root_observation_type
+            query = seed_query
+            if scalar_root_supported:
+                seed_builder = TraceListQueryBuilderV2(
+                    project_id=str(project_id),
+                    filters=[
+                        {
+                            "column_id": "start_time",
+                            "filter_config": {
+                                "col_type": "SYSTEM_METRIC",
+                                "filter_type": "datetime",
+                                "filter_op": "between",
+                                "filter_value": [requested_start, requested_end],
+                            },
+                        }
+                    ],
+                )
+                query, seed_params = seed_builder.build_latest_root_id_page(
+                    slice_start=slice_start,
+                    slice_end=cursor,
+                    limit=candidate_limit,
+                    exclude_trace_ids=skip_ids,
+                    trace_id_desc=True,
+                    order_by_recent_minute=False,
+                )
             try:
                 seed_result = analytics.execute_ch_query(
-                    seed_query,
+                    query,
                     seed_params,
                     timeout_ms=_remaining_timeout_ms(),
                     settings=_settings(candidate_limit),
@@ -911,6 +970,15 @@ def _resolve_span_ids_clickhouse(
     target = cap + 1
     excluded = {str(value) for value in exclude_ids if value}
     deadline = time.monotonic() + (_BULK_TRACE_TOTAL_READ_MS / 1000)
+    scalar_span_builder = BuilderCls(
+        project_id=str(project_id),
+        filters=ch_filters,
+        annotation_label_ids=annotation_label_ids,
+    )
+    scalar_span_supported = (
+        any(_filter_column_id(item) == "final_status" for item in ch_filters)
+        and scalar_span_builder.supports_latest_attribute_page()
+    )
 
     def _remaining_timeout_ms(*, maximum: int = _BULK_TRACE_QUERY_MAX_MS) -> int:
         remaining = int((deadline - time.monotonic()) * 1000)
@@ -942,37 +1010,49 @@ def _resolve_span_ids_clickhouse(
         timeout_max: int = _BULK_TRACE_QUERY_MAX_MS,
         slice_bounds: tuple[datetime, datetime] | None = None,
     ) -> tuple[list[str], int]:
-        builder = BuilderCls(
-            project_id=str(project_id),
-            filters=[*ch_filters, _exclusion_filter(skip_ids)],
-            annotation_label_ids=annotation_label_ids,
-        )
-        query, params = builder.build_id_query(
-            # Keep the saved whole-window params in annotation/eval membership
-            # subqueries. A fallback slice is an additional outer span-time
-            # predicate, not a replacement UI time filter.
-            limit=None if slice_bounds is not None else limit,
-            order_by_recent_minute=True,
-            latest_state=True,
-        )
-        if slice_bounds is not None:
-            params = {
-                **params,
-                "bulk_slice_start": slice_bounds[0],
-                "bulk_slice_end": slice_bounds[1],
-                "bulk_slice_limit": limit,
-            }
-            slice_clause = """
-              AND start_time >= %(bulk_slice_start)s
-              AND start_time < %(bulk_slice_end)s
-            ORDER BY toStartOfMinute(start_time) DESC, id
-            LIMIT %(bulk_slice_limit)s
-            """
-            head, marker, tail = query.rpartition("\nSETTINGS ")
-            if marker:
-                query = f"{head.rstrip()}{slice_clause}\nSETTINGS {tail}"
-            else:
-                query = f"{query.rstrip()}{slice_clause}"
+        if scalar_span_supported:
+            scalar_start, scalar_end = slice_bounds or (
+                requested_start,
+                requested_end,
+            )
+            query, params = scalar_span_builder.build_latest_attribute_id_page(
+                slice_start=scalar_start,
+                slice_end=scalar_end,
+                limit=limit,
+                exclude_span_ids=skip_ids,
+            )
+        else:
+            builder = BuilderCls(
+                project_id=str(project_id),
+                filters=[*ch_filters, _exclusion_filter(skip_ids)],
+                annotation_label_ids=annotation_label_ids,
+            )
+            query, params = builder.build_id_query(
+                # Keep the saved whole-window params in annotation/eval membership
+                # subqueries. A fallback slice is an additional outer span-time
+                # predicate, not a replacement UI time filter.
+                limit=None if slice_bounds is not None else limit,
+                order_by_recent_minute=True,
+                latest_state=True,
+            )
+            if slice_bounds is not None:
+                params = {
+                    **params,
+                    "bulk_slice_start": slice_bounds[0],
+                    "bulk_slice_end": slice_bounds[1],
+                    "bulk_slice_limit": limit,
+                }
+                slice_clause = """
+                  AND start_time >= %(bulk_slice_start)s
+                  AND start_time < %(bulk_slice_end)s
+                ORDER BY toStartOfMinute(start_time) DESC, id
+                LIMIT %(bulk_slice_limit)s
+                """
+                head, marker, tail = query.rpartition("\nSETTINGS ")
+                if marker:
+                    query = f"{head.rstrip()}{slice_clause}\nSETTINGS {tail}"
+                else:
+                    query = f"{query.rstrip()}{slice_clause}"
         result = analytics.execute_ch_query(
             query,
             params,

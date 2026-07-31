@@ -317,8 +317,9 @@ class TestBuildContentQuery:
         sql, params = _make_builder().build_content_query(span_ids=["s1", "s2"])
         assert "PREWHERE project_id = %(project_id)s" in sql
         assert "AND id IN %(content_span_ids)s" in sql
-        assert sql.index("start_time >= %(start_date)s") < sql.index("WHERE is_deleted")
-        assert "WHERE is_deleted = 0" in sql
+        assert sql.index("start_time >= %(start_date)s") < sql.index("GROUP BY id")
+        assert "HAVING argMax(is_deleted, _peerdb_version) = 0" in sql
+        assert "FINAL" not in sql
         assert params["content_span_ids"] == ("s1", "s2")
 
     def test_bounds_start_time_window(self):

@@ -1,8 +1,12 @@
 """Classification helpers for bounded ClickHouse reads."""
 
+import re
 from collections.abc import Iterable
 from datetime import datetime
 
+from clickhouse_connect.driver.exceptions import (
+    DatabaseError as ClickHouseConnectDatabaseError,
+)
 from clickhouse_driver.errors import Error as ClickHouseError
 from clickhouse_driver.errors import ErrorCodes
 
@@ -33,6 +37,17 @@ _READ_BUDGET_ERROR_CODES = {
     ErrorCodes.TOO_MANY_ROWS_OR_BYTES,
     ErrorCodes.TOO_MANY_SIMULTANEOUS_QUERIES,
 }
+
+# ``clickhouse-driver`` exposes the server code on ``exc.code``.  The HTTP
+# driver does not: its ``DatabaseError`` stores the code only in the canonical
+# prefix produced by ``HttpClient._error_handler``.  Match that exact prefix
+# and exception family rather than looking for a loose ``Code: N`` substring;
+# arbitrary application/validation errors must never be mistaken for a safe
+# resource-budget fallback.
+_CLICKHOUSE_CONNECT_CODE_RE = re.compile(
+    r"\AReceived ClickHouse exception,\s*code:\s*(\d+)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def build_future_tail_probe(
@@ -91,6 +106,9 @@ def is_read_budget_error(exc: Exception) -> bool:
 
     if isinstance(exc, TimeoutError):
         return True
-    return isinstance(exc, ClickHouseError) and getattr(exc, "code", None) in (
-        _READ_BUDGET_ERROR_CODES
-    )
+    if isinstance(exc, ClickHouseError):
+        return getattr(exc, "code", None) in _READ_BUDGET_ERROR_CODES
+    if isinstance(exc, ClickHouseConnectDatabaseError):
+        match = _CLICKHOUSE_CONNECT_CODE_RE.match(str(exc))
+        return bool(match and int(match.group(1)) in _READ_BUDGET_ERROR_CODES)
+    return False

@@ -407,14 +407,18 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         """Return the one root-attribute predicate the rollup can answer exactly.
 
         Only ``final_status`` has positive production parity evidence for this
-        incident path. It is safe for the trace latency graph only. Date filters
-        are handled by :meth:`parse_time_range`; any other filter forces the
-        raw spans path. Empty values are rejected because the rollup cannot
-        distinguish an absent Map key from a present key whose value is empty.
+        incident path. It is guaranteed to live on trace-root spans, so the
+        root-only rollup is exact for both trace and span latency/traffic
+        graphs: in
+        span mode, the rows matching ``final_status`` are precisely those same
+        root rows. Date filters are handled by :meth:`parse_time_range`; any
+        other filter forces the raw spans path. Empty values are rejected
+        because the rollup cannot distinguish an absent Map key from a present
+        key whose value is empty.
         """
         if (
-            self.observe_type != "trace"
-            or self.metric_id != "latency"
+            self.observe_type not in {"trace", "span"}
+            or self.metric_id not in {"latency", "traffic"}
             or self.interval not in self.ATTR_ROLLUP_INTERVALS
         ):
             return None
@@ -524,7 +528,11 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
                 project_id=self.project_id,
                 project_ids=self.project_ids,
                 span_date_scope=True,
-                query_mode=ClickHouseFilterBuilderV2.QUERY_MODE_TRACE,
+                query_mode=(
+                    ClickHouseFilterBuilderV2.QUERY_MODE_SPAN
+                    if self.observe_type == "span"
+                    else ClickHouseFilterBuilderV2.QUERY_MODE_TRACE
+                ),
             )
             extra_where, extra_params = filter_builder.translate(self.filters)
             self.params.update(extra_params)

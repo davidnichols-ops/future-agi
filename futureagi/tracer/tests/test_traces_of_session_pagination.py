@@ -158,9 +158,12 @@ class TestTracesOfSessionPagination:
             },
         }
 
-        assert _candidate_seed_filters(
-            [*root_filters, final_status_filter, expensive_attr]
-        ) == [*root_filters, final_status_filter]
+        assert (
+            _candidate_seed_filters(
+                [*root_filters, final_status_filter, expensive_attr]
+            )
+            == root_filters
+        )
 
         child_membership_status = {
             "column_id": "status",
@@ -377,7 +380,7 @@ class TestTracesOfSessionPagination:
         assert "FROM spans" in seed_call.args[0]
         assert "start_time" in seed_call.args[0]
         assert "FROM traces FINAL" not in seed_call.args[0]
-        assert seed_call.kwargs["timeout_ms"] == 250
+        assert seed_call.kwargs["timeout_ms"] <= 750
         assert hydrate_call.kwargs["timeout_ms"] <= 750
         assert "candidate_trace_ids" in hydrate_call.args[1]
         seed_select = seed_call.args[0].split("FROM", 1)[0]
@@ -475,13 +478,14 @@ class TestTracesOfSessionPagination:
         ]
         assert payload["metadata"]["total_rows_is_lower_bound"] is True
         assert payload["metadata"].get("query_complete", True) is True
-        assert len(calls) == 2
+        assert len(calls) == 3
 
         seed_query, seed_params, seed_kwargs = calls[0]
         assert "candidate_trace_ids" not in seed_params
-        assert seed_params["start_date"] == now - timedelta(minutes=5)
+        assert seed_params["start_date"] == now - timedelta(days=7)
         assert seed_params["end_date"] == now
-        assert f"mapContains(attrs_string, '{root_attribute}')" in seed_query
+        assert f"mapContains(attrs_string, '{root_attribute}')" not in seed_query
+        assert "FINAL" not in seed_query
         assert "trace_id IN (SELECT trace_id FROM spans" not in seed_query
         assert seed_kwargs["timeout_ms"] <= 750
         assert seed_kwargs["settings"]["max_threads"] == 1
@@ -490,8 +494,18 @@ class TestTracesOfSessionPagination:
         probe_query, probe_params, probe_kwargs = calls[1]
         assert len(probe_params["candidate_trace_ids"]) == len(rows)
         assert f"mapContains(attrs_string, '{root_attribute}')" in probe_query
+        assert "argMax(" in probe_query
+        assert "FINAL" not in probe_query
         assert "trace_id IN (SELECT trace_id FROM spans" not in probe_query
         assert probe_kwargs["timeout_ms"] <= 750
+
+        hydrate_query, hydrate_params, hydrate_kwargs = calls[2]
+        assert (
+            hydrate_params["candidate_trace_ids"] == probe_params["candidate_trace_ids"]
+        )
+        assert "grouped_trace_id" in hydrate_query
+        assert "FINAL" not in hydrate_query
+        assert hydrate_kwargs["timeout_ms"] <= 750
 
     def test_guaranteed_root_attribute_slice_timeout_is_honestly_degraded(self):
         from tracer.services.clickhouse.v2.query_builders.trace_list import (
@@ -560,9 +574,10 @@ class TestTracesOfSessionPagination:
         assert payload["metadata"]["query_error_code"] == "read_budget_exceeded"
         assert len(calls) == 1
         query, params, kwargs = calls[0]
-        assert params["start_date"] == now - timedelta(minutes=5)
+        assert params["start_date"] == now - timedelta(days=7)
         assert params["end_date"] == now
-        assert "mapContains(attrs_string, 'final_status')" in query
+        assert "mapContains(attrs_string, 'final_status')" not in query
+        assert "FINAL" not in query
         assert "trace_id IN (SELECT trace_id FROM spans" not in query
         assert kwargs["timeout_ms"] <= 750
 
@@ -595,9 +610,16 @@ class TestTracesOfSessionPagination:
                 return SimpleNamespace(data=list(candidate_rows))
 
             ids = list(params["candidate_trace_ids"])
-            assert len(ids) == 50
-            assert query.count("candidate_trace_ids") >= 2
-            assert "trace_id IN (SELECT trace_id FROM spans FINAL" in query
+            if "latest_trace_name AS trace_name" not in query:
+                assert len(ids) == 50
+                assert query.count("candidate_trace_ids") >= 1
+                assert "argMax(" in query
+                assert "argMax(tuple(trace_session_id)" in query
+                assert "FINAL" not in query
+                return SimpleNamespace(
+                    data=[{"trace_id": trace_id} for trace_id in ids[:25]]
+                )
+            assert len(ids) == 25
             by_id = {row["trace_id"]: row for row in candidate_rows}
             # Deliberately reverse the CH response. The view must restore the
             # authoritative newest-root candidate order before paginating.
@@ -638,14 +660,69 @@ class TestTracesOfSessionPagination:
         assert [row["trace_id"] for row in payload["table"]] == [
             row["trace_id"] for row in candidate_rows[:10]
         ]
-        assert len(calls) == 2
+        assert len(calls) == 3
         assert "trace_session_id" in calls[0][0]
         assert str(session_id) in calls[0][1].values()
         assert calls[0][2]["settings"]["max_memory_usage"] == 268_435_456
         assert calls[1][2]["timeout_ms"] <= 750
+        assert calls[2][2]["timeout_ms"] <= 750
 
-    def test_candidate_seed_exhausts_adjacent_slices_in_newest_first_order(self):
-        """Short five-minute seeds advance over an exact, adjacent window."""
+    def test_unsupported_mixed_attribute_filter_fails_closed_without_ch_read(self):
+        """An unsupported mixed shape must not fall back to ``spans FINAL``."""
+        from tracer.services.clickhouse.v2.query_builders.trace_list import (
+            TraceListQueryBuilderV2,
+        )
+
+        view = self._make_view()
+        request = self._make_request(page_size=10)
+        analytics = mock.MagicMock()
+        filters = [
+            {
+                "column_id": "arbitrary_customer_attribute",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "matched",
+                },
+            },
+            {
+                "column_id": "tags",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "production",
+                },
+            },
+        ]
+
+        with mock.patch(
+            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+            return_value=TraceListQueryBuilderV2,
+        ):
+            status, payload = view._list_traces_of_session_clickhouse(
+                request,
+                project_id=str(uuid.uuid4()),
+                validated_data={
+                    "filters": filters,
+                    "page_number": 0,
+                    "page_size": 10,
+                    "preview": True,
+                },
+                analytics=analytics,
+                org_project_ids=None,
+                org=request.organization,
+            )
+
+        assert status == "ok"
+        assert payload["table"] == []
+        assert payload["metadata"]["query_complete"] is False
+        assert payload["metadata"]["query_status"] == "degraded"
+        analytics.execute_ch_query.assert_not_called()
+
+    def test_candidate_seed_scans_full_window_once_in_newest_first_order(self):
+        """The projection-backed seed covers the requested window without retries."""
         view = self._make_view()
         request = self._make_request(page_size=50)
         end = datetime(2026, 7, 30, 12)
@@ -663,10 +740,6 @@ class TestTracesOfSessionPagination:
         def _execute(query, params=None, **kwargs):
             params = dict(params or {})
             calls.append((query, params, kwargs))
-            call_number = len(calls)
-            if call_number == 1:
-                # The one allowed whole-window attempt is deliberately bounded.
-                raise TimeoutError("whole-window seed exceeded its sub-budget")
             if "candidate_trace_ids" in params:
                 candidates = {
                     row["trace_id"]: row
@@ -675,11 +748,9 @@ class TestTracesOfSessionPagination:
                 }
                 # ClickHouse probe order is not authoritative.
                 return SimpleNamespace(data=list(reversed(candidates.values())))
-            if params["start_date"] == end - timedelta(minutes=5):
-                return SimpleNamespace(data=list(newest))
-            if params["start_date"] == start:
-                return SimpleNamespace(data=list(older))
-            raise AssertionError(f"unexpected candidate seed window: {params}")
+            assert params["start_date"] == start
+            assert params["end_date"] == end
+            return SimpleNamespace(data=[*newest, *older])
 
         analytics = mock.MagicMock()
         analytics.execute_ch_query.side_effect = _execute
@@ -704,16 +775,12 @@ class TestTracesOfSessionPagination:
         ]
         assert payload["metadata"].get("query_complete", True) is True
         seed_calls = [call for call in calls if "candidate_trace_ids" not in call[1]]
-        assert len(seed_calls) == 3
+        assert len(seed_calls) == 1
         assert seed_calls[0][1]["start_date"] == start
         assert seed_calls[0][1]["end_date"] == end
-        assert seed_calls[1][1]["start_date"] == end - timedelta(minutes=5)
-        assert seed_calls[1][1]["end_date"] == end
-        assert seed_calls[2][1]["start_date"] == start
-        assert seed_calls[2][1]["end_date"] == end - timedelta(minutes=5)
+        assert len(calls) == 3
 
-    def test_empty_future_tail_is_proven_before_adjacent_candidate_scan(self):
-        """An end-of-local-day filter proves its skipped future tail is empty."""
+    def test_end_of_local_day_range_is_covered_by_the_single_seed(self):
         view = self._make_view()
         request = self._make_request(page_size=50)
         now = datetime(2026, 7, 31, 2, 50)
@@ -731,17 +798,10 @@ class TestTracesOfSessionPagination:
         def _execute(query, params=None, **kwargs):
             params = dict(params or {})
             calls.append((query, params, kwargs))
-            if len(calls) == 1:
-                assert params["end_date"] == requested_end
-                raise TimeoutError("whole-window seed exceeded its sub-budget")
-            if "future_tail_start" in params:
-                assert params["future_tail_start"] == now + timedelta(minutes=5)
-                assert params["future_tail_end"] == requested_end
-                return SimpleNamespace(data=[])
             if "candidate_trace_ids" in params:
                 return SimpleNamespace(data=list(candidates))
-            assert params["start_date"] == now
-            assert params["end_date"] == now + timedelta(minutes=5)
+            assert params["start_date"] == requested_start
+            assert params["end_date"] == requested_end
             return SimpleNamespace(data=list(candidates))
 
         analytics = mock.MagicMock()
@@ -783,15 +843,9 @@ class TestTracesOfSessionPagination:
 
         assert status == "ok"
         assert len(payload["table"]) == 10
-        assert len(calls) == 4
+        assert len(calls) == 3
         assert payload["metadata"].get("query_complete", True) is True
-        tail_query, _, tail_kwargs = calls[1]
-        assert "FROM spans" in tail_query
-        assert "FINAL" not in tail_query
-        assert "parent_span_id IS NULL" in tail_query
-        assert tail_kwargs["timeout_ms"] == 100
-        assert tail_kwargs["settings"]["max_threads"] == 1
-        assert tail_kwargs["settings"]["max_memory_usage"] == 64 * 1024 * 1024
+        assert all("future_tail_start" not in params for _, params, _ in calls)
 
     def test_future_skewed_root_fails_closed_without_using_partial_page(self):
         view = self._make_view()
@@ -804,11 +858,7 @@ class TestTracesOfSessionPagination:
         def _execute(query, params=None, **kwargs):
             params = dict(params or {})
             calls.append((query, params, kwargs))
-            if len(calls) == 1:
-                raise TimeoutError("whole-window seed exceeded its sub-budget")
-            if "future_tail_start" in params:
-                return SimpleNamespace(data=[{"future_tail_row": 1}])
-            raise AssertionError("fallback must not run after a future-tail row")
+            raise TimeoutError("projection seed exceeded its read budget")
 
         analytics = mock.MagicMock()
         analytics.execute_ch_query.side_effect = _execute
@@ -836,10 +886,9 @@ class TestTracesOfSessionPagination:
         assert payload["metadata"]["query_complete"] is False
         assert payload["metadata"]["query_status"] == "degraded"
         assert payload["metadata"]["query_error_code"] == "read_budget_exceeded"
-        assert len(calls) == 2
+        assert len(calls) == 1
 
-    def test_saturated_candidate_slice_grows_prefix_without_skipping_roots(self):
-        """A dense slice re-reads a larger prefix before moving older."""
+    def test_saturated_candidate_seed_continues_with_a_stable_keyset(self):
         view = self._make_view()
         request = self._make_request(page_size=50)
         end = datetime(2026, 7, 30, 12)
@@ -849,17 +898,25 @@ class TestTracesOfSessionPagination:
                 uuid.uuid4(),
                 end - timedelta(seconds=index + 1),
             )
-            for index in range(100)
+            for index in range(200)
         ]
         calls = []
 
         def _execute(query, params=None, **kwargs):
             params = dict(params or {})
             calls.append((query, params, kwargs))
-            if len(calls) == 1:
-                raise TimeoutError("whole-window seed exceeded its sub-budget")
             if "candidate_trace_ids" not in params:
-                return SimpleNamespace(data=list(candidates[: params["limit"]]))
+                if "keyset_trace_id" in params:
+                    offset = next(
+                        index + 1
+                        for index, row in enumerate(candidates)
+                        if row["trace_id"] == params["keyset_trace_id"]
+                    )
+                else:
+                    offset = 0
+                return SimpleNamespace(
+                    data=list(candidates[offset : offset + params["limit"]])
+                )
 
             candidate_ids = list(params["candidate_trace_ids"])
             by_id = {row["trace_id"]: row for row in candidates}
@@ -890,15 +947,22 @@ class TestTracesOfSessionPagination:
             row["trace_id"] for row in candidates[:10]
         ]
         seed_calls = [call for call in calls if "candidate_trace_ids" not in call[1]]
-        assert [call[1]["limit"] for call in seed_calls] == [50, 50, 100]
+        assert [call[1]["limit"] for call in seed_calls] == [100, 100]
+        assert "keyset_start_time" not in seed_calls[0][1]
+        assert seed_calls[1][1]["keyset_start_time"] == candidates[99]["start_time"]
+        assert seed_calls[1][1]["keyset_trace_id"] == candidates[99]["trace_id"]
         probe_calls = [call for call in calls if "candidate_trace_ids" in call[1]]
-        assert len(probe_calls) == 2
+        assert len(probe_calls) == 4
         assert list(probe_calls[0][1]["candidate_trace_ids"]) == [
-            row["trace_id"] for row in candidates[:50]
+            row["trace_id"] for row in candidates[:100]
         ]
-        assert list(probe_calls[1][1]["candidate_trace_ids"]) == [
-            row["trace_id"] for row in candidates[50:100]
+        assert list(probe_calls[2][1]["candidate_trace_ids"]) == [
+            row["trace_id"] for row in candidates[100:200]
         ]
+        assert (
+            list(probe_calls[1][1]["candidate_trace_ids"])
+            == [row["trace_id"] for row in candidates[:50]][:10]
+        )
         assert payload["metadata"].get("query_complete", True) is True
 
     def test_candidate_seed_code307_fails_closed_without_wide_retry(self):
@@ -944,18 +1008,15 @@ class TestTracesOfSessionPagination:
         assert payload["metadata"]["query_complete"] is False
         assert payload["metadata"]["query_error_code"] == "read_budget_exceeded"
         assert "ClickHouse" not in str(payload)
-        assert len(calls) == 2
+        assert len(calls) == 1
         assert calls[0][1]["start_date"] == start
         assert calls[0][1]["end_date"] == end
-        assert calls[0][2]["timeout_ms"] == 250
-        assert calls[1][1]["start_date"] == end - timedelta(minutes=5)
-        assert calls[1][1]["end_date"] == end
-        assert 640 <= calls[1][2]["timeout_ms"] <= 650
+        assert calls[0][2]["timeout_ms"] == 750
         assert all(
             call[2]["settings"]["read_overflow_mode"] == "throw" for call in calls
         )
 
-    def test_candidate_seed_and_probe_share_one_900ms_deadline(self):
+    def test_candidate_seed_and_probe_share_one_1800ms_deadline(self):
         """No seed or probe starts after the shared wall-clock budget expires."""
         view = self._make_view()
         request = self._make_request(page_size=50)
@@ -963,15 +1024,13 @@ class TestTracesOfSessionPagination:
         start = end - timedelta(minutes=15)
         candidate = self._trace_row(uuid.uuid4(), end - timedelta(minutes=1))
         calls = []
-        # deadline=0.9; fast attempt ends at .25, slice seed ends at .65,
-        # probe ends at .901, so the next adjacent slice must never start.
-        clock = iter((0.0, 0.0, 0.25, 0.65, 0.901))
+        # The match finishes inside the shared budget but hydration is not
+        # allowed to start after it expires.
+        clock = iter((0.0, 0.0, 0.2, 0.4, 1.81, 1.82))
 
         def _execute(query, params=None, **kwargs):
             params = dict(params or {})
             calls.append((query, params, kwargs))
-            if len(calls) == 1:
-                raise TimeoutError("whole-window seed exceeded its sub-budget")
             if "candidate_trace_ids" in params:
                 return SimpleNamespace(data=[candidate])
             return SimpleNamespace(data=[candidate])
@@ -997,13 +1056,12 @@ class TestTracesOfSessionPagination:
             )
 
         assert status == "ok"
-        assert len(calls) == 3
-        assert calls[0][2]["timeout_ms"] == 250
-        assert 640 <= calls[1][2]["timeout_ms"] <= 650
-        assert 240 <= calls[2][2]["timeout_ms"] <= 250
+        assert len(calls) == 2
+        assert calls[0][2]["timeout_ms"] == 750
+        assert calls[1][2]["timeout_ms"] == 750
         assert payload["metadata"]["query_complete"] is False
         assert payload["metadata"]["query_status"] == "degraded"
-        assert payload["metadata"]["total_rows"] == 1
+        assert payload["metadata"]["total_rows"] == 0
 
     def test_task_preview_marks_read_budget_failure_as_degraded(self):
         """A timed-out preview must not masquerade as a true empty selection."""
@@ -1059,7 +1117,7 @@ class TestTracesOfSessionPagination:
                 "total_tokens": 1,
                 "cost": 0,
             }
-            for index in range(50)
+            for index in range(100)
         ]
         calls = 0
 
@@ -1069,6 +1127,10 @@ class TestTracesOfSessionPagination:
             if calls == 1:
                 return SimpleNamespace(data=list(candidate_rows))
             if calls == 2:
+                return SimpleNamespace(
+                    data=[{"trace_id": row["trace_id"]} for row in candidate_rows[:10]]
+                )
+            if calls == 3:
                 return SimpleNamespace(data=list(candidate_rows[:10]))
             raise ServerException(
                 "private ClickHouse timeout details",

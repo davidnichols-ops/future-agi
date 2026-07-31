@@ -1,5 +1,7 @@
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -17,6 +19,75 @@ from model_hub.views.separate_evals import (
     TraceEvalView,
 )
 from tracer.models.project import Project
+
+PRIVATE_ERROR = "Code: 159. DB::Exception: private ClickHouse stack trace"
+CONTEXT_ERROR_MESSAGE = "Evaluation context could not be loaded. Please try again."
+EXECUTION_ERROR_MESSAGE = "Evaluation could not be completed. Please try again."
+
+
+def _eval_playground_payload(eval_template, context_kind=None, context_id=None):
+    payload = {
+        "template_id": str(eval_template.id),
+        "model": "",
+        "mapping": {"input": "hello", "output": "world"},
+        "config": {"params": {}},
+    }
+    if context_kind is not None:
+        payload[f"{context_kind}_id"] = context_id
+    return payload
+
+
+def _patch_playground_context_resolver(
+    monkeypatch,
+    context_kind,
+    *,
+    result=None,
+    exc=None,
+):
+    if context_kind == "span":
+        if exc is not None:
+
+            def _get_reader():
+                raise exc
+
+            monkeypatch.setattr(
+                "tracer.services.clickhouse.v2.get_reader",
+                _get_reader,
+            )
+            return
+
+        reader = MagicMock()
+        reader.__enter__.return_value = reader
+        reader.__exit__.return_value = False
+        reader.scope_by_ids.return_value = {} if result is None else result
+        monkeypatch.setattr(
+            "tracer.services.clickhouse.v2.get_reader",
+            lambda: reader,
+        )
+        return
+
+    method_name = f"_{context_kind}_context_from_clickhouse"
+
+    def _resolver(_cls, **_kwargs):
+        if exc is not None:
+            raise exc
+        return result
+
+    monkeypatch.setattr(
+        EvalPlayGroundAPIView,
+        method_name,
+        classmethod(_resolver),
+    )
+
+
+def _assert_safe_error(response, *, status_code, code, message):
+    assert response.status_code == status_code
+    assert response.data["code"] == code
+    assert all(
+        response.data[field] == message
+        for field in ("message", "detail", "error", "result")
+    )
+    assert PRIVATE_ERROR not in json.dumps(response.data)
 
 
 @pytest.fixture
@@ -458,8 +529,6 @@ def test_eval_playground_span_context_scopes_before_wide_hydration(
     workspace,
     monkeypatch,
 ):
-    from unittest.mock import MagicMock
-
     from tracer.services.clickhouse.v2.span_reader import SpanScope
 
     span_id = "collector-span-1"
@@ -525,3 +594,232 @@ def test_eval_playground_span_context_scopes_before_wide_hydration(
     assert get_call.args == (span_id,)
     assert get_call.kwargs["project_id"] == str(project.id)
     assert get_call.kwargs["settings"]["max_execution_time"] == 0.75
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("context_kind", ["span", "trace", "session"])
+@pytest.mark.parametrize(
+    ("exc_type", "expected_code"),
+    [
+        (RuntimeError, "query_failed"),
+        (TimeoutError, "read_budget_exceeded"),
+    ],
+)
+def test_eval_playground_context_query_failure_is_safe_and_fails_closed(
+    auth_client,
+    eval_template,
+    monkeypatch,
+    context_kind,
+    exc_type,
+    expected_code,
+):
+    context_id = "collector-span-1" if context_kind == "span" else str(uuid4())
+    _patch_playground_context_resolver(
+        monkeypatch,
+        context_kind,
+        exc=exc_type(PRIVATE_ERROR),
+    )
+    run_eval = Mock(return_value={"output": "Passed"})
+    monkeypatch.setattr(
+        "model_hub.views.separate_evals.run_eval_func",
+        run_eval,
+    )
+
+    response = auth_client.post(
+        "/model-hub/eval-playground/",
+        _eval_playground_payload(eval_template, context_kind, context_id),
+        format="json",
+    )
+
+    _assert_safe_error(
+        response,
+        status_code=400,
+        code=expected_code,
+        message=CONTEXT_ERROR_MESSAGE,
+    )
+    run_eval.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("context_kind", "expected_message"),
+    [
+        ("span", "Span not found."),
+        ("trace", "Trace not found."),
+        ("session", "Session not found."),
+    ],
+)
+def test_eval_playground_missing_context_returns_not_found_without_running_eval(
+    auth_client,
+    eval_template,
+    monkeypatch,
+    context_kind,
+    expected_message,
+):
+    context_id = "missing-span" if context_kind == "span" else str(uuid4())
+    _patch_playground_context_resolver(monkeypatch, context_kind, result=None)
+    run_eval = Mock(return_value={"output": "Passed"})
+    monkeypatch.setattr(
+        "model_hub.views.separate_evals.run_eval_func",
+        run_eval,
+    )
+
+    response = auth_client.post(
+        "/model-hub/eval-playground/",
+        _eval_playground_payload(eval_template, context_kind, context_id),
+        format="json",
+    )
+
+    _assert_safe_error(
+        response,
+        status_code=404,
+        code="not_found",
+        message=expected_message,
+    )
+    run_eval.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_eval_playground_execution_failure_does_not_leak_private_details(
+    auth_client,
+    eval_template,
+    monkeypatch,
+):
+    run_eval = Mock(side_effect=RuntimeError(PRIVATE_ERROR))
+    monkeypatch.setattr(
+        "model_hub.views.separate_evals.run_eval_func",
+        run_eval,
+    )
+
+    response = auth_client.post(
+        "/model-hub/eval-playground/",
+        _eval_playground_payload(eval_template),
+        format="json",
+    )
+
+    _assert_safe_error(
+        response,
+        status_code=400,
+        code="evaluation_failed",
+        message=EXECUTION_ERROR_MESSAGE,
+    )
+    run_eval.assert_called_once()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("exc_type", "expected_code"),
+    [
+        (RuntimeError, "query_failed"),
+        (TimeoutError, "read_budget_exceeded"),
+    ],
+)
+def test_trace_eval_query_failure_is_safe_and_not_misreported_as_not_found(
+    auth_client,
+    eval_template,
+    monkeypatch,
+    exc_type,
+    expected_code,
+):
+    trace_id = str(uuid4())
+
+    def _raise_private_error(_cls, **_kwargs):
+        raise exc_type(PRIVATE_ERROR)
+
+    monkeypatch.setattr(
+        TraceEvalView,
+        "_read_trace_from_clickhouse",
+        classmethod(_raise_private_error),
+    )
+    run_eval = Mock(return_value={"output": {"output": "Passed"}})
+    monkeypatch.setattr(
+        "model_hub.views.utils.evals.run_eval_func",
+        run_eval,
+    )
+
+    response = auth_client.post(
+        f"/model-hub/eval-templates/{eval_template.id}/run-on-trace/",
+        {"trace_id": trace_id},
+        format="json",
+    )
+
+    _assert_safe_error(
+        response,
+        status_code=400,
+        code=expected_code,
+        message=CONTEXT_ERROR_MESSAGE,
+    )
+    run_eval.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_trace_eval_missing_trace_preserves_not_found_contract(
+    auth_client,
+    eval_template,
+    monkeypatch,
+):
+    trace_id = str(uuid4())
+    monkeypatch.setattr(
+        TraceEvalView,
+        "_read_trace_from_clickhouse",
+        classmethod(lambda _cls, **_kwargs: None),
+    )
+    run_eval = Mock(return_value={"output": {"output": "Passed"}})
+    monkeypatch.setattr(
+        "model_hub.views.utils.evals.run_eval_func",
+        run_eval,
+    )
+
+    response = auth_client.post(
+        f"/model-hub/eval-templates/{eval_template.id}/run-on-trace/",
+        {"trace_id": trace_id},
+        format="json",
+    )
+
+    _assert_safe_error(
+        response,
+        status_code=404,
+        code="not_found",
+        message="Trace not found.",
+    )
+    run_eval.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_trace_eval_execution_failure_does_not_leak_private_details(
+    auth_client,
+    eval_template,
+    monkeypatch,
+):
+    trace_id = str(uuid4())
+    monkeypatch.setattr(
+        TraceEvalView,
+        "_read_trace_from_clickhouse",
+        classmethod(
+            lambda _cls, **_kwargs: {
+                "id": trace_id,
+                "project_id": str(uuid4()),
+                "input": {"input": "hello"},
+                "output": {"output": "world"},
+            }
+        ),
+    )
+    run_eval = Mock(side_effect=RuntimeError(PRIVATE_ERROR))
+    monkeypatch.setattr(
+        "model_hub.views.utils.evals.run_eval_func",
+        run_eval,
+    )
+
+    response = auth_client.post(
+        f"/model-hub/eval-templates/{eval_template.id}/run-on-trace/",
+        {"trace_id": trace_id},
+        format="json",
+    )
+
+    _assert_safe_error(
+        response,
+        status_code=400,
+        code="evaluation_failed",
+        message=EXECUTION_ERROR_MESSAGE,
+    )
+    run_eval.assert_called_once()

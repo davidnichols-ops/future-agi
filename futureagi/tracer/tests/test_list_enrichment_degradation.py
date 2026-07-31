@@ -2,7 +2,7 @@
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -22,12 +22,23 @@ def _view(view_class):
 class _SpanBuilder:
     def __init__(self, **kwargs):
         self.params = {}
+        self.filters = kwargs.get("filters", [])
+        self.page_number = kwargs.get("page_number", 0)
+        self.page_size = kwargs.get("page_size", 50)
+        self.sort_params = kwargs.get("sort_params", [])
 
     def requires_bounded_filter_scan(self):
         return False
 
-    def build(self, since=None):
+    def build(self, since=None, **kwargs):
         return "phase_one", {}
+
+    def parse_time_range(self, filters):
+        end = datetime.now()
+        return end - timedelta(days=1), end
+
+    def supports_latest_attribute_page(self):
+        return False
 
     def build_content_query(self, span_ids):
         return "content", {"content_span_ids": tuple(span_ids)}

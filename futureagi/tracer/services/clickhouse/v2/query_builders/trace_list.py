@@ -29,6 +29,7 @@ from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryB
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.query_builders.filters import (
     ClickHouseFilterBuilderV2,
+    _append_v2_settings,
 )
 
 
@@ -42,11 +43,66 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
     Or route via the shadow harness in v2/shadow.py.
     """
 
-    _v2_rewrite_exclude = frozenset({"build_eval_query", "build_annotation_query"})
+    _v2_rewrite_exclude = frozenset(
+        {
+            "build_eval_query",
+            "build_annotation_query",
+            # Native typed-JSON aggregation below. Applying the generic bare
+            # JSON compatibility rewrite inside argMax would produce invalid
+            # SQL, so this complete statement appends v2 settings itself.
+            "build_span_attributes_query",
+        }
+    )
 
     # Use the v2 filter compiler so filters read the v2 dimension tables
     # (end_users, etc.) instead of the dropped legacy CDC tables.
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
+
+    def build_span_attributes_query(
+        self, trace_ids: list[str]
+    ) -> tuple[str, dict[str, Any]]:
+        """Read latest attributes for only the visible trace page, sans ``FINAL``."""
+
+        bounded_ids = [str(trace_id) for trace_id in trace_ids if trace_id]
+        if not bounded_ids:
+            return "", {}
+        params: dict[str, Any] = {
+            **self.params,
+            "attr_trace_ids": tuple(bounded_ids),
+        }
+        span_window = self._span_time_window(params)
+        query = f"""
+        SELECT
+            grouped_trace_id AS trace_id,
+            latest_attributes_extra AS attributes_extra,
+            latest_attrs_string AS attrs_string,
+            latest_attrs_number AS attrs_number,
+            latest_attrs_bool AS attrs_bool
+        FROM (
+            SELECT
+                trace_id AS grouped_trace_id,
+                id AS grouped_id,
+                argMax(toJSONString(attributes_extra), _version)
+                    AS latest_attributes_extra,
+                argMax(attrs_string, _version) AS latest_attrs_string,
+                argMax(attrs_number, _version) AS latest_attrs_number,
+                argMax(attrs_bool, _version) AS latest_attrs_bool,
+                argMax(is_deleted, _version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND trace_id IN %(attr_trace_ids)s
+              {span_window}
+            GROUP BY trace_id, id
+        )
+        WHERE latest_is_deleted = 0
+          AND (
+              latest_attributes_extra != '{{}}'
+              OR notEmpty(latest_attrs_string)
+              OR notEmpty(latest_attrs_number)
+              OR notEmpty(latest_attrs_bool)
+          )
+        """
+        return _append_v2_settings(query), params
 
     def build_content_query(self, trace_ids: list[str]) -> tuple[str, dict[str, Any]]:
         """Hydrate trace-owned content from the compact ``traces`` table.

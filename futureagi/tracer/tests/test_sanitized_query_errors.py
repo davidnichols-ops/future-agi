@@ -7,6 +7,7 @@ import pytest
 from django.db.models import Q
 
 from tfc.utils.api_serializers import ApiErrorResponseSerializer
+from tracer.views import charts as chart_views
 from tracer.views import dashboard as dashboard_views
 from tracer.views import observation_span as span_views
 from tracer.views import trace as trace_views
@@ -94,7 +95,9 @@ def test_span_index_navigation_sanitizes_internal_errors(
     monkeypatch, method_name, validated_query_data, manager
 ):
     organization_id = uuid.uuid4()
-    monkeypatch.setattr(span_views, "_project_workspace_scope_q", lambda *args, **kwargs: Q())
+    monkeypatch.setattr(
+        span_views, "_project_workspace_scope_q", lambda *args, **kwargs: Q()
+    )
     monkeypatch.setattr(
         span_views, "_get_request_organization", lambda request: organization_id
     )
@@ -168,12 +171,8 @@ def test_dashboard_query_endpoints_sanitize_internal_errors(monkeypatch, method_
 
     view = dashboard_views.DashboardWidgetViewSet()
     query_config = {"metrics": [{"id": "latency"}]}
-    view.get_object = MagicMock(
-        return_value=SimpleNamespace(query_config=query_config)
-    )
-    view._execute_ch_query_config = MagicMock(
-        side_effect=RuntimeError(PRIVATE_ERROR)
-    )
+    view.get_object = MagicMock(return_value=SimpleNamespace(query_config=query_config))
+    view._execute_ch_query_config = MagicMock(side_effect=RuntimeError(PRIVATE_ERROR))
     request = SimpleNamespace(
         workspace=object(),
         validated_data={"query_config": query_config},
@@ -189,3 +188,79 @@ def test_dashboard_query_endpoints_sanitize_internal_errors(monkeypatch, method_
     )
     assert log.error.call_args.kwargs["error"] == PRIVATE_ERROR
     assert log.error.call_args.kwargs["exc_info"] is True
+
+
+def test_trace_eval_names_sanitizes_internal_errors(monkeypatch):
+    project_query = MagicMock()
+    project_query.filter.return_value.first.return_value = SimpleNamespace(
+        trace_type="observe"
+    )
+    monkeypatch.setattr(
+        trace_views, "_project_queryset_for_request", lambda request: project_query
+    )
+    monkeypatch.setattr(
+        trace_views,
+        "AnalyticsQueryService",
+        MagicMock(side_effect=RuntimeError(PRIVATE_ERROR)),
+    )
+    log = MagicMock()
+    monkeypatch.setattr(trace_views, "logger", log)
+
+    request = SimpleNamespace(query_params={"project_id": str(uuid.uuid4())})
+    view = trace_views.TraceView()
+    view.request = request
+
+    response = view.get_eval_names(request)
+
+    _assert_sanitized(
+        response,
+        message="Evaluation names could not be loaded. Please try again.",
+        code="query_failed",
+    )
+    assert log.exception.call_args.kwargs["error_type"] == "RuntimeError"
+
+
+def test_span_evaluation_details_sanitizes_internal_errors(monkeypatch):
+    log = MagicMock()
+    monkeypatch.setattr(span_views, "logger", log)
+    monkeypatch.setattr(
+        span_views.ObservationSpanView,
+        "_get_evaluation_details_clickhouse",
+        MagicMock(side_effect=RuntimeError(PRIVATE_ERROR)),
+    )
+
+    request = SimpleNamespace(
+        query_params={
+            "observation_span_id": str(uuid.uuid4()),
+            "custom_eval_config_id": str(uuid.uuid4()),
+        }
+    )
+    view = span_views.ObservationSpanView()
+    view.request = request
+
+    response = view.get_evaluation_details(request)
+
+    _assert_sanitized(
+        response,
+        message="Evaluation details could not be loaded. Please try again.",
+        code="query_failed",
+    )
+    assert log.exception.call_args.kwargs["error_type"] == "RuntimeError"
+
+
+def test_chart_graph_sanitizes_internal_errors(monkeypatch):
+    log = MagicMock()
+    monkeypatch.setattr(chart_views, "logger", log)
+
+    view = chart_views.ChartsView()
+    view.serializer_class = MagicMock(side_effect=RuntimeError(PRIVATE_ERROR))
+    request = SimpleNamespace(query_params={})
+
+    response = view.fetch_graph(request)
+
+    _assert_sanitized(
+        response,
+        message="Graph data could not be loaded. Please try again.",
+        code="query_failed",
+    )
+    assert log.exception.call_args.kwargs["error_type"] == "RuntimeError"

@@ -642,6 +642,28 @@ class TestObservationSpanBulkCreateAPI:
 class TestObservationSpanListSpansAPI:
     """Tests for GET /tracer/observation-span/list_spans/ endpoint."""
 
+    @pytest.fixture(autouse=True)
+    def _route_span_list_to_ch25(self, settings):
+        """Mirror production's direct-CH25 routing for this endpoint suite.
+
+        The local ``spans`` fixture is the curated CH25 table (``_version``),
+        not the legacy PeerDB mirror (``_peerdb_version``).  Production routes
+        ``SPAN_LIST`` through the v2 builder for the same reason, so exercising
+        the v1 builder here tests an impossible schema/routing combination.
+        """
+        v2_only = {
+            query_type.strip()
+            for query_type in settings.CLICKHOUSE_V2.get(
+                "QUERY_TYPES_V2_ONLY", ""
+            ).split(",")
+            if query_type.strip()
+        }
+        v2_only.add("SPAN_LIST")
+        settings.CLICKHOUSE_V2 = {
+            **settings.CLICKHOUSE_V2,
+            "QUERY_TYPES_V2_ONLY": ",".join(sorted(v2_only)),
+        }
+
     def test_list_spans_unauthenticated(self, api_client, project_version):
         """Unauthenticated requests should be rejected."""
         response = api_client.get(
@@ -820,9 +842,22 @@ class TestObservationSpanListSpansObserveAPI:
         assert response.status_code == status.HTTP_400_BAD_REQUEST
 
     def test_list_spans_observe_success(
-        self, auth_client, observe_project, trace_session, session_trace
+        self,
+        auth_client,
+        observe_project,
+        trace_session,
+        session_trace,
+        monkeypatch,
     ):
         """List spans for observe project."""
+        from tracer.services.clickhouse.v2.query_builders.span_list import (
+            SpanListQueryBuilderV2,
+        )
+
+        monkeypatch.setattr(
+            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+            lambda _query_type: SpanListQueryBuilderV2,
+        )
         # Create a span for the observe project
         ObservationSpan.objects.create(
             id=f"observe_span_{uuid.uuid4().hex[:8]}",
@@ -843,13 +878,7 @@ class TestObservationSpanListSpansObserveAPI:
     def test_unfiltered_task_preview_uses_bounded_prefix_and_skips_enrichment(
         self, auth_client, observe_project, monkeypatch
     ):
-        """An unfiltered preview uses a cheap exact whole-window prefix read.
-
-        Exact counts, content hydration, eval discovery, and annotation pivots
-        are grid concerns. A healthy low-volume tenant can prove the requested
-        window under a small sub-budget; high-volume requests fall back to
-        minute slices under the same shared deadline.
-        """
+        """An unfiltered preview uses the bounded scalar-latest prefix path."""
         from tracer.services.clickhouse.query_service import (
             AnalyticsQueryService,
             QueryResult,
@@ -926,13 +955,13 @@ class TestObservationSpanListSpansObserveAPI:
         assert settings["max_threads"] == 1
         assert settings["max_block_size"] == 8192
         assert settings["max_result_rows"] == 30
-        assert "ORDER BY start_time DESC" in query
+        assert "ORDER BY latest_start_time DESC" in query
         assert "start_time >= %(slice_start)s" in query
         assert "start_time < %(slice_end)s" in query
         assert "LIMIT %(limit)s" in query
         assert "count(" not in query.lower()
-        assert params["slice_end"] - params["slice_start"] == timedelta(days=180)
-        assert timeout_ms == 250
+        assert params["slice_end"] - params["slice_start"] == timedelta(minutes=1)
+        assert timeout_ms <= 750
         result = get_result(response)
         assert result["table"][0]["span_id"] == "preview-span-00"
         assert result["metadata"]["query_complete"] is True
@@ -954,7 +983,7 @@ class TestObservationSpanListSpansObserveAPI:
             return QueryResult(
                 data=[
                     {
-                        "id": "boolean-preview-span",
+                        "id": f"boolean-preview-span-{index:02d}",
                         "trace_id": str(uuid.uuid4()),
                         "name": "preview",
                         "observation_type": "llm",
@@ -971,8 +1000,9 @@ class TestObservationSpanListSpansObserveAPI:
                         "end_user_id": None,
                         "created_at": now,
                     }
+                    for index in range(20)
                 ],
-                row_count=1,
+                row_count=20,
                 backend_used="clickhouse",
                 query_time_ms=1,
             )
@@ -1023,16 +1053,18 @@ class TestObservationSpanListSpansObserveAPI:
         query, params, timeout_ms, settings = calls[0]
         assert "span_attr_bool" in query or "attrs_bool" in query
         boolean_params = [
-            value for key, value in params.items() if key.startswith("attr_")
+            value
+            for key, value in params.items()
+            if key.startswith(("attr_", "latest_attr_param_"))
         ]
         assert boolean_params == [1]
         assert "start_time >= %(slice_start)s" in query
         assert "start_time < %(slice_end)s" in query
-        assert timeout_ms == 250
+        assert timeout_ms <= 750
         assert settings["timeout_overflow_mode"] == "throw"
         assert settings["read_overflow_mode"] == "throw"
         result = get_result(response)
-        assert result["table"][0]["span_id"] == "boolean-preview-span"
+        assert result["table"][0]["span_id"] == "boolean-preview-span-00"
         assert result["metadata"]["query_complete"] is True
 
     def test_string_filtered_grid_does_not_repeat_a_full_window_count(
@@ -1062,7 +1094,7 @@ class TestObservationSpanListSpansObserveAPI:
                     }
                     for span_id in params["content_span_ids"]
                 ]
-            elif "ORDER BY start_time DESC" in query:
+            elif "ORDER BY latest_start_time DESC" in query:
                 data = [
                     {
                         "id": f"grid-span-{index}",
@@ -1132,9 +1164,7 @@ class TestObservationSpanListSpansObserveAPI:
 
         assert response.status_code == status.HTTP_200_OK
         assert not any("count()" in query.lower() for query, *_ in calls)
-        content_calls = [
-            call for call in calls if "SELECT id, input, output" in call[0]
-        ]
+        content_calls = [call for call in calls if "content_span_ids" in call[1]]
         assert len(content_calls) == 1
         assert content_calls[0][3]["max_threads"] == 1
         assert content_calls[0][3]["max_block_size"] == 8192

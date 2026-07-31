@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Iterator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
@@ -93,6 +93,12 @@ def iter_desired_rows(
     limit = task.spans_limit if task.run_type == RunType.HISTORICAL else None
     sampling_rate = task.sampling_rate if task.sampling_rate is not None else 100.0
 
+    continuous_floor = _continuous_floor(task)
+    continuous_start = (
+        task.start_time or task.created_at
+        if task.run_type == RunType.CONTINUOUS
+        else None
+    )
     sql, params = _build_sample_query(
         project_id=str(task.project_id),
         row_type=task.row_type,
@@ -100,7 +106,8 @@ def iter_desired_rows(
         sampling_rate=float(sampling_rate),
         filters=task.filters or {},
         limit=limit,
-        created_at_floor=_continuous_floor(task),
+        created_at_floor=continuous_floor,
+        continuous_start=continuous_start,
     )
     reader = get_reader()
     try:
@@ -198,7 +205,13 @@ def _resolve_bounded_historical_span_ids(
         if not is_read_budget_error(exc):
             raise
     else:
-        candidate_limit = int(params.get("lim") or params.get("id_limit") or 0)
+        candidate_limit = int(
+            params.get("lim")
+            or params.get("id_limit")
+            or params.get("latest_root_limit")
+            or params.get("latest_span_limit")
+            or 0
+        )
         # Reaching the requested unique-id cap proves the canonical prefix.
         # Duplicate-margin exhaustion matters only when it did not.
         if len(whole_window_prefix) >= limit:
@@ -342,10 +355,13 @@ def _resolve_bounded_historical_span_ids(
             # minute is exhausted; a full page advances by id and reads its next
             # exact segment.
             unique_page_limit = int(
-                page_params[
-                    "candidate_limit" if trace_candidate_verification else "lim"
-                ]
+                page_params.get("latest_root_limit")
+                or page_params.get("latest_span_limit")
+                or page_params.get("lim")
+                or 0
             )
+            if unique_page_limit <= 0:
+                raise RuntimeError("Evaluation task page did not bind a row limit")
             if len(page_unique_ids) < unique_page_limit:
                 break
             next_after_id = max(page_unique_ids)
@@ -362,7 +378,13 @@ def _trace_slice_fallback_is_exact(sql: str) -> bool:
     """Whether root-time slicing preserves a TRACE_LIST query's semantics."""
 
     return (
-        re.search(
+        # Scalar canonical-root predicates (notably final_status) must classify
+        # a candidate against the whole requested window. Applying the filter
+        # independently inside adjacent minutes could let an older matching
+        # root resurface after a newer non-matching root was skipped.
+        "latest_root_slice_start" not in sql
+        and "final_status" not in sql
+        and re.search(
             r"\btrace_id\s+(?:NOT\s+)?IN\s*\(\s*SELECT\b",
             sql,
             flags=re.IGNORECASE,
@@ -388,41 +410,34 @@ def _build_trace_candidate_seed_query(
     task window. Sampling is safe to push into this seed because it is a pure,
     deterministic function of ``trace_id``.
     """
+    from tracer.services.clickhouse.v2.dispatch import get_v2_class
+
     if limit <= 0:
         raise ValueError("Trace candidate limit must be greater than zero")
     if not 0 <= sampling_rate <= 100:
         raise ValueError("sampling_rate must be between 0 and 100")
 
-    params: dict[str, Any] = {
-        "candidate_project_id": str(project_id),
-        "candidate_start": start,
-        "candidate_end": end,
-        "candidate_salt": str(salt),
-        "candidate_rate": float(sampling_rate),
-        "candidate_limit": int(limit),
+    time_filter = {
+        "column_id": "start_time",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "datetime",
+            "filter_op": "between",
+            "filter_value": [start, end],
+        },
     }
-    after_fragment = ""
-    if after_id is not None:
-        params["candidate_after_id"] = str(after_id)
-        after_fragment = "AND trace_id > %(candidate_after_id)s"
-
-    sql = f"""
-    SELECT DISTINCT trace_id
-    FROM spans FINAL
-    PREWHERE project_id = %(candidate_project_id)s
-      AND start_time >= %(candidate_start)s
-      AND start_time < %(candidate_end)s
-    WHERE is_deleted = 0
-      AND (parent_span_id IS NULL OR parent_span_id = '')
-      AND modulo(
-        cityHash64(%(candidate_salt)s, toString(trace_id)),
-        100
-      ) < %(candidate_rate)s
-      {after_fragment}
-    ORDER BY trace_id
-    LIMIT %(candidate_limit)s
-    """
-    return sql, params
+    builder = get_v2_class("TRACE_LIST")(
+        project_id=str(project_id),
+        filters=[time_filter],
+    )
+    return builder.build_latest_root_id_page(
+        slice_start=start,
+        slice_end=end,
+        limit=int(limit),
+        sampling_salt=str(salt),
+        sampling_rate=float(sampling_rate),
+        after_trace_id=after_id,
+    )
 
 
 def _verify_trace_candidates(
@@ -617,6 +632,38 @@ def _continuous_floor(task: EvalTask) -> datetime | None:
     return task.continuous_cursor or task.start_time or task.created_at
 
 
+def _unix_nanoseconds(value: datetime) -> int:
+    """Return a UTC epoch-ns floor for the direct-write ``_version`` column."""
+
+    if timezone.is_aware(value):
+        value = value.astimezone(UTC).replace(tzinfo=None)
+    delta = value - datetime(1970, 1, 1)
+    return (
+        delta.days * 86_400 + delta.seconds
+    ) * 1_000_000_000 + delta.microseconds * 1_000
+
+
+def _is_continuous_final_status_shape(
+    active_filters: list[dict[str, Any]],
+) -> bool:
+    """Whether the continuous scalar path can preserve the saved filter exactly.
+
+    Keep this deliberately narrow during the SOS rollout. Arbitrary/mixed
+    continuous filters retain their established streaming query; historical
+    unsupported shapes retain the bounded fail-closed fallback.
+    """
+
+    if not active_filters:
+        return False
+    for item in active_filters:
+        column_id = item.get("column_id") or item.get("columnId")
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        col_type = str(config.get("col_type") or config.get("colType") or "").upper()
+        if column_id != "final_status" or col_type != "SPAN_ATTRIBUTE":
+            return False
+    return True
+
+
 def _build_sample_query(
     *,
     project_id: str,
@@ -626,6 +673,7 @@ def _build_sample_query(
     filters: dict | None,
     limit: int | None,
     created_at_floor: datetime | None = None,
+    continuous_start: datetime | None = None,
     time_window: tuple[datetime, datetime] | None = None,
     after_id: str | None = None,
     candidate_trace_ids: list[str] | None = None,
@@ -704,7 +752,9 @@ def _build_sample_query(
     # parse_time_range over any date_range start above (a continuous task is
     # anchored at its own start, not an earlier configured window) — and so the
     # set isn't silently capped at parse_time_range's now-30d default.
+    continuous_floor_filter_index: int | None = None
     if created_at_floor is not None:
+        continuous_floor_filter_index = len(ui_filters)
         ui_filters.append(
             {
                 "column_id": "created_at",
@@ -811,6 +861,133 @@ def _build_sample_query(
         candidate_limit = int(limit)
         if (is_span_query or is_trace_query) and not distinct_slice_ids:
             candidate_limit *= _DEDUP_ID_CANDIDATE_MULTIPLIER
+
+    # Candidate IDs supplied here were already deterministically sampled by
+    # the adjacent-slice seed. For scalar trace predicates, verify their latest
+    # state directly with point-scoped argMax reads instead of reintroducing a
+    # table-level FINAL merge. Unsupported filter shapes intentionally fall
+    # through to the established bounded builder path.
+    if is_trace_query and candidate_trace_ids and not ot_values:
+        try:
+            return builder.build_latest_filter_match_query(candidate_trace_ids)
+        except ValueError:
+            pass
+
+    active_ui_filters = [
+        item
+        for item in ui_filters
+        if (item.get("column_id") or item.get("columnId"))
+        not in {"created_at", "start_time"}
+    ]
+    continuous_scalar_filters: list[dict[str, Any]] | None = None
+    if (
+        created_at_floor is not None
+        and continuous_start is not None
+        and continuous_floor_filter_index is not None
+        and candidate_limit is None
+        and not ot_values
+        and _is_continuous_final_status_shape(active_ui_filters)
+    ):
+        # The persisted cursor is a write-version watermark, not the span's
+        # immutable start_time. Classify every changed id against its complete
+        # task-time history so a late update/tombstone is observed without
+        # letting an older matching version (or root) resurface.
+        continuous_scalar_filters = list(ui_filters)
+        continuous_scalar_filters[continuous_floor_filter_index] = {
+            "column_id": "created_at",
+            "filter_config": {
+                "filter_type": "datetime",
+                "filter_op": "greater_than",
+                "filter_value": continuous_start,
+            },
+        }
+
+    if continuous_scalar_filters is not None and is_trace_query:
+        continuous_builder = get_v2_class(query_type)(
+            project_id=str(project_id),
+            filters=continuous_scalar_filters,
+        )
+        if continuous_builder.supports_latest_root_id_page():
+            scalar_start, scalar_end = continuous_builder.parse_time_range(
+                continuous_scalar_filters
+            )
+            return continuous_builder.build_latest_root_id_page(
+                slice_start=scalar_start,
+                slice_end=scalar_end,
+                limit=None,
+                sampling_salt=str(salt),
+                sampling_rate=float(sampling_rate),
+                changed_since_version=_unix_nanoseconds(created_at_floor),
+            )
+
+    if (
+        is_trace_query
+        and candidate_limit is not None
+        and active_ui_filters
+        and builder.supports_latest_root_id_page()
+    ):
+        scalar_start, scalar_end = builder.parse_time_range(ui_filters)
+        return builder.build_latest_root_id_page(
+            slice_start=scalar_start,
+            slice_end=scalar_end,
+            limit=candidate_limit,
+            sampling_salt=str(salt),
+            sampling_rate=float(sampling_rate),
+        )
+
+    span_scalar_filters = (
+        ui_filters[:-1] if is_span_query and after_id is not None else ui_filters
+    )
+    span_scalar_builder = (
+        get_v2_class(query_type)(
+            project_id=str(project_id),
+            filters=span_scalar_filters,
+        )
+        if is_span_query and after_id is not None
+        else builder
+    )
+    active_span_scalar_filters = [
+        item
+        for item in span_scalar_filters
+        if (item.get("column_id") or item.get("columnId"))
+        not in {"created_at", "start_time"}
+    ]
+    if continuous_scalar_filters is not None and is_span_query:
+        continuous_span_builder = get_v2_class(query_type)(
+            project_id=str(project_id),
+            filters=continuous_scalar_filters,
+        )
+        if continuous_span_builder.supports_latest_attribute_page():
+            scalar_start, scalar_end = continuous_span_builder.parse_time_range(
+                continuous_scalar_filters
+            )
+            return continuous_span_builder.build_latest_attribute_id_page(
+                slice_start=scalar_start,
+                slice_end=scalar_end,
+                limit=None,
+                sampling_salt=str(salt),
+                sampling_rate=float(sampling_rate),
+                changed_since_version=_unix_nanoseconds(created_at_floor),
+            )
+
+    if (
+        is_span_query
+        and candidate_limit is not None
+        and active_span_scalar_filters
+        and span_scalar_builder.supports_latest_attribute_page()
+    ):
+        request_start, request_end = span_scalar_builder.parse_time_range(
+            span_scalar_filters
+        )
+        scalar_start, scalar_end = time_window or (request_start, request_end)
+        return span_scalar_builder.build_latest_attribute_id_page(
+            slice_start=scalar_start,
+            slice_end=scalar_end,
+            limit=candidate_limit,
+            sampling_salt=str(salt),
+            sampling_rate=float(sampling_rate),
+            after_span_id=after_id,
+        )
 
     if sampling_pushed_down:
         build_id_kwargs = {
