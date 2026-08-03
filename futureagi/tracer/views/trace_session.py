@@ -62,6 +62,7 @@ from tracer.selectors.trace_filter_reads import (
     PAGE_DEPTH_EXCEEDED_MESSAGE,
     bounded_numbered_page_depth_exceeded,
     numbered_page_depth_exceeded,
+    read_bounded_filter_page,
 )
 from tracer.serializers.eval_task import PaginationQuerySerializer
 from tracer.serializers.filters import (
@@ -69,6 +70,7 @@ from tracer.serializers.filters import (
     ObserveGraphDataResponseSerializer,
     PageDepthExceededErrorSerializer,
 )
+from tracer.serializers.trace import TraceObserveListResponseSerializer
 from tracer.serializers.trace_session import (
     TraceSessionExportQuerySerializer,
     TraceSessionFilterValuesQuerySerializer,
@@ -1272,6 +1274,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
     @validated_request(
         query_serializer=TraceSessionListQuerySerializer,
         responses={
+            200: TraceObserveListResponseSerializer,
             400: ApiErrorResponseSerializer,
             422: PageDepthExceededErrorSerializer,
             500: ApiErrorResponseSerializer,
@@ -2420,19 +2423,21 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             user_id=None,
         )
 
-        # Phase 1: select the exact default/time-only page using only physical
-        # latest root identity + ordering columns. Aggregate cost/token metrics
-        # are then hydrated for those page sessions only. Complex filters/sorts
-        # cannot be moved after LIMIT without changing page-N membership. Do
-        # not silently execute the historical unbounded aggregate for those
-        # shapes: fail closed with a sanitized retryable response until a
-        # separately proven bounded selector exists.
+        # Phase 1: select the exact page identities before hydrating cost/token,
+        # content, and attributes. Default/session-level shapes use the narrow
+        # one-query candidate selector. Scalar span attributes (for example
+        # ``final_status``) use adjacent root-session seed pages plus finite
+        # latest-state classification. The latter avoids the historical
+        # full-window GROUP BY that timed out on high-volume tenants while
+        # preserving the same newest-session page membership.
         candidate_first = builder.supports_candidate_first_page()
-        if not candidate_first:
+        bounded_page = None
+        if not candidate_first and not builder.supports_bounded_filter_scan():
             logger.warning(
                 "bounded_session_list_shape_unsupported",
                 filter_count=len(filters),
                 sort_count=len(sort_params),
+                error_code=builder.bounded_filter_degraded_error_code(),
             )
             return self._gm.custom_error_response(
                 drf_status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -2440,17 +2445,66 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 code="service_unavailable",
             )
 
-        candidate_total_count = None
-        page_query, page_params = builder.build_candidate_page_query()
-        page_result = analytics.execute_ch_query(
-            page_query,
-            page_params,
-            timeout_ms=read_deadline.remaining_ms(SESSION_LIST_QUERY_TIMEOUT_MS),
-            settings=_session_read_settings(max_result_rows=page_size + 1),
-        )
-        page_candidates = page_result.data[:page_size]
-        if page_candidates:
-            candidate_total_count = int(page_candidates[0].get("total_count", 0) or 0)
+        candidate_total_count: int | None = None
+        if candidate_first:
+            page_query, page_params = builder.build_candidate_page_query()
+            page_result = analytics.execute_ch_query(
+                page_query,
+                page_params,
+                timeout_ms=read_deadline.remaining_ms(SESSION_LIST_QUERY_TIMEOUT_MS),
+                settings=_session_read_settings(max_result_rows=page_size + 1),
+            )
+            page_candidates = page_result.data[:page_size]
+            if page_candidates:
+                candidate_total_count = int(
+                    page_candidates[0].get("total_count", 0) or 0
+                )
+        else:
+            bounded_page = read_bounded_filter_page(
+                builder=builder,
+                analytics=analytics,
+                filters=filters,
+                key_field="session_id",
+                page_number=page_number,
+                page_size=page_size,
+                deadline_ms=read_deadline.remaining_ms(SESSION_LIST_QUERY_TIMEOUT_MS),
+                # Session seed and classifier statements are intentionally
+                # capped at 200 IDs by the builder contract.
+                max_candidates=200,
+                classify_batch_size=200,
+                read_settings=_session_read_settings(max_result_rows=200),
+            )
+            if not bounded_page.complete:
+                if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
+                    logger.info(
+                        "session_list_page_depth_exceeded",
+                        project_id=str(project_id) if project_id else None,
+                        page_number=page_number,
+                        page_size=page_size,
+                    )
+                    return self._gm.custom_error_response(
+                        drf_status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        PAGE_DEPTH_EXCEEDED_MESSAGE,
+                        code=PAGE_DEPTH_EXCEEDED_CODE,
+                    )
+                logger.warning(
+                    "session_list_bounded_read_incomplete",
+                    project_id=str(project_id) if project_id else None,
+                    page_number=page_number,
+                    error_code=bounded_page.error_code,
+                    query_count=bounded_page.query_count,
+                )
+                return self._gm.custom_error_response(
+                    drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Filtered session data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            page_candidates = bounded_page.rows
+            # As on bounded trace/span lists, this is the proven count prefix.
+            # Re-running the legacy full-window count would reintroduce the
+            # exact timeout this path removes.
+            candidate_total_count = bounded_page.total_rows_lower_bound
+
         candidate_ids = [
             str(row.get("session_id", ""))
             for row in page_candidates
@@ -2728,9 +2782,24 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         lid = str(label.id)
                         entry[lid] = session_scores.get(lid)
 
+        metadata = {"total_rows": total_count}
+        if bounded_page is not None:
+            # The selector proves page membership and whether another page
+            # exists, but it may stop once that ordered prefix is proved.  Its
+            # count is therefore a lower bound, not an exact full-window count.
+            metadata.update(
+                {
+                    "total_rows_is_lower_bound": True,
+                    "has_more": bounded_page.has_more,
+                    "query_complete": bounded_page.complete,
+                    "query_status": bounded_page.status,
+                    "query_error_code": bounded_page.error_code,
+                }
+            )
+
         return self._gm.success_response(
             {
-                "metadata": {"total_rows": total_count},
+                "metadata": metadata,
                 "table": formatted,
                 "config": config,
             }

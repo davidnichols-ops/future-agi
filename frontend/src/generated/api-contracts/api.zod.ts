@@ -41612,21 +41612,68 @@ export const TracerTraceSessionListSessionsQueryParams = zod.object({
   "interval": zod.string().optional()
 })
 
-export const tracerTraceSessionListSessionsResponseResultsItemNameMax = 255;
+
+
+export const tracerTraceSessionListSessionsResponseResultMetadataQueryCountMin = 0;
+
+export const tracerTraceSessionListSessionsResponseResultMetadataQueryRowsReturnedMin = 0;
+
+export const tracerTraceSessionListSessionsResponseResultMetadataQueryResultPayloadBytesMin = 0;
+
+
+
+
+
+
+
+
+
 
 
 
 export const TracerTraceSessionListSessionsResponse = zod.object({
-  "count": zod.number(),
-  "next": zod.string().url().optional(),
-  "previous": zod.string().url().optional(),
-  "results": zod.array(zod.object({
-  "id": zod.string().uuid().optional(),
-  "project": zod.string().uuid(),
-  "bookmarked": zod.boolean().optional(),
-  "name": zod.string().max(tracerTraceSessionListSessionsResponseResultsItemNameMax).optional(),
-  "created_at": zod.string().datetime({"offset":true}).optional()
+  "status": zod.boolean(),
+  "result": zod.object({
+  "metadata": zod.object({
+  "total_rows": zod.number(),
+  "total_rows_exact": zod.number().optional(),
+  "total_rows_is_lower_bound": zod.boolean().optional(),
+  "has_more": zod.boolean().optional(),
+  "next_cursor": zod.string().min(1).optional(),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'degraded']).optional(),
+  "query_error_code": zod.string().min(1).optional(),
+  "query_elapsed_ms": zod.number().optional(),
+  "query_count": zod.number().min(tracerTraceSessionListSessionsResponseResultMetadataQueryCountMin).optional(),
+  "query_rows_returned": zod.number().min(tracerTraceSessionListSessionsResponseResultMetadataQueryRowsReturnedMin).optional(),
+  "query_result_payload_bytes": zod.number().min(tracerTraceSessionListSessionsResponseResultMetadataQueryResultPayloadBytesMin).optional()
+}),
+  "table": zod.array(zod.record(zod.string(), zod.object({
+
+}).passthrough().describe('Any valid JSON value.'))),
+  "config": zod.array(zod.object({
+  "id": zod.string().min(1),
+  "name": zod.string().min(1),
+  "is_visible": zod.boolean(),
+  "group_by": zod.string().min(1).optional(),
+  "output_type": zod.string().min(1).optional(),
+  "reverse_output": zod.boolean().optional(),
+  "annotation_label_type": zod.string().min(1).optional(),
+  "choices": zod.array(zod.string().min(1)).optional(),
+  "settings": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "choices_map": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "eval_template_id": zod.string().min(1).optional(),
+  "annotators": zod.object({
+
+}).passthrough().optional().describe('Any valid JSON value.'),
+  "source_field": zod.string().min(1).optional(),
+  "parent_eval_id": zod.string().min(1).optional()
 }))
+})
 })
 
 

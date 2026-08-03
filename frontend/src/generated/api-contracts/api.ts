@@ -1205,7 +1205,6 @@ import type {
   TracerTraceSessionGetTraceSessionExportDataParams,
   TracerTraceSessionList200,
   TracerTraceSessionListParams,
-  TracerTraceSessionListSessions200,
   TracerTraceSessionListSessionsParams,
   TracerTraceVoiceCallDetail200,
   TracerTraceVoiceCallDetailParams,
@@ -66200,7 +66199,7 @@ export const tracerTraceSessionGetTraceSessionExportData = async (params?: Trace
 
 
 export type tracerTraceSessionListSessionsResponse200 = {
-  data: TracerTraceSessionListSessions200
+  data: TraceObserveListResponseApi
   status: 200
 }
 

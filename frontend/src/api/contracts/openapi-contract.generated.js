@@ -35275,32 +35275,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/TraceSession"
-                }
-              }
-            }
+            "$ref": "#/definitions/TraceObserveListResponse"
           },
           "400": {
             "$ref": "#/definitions/ApiErrorResponse"

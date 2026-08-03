@@ -27057,13 +27057,6 @@ page_size?: number;
 interval?: string;
 };
 
-export type TracerTraceSessionListSessions200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: TraceSessionApi[];
-};
-
 export type TracerTraceListParams = {
 /**
  * A page number within the paginated result set.
