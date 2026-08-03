@@ -11,13 +11,11 @@ through that ONE polymorphic method. A metric may target the migrated `spans`
 schema (system_metric / custom_attribute) OR a non-migrated legacy table
 (eval_metric → `usage_apicalllog`, annotation_metric → `model_hub_score`, both
 still on `_peerdb_is_deleted` / `deleted`). `V2RewriteMixin`'s blanket auto-wrap
-can't make that per-metric distinction — it would rename `_peerdb_is_deleted` →
-`is_deleted` on the legacy tables too. So both dispatch methods are excluded
-from the mixin and the rewrite is applied here, per metric. For legacy-table
-metrics that JOIN onto spans (breakdowns/filters by trace dimensions), the
-full rewrite is applied first (fixing spans refs like `s._peerdb_is_deleted` →
-`s.is_deleted`, `s.span_attr_str` → `s.attrs_string`), then the legacy-table
-aliases are restored (e.g. `e.is_deleted` → `e._peerdb_is_deleted`).
+cannot distinguish aliases by physical table. Both dispatch methods are
+therefore excluded from the mixin and the rewrite is applied here after
+protecting/restoring every legacy-table alias. That matters for mixed queries
+too: a system metric can JOIN `model_hub_score` for an annotation breakdown
+while its spans columns still need the v2 rewrite.
 """
 
 from __future__ import annotations
@@ -29,9 +27,6 @@ from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.query_builders.filters import (
     rewrite_and_apply_v2_settings,
 )
-
-# Metric types whose SQL reads tables NOT migrated to the CH 25.3 spans schema.
-_LEGACY_TABLE_METRIC_TYPES = frozenset({"eval_metric", "annotation_metric"})
 
 # Tables whose columns must NOT be rewritten (they keep `_peerdb_is_deleted`).
 _LEGACY_TABLE_RE = re.compile(
@@ -69,14 +64,9 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
 
     Both `build_metric_query` and `build_all_queries` are excluded from the
     mixin's blanket rewrite because they are polymorphic over metric type (see
-    module docstring). `build_metric_query` applies the rewrite itself, per
-    metric:
-
-    * Non-legacy metrics (system_metric, custom_attribute): full rewrite.
-    * Legacy metrics (eval_metric, annotation_metric): full rewrite first
-      (so spans-JOINed refs like ``s._peerdb_is_deleted`` become
-      ``s.is_deleted``), then legacy-table aliases are restored
-      (``e.is_deleted`` → ``e._peerdb_is_deleted``).
+    module docstring). `build_metric_query` applies the rewrite itself, then
+    restores protected legacy aliases. This covers both legacy metrics and
+    mixed queries such as a system metric with an annotation/eval breakdown.
     """
 
     # dashboard_attr_rollup ships only in the v2 schema, so the fast-path is safe only here.
@@ -88,12 +78,14 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
     # access) while preserving latest-live + id-remap semantics.
     _direct_end_users_available: bool = True
 
+    # Project-scope trace-attached annotations through the direct-write traces
+    # table. The locked production read-only identity has no dictionary grants.
+    _direct_trace_project_scope_available: bool = True
+
     _v2_rewrite_exclude = frozenset({"build_metric_query", "build_all_queries"})
 
     def build_metric_query(self, metric: dict) -> tuple[str, dict]:
         sql, params = super().build_metric_query(metric)
-        if metric.get("type") not in _LEGACY_TABLE_METRIC_TYPES:
-            return rewrite_and_apply_v2_settings(sql), params
         sql = _protect_usage_cdc_columns(sql)
         sql = rewrite_and_apply_v2_settings(sql)
         sql = _restore_usage_cdc_columns(sql)

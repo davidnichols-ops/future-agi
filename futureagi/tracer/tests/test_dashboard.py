@@ -73,8 +73,9 @@ def test_join_alias_prefixing_never_rewrites_quoted_customer_data():
     clause = (
         "project_id IN %(project_ids)s "
         "AND start_time >= %(start_date)s "
+        "AND created_at >= %(start_date)s - INTERVAL 1 DAY "
         "AND parent_span_id = '' "
-        "AND marker = 'project_id / start_time / parent_span_id' "
+        "AND marker = 'project_id / start_time / created_at / parent_span_id' "
         "AND escaped = 'it''s _peerdb_is_deleted'"
     )
 
@@ -82,8 +83,9 @@ def test_join_alias_prefixing_never_rewrites_quoted_customer_data():
 
     assert "s.project_id IN %(project_ids)s" in prefixed
     assert "s.start_time >= %(start_date)s" in prefixed
+    assert "s.created_at >= %(start_date)s - INTERVAL 1 DAY" in prefixed
     assert "s.parent_span_id = ''" in prefixed
-    assert "'project_id / start_time / parent_span_id'" in prefixed
+    assert "'project_id / start_time / created_at / parent_span_id'" in prefixed
     assert "'it''s _peerdb_is_deleted'" in prefixed
 
 
@@ -5417,6 +5419,93 @@ class TestDashboardV2RewriteRouting:
         sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
         assert sql.count("use_skip_indexes_if_final") == 1
         assert sql.count("SETTINGS") == 1
+
+    def test_annotation_breakdown_qualifies_spans_created_at(self):
+        config = _single_metric_config(
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "aggregation": "avg",
+            },
+            breakdowns=[
+                {
+                    "name": "44444444-4444-4444-4444-444444444444",
+                    "type": "annotation_metric",
+                    "output_type": "text",
+                }
+            ],
+        )
+
+        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "LEFT JOIN model_hub_score AS ann0" in sql
+        assert "s.created_at >= %(start_date)s - INTERVAL 1 DAY" in sql
+        assert " AND created_at >= %(start_date)s" not in sql
+        assert "ann0._peerdb_is_deleted = 0" in sql
+        assert "ann0.is_deleted = 0" not in sql
+
+    def test_annotation_metric_uses_bounded_direct_latest_live_trace_scope(self):
+        config = _single_metric_config(
+            {
+                "id": "44444444-4444-4444-4444-444444444444",
+                "name": "quality",
+                "type": "annotation_metric",
+                "label_id": "44444444-4444-4444-4444-444444444444",
+                "output_type": "text",
+                "aggregation": "count",
+            }
+        )
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "trace_dict" not in sql
+        assert "FROM traces AS trace_project_scan" in compact_sql
+        assert "INNER JOIN ( SELECT DISTINCT" in compact_sql
+        assert "FROM model_hub_score AS annotation_trace_candidate" in compact_sql
+        assert (
+            "annotation_trace_candidate.organization_id = "
+            "toUUID(%(annotation_organization_id)s)"
+        ) in compact_sql
+        assert (
+            "annotation_trace_candidate.label_id = toUUID(%(annotation_label_id)s)"
+        ) in compact_sql
+        assert "annotation_trace_candidate.created_at >= %(start_date)s" in compact_sql
+        assert "annotation_trace_candidate.created_at < %(end_date)s" in compact_sql
+        assert (
+            "PREWHERE trace_project_scan.project_id IN %(project_ids)s" in compact_sql
+        )
+        assert "argMax(" in compact_sql
+        assert "trace_project_scan.is_deleted" in compact_sql
+        assert "GROUP BY trace_project_scan.id" in compact_sql
+        assert "WHERE tupleElement(latest_state, 2) = 0" in compact_sql
+        assert (
+            "LEFT JOIN ( SELECT trace_id, tupleElement(latest_state, 1) AS project_id"
+            in compact_sql
+        )
+        assert "ON annotation_trace_project.trace_id = a.trace_id" in compact_sql
+        assert "annotation_trace_project.project_id IN %(project_ids)s" in compact_sql
+        assert "a.trace_id IN (" not in compact_sql
+        assert params["annotation_organization_id"] == config["organization_id"]
+
+    def test_v1_annotation_metric_preserves_trace_dictionary_scope(self):
+        config = _single_metric_config(
+            {
+                "id": "44444444-4444-4444-4444-444444444444",
+                "name": "quality",
+                "type": "annotation_metric",
+                "label_id": "44444444-4444-4444-4444-444444444444",
+                "output_type": "text",
+                "aggregation": "count",
+            }
+        )
+
+        sql, params, _ = DashboardQueryBuilder(config).build_all_queries()[0]
+
+        assert "dictGet('trace_dict', 'project_id', a.trace_id)" in sql
+        assert "FROM traces AS trace_project_scan" not in sql
+        assert "annotation_organization_id" not in params
 
     def test_user_breakdown_reads_bounded_direct_end_users_not_dictionary(self):
         config = _single_metric_config(

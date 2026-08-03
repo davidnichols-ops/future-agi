@@ -341,6 +341,7 @@ def _prefix_spans_columns(clause: str) -> str:
             "project_id",
             "_peerdb_is_deleted",
             "start_time",
+            "created_at",
             "parent_span_id",
             "end_user_id",
             "trace_session_id",
@@ -447,6 +448,11 @@ class DashboardQueryBuilder:
     # user labels are dictionary-backed. The v2 subclass flips this on because
     # the direct-write ``end_users`` table is authoritative there.
     _direct_end_users_available: bool = False
+
+    # The v1 dashboard retains the deployed trace dictionary. The direct-write
+    # v2 subclass resolves annotation trace ownership from the authoritative
+    # ``traces`` table so a locked read-only role needs no dictionary grants.
+    _direct_trace_project_scope_available: bool = False
 
     _DIRECT_USER_METRIC_EXPRESSIONS = {
         # Preserve the dictionary path's missing-label fallback: a live span
@@ -1363,17 +1369,52 @@ class DashboardQueryBuilder:
         order_parts = ["time_bucket"]
         select_parts.append(f"{agg_expr} AS value")
 
-        # model_hub_score has no project_id of its own that maps to
-        # tracer.Project, so resolve via trace_dict for trace-attached
-        # scores and via the spans table for span-attached scores.
+        # model_hub_score has no reliable tracer.Project foreign key for every
+        # historical row. V1 retains the deployed trace dictionary; direct-write
+        # V2 resolves the finite label/time candidate set through latest-live
+        # ``traces`` rows so the production read-only role needs no dictionary
+        # privilege. Span-attached scores continue to scope through ``spans``.
+        if self._direct_trace_project_scope_available:
+            params["annotation_organization_id"] = self.organization_id
+            annotation_trace_candidates = """
+                SELECT DISTINCT
+                    annotation_trace_candidate.trace_id AS trace_id
+                FROM model_hub_score AS annotation_trace_candidate
+                PREWHERE annotation_trace_candidate.organization_id =
+                             toUUID(%(annotation_organization_id)s)
+                  AND annotation_trace_candidate.label_id =
+                      toUUID(%(annotation_label_id)s)
+                  AND annotation_trace_candidate.created_at >= %(start_date)s
+                  AND annotation_trace_candidate.created_at < %(end_date)s
+                WHERE annotation_trace_candidate.trace_id IS NOT NULL
+            """
+            trace_projects = latest_live_trace_projects_sql(
+                candidate_trace_ids_sql=annotation_trace_candidates
+            )
+            trace_project_join = (
+                "LEFT JOIN ("
+                f"{trace_projects}"
+                ") AS annotation_trace_project "
+                "ON annotation_trace_project.trace_id = a.trace_id"
+            )
+            trace_project_scope = (
+                "(a.trace_id IS NOT NULL "
+                "AND annotation_trace_project.trace_id = a.trace_id "
+                "AND annotation_trace_project.project_id IN %(project_ids)s)"
+            )
+        else:
+            trace_project_join = ""
+            trace_project_scope = (
+                "(a.trace_id IS NOT NULL "
+                "AND dictGet('trace_dict', 'project_id', a.trace_id) "
+                "IN %(project_ids)s)"
+            )
+
         # Other source types (call_execution, dataset_row, …) are out of
         # scope for trace dashboards.
         where_parts = [
             (
-                "("
-                "(a.trace_id IS NOT NULL "
-                "AND dictGet('trace_dict', 'project_id', a.trace_id) "
-                "IN %(project_ids)s)"
+                f"({trace_project_scope}"
                 " OR "
                 "(a.observation_span_id IS NOT NULL "
                 "AND a.observation_span_id != '' "
@@ -1393,6 +1434,7 @@ class DashboardQueryBuilder:
         query = (
             f"SELECT {', '.join(select_parts)}\n"
             f"FROM model_hub_score AS a FINAL\n"
+            f"{trace_project_join}\n"
             f"WHERE {' AND '.join(where_parts)}\n"
             f"GROUP BY {', '.join(group_parts)}\n"
             f"ORDER BY {', '.join(order_parts)}"
