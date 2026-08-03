@@ -213,6 +213,67 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.recommended_filter_classify_batch_size() == 512
 
 
+def test_call_type_trace_filter_skips_unindexed_window_anchor() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _system_filter("call_type", "inbound")],
+    )
+
+    ordered_sql, _ = builder.build_filter_ordered_seed_page(
+        slice_start=END - timedelta(minutes=5),
+        slice_end=END,
+        limit=50,
+    )
+    match_sql, _ = builder.build_filter_match_query(["trace-a"])
+
+    assert builder.supports_filter_anchor_probe() is False
+    with pytest.raises(ValueError, match="indexed any-span filter"):
+        builder.build_filter_anchor_probe(limit=513)
+    assert "JSONExtract" not in ordered_sql
+    assert "parent_span_id IS NULL" in ordered_sql
+    assert "JSONExtract" in match_sql
+    assert builder.recommended_filter_seed_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 50
+
+
+def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+            _system_filter("call_type", "inbound"),
+        ],
+    )
+
+    anchor_sql, anchor_params = builder.build_filter_anchor_probe(limit=513)
+
+    assert builder.supports_filter_anchor_probe() is True
+    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in anchor_sql
+    assert "JSONExtract" not in anchor_sql
+    assert anchor_params["latest_filter_key_0"] == "final_status"
+    assert "latest_filter_param_1" not in anchor_params
+    assert builder.recommended_filter_seed_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 50
+
+
+def test_trace_candidate_classifier_prunes_to_request_partitions() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+    )
+
+    sql, params = builder.build_filter_match_query(["trace-a"])
+
+    prewhere = sql.split("GROUP BY trace_id, id, start_time", 1)[0]
+    assert "toDate(start_time) >= toDate(%(candidate_start_date)s)" in prewhere
+    assert "toDate(start_time) <= toDate(%(candidate_end_date)s)" in prewhere
+    assert "start_time >= %(candidate_start_date)s" in prewhere
+    assert "start_time < %(candidate_end_date)s" in prewhere
+    assert params["candidate_start_date"] == START
+    assert params["candidate_end_date"] == END
+
+
 def test_root_seed_replay_does_not_trust_one_raw_physical_root_id() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
@@ -2093,6 +2154,29 @@ class _FakeExecutor:
         return QueryResult(rows, len(rows), "clickhouse", 1.0)
 
 
+class _UnindexedAnySpanFakeBuilder(_FakeBuilder):
+    def supports_filter_anchor_probe(self) -> bool:
+        return False
+
+    def build_filter_ordered_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        before_start_time: datetime | None = None,
+        before_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        _, params = self.build_filter_seed_page(
+            slice_start=slice_start,
+            slice_end=slice_end,
+            limit=limit,
+            before_start_time=before_start_time,
+            before_id=before_id,
+        )
+        return "ordered_seed", params
+
+
 class _VersionedFakeExecutor(_FakeExecutor):
     """Apply the same raw-version table filter used by CH cursor reads."""
 
@@ -3199,6 +3283,27 @@ def test_any_span_seed_exhausts_sparse_year_before_root_ordered_page_n() -> None
     for executor in (first_executor, second_executor):
         seed_calls = [params for query, params in executor.calls if query == "seed"]
         assert min(call["slice_start"] for call in seed_calls) == window_start
+
+
+def test_unindexed_any_span_reader_starts_with_ordered_root_batches() -> None:
+    rows = _rows(1, 2, 3)
+    builder = _UnindexedAnySpanFakeBuilder(rows, seed_proves_order=False)
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+        deadline_ms=5_000,
+    )
+
+    seed_queries = [query for query, _ in executor.calls if query != "match"]
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == ["span-0"]
+    assert seed_queries == ["ordered_seed"]
 
 
 def test_any_span_customer_match_set_uses_200_candidate_query_budget() -> None:

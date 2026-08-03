@@ -606,6 +606,14 @@ def read_bounded_filter_page(
             # without an extra full-slice exhaustion read.
             seed_page_builder = ordered_seed_builder
             seed_proves_result_order = True
+        elif callable(ordered_seed_builder) and not seed_proves_result_order:
+            # Some any-span predicates (notably structured JSON/call_type)
+            # have no selective index. A whole-window anchor probe would be
+            # the broad scan this bounded reader exists to avoid, so start
+            # directly with finite newest-root batches and classify only those
+            # candidate trace IDs.
+            seed_page_builder = ordered_seed_builder
+            seed_proves_result_order = True
 
         for seed_index in range(max_seed_attempts if use_seed_loop else 0):
             if slice_end <= request_start:

@@ -321,8 +321,17 @@ class ClickHouseFilterBuilder:
     # Voice system metrics using expressions on span_attributes_raw JSON
     VOICE_SYSTEM_METRIC_STR_EXPRS: dict[str, str] = {
         "call_type": (
-            "if(JSONExtractString(span_attributes_raw, 'raw_log', 'type') = 'inboundPhoneCall', "
-            "'inbound', 'outbound')"
+            "multiIf("
+            "coalesce("
+            "nullIf(JSONExtractString(span_attributes_raw, 'raw_log', 'type'), ''), "
+            "nullIf(JSONExtractString(JSONExtractString(span_attributes_raw, 'raw_log'), 'type'), ''), "
+            "nullIf(JSONExtractString(span_attr_str['raw_log'], 'type'), '')"
+            ") = 'inboundPhoneCall', 'inbound', "
+            "coalesce("
+            "nullIf(JSONExtractString(span_attributes_raw, 'raw_log', 'type'), ''), "
+            "nullIf(JSONExtractString(JSONExtractString(span_attributes_raw, 'raw_log'), 'type'), ''), "
+            "nullIf(JSONExtractString(span_attr_str['raw_log'], 'type'), '')"
+            ") = 'outboundPhoneCall', 'outbound', null)"
         ),
     }
 

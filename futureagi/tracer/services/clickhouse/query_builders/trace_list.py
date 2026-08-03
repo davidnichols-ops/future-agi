@@ -28,6 +28,7 @@ from tracer.services.clickhouse.query_builders.eval_status import (
 )
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+    LatestFilterPredicate,
     partition_trace_filter_plans,
     supports_trace_filters,
     targets_trace_filter_domain,
@@ -240,10 +241,36 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
         return not any(plan.scope == "any" for plan in plans)
 
+    def _filter_anchor_plans(self) -> list[LatestFilterPredicate]:
+        """Return directly selective any-span leaves safe for a broad probe.
+
+        Typed Map/system predicates can use deployed skip indexes and stop at
+        the 513-row sentinel.  Structured JSON extraction has no such index;
+        probing it across the complete UI window was itself the expensive
+        query and could consume the endpoint deadline before the bounded
+        root-ordered fallback ran.
+        """
+
+        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        return [
+            plan
+            for plan in plans
+            if plan.scope == "any" and "JSONExtract" not in plan.seed_predicate
+        ]
+
+    def _has_unindexed_any_span_filter(self) -> bool:
+        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        return any(
+            plan.scope == "any" and "JSONExtract" in plan.seed_predicate
+            for plan in plans
+        )
+
     def recommended_filter_seed_batch_size(self) -> int:
         """Use the production-proven finite 512-trace seed/classifier batch."""
 
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        if self._has_unindexed_any_span_filter():
+            return 50
         return 512 if any(plan.scope == "any" for plan in plans) else 50
 
     def recommended_filter_classify_batch_size(self) -> int | None:
@@ -257,6 +284,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if self._bounded_bulk_scan:
             return 200
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        if self._has_unindexed_any_span_filter():
+            return 50
         return 512 if any(plan.scope == "any" for plan in plans) else 50
 
     def bounded_filter_seed_identity(
@@ -288,8 +317,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def supports_filter_anchor_probe(self) -> bool:
         """Whether a direct any-span leaf can classify sparse vs common."""
 
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
-        return any(plan.scope == "any" for plan in plans)
+        return bool(self._filter_anchor_plans())
 
     def build_filter_anchor_probe(self, *, limit: int) -> tuple[str, dict[str, Any]]:
         """Return a finite unordered any-span candidate sentinel.
@@ -306,11 +334,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             raise ValueError("anchor probe limit must include a sentinel")
         request_start, request_end = self.parse_time_range(self.filters)
         self.start_date, self.end_date = request_start, request_end
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
-        any_span_plans = [plan for plan in plans if plan.scope == "any"]
-        if not any_span_plans:
-            raise ValueError("trace anchor probe requires an any-span filter")
-        anchor = any_span_plans[0]
+        anchor_plans = self._filter_anchor_plans()
+        if not anchor_plans:
+            raise ValueError("trace anchor probe requires an indexed any-span filter")
+        anchor = anchor_plans[0]
         anchor_params = {
             key: value
             for key, value in anchor.params.items()
@@ -668,6 +695,18 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     "candidate_end_date": request_end,
                 }
             )
+        candidate_time_fragment = ""
+        if scope_to_request_window:
+            # start_time is part of the immutable physical span identity. All
+            # versions of an in-window span therefore stay in the same daily
+            # partition, so pruning outside partitions before argMax cannot
+            # hide a newer version or change latest-state membership.
+            candidate_time_fragment = """
+                  AND toDate(start_time) >= toDate(%(candidate_start_date)s)
+                  AND toDate(start_time) <= toDate(%(candidate_end_date)s)
+                  AND start_time >= %(candidate_start_date)s
+                  AND start_time < %(candidate_end_date)s
+            """
         project_version_fragment = ""
         if self.project_version_id:
             params["project_version_id"] = self.project_version_id
@@ -892,6 +931,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 PREWHERE {self.project_filter_sql()}
                   {project_version_fragment}
                   AND trace_id IN %(candidate_trace_ids)s
+                  {candidate_time_fragment}
                 GROUP BY trace_id, id, start_time
             )
             WHERE latest_is_deleted = 0

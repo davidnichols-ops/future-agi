@@ -327,7 +327,15 @@ def _prefix_spans_columns(clause: str) -> str:
     import re
 
     # Prefix bare column names (not already prefixed and not inside %(...))
-    for col in ("project_id", "_peerdb_is_deleted", "start_time", "parent_span_id"):
+    for col in (
+        "project_id",
+        "_peerdb_is_deleted",
+        "start_time",
+        "parent_span_id",
+        "span_attr_str",
+        "span_attr_num",
+        "span_attr_bool",
+    ):
         # Match bare column name not preceded by . or inside %(...)
         clause = re.sub(
             rf"(?<!\.)(?<!%\()(?<!\w){col}(?!\w)(?!s\))",
@@ -646,6 +654,15 @@ class DashboardQueryBuilder:
 
         bd_infos = self._resolve_all_breakdowns(params)
         has_annotation_bd = any(b["type"] == "annotation" for b in bd_infos)
+        # A custom-attribute breakdown has values only on rows that carry the
+        # selected Map key. Without this predicate ClickHouse must materialize
+        # the complete Map value column for every span in the window, and rows
+        # without the key become a misleading default empty/zero bucket. The
+        # key predicate is also the expression covered by the deployed Map-key
+        # bloom indexes.
+        all_where.extend(
+            b["presence_predicate"] for b in bd_infos if b.get("presence_predicate")
+        )
 
         if bd_infos:
             bd_exprs = []
@@ -1208,7 +1225,8 @@ class DashboardQueryBuilder:
         attr_type = metric.get("attribute_type", "number")
 
         if attr_type == "number":
-            col_expr = f"span_attr_num['{attr_key}']"
+            attr_map = "span_attr_num"
+            col_expr = f"{attr_map}['{attr_key}']"
         else:
             if aggregation in _NUMERIC_ONLY_AGGREGATIONS:
                 raise InvalidMetricCombinationError(
@@ -1216,7 +1234,8 @@ class DashboardQueryBuilder:
                     f"'{attr_key}'. Use count or count distinct, or pick a "
                     f"numeric attribute."
                 )
-            col_expr = f"span_attr_str['{attr_key}']"
+            attr_map = "span_attr_str"
+            col_expr = f"{attr_map}['{attr_key}']"
 
         agg_expr = AGGREGATIONS.get(aggregation, "avg({col})").format(col=col_expr)
 
@@ -1235,6 +1254,11 @@ class DashboardQueryBuilder:
         where_clauses, params = self._build_where_clauses(
             "spans", "start_time", per_metric_filters, params
         )
+        # Missing Map keys are not metric observations. Besides preventing a
+        # default empty string/zero from entering count/avg results, this lets
+        # ClickHouse use the deployed typed-Map key bloom index instead of
+        # deserializing the value Map for every span in the window.
+        where_clauses.append(f"mapContains({attr_map}, '{attr_key}')")
 
         subquery_clauses = self._build_subquery_filters(
             self.global_filters + per_metric_filters, params, "ca_"
@@ -1463,12 +1487,18 @@ class DashboardQueryBuilder:
             elif bd_type == "custom_attribute":
                 safe_name = _sanitize_attr_key(bd_name)
                 attr_type = bd.get("attribute_type", "string")
-                expr = (
-                    f"span_attr_num['{safe_name}']"
-                    if attr_type == "number"
-                    else f"span_attr_str['{safe_name}']"
+                attr_map = "span_attr_num" if attr_type == "number" else "span_attr_str"
+                expr = f"{attr_map}['{safe_name}']"
+                result.append(
+                    {
+                        "type": "column",
+                        "expr": expr,
+                        "join": None,
+                        "presence_predicate": (
+                            f"mapContains({attr_map}, '{safe_name}')"
+                        ),
+                    }
                 )
-                result.append({"type": "column", "expr": expr, "join": None})
 
             elif bd_type == "annotation_metric":
                 label_id = bd.get("label_id") or bd_name

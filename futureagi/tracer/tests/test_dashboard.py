@@ -2256,6 +2256,30 @@ class TestDashboardQueryBuilder:
         sql, _, _ = queries[0]
         assert "span_attr_num" in sql
         assert "custom.score" in sql
+        assert "mapContains(span_attr_num, 'custom.score')" in sql
+
+    def test_v2_string_attribute_metric_uses_map_key_bloom_predicate(self):
+        config = {
+            "project_ids": ["00000000-0000-4000-8000-000000000001"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": "final_status",
+                    "name": "final_status",
+                    "type": "custom_attribute",
+                    "attribute_key": "final_status",
+                    "attribute_type": "string",
+                    "aggregation": "count_distinct",
+                }
+            ],
+        }
+
+        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "uniq(attrs_string['final_status'])" in sql
+        assert "mapContains(attrs_string, 'final_status')" in sql
+        assert "span_attr_str" not in sql
 
     def test_multiple_metrics(self, sample_query_config):
         sample_query_config["metrics"].append(
@@ -2313,6 +2337,35 @@ class TestDashboardQueryBuilder:
         sql, _, _ = queries[0]
         assert "span_attr_str" in sql
         assert "breakdown_value" in sql
+        assert "mapContains(span_attr_str, 'env')" in sql
+
+    def test_v2_custom_attribute_breakdown_uses_map_key_bloom_predicate(self):
+        config = {
+            "project_ids": ["00000000-0000-4000-8000-000000000001"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": "latency",
+                    "name": "latency",
+                    "type": "system_metric",
+                    "aggregation": "avg",
+                }
+            ],
+            "breakdowns": [
+                {
+                    "type": "custom_attribute",
+                    "name": "final_status",
+                    "attribute_type": "string",
+                }
+            ],
+        }
+
+        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "attrs_string['final_status'] AS breakdown_value" in sql
+        assert "mapContains(attrs_string, 'final_status')" in sql
+        assert "span_attr_str" not in sql
 
 
 class TestDashboardAttrRollupRouting:

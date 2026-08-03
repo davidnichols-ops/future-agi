@@ -43,3 +43,25 @@ def test_voice_filter_alias_resolves_to_stored_key(col_id, stored_key):
         ]
     )
     assert stored_key in where, f"{col_id} must read '{stored_key}', got: {where[:200]}"
+
+
+@pytest.mark.unit
+def test_call_type_filter_excludes_missing_or_unknown_raw_type():
+    where, _ = ClickHouseFilterBuilder().translate(
+        [
+            {
+                "column_id": "call_type",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "outbound",
+                    "col_type": "SYSTEM_METRIC",
+                },
+            }
+        ]
+    )
+
+    assert "multiIf(" in where
+    assert "= 'inboundPhoneCall', 'inbound'" in where
+    assert "= 'outboundPhoneCall', 'outbound', null)" in where
+    assert "'inbound', 'outbound')" not in where
