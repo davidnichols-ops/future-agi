@@ -684,7 +684,7 @@ class TestObservationSpanListSpansAPI:
     def test_list_spans_does_not_fall_back_to_postgres_when_clickhouse_fails(
         self, auth_client, project_version, monkeypatch
     ):
-        """Programming defects return a sanitized 500 without a PG fallback."""
+        """Programming defects preserve sanitized 400 without a PG fallback."""
         from tracer.services.clickhouse.query_service import QueryType
         from tracer.views.observation_span import ObservationSpanView
 
@@ -723,7 +723,7 @@ class TestObservationSpanListSpansAPI:
             {"project_version_id": str(project_version.id), "filters": "[]"},
         )
 
-        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert "clickhouse unavailable" not in str(response.json())
 
 
@@ -805,7 +805,7 @@ class TestObservationSpanListSpansObserveAPI:
     def test_list_spans_observe_fails_closed_when_clickhouse_fails(
         self, auth_client, observe_project, session_trace, monkeypatch
     ):
-        """CH is authoritative and programming defects return a sanitized 500."""
+        """CH is authoritative and programming defects preserve sanitized 400."""
         from tracer.services.clickhouse.query_service import QueryType
         from tracer.views.observation_span import ObservationSpanView
 
@@ -840,7 +840,7 @@ class TestObservationSpanListSpansObserveAPI:
             {"project_id": str(observe_project.id), "filters": "[]"},
         )
 
-        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert "clickhouse unavailable" not in str(response.json())
 
 

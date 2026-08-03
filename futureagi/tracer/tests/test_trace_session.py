@@ -795,7 +795,7 @@ class TestTraceSessionGraphAPI:
             RuntimeError("secret compiler state"),
         ],
     )
-    def test_session_graph_query_defects_are_sanitized_500_without_pg_fallback(
+    def test_session_graph_query_defects_are_sanitized_400_without_pg_fallback(
         self,
         auth_client,
         observe_project,
@@ -826,7 +826,7 @@ class TestTraceSessionGraphAPI:
                 format="json",
             )
 
-        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
         rendered = str(response.data)
         assert "secret" not in rendered
         assert "unknown identifier" not in rendered
@@ -1310,7 +1310,7 @@ class TestTraceSessionWorkspaceScopeAPI:
         assert settings["timeout_overflow_mode"] == "throw"
         assert settings["read_overflow_mode"] == "throw"
 
-    def test_session_message_filter_query_defect_is_sanitized_500(
+    def test_session_message_filter_query_defect_is_sanitized_400(
         self, auth_client, observe_project
     ):
         analytics = mock.Mock()
@@ -1330,7 +1330,7 @@ class TestTraceSessionWorkspaceScopeAPI:
                 },
             )
 
-        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
         rendered = str(response.data)
         assert "secret unknown identifier" not in rendered
         assert "DB::Exception" not in rendered
@@ -1370,7 +1370,7 @@ class TestTraceSessionWorkspaceScopeAPI:
             RuntimeError("secret session filter compiler state"),
         ],
     )
-    def test_session_filter_values_query_defects_are_sanitized_500(
+    def test_session_filter_values_query_defects_are_sanitized_400(
         self,
         auth_client,
         observe_project,
@@ -1388,7 +1388,7 @@ class TestTraceSessionWorkspaceScopeAPI:
                 {"project_id": str(observe_project.id), "column": "user_id"},
             )
 
-        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
         rendered = str(response.data)
         assert "secret" not in rendered
         assert "unknown identifier" not in rendered
@@ -1479,7 +1479,7 @@ class TestTraceSessionWorkspaceScopeAPI:
             RuntimeError("secret session compiler invariant failed"),
         ],
     )
-    def test_session_list_query_defects_are_sanitized_500(
+    def test_session_list_query_defects_are_sanitized_400(
         self,
         auth_client,
         observe_project,
@@ -1497,7 +1497,7 @@ class TestTraceSessionWorkspaceScopeAPI:
                 {"project_id": str(observe_project.id)},
             )
 
-        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
         rendered = str(response.data)
         assert "secret" not in rendered
         assert "unknown identifier" not in rendered
