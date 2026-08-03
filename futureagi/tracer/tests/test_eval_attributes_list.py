@@ -339,7 +339,9 @@ class TestSpanAttributeKeysPartitionPruning:
         assert params["segment_start"] < params["segment_end"]
         assert "LIMIT 1 BY project_id, trace_id, id, start_time" in sql
         assert "GROUP BY" not in sql
-        assert "ORDER BY" not in sql
+        assert (
+            "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC" in sql
+        )
 
     def test_reads_keys_subcolumn_not_whole_map(self, monkeypatch):
         sql = self._capture_calls(monkeypatch, recent_days=7)[0][0]

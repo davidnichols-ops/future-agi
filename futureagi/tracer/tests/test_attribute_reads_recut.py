@@ -140,6 +140,44 @@ def _candidate(
     }
 
 
+def _candidate_key(row: dict[str, Any]) -> tuple[datetime, str, str, str]:
+    return (
+        row["start_time"],
+        str(row["id"]),
+        str(row["trace_id"]),
+        str(row["project_id"]),
+    )
+
+
+def _keyset_candidate_page(
+    rows: list[dict[str, Any]], call: QueryCall
+) -> list[dict[str, Any]]:
+    """Apply the candidate SQL's physical-identity order to fixture rows."""
+
+    unique = {
+        (
+            str(row["project_id"]),
+            str(row["trace_id"]),
+            str(row["id"]),
+            row["start_time"],
+        ): row
+        for row in rows
+    }
+    ordered = sorted(unique.values(), key=_candidate_key, reverse=True)
+    if "candidate_before_start_us" in call.params:
+        before = (
+            datetime.fromtimestamp(
+                call.params["candidate_before_start_us"] / 1_000_000,
+                tz=UTC,
+            ),
+            call.params["candidate_before_id"],
+            call.params["candidate_before_trace_id"],
+            call.params["candidate_before_project_id"],
+        )
+        ordered = [row for row in ordered if _candidate_key(row) < before]
+    return ordered[: call.params["candidate_limit"]]
+
+
 class _ProjectScope:
     def __init__(self, project_ids):
         self.project_ids = project_ids
@@ -196,7 +234,10 @@ def test_empty_key_inventory_walks_five_bounded_ch25_segments():
         assert "SELECT DISTINCT" not in upper_sql
         assert "LIMIT 1 BY PROJECT_ID, TRACE_ID, ID, START_TIME" in upper_sql
         assert "GROUP BY" not in upper_sql
-        assert "ORDER BY" not in upper_sql
+        assert (
+            "ORDER BY START_TIME DESC, ID DESC, TRACE_ID DESC, PROJECT_ID DESC"
+            in upper_sql
+        )
         assert call.timeout_ms <= 1_500
         assert call.settings["max_threads"] == 1
         assert call.settings["optimize_use_projections"] == 0
@@ -314,10 +355,13 @@ def test_general_exact_key_probe_finds_rare_key_in_later_band(
     assert "argMin(" not in candidate_sql
     assert "LIMIT 1 BY project_id, trace_id, id, start_time" in candidate_sql
     assert "GROUP BY" not in candidate_sql
-    assert "ORDER BY" not in candidate_sql
+    assert (
+        "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC"
+        in candidate_sql
+    )
 
 
-def test_exact_key_probe_exclusion_pages_past_512_stale_latest_states() -> None:
+def test_exact_key_probe_keyset_pages_past_512_stale_latest_states() -> None:
     key = "final_status"
     first_page = [
         _candidate(
@@ -340,10 +384,8 @@ def test_exact_key_probe_exclusion_pages_past_512_stale_latest_states() -> None:
 
     def respond(call, _):
         if "segment_start" in call.params:
-            if "excluded_candidate_identities" not in call.params:
-                # The +1 row is a truncation sentinel, not part of the replay.
-                return [*first_page, live_candidate]
-            return [live_candidate]
+            # The +1 row is a truncation sentinel, not part of the replay.
+            return _keyset_candidate_page([*first_page, live_candidate], call)
         candidate_ids = call.params["candidate_ids_0"]
         return [
             _target_row(
@@ -372,14 +414,94 @@ def test_exact_key_probe_exclusion_pages_past_512_stale_latest_states() -> None:
         call for call in executor.calls if "segment_start" in call.params
     ]
     assert len(candidate_calls) == 2
-    assert "ORDER BY" not in candidate_calls[0].sql
-    assert "excluded_candidate_identities" not in candidate_calls[0].params
-    exclusions = candidate_calls[1].params["excluded_candidate_identities"]
-    assert len(exclusions) == ATTRIBUTE_READ_CANDIDATE_LIMIT
-    assert exclusions[-1][2] == first_page[-1]["id"]
-    assert "NOT IN %(excluded_candidate_identities)s" in candidate_calls[1].sql
+    assert (
+        "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC"
+        in candidate_calls[0].sql
+    )
+    assert "candidate_before_start_us" not in candidate_calls[0].params
+    cursor = candidate_calls[1].params
+    assert cursor["candidate_before_id"] == first_page[-1]["id"]
+    assert cursor["candidate_before_trace_id"] == first_page[-1]["trace_id"]
+    assert cursor["candidate_before_project_id"] == PROJECT_A
+    assert "candidate_before_start_us" in cursor
+    assert "NOT IN" not in candidate_calls[1].sql
     assert all(key not in call.sql for call in executor.calls)
     assert all(call.params["attribute_key"] == key for call in executor.calls)
+
+
+def test_exact_key_keyset_is_bounded_and_lossless_past_2560_tied_candidates():
+    key = "final_status"
+    physical_count = 5 * ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"shared-{index // 2:04d}",
+            trace_id=f"trace-{index:04d}",
+            # Four identities share every timestamp; two also share an id.
+            start_time=NOW - timedelta(seconds=index // 4 + 1),
+        )
+        for index in range(physical_count)
+    ]
+    ordered = sorted(candidates, key=_candidate_key, reverse=True)
+    live_identity = (
+        ordered[-1]["trace_id"],
+        ordered[-1]["id"],
+        _unix_microseconds(ordered[-1]["start_time"]),
+    )
+    by_identity = {
+        (row["trace_id"], row["id"], _unix_microseconds(row["start_time"])): row
+        for row in candidates
+    }
+    replayed: list[tuple[str, str, int]] = []
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            # A duplicate raw version of one physical span must not create a
+            # second candidate after LIMIT 1 BY.
+            return _keyset_candidate_page([*candidates, candidates[17]], call)
+        encoded = list(call.params["candidate_physical_identities_0"])
+        replayed.extend(encoded)
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=trace_id,
+                start_time=by_identity[(trace_id, span_id, start_us)]["start_time"],
+                string="Rejected" if identity == live_identity else None,
+            )
+            for identity in encoded
+            for trace_id, span_id, start_us in [identity]
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+    ).discover_keys([PROJECT_A], exact_key=key, horizon_days=7)
+
+    assert read.rows == (AttributeKeyRow(key, "string", 1),)
+    assert read.metadata.query_complete is True
+    assert read.metadata.query_count == 12
+    assert len(replayed) == physical_count
+    assert len(set(replayed)) == physical_count
+    assert set(replayed) == set(by_identity)
+
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert len(candidate_calls) == 6
+    assert all(
+        "excluded_candidate_identities" not in call.params for call in candidate_calls
+    )
+    assert all(" NOT IN " not in call.sql for call in candidate_calls)
+    assert (
+        max(len(call.sql) + len(repr(call.params)) for call in candidate_calls) < 8_192
+    )
+    continuation_sizes = [
+        len(call.sql) + len(repr(call.params)) for call in candidate_calls[1:]
+    ]
+    assert max(continuation_sizes) - min(continuation_sizes) < 64
 
 
 def test_exact_key_continuation_stops_at_hard_page_cap_and_degrades() -> None:
@@ -427,11 +549,14 @@ def test_exact_key_continuation_stops_at_hard_page_cap_and_degrades() -> None:
     final_candidate_call = [
         call for call in executor.calls if "segment_start" in call.params
     ][-1]
-    assert len(final_candidate_call.params["excluded_candidate_identities"]) == (
-        ATTRIBUTE_READ_CANDIDATE_LIMIT
-        * (ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT - 1)
-    )
-    assert "ORDER BY" not in final_candidate_call.sql
+    assert set(final_candidate_call.params) >= {
+        "candidate_before_start_us",
+        "candidate_before_id",
+        "candidate_before_trace_id",
+        "candidate_before_project_id",
+    }
+    assert len(repr(final_candidate_call.params)) < ATTRIBUTE_READ_CANDIDATE_LIMIT * 4
+    assert "NOT IN" not in final_candidate_call.sql
 
 
 def test_exact_key_page_cap_is_global_across_horizon_bands() -> None:
@@ -531,7 +656,10 @@ def test_browse_inventory_stops_after_513th_identity_and_marks_sampling_incomple
     )
     assert "LIMIT 1 BY project_id, trace_id, id, start_time" in candidate_call.sql
     assert "GROUP BY" not in candidate_call.sql
-    assert "ORDER BY" not in candidate_call.sql
+    assert (
+        "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC"
+        in candidate_call.sql
+    )
     assert candidate_call.params["candidate_limit"] == (
         ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
     )
@@ -1251,9 +1379,8 @@ def test_value_read_pages_dense_recent_band_and_still_covers_older_band():
     def respond(call, _):
         if "segment_start" in call.params:
             segment_start = call.params["segment_start"]
-            exclusions = call.params.get("excluded_candidate_identities", ())
             if segment_start == recent_start:
-                return recent if not exclusions else [recent[-1]]
+                return _keyset_candidate_page(recent, call)
             if segment_start == oldest_start:
                 return [older]
             return []
@@ -1289,9 +1416,8 @@ def test_value_read_pages_dense_recent_band_and_still_covers_older_band():
         if call.params.get("segment_start") == recent_start
     ]
     assert len(recent_candidate_calls) == 2
-    assert (
-        len(recent_candidate_calls[1].params["excluded_candidate_identities"])
-        == ATTRIBUTE_READ_CANDIDATE_LIMIT
+    assert recent_candidate_calls[1].params["candidate_before_id"] == (
+        recent[ATTRIBUTE_READ_CANDIDATE_LIMIT - 1]["id"]
     )
 
 
@@ -1318,9 +1444,7 @@ def test_value_search_pages_past_512_stale_matches_to_live_value():
         if "segment_start" in call.params:
             if call.params["segment_start"] != recent_start:
                 return []
-            if "excluded_candidate_identities" not in call.params:
-                return [*stale, live]
-            return [live]
+            return _keyset_candidate_page([*stale, live], call)
         return [
             _target_row(
                 PROJECT_A,
@@ -1344,11 +1468,9 @@ def test_value_search_pages_past_512_stale_matches_to_live_value():
     candidates = [call for call in executor.calls if "segment_start" in call.params]
     assert all(call.params["attribute_search"] == "Rejected" for call in candidates)
     continuation = next(
-        call for call in candidates if "excluded_candidate_identities" in call.params
+        call for call in candidates if "candidate_before_start_us" in call.params
     )
-    assert len(continuation.params["excluded_candidate_identities"]) == (
-        ATTRIBUTE_READ_CANDIDATE_LIMIT
-    )
+    assert continuation.params["candidate_before_id"] == stale[-1]["id"]
 
 
 def test_incomplete_global_latest_replay_fails_closed_without_retry():
@@ -1472,14 +1594,15 @@ def test_each_public_operation_starts_fresh_wall_budget_at_call_boundary():
 def test_candidate_sample_cap_is_explicitly_degraded_and_query_count_bounded():
     starts_by_id: dict[str, datetime] = {}
     recent_start = adaptive_attribute_windows(NOW)[0][0]
+    recent_page = 0
 
     def respond(call, _):
+        nonlocal recent_page
         if "segment_start" in call.params:
             if call.params["segment_start"] != recent_start:
                 return []
-            page = len(call.params.get("excluded_candidate_identities", ())) // (
-                ATTRIBUTE_READ_CANDIDATE_LIMIT
-            )
+            page = recent_page
+            recent_page += 1
             rows = [
                 _candidate(
                     PROJECT_A,

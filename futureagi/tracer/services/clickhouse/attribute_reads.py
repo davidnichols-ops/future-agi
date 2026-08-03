@@ -343,6 +343,7 @@ _CANDIDATE_SQL = """
       AND start_time < %(segment_end)s
     WHERE is_deleted = 0
       AND ({candidate_predicate})
+    ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC
     LIMIT 1 BY project_id, trace_id, id, start_time
     LIMIT %(candidate_limit)s
 """
@@ -360,6 +361,7 @@ _STRATIFIED_CANDIDATE_SQL = """
       AND start_time < %(segment_end)s
     WHERE is_deleted = 0
       AND ({candidate_predicate})
+    ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC
     LIMIT 1 BY project_id, trace_id, id, start_time
     LIMIT %(candidate_limit)s
 """
@@ -797,7 +799,7 @@ class AttributeReadSelector:
         attribute_key: str | None,
         attribute_search: str | None = None,
         stratified: bool = False,
-        excluded_identities: tuple[PhysicalSpanIdentity, ...] = (),
+        before_identity: PhysicalSpanIdentity | None = None,
         candidate_limit: int,
     ) -> tuple[tuple[PhysicalSpanIdentity, ...], bool]:
         segment_start, segment_end = segment
@@ -819,26 +821,34 @@ class AttributeReadSelector:
             # indexes.  Disabling skip-index planning avoids building useless
             # index conditions; primary-key and partition pruning remain on.
             query_settings = {"use_skip_indexes": 0}
-        if excluded_identities:
-            max_exclusions = ATTRIBUTE_READ_CANDIDATE_LIMIT * (
-                ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT - 1
+        if before_identity is not None:
+            before_project_id, before_trace_id, before_id, before_start_time = (
+                before_identity
             )
-            if len(excluded_identities) > max_exclusions:
-                raise ValueError("candidate exclusion set exceeds bounded limit")
-            params["excluded_candidate_identities"] = tuple(
-                (
-                    project_id,
-                    trace_id,
-                    span_id,
-                    _unix_microseconds(start_time),
-                )
-                for project_id, trace_id, span_id, start_time in excluded_identities
+            if (
+                before_project_id not in project_ids
+                or not segment_start <= before_start_time < segment_end
+            ):
+                raise ValueError("candidate keyset must stay inside its segment")
+            params.update(
+                {
+                    "candidate_before_start_us": _unix_microseconds(before_start_time),
+                    "candidate_before_id": before_id,
+                    "candidate_before_trace_id": before_trace_id,
+                    "candidate_before_project_id": before_project_id,
+                }
             )
             predicate = (
                 f"({predicate}) AND "
-                "(toString(project_id), trace_id, id, "
-                "toUnixTimestamp64Micro(start_time)) "
-                "NOT IN %(excluded_candidate_identities)s"
+                "(toUnixTimestamp64Micro(start_time) "
+                "< %(candidate_before_start_us)s "
+                "OR (toUnixTimestamp64Micro(start_time) "
+                "= %(candidate_before_start_us)s AND "
+                "(id < %(candidate_before_id)s "
+                "OR (id = %(candidate_before_id)s AND "
+                "(trace_id < %(candidate_before_trace_id)s "
+                "OR (trace_id = %(candidate_before_trace_id)s AND "
+                "project_id < toUUID(%(candidate_before_project_id)s)))))))"
             )
         candidate_sql = self._single_project_scope_sql(
             candidate_sql, project_ids, params
@@ -1231,7 +1241,7 @@ class AttributeReadSelector:
         targeted_candidate_pages = 0
         candidate_scan_halted = False
         for segment in windows:
-            excluded_candidate_ids: list[PhysicalSpanIdentity] = []
+            before_identity: PhysicalSpanIdentity | None = None
             while True:
                 if (
                     exact_key is not None
@@ -1248,7 +1258,7 @@ class AttributeReadSelector:
                         predicate=predicate,
                         attribute_key=exact_key,
                         stratified=exact_key is None,
-                        excluded_identities=tuple(excluded_candidate_ids),
+                        before_identity=before_identity,
                         candidate_limit=ATTRIBUTE_READ_CANDIDATE_LIMIT,
                     )
                     if exact_key is not None:
@@ -1257,11 +1267,15 @@ class AttributeReadSelector:
                         sql=(
                             _LATEST_TYPED_TARGET_SQL
                             if exact_key is not None and not self._reads_json_overflow
-                            else _LATEST_TARGET_SQL
-                            if exact_key is not None
-                            else _LATEST_TYPED_BROWSE_SQL
-                            if not self._reads_json_overflow
-                            else _LATEST_BROWSE_SQL
+                            else (
+                                _LATEST_TARGET_SQL
+                                if exact_key is not None
+                                else (
+                                    _LATEST_TYPED_BROWSE_SQL
+                                    if not self._reads_json_overflow
+                                    else _LATEST_BROWSE_SQL
+                                )
+                            )
                         ),
                         project_ids=projects,
                         candidate_ids=candidate_ids,
@@ -1307,8 +1321,9 @@ class AttributeReadSelector:
                         truncated = truncated or unsupported_value_seen
 
                 # Generic browse remains a single sampled page. Exact-key
-                # discovery alone may exclude and continue past stale/cleared
-                # candidate identities.
+                # discovery alone may continue past stale/cleared candidate
+                # identities with the final ordered physical identity as its
+                # fixed-size keyset cursor.
                 if exact_key is None:
                     truncated = truncated or segment_truncated
                     if segment_truncated:
@@ -1330,7 +1345,7 @@ class AttributeReadSelector:
                     truncated = True
                     candidate_scan_halted = True
                     break
-                excluded_candidate_ids.extend(candidate_ids)
+                before_identity = candidate_ids[-1]
 
             if budget_exceeded or candidate_scan_halted:
                 break
@@ -1378,9 +1393,7 @@ class AttributeReadSelector:
                 error_code=(
                     "read_budget_exceeded"
                     if budget_exceeded
-                    else "sample_limit"
-                    if truncated
-                    else None
+                    else "sample_limit" if truncated else None
                 ),
                 window_start=covered_start,
                 window_end=overall_end,
@@ -1462,13 +1475,13 @@ class AttributeReadSelector:
         budget_exceeded = False
         covered_start = overall_end
         # Each state is one disjoint adaptive time band. Continue candidate
-        # pages by excluding only identities already replayed in that band.
+        # pages from the final ordered physical identity replayed in that band.
         # Round-robin traversal guarantees the first page of every older band
         # before a dense recent band consumes the finite continuation budget.
         segment_states: list[dict[str, Any]] = [
             {
                 "segment": segment,
-                "excluded": [],
+                "before_identity": None,
                 "pages": 0,
                 "complete": False,
             }
@@ -1497,7 +1510,7 @@ class AttributeReadSelector:
                         predicate=predicate,
                         attribute_key=key,
                         attribute_search=pushed_search,
-                        excluded_identities=tuple(state["excluded"]),
+                        before_identity=state["before_identity"],
                         candidate_limit=ATTRIBUTE_READ_CANDIDATE_LIMIT,
                     )
                     rows = self._verify_latest(
@@ -1559,7 +1572,7 @@ class AttributeReadSelector:
                     truncated = True
                     state["complete"] = True
                 else:
-                    state["excluded"].extend(candidate_ids)
+                    state["before_identity"] = candidate_ids[-1]
 
             if budget_exceeded or not progressed:
                 break
@@ -1622,9 +1635,7 @@ class AttributeReadSelector:
                 error_code=(
                     "read_budget_exceeded"
                     if budget_exceeded
-                    else "sample_limit"
-                    if truncated
-                    else None
+                    else "sample_limit" if truncated else None
                 ),
                 window_start=covered_start,
                 window_end=overall_end,
@@ -1755,9 +1766,7 @@ class AttributeReadSelector:
                 error_code=(
                     "read_budget_exceeded"
                     if budget_exceeded
-                    else "sample_limit"
-                    if truncated
-                    else None
+                    else "sample_limit" if truncated else None
                 ),
                 window_start=covered_start,
                 window_end=overall_end,
