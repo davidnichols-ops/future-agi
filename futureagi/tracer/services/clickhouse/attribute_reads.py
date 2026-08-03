@@ -1393,7 +1393,9 @@ class AttributeReadSelector:
                 error_code=(
                     "read_budget_exceeded"
                     if budget_exceeded
-                    else "sample_limit" if truncated else None
+                    else "sample_limit"
+                    if truncated
+                    else None
                 ),
                 window_start=covered_start,
                 window_end=overall_end,
@@ -1635,7 +1637,9 @@ class AttributeReadSelector:
                 error_code=(
                     "read_budget_exceeded"
                     if budget_exceeded
-                    else "sample_limit" if truncated else None
+                    else "sample_limit"
+                    if truncated
+                    else None
                 ),
                 window_start=covered_start,
                 window_end=overall_end,
@@ -1766,7 +1770,9 @@ class AttributeReadSelector:
                 error_code=(
                     "read_budget_exceeded"
                     if budget_exceeded
-                    else "sample_limit" if truncated else None
+                    else "sample_limit"
+                    if truncated
+                    else None
                 ),
                 window_start=covered_start,
                 window_end=overall_end,

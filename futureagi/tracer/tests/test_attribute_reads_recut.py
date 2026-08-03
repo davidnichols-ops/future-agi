@@ -1416,8 +1416,9 @@ def test_value_read_pages_dense_recent_band_and_still_covers_older_band():
         if call.params.get("segment_start") == recent_start
     ]
     assert len(recent_candidate_calls) == 2
-    assert recent_candidate_calls[1].params["candidate_before_id"] == (
-        recent[ATTRIBUTE_READ_CANDIDATE_LIMIT - 1]["id"]
+    assert (
+        recent_candidate_calls[1].params["candidate_before_id"]
+        == (recent[ATTRIBUTE_READ_CANDIDATE_LIMIT - 1]["id"])
     )
 
 

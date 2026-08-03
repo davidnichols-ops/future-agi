@@ -235,6 +235,7 @@ def get_eval_graph_data(
             from tracer.services.clickhouse.v2.dispatch import (
                 get_query_builder_class,
             )
+
             EvalBuilderCls = get_query_builder_class("EVAL_METRICS")  # noqa: N806
             builder = EvalBuilderCls(
                 project_id=str(ch_project_id),
@@ -339,7 +340,6 @@ def get_eval_graph_data(
         return result
 
     elif observe_type == "charts":
-
         project_id = eval_logger_filters.get("project_id")
         if project_id is None:
             return _empty_result(
@@ -528,7 +528,6 @@ def _aggregate_for_observe_screen(
             return result
 
     elif eval_output_type == EvalOutputType.PASS_FAIL:
-
         if screen_type == "charts":
             results = []
             for value in [True, False]:
