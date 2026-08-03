@@ -7,8 +7,8 @@ Replaces ``get_eval_graph_data()`` and its helpers from
 Strategy:
 - Unfiltered eval dashboard queries read from the ``eval_metrics_hourly``
   pre-aggregated table.
-- Filtered queries or per-eval-config breakdowns read from the
-  ``tracer_eval_logger`` CDC table (with FINAL for correct deduplication).
+- Filtered queries or per-eval-config breakdowns read from the configured
+  eval-logger table (with FINAL for correct deduplication).
 
 Supports three eval output types:
 - **float (SCORE):** ``avg(output_float) * 100`` per time bucket.
@@ -21,6 +21,7 @@ Supports three eval output types:
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 
 # Eval output type constants (mirrors EvalOutputType from Django models)
@@ -59,7 +60,6 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
     """
 
     AGG_TABLE = "eval_metrics_hourly"
-    RAW_TABLE = "tracer_eval_logger"
 
     def __init__(
         self,
@@ -206,16 +206,22 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         return query, self.params
 
     def _build_score_raw(self) -> Tuple[str, Dict[str, Any]]:
-        """Score query against the raw CDC table."""
+        """Score query against the configured raw eval-logger table."""
         bucket_fn = self.time_bucket_expr(self.interval)
         filter_frag = self._filter_fragment()
+        # Eval-logger rows have no project_id column. The caller authorizes the
+        # globally unique config against the request project before building
+        # this query; filtered reads additionally bind the logger rows to the
+        # project's matching trace set in ``_filter_fragment``. Keep the raw scan
+        # config/time scoped and let the topology resolver select the matching
+        # legacy ``deleted`` or direct-write ``is_deleted`` predicate.
+        raw_table, live_predicate = eval_logger_source()
         query = f"""
         SELECT
             {bucket_fn}(created_at) AS time_bucket,
             ifNotFinite(avg(output_float) * 100, NULL) AS value
-        FROM {self.RAW_TABLE} FINAL
-        WHERE project_id = %(project_id)s
-          AND (deleted = 0 OR deleted IS NULL)
+        FROM {raw_table} FINAL
+        WHERE {live_predicate}
           AND custom_eval_config_id = toUUID(%(eval_config_id)s)
           AND created_at >= %(start_date)s
           AND created_at < %(end_date)s
@@ -254,17 +260,17 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         return query, self.params
 
     def _build_pass_fail_raw(self) -> Tuple[str, Dict[str, Any]]:
-        """Pass/Fail query against the raw CDC table."""
+        """Pass/Fail query against the configured raw eval-logger table."""
         bucket_fn = self.time_bucket_expr(self.interval)
         filter_frag = self._filter_fragment()
+        raw_table, live_predicate = eval_logger_source()
         query = f"""
         SELECT
             {bucket_fn}(created_at) AS time_bucket,
             ifNotFinite(avg(CASE WHEN output_bool = 1 THEN 100.0 ELSE 0.0 END), NULL)
                 AS value
-        FROM {self.RAW_TABLE} FINAL
-        WHERE project_id = %(project_id)s
-          AND (deleted = 0 OR deleted IS NULL)
+        FROM {raw_table} FINAL
+        WHERE {live_predicate}
           AND custom_eval_config_id = toUUID(%(eval_config_id)s)
           AND created_at >= %(start_date)s
           AND created_at < %(end_date)s
@@ -307,14 +313,14 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         choice_select = ",\n            ".join(choice_cols)
 
         filter_frag = self._filter_fragment()
+        raw_table, live_predicate = eval_logger_source()
         query = f"""
         SELECT
             {bucket_fn}(created_at) AS time_bucket,
             count() AS total_count,
             {choice_select}
-        FROM {self.RAW_TABLE} FINAL
-        WHERE project_id = %(project_id)s
-          AND (deleted = 0 OR deleted IS NULL)
+        FROM {raw_table} FINAL
+        WHERE {live_predicate}
           AND custom_eval_config_id = toUUID(%(eval_config_id)s)
           AND created_at >= %(start_date)s
           AND created_at < %(end_date)s
