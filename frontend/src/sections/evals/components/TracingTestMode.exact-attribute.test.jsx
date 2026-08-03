@@ -186,4 +186,34 @@ describe("TracingTestMode exact task attribute mapping", () => {
       expect(await screen.findByText(message)).toBeInTheDocument();
     },
   );
+
+  it("keeps a bounded exact suggestion selectable while warning that the read is degraded", async () => {
+    mocks.exactFields = ["final_status"];
+    mocks.exactReadState = "degraded";
+    const onReadyChange = vi.fn();
+    renderTaskMapping(onReadyChange);
+
+    const input = await screen.findByPlaceholderText(
+      "Search or type a path (e.g. attributes.input.value)",
+    );
+    await waitFor(() => expect(input).not.toBeDisabled());
+    await userEvent.click(input);
+    await userEvent.type(input, "final_status");
+
+    expect(
+      await screen.findByText(
+        "Results are incomplete. Please retry in a moment.",
+      ),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      await screen.findByRole("option", { name: "final_status" }),
+    );
+
+    expect(input).toHaveValue("final_status");
+    await waitFor(() =>
+      expect(onReadyChange).toHaveBeenCalledWith(true, {
+        evaluation_result: "final_status",
+      }),
+    );
+  });
 });

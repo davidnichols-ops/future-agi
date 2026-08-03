@@ -129,7 +129,7 @@ describe("useExactEvalAttributeFields", () => {
     expect(result.current.data).not.toContain("spans.0.final_status");
   });
 
-  it("does not present degraded fields as exact", async () => {
+  it("keeps latest-state-verified fields from a degraded bounded read", async () => {
     mocks.getEvalAttributes.mockResolvedValue({
       data: {
         result: ["final_status"],
@@ -151,7 +151,7 @@ describe("useExactEvalAttributeFields", () => {
     );
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toEqual([]);
+    expect(result.current.data).toEqual(["final_status"]);
     expect(result.current.queryReadState).toBe("degraded");
   });
 

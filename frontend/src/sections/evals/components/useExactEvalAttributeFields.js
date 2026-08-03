@@ -52,10 +52,15 @@ export function useExactEvalAttributeFields({
     select: ({ data }) => {
       const queryReadState = getQueryReadState(data);
       return {
-        fields:
-          queryReadState === "complete" && Array.isArray(data?.result)
-            ? data.result.filter((field) => typeof field === "string" && field)
-            : [],
+        // An exact-q response can be degraded because the bounded selector
+        // could not finish counting every matching span or sampling the full
+        // trace cardinality.  The fields it did return have still passed the
+        // latest-state replay, so hiding them makes common attributes vanish
+        // on large projects.  Keep those verified suggestions while retaining
+        // the degraded state below so the picker still shows its retry warning.
+        fields: Array.isArray(data?.result)
+          ? data.result.filter((field) => typeof field === "string" && field)
+          : [],
         queryReadState,
       };
     },
