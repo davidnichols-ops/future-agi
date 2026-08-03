@@ -1,5 +1,5 @@
 /* eslint-disable react/prop-types */
-import { Box, useTheme } from "@mui/material";
+import { Box, Typography, useTheme } from "@mui/material";
 import { AgGridReact } from "ag-grid-react";
 import "src/styles/clean-data-table.css";
 import PropTypes from "prop-types";
@@ -42,6 +42,13 @@ import { APP_CONSTANTS } from "src/utils/constants";
 import { useShallowToggleAnnotationsStore } from "../../agents/store";
 import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
+import NoRowsOverlay from "src/sections/project-detail/CompareDrawer/NoRowsOverlay";
+import {
+  failServerSideGridRead,
+  getQueryReadMessage,
+  getQueryReadState,
+} from "src/utils/queryReadState";
+import { createListCursorPagination } from "./listCursorPagination";
 
 const ROWS_LIMIT = 25;
 
@@ -206,6 +213,9 @@ const SpanGrid = React.forwardRef(
     }));
     const [openQuickFilter, setOpenQuickFilter] = useState(null);
     const [selectedAll, setSelectedAll] = useState(false);
+    const [readState, setReadState] = useState("complete");
+    const readStateRef = useRef("complete");
+    const readMessage = getQueryReadMessage(readState);
 
     // Use ref to track latest columns for comparison without triggering dataSource recreation
     const columnsRef = useRef(columns);
@@ -215,8 +225,11 @@ const SpanGrid = React.forwardRef(
 
     // Prefetch cache: stores next page data so scroll feels instant
     const prefetchCache = useRef(new Map());
+    const cursorPagination = useRef(createListCursorPagination());
 
     const refreshGrid = useCallback(() => {
+      prefetchCache.current.clear();
+      cursorPagination.current.reset();
       gridRef?.current?.api?.refreshServerSide({ purge: true });
     }, [gridRef]);
     const filterRequestKey = useMemo(
@@ -237,6 +250,7 @@ const SpanGrid = React.forwardRef(
       if (previousFilterRequestKeyRef.current === filterRequestKey) return;
       previousFilterRequestKeyRef.current = filterRequestKey;
       prefetchCache.current.clear();
+      cursorPagination.current.reset();
       refreshGrid();
     }, [filterRequestKey, refreshGrid]);
 
@@ -385,34 +399,41 @@ const SpanGrid = React.forwardRef(
     const dataSource = useMemo(
       () => {
         prefetchCache.current.clear();
+        cursorPagination.current.reset();
         return {
           getRows: async (params) => {
             if (!enabled) {
               params.success({ rowData: [], rowCount: 0 });
               return;
             }
+            let pageNumber = 0;
             try {
               setLoading(true);
               const { request } = params;
+              const requestGeneration = cursorPagination.current.generation();
 
               const pageSize = request.endRow - request.startRow;
-              const pageNumber = Math.floor(request.startRow / pageSize);
+              pageNumber = Math.floor(request.startRow / pageSize);
+              if (pageNumber === 0) {
+                readStateRef.current = "complete";
+                setReadState("complete");
+              }
 
-              const buildParams = (page) => ({
-                // Omit project_id when null — backend treats absent
-                // project_id as org-scoped (used by user-detail page).
-                ...(observeId ? { project_id: observeId } : {}),
-                page_number: page,
-                page_size: ROWS_LIMIT,
-                filters: JSON.stringify(
-                  toBackendFilters([
-                    ...filters,
-                    ...(hasEvalFilter ? [FILTER_FOR_HAS_EVAL] : []),
-                    ...(extraFilters || EMPTY_EXTRA_FILTERS),
-                    ...(metricFilters || []),
-                  ]),
-                ),
-              });
+              const buildParams = (page) =>
+                cursorPagination.current.requestParams(page, {
+                  // Omit project_id when null — backend treats absent
+                  // project_id as org-scoped (used by user-detail page).
+                  ...(observeId ? { project_id: observeId } : {}),
+                  page_size: ROWS_LIMIT,
+                  filters: JSON.stringify(
+                    toBackendFilters([
+                      ...filters,
+                      ...(hasEvalFilter ? [FILTER_FOR_HAS_EVAL] : []),
+                      ...(extraFilters || EMPTY_EXTRA_FILTERS),
+                      ...(metricFilters || []),
+                    ]),
+                  ),
+                });
 
               // Use prefetched data if available, otherwise fetch
               const cached = prefetchCache.current.get(pageNumber);
@@ -423,8 +444,17 @@ const SpanGrid = React.forwardRef(
                   endpoints.project.getSpansForObserveProject(),
                   { params: buildParams(pageNumber) },
                 ));
+              if (!cursorPagination.current.isCurrent(requestGeneration)) {
+                failServerSideGridRead(params);
+                return;
+              }
 
               const res = results?.data?.result;
+              const nextReadState = getQueryReadState(results?.data);
+              if (pageNumber === 0 || nextReadState !== "complete") {
+                readStateRef.current = nextReadState;
+                setReadState(nextReadState);
+              }
               const newCols = normalizeConfigKeys(res?.config);
 
               // Use ref to get latest columns for comparison without triggering dataSource recreation
@@ -483,12 +513,18 @@ const SpanGrid = React.forwardRef(
               }
 
               const rows = res?.table || [];
-              const totalRows = res?.metadata?.total_rows;
+              const metadata = res?.metadata || {};
+              cursorPagination.current.recordResponse(pageNumber, metadata);
+              const totalRows = metadata.total_rows;
               params.api.totalRowCount = totalRows;
               useSpanGridStore.setState({ totalRowCount: totalRows || 0 });
 
               // Infinite-scroll: don't expose total upfront → scrollbar grows as you scroll
-              const isLastPage = rows.length < ROWS_LIMIT;
+              const isLastPage = cursorPagination.current.isLastPage(
+                metadata,
+                rows.length,
+                ROWS_LIMIT,
+              );
               const lastRow = isLastPage ? request.startRow + rows.length : -1;
 
               params.success({
@@ -503,12 +539,28 @@ const SpanGrid = React.forwardRef(
                     params: buildParams(pageNumber + 1),
                   })
                   .then((res) => {
-                    prefetchCache.current.set(pageNumber + 1, res);
+                    if (cursorPagination.current.isCurrent(requestGeneration)) {
+                      prefetchCache.current.set(pageNumber + 1, res);
+                    }
                   })
                   .catch(() => {});
               }
-            } catch {
-              params.fail();
+            } catch (error) {
+              if (
+                cursorPagination.current.canRecoverFromContinuationError(
+                  pageNumber,
+                  error,
+                )
+              ) {
+                prefetchCache.current.clear();
+                cursorPagination.current.disableCursor();
+                params.fail();
+                params.api?.refreshServerSide?.({ purge: true });
+                return;
+              }
+              readStateRef.current = "error";
+              setReadState("error");
+              failServerSideGridRead(params);
             } finally {
               setLoading(false);
             }
@@ -629,8 +681,31 @@ const SpanGrid = React.forwardRef(
       return () => resetMetricIds();
     }, [resetMetricIds]);
     return (
-      <Box sx={{ height: "calc(100vh - 270px)" }}>
+      <Box
+        sx={{
+          height: "calc(100vh - 270px)",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        {readMessage && (
+          <Box
+            role="status"
+            sx={{
+              px: 1.5,
+              py: 0.75,
+              fontSize: 12,
+              color: "warning.main",
+              bgcolor: "warning.lighter",
+              borderBottom: "1px solid",
+              borderColor: "warning.light",
+            }}
+          >
+            {readMessage}
+          </Box>
+        )}
         <AgGridReact
+          style={{ flex: 1, minHeight: 0 }}
           className={
             cellHeight && cellHeight !== "Short"
               ? "cell-wrap clean-data-table"
@@ -666,6 +741,19 @@ const SpanGrid = React.forwardRef(
           tooltipInteraction={true}
           serverSideDatasource={dataSource}
           suppressServerSideFullWidthLoadingRow={true}
+          noRowsOverlayComponent={() =>
+            NoRowsOverlay(
+              <Typography
+                sx={{
+                  fontSize: 14,
+                  fontWeight: 400,
+                  color: "text.secondary",
+                }}
+              >
+                {getQueryReadMessage(readStateRef.current) || "No spans found"}
+              </Typography>,
+            )
+          }
           onCellClicked={handleCellClick}
           onSelectionChanged={onSelectionChanged}
           // onGridReady={(params) => {

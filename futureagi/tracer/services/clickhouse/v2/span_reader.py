@@ -2150,13 +2150,16 @@ class CHSpanReader:
         params: dict[str, Any] | None = None,
         *,
         batch_size: int = 10_000,
+        settings: dict[str, Any] | None = None,
     ) -> Iterator[list[str]]:
         """Stream a query's first column as strings, re-chunked to ``batch_size``
         so neither the client nor the caller holds the full result in memory — a
         large historical scan can be consumed in waves."""
         batch: list[str] = []
         with self._client.query_row_block_stream(
-            sql, parameters=params or {}
+            sql,
+            parameters=params or {},
+            settings=settings or {},
         ) as stream:
             for block in stream:
                 for row in block:

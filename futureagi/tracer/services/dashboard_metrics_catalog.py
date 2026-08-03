@@ -16,11 +16,9 @@ from django.core.cache import cache
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.models.project import Project, ProjectSourceChoices
 from tracer.services.clickhouse.client import (
-    get_clickhouse_client,
     is_clickhouse_enabled,
 )
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
-from tracer.utils.sql_queries import SQL_query_handler
 
 logger = structlog.get_logger(__name__)
 
@@ -554,12 +552,11 @@ def build_metrics_catalog(
     def _discover_span_attributes():
         attrs = []
         try:
-            if is_clickhouse_enabled() and project_ids:
+            if project_ids:
                 analytics = AnalyticsQueryService()
                 rows = analytics.get_span_attribute_keys_ch_for_projects(
                     project_ids,
                     recent_days=None,
-                    timeout_ms=15000,
                     outer_limit=2000,
                 )
                 for r in rows:
@@ -567,15 +564,6 @@ def build_metrics_catalog(
                     t = r.get("type", "string")
                     if k:
                         attrs.append({"key": k, "type": t})
-            elif project_ids:
-                for pid in project_ids:
-                    keys = SQL_query_handler.get_span_attributes_for_project(pid)
-                    for key in keys:
-                        k = key if isinstance(key, str) else str(key)
-                        if k not in [
-                            a.get("key") if isinstance(a, dict) else a for a in attrs
-                        ]:
-                            attrs.append({"key": k, "type": "string"})
         except Exception as exc:
             logger.warning(
                 "dashboard_span_attribute_discovery_failed",

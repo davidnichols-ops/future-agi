@@ -38,6 +38,7 @@ def _capturing_service(rows):
         captured["query"] = query
         captured["params"] = params
         captured["timeout_ms"] = timeout_ms
+        captured["settings"] = settings
         return _Result(rows)
 
     svc.execute_ch_query = _recorder
@@ -235,8 +236,11 @@ class TestEvalReadSelectors:
 
         assert rows == [{"span_id": "s", "config_id": "c"}]
         query = captured["query"]
-        assert "tracer_eval_logger_v2 FINAL" in query
-        assert "is_deleted = 0" in query
+        assert "tracer_eval_logger_v2 FINAL" not in query
+        assert "FROM tracer_eval_logger_v2 AS eval_scan" in query
+        assert "ORDER BY eval_scan._version DESC" in query
+        assert "LIMIT 1 BY eval_scan.id" in query
+        assert "latest_eval.is_deleted = 0" in query
         assert "_peerdb_is_deleted" not in query
         assert "observation_span_id IN %(span_ids)s" in query
         assert captured["params"] == {"span_ids": ["s1", "s2"]}
@@ -248,20 +252,58 @@ class TestEvalReadSelectors:
 
     @override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
     def test_eval_detail_v2_predicate_and_returns_first_row(self):
-        svc, captured = _capturing_service([{"output_float": 1.0}])
-        row = svc.get_eval_detail_ch("span-1", "cfg-1")
+        from tracer.services.clickhouse.query_service import AnalyticsQueryService
+
+        svc = AnalyticsQueryService()
+        calls = []
+
+        def recorder(query, params=None, timeout_ms=None, settings=None):
+            calls.append((query, params, timeout_ms, settings))
+            if "FROM spans" in query:
+                return _Result([{"trace_id": "00000000-0000-0000-0000-000000000001"}])
+            return _Result([{"output_float": 1.0}])
+
+        svc.execute_ch_query = recorder
+        row = svc.get_eval_detail_ch("span-1", "cfg-1", project_id="project-1")
 
         assert row == {"output_float": 1.0}
-        query = captured["query"]
-        assert "tracer_eval_logger_v2 FINAL" in query
-        assert "is_deleted = 0" in query
+        assert len(calls) == 2
+        anchor_query, anchor_params, *_ = calls[0]
+        assert "FROM spans" in anchor_query
+        assert "project_id = toUUID(%(project_id)s)" in anchor_query
+        assert "HAVING argMax(is_deleted, _version) = 0" in anchor_query
+        assert "LIMIT 2" in anchor_query
+        assert anchor_params == {"project_id": "project-1", "span_id": "span-1"}
+
+        query, params, *_ = calls[1]
+        assert "tracer_eval_logger_v2 FINAL" not in query
+        assert "FROM tracer_eval_logger_v2 AS eval_scan" in query
+        assert "ORDER BY eval_scan._version DESC" in query
+        assert "LIMIT 1 BY eval_scan.id" in query
+        assert "latest_eval.is_deleted = 0" in query
+        assert "eval_scan.trace_id = toUUID(%(trace_id)s)" in query
         assert "target_type IN ('span', 'trace')" in query
         assert "LIMIT 1" in query
-        assert captured["params"] == {"span_id": "span-1", "config_id": "cfg-1"}
+        assert params == {
+            "span_id": "span-1",
+            "config_id": "cfg-1",
+            "trace_id": "00000000-0000-0000-0000-000000000001",
+        }
 
     def test_eval_detail_returns_none_when_absent(self):
         svc, _ = _capturing_service([])
-        assert svc.get_eval_detail_ch("span-1", "cfg-1") is None
+        assert svc.get_eval_detail_ch("span-1", "cfg-1", project_id="project-1") is None
+
+    def test_eval_detail_fails_closed_on_same_project_span_id_collision(self):
+        svc, captured = _capturing_service(
+            [
+                {"trace_id": "00000000-0000-0000-0000-000000000001"},
+                {"trace_id": "00000000-0000-0000-0000-000000000002"},
+            ]
+        )
+
+        assert svc.get_eval_detail_ch("span-1", "cfg-1", project_id="project-1") is None
+        assert "FROM spans" in captured["query"]
 
     @override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
     def test_trace_eval_scores_v2_predicate_and_scope(self):
@@ -270,8 +312,11 @@ class TestEvalReadSelectors:
 
         assert rows == [{"trace_id": "t", "config_id": "c"}]
         query = captured["query"]
-        assert "tracer_eval_logger_v2 FINAL" in query
-        assert "is_deleted = 0" in query
+        assert "tracer_eval_logger_v2 FINAL" not in query
+        assert "FROM tracer_eval_logger_v2 AS eval_scan" in query
+        assert "ORDER BY eval_scan._version DESC" in query
+        assert "LIMIT 1 BY eval_scan.id" in query
+        assert "latest_eval.is_deleted = 0" in query
         assert "_peerdb_is_deleted" not in query
         assert "trace_id IN %(trace_ids)s" in query
         assert "custom_eval_config_id IN %(config_ids)s" in query

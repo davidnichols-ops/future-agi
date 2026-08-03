@@ -14,6 +14,7 @@ import {
   FILTER_CONTRACT_VERSION,
   FILTER_TYPE_ALLOWED_OPS,
   SPAN_ATTRIBUTE_ALLOWED_OPS,
+  STRUCTURED_SPAN_ATTRIBUTE_ALLOWED_OPS,
 } from "../filter-contract.generated";
 
 const valueFor = (filterType, operator) => {
@@ -285,6 +286,44 @@ describe("filter contract", () => {
     expect(normalizeFilterType("string")).toBe("text");
     expect(isAllowedFilterOperator("number", "contains")).toBe(false);
     expect(isAllowedFilterOperator("number", "not_between")).toBe(true);
+    expect(STRUCTURED_SPAN_ATTRIBUTE_ALLOWED_OPS.map).toEqual([
+      "equals",
+      "not_equals",
+      "contains",
+      "not_contains",
+      "is_null",
+      "is_not_null",
+    ]);
+    expect(isAllowedFilterOperator("map", "contains")).toBe(true);
+    expect(isAllowedFilterOperator("map", "between")).toBe(false);
+  });
+
+  it("keeps json lists as arrays and canonicalizes json objects to maps", () => {
+    expect(normalizeFilterType("json", ["vip"])).toBe("array");
+    expect(normalizeFilterType("list", ["vip"])).toBe("array");
+    expect(normalizeFilterType("json", { tier: "vip" })).toBe("map");
+    expect(normalizeFilterType("map", { tier: "vip" })).toBe("map");
+    expect(normalizeFilterType("object", { tier: "vip" })).toBe("map");
+
+    expect(
+      serializeFilterForApi({
+        column_id: "customer.context",
+        filter_config: {
+          col_type: "SPAN_ATTRIBUTE",
+          filter_type: "json",
+          filter_op: "contains",
+          filter_value: { tier: "vip", attempt: 2 },
+        },
+      }),
+    ).toEqual({
+      column_id: "customer.context",
+      filter_config: {
+        col_type: "SPAN_ATTRIBUTE",
+        filter_type: "map",
+        filter_op: "contains",
+        filter_value: { tier: "vip", attempt: 2 },
+      },
+    });
   });
 
   it("fails before sending a non-canonical operator to the API", () => {

@@ -70,31 +70,29 @@ _DICT_RENAME_RE = re.compile(
 )
 
 
+# Eval filters are polymorphic: even when the outer spans query targets CH25,
+# ``CH25_EVAL_LOGGER_TABLE`` may still select the legacy PeerDB table. The
+# whole-fragment v2 rewrite must continue to migrate spans references, but it
+# must not rename that table's physical version/tombstone columns. Protect only
+# the dedicated eval aliases emitted by the base filter compiler, rewrite the
+# rest of the fragment, then restore the legacy identifiers.
+_LEGACY_EVAL_COLUMN_MARKERS: dict[str, str] = {
+    "eval_scan._peerdb_version": "eval_scan.__eval_legacy_version__",
+    "eval_scan._peerdb_is_deleted": "eval_scan.__eval_legacy_cdc_deleted__",
+    "latest_eval._peerdb_is_deleted": "latest_eval.__eval_legacy_cdc_deleted__",
+}
+
+
 # ─── JSON-overflow access rewrites ────────────────────────────────────────────
-# v1 emits `JSONExtractType(span_attributes_raw, 'path.with.dots')`; v2 uses
-# CH 25.x typed JSON path access `attributes_extra.path.with.dots.:Type`.
-# Same translation applies to `metadata_map` (v1 Map) → `metadata` (v2 typed JSON).
+# Schema 013 stores attributes_extra as String JSON. Preserve JSONExtract*/
+# JSONHas and replace only the legacy first argument, including variadic paths.
+_ATTRIBUTES_EXTRA_JSON_FUNCTION_PATTERN = re.compile(
+    r"\b(?P<function>JSONExtract(?:String|Float|U?Int|Bool|ArrayRaw|Raw)|JSONHas|JSONType)"
+    r"(?P<open>\s*\(\s*)span_attributes_raw(?P<comma>\s*,)"
+)
+
+# Resource attributes and metadata remain typed JSON.
 _JSON_EXTRACT_PATTERNS: list[tuple[re.Pattern, str, str]] = [
-    (
-        re.compile(r"JSONExtractString\(\s*span_attributes_raw\s*,\s*'([^']+)'\s*\)"),
-        cols.ATTRIBUTES_EXTRA,
-        "String",
-    ),
-    (
-        re.compile(r"JSONExtractFloat\(\s*span_attributes_raw\s*,\s*'([^']+)'\s*\)"),
-        cols.ATTRIBUTES_EXTRA,
-        "Float64",
-    ),
-    (
-        re.compile(r"JSONExtractInt\(\s*span_attributes_raw\s*,\s*'([^']+)'\s*\)"),
-        cols.ATTRIBUTES_EXTRA,
-        "Int64",
-    ),
-    (
-        re.compile(r"JSONExtractBool\(\s*span_attributes_raw\s*,\s*'([^']+)'\s*\)"),
-        cols.ATTRIBUTES_EXTRA,
-        "Bool",
-    ),
     (
         re.compile(
             r"JSONExtractString\(\s*resource_attributes_raw\s*,\s*'([^']+)'\s*\)"
@@ -111,26 +109,29 @@ _JSON_EXTRACT_PATTERNS: list[tuple[re.Pattern, str, str]] = [
 
 # `JSONHas(span_attributes_raw, 'path')` → `(attributes_extra.path.:String IS NOT NULL)`
 _JSON_HAS_PATTERN = re.compile(
-    r"JSONHas\(\s*(span_attributes_raw|resource_attributes_raw|metadata_map)\s*,\s*'([^']+)'\s*\)"
+    r"JSONHas\(\s*(resource_attributes_raw|metadata_map)\s*,\s*'([^']+)'\s*\)"
 )
 _JSON_HAS_TARGET = {
-    "span_attributes_raw": (cols.ATTRIBUTES_EXTRA, "String"),
     "resource_attributes_raw": (cols.RESOURCE_ATTRS, "String"),
     "metadata_map": (cols.METADATA_JSON, "String"),
 }
 
-# Map from legacy bare JSON column → v2 typed-JSON column. Used by the bare-
-# column rewriters below. These columns CAN'T just be renamed (their TYPES
-# differ — v1 is String, v2 is typed JSON), so:
-#   • In SELECT lists: wrap with toJSONString(v2_col) AS legacy_col so the
-#     callers' Python code can still do row["legacy_col"] and get a JSON string.
-#   • In WHERE emptiness checks: rewrite to length-based predicates on the
-#     toJSONString form (semantically equivalent for "has any keys").
+# Map from legacy bare JSON columns to v2 columns. attributes_extra is already
+# String JSON; resource_attrs and metadata remain typed JSON and are stringified
+# only when callers require the legacy textual row shape.
 _BARE_JSON_REWRITES = {
     "span_attributes_raw": cols.ATTRIBUTES_EXTRA,
     "metadata_map": cols.METADATA_JSON,
     "resource_attributes_raw": cols.RESOURCE_ATTRS,
 }
+_STRING_JSON_LEGACY_COLUMNS = frozenset({"span_attributes_raw"})
+
+
+def _json_text_expression(legacy_col: str, v2_col: str) -> str:
+    if legacy_col in _STRING_JSON_LEGACY_COLUMNS:
+        return v2_col
+    return f"toJSONString({v2_col})"
+
 
 # WHERE emptiness checks v1 emits: `<legacy_col> != '{}'`, `!= ''`, `= '{}'`, `= ''`.
 # Pattern allows single or doubled `{}` (the `{{}}` form appears when the SQL
@@ -218,19 +219,29 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
     the full filter compiler.
 
     Order matters:
-      1. JSON path access — JSONExtract*(legacy_col, ...) → typed JSON path.
-         Consumes legacy_col occurrences that are inside function calls.
-      2. JSON has — JSONHas(legacy_col, key) → (typed JSON path IS NOT NULL).
+      1. String JSON access keeps JSONExtract*/JSONHas and retargets its first
+         argument to attributes_extra.
+      2. Typed resource/metadata JSON access becomes typed path syntax.
       3. WHERE emptiness predicates — `WHERE legacy_col != '{}'` →
-         length-based check on toJSONString(v2_col).
+         length-based check on the JSON string representation.
       4. Bare SELECT-list refs — `SELECT … legacy_col …` →
-         `SELECT … toJSONString(v2_col) AS legacy_col …`. Preserves the
+         `SELECT … <json text> AS legacy_col …`. Preserves the
          downstream Python `row["legacy_col"]` shape (still a JSON string).
       5. Naked simple renames — `_peerdb_is_deleted` → `is_deleted`, etc.
          Word-boundary substitution; runs last.
       6. Append v2-required settings (use_skip_indexes_if_final etc).
     """
-    # 1. JSON path access
+    # 1. String JSON access. Replace only the first argument so nested paths
+    # and escaped/unicode literals remain unchanged.
+    sql = _ATTRIBUTES_EXTRA_JSON_FUNCTION_PATTERN.sub(
+        lambda match: (
+            f"{match.group('function')}{match.group('open')}"
+            f"{cols.ATTRIBUTES_EXTRA}{match.group('comma')}"
+        ),
+        sql,
+    )
+
+    # 2. Typed resource/metadata JSON path access.
     for pat, target_col, ch_type in _JSON_EXTRACT_PATTERNS:
         sql = pat.sub(
             lambda m, c=target_col, t=ch_type: cols.json_path(c, m.group(1), t),
@@ -250,7 +261,7 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
         op = m.group(2)
         literal = m.group(3)
         v2_col = _BARE_JSON_REWRITES[legacy_col]
-        wrapped = f"toJSONString({v2_col})"
+        wrapped = _json_text_expression(legacy_col, v2_col)
         # `'{}'` or `'{{}}'` mean "empty object literal" → 2 chars (or 4 if
         # the double-brace was a Python format-string escape, which CH never
         # sees — by the time SQL reaches us, the braces are concrete).
@@ -268,12 +279,11 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
 
     sql = _WHERE_EMPTY_PATTERN.sub(_empty_repl, sql)
 
-    # 4. Bare SELECT-list refs — wrap with toJSONString() AS legacy_col so the
-    # caller's row["legacy_col"] still works.
+    # 4. Bare SELECT-list refs preserve the caller's JSON-string row shape.
     def _bare_repl(m):
         legacy_col = m.group(1)
         v2_col = _BARE_JSON_REWRITES[legacy_col]
-        return f"toJSONString({v2_col}) AS {legacy_col}"
+        return f"{_json_text_expression(legacy_col, v2_col)} AS {legacy_col}"
 
     sql = _BARE_REF_PATTERN.sub(_bare_repl, sql)
 
@@ -314,6 +324,23 @@ class ClickHouseFilterBuilderV2(ClickHouseFilterBuilder):
     _ENDUSER_DIM_TABLE = "end_users"
     _ENDUSER_DIM_ID_COL = "end_user_id"
     _ENDUSER_DIM_NOT_DELETED = "is_deleted = 0"
+
+    @staticmethod
+    def _rewrite_filter_fragment(sql: str) -> str:
+        """Rewrite spans SQL without corrupting a legacy eval-table probe."""
+        from tracer.services.clickhouse.eval_logger_table import eval_logger_source
+
+        eval_table, _ = eval_logger_source()
+        if eval_table.endswith("_v2"):
+            return rewrite_v1_sql_to_v2(sql)
+
+        protected = sql
+        for source, marker in _LEGACY_EVAL_COLUMN_MARKERS.items():
+            protected = protected.replace(source, marker)
+        rewritten = rewrite_v1_sql_to_v2(protected)
+        for source, marker in _LEGACY_EVAL_COLUMN_MARKERS.items():
+            rewritten = rewritten.replace(marker, source)
+        return rewritten
 
     def _span_attr_inner(
         self,
@@ -385,7 +412,7 @@ class ClickHouseFilterBuilderV2(ClickHouseFilterBuilder):
         # etc.). Otherwise we'd end up with `WHERE ... SETTINGS ... AND ...`
         # which is a syntax error.
         sql, params = super().translate(filters)
-        return rewrite_v1_sql_to_v2(sql), params
+        return self._rewrite_filter_fragment(sql), params
 
     def translate_sort(self, sort_params, *args, **kwargs):  # type: ignore[override]
         # Forward extra args (e.g. field_map) to the v1 implementation — callers

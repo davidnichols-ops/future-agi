@@ -135,18 +135,24 @@ def seed_ch_spans(
     spans: Iterable[Any],
     *,
     client: Any | None = None,
+    version_from_created_at: bool = False,
 ) -> int:
     """Bulk-insert ObservationSpan rows into the CH ``spans`` table.
 
     Returns the number of rows inserted. Uses ``adapt()`` so the row shape
     matches the production PG→CH backfill exactly (same typed-Map split,
-    same attributes-extra merge, same JSON serialisation).
+    same attributes-extra merge, same JSON serialisation). Lifecycle tests can
+    set ``version_from_created_at`` to emulate an earlier/later physical CH
+    arrival without sleeping or changing the system clock.
     """
     rows: list[tuple] = []
     for s in spans:
         pg_row = s if isinstance(s, dict) else _pg_row_from_django_span(s)
         ch_row = adapt(pg_row)
-        rows.append(row_to_tuple(ch_row))
+        row = row_to_tuple(ch_row)
+        if version_from_created_at:
+            row = (*row, _epoch_nanoseconds(ch_row.created_at))
+        rows.append(row)
 
     if not rows:
         return 0
@@ -155,10 +161,14 @@ def seed_ch_spans(
     if own_client:
         client = _get_ch_client()
     try:
-        client.insert("spans", rows, column_names=list(CH_INSERT_COLUMNS))
+        columns = list(CH_INSERT_COLUMNS)
+        if version_from_created_at:
+            columns.append("_version")
+        client.insert("spans", rows, column_names=columns)
     finally:
         if own_client:
             client.close()
+    return len(rows)
 
 
 _TRACE_SESSIONS_COLUMNS = [
@@ -203,6 +213,21 @@ def seed_ch_trace_sessions(
         if own_client:
             client.close()
     return len(rows)
+
+
+def _epoch_nanoseconds(value: datetime) -> int:
+    """Exact UInt64 arrival version used by time-window lifecycle fixtures."""
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    value = value.astimezone(UTC)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    delta = value - epoch
+    return (
+        delta.days * 86_400 * 1_000_000_000
+        + delta.seconds * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
 
 
 _TRACES_COLUMNS = [

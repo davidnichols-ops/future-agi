@@ -1,8 +1,10 @@
+import concurrent.futures
 import csv
 import io
 import json
 import math
 import traceback
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -32,7 +34,7 @@ from django.http import FileResponse, HttpResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_yasg.utils import swagger_auto_schema
-from rest_framework import serializers
+from rest_framework import serializers, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
@@ -51,9 +53,16 @@ from tracer.models.project import Project
 from tracer.models.project_version import ProjectVersion
 from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession
+from tracer.selectors.trace_filter_reads import (
+    PAGE_DEPTH_EXCEEDED_CODE,
+    PAGE_DEPTH_EXCEEDED_MESSAGE,
+    bounded_numbered_page_depth_exceeded,
+    numbered_page_depth_exceeded,
+)
 from tracer.serializers.filters import (
     ObserveGraphDataRequestSerializer,
     ObserveGraphDataResponseSerializer,
+    PageDepthExceededErrorSerializer,
 )
 from tracer.serializers.trace import (
     TraceAgentGraphQuerySerializer,
@@ -66,14 +75,29 @@ from tracer.serializers.trace import (
     TraceObserveListResponseSerializer,
     TraceSerializer,
     TraceVoiceCallListQuerySerializer,
+    TraceVoiceCallListResponseSerializer,
     UserCodeExampleResponseSerializer,
     UsersQuerySerializer,
     UsersResponseSerializer,
 )
+from tracer.services.clickhouse.bounded_graph_reads import BoundedGraphReadError
 from tracer.services.clickhouse.graph_dispatch import (
+    degraded_graph_response,
+    enforce_exact_graph_data_contract,
     fetch_annotation_graph_ch,
     fetch_eval_graph_ch,
     fetch_system_metric_graph_ch,
+)
+from tracer.services.clickhouse.list_cursor import (
+    ListCursorError,
+    capture_snapshot_version_ceiling,
+    cursor_page_metadata,
+    cursor_scope_for_request,
+    decode_list_cursor,
+    encode_list_cursor,
+    frozen_window_filter,
+    snapshot_cursor_supported,
+    snapshot_read_settings,
 )
 from tracer.services.clickhouse.page_dedup import paginate_deduped
 from tracer.services.clickhouse.query_builders import (
@@ -81,9 +105,21 @@ from tracer.services.clickhouse.query_builders import (
 )
 from tracer.services.clickhouse.query_builders.base import NIL_UUID
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
+from tracer.services.clickhouse.read_budget import (
+    ReadDeadline,
+    ReadDeadlineExceeded,
+    is_clickhouse_query_error,
+    is_read_budget_error,
+)
+from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.services.clickhouse.v2.span_selectors import (
     flatten_span_attributes_into_entry,
     merge_content_rows,
+)
+from tracer.services.clickhouse.v2.trace_detail_reads import (
+    TraceDetailNotFound,
+    TraceDetailReadUnavailable,
+    read_trace_detail,
 )
 from tracer.services.observability_providers import ObservabilityService
 from tracer.services.users_list_manager import UsersListManager
@@ -110,6 +146,27 @@ ERROR_RESPONSES = {
     400: ApiErrorResponseSerializer,
     500: ApiErrorResponseSerializer,
 }
+
+TRACE_LIST_WALL_DEADLINE_MS = 3_000
+TRACE_LIST_CANDIDATE_DEADLINE_MS = 2_200
+TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 900
+TRACE_LIST_READ_SETTINGS = {
+    "max_threads": 1,
+    "max_block_size": 8192,
+    "max_memory_usage": 256 * 1024 * 1024,
+    "max_bytes_to_read": 512 * 1024 * 1024,
+    "max_result_rows": 5_001,
+    "read_overflow_mode": "throw",
+    "result_overflow_mode": "throw",
+    "timeout_overflow_mode": "throw",
+}
+TRACE_NAVIGATION_CANDIDATE_LIMIT = 4_095
+
+
+class TraceNavigationReadUnavailable(RuntimeError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
 
 
 class TraceTagsUpdateSerializer(serializers.Serializer):
@@ -195,6 +252,114 @@ def _safe_parse_metadata(raw):
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return {}
+
+
+def _pivot_voice_detail_eval_rows(
+    eval_rows: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Aggregate exact per-span eval rows into the voice-detail contract.
+
+    ``read_trace_detail`` has already replayed the latest physical version of
+    each eval row and removed tombstones.  This is intentionally a pure,
+    bounded Python reduction over that candidate set; it must not issue a
+    second trace-wide ClickHouse query after the reader's shared deadline.
+    """
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for eval_row in eval_rows:
+        config_id = str(eval_row.get("eval_config_id") or "")
+        if config_id:
+            grouped.setdefault(config_id, []).append(eval_row)
+
+    pivoted: dict[str, dict[str, Any]] = {}
+    for config_id, rows in grouped.items():
+        completed: list[dict[str, Any]] = []
+        errored = False
+        status_counts = {"skipped": 0, "running": 0, "pending": 0}
+        skipped_reason = None
+
+        for eval_row in rows:
+            row_status = str(eval_row.get("status") or "").lower()
+            row_error = bool(eval_row.get("error")) or row_status == "errored"
+            row_error = row_error or eval_row.get("output_str") == "ERROR"
+            if row_error:
+                errored = True
+                continue
+            if row_status in status_counts:
+                status_counts[row_status] += 1
+                if row_status == "skipped" and not skipped_reason:
+                    skipped_reason = eval_row.get("skipped_reason")
+                continue
+            completed.append(eval_row)
+
+        # Completed rows have precedence over a partial error, matching the
+        # list endpoint's completed > errored > lifecycle state contract.
+        if completed:
+            parsed_choice_lists: list[list[str]] = []
+            for eval_row in completed:
+                raw_choices = eval_row.get("output_str_list")
+                if isinstance(raw_choices, str):
+                    try:
+                        raw_choices = json.loads(raw_choices)
+                    except (json.JSONDecodeError, TypeError):
+                        raw_choices = None
+                if isinstance(raw_choices, (list, tuple)) and raw_choices:
+                    parsed_choice_lists.append([str(value) for value in raw_choices])
+
+            if parsed_choice_lists:
+                choice_counts: dict[str, int] = {}
+                for choices in parsed_choice_lists:
+                    for choice in set(choices):
+                        choice_counts[choice] = choice_counts.get(choice, 0) + 1
+                total = len(parsed_choice_lists)
+                pivoted[config_id] = {
+                    "per_choice": {
+                        choice: round(100.0 * count / total, 2)
+                        for choice, count in choice_counts.items()
+                    }
+                }
+                continue
+
+            float_values = [
+                value
+                for value in (row.get("output_float") for row in completed)
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+            ]
+            bool_values = [
+                bool(value)
+                for value in (row.get("output_bool") for row in completed)
+                if value is not None
+            ]
+            pivoted[config_id] = {
+                "avg_score": (
+                    round(100.0 * sum(float_values) / len(float_values), 2)
+                    if float_values
+                    else None
+                ),
+                "pass_rate": (
+                    round(100.0 * sum(bool_values) / len(bool_values), 2)
+                    if bool_values
+                    else None
+                ),
+                "count": len(completed),
+            }
+            continue
+
+        if errored:
+            pivoted[config_id] = {"error": True}
+        elif status_counts["skipped"]:
+            marker: dict[str, Any] = {"status": "skipped"}
+            if skipped_reason:
+                marker["skipped_reason"] = skipped_reason
+            pivoted[config_id] = marker
+        elif status_counts["running"]:
+            pivoted[config_id] = {"status": "running"}
+        elif status_counts["pending"]:
+            pivoted[config_id] = {"status": "pending"}
+
+    return pivoted
 
 
 def _build_agent_graph_pg(project_id, filters, builder):
@@ -1073,30 +1238,65 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         _soft_delete_trace_tree([instance])
 
     @swagger_auto_schema(
-        responses={200: TraceDetailResponseSerializer, **ERROR_RESPONSES},
+        responses={
+            200: TraceDetailResponseSerializer,
+            **ERROR_RESPONSES,
+            503: ApiErrorResponseSerializer,
+        },
     )
     def retrieve(self, request, *args, **kwargs):
         """
         Retrieve a trace by its ID.
         """
+        from tracer.services.clickhouse.v2.trace_detail_reads import (
+            TraceDetailReadUnavailable,
+        )
+
         try:
             trace_id = kwargs.get("pk")
             from tracer.services.clickhouse.v2.dispatch import (
                 get_query_builder_class,
             )
+            from tracer.services.clickhouse.v2.query_service import (
+                query_service_for_builder,
+            )
 
             HandlerCls = get_query_builder_class("TRACE_DETAIL")
+            analytics = query_service_for_builder(
+                "TRACE_DETAIL",
+                HandlerCls,
+                AnalyticsQueryService(),
+            )
             handler = HandlerCls(
                 view=self,
                 request=request,
                 pk=trace_id,
-                analytics=AnalyticsQueryService(),
+                analytics=analytics,
             )
             return self._gm.success_response(handler.fetch())
-        except Exception as e:
-            logger.exception(f"Error in fetching the trace: {str(e)}")
+        except Trace.DoesNotExist:
             return self._gm.bad_request(
                 f"error retrieving trace {get_error_message('ERROR_GETTING_TRACE')}"
+            )
+        except TraceDetailReadUnavailable as exc:
+            logger.warning(
+                "trace_detail_bounded_read_incomplete",
+                trace_id=str(kwargs.get("pk") or ""),
+                error_code=exc.code,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace details are temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        except Exception as exc:
+            logger.exception(
+                "trace_detail_request_failed",
+                trace_id=str(kwargs.get("pk") or ""),
+                error_type=type(exc).__name__,
+            )
+            return self._gm.bad_request(
+                "Trace details could not be loaded"
             )
 
     # Keys to strip from the list response (heavy / detail-only fields).
@@ -1580,14 +1780,23 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             return self._gm.success_response(properties)
 
-        except Exception as e:
-            return self._gm.bad_request(f"Failed to fetch properties: {str(e)}")
+        except Exception as exc:
+            logger.exception("trace_properties_failed", error_type=type(exc).__name__)
+            return self._gm.bad_request("Trace properties could not be loaded")
 
+    @validated_request(
+        responses={
+            400: ApiErrorResponseSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        }
+    )
     @action(detail=False, methods=["get"])
     def get_eval_names(self, request, *args, **kwargs):
         """
         Fetch all evaluation template names.
         """
+        project_id = None
         try:
             project_id = self.request.query_params.get("project_id", None)
             project = (
@@ -1654,11 +1863,35 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             return self._gm.success_response(configs)
 
-        except Exception as e:
-            traceback.print_exc()
-            return self._gm.bad_request(f"Failed to fetch evaluation names: {str(e)}")
+        except Exception as exc:
+            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+                logger.warning(
+                    "evaluation_name_picker_query_unavailable",
+                    project_id=str(project_id or ""),
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Evaluation names are temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.exception(
+                "evaluation_name_picker_request_failed",
+                error_type=type(exc).__name__,
+            )
+            return self._gm.bad_request(
+                "Evaluation names could not be loaded"
+            )
 
-    @validated_request(query_serializer=TraceListQuerySerializer)
+    @validated_request(
+        query_serializer=TraceListQuerySerializer,
+        responses={
+            400: ApiErrorResponseSerializer,
+            422: PageDepthExceededErrorSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=["get"])
     def list_traces(self, request, *args, **kwargs):
         """
@@ -1674,7 +1907,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 .first()
             )
             if not project_version:
-                raise Exception("Project version not found")  # noqa: B904
+                return self._gm.bad_request("Project version not found")
 
             # CH-only path post-migration. D-027: the previous PG fallback
             # body (Trace.objects.filter + 6 ObservationSpan Subquery
@@ -1690,16 +1923,37 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 request, project_version_id, analytics, query_params
             )
 
-        except Exception as e:
-            logger.exception(f"Error in fetching the traces list: {str(e)}")
-
+        except Exception as exc:
+            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+                logger.warning(
+                    "trace_list_query_unavailable",
+                    project_version_id=str(
+                        getattr(request, "validated_query_data", {}).get(
+                            "project_version_id", ""
+                        )
+                    ),
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trace data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.exception(
+                "trace_list_request_failed",
+                error_type=type(exc).__name__,
+            )
             return self._gm.bad_request(
-                f"error fetching the traces list {get_error_message('ERROR_GETTING_TRACE_LIST')}"
+                "Trace data could not be loaded"
             )
 
     @validated_request(
         request_serializer=ObserveGraphDataRequestSerializer,
-        responses={200: ObserveGraphDataResponseSerializer},
+        responses={
+            200: ObserveGraphDataResponseSerializer,
+            400: ApiErrorResponseSerializer,
+            500: ApiErrorResponseSerializer,
+        },
     )
     @action(detail=False, methods=["post"])
     def get_graph_methods(self, request, *args, **kwargs):
@@ -1725,9 +1979,23 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             interval = body["interval"]
             req_data_config = body["req_data_config"]
 
-            type = req_data_config.get("type", None)
-            if type not in ["EVAL", "ANNOTATION", "SYSTEM_METRIC"]:
+            metric_type = req_data_config.get("type", None)
+            if metric_type not in ["EVAL", "ANNOTATION", "SYSTEM_METRIC"]:
                 return self._gm.bad_request("Filter property type is not valid")
+            metric_id = req_data_config.get("id", "latency")
+            # PostgreSQL remains authoritative for small config metadata and
+            # authorization only. Telemetry still comes exclusively from CH25.
+            if (
+                metric_type == "EVAL"
+                and not CustomEvalConfig.objects.filter(
+                    id=metric_id,
+                    project_id=project_id,
+                    deleted=False,
+                ).exists()
+            ):
+                return self._gm.bad_request(
+                    "Evaluation config is not available for this project"
+                )
 
             # CH-only path post-migration. D-027: the previous PG fallback
             # (root_span_qs / all_span_qs Subquery annotations over Trace
@@ -1739,30 +2007,22 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # If neither TIME_SERIES (SYSTEM_METRIC) / EVAL_METRICS (EVAL)
             # / ANNOTATION_GRAPH (ANNOTATION) is routed to CH, that's a
             # config error — surface it as a 400.
-            analytics = AnalyticsQueryService()
-            if type == "SYSTEM_METRIC":
-                return self._gm.success_response(
-                    fetch_system_metric_graph_ch(
+            # Graph telemetry is direct-write CH25 data. Bind explicitly to the
+            # pooled V2 client; the legacy CH connection and PostgreSQL span /
+            # trace models are never a fallback for this endpoint.
+            analytics = V2AnalyticsQueryService()
+            try:
+                if metric_type == "SYSTEM_METRIC":
+                    graph = fetch_system_metric_graph_ch(
                         analytics=analytics,
                         project_id=project_id,
                         filters=filters,
                         interval=interval,
-                        metric_id=req_data_config.get("id", "latency"),
+                        metric_id=metric_id,
+                        observe_type="trace",
                     )
-                )
-            elif type == "EVAL":
-                return self._gm.success_response(
-                    fetch_eval_graph_ch(
-                        analytics=analytics,
-                        project_id=project_id,
-                        filters=filters,
-                        interval=interval,
-                        req_data_config=req_data_config,
-                    )
-                )
-            elif type == "ANNOTATION":
-                return self._gm.success_response(
-                    fetch_annotation_graph_ch(
+                elif metric_type == "EVAL":
+                    graph = fetch_eval_graph_ch(
                         analytics=analytics,
                         project_id=project_id,
                         filters=filters,
@@ -1770,12 +2030,47 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         req_data_config=req_data_config,
                         observe_type="trace",
                     )
+                else:
+                    graph = fetch_annotation_graph_ch(
+                        analytics=analytics,
+                        project_id=project_id,
+                        filters=filters,
+                        interval=interval,
+                        req_data_config=req_data_config,
+                        observe_type="trace",
+                    )
+                return self._gm.success_response(
+                    enforce_exact_graph_data_contract(graph)
                 )
-            return self._gm.bad_request("Filter property type is not valid")
+            except Exception as exc:
+                if not (
+                    isinstance(exc, BoundedGraphReadError)
+                    or is_read_budget_error(exc)
+                    or is_clickhouse_query_error(exc)
+                ):
+                    # A programming defect is not a successful degraded graph.
+                    # Re-raise into the outer sanitized handler, which records
+                    # the traceback without exposing it in the API response.
+                    raise
+                logger.warning(
+                    "trace graph query degraded",
+                    project_id=project_id,
+                    metric_type=metric_type,
+                    metric_id=metric_id,
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.success_response(
+                    degraded_graph_response(str(metric_id or ""), exc)
+                )
 
-        except Exception as e:
-            logger.exception(f"Error in get_graph_methods: {str(e)}")
-            return self._gm.bad_request(f"Error fetching graph data: {str(e)}")
+        except Exception as exc:
+            logger.exception(
+                "trace graph request failed",
+                error_type=type(exc).__name__,
+            )
+            return self._gm.bad_request(
+                "Graph data could not be loaded"
+            )
 
     @action(detail=False, methods=["post"])
     def bulk_create(self, request, *args, **kwargs):
@@ -2024,9 +2319,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                             ):
                                 total_eval_configs[
                                     str(metric["custom_eval_config_id"]) + "**" + choice
-                                ] = (
-                                    metric["custom_eval_config__name"] + " - " + choice
-                                )
+                                ] = metric["custom_eval_config__name"] + " - " + choice
                 else:
                     score = (
                         metric["avg_float_score"]
@@ -2383,16 +2676,18 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             return self._gm.success_response(response)
 
-        except Exception as e:
-            logger.exception(f"Error in fetching the trace id by index: {str(e)}")
-
-            return self._gm.bad_request(
-                f"error fetching the trace id by index {str(e)}"
-            )
+        except Exception as exc:
+            logger.exception("trace_navigation_failed", error_type=type(exc).__name__)
+            return self._gm.bad_request("Trace navigation could not be loaded")
 
     @validated_request(
         query_serializer=TraceObserveListQuerySerializer,
-        responses={200: TraceObserveListResponseSerializer, **ERROR_RESPONSES},
+        responses={
+            200: TraceObserveListResponseSerializer,
+            **ERROR_RESPONSES,
+            422: PageDepthExceededErrorSerializer,
+            503: ApiErrorResponseSerializer,
+        },
     )
     @action(detail=False, methods=["get"])
     def list_traces_of_session(self, request, *args, **kwargs):
@@ -2440,7 +2735,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     _project_queryset_for_request(request).filter(id=project_id).first()
                 )
                 if not project or project.trace_type not in ("observe", "experiment"):
-                    raise Exception("Project should be of type observe or experiment")
+                    return self._gm.bad_request(
+                        "Project should be of type observe or experiment"
+                    )
                 org_project_ids = None
 
             # CH-only path post-migration. D-027: the previous PG fallback
@@ -2465,14 +2762,46 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 org=org,
             )
 
-        except Exception as e:
-            logger.exception(f"Error in fetching the traces list of observe: {str(e)}")
-
+        except ListCursorError as exc:
+            return self._gm.custom_error_response(
+                status.HTTP_400_BAD_REQUEST, str(exc), code=exc.code
+            )
+        except Exception as exc:
+            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+                logger.warning(
+                    "observe_trace_list_query_unavailable",
+                    project_id=str(
+                        getattr(request, "validated_query_data", {}).get(
+                            "project_id", ""
+                        )
+                    ),
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trace data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.exception(
+                "observe_trace_list_request_failed",
+                error_type=type(exc).__name__,
+            )
             return self._gm.bad_request(
-                f"error fetching the traces list of observe {str(e)}"
+                "Trace data could not be loaded"
             )
 
-    @action(detail=False, methods=["get"])
+    @validated_request(
+        query_serializer=TraceVoiceCallListQuerySerializer,
+        responses={
+            200: TraceVoiceCallListResponseSerializer,
+            400: ApiErrorResponseSerializer,
+            404: ApiErrorResponseSerializer,
+            422: PageDepthExceededErrorSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
+    )
+    @action(detail=False, methods=["get"], pagination_class=None)
     def list_voice_calls(self, request, *args, **kwargs):
         """
         List voice/conversation traces for a project in an optimized way and
@@ -2483,12 +2812,19 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         - page (1-based, optional, default 1)
         - page_size (optional, default 30)
         """
+        project_id = ""
         try:
-            serializer = TraceVoiceCallListQuerySerializer(data=request.query_params)
-            if not serializer.is_valid():
-                return self._gm.bad_request(serializer.errors)
-
-            validated_data = serializer.validated_data
+            validated_data = getattr(request, "validated_query_data", None)
+            if not validated_data:
+                # Direct unit calls unwrap ``validated_request``. Keep those
+                # calls validated by the same serializer without double-validating
+                # normal HTTP requests.
+                serializer = TraceVoiceCallListQuerySerializer(
+                    data=request.query_params
+                )
+                if not serializer.is_valid():
+                    return self._gm.bad_request(serializer.errors)
+                validated_data = serializer.validated_data
             project_id = str(validated_data["project_id"])
             remove_simulation_calls = validated_data.get(
                 "remove_simulation_calls", False
@@ -2520,13 +2856,33 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 analytics,
             )
 
+        except ListCursorError as exc:
+            return self._gm.custom_error_response(
+                status.HTTP_400_BAD_REQUEST, str(exc), code=exc.code
+            )
         except NotFound:
             raise
-        except ValueError as e:
-            return self._gm.bad_request(str(e))
-        except Exception as e:
-            logger.exception(f"Error in fetching voice calls list: {str(e)}")
-            return self._gm.bad_request("Failed to fetch voice calls")
+        except Project.DoesNotExist:
+            return self._gm.bad_request("Project not found")
+        except Exception as exc:
+            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+                logger.warning(
+                    "voice_call_list_query_unavailable",
+                    project_id=str(project_id),
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Voice call data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.exception(
+                "voice_call_list_request_failed",
+                error_type=type(exc).__name__,
+            )
+            return self._gm.bad_request(
+                "Voice call data could not be loaded"
+            )
 
     # ------------------------------------------------------------------
     # Voice call detail — returns heavy fields for a single call
@@ -2577,85 +2933,84 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if not trace_id:
                 return self._gm.bad_request("trace_id is required")
 
-            # Resolve the trace's project from CH and validate ownership. PG
-            # `tracer_trace` is dropped on CH25, so the project comes from the CH
-            # `traces` row and ownership is checked against the still-present
-            # `tracer_project`.
-            analytics = AnalyticsQueryService()
-            proj_result = analytics.execute_ch_query(
-                "SELECT toString(project_id) AS project_id FROM traces "
-                "WHERE id = toUUID(%(trace_id)s) AND is_deleted = 0 LIMIT 1",
-                {"trace_id": str(trace_id)},
-                timeout_ms=10000,
-            )
-            if not proj_result.data:
-                return self._gm.not_found("trace_id not found")
-            project_id = proj_result.data[0]["project_id"]
-            if not Project.objects.filter(
-                id=project_id,
-                organization=_get_request_organization(request),
-            ).exists():
-                return self._gm.not_found("trace_id not found")
+            # Scope the ClickHouse identity read up front.  The exact reader
+            # resolves latest span versions/tombstones inside only these
+            # authorized projects, so a colliding public trace id cannot select
+            # another tenant via an arbitrary LIMIT 1.
+            project_ids = [
+                str(project_id)
+                for project_id in _project_queryset_for_request(request)
+                .values_list("id", flat=True)
+                .order_by("id")[:4097]
+            ]
+            eval_configs_by_project: dict[str, list[CustomEvalConfig]] = {}
 
-            # ClickHouse-only path: span data lives in CH, not PG (PLAN_V2_NO_CDC).
+            def resolve_eval_config_ids(selected_project_id: str) -> list[str]:
+                eval_configs, eval_config_ids = get_project_eval_configs(
+                    selected_project_id
+                )
+                eval_configs_by_project[str(selected_project_id)] = eval_configs
+                return eval_config_ids
+
+            detail = read_trace_detail(
+                analytics=V2AnalyticsQueryService(),
+                project_ids=project_ids,
+                trace_id=str(trace_id),
+                eval_config_ids_resolver=resolve_eval_config_ids,
+                deadline_ms=6000,
+            )
+            eval_configs = eval_configs_by_project.get(str(detail.project_id), [])
             return self._voice_call_detail_clickhouse(
-                request, trace_id, analytics, project_id
+                request,
+                trace_id,
+                detail,
+                eval_configs,
+            )
+        except TraceDetailNotFound:
+            return self._gm.not_found("trace_id not found")
+        except TraceDetailReadUnavailable as e:
+            logger.warning(
+                "voice_call_detail_bounded_read_incomplete",
+                trace_id=str(request.query_params.get("trace_id") or ""),
+                error_code=e.code,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Voice call details are temporarily unavailable. Please retry.",
+                code="service_unavailable",
             )
         except Exception as e:
             logger.exception("voice_call_detail_error", error=str(e))
-            return self._gm.bad_request("error fetching voice call detail")
+            return self._gm.bad_request("Voice call details could not be loaded")
 
-    def _voice_call_detail_clickhouse(self, request, trace_id, analytics, project_id):
+    def _voice_call_detail_clickhouse(self, request, trace_id, detail, eval_configs):
         """Return heavy voice-call detail fields from ClickHouse."""
-        from tracer.services.clickhouse.query_builders.trace_list import (
-            TraceListQueryBuilder,
-        )
-
-        # 1. Fetch root conversation span for this trace
-        root_query = """
-        SELECT
-            id AS span_id,
-            project_id,
-            trace_id,
-            observation_type,
-            status,
-            start_time,
-            end_time,
-            latency_ms,
-            provider,
-            attributes_extra,
-            -- `eval_attributes` lives on the LANDING table `tracer_observation_span`,
-            -- not on the denormalized `spans` table the dashboard reads. The
-            -- original query referenced it and CH errored with
-            -- `Unknown expression identifier eval_attributes`. The actual eval
-            -- output comes from the EvalLogger rows we already load further
-            -- down — eval_attrs here was only used by simulation_context as a
-            -- fallback, and that fallback resolves to {} on this path.
-            attrs_string,
-            attrs_number,
-            attrs_bool,
-            toJSONString(metadata) AS metadata_json
-        FROM spans
-        WHERE project_id = toUUID(%(project_id)s)
-          AND trace_id = %(trace_id)s
-          AND is_deleted = 0
-          AND (parent_span_id IS NULL OR parent_span_id = '')
-          AND observation_type = 'conversation'
-        LIMIT 1
-        """
-        root_result = analytics.execute_ch_query(
-            root_query,
-            {"trace_id": str(trace_id), "project_id": project_id},
-            timeout_ms=10000,
-        )
-        if not root_result.data:
+        project_id = detail.project_id
+        root_rows = [
+            span
+            for span in detail.spans
+            if span.get("parent_span_id") in (None, "")
+            and str(span.get("observation_type") or "").lower() == "conversation"
+        ]
+        if not root_rows:
             return self._gm.not_found("No conversation root span found in CH")
 
-        row = root_result.data[0]
+        # ``read_trace_detail`` returns exact rows ordered by physical start
+        # identity. Voice traces normally have one conversation root; choosing
+        # by time/id keeps malformed multi-root data deterministic.
+        row = min(
+            root_rows,
+            key=lambda span: (span.get("start_time"), str(span.get("id") or "")),
+        )
+        child_rows = [
+            span
+            for span in detail.spans
+            if span.get("parent_span_id") not in (None, "")
+        ]
         provider = row.get("provider") or "vapi"
 
         # Parse attributes_extra to get raw_log
-        span_attrs_raw = row.get("attributes_extra", "{}")
+        span_attrs_raw = row.get("span_attributes", "{}")
         try:
             span_attrs = (
                 json.loads(span_attrs_raw)
@@ -2714,47 +3069,6 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         attr_str = row.get("attrs_string") or {}
         recording = self._build_recording_dict(attr_str)
 
-        # 2. Fetch child spans
-        child_query = """
-        SELECT
-            id,
-            trace_id,
-            name,
-            observation_type,
-            status,
-            start_time,
-            end_time,
-            latency_ms,
-            model,
-            provider,
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            cost,
-            input,
-            output,
-            parent_span_id,
-            attributes_extra,
-            attrs_string,
-            attrs_number,
-            attrs_bool,
-            toJSONString(metadata) AS metadata_json,
-            status_message,
-            tags
-        FROM spans
-        WHERE project_id = toUUID(%(project_id)s)
-          AND trace_id = %(trace_id)s
-          AND is_deleted = 0
-          AND parent_span_id IS NOT NULL
-        ORDER BY start_time ASC
-        LIMIT 1 BY id
-        """
-        child_result = analytics.execute_ch_query(
-            child_query,
-            {"trace_id": str(trace_id), "project_id": project_id},
-            timeout_ms=10000,
-        )
-
         # Build observation_span array — root span first
         root_span_id = str(row.get("span_id", row.get("id", "")))
         observation_span = [
@@ -2777,8 +3091,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             }
         ]
 
-        for child in child_result.data:
-            child_attrs_raw = child.get("attributes_extra", "{}")
+        for child in child_rows:
+            child_attrs_raw = child.get("span_attributes", "{}")
             try:
                 child_span_attrs = (
                     json.loads(child_attrs_raw)
@@ -2853,35 +3167,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 if not processed_log.get("message_count"):
                     processed_log["message_count"] = len(stored)
 
-        # All non-deleted eval configs for the project so the drawer renders
-        # the same set of evals as the list columns; missing scores become
-        # placeholder entries with `output=None`. Read from PG (indexed) —
-        # replaces the unbounded CH dictGet discovery scan.
-        eval_configs, eval_config_ids = get_project_eval_configs(project_id)
-
         eval_outputs = {}
-        trace_evals: dict[str, Any] = {}
-        if eval_config_ids:
-            # Reuse the list builder's eval query so the detail view stays in
-            # parity with the voice-call list (same completed-only aggregation
-            # + per-status counts) instead of a drifting parallel query. The
-            # builder gates aggregates on ``status = 'completed'`` so pending /
-            # running / skipped rows no longer contaminate the average, and the
-            # shared pivot emits a ``{"status": ...}`` marker for them.
-            eval_builder = TraceListQueryBuilder(
-                project_id=str(project_id),
-                eval_config_ids=eval_config_ids,
-            )
-            eval_query, eval_params = eval_builder.build_eval_query([str(trace_id)])
-            if eval_query:
-                eval_result = analytics.execute_ch_query(
-                    eval_query, eval_params, timeout_ms=30000
-                )
-                eval_map = TraceListQueryBuilder.pivot_eval_results(
-                    [list(r.values()) for r in eval_result.data],
-                    list(eval_result.data[0].keys()) if eval_result.data else [],
-                )
-                trace_evals = eval_map.get(str(trace_id), {}) or {}
+        trace_evals = _pivot_voice_detail_eval_rows(detail.evals)
 
         for config in eval_configs:
             config_id = str(config.id)
@@ -2929,18 +3216,22 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     ]
                 elif "str_list" in scores and scores["str_list"]:
                     metric_entry["output"] = scores["str_list"]
-                elif "avg_score" in scores:
-                    score_val = scores.get("avg_score") or scores.get("pass_rate")
+                elif "avg_score" in scores or "pass_rate" in scores:
+                    score_val = (
+                        scores.get("pass_rate")
+                        if output_type == EvalOutputType.PASS_FAIL.value
+                        else scores.get("avg_score")
+                    )
                     if output_type == "Pass/Fail":
                         metric_entry["output"] = (
-                            "Pass" if score_val and score_val > 0 else "Fail"
+                            "Pass"
+                            if isinstance(score_val, (int, float)) and score_val > 0
+                            else "Fail"
                         )
                     else:
-                        metric_entry["output"] = (
-                            round(score_val * 100, 2)
-                            if isinstance(score_val, (int, float))
-                            else score_val
-                        )
+                        # The bounded reducer uses the list endpoint's
+                        # pre-scaled 0..100 score contract.
+                        metric_entry["output"] = score_val
                 else:
                     metric_entry["output"] = None
             else:
@@ -2990,100 +3281,61 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     def _get_trace_id_by_index_observe_clickhouse(
         self, request, trace_id, project_id, filters, analytics
     ):
-        """CH path: get prev/next trace IDs using the spans table."""
-        from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
-        from tracer.services.clickhouse.query_builders.filters import (
-            ClickHouseFilterBuilder,
+        """Return exact adjacent ids from the same bounded list order."""
+        from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+        from tracer.services.clickhouse.v2.query_builders.trace_list import (
+            TraceListQueryBuilderV2,
         )
 
-        fb = ClickHouseFilterBuilder(table="spans")
-        extra_where, extra_params = fb.translate(filters)
-
-        # Parse date range from filters.  The drawer does not forward the
-        # date-range picker value, so we fall back to 1 year to avoid
-        # excluding the current trace.
-        from datetime import datetime, timedelta
-
-        start_date, end_date = BaseQueryBuilder.parse_time_range(filters)
-        has_explicit_date = any(
-            f.get("column_id") in ("created_at", "start_time") for f in filters
+        builder = TraceListQueryBuilderV2(
+            project_id=str(project_id),
+            page_number=0,
+            page_size=TRACE_NAVIGATION_CANDIDATE_LIMIT,
+            filters=list(filters or []),
+            bounded_internal_scan=True,
+            bounded_identity_only=True,
+            bounded_bulk_scan=True,
         )
-        if not has_explicit_date:
-            start_date = datetime.utcnow() - timedelta(days=365)
-            end_date = datetime.utcnow()
-
-        params = {
-            "project_id": str(project_id),
-            "trace_id": str(trace_id),
-            "start_date": start_date,
-            "end_date": end_date,
-        }
-        params.update(extra_params)
-
-        time_filter = "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
-        filter_fragment = f"AND {extra_where}" if extra_where else ""
-
-        # Get current trace's start_time
-        current_query = f"""
-        SELECT start_time
-        FROM spans
-        WHERE project_id = toUUID(%(project_id)s)
-          AND is_deleted = 0
-          AND trace_id = %(trace_id)s
-          AND (parent_span_id IS NULL OR parent_span_id = '')
-          {time_filter}
-          {filter_fragment}
-        ORDER BY start_time DESC
-        LIMIT 1
-        """
-        current_result = analytics.execute_ch_query(
-            current_query, params, timeout_ms=30000
+        error_code = builder.bounded_filter_degraded_error_code()
+        if error_code or not builder.supports_bounded_filter_scan():
+            raise TraceNavigationReadUnavailable(
+                error_code or "unsupported_filter_shape"
+            )
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=analytics,
+            filters=list(filters or []),
+            key_field="trace_id",
+            page_number=0,
+            page_size=TRACE_NAVIGATION_CANDIDATE_LIMIT,
+            deadline_ms=TRACE_LIST_WALL_DEADLINE_MS,
         )
-        if not current_result.data:
-            return self._gm.bad_request("Trace not found")
+        if not page.complete:
+            raise TraceNavigationReadUnavailable(page.error_code or "read_incomplete")
 
-        current_start_time = current_result.data[0]["start_time"]
-        params["current_start_time"] = current_start_time
+        ordered_ids = [
+            str(row.get("trace_id") or "") for row in page.rows if row.get("trace_id")
+        ]
+        try:
+            current_index = ordered_ids.index(str(trace_id))
+        except ValueError:
+            code = "page_depth_exceeded" if page.has_more else "trace_not_in_list"
+            raise TraceNavigationReadUnavailable(code) from None
+        if page.has_more and current_index == len(ordered_ids) - 1:
+            # The older sentinel is outside the returned page; guessing would
+            # make navigation disagree with page N.
+            raise TraceNavigationReadUnavailable("page_depth_exceeded")
 
-        # Previous trace (newer by time — "next in line")
-        prev_query = f"""
-        SELECT trace_id
-        FROM spans
-        WHERE project_id = toUUID(%(project_id)s)
-          AND is_deleted = 0
-          AND (parent_span_id IS NULL OR parent_span_id = '')
-          AND trace_id != %(trace_id)s
-          AND start_time <= %(current_start_time)s
-          {time_filter}
-          {filter_fragment}
-        ORDER BY start_time DESC
-        LIMIT 1 BY trace_id
-        LIMIT 1
-        """
-        prev_result = analytics.execute_ch_query(prev_query, params, timeout_ms=30000)
-        previous_trace = prev_result.data[0]["trace_id"] if prev_result.data else None
-
-        # Next trace (older by time)
-        next_query = f"""
-        SELECT trace_id
-        FROM spans
-        WHERE project_id = toUUID(%(project_id)s)
-          AND is_deleted = 0
-          AND (parent_span_id IS NULL OR parent_span_id = '')
-          AND trace_id != %(trace_id)s
-          AND start_time >= %(current_start_time)s
-          {time_filter}
-          {filter_fragment}
-        ORDER BY start_time ASC
-        LIMIT 1 BY trace_id
-        LIMIT 1
-        """
-        next_result = analytics.execute_ch_query(next_query, params, timeout_ms=30000)
-        next_trace = next_result.data[0]["trace_id"] if next_result.data else None
+        newer_trace = ordered_ids[current_index - 1] if current_index > 0 else None
+        older_trace = (
+            ordered_ids[current_index + 1]
+            if current_index + 1 < len(ordered_ids)
+            else None
+        )
 
         response = {
-            "next_trace_id": str(previous_trace) if previous_trace else None,
-            "previous_trace_id": str(next_trace) if next_trace else None,
+            "next_trace_id": str(older_trace) if older_trace else None,
+            "previous_trace_id": str(newer_trace) if newer_trace else None,
         }
         return self._gm.success_response(response)
 
@@ -3114,15 +3366,36 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # was deleted. CH path lives in
             # _get_trace_id_by_index_observe_clickhouse and uses the spans
             # table directly with cursor-style start_time comparisons.
-            analytics = AnalyticsQueryService()
+            analytics = V2AnalyticsQueryService()
             return self._get_trace_id_by_index_observe_clickhouse(
                 request, trace_id, project_id, filters, analytics
             )
 
-        except Exception as e:
-            return self._gm.bad_request(
-                f"error fetching the trace id by index {str(e)}"
+        except TraceNavigationReadUnavailable as exc:
+            # A completed bounded read that does not contain the requested
+            # trace is an exact not-found result, not an availability failure.
+            # Keep genuine incomplete/budget outcomes retryable below.
+            if exc.code == "trace_not_in_list":
+                return self._gm.bad_request("Trace not found")
+            logger.warning(
+                "trace_navigation_bounded_read_incomplete",
+                project_id=str(request.validated_query_data.get("project_id") or ""),
+                error_code=exc.code,
             )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace navigation is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        except Exception as exc:
+            logger.exception("trace_navigation_failed", error_type=type(exc).__name__)
+            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trace navigation is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            return self._gm.bad_request("Trace navigation could not be loaded")
 
     @action(detail=False, methods=["get"])
     def get_trace_export_data(self, request, *args, **kwargs):
@@ -3431,13 +3704,60 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         CH25_QUERY_TYPES_V2_PRIMARY=TRACE_LIST to flip to CH 25.3.
         """
         from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
+        from tracer.services.clickhouse.v2.query_service import (
+            query_service_for_builder,
+        )
 
         BuilderCls = get_query_builder_class("TRACE_LIST")  # noqa: N806
+        analytics = query_service_for_builder("TRACE_LIST", BuilderCls, analytics)
+        read_deadline = ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
 
         org_scope = bool(org_project_ids)
         filters = list(validated_data.get("filters", []) or [])
         page_number = validated_data["page_number"]
         page_size = validated_data["page_size"]
+        cursor_token = validated_data.get("cursor")
+        cursor_requested = bool(cursor_token or validated_data.get("cursor_mode"))
+        scope_project_ids = [
+            str(value)
+            for value in (org_project_ids or ([project_id] if project_id else []))
+        ]
+        cursor_scope = cursor_scope_for_request(request, project_ids=scope_project_ids)
+        cursor_query = dict(validated_data)
+        cursor_state = None
+        if cursor_token:
+            cursor_state = decode_list_cursor(
+                cursor_token,
+                resource="observe_traces",
+                scope=cursor_scope,
+                query=cursor_query,
+                page_size=page_size,
+            )
+            if (
+                len(cursor_state.order) != 2
+                or not isinstance(cursor_state.order[0], datetime)
+                or not isinstance(cursor_state.order[1], str)
+            ):
+                raise ListCursorError(
+                    "invalid_cursor", "The continuation cursor is invalid."
+                )
+            filters.append(frozen_window_filter(cursor_state))
+            page_number = 0
+        if not cursor_token and numbered_page_depth_exceeded(
+            page_number=page_number,
+            page_size=page_size,
+        ):
+            logger.info(
+                "trace_list_page_depth_exceeded_preflight",
+                project_id=str(project_id) if project_id else None,
+                page_number=page_number,
+                page_size=page_size,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                PAGE_DEPTH_EXCEEDED_MESSAGE,
+                code=PAGE_DEPTH_EXCEEDED_CODE,
+            )
         session_id = (
             str(validated_data["session_id"])
             if validated_data.get("session_id")
@@ -3456,55 +3776,30 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 }
             )
 
-        # Get eval config IDs. Project mode uses a CH dict-lookup (fast);
-        # org mode uses a PG scan because the CH dict-lookup takes a single
-        # project_id — multi-project CH variant not implemented yet.
+        # Eval configuration metadata is small and remains in PostgreSQL. Never
+        # discover data-bearing configs through PG Trace/EvalLogger telemetry:
+        # direct-write CH25 is authoritative and those rows need not exist in
+        # PostgreSQL. In org mode, including a config with no page result only
+        # adds an empty column; it is safer than silently losing CH-only data.
         eval_config_ids = []
         if org_scope:
             eval_configs = CustomEvalConfig.objects.filter(
-                id__in=EvalLogger.objects.filter(
-                    trace_id__in=Trace.objects.filter(
-                        project_id__in=org_project_ids
-                    ).values("id")
-                )
-                .values("custom_eval_config_id")
-                .distinct(),
+                project_id__in=org_project_ids,
                 deleted=False,
             ).select_related("eval_template")
             eval_config_ids = [str(c.id) for c in eval_configs]
         else:
-            # PERF: resolve this project's configs from PG first (indexed by
-            # the project FK), then ask CH which of them have recent data via
-            # a ``custom_eval_config_id IN (…)`` scope — the eval table's
-            # leading sort key, so CH prunes to just those configs. The old
-            # inline query ran ``FINAL`` over the ENTIRE eval table plus a
-            # per-row ``dictGet('trace_dict', 'project_id', …)`` call — a
-            # full-table merge + dictionary lookup per eval row that
-            # OOM-crashed the server at tens of millions of eval rows. See
-            # AnalyticsQueryService.get_eval_config_ids_with_data_ch.
-            project_configs = list(
+            # Config metadata is already a finite project-scoped PG read. Do
+            # not put a second, window-wide CH discovery query in front of the
+            # authoritative page read: on large tenants that optional column
+            # pruning phase consumed the whole endpoint deadline. Empty configs
+            # merely render empty cells; page-scoped eval hydration below stays
+            # finite by trace IDs + this finite config set.
+            eval_configs = list(
                 CustomEvalConfig.objects.filter(
                     project_id=project_id, deleted=False
                 ).select_related("eval_template")
             )
-            candidate_ids = [str(c.id) for c in project_configs]
-            # Discover eval columns over the requested window (cover
-            # [start, now]), not a fixed 30 days — so configs with data anywhere
-            # in the viewed range keep their columns. Bounded by candidate ids.
-            window_days = BuilderCls.window_days_covering(filters)
-            ids_with_data = (
-                set(
-                    analytics.get_eval_config_ids_with_data_ch(
-                        str(project_id),
-                        timeout_ms=30000,
-                        candidate_config_ids=candidate_ids,
-                        window_days=window_days,
-                    )
-                )
-                if candidate_ids
-                else set()
-            )
-            eval_configs = [c for c in project_configs if str(c.id) in ids_with_data]
             eval_config_ids = [str(c.id) for c in eval_configs]
 
         # Annotation labels — skip in org-scoped mode (deferred enhancement)
@@ -3515,6 +3810,25 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         annotation_label_ids = [str(label.id) for label in annotation_labels]
         label_types = {str(label.id): label.type for label in annotation_labels}
 
+        cursor_supported = snapshot_cursor_supported(filters, resource="observe_traces")
+        if cursor_state is not None and not cursor_supported:
+            raise ListCursorError(
+                "cursor_unsupported",
+                "Cursor pagination is unavailable for this query shape.",
+            )
+        cursor_enabled = cursor_requested and cursor_supported
+        version_ceiling = (
+            cursor_state.version_ceiling
+            if cursor_state is not None
+            else (
+                capture_snapshot_version_ceiling(
+                    analytics,
+                    timeout_ms=read_deadline.remaining_ms(250),
+                )
+                if cursor_enabled
+                else None
+            )
+        )
         builder = BuilderCls(
             project_id=None if org_scope else str(project_id),
             project_ids=[str(p) for p in org_project_ids] if org_scope else None,
@@ -3524,51 +3838,289 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             eval_config_ids=eval_config_ids,
             annotation_label_ids=annotation_label_ids,
         )
+        page_read_settings = (
+            snapshot_read_settings(
+                TRACE_LIST_READ_SETTINGS,
+                builder=builder,
+                version_ceiling=version_ceiling,
+            )
+            if version_ceiling is not None
+            else TRACE_LIST_READ_SETTINGS
+        )
 
         # Phase 1: Paginated traces (light columns only — no input/output)
-        query, params = builder.build()
-        result = analytics.execute_ch_query(query, params, timeout_ms=10000)
+        bounded_page = None
+        bounded_error_code = builder.bounded_filter_degraded_error_code()
+        try:
+            candidate_deadline_ms = read_deadline.remaining_ms(
+                TRACE_LIST_CANDIDATE_DEADLINE_MS
+            )
+        except ReadDeadlineExceeded:
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        if builder.supports_bounded_filter_scan():
+            from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+            from tracer.services.clickhouse.query_service import QueryResult
 
-        # Prefix-dedup pagination: Phase 1 dropped `LIMIT 1 BY trace_id` (its
-        # O(roots-in-window) full sort OOM-crashed CH — see
-        # TraceListQueryBuilder.build) and instead fetched the sorted prefix
-        # [0, offset + 2*page_size). De-dup the prefix by trace id and slice
-        # the page — every page is a disjoint slice of the same globally
-        # de-duplicated stream, so a trace (even a multi-root one whose roots
-        # sort pages apart) can never appear on two pages and none is
-        # skipped. See page_dedup.py.
-        result.data, _has_more = paginate_deduped(
-            result.data, "trace_id", page_number, page_size
-        )
-
-        # Count
-        count_query, count_params = builder.build_count_query()
-        count_result = analytics.execute_ch_query(
-            count_query, count_params, timeout_ms=30000
-        )
-        total_count = count_result.data[0].get("total", 0) if count_result.data else 0
-
-        # Phase 1b: Fetch heavy columns (input/output/attrs) for the page
-        trace_ids = [str(row.get("trace_id", "")) for row in result.data]
-        content_rows = []
-        if trace_ids:
-            content_query, content_params = builder.build_content_query(trace_ids)
-            if content_query:
-                content_result = analytics.execute_ch_query(
-                    content_query, content_params, timeout_ms=10000
-                )
-                content_rows = content_result.data
-                # Every in-window trace has a root span, so a shortfall means
-                # spans fell outside the 1-day window buffer (a trace running
-                # longer than the buffer, clock skew, or backfilled
-                # timestamps) and enrichment silently dropped them.
-                if len(content_rows) < len(trace_ids):
-                    logger.warning(
-                        "trace content enrichment returned fewer traces than requested",
-                        returned=len(content_rows),
-                        requested=len(trace_ids),
+            bounded_page = read_bounded_filter_page(
+                builder=builder,
+                analytics=analytics,
+                filters=filters,
+                key_field="trace_id",
+                page_number=page_number,
+                page_size=page_size,
+                deadline_ms=candidate_deadline_ms,
+                cursor_start_time=(
+                    cursor_state.order[0] if cursor_state is not None else None
+                ),
+                cursor_order_token=(
+                    cursor_state.order[1] if cursor_state is not None else None
+                ),
+                read_settings=page_read_settings,
+            )
+            if not bounded_page.complete:
+                if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
+                    logger.info(
+                        "trace_list_page_depth_exceeded",
                         project_id=str(project_id) if project_id else None,
+                        page_number=page_number,
+                        page_size=page_size,
                     )
+                    return self._gm.custom_error_response(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        PAGE_DEPTH_EXCEEDED_MESSAGE,
+                        code=PAGE_DEPTH_EXCEEDED_CODE,
+                    )
+                logger.warning(
+                    "trace_list_bounded_read_incomplete",
+                    project_id=str(project_id) if project_id else None,
+                    page_number=page_number,
+                    error_code=bounded_page.error_code,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Filtered trace data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            result = QueryResult(
+                data=bounded_page.rows,
+                row_count=len(bounded_page.rows),
+                backend_used="clickhouse",
+                query_time_ms=bounded_page.elapsed_ms,
+            )
+            total_count = bounded_page.total_rows_lower_bound
+        elif bounded_error_code:
+            logger.warning(
+                "trace_list_filter_unsupported",
+                project_id=str(project_id) if project_id else None,
+                page_number=page_number,
+                error_code=bounded_error_code,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Filtered trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        else:
+            if cursor_state is not None:
+                raise ListCursorError(
+                    "cursor_unsupported",
+                    "Cursor pagination is unavailable for this query shape.",
+                )
+            query, params = builder.build()
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=read_deadline.remaining_ms(1_200),
+                settings=page_read_settings,
+            )
+
+            # De-duplicate the common sorted prefix before slicing page N.
+            result.data, _has_more = paginate_deduped(
+                result.data, "trace_id", page_number, page_size
+            )
+
+            count_query, count_params = builder.build_count_query()
+            count_result = analytics.execute_ch_query(
+                count_query,
+                count_params,
+                timeout_ms=read_deadline.remaining_ms(1_200),
+                settings=page_read_settings,
+            )
+            total_count = (
+                count_result.data[0].get("total", 0) if count_result.data else 0
+            )
+
+        query_count = bounded_page.query_count if bounded_page is not None else 2
+        query_rows_returned = (
+            bounded_page.rows_returned
+            if bounded_page is not None
+            else len(result.data) + len(count_result.data or [])
+        )
+        query_result_payload_bytes = (
+            bounded_page.result_payload_bytes
+            if bounded_page is not None
+            else len(
+                json.dumps(
+                    [result.data, count_result.data],
+                    default=str,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        )
+
+        # Every page-scoped ClickHouse enrichment shares the request's one wall
+        # deadline. They are independent once the trace page is known, so run
+        # them concurrently: endpoint latency is selector + max(enrichment),
+        # never selector + the serial sum of five independent queries.
+        trace_ids = [str(row.get("trace_id", "")) for row in result.data]
+        root_identities = [
+            (
+                str(row.get("project_id") or project_id or ""),
+                str(row.get("trace_id") or ""),
+                str(row.get("root_span_id") or ""),
+                row.get("start_time"),
+            )
+            for row in result.data
+            if row.get("trace_id")
+            and row.get("root_span_id")
+            and row.get("start_time") is not None
+            and (row.get("project_id") or project_id)
+        ]
+        content_query, content_params = builder.build_content_query(
+            trace_ids,
+            root_identities=(
+                root_identities if len(root_identities) == len(result.data) else None
+            ),
+        )
+        user_query, user_params = builder.build_user_id_query(trace_ids)
+        eval_query, eval_params = builder.build_eval_query(trace_ids)
+        attr_query, attr_params = builder.build_span_attributes_query(trace_ids)
+
+        def _execute_enrichment(query, params):
+            return analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=read_deadline.remaining_ms(TRACE_LIST_ENRICHMENT_TIMEOUT_MS),
+                settings=page_read_settings,
+            )
+
+        def _fetch_span_trace_map():
+            return analytics.get_span_trace_map(
+                trace_ids,
+                project_id=None if org_scope else str(project_id),
+                start_date=builder.params.get("start_date"),
+                end_date=builder.params.get("end_date"),
+                timeout_ms=read_deadline.remaining_ms(TRACE_LIST_ENRICHMENT_TIMEOUT_MS),
+                settings=page_read_settings,
+            )
+
+        tasks: dict[str, Any] = {}
+        if content_query:
+            tasks["content"] = (content_query, content_params)
+        if user_query:
+            tasks["users"] = (user_query, user_params)
+        if eval_query and trace_ids and eval_config_ids:
+            tasks["evals"] = (eval_query, eval_params)
+        if attr_query:
+            tasks["attributes"] = (attr_query, attr_params)
+
+        enrichment_results: dict[str, Any] = {}
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        future_names: dict[concurrent.futures.Future, str] = {}
+        try:
+            for task_name, (task_query, task_params) in tasks.items():
+                future = pool.submit(_execute_enrichment, task_query, task_params)
+                future_names[future] = task_name
+            if trace_ids and annotation_label_ids:
+                span_map_future = pool.submit(_fetch_span_trace_map)
+                future_names[span_map_future] = "span_trace_map"
+
+            wait_seconds = read_deadline.remaining_ms() / 1000
+            for future in concurrent.futures.as_completed(
+                future_names, timeout=wait_seconds
+            ):
+                enrichment_results[future_names[future]] = future.result()
+            read_deadline.remaining_ms()
+        except (concurrent.futures.TimeoutError, ReadDeadlineExceeded) as exc:
+            logger.warning(
+                "trace_list_enrichment_deadline_exceeded",
+                error_type=type(exc).__name__,
+                project_id=str(project_id) if project_id else None,
+                page_number=page_number,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        except Exception as exc:
+            failed_phase = next(
+                (
+                    name
+                    for future, name in future_names.items()
+                    if future.done() and future.exception() is exc
+                ),
+                "unknown",
+            )
+            logger.warning(
+                "trace_list_enrichment_failed",
+                phase=failed_phase,
+                error_type=type(exc).__name__,
+                read_budget_error=is_read_budget_error(exc),
+                project_id=str(project_id) if project_id else None,
+                page_number=page_number,
+                exc_info=True,
+            )
+            if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+                raise
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        if set(enrichment_results) != set(future_names.values()):
+            raise AssertionError("trace enrichment futures did not all complete")
+
+        query_count += len(future_names)
+        for task_result in enrichment_results.values():
+            task_rows = (
+                task_result.data if hasattr(task_result, "data") else task_result
+            )
+            if isinstance(task_rows, dict):
+                task_rows = list(task_rows.items())
+            if isinstance(task_rows, (list, tuple)):
+                query_rows_returned += len(task_rows)
+                query_result_payload_bytes += len(
+                    json.dumps(
+                        task_rows,
+                        default=str,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+
+        content_result = enrichment_results.get("content")
+        content_rows = content_result.data if content_result is not None else []
+        if content_query and len(content_rows) < len(trace_ids):
+            logger.warning(
+                "trace_list_content_replay_incomplete",
+                returned=len(content_rows),
+                requested=len(trace_ids),
+                project_id=str(project_id) if project_id else None,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         content_map = merge_content_rows(
             result.data,
             content_rows,
@@ -3596,38 +4148,44 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             else:
                 row["metadata"] = raw_meta or {}
 
-        user_id_map = builder.resolve_user_ids(trace_ids, analytics)
+        user_result = enrichment_results.get("users")
+        user_id_map = {
+            str(row.get("trace_id", "")): row.get("user_id")
+            for row in (user_result.data if user_result is not None else [])
+            if row.get("user_id")
+        }
 
-        # Phase 2: Eval scores
+        # Phase 2: page-scoped eval scores.
         eval_map = {}
-        if trace_ids and eval_config_ids:
-            eval_query, eval_params = builder.build_eval_query(trace_ids)
-            if eval_query:
-                eval_result = analytics.execute_ch_query(
-                    eval_query, eval_params, timeout_ms=30000
-                )
-                eval_map = builder.pivot_eval_results(
-                    [(list(row.values())) for row in eval_result.data],
-                    list(eval_result.data[0].keys()) if eval_result.data else [],
-                )
+        eval_result = enrichment_results.get("evals")
+        if eval_result is not None:
+            eval_map = builder.pivot_eval_results(
+                [(list(row.values())) for row in eval_result.data],
+                list(eval_result.data[0].keys()) if eval_result.data else [],
+            )
 
         # Phase 3: Annotations — PG values, span->trace resolved via CH.
         # In org-scoped mode the page spans multiple projects, so scope the
         # map on the window only (a single project_id would drop other
         # projects' spans).
-        span_trace_map = (
-            analytics.get_span_trace_map(
-                trace_ids,
-                project_id=None if org_scope else str(project_id),
-                start_date=builder.params.get("start_date"),
-                end_date=builder.params.get("end_date"),
-            )
-            if trace_ids and annotation_label_ids
-            else {}
-        )
+        span_trace_map = enrichment_results.get("span_trace_map", {})
         annotation_map = _build_annotation_map_from_scores(
             trace_ids, annotation_label_ids, label_types, span_trace_map
         )
+        try:
+            read_deadline.remaining_ms()
+        except ReadDeadlineExceeded as exc:
+            logger.warning(
+                "trace_list_annotation_hydration_deadline_exceeded",
+                error_type=type(exc).__name__,
+                project_id=str(project_id) if project_id else None,
+                page_number=page_number,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
 
         # Phase 4: Aggregated span attributes for custom columns
         _SKIP_ATTR_PREFIXES = (
@@ -3638,55 +4196,38 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             "output.value",
         )
         aggregated_attrs = {}  # trace_id -> {attr_key -> [unique_values]}
-        if trace_ids:
+        attr_result = enrichment_results.get("attributes")
+        for attr_row in attr_result.data if attr_result is not None else []:
+            tid = str(attr_row.get("trace_id", ""))
+            raw = attr_row.get("attributes_extra", "{}")
             try:
-                attr_query, attr_params = builder.build_span_attributes_query(trace_ids)
-                if attr_query:
-                    attr_result = analytics.execute_ch_query(
-                        attr_query, attr_params, timeout_ms=30000
+                attrs = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except (json.JSONDecodeError, TypeError):
+                attrs = {}
+            # Fallback: merge from typed Map columns when raw is empty.
+            if not attrs:
+                str_map = attr_row.get("attrs_string") or {}
+                num_map = attr_row.get("attrs_number") or {}
+                if isinstance(str_map, dict):
+                    attrs.update(str_map)
+                if isinstance(num_map, dict):
+                    for key, value in num_map.items():
+                        if key not in attrs:
+                            attrs[key] = value
+            aggregated_attrs.setdefault(tid, {})
+            for key, value in attrs.items():
+                if key.startswith(_SKIP_ATTR_PREFIXES):
+                    continue
+                if isinstance(value, str) and len(value) > 500:
+                    continue
+                if key not in aggregated_attrs[tid]:
+                    aggregated_attrs[tid][key] = (
+                        set() if isinstance(value, (str, int, float, bool)) else []
                     )
-                    for attr_row in attr_result.data:
-                        tid = str(attr_row.get("trace_id", ""))
-                        raw = attr_row.get("attributes_extra", "{}")
-                        try:
-                            attrs = (
-                                json.loads(raw) if isinstance(raw, str) else (raw or {})
-                            )
-                        except (json.JSONDecodeError, TypeError):
-                            attrs = {}
-                        # Fallback: merge from typed Map columns when raw is empty
-                        if not attrs:
-                            str_map = attr_row.get("attrs_string") or {}
-                            num_map = attr_row.get("attrs_number") or {}
-                            if isinstance(str_map, dict):
-                                attrs.update(str_map)
-                            if isinstance(num_map, dict):
-                                for k, v in num_map.items():
-                                    if k not in attrs:
-                                        attrs[k] = v
-                        if tid not in aggregated_attrs:
-                            aggregated_attrs[tid] = {}
-                        for key, value in attrs.items():
-                            if key.startswith(_SKIP_ATTR_PREFIXES):
-                                continue
-                            if isinstance(value, str) and len(value) > 500:
-                                continue
-                            if key not in aggregated_attrs[tid]:
-                                aggregated_attrs[tid][key] = (
-                                    set()
-                                    if isinstance(value, (str, int, float, bool))
-                                    else []
-                                )
-                            if isinstance(value, (str, int, float, bool)):
-                                aggregated_attrs[tid][key].add(
-                                    value
-                                    if not isinstance(value, bool)
-                                    else str(value).lower()
-                                )
-                            elif isinstance(value, (list, dict)):
-                                pass  # skip complex values for aggregation
-            except Exception as e:
-                logger.warning(f"Span attribute aggregation failed: {e}")
+                if isinstance(value, (str, int, float, bool)):
+                    aggregated_attrs[tid][key].add(
+                        value if not isinstance(value, bool) else str(value).lower()
+                    )
 
         # Build column config — get_default_trace_config() already includes
         # all standard columns (latency, tokens, cost, user_id, etc.)
@@ -3781,8 +4322,72 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             table_data.append(entry)
 
+        try:
+            read_deadline.remaining_ms()
+        except ReadDeadlineExceeded:
+            logger.warning(
+                "trace_list_response_deadline_exceeded",
+                project_id=str(project_id) if project_id else None,
+                page_number=page_number,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+
+        next_cursor = None
+        cursor_seen_rows = (
+            cursor_state.seen_rows
+            if cursor_state is not None
+            else page_number * page_size
+        ) + len(result.data)
+        if (
+            cursor_enabled
+            and bounded_page is not None
+            and bounded_page.has_more
+            and result.data
+            and version_ceiling is not None
+        ):
+            last_row = result.data[-1]
+            window_start, window_end = builder.parse_time_range(filters)
+            next_cursor = encode_list_cursor(
+                resource="observe_traces",
+                scope=cursor_scope,
+                query=cursor_query,
+                page_size=page_size,
+                window_start=window_start,
+                window_end=window_end,
+                order=(last_row.get("start_time"), str(last_row.get("trace_id", ""))),
+                version_ceiling=version_ceiling,
+                seen_rows=cursor_seen_rows,
+            )
+
+        metadata = {"total_rows": total_count}
+        if bounded_page is not None:
+            metadata.update(
+                {
+                    "total_rows_is_lower_bound": True,
+                    "has_more": bounded_page.has_more,
+                    "query_complete": bounded_page.complete,
+                    "query_status": bounded_page.status,
+                    "query_error_code": bounded_page.error_code,
+                    "query_elapsed_ms": round(read_deadline.elapsed_ms(), 3),
+                    "query_count": query_count,
+                    "query_rows_returned": query_rows_returned,
+                    "query_result_payload_bytes": query_result_payload_bytes,
+                }
+            )
+        metadata.update(
+            cursor_page_metadata(
+                enabled=cursor_enabled,
+                has_more=bool(bounded_page and bounded_page.has_more),
+                seen_rows=cursor_seen_rows,
+                next_cursor=next_cursor,
+            )
+        )
         response = {
-            "metadata": {"total_rows": total_count},
+            "metadata": metadata,
             "table": _sanitize_nonfinite_floats(table_data),
             "config": column_config,
         }
@@ -3801,14 +4406,41 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         from tracer.services.clickhouse.query_builders.trace_list import (
             TraceListQueryBuilder,
         )
+        from tracer.services.clickhouse.read_budget import is_read_budget_error
         from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
+        from tracer.services.clickhouse.v2.query_service import (
+            query_service_for_builder,
+        )
 
         VoiceBuilderCls = get_query_builder_class("VOICE_CALL_LIST")  # noqa: N806
-
         filters = validated_data.get("filters", [])
         page = validated_data.get("page", 1)
         page_size = validated_data.get("page_size", 30)
         page_number = page - 1  # Convert 1-based to 0-based
+        classify_batch_size = int(
+            VoiceBuilderCls.recommended_filter_classify_batch_size()
+        )
+        if bounded_numbered_page_depth_exceeded(
+            page_number=page_number,
+            page_size=page_size,
+            classify_batch_size=classify_batch_size,
+            seed_batch_size=classify_batch_size,
+        ):
+            logger.info(
+                "voice_call_list_page_depth_exceeded_preflight",
+                project_id=str(project_id),
+                page_number=page_number,
+                page_size=page_size,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                PAGE_DEPTH_EXCEEDED_MESSAGE,
+                code=PAGE_DEPTH_EXCEEDED_CODE,
+            )
+
+        analytics = query_service_for_builder(
+            "VOICE_CALL_LIST", VoiceBuilderCls, analytics
+        )
 
         # Eval configs for the project, from PG (indexed) — replaces the
         # unbounded CH dictGet discovery scan.
@@ -3833,55 +4465,127 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             annotation_label_ids=annotation_label_ids,
         )
 
-        # Phase 1: Paginated root conversation spans (light columns only)
-        query, params = builder.build()
-        result = analytics.execute_ch_query(query, params, timeout_ms=10000)
-        result.data = result.data[:page_size]
+        # Phase 1: bounded, newest-first latest-state voice roots. This is used
+        # for the healthy path too: the previous raw count scanned the complete
+        # project/window and dominated latency even when the first page itself
+        # was cheap. The selector proves the requested prefix and exposes a
+        # lower-bound count/has-more marker without a second broad aggregation.
+        from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+        from tracer.services.clickhouse.query_service import QueryResult
 
-        # Phase 1b: Fetch span_attributes + provider for the paginated spans
-        # from the v2 `spans` table (CH25 close-out: was `tracer_observation_span`
-        # CDC mirror). fi-collector populates three sources, in priority order:
-        #   1. `attributes_extra` JSON — overflow keys that didn't match the
-        #      typed-Map classifier.
-        #   2. `attrs_string` / `attrs_number` / `attrs_bool` Maps — the
-        #      common-case typed attributes (gen_ai.* keys for LLM spans).
-        # We SELECT all three and reconstruct the flat dict on the Python side,
-        # matching the pattern used by the trace-tree fetch above (~line 1195).
-        # Dedup via `FINAL` + `use_skip_indexes_if_final = 1` (the CHSpanReader
-        # idiom): bare `FINAL` without the setting disables the `idx_id` skip
-        # index and full-scans the table; with it the skip index prunes. NB: no
-        # `is_deleted = 0` predicate — the two-arg ReplacingMergeTree(_version,
-        # is_deleted) engine already drops tombstones under FINAL, and pairing
-        # that predicate with the setting arms a resurrection bug (the is_deleted
-        # minmax index prunes tombstone granules before the merge). See
-        # `_FINAL_SKIP_INDEX_SETTINGS` in services/clickhouse/v2/span_reader.py.
-        # The ~900 KB `call_logs` blob lands in `attrs_string` (collector path,
-        # a JSON string) or in `attributes_extra` (backfill path, a list in the
-        # JSON overflow) — strip it from both at read so it's never transferred.
-        # `raw_log` / `metrics_data` stay (still read downstream).
-        page_rows = result.data[:page_size]
+        bounded_page = read_bounded_filter_page(
+            builder=builder,
+            analytics=analytics,
+            filters=filters,
+            key_field="trace_id",
+            page_number=page_number,
+            page_size=page_size,
+            deadline_ms=4500,
+        )
+        if not bounded_page.complete:
+            if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
+                logger.info(
+                    "voice_call_list_page_depth_exceeded",
+                    project_id=str(project_id),
+                    page_number=page_number,
+                    page_size=page_size,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    PAGE_DEPTH_EXCEEDED_MESSAGE,
+                    code=PAGE_DEPTH_EXCEEDED_CODE,
+                )
+            logger.warning(
+                "voice_call_list_bounded_read_incomplete",
+                project_id=str(project_id),
+                page_number=page_number,
+                error_code=bounded_page.error_code,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Voice call data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        result = QueryResult(
+            data=bounded_page.rows,
+            row_count=len(bounded_page.rows),
+            backend_used="clickhouse",
+            query_time_ms=bounded_page.elapsed_ms,
+        )
+
+        # Phase 1b: hydrate only the exact physical roots selected above.
+        # The builder resolves latest versions by (project, trace, id,
+        # start_time), prunes by partition date, applies tombstones, and strips
+        # `call_logs` before transfer. No broad FINAL scan is used.
+        page_rows = result.data
         span_ids = [
-            str(row.get("span_id", "")) for row in page_rows if row.get("span_id")
+            str(row.get("root_span_id") or row.get("span_id") or "")
+            for row in page_rows
+            if row.get("root_span_id") or row.get("span_id")
         ]
         attrs_map = {}
         if span_ids:
-            attrs_result = analytics.execute_ch_query(
-                "SELECT id, provider, "
-                "concat('{', arrayStringConcat(arrayMap("
-                "kv -> concat('\"', kv.1, '\":', kv.2), "
-                "arrayFilter(kv -> kv.1 != 'call_logs', "
-                "JSONExtractKeysAndValuesRaw(attributes_extra))), ','), '}') "
-                "AS span_attributes, "
-                "mapFilter((k, v) -> k != 'call_logs', attrs_string) AS attrs_string, "
-                "attrs_number, attrs_bool "
-                "FROM spans FINAL "
-                "PREWHERE id IN %(span_ids)s AND project_id = %(project_id)s "
-                "SETTINGS use_skip_indexes_if_final = 1",
-                {"span_ids": tuple(span_ids), "project_id": str(project_id)},
-                timeout_ms=10000,
+            root_identities = [
+                (
+                    str(row.get("project_id") or project_id),
+                    str(row.get("trace_id") or ""),
+                    str(row.get("root_span_id") or row.get("span_id") or ""),
+                    row.get("start_time"),
+                )
+                for row in page_rows
+            ]
+            attrs_query, attrs_params = builder.build_content_query(
+                span_ids,
+                root_identities=root_identities,
             )
+            try:
+                attrs_result = analytics.execute_ch_query(
+                    attrs_query,
+                    attrs_params,
+                    timeout_ms=1500,
+                    settings={
+                        "max_threads": 1,
+                        "max_memory_usage": 256 * 1024 * 1024,
+                        "max_bytes_to_read": 512 * 1024 * 1024,
+                        "read_overflow_mode": "throw",
+                        "max_result_rows": 200,
+                        "result_overflow_mode": "throw",
+                    },
+                )
+            except Exception as exc:
+                if not is_read_budget_error(exc):
+                    raise
+                logger.warning(
+                    "voice_call_content_read_budget_exceeded",
+                    project_id=str(project_id),
+                    page_number=page_number,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Voice call data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            if len(attrs_result.data) != len(root_identities):
+                logger.warning(
+                    "voice_call_content_replay_incomplete",
+                    project_id=str(project_id),
+                    page_number=page_number,
+                    expected_rows=len(root_identities),
+                    actual_rows=len(attrs_result.data),
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Voice call data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
             for arow in attrs_result.data:
-                sid = str(arow.get("id", ""))
+                sid = str(arow.get("span_id", ""))
+                attr_identity = (
+                    str(arow.get("project_id") or project_id),
+                    str(arow.get("trace_id") or ""),
+                    sid,
+                    arow.get("start_time"),
+                )
                 raw = arow.get("span_attributes", "{}")
                 try:
                     parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
@@ -3897,17 +4601,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     parsed.setdefault(k, v)
                 for k, v in (arow.get("attrs_bool") or {}).items():
                     parsed.setdefault(k, bool(v))
-                attrs_map[sid] = {
+                attrs_map[attr_identity] = {
                     "span_attributes": parsed,
                     "provider": arow.get("provider"),
                 }
 
-        # Count
-        count_query, count_params = builder.build_count_query()
-        count_result = analytics.execute_ch_query(
-            count_query, count_params, timeout_ms=30000
-        )
-        total_count = count_result.data[0].get("total", 0) if count_result.data else 0
+        total_count = bounded_page.total_rows_lower_bound
 
         trace_ids = [str(row.get("trace_id", "")) for row in page_rows]
 
@@ -3916,9 +4615,44 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         if trace_ids and eval_config_ids:
             eval_query, eval_params = builder.build_eval_query(trace_ids)
             if eval_query:
-                eval_result = analytics.execute_ch_query(
-                    eval_query, eval_params, timeout_ms=30000
-                )
+                try:
+                    eval_result = analytics.execute_ch_query(
+                        eval_query,
+                        eval_params,
+                        timeout_ms=1500,
+                        settings={
+                            "max_threads": 1,
+                            "max_memory_usage": 256 * 1024 * 1024,
+                            "max_bytes_to_read": 512 * 1024 * 1024,
+                            "read_overflow_mode": "throw",
+                            "max_result_rows": 5001,
+                            "result_overflow_mode": "throw",
+                        },
+                    )
+                except Exception as exc:
+                    if not is_read_budget_error(exc):
+                        raise
+                    logger.warning(
+                        "voice_call_eval_read_budget_exceeded",
+                        project_id=str(project_id),
+                        page_number=page_number,
+                    )
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Voice call data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
+                if len(eval_result.data) > 5000:
+                    logger.warning(
+                        "voice_call_eval_result_limit_exceeded",
+                        project_id=str(project_id),
+                        page_number=page_number,
+                    )
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Voice call data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
                 eval_map = TraceListQueryBuilder.pivot_eval_results(
                     [(list(row.values())) for row in eval_result.data],
                     list(eval_result.data[0].keys()) if eval_result.data else [],
@@ -3948,11 +4682,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         results = []
         for row in page_rows:
             trace_id = str(row.get("trace_id", ""))
-            span_id = str(row.get("span_id", ""))
+            span_id = str(row.get("root_span_id") or row.get("span_id") or "")
             provider = row.get("provider") or "vapi"
 
             # Get span_attributes from CH CDC table (Phase 1b)
-            attr_row = attrs_map.get(span_id, {})
+            attr_identity = (
+                str(row.get("project_id") or project_id),
+                trace_id,
+                span_id,
+                row.get("start_time"),
+            )
+            attr_row = attrs_map.get(attr_identity, {})
             span_attrs = attr_row.get("span_attributes") or {}
             provider = attr_row.get("provider") or provider
 
@@ -4048,14 +4788,18 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # provider_transcript / fi.conversation.transcript / metrics_data are
             # detail-only transcript payloads — never in a list row.
             for key, value in span_attrs.items():
-                if key in (
-                    "raw_log",
-                    "call",
-                    "call_logs",
-                    "provider_transcript",
-                    "fi.conversation.transcript",
-                    "metrics_data",
-                ) or key in entry:
+                if (
+                    key
+                    in (
+                        "raw_log",
+                        "call",
+                        "call_logs",
+                        "provider_transcript",
+                        "fi.conversation.transcript",
+                        "metrics_data",
+                    )
+                    or key in entry
+                ):
                     continue
                 if isinstance(value, (str, int, float, bool)):
                     entry[key] = value
@@ -4159,14 +4903,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         total_pages = math.ceil(total_count / page_size) if page_size else 1
         response_data = {
             "count": total_count,
+            "count_is_lower_bound": True,
             "total_pages": total_pages,
             "current_page": page,
             "next": None,
             "previous": None,
             "results": results,
             "config": column_config,
+            "has_more": bounded_page.has_more,
+            "query_complete": bounded_page.complete,
         }
-        if page < total_pages:
+        if bounded_page.has_more:
             response_data["next"] = page + 1
         if page > 1:
             response_data["previous"] = page - 1
@@ -4183,13 +4930,33 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         v1↔v2 dispatch — flips with CH25_QUERY_TYPES_V2_PRIMARY=TRACE_LIST.
         """
         from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
+        from tracer.services.clickhouse.v2.query_service import (
+            query_service_for_builder,
+        )
 
         BuilderCls = get_query_builder_class("TRACE_LIST")  # noqa: N806
+        analytics = query_service_for_builder("TRACE_LIST", BuilderCls, analytics)
+        read_deadline = ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
 
         filters = query_params["filters"]
         sort_params = query_params["sort_params"]
         page_number = query_params["page_number"]
         page_size = query_params["page_size"]
+        if numbered_page_depth_exceeded(
+            page_number=page_number,
+            page_size=page_size,
+        ):
+            logger.info(
+                "prototype_trace_list_page_depth_exceeded_preflight",
+                project_version_id=str(project_version_id),
+                page_number=page_number,
+                page_size=page_size,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                PAGE_DEPTH_EXCEEDED_MESSAGE,
+                code=PAGE_DEPTH_EXCEEDED_CODE,
+            )
 
         # Get project_id from project_version
         project_version = ProjectVersion.objects.get(
@@ -4199,36 +4966,19 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         )
         project_id = str(project_version.project_id)
 
-        # PERF: resolve this project's configs from PG first (indexed by the
-        # project FK), then ask CH which of them have recent data via a
-        # ``custom_eval_config_id IN (…)`` scope — the eval table's leading
-        # sort key. The old inline query ran ``FINAL`` over the ENTIRE eval
-        # table plus a per-row ``dictGet('trace_dict', …)`` — a full-table
-        # merge that OOM-crashed the server at tens of millions of eval rows.
-        # See AnalyticsQueryService.get_eval_config_ids_with_data_ch.
+        # Eval configuration metadata is a finite project-scoped PG read. Do
+        # not put a separate window-wide ClickHouse discovery query in front of
+        # the authoritative trace page: that optional column-pruning step used
+        # to carry its own 30-second timeout and could consume the request before
+        # the list query started. Page-scoped eval hydration below remains
+        # bounded by the selected trace IDs and this finite config set; configs
+        # without page data simply render empty cells.
         project_configs = list(
             CustomEvalConfig.objects.filter(
                 project_id=project_id, deleted=False
             ).select_related("eval_template")
         )
-        candidate_ids = [str(c.id) for c in project_configs]
-        # Discover eval columns over the requested window (cover [start, now]),
-        # not a fixed 30 days — so configs with data anywhere in the viewed range
-        # keep their columns. Bounded by candidate ids.
-        window_days = BuilderCls.window_days_covering(filters)
-        ids_with_data = (
-            set(
-                analytics.get_eval_config_ids_with_data_ch(
-                    str(project_id),
-                    timeout_ms=30000,
-                    candidate_config_ids=candidate_ids,
-                    window_days=window_days,
-                )
-            )
-            if candidate_ids
-            else set()
-        )
-        eval_configs = [c for c in project_configs if str(c.id) in ids_with_data]
+        eval_configs = project_configs
         eval_config_ids = [str(c.id) for c in eval_configs]
 
         # Get annotation labels that have actual annotations for this project
@@ -4245,64 +4995,230 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             page_size=page_size,
             sort_params=sort_params,
             eval_config_ids=eval_config_ids,
+            annotation_label_ids=annotation_label_ids,
             project_version_id=str(project_version_id),
         )
 
-        # Phase 1: Get paginated traces
-        query, params = builder.build()
-        result = analytics.execute_ch_query(query, params, timeout_ms=10000)
+        # Phase 1: Get paginated traces. Project-version-scoped task/eval
+        # selectors use the same bounded latest-state reader as Observe; the
+        # project_version_id is pushed into both seed and classifier reads.
+        bounded_page = None
+        bounded_error_code = builder.bounded_filter_degraded_error_code()
+        try:
+            candidate_deadline_ms = read_deadline.remaining_ms(
+                TRACE_LIST_CANDIDATE_DEADLINE_MS
+            )
+        except ReadDeadlineExceeded:
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        if builder.supports_bounded_filter_scan():
+            from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+            from tracer.services.clickhouse.query_service import QueryResult
 
-        # Prefix-dedup pagination (Phase 1 fetches the sorted prefix
-        # [0, offset + 2*page_size); dedup by trace id + slice — see
-        # TraceListQueryBuilder.build and page_dedup.py).
-        result.data, _has_more = paginate_deduped(
-            result.data, "trace_id", page_number, page_size
-        )
-
-        # Phase 1b: heavy columns (input/output + root-span attrs) for the page.
-        # Root-span attrs feed custom columns; without this merge they render "-".
-        page_trace_ids = [str(row.get("trace_id", "")) for row in result.data]
-        if page_trace_ids:
-            content_query, content_params = builder.build_content_query(page_trace_ids)
-            if content_query:
-                content_result = analytics.execute_ch_query(
-                    content_query, content_params, timeout_ms=10000
+            bounded_page = read_bounded_filter_page(
+                builder=builder,
+                analytics=analytics,
+                filters=filters,
+                key_field="trace_id",
+                page_number=page_number,
+                page_size=page_size,
+                deadline_ms=candidate_deadline_ms,
+            )
+            if not bounded_page.complete:
+                if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
+                    logger.info(
+                        "prototype_trace_list_page_depth_exceeded",
+                        project_version_id=str(project_version_id),
+                        page_number=page_number,
+                        page_size=page_size,
+                    )
+                    return self._gm.custom_error_response(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        PAGE_DEPTH_EXCEEDED_MESSAGE,
+                        code=PAGE_DEPTH_EXCEEDED_CODE,
+                    )
+                logger.warning(
+                    "non_observe_trace_list_bounded_read_incomplete",
+                    project_id=project_id,
+                    project_version_id=str(project_version_id),
+                    page_number=page_number,
+                    error_code=bounded_page.error_code,
                 )
-                merge_content_rows(
-                    result.data,
-                    content_result.data,
-                    id_key="trace_id",
-                    keys=(
-                        "input",
-                        "output",
-                        "trace_tags",
-                        "attrs_string",
-                        "attrs_number",
-                        "attrs_bool",
-                        "attributes_extra",
-                    ),
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Filtered trace data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
                 )
+            result = QueryResult(
+                data=bounded_page.rows,
+                row_count=len(bounded_page.rows),
+                backend_used="clickhouse",
+                query_time_ms=bounded_page.elapsed_ms,
+            )
+            total_count = bounded_page.total_rows_lower_bound
+        elif bounded_error_code:
+            logger.warning(
+                "non_observe_trace_list_filter_unsupported",
+                project_id=project_id,
+                project_version_id=str(project_version_id),
+                page_number=page_number,
+                error_code=bounded_error_code,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Filtered trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        else:
+            query, params = builder.build()
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=read_deadline.remaining_ms(1_200),
+                settings=TRACE_LIST_READ_SETTINGS,
+            )
 
-        # Get count
-        count_query, count_params = builder.build_count_query()
-        count_result = analytics.execute_ch_query(
-            count_query, count_params, timeout_ms=30000
-        )
-        total_count = count_result.data[0].get("total", 0) if count_result.data else 0
+            # Prefix-dedup pagination (Phase 1 fetches the sorted prefix
+            # [0, offset + 2*page_size); dedup by trace id + slice — see
+            # TraceListQueryBuilder.build and page_dedup.py).
+            result.data, _has_more = paginate_deduped(
+                result.data, "trace_id", page_number, page_size
+            )
 
-        # Phase 2: Get eval scores for this page
+            count_query, count_params = builder.build_count_query()
+            count_result = analytics.execute_ch_query(
+                count_query,
+                count_params,
+                timeout_ms=read_deadline.remaining_ms(1_200),
+                settings=TRACE_LIST_READ_SETTINGS,
+            )
+            total_count = (
+                count_result.data[0].get("total", 0) if count_result.data else 0
+            )
+
+        # Every page-scoped ClickHouse enrichment shares the same request wall
+        # deadline and finite read settings. Content, eval, and user reads are
+        # independent after page selection, so run them concurrently instead of
+        # stacking the former 10s + 30s + 10s per-query timeouts.
         trace_ids = [str(row.get("trace_id", "")) for row in result.data]
+        root_identities = [
+            (
+                str(row.get("project_id") or project_id or ""),
+                str(row.get("trace_id") or ""),
+                str(row.get("root_span_id") or ""),
+                row.get("start_time"),
+            )
+            for row in result.data
+            if row.get("trace_id")
+            and row.get("root_span_id")
+            and row.get("start_time") is not None
+            and (row.get("project_id") or project_id)
+        ]
+        content_query, content_params = builder.build_content_query(
+            trace_ids,
+            root_identities=(
+                root_identities if len(root_identities) == len(result.data) else None
+            ),
+        )
+        eval_query, eval_params = builder.build_eval_query(trace_ids)
+        user_query, user_params = builder.build_user_id_query(trace_ids)
+
+        def _execute_project_version_enrichment(query, params):
+            return analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=read_deadline.remaining_ms(TRACE_LIST_ENRICHMENT_TIMEOUT_MS),
+                settings=TRACE_LIST_READ_SETTINGS,
+            )
+
+        tasks: dict[str, tuple[str, dict[str, Any]]] = {}
+        if content_query:
+            tasks["content"] = (content_query, content_params)
+        if eval_query and trace_ids and eval_config_ids:
+            tasks["evals"] = (eval_query, eval_params)
+        if user_query:
+            tasks["users"] = (user_query, user_params)
+
+        enrichment_results: dict[str, Any] = {}
+        if tasks:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks))
+            future_names = {
+                pool.submit(_execute_project_version_enrichment, query, params): name
+                for name, (query, params) in tasks.items()
+            }
+            try:
+                wait_seconds = read_deadline.remaining_ms() / 1000
+                for future in concurrent.futures.as_completed(
+                    future_names, timeout=wait_seconds
+                ):
+                    enrichment_results[future_names[future]] = future.result()
+                read_deadline.remaining_ms()
+            except (concurrent.futures.TimeoutError, ReadDeadlineExceeded) as exc:
+                logger.warning(
+                    "non_observe_trace_list_enrichment_deadline_exceeded",
+                    error_type=type(exc).__name__,
+                    project_id=project_id,
+                    project_version_id=str(project_version_id),
+                    page_number=page_number,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trace data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "non_observe_trace_list_enrichment_failed",
+                    error_type=type(exc).__name__,
+                    read_budget_error=is_read_budget_error(exc),
+                    project_id=project_id,
+                    project_version_id=str(project_version_id),
+                    page_number=page_number,
+                    exc_info=True,
+                )
+                if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+                    raise
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trace data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+        content_result = enrichment_results.get("content")
+        merge_content_rows(
+            result.data,
+            content_result.data if content_result is not None else [],
+            id_key="trace_id",
+            keys=(
+                "input",
+                "output",
+                "trace_tags",
+                "attrs_string",
+                "attrs_number",
+                "attrs_bool",
+                "attributes_extra",
+            ),
+        )
+
         eval_map = {}
-        if trace_ids and eval_config_ids:
-            eval_query, eval_params = builder.build_eval_query(trace_ids)
-            if eval_query:
-                eval_result = analytics.execute_ch_query(
-                    eval_query, eval_params, timeout_ms=30000
-                )
-                eval_map = builder.pivot_eval_results(
-                    [(list(row.values())) for row in eval_result.data],
-                    list(eval_result.data[0].keys()) if eval_result.data else [],
-                )
+        eval_result = enrichment_results.get("evals")
+        if eval_result is not None:
+            eval_map = builder.pivot_eval_results(
+                [(list(row.values())) for row in eval_result.data],
+                list(eval_result.data[0].keys()) if eval_result.data else [],
+            )
+
+        user_result = enrichment_results.get("users")
+        user_id_map = {
+            str(row.get("trace_id", "")): row.get("user_id")
+            for row in (user_result.data if user_result is not None else [])
+            if row.get("user_id")
+        }
 
         # Phase 3: Annotations — fetch from PG Score (unified annotation system)
         annotation_map = _build_annotation_map_from_scores(
@@ -4313,8 +5229,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             start_date=builder.params.get("start_date"),
             end_date=builder.params.get("end_date"),
         )
-
-        user_id_map = builder.resolve_user_ids(trace_ids, analytics)
+        try:
+            read_deadline.remaining_ms()
+        except ReadDeadlineExceeded:
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
 
         # Build column config
         column_config = get_default_trace_config()
@@ -4378,9 +5300,24 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             table_data.append(entry)
 
+        metadata = {"total_rows": total_count}
+        if bounded_page is not None:
+            metadata.update(
+                {
+                    "total_rows_is_lower_bound": True,
+                    "has_more": bounded_page.has_more,
+                    "query_complete": bounded_page.complete,
+                    "query_status": bounded_page.status,
+                    "query_error_code": bounded_page.error_code,
+                    "query_elapsed_ms": round(bounded_page.elapsed_ms, 3),
+                    "query_count": bounded_page.query_count,
+                    "query_rows_returned": bounded_page.rows_returned,
+                    "query_result_payload_bytes": bounded_page.result_payload_bytes,
+                }
+            )
         response = {
             "column_config": column_config,
-            "metadata": {"total_rows": total_count},
+            "metadata": metadata,
             "table": table_data,
         }
 
@@ -4390,7 +5327,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     # Agent Graph — aggregate topology visualization
     # ------------------------------------------------------------------
 
-    @validated_request(query_serializer=TraceAgentGraphQuerySerializer)
+    @validated_request(
+        query_serializer=TraceAgentGraphQuerySerializer,
+        responses={
+            400: ApiErrorResponseSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=["get"])
     def agent_graph(self, request, *args, **kwargs):
         """Return the aggregate agent graph for a project.
@@ -4445,9 +5389,26 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
             return self._gm.success_response(result)
 
-        except Exception as e:
-            logger.exception("agent_graph failed", error=str(e))
-            return self._gm.bad_request("Failed to compute agent graph")
+        except Exception as exc:
+            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+                logger.warning(
+                    "agent_graph_query_unavailable",
+                    project_id=str(project_id or ""),
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Agent graph data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.exception(
+                "agent_graph_request_failed",
+                project_id=str(project_id or ""),
+                error_type=type(exc).__name__,
+            )
+            return self._gm.bad_request(
+                "Agent graph data could not be loaded"
+            )
 
 
 class UsersView(APIView):
@@ -4511,9 +5472,9 @@ class UsersView(APIView):
             )
             return self._gm.success_response(payload)
 
-        except Exception as e:
-            logger.exception(f"ERROR {e}")
-            return self._gm.bad_request(f"error fetching users: {str(e)}")
+        except Exception:
+            logger.exception("users_list_failed")
+            return self._gm.bad_request("User data could not be loaded")
 
 
 class GetUserCodeExampleView(APIView):

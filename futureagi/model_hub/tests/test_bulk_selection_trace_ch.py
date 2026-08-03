@@ -12,14 +12,19 @@ faked so the *wiring* is asserted deterministically without a live ClickHouse.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from structlog.testing import capture_logs
 
 from model_hub.models.ai_model import AIModel
 from model_hub.services.bulk_selection import (
+    BulkSelectionReadIncomplete,
     ResolveResult,
+    _bounded_bulk_worst_case_query_count,
     _resolve_trace_ids_clickhouse,
     _resolve_voice_call_ids_clickhouse,
+    _supports_bounded_bulk_prefix,
     resolve_filtered_trace_ids,
 )
 from tracer.models.project import Project
@@ -30,7 +35,16 @@ class _FakeResult:
         self.data = rows
 
 
-def _install_fake_trace_builder(monkeypatch, *, rows, capture):
+def _install_fake_trace_builder(
+    monkeypatch,
+    *,
+    rows,
+    capture,
+    complete=True,
+    has_more=False,
+    error_code=None,
+    supports=True,
+):
     """Patch TraceListQueryBuilder + AnalyticsQueryService so
     ``_resolve_trace_ids_clickhouse`` runs against a fake CH returning ``rows``.
     ``capture`` records the builder constructor kwargs (page_size, filters)."""
@@ -39,16 +53,36 @@ def _install_fake_trace_builder(monkeypatch, *, rows, capture):
         def __init__(self, **kwargs):
             capture.update(kwargs)
 
+        def supports_bounded_filter_scan(self):
+            return supports
+
+        def bounded_filter_degraded_error_code(self):
+            return None
+
         def build(self):
+            capture["legacy_build"] = True
             return "SELECT trace_id FROM traces", {}
 
     class _FakeAnalytics:
         def execute_ch_query(self, query, params, timeout_ms=None):
             return _FakeResult(rows)
 
+    def _fake_bounded_read(**kwargs):
+        capture["bounded_read"] = kwargs
+        return SimpleNamespace(
+            rows=rows,
+            has_more=has_more,
+            complete=complete,
+            error_code=error_code,
+        )
+
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_builders.trace_list.TraceListQueryBuilder",
-        _FakeBuilder,
+        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+        lambda query_type: _FakeBuilder,
+    )
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        _fake_bounded_read,
     )
     monkeypatch.setattr(
         "tracer.services.clickhouse.query_service.AnalyticsQueryService",
@@ -88,7 +122,7 @@ def _install_fake_voice_builder(monkeypatch, *, rows, capture):
 # ---------------------------------------------------------------------------
 # _resolve_trace_ids_clickhouse — cap+1 sentinel, exclude, failure
 # ---------------------------------------------------------------------------
-def test_trace_requests_cap_plus_one_page(monkeypatch):
+def test_trace_requests_cap_plus_one_bounded_prefix(monkeypatch):
     # The trace build() LIMIT is exactly page_size (no internal +1, unlike
     # voice), so the resolver MUST request cap+1 or a >cap add silently caps at
     # cap instead of reporting truncation (→ selection_too_large upstream).
@@ -99,48 +133,163 @@ def test_trace_requests_cap_plus_one_page(monkeypatch):
         capture=capture,
     )
     res = _resolve_trace_ids_clickhouse(
-        project_id="p1", filters=[], exclude_ids=set(), cap=10,
+        project_id="p1",
+        filters=[],
+        exclude_ids=set(),
+        cap=10,
         annotation_label_ids=[],
     )
-    assert capture["page_size"] == 11  # cap + 1, not cap
+    assert capture["page_size"] == 11  # builder contract remains cap + 1
+    assert capture["bounded_identity_only"] is True
+    assert capture["bounded_bulk_scan"] is True
+    assert capture["bounded_internal_scan"] is True
+    assert capture["bounded_read"]["page_number"] == 0
+    assert capture["bounded_read"]["page_size"] == 11
+    assert capture["bounded_read"]["classify_batch_size"] == 200
     assert res.truncated is True
     assert res.total_matching == 11
 
 
 def test_trace_cap_sentinel_survives_exclusion(monkeypatch):
-    # An excluded sentinel row drops the list to cap; truncated must stay True
-    # (more non-excluded rows may lie beyond the fetched window).
+    # The bounded resolver overscans by the exclusion count, so an exact raw
+    # result of cap+1 with one excluded row proves cap post-exclusion rows and
+    # must not produce a false selection_too_large response.
+    capture: dict = {}
     _install_fake_trace_builder(
         monkeypatch,
         rows=[{"trace_id": f"t{i}"} for i in range(11)],
-        capture={},
+        capture=capture,
     )
     res = _resolve_trace_ids_clickhouse(
-        project_id="p1", filters=[], exclude_ids={"t0"}, cap=10,
+        project_id="p1",
+        filters=[],
+        exclude_ids={"t0"},
+        cap=10,
         annotation_label_ids=[],
     )
     assert res.ids == [f"t{i}" for i in range(1, 11)]
-    assert res.total_matching == 11
-    assert res.truncated is True
+    assert capture["bounded_read"]["page_size"] == 12
+    assert res.total_matching == 10
+    assert res.truncated is False
+
+
+def test_trace_10001_raw_minus_excluded_is_exactly_10000(monkeypatch):
+    capture: dict = {}
+    _install_fake_trace_builder(
+        monkeypatch,
+        rows=[{"trace_id": f"t{i}"} for i in range(10_001)],
+        capture=capture,
+    )
+
+    res = _resolve_trace_ids_clickhouse(
+        project_id="p1",
+        filters=[],
+        exclude_ids={"t0"},
+        cap=10_000,
+        annotation_label_ids=[],
+    )
+
+    assert capture["bounded_read"]["page_size"] == 10_002
+    assert len(res.ids) == 10_000
+    assert "t0" not in res.ids
+    assert res.total_matching == 10_000
+    assert res.truncated is False
+
+
+def test_trace_more_than_950_exclusions_stays_on_bounded_path(monkeypatch):
+    capture: dict = {}
+    _install_fake_trace_builder(
+        monkeypatch,
+        rows=[{"trace_id": f"t{i}"} for i in range(11)],
+        capture=capture,
+    )
+
+    res = _resolve_trace_ids_clickhouse(
+        project_id="p1",
+        filters=[],
+        exclude_ids={f"excluded-{i}" for i in range(951)},
+        cap=10_000,
+        annotation_label_ids=[],
+    )
+
+    assert capture["bounded_identity_only"] is True
+    assert capture["bounded_bulk_scan"] is True
+    assert capture["bounded_read"]["page_size"] == 10_952
+    assert "legacy_build" not in capture
+    assert res.truncated is False
+
+
+def test_trace_exclusion_prefix_budget_matches_per_seed_classifier_batches():
+    # A 12,799-row page asks the selector to prove row 12,800. Sixty-four
+    # 200-row seeds plus one 200-row classifier per seed use exactly 128
+    # queries. One more raw row needs a 65th seed/classifier pair.
+    assert _bounded_bulk_worst_case_query_count(12_799) == 128
+    assert _bounded_bulk_worst_case_query_count(12_800) == 130
+    assert _supports_bounded_bulk_prefix(cap=10_000, exclude_count=2_798) is True
+    assert _supports_bounded_bulk_prefix(cap=10_000, exclude_count=2_799) is False
+
+
+def test_trace_over_budget_exclusions_fail_closed_without_legacy_build(monkeypatch):
+    capture: dict = {}
+    _install_fake_trace_builder(monkeypatch, rows=[], capture=capture)
+
+    with pytest.raises(BulkSelectionReadIncomplete, match="selection_prefix_too_large"):
+        _resolve_trace_ids_clickhouse(
+            project_id="p1",
+            filters=[],
+            exclude_ids={f"excluded-{i}" for i in range(2_799)},
+            cap=10_000,
+            annotation_label_ids=[],
+        )
+
+    assert "legacy_build" not in capture
+    assert "bounded_read" not in capture
+
+
+def test_trace_cap_over_10000_fails_closed_without_legacy_build(monkeypatch):
+    capture: dict = {}
+    _install_fake_trace_builder(monkeypatch, rows=[], capture=capture)
+
+    with pytest.raises(BulkSelectionReadIncomplete, match="selection_prefix_too_large"):
+        _resolve_trace_ids_clickhouse(
+            project_id="p1",
+            filters=[],
+            exclude_ids=set(),
+            cap=10_001,
+            annotation_label_ids=[],
+        )
+
+    assert "legacy_build" not in capture
+    assert "bounded_read" not in capture
 
 
 def test_trace_ch_query_failure_propagates(monkeypatch):
     # CH is the sole backend — a failure must propagate, not resolve to empty.
-    class _Boom:
+    class _Builder:
         def __init__(self, **kwargs):
             pass
 
-        def build(self):
-            raise RuntimeError("CH down")
+        def supports_bounded_filter_scan(self):
+            return True
+
+        def bounded_filter_degraded_error_code(self):
+            return None
 
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_builders.trace_list.TraceListQueryBuilder",
-        _Boom,
+        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+        lambda query_type: _Builder,
+    )
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("CH down")),
     )
     with capture_logs() as logs:
         with pytest.raises(RuntimeError, match="CH down"):
             _resolve_trace_ids_clickhouse(
-                project_id="p1", filters=[], exclude_ids=set(), cap=10,
+                project_id="p1",
+                filters=[],
+                exclude_ids=set(),
+                cap=10,
                 annotation_label_ids=[],
             )
     # The failure must leave a breadcrumb for log-based alerting before it raises.
@@ -149,6 +298,195 @@ def test_trace_ch_query_failure_propagates(monkeypatch):
         and e["log_level"] == "warning"
         for e in logs
     )
+
+
+def test_trace_incomplete_nonempty_prefix_fails_closed(monkeypatch):
+    _install_fake_trace_builder(
+        monkeypatch,
+        rows=[{"trace_id": "partial-must-not-escape"}],
+        capture={},
+        complete=False,
+        error_code="scan_budget_exceeded",
+    )
+
+    with pytest.raises(RuntimeError, match="scan_budget_exceeded"):
+        _resolve_trace_ids_clickhouse(
+            project_id="p1",
+            filters=[],
+            exclude_ids=set(),
+            cap=10,
+            annotation_label_ids=[],
+        )
+
+
+def test_trace_complete_empty_prefix_is_authoritative(monkeypatch):
+    _install_fake_trace_builder(monkeypatch, rows=[], capture={})
+    result = _resolve_trace_ids_clickhouse(
+        project_id="p1",
+        filters=[],
+        exclude_ids=set(),
+        cap=10,
+        annotation_label_ids=[],
+    )
+    assert result == ResolveResult(ids=[], total_matching=0, truncated=False)
+
+
+def test_trace_multi_filter_payload_reaches_same_bounded_builder(monkeypatch):
+    filters = [
+        {
+            "column_id": "created_at",
+            "filter_config": {
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": ["2026-01-01", "2026-07-01"],
+            },
+        },
+        {
+            "column_id": "final_status",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "in",
+                "filter_value": ["Rechazado", "Aceptado"],
+            },
+        },
+        {
+            "column_id": "status",
+            "filter_config": {
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "ERROR",
+            },
+        },
+    ]
+    capture: dict = {}
+    _install_fake_trace_builder(monkeypatch, rows=[{"trace_id": "t1"}], capture=capture)
+
+    _resolve_trace_ids_clickhouse(
+        project_id="p1",
+        filters=filters,
+        exclude_ids=set(),
+        cap=25,
+        annotation_label_ids=[],
+    )
+
+    assert capture["filters"] == filters
+    assert capture["bounded_read"]["filters"] == filters
+
+
+def test_trace_time_only_filter_uses_bounded_internal_scan(monkeypatch):
+    capture: dict = {}
+    _install_fake_trace_builder(
+        monkeypatch,
+        rows=[{"trace_id": "t1"}],
+        capture=capture,
+    )
+    result = _resolve_trace_ids_clickhouse(
+        project_id="p1",
+        filters=[],
+        exclude_ids=set(),
+        cap=25,
+        annotation_label_ids=[],
+    )
+    assert result.ids == ["t1"]
+    assert capture["bounded_internal_scan"] is True
+    assert "bounded_read" in capture
+    assert "legacy_build" not in capture
+
+
+def test_trace_unsupported_bounded_shape_fails_closed_without_legacy_build(monkeypatch):
+    capture: dict = {}
+    _install_fake_trace_builder(
+        monkeypatch,
+        rows=[{"trace_id": "must-not-escape"}],
+        capture=capture,
+        supports=False,
+    )
+
+    with pytest.raises(BulkSelectionReadIncomplete, match="unsupported_bounded_filter"):
+        _resolve_trace_ids_clickhouse(
+            project_id="p1",
+            filters=[{"column_id": "unsupported"}],
+            exclude_ids=set(),
+            cap=25,
+            annotation_label_ids=[],
+        )
+
+    assert "legacy_build" not in capture
+    assert "bounded_read" not in capture
+
+
+@pytest.mark.parametrize(
+    ("residual_filter", "expected_fragment"),
+    [
+        (
+            {
+                "column_id": "00000000-0000-4000-8000-000000000091",
+                "filter_config": {
+                    "col_type": "EVAL_METRIC",
+                    "filter_type": "number",
+                    "filter_op": "greater_than",
+                    "filter_value": 0.5,
+                },
+            },
+            "SELECT toUUID('00000000-0000-0000-0000-000000000000')",
+        ),
+        (
+            {
+                "column_id": "00000000-0000-4000-8000-000000000092",
+                "filter_config": {
+                    "col_type": "ANNOTATION",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "approved",
+                },
+            },
+            "model_hub_score",
+        ),
+        (
+            {
+                "column_id": "user_id",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "contains",
+                    "filter_value": "customer",
+                },
+            },
+            "tracer_enduser",
+        ),
+    ],
+)
+def test_real_trace_builder_keeps_candidate_scoped_residual_filters(
+    residual_filter, expected_fragment
+):
+    from tracer.services.clickhouse.query_builders.trace_list import (
+        TraceListQueryBuilder,
+    )
+
+    time_filter = {
+        "column_id": "start_time",
+        "filter_config": {
+            "filter_type": "datetime",
+            "filter_op": "between",
+            "filter_value": ["2026-01-01", "2026-07-01"],
+        },
+    }
+    builder = TraceListQueryBuilder(
+        project_id="00000000-0000-4000-8000-000000000001",
+        filters=[time_filter, residual_filter],
+        annotation_label_ids=["00000000-0000-4000-8000-000000000092"],
+        bounded_identity_only=True,
+        bounded_internal_scan=False,
+        bounded_bulk_scan=True,
+    )
+
+    assert builder.supports_bounded_filter_scan() is True
+    assert builder.recommended_filter_classify_batch_size() == 200
+    query, params = builder.build_filter_match_query(["trace-candidate"])
+    assert expected_fragment in query
+    assert "candidate_trace_ids" in query
+    assert params["candidate_trace_ids"] == ("trace-candidate",)
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +502,12 @@ def test_voice_truncation_and_flag_passthrough(monkeypatch):
         capture=capture,
     )
     res = _resolve_voice_call_ids_clickhouse(
-        project_id="p1", filters=[], exclude_ids=set(), cap=2,
-        remove_simulation_calls=True, annotation_label_ids=[],
+        project_id="p1",
+        filters=[],
+        exclude_ids=set(),
+        cap=2,
+        remove_simulation_calls=True,
+        annotation_label_ids=[],
     )
     assert capture["page_size"] == 2  # voice adds its own +1
     assert capture["remove_simulation_calls"] is True
@@ -189,8 +531,12 @@ def test_voice_ch_query_failure_propagates(monkeypatch):
     with capture_logs() as logs:
         with pytest.raises(RuntimeError, match="CH down"):
             _resolve_voice_call_ids_clickhouse(
-                project_id="p1", filters=[], exclude_ids=set(), cap=10,
-                remove_simulation_calls=False, annotation_label_ids=[],
+                project_id="p1",
+                filters=[],
+                exclude_ids=set(),
+                cap=10,
+                remove_simulation_calls=False,
+                annotation_label_ids=[],
             )
     # The failure must leave a breadcrumb for log-based alerting before it raises.
     assert any(
@@ -234,9 +580,7 @@ class TestDispatch:
         resolve_filtered_trace_ids(
             project_id=observe_project.id, filters=[], organization=organization
         )
-        injected = [
-            f for f in capture["filters"] if f.get("column_id") == "start_time"
-        ]
+        injected = [f for f in capture["filters"] if f.get("column_id") == "start_time"]
         assert len(injected) == 1
         assert injected[0]["filter_config"]["filter_value"][0].startswith("1971")
 

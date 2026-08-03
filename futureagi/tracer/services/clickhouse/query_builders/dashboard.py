@@ -31,6 +31,35 @@ logger = logging.getLogger(__name__)
 # Allowed characters for ClickHouse map keys: alphanumeric, dots, underscores, hyphens
 _SAFE_ATTR_KEY_RE = re.compile(r"^[a-zA-Z0-9._\-]+$")
 
+# ClickHouse excludes MATERIALIZED columns from ``alias.*`` unless the
+# session-level ``asterisk_include_materialized_columns`` setting is enabled.
+# Eval queries consume four materialized fields after the physical-latest
+# subquery, so keep the projection explicit and independent of session
+# settings.  Limit this to columns used by the dashboard query rather than
+# coupling the read to every physical column in the CDC table.
+_USAGE_EVAL_LATEST_COLUMNS = (
+    "id",
+    "organization_id",
+    "workspace_id",
+    "status",
+    "eval_score",
+    "eval_output_str",
+    "eval_trace_id",
+    "eval_dataset_id",
+    "source",
+    "source_id",
+    "deleted",
+    "created_at",
+    "_peerdb_is_deleted",
+    "_peerdb_version",
+)
+
+
+def _usage_eval_latest_projection(alias: str) -> str:
+    return ",\n                        ".join(
+        f"{alias}.{column}" for column in _USAGE_EVAL_LATEST_COLUMNS
+    )
+
 
 def _sanitize_attr_key(key: str) -> str:
     """Validate an attribute key is safe for use in ClickHouse map access expressions."""
@@ -753,39 +782,65 @@ class DashboardQueryBuilder:
         # Scope to workspace when available, otherwise org
         if self.workspace_id:
             _scope_filter = "e.workspace_id = toUUID(%(workspace_id)s)"
+            _usage_main_scope = (
+                "usage_main_scan.workspace_id = toUUID(%(workspace_id)s)"
+            )
         else:
             _scope_filter = "e.organization_id = toUUID(%(organization_id)s)"
+            _usage_main_scope = (
+                "usage_main_scan.organization_id = toUUID(%(organization_id)s)"
+            )
+
+        # Candidate first, then physical-latest, then live/status predicates.
+        # Table-level FINAL previously merged every usage row before the
+        # template/time filters and the second self-scan built an ordered set
+        # of the same data. On large tenants that pair is the Code 159 hot path.
+        # Keeping the deletion predicates outside LIMIT 1 BY is required: an
+        # inner live filter would resurrect a superseded row after a tombstone.
+        eval_source = f"""
+            (
+                SELECT *
+                FROM (
+                    SELECT {_usage_eval_latest_projection("usage_main_scan")}
+                    FROM usage_apicalllog AS usage_main_scan
+                    PREWHERE {_usage_main_scope}
+                      AND usage_main_scan.source_id = %(eval_template_id)s
+                      AND usage_main_scan.created_at >= %(start_date)s
+                      AND usage_main_scan.created_at < %(end_date)s
+                    ORDER BY usage_main_scan._peerdb_version DESC
+                    LIMIT 1 BY usage_main_scan.id
+                ) AS usage_main_latest
+                WHERE usage_main_latest._peerdb_is_deleted = 0
+                  AND usage_main_latest.deleted = 0
+                  AND usage_main_latest.status = 'success'
+                  AND (
+                    usage_main_latest.eval_trace_id = ''
+                    OR dictGetOrDefault(
+                        'trace_dict',
+                        'project_id',
+                        toUUIDOrZero(usage_main_latest.eval_trace_id),
+                        toUUID('00000000-0000-0000-0000-000000000000')
+                    ) IN %(project_ids)s
+                  )
+                ORDER BY usage_main_latest.created_at DESC,
+                         usage_main_latest.id DESC
+                LIMIT 1 BY if(
+                    usage_main_latest.eval_trace_id = '',
+                    concat('row:', toString(usage_main_latest.id)),
+                    concat('trace:', usage_main_latest.eval_trace_id)
+                )
+            ) AS e
+        """
 
         where_parts = [
             _scope_filter,
             "e._peerdb_is_deleted = 0",
+            "e.deleted = 0",
             "e.status = 'success'",
             "e.source_id = %(eval_template_id)s",
             "e.created_at >= %(start_date)s",
             "e.created_at < %(end_date)s",
         ]
-
-        # Keep one latest trace-eval attempt; dataset/playground rows pass through.
-        _dedup_scope_d = (
-            "d.workspace_id = toUUID(%(workspace_id)s)"
-            if self.workspace_id
-            else "d.organization_id = toUUID(%(organization_id)s)"
-        )
-        # `d._peerdb_is_deleted = 0` already filters CDC tombstones; the outer
-        # `e … FINAL` still collapses duplicate parts for the join. argMax(id)
-        # picks the latest attempt deterministically even across unmerged parts,
-        # so we can skip the extra FINAL scan on this subquery.
-        where_parts.append(
-            "(e.eval_trace_id = '' OR (e.eval_trace_id, e.id) IN ("
-            "SELECT d.eval_trace_id, argMax(d.id, tuple(d.created_at, d.id)) "
-            "FROM usage_apicalllog AS d "
-            f"WHERE {_dedup_scope_d} "
-            "AND d._peerdb_is_deleted = 0 AND d.status = 'success' "
-            "AND d.source_id = %(eval_template_id)s "
-            "AND d.created_at >= %(start_date)s AND d.created_at < %(end_date)s "
-            "AND d.eval_trace_id != '' "
-            "GROUP BY d.eval_trace_id))"
-        )
 
         joins = []
         need_spans_join = False
@@ -983,21 +1038,56 @@ class DashboardQueryBuilder:
             else f"AND {'{alias}'}.organization_id = toUUID(%(organization_id)s)"
         )
         for ev_alias, param_key in need_eval_join.items():
-            # Cross-eval JOIN: match on same trace_id via materialized columns
+            # Cross-eval JOIN: preselect only this config/range, collapse row
+            # versions, then keep its latest successful attempt per trace.
+            # The one-day edge buffer covers normal async eval ingestion skew
+            # without restoring the previous unbounded all-history FINAL.
+            scan_alias = f"usage_cross_{ev_alias}_scan"
+            latest_alias = f"usage_cross_{ev_alias}_latest"
+            cross_scope = (
+                f"{scan_alias}.workspace_id = toUUID(%(workspace_id)s)"
+                if self.workspace_id
+                else f"{scan_alias}.organization_id = toUUID(%(organization_id)s)"
+            )
+            cross_source = f"""
+                (
+                    SELECT *
+                    FROM (
+                        SELECT {_usage_eval_latest_projection(scan_alias)}
+                        FROM usage_apicalllog AS {scan_alias}
+                        PREWHERE {cross_scope}
+                          AND {scan_alias}.source_id = %({param_key})s
+                          AND {scan_alias}.created_at >=
+                              %(start_date)s - INTERVAL 1 DAY
+                          AND {scan_alias}.created_at <
+                              %(end_date)s + INTERVAL 1 DAY
+                        ORDER BY {scan_alias}._peerdb_version DESC
+                        LIMIT 1 BY {scan_alias}.id
+                    ) AS {latest_alias}
+                    WHERE {latest_alias}._peerdb_is_deleted = 0
+                      AND {latest_alias}.deleted = 0
+                      AND {latest_alias}.status = 'success'
+                      AND {latest_alias}.eval_trace_id != ''
+                    ORDER BY {latest_alias}.created_at DESC,
+                             {latest_alias}.id DESC
+                    LIMIT 1 BY {latest_alias}.eval_trace_id
+                ) AS {ev_alias}
+            """
             joins.append(
-                f"LEFT JOIN usage_apicalllog AS {ev_alias} FINAL "
+                f"LEFT JOIN {cross_source} "
                 f"ON {ev_alias}.eval_trace_id = {_trace_id_expr} "
                 f"AND {ev_alias}.source_id = %({param_key})s "
                 f"{_join_scope.format(alias=ev_alias)} "
                 f"AND {ev_alias}.status = 'success' "
-                f"AND {ev_alias}._peerdb_is_deleted = 0"
+                f"AND {ev_alias}._peerdb_is_deleted = 0 "
+                f"AND {ev_alias}.deleted = 0"
             )
 
         join_str = "\n".join(joins)
 
         query = (
             f"SELECT {', '.join(select_parts)}\n"
-            f"FROM usage_apicalllog AS e FINAL\n"
+            f"FROM {eval_source}\n"
             f"{join_str}\n"
             f"WHERE {' AND '.join(where_parts)}\n"
             f"GROUP BY {', '.join(group_parts)}\n"

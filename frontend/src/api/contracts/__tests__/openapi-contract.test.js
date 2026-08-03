@@ -582,4 +582,46 @@ describe("OpenAPI runtime contract", () => {
       ),
     ).toMatchObject({ ok: false });
   });
+
+  it("accepts array span attributes and JSON scalar picker values", () => {
+    const readState = {
+      query_complete: true,
+      query_status: "complete",
+      query_window_start: "2026-07-24T02:43:12Z",
+      query_window_end: "2026-07-31T06:59:59Z",
+    };
+
+    expect(
+      validateContractedResponse({
+        status: 200,
+        config: {
+          url: "/api/traces/span-attribute-keys/?project_id=p1",
+          method: "get",
+        },
+        data: {
+          result: [{ key: "json_choices", type: "array", count: 4 }],
+          ...readState,
+        },
+      }),
+    ).toMatchObject({ ok: true });
+
+    expect(
+      validateContractedResponse({
+        status: 200,
+        config: {
+          url: "/api/traces/span-attribute-values/?project_id=p1&key=json_choices",
+          method: "get",
+        },
+        data: {
+          result: [
+            { value: "Rechazado", type: "array", count: 4 },
+            { value: 7, type: "array", count: 3 },
+            { value: false, type: "array", count: 2 },
+            { value: null, type: "array", count: 1 },
+          ],
+          ...readState,
+        },
+      }),
+    ).toMatchObject({ ok: true });
+  });
 });

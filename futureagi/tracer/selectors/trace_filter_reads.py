@@ -1,0 +1,727 @@
+"""Bounded, newest-first ClickHouse reads for filtered trace/span pages."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Hashable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from math import ceil
+from time import monotonic
+from typing import Any, Protocol
+
+from tracer.services.clickhouse.query_service import QueryResult
+from tracer.services.clickhouse.read_budget import is_read_budget_error
+
+_INITIAL_SLICE = timedelta(minutes=5)
+_MAX_SLICE = timedelta(days=2)
+_MAX_SEED_ATTEMPTS = 24
+_MAX_CANDIDATES = 512
+_ABSOLUTE_MAX_CANDIDATES = 512
+_ABSOLUTE_MAX_QUERIES = 128
+_SELECTIVE_ANCHOR_SENTINEL = 513
+_QUERY_TIMEOUT_MS = 750
+# Trace/span list queries fetch one additional page-sized de-duplication
+# margin; 5,000 is also the existing server-side result ceiling used by those
+# endpoints.  Keeping one public ceiling makes numbered-page work finite for
+# filtered selectors, unfiltered top-K reads, and session OFFSET reads alike.
+MAX_NUMBERED_PAGE_WORK_ROWS = 5_000
+_READ_SETTINGS = {
+    "max_threads": 1,
+    "max_block_size": 8192,
+    "max_memory_usage": 256 * 1024 * 1024,
+    "max_bytes_to_read": 512 * 1024 * 1024,
+    "read_overflow_mode": "throw",
+    "max_result_rows": _MAX_CANDIDATES,
+    "result_overflow_mode": "throw",
+}
+
+PAGE_DEPTH_EXCEEDED_CODE = "page_depth_exceeded"
+PAGE_DEPTH_EXCEEDED_MESSAGE = (
+    "The requested page is beyond the supported numbered-page depth. "
+    "Request an earlier page or narrow the filter time range."
+)
+
+
+class FilterPageBuilder(Protocol):
+    def parse_time_range(
+        self, filters: list[dict[str, Any]]
+    ) -> tuple[datetime, datetime]: ...
+
+    def build_filter_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        before_start_time: datetime | None = None,
+        before_id: Any = None,
+    ) -> tuple[str, dict[str, Any]]: ...
+
+    def build_filter_match_query(
+        self, candidate_ids: list[str]
+    ) -> tuple[str, dict[str, Any]]: ...
+
+
+class QueryExecutor(Protocol):
+    def execute_ch_query(
+        self,
+        query: str,
+        params: dict[str, Any],
+        *,
+        timeout_ms: int,
+        settings: dict[str, Any],
+    ) -> QueryResult: ...
+
+
+@dataclass(frozen=True)
+class FilterReadAttempt:
+    kind: str
+    slice_start: datetime
+    slice_end: datetime
+    elapsed_ms: float
+    rows_returned: int
+    result_payload_bytes: int
+    query_count: int = 1
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class BoundedFilterPage:
+    rows: list[dict[str, Any]]
+    has_more: bool
+    complete: bool
+    status: str
+    error_code: str | None
+    total_rows_lower_bound: int
+    elapsed_ms: float
+    query_count: int
+    rows_returned: int
+    result_payload_bytes: int
+    attempts: tuple[FilterReadAttempt, ...]
+
+
+class _BudgetExceeded(Exception):
+    def __init__(self, error_code: str):
+        self.error_code = error_code
+        super().__init__(error_code)
+
+
+def degraded_bounded_filter_page(error_code: str) -> BoundedFilterPage:
+    """Return a sanitized incomplete page without issuing a database read."""
+
+    return BoundedFilterPage(
+        rows=[],
+        has_more=False,
+        complete=False,
+        status="degraded",
+        error_code=error_code,
+        total_rows_lower_bound=0,
+        elapsed_ms=0.0,
+        query_count=0,
+        rows_returned=0,
+        result_payload_bytes=0,
+        attempts=(),
+    )
+
+
+def numbered_page_depth_exceeded(
+    *,
+    page_number: int,
+    page_size: int,
+) -> bool:
+    """Return whether numbered-page work exceeds the shared finite ceiling.
+
+    Trace and span lists read a stable ordered prefix through the requested
+    page plus one page-sized de-duplication margin. Session and filtered reads
+    need no more work than that conservative bound, so one calculation safely
+    gates every numbered-list path without changing membership below it.
+    """
+
+    if page_number < 0 or page_size <= 0:
+        raise ValueError("page_number must be non-negative and page_size positive")
+    return ((page_number + 2) * page_size) > MAX_NUMBERED_PAGE_WORK_ROWS
+
+
+def bounded_numbered_page_depth_exceeded(
+    *,
+    page_number: int,
+    page_size: int,
+    max_seed_attempts: int = _MAX_SEED_ATTEMPTS,
+    max_candidates: int = _MAX_CANDIDATES,
+    max_query_count: int | None = None,
+    classify_batch_size: int = 200,
+    seed_batch_size: int = 200,
+) -> bool:
+    """Return whether page N cannot fit inside the finite selector contract.
+
+    This is a mechanical prefix-budget check only: it performs no database
+    read and makes no claim that an accepted page will contain data.  Keeping
+    the calculation public lets list transports reject unsupported deep
+    numbered pages as a stable, non-retryable client error before ClickHouse is
+    contacted.  Cursor/unbounded pagination is intentionally not implied.
+    """
+
+    if page_number < 0 or page_size <= 0:
+        raise ValueError("page_number must be non-negative and page_size positive")
+    if not 1 <= max_seed_attempts <= _ABSOLUTE_MAX_QUERIES:
+        raise ValueError("max_seed_attempts exceeds the bounded read contract")
+    if not 1 <= max_candidates <= _ABSOLUTE_MAX_CANDIDATES:
+        raise ValueError("max_candidates exceeds the bounded read contract")
+    if max_query_count is None:
+        max_query_count = min(max_seed_attempts * 2, _ABSOLUTE_MAX_QUERIES)
+    if not 1 <= max_query_count <= _ABSOLUTE_MAX_QUERIES:
+        raise ValueError("max_query_count exceeds the bounded read contract")
+    if not 1 <= classify_batch_size <= max_candidates:
+        raise ValueError("classify_batch_size exceeds max_candidates")
+    if not 1 <= seed_batch_size <= max_candidates:
+        raise ValueError("seed_batch_size exceeds max_candidates")
+    prefix_needed = ((page_number + 1) * page_size) + 1
+    candidate_limit = min(max_candidates, max(seed_batch_size, prefix_needed))
+    minimum_query_count = ceil(prefix_needed / candidate_limit) + ceil(
+        prefix_needed / classify_batch_size
+    )
+    return (
+        prefix_needed > max_seed_attempts * max_candidates
+        or minimum_query_count > max_query_count
+    )
+
+
+def _without_timezone(value: datetime) -> datetime:
+    return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+
+def _result_payload_bytes(rows: list[dict[str, Any]]) -> int:
+    return len(
+        json.dumps(rows, default=str, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+
+def read_bounded_filter_page(
+    *,
+    builder: FilterPageBuilder,
+    analytics: QueryExecutor,
+    filters: list[dict[str, Any]],
+    key_field: str,
+    page_number: int,
+    page_size: int,
+    deadline_ms: int = 1_800,
+    max_seed_attempts: int = _MAX_SEED_ATTEMPTS,
+    max_candidates: int = _MAX_CANDIDATES,
+    max_query_count: int | None = None,
+    classify_batch_size: int | None = None,
+    retry_wide_read_budget: bool = False,
+    include_incomplete_rows: bool = False,
+    cursor_start_time: datetime | None = None,
+    cursor_order_token: Any = None,
+    read_settings: dict[str, Any] | None = None,
+) -> BoundedFilterPage:
+    """Return one exact numbered page or an explicit sanitized degradation.
+
+    Seed reads cover adjacent half-open time slices in descending order. Each
+    seed is only an identity/order superset; every ID is reclassified against
+    global latest state before it can enter the page. A failed read is never
+    retried as control flow, and a partial prefix is never exposed as page N.
+    Graph callers may opt into proven-but-incomplete page-zero rows; numbered
+    list/eval callers retain the exact/empty default.
+    """
+
+    if page_number < 0 or page_size <= 0 or deadline_ms <= 0:
+        raise ValueError("page_number, page_size and deadline_ms must be positive")
+    if (cursor_start_time is None) != (cursor_order_token is None):
+        raise ValueError("cursor order values must be provided together")
+    if cursor_start_time is not None and page_number != 0:
+        raise ValueError("cursor reads must use page_number zero")
+    if include_incomplete_rows and page_number != 0:
+        raise ValueError("incomplete rows are available only for page zero")
+    if not 1 <= max_seed_attempts <= _ABSOLUTE_MAX_QUERIES:
+        raise ValueError("max_seed_attempts exceeds the bounded read contract")
+    if not 1 <= max_candidates <= _ABSOLUTE_MAX_CANDIDATES:
+        raise ValueError("max_candidates exceeds the bounded read contract")
+    if max_query_count is None:
+        max_query_count = min(max_seed_attempts * 2, _ABSOLUTE_MAX_QUERIES)
+    if not 1 <= max_query_count <= _ABSOLUTE_MAX_QUERIES:
+        raise ValueError("max_query_count exceeds the bounded read contract")
+
+    recommended_batch_size: int | None = None
+    batch_recommendation = getattr(
+        builder, "recommended_filter_classify_batch_size", None
+    )
+    if callable(batch_recommendation):
+        raw_recommendation = batch_recommendation()
+        if raw_recommendation is not None:
+            recommended_batch_size = int(raw_recommendation)
+            if recommended_batch_size <= 0:
+                raise ValueError("recommended classify batch size must be positive")
+            recommended_batch_size = min(recommended_batch_size, max_candidates)
+    if classify_batch_size is None:
+        classify_batch_size = recommended_batch_size or min(200, max_candidates)
+    if not 1 <= classify_batch_size <= max_candidates:
+        raise ValueError("classify_batch_size exceeds max_candidates")
+
+    started = monotonic()
+    deadline = started + (deadline_ms / 1000)
+    seed_order_proof = getattr(builder, "filter_seed_proves_result_order", None)
+    seed_proves_result_order = (
+        bool(seed_order_proof()) if callable(seed_order_proof) else True
+    )
+    request_start, request_end = builder.parse_time_range(filters)
+    request_start = _without_timezone(request_start)
+    request_end = _without_timezone(request_end)
+    cursor_key: tuple[datetime, Any] | None = None
+    if cursor_start_time is not None:
+        cursor_key = (_without_timezone(cursor_start_time), cursor_order_token)
+    if request_start >= request_end:
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            elapsed_ms=(monotonic() - started) * 1000,
+            query_count=0,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
+
+    prefix_needed = ((page_number + 1) * page_size) + 1
+    # A builder can lower both the seed and classifier working set when its
+    # candidate query is memory-heavy. The requested prefix remains a floor so
+    # page zero includes its has-more sentinel in the first ordered root seed.
+    seed_batch_recommendation = getattr(
+        builder, "recommended_filter_seed_batch_size", None
+    )
+    candidate_floor = min(
+        int(seed_batch_recommendation())
+        if callable(seed_batch_recommendation)
+        else recommended_batch_size or min(200, max_candidates),
+        max_candidates,
+    )
+    if not 1 <= candidate_floor <= max_candidates:
+        raise ValueError("recommended seed batch size exceeds max_candidates")
+    candidate_limit = min(max_candidates, max(candidate_floor, prefix_needed))
+    if bounded_numbered_page_depth_exceeded(
+        page_number=page_number,
+        page_size=page_size,
+        max_seed_attempts=max_seed_attempts,
+        max_candidates=max_candidates,
+        max_query_count=max_query_count,
+        classify_batch_size=classify_batch_size,
+        seed_batch_size=candidate_floor,
+    ):
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=False,
+            status="degraded",
+            error_code=PAGE_DEPTH_EXCEEDED_CODE,
+            total_rows_lower_bound=0,
+            elapsed_ms=(monotonic() - started) * 1000,
+            query_count=0,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
+
+    attempts: list[FilterReadAttempt] = []
+    # A trace any-span seed is a physical *span*, while the classified result
+    # identity is its trace.  Keep these namespaces separate: using trace_id as
+    # the seed key both breaks keyset continuation when one trace has multiple
+    # matching spans and can stop a dense selective scan before it is proven
+    # exhaustive.
+    seen_seed_ids: set[Hashable] = set()
+    seen_candidate_ids: set[Hashable] = set()
+    matched_by_id: dict[Hashable, dict[str, Any]] = {}
+    if cursor_key is not None and cursor_key[0] < request_start:
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            elapsed_ms=(monotonic() - started) * 1000,
+            query_count=0,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
+    # Include rows tied on the cursor timestamp; the strict complete-order
+    # predicate below removes the cursor row and every row before it.
+    slice_end = (
+        min(request_end, cursor_key[0] + timedelta(microseconds=1))
+        if cursor_key is not None
+        else request_end
+    )
+    slice_width = _INITIAL_SLICE
+    before_start_time: datetime | None = cursor_key[0] if cursor_key else None
+    before_id: Any = cursor_key[1] if cursor_key else None
+    forced_width_cap: timedelta | None = None
+    page_complete = False
+    degraded_error_code: str | None = None
+
+    def execute(
+        *,
+        kind: str,
+        query: str,
+        params: dict[str, Any],
+        active_start: datetime,
+        active_end: datetime,
+        result_limit: int = _ABSOLUTE_MAX_CANDIDATES,
+    ) -> QueryResult:
+        remaining_ms = int((deadline - monotonic()) * 1000)
+        if remaining_ms < 25:
+            raise _BudgetExceeded("deadline_exceeded")
+        if len(attempts) >= max_query_count:
+            raise _BudgetExceeded("query_budget_exceeded")
+        attempt_started = monotonic()
+        try:
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=min(_QUERY_TIMEOUT_MS, remaining_ms),
+                settings={
+                    **_READ_SETTINGS,
+                    **(read_settings or {}),
+                    "max_result_rows": result_limit,
+                },
+            )
+        except Exception as exc:
+            if not is_read_budget_error(exc):
+                raise
+            attempts.append(
+                FilterReadAttempt(
+                    kind=kind,
+                    slice_start=active_start,
+                    slice_end=active_end,
+                    elapsed_ms=(monotonic() - attempt_started) * 1000,
+                    rows_returned=0,
+                    result_payload_bytes=0,
+                    error_code="read_budget_exceeded",
+                )
+            )
+            raise _BudgetExceeded("read_budget_exceeded") from None
+        rows = list(result.data or [])
+        attempts.append(
+            FilterReadAttempt(
+                kind=kind,
+                slice_start=active_start,
+                slice_end=active_end,
+                elapsed_ms=(monotonic() - attempt_started) * 1000,
+                rows_returned=len(rows),
+                result_payload_bytes=_result_payload_bytes(rows),
+            )
+        )
+        return result
+
+    def row_identity(row: dict[str, Any]) -> Hashable:
+        identity_builder = getattr(builder, "bounded_filter_row_identity", None)
+        identity: Hashable = (
+            identity_builder(row)
+            if callable(identity_builder)
+            else str(row.get(key_field, ""))
+        )
+        try:
+            hash(identity)
+        except TypeError as exc:
+            raise ValueError("bounded filter row identity must be hashable") from exc
+        return identity
+
+    def result_row_key(row: dict[str, Any]) -> tuple[datetime, Any]:
+        value = row.get("start_time")
+        start_time = (
+            _without_timezone(value) if isinstance(value, datetime) else datetime.min
+        )
+        order_builder = getattr(builder, "bounded_filter_row_order_token", None)
+        order_token = (
+            order_builder(row)
+            if callable(order_builder)
+            else str(row.get(key_field, ""))
+        )
+        return start_time, order_token
+
+    def seed_identity(row: dict[str, Any]) -> Hashable:
+        identity_builder = getattr(builder, "bounded_filter_seed_identity", None)
+        identity: Hashable = (
+            identity_builder(row) if callable(identity_builder) else row_identity(row)
+        )
+        try:
+            hash(identity)
+        except TypeError as exc:
+            raise ValueError("bounded filter seed identity must be hashable") from exc
+        return identity
+
+    def seed_row_key(row: dict[str, Any]) -> tuple[datetime, Any]:
+        value = row.get("start_time")
+        start_time = (
+            _without_timezone(value) if isinstance(value, datetime) else datetime.min
+        )
+        order_builder = getattr(builder, "bounded_filter_seed_order_token", None)
+        if callable(order_builder):
+            return start_time, order_builder(row)
+        return result_row_key(row)
+
+    def classify_seed_rows(
+        candidate_rows: list[dict[str, Any]],
+        *,
+        active_start: datetime,
+        active_end: datetime,
+    ) -> None:
+        candidate_seed_rows: dict[Hashable, dict[str, Any]] = {}
+        for row in candidate_rows:
+            public_identity = str(row.get(key_field, ""))
+            if not public_identity:
+                continue
+            candidate_identity = row_identity(row)
+            if candidate_identity in seen_candidate_ids:
+                continue
+            seen_candidate_ids.add(candidate_identity)
+            candidate_seed_rows[candidate_identity] = row
+
+        candidate_identities = list(candidate_seed_rows)
+        for batch_offset in range(0, len(candidate_identities), classify_batch_size):
+            identity_batch = candidate_identities[
+                batch_offset : batch_offset + classify_batch_size
+            ]
+            candidate_batch = [
+                str(candidate_seed_rows[identity].get(key_field, ""))
+                for identity in identity_batch
+            ]
+            seeded_match_builder = getattr(
+                builder,
+                "build_filter_match_query_from_seed_rows",
+                None,
+            )
+            if callable(seeded_match_builder):
+                match_query, match_params = seeded_match_builder(
+                    [candidate_seed_rows[identity] for identity in identity_batch]
+                )
+            else:
+                match_query, match_params = builder.build_filter_match_query(
+                    candidate_batch
+                )
+            if not match_query:
+                continue
+            match_result = execute(
+                kind="classify",
+                query=match_query,
+                params=match_params,
+                active_start=active_start,
+                active_end=active_end,
+                result_limit=max_candidates,
+            )
+            for row in match_result.data:
+                identity = row_identity(row)
+                # A classifier can return an updated ordering value different
+                # from its raw seed. Apply the signed result boundary again so
+                # continuation pages remain strictly disjoint.
+                if cursor_key is not None and result_row_key(row) >= cursor_key:
+                    continue
+                if str(row.get(key_field, "")):
+                    matched_by_id[identity] = row
+
+    try:
+        # Any-span trace filters first ask a direct key+value predicate for a
+        # finite DISTINCT trace-id sentinel.  If it exhausts, that is an exact
+        # candidate superset and no root-history scan is needed.  If it reaches
+        # the sentinel (or its read budget), the predicate is common: switch to
+        # ordered root batches, where a proven page prefix can close without
+        # materialising the tenant-wide set that triggered Code 159.
+        anchor_builder = getattr(builder, "build_filter_anchor_probe", None)
+        anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
+        ordered_seed_builder = getattr(builder, "build_filter_ordered_seed_page", None)
+        use_seed_loop = True
+        seed_page_builder = builder.build_filter_seed_page
+        anchor_limit = min(_SELECTIVE_ANCHOR_SENTINEL, max_candidates + 1)
+        if cursor_key is not None:
+            # Continuations must start from the signed *result* tuple. Trace
+            # any-span seeds are ordered by the matching physical child, not
+            # by the public root trace, so use the root-ordered fallback when
+            # the builder exposes it. Span seeds already share result order.
+            if callable(ordered_seed_builder):
+                seed_page_builder = ordered_seed_builder
+                seed_proves_result_order = True
+        elif (
+            anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
+            and callable(anchor_builder)
+            and callable(ordered_seed_builder)
+            and callable(anchor_support)
+            and bool(anchor_support())
+        ):
+            try:
+                anchor_query, anchor_params = anchor_builder(limit=anchor_limit)
+                anchor_result = execute(
+                    kind="anchor",
+                    query=anchor_query,
+                    params=anchor_params,
+                    active_start=request_start,
+                    active_end=request_end,
+                    result_limit=anchor_limit,
+                )
+                anchor_rows = list(anchor_result.data or [])
+                if len(anchor_rows) < anchor_limit:
+                    classify_seed_rows(
+                        anchor_rows,
+                        active_start=request_start,
+                        active_end=request_end,
+                    )
+                    page_complete = True
+                    use_seed_loop = False
+                else:
+                    seed_page_builder = ordered_seed_builder
+                    seed_proves_result_order = True
+            except _BudgetExceeded as exc:
+                if exc.error_code != "read_budget_exceeded":
+                    raise
+                seed_page_builder = ordered_seed_builder
+                seed_proves_result_order = True
+        elif (
+            callable(ordered_seed_builder)
+            and callable(anchor_support)
+            and bool(anchor_support())
+        ):
+            # A caller-imposed working set smaller than the 512+1 sparse/common
+            # sentinel cannot safely run the anchor probe. Fall straight back
+            # to finite root-ordered batches; their order proof closes page N
+            # without an extra full-slice exhaustion read.
+            seed_page_builder = ordered_seed_builder
+            seed_proves_result_order = True
+
+        for seed_index in range(max_seed_attempts if use_seed_loop else 0):
+            if slice_end <= request_start:
+                page_complete = True
+                break
+
+            remaining_attempts = max_seed_attempts - seed_index
+            remaining_window = slice_end - request_start
+            scheduled_width = slice_width
+            scheduled_coverage = timedelta(0)
+            for _ in range(remaining_attempts):
+                scheduled_coverage += scheduled_width
+                scheduled_width = min(scheduled_width * 2, _MAX_SLICE)
+            active_width = slice_width
+            if scheduled_coverage < remaining_window:
+                active_width = max(active_width, remaining_window / remaining_attempts)
+            if forced_width_cap is not None:
+                active_width = min(active_width, forced_width_cap)
+            slice_start = max(request_start, slice_end - active_width)
+
+            seed_query, seed_params = seed_page_builder(
+                slice_start=slice_start,
+                slice_end=slice_end,
+                limit=candidate_limit,
+                before_start_time=before_start_time,
+                before_id=before_id,
+            )
+            try:
+                seed_result = execute(
+                    kind="seed",
+                    query=seed_query,
+                    params=seed_params,
+                    active_start=slice_start,
+                    active_end=slice_end,
+                )
+            except _BudgetExceeded as exc:
+                if (
+                    retry_wide_read_budget
+                    and exc.error_code == "read_budget_exceeded"
+                    and active_width > _INITIAL_SLICE
+                ):
+                    forced_width_cap = max(_INITIAL_SLICE, active_width / 2)
+                    before_start_time = None
+                    before_id = None
+                    continue
+                raise
+            forced_width_cap = None
+            seed_rows = sorted(seed_result.data, key=seed_row_key, reverse=True)
+            new_candidate_rows: list[dict[str, Any]] = []
+            for row in seed_rows:
+                public_identity = str(row.get(key_field, ""))
+                raw_identity = seed_identity(row)
+                if not public_identity or raw_identity in seen_seed_ids:
+                    continue
+                seen_seed_ids.add(raw_identity)
+                new_candidate_rows.append(row)
+
+            classify_seed_rows(
+                new_candidate_rows,
+                active_start=slice_start,
+                active_end=slice_end,
+            )
+
+            slice_exhausted = len(seed_rows) < candidate_limit
+            ordered_matches = sorted(
+                matched_by_id.values(), key=result_row_key, reverse=True
+            )
+            if seed_proves_result_order and len(ordered_matches) >= prefix_needed:
+                cutoff = result_row_key(ordered_matches[prefix_needed - 1])
+                prefix_is_proven = (
+                    cutoff[0] >= slice_start
+                    if slice_exhausted
+                    else cutoff >= seed_row_key(seed_rows[-1])
+                )
+                if prefix_is_proven:
+                    page_complete = True
+                    break
+
+            if not slice_exhausted:
+                if not seed_rows:
+                    break
+                next_start_time, next_id = seed_row_key(seed_rows[-1])
+                if (next_start_time, next_id) == (before_start_time, before_id):
+                    break
+                before_start_time, before_id = next_start_time, next_id
+                continue
+
+            if slice_start <= request_start:
+                page_complete = True
+                break
+            slice_end = slice_start
+            slice_width = min(active_width * 2, _MAX_SLICE)
+            before_start_time = None
+            before_id = None
+    except _BudgetExceeded as exc:
+        page_complete = False
+        degraded_error_code = exc.error_code
+
+    ordered_matches = sorted(matched_by_id.values(), key=result_row_key, reverse=True)
+    offset = page_number * page_size
+    has_more = len(ordered_matches) > offset + page_size
+    page_rows = (
+        ordered_matches[offset : offset + page_size]
+        if page_complete or include_incomplete_rows
+        else []
+    )
+    error_code = (
+        None if page_complete else degraded_error_code or "scan_budget_exceeded"
+    )
+    return BoundedFilterPage(
+        rows=page_rows,
+        has_more=has_more if page_complete or include_incomplete_rows else False,
+        complete=page_complete,
+        status="complete" if page_complete else "degraded",
+        error_code=error_code,
+        total_rows_lower_bound=len(ordered_matches),
+        elapsed_ms=(monotonic() - started) * 1000,
+        query_count=len(attempts),
+        rows_returned=sum(attempt.rows_returned for attempt in attempts),
+        result_payload_bytes=sum(attempt.result_payload_bytes for attempt in attempts),
+        attempts=tuple(attempts),
+    )
+
+
+__all__ = [
+    "BoundedFilterPage",
+    "FilterReadAttempt",
+    "PAGE_DEPTH_EXCEEDED_CODE",
+    "PAGE_DEPTH_EXCEEDED_MESSAGE",
+    "MAX_NUMBERED_PAGE_WORK_ROWS",
+    "bounded_numbered_page_depth_exceeded",
+    "degraded_bounded_filter_page",
+    "numbered_page_depth_exceeded",
+    "read_bounded_filter_page",
+]

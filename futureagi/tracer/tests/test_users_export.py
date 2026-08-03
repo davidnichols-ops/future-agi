@@ -521,7 +521,14 @@ class TestUsersExportStreaming:
             {"user_id": f"u{i}", "end_user_id": uuid.uuid4()}
             for i in range(MAX_EXPORT_ROWS + 5)
         ]
-        with patch.object(UsersListManager, "_fetch_rows", return_value=(oversized, 0, MagicMock())):
+        with (
+            patch.object(
+                UsersListManager,
+                "_fetch_rows",
+                return_value=(oversized, 0, MagicMock()),
+            ),
+            patch.object(UsersListManager, "_read_page_metrics", return_value={}),
+        ):
             body = "".join(manager.iter_export_csv())
 
         rows = [r for r in csv.reader(io.StringIO(body)) if r]
@@ -530,23 +537,59 @@ class TestUsersExportStreaming:
         assert "truncated" in marker[0]
         assert len(data_rows[:-1]) == MAX_EXPORT_ROWS
 
-    def test_list_enrichment_fails_open(self):
-        # The list path enriches rows with span attributes; if that secondary
-        # query fails it must log and return the base rows, not 500 the list.
+    def test_list_enrichment_programming_defect_is_not_hidden(self):
+        # Arbitrary runtime defects must reach the sanitized HTTP boundary,
+        # never masquerade as a successful partially enriched user page.
         manager = self._manager()
         base_rows = [{"user_id": "u1", "end_user_id": uuid.uuid4()}]
         with (
-            patch.object(UsersListManager, "_fetch_rows", return_value=(base_rows, 1, MagicMock())),
+            patch.object(
+                UsersListManager,
+                "_fetch_rows",
+                return_value=(base_rows, 1, MagicMock()),
+            ),
+            patch.object(UsersListManager, "_read_page_metrics", return_value={}),
             patch.object(
                 AnalyticsQueryService,
                 "execute_ch_query",
                 side_effect=RuntimeError("attr query down"),
             ),
         ):
+            with pytest.raises(RuntimeError, match="attr query down"):
+                manager.list_payload(page_size=30, current_page=0)
+
+    def test_list_clickhouse_reads_share_deadline_and_have_hard_caps(self):
+        manager = self._manager()
+        base_row = _row(user_id="u1", end_user_id=uuid.uuid4(), total_count=1)
+
+        def execute(query, _params, *, timeout_ms, settings):
+            if "attributes_extra AS attributes_extra" in query:
+                return _ch_stub([])
+            if "bool_eval_pass_rate" in query and "tracer_eval_logger" in query:
+                return _ch_stub([])
+            return _ch_stub([base_row])
+
+        with patch.object(
+            AnalyticsQueryService,
+            "execute_ch_query",
+            side_effect=execute,
+        ) as execute_mock:
             payload = manager.list_payload(page_size=30, current_page=0)
 
-        assert payload["table"] == base_rows
         assert payload["total_count"] == 1
+        assert payload["table"][0]["user_id"] == "u1"
+        # Conservative physical-span presence proof, exact page, then three
+        # concurrent finite enrichments (metrics, attributes, evals).
+        assert execute_mock.call_count == 5
+        for call in execute_mock.call_args_list:
+            assert 0 < call.kwargs["timeout_ms"] <= 2_200
+            settings = call.kwargs["settings"]
+            assert settings["max_rows_to_read"] == 10_000_000
+            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_result_rows"] > 0
+            assert settings["max_result_bytes"] == 32 * 1024 * 1024
+            assert settings["result_overflow_mode"] == "throw"
 
     def test_export_columns_match_serializer_fields(self):
         # The CSV columns must stay a subset of the JSON contract's serializer

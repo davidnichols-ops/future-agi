@@ -30,7 +30,6 @@ from tracer.services.clickhouse.v2.query_builders.filters import (
     rewrite_and_apply_v2_settings,
 )
 
-
 # Metric types whose SQL reads tables NOT migrated to the CH 25.3 spans schema.
 _LEGACY_TABLE_METRIC_TYPES = frozenset({"eval_metric", "annotation_metric"})
 
@@ -38,6 +37,31 @@ _LEGACY_TABLE_METRIC_TYPES = frozenset({"eval_metric", "annotation_metric"})
 _LEGACY_TABLE_RE = re.compile(
     r"(?:usage_apicalllog|model_hub_score)\s+AS\s+(\w+)", re.IGNORECASE
 )
+
+# The eval-metric builder uses candidate-scoped subqueries over the legacy
+# usage table. Their outer aliases no longer appear immediately after the
+# table token, so `_LEGACY_TABLE_RE` cannot discover them. Protect only the
+# explicitly generated usage aliases while the spans portion is rewritten.
+_USAGE_CDC_COLUMN_RE = re.compile(
+    r"\b(?P<alias>e|ev_(?:bd|f)\d+|usage_[A-Za-z0-9_]+)\."
+    r"(?P<column>_peerdb_is_deleted|_peerdb_version)\b"
+)
+
+
+def _protect_usage_cdc_columns(sql: str) -> str:
+    return _USAGE_CDC_COLUMN_RE.sub(
+        lambda match: (
+            f"{match.group('alias')}.__usage_legacy_"
+            f"{match.group('column').removeprefix('_peerdb_')}__"
+        ),
+        sql,
+    )
+
+
+def _restore_usage_cdc_columns(sql: str) -> str:
+    return sql.replace(".__usage_legacy_is_deleted__", "._peerdb_is_deleted").replace(
+        ".__usage_legacy_version__", "._peerdb_version"
+    )
 
 
 class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
@@ -62,9 +86,11 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
 
     def build_metric_query(self, metric: dict) -> tuple[str, dict]:
         sql, params = super().build_metric_query(metric)
-        sql = rewrite_and_apply_v2_settings(sql)
         if metric.get("type") not in _LEGACY_TABLE_METRIC_TYPES:
-            return sql, params
+            return rewrite_and_apply_v2_settings(sql), params
+        sql = _protect_usage_cdc_columns(sql)
+        sql = rewrite_and_apply_v2_settings(sql)
+        sql = _restore_usage_cdc_columns(sql)
         # Mixed-table query: rewrite already fixed spans refs, now restore
         # _peerdb_is_deleted for every legacy-table alias.
         for alias in _LEGACY_TABLE_RE.findall(sql):

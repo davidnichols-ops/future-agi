@@ -1,7 +1,12 @@
+import inspect
+import re
+import sys
 import uuid
 from datetime import timedelta
 
 import pytest
+from clickhouse_driver.errors import ServerException
+from django.urls import get_resolver
 from django.utils import timezone
 from rest_framework import status
 
@@ -214,13 +219,13 @@ class TestTraceWorkspaceScopeAPI:
         assert "P95" in response.data["result"]
 
     def test_agent_graph_propagates_clickhouse_failure_without_pg_fallback(
-        self, auth_client, project, observation_span, child_span, monkeypatch
+        self, auth_client, project, monkeypatch
     ):
         # Post-migration contract (DECISIONS #027): agent_graph is CH-only.
         # The legacy "CH fails → silently rebuild graph from PG" path was
         # removed because PG is no longer the source of truth — falling back
         # would return a partial graph that operators wrongly trust. CH errors
-        # now surface as a 4xx with a diagnostic so the data pipeline gets
+        # now surface as a sanitized 5xx so the data pipeline gets
         # paged instead of silently degrading.
         monkeypatch.setattr(
             "tracer.services.clickhouse.query_service.AnalyticsQueryService.execute_ch_query",
@@ -239,10 +244,8 @@ class TestTraceWorkspaceScopeAPI:
         #   • module-attr call: trace_helpers._build_agent_graph_pg(...)
         # Stays robust against tracer.views.trace circular-import path at
         # test setup time that defeated a runtime-sentinel approach.
-        import inspect
-        from django.urls import get_resolver
-        get_resolver().reverse_dict  # forces URL conf + view imports
-        import sys
+        _ = get_resolver().reverse_dict  # forces URL conf + view imports
+
         trace_module = sys.modules["tracer.views.trace"]
         agent_graph_fn = trace_module.TraceView.agent_graph
         src = inspect.getsource(agent_graph_fn)
@@ -251,7 +254,6 @@ class TestTraceWorkspaceScopeAPI:
         # over the function source so aliases and module-prefixed calls are
         # caught equally — re.search rather than substring to allow word-
         # boundary detection.
-        import re
         forbidden = [
             r"\b_build_agent_graph_pg\b",
             r"\b_agent_graph_pg\b",
@@ -271,8 +273,8 @@ class TestTraceWorkspaceScopeAPI:
             {"project_id": str(project.id)},
         )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST, (
-            f"expected 400 when CH fails (no PG fallback); got {response.status_code}: "
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR, (
+            f"expected 500 when CH fails (no PG fallback); got {response.status_code}: "
             f"{getattr(response, 'data', None)!r}"
         )
         # Diagnostic must mention agent_graph so operators can route the alert.
@@ -281,6 +283,54 @@ class TestTraceWorkspaceScopeAPI:
         assert "agent graph" in message, (
             f"diagnostic must identify the failing endpoint; got {body!r}"
         )
+        assert "ch down" not in str(body)
+
+    @pytest.mark.parametrize(
+        ("failure", "expected_status"),
+        [
+            (
+                ServerException("secret timeout stack", 159),
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+            ),
+            (
+                ServerException("secret unknown identifier", 47),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ServerException("secret unknown table", 60),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ServerException("secret syntax error", 62),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+            ),
+        ],
+    )
+    def test_agent_graph_classifies_clickhouse_failures_without_leaking_details(
+        self,
+        auth_client,
+        project,
+        monkeypatch,
+        failure,
+        expected_status,
+    ):
+        monkeypatch.setattr(
+            "tracer.services.clickhouse.query_service."
+            "AnalyticsQueryService.execute_ch_query",
+            lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+        )
+
+        response = auth_client.get(
+            "/tracer/trace/agent_graph/",
+            {"project_id": str(project.id)},
+        )
+
+        assert response.status_code == expected_status
+        rendered = str(response.data)
+        assert "secret" not in rendered
+        assert "unknown identifier" not in rendered
+        assert "unknown table" not in rendered
+        assert "syntax error" not in rendered
 
     def test_generic_delete_cascades_trace_spans_and_eval_logs(
         self, auth_client, trace, observation_span, custom_eval_config

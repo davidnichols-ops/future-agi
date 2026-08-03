@@ -11,9 +11,33 @@ import TraceFilterPanel, {
 import {
   getPickerOptionSearchText,
   getPickerOptionSecondaryLabel,
+  normalizePickerValues,
 } from "../filterValuePickerUtils";
 
 const parseQueryMock = vi.fn();
+
+describe("JSON array picker value identity", () => {
+  it("preserves scalar JSON types and removes only exact duplicates", () => {
+    expect(
+      normalizePickerValues([
+        { value: true, label: "true" },
+        { value: 1, label: "1" },
+        { value: 1.0, label: "1.0" },
+        { value: "1", label: "1" },
+        { value: false, label: "false" },
+        { value: 0, label: "0" },
+        { value: true, label: "duplicate" },
+        true,
+        7,
+        false,
+        0,
+        "  text  ",
+        null,
+        Number.NaN,
+      ]),
+    ).toEqual([true, 1, "1", false, 0, 7, "text"]);
+  });
+});
 
 vi.mock("src/hooks/use-ai-filter", () => ({
   useAIFilter: () => ({

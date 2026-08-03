@@ -135,7 +135,8 @@ def test_build_eval_query_routes_to_v2_table():
     # `ORDER BY _version DESC LIMIT 1 BY id` inside the subquery.
     assert "tracer_eval_logger_v2 FINAL" not in sql
     assert "LIMIT 1 BY id" in sql
-    assert "is_deleted = 0" in sql
+    assert "is_deleted AS latest_state_0" in sql
+    assert "latest_state_0 = 0" in sql
     assert "_peerdb_is_deleted" not in sql
     assert "deleted IS NULL" not in sql
 
@@ -149,8 +150,10 @@ def test_build_eval_query_keeps_legacy_table_and_predicate():
     assert "tracer_eval_logger FINAL" not in sql
     assert "LIMIT 1 BY id" in sql
     assert "tracer_eval_logger_v2" not in sql
-    assert "_peerdb_is_deleted = 0" in sql
-    assert "deleted = 0 OR deleted IS NULL" in sql
+    assert "_peerdb_is_deleted AS latest_state_0" in sql
+    assert "deleted AS latest_state_1" in sql
+    assert "latest_state_0 = 0" in sql
+    assert "latest_state_1 = 0 OR latest_state_1 IS NULL" in sql
 
 
 # ── perf-fix shapes: tiebreak, progressive slices, created_at bounds ─────────

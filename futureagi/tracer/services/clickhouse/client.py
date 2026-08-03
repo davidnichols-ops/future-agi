@@ -51,11 +51,15 @@ class ClickHouseClient:
         """
         ch_settings = getattr(settings, "CLICKHOUSE", {})
 
-        self.host = host or ch_settings.get("CH_HOST")
-        self.port = int(port or ch_settings.get("CH_PORT", 9000))
-        self.user = user or ch_settings.get("CH_USERNAME", "default")
-        self.password = password or ch_settings.get("CH_PASSWORD", "")
-        self.database = database or ch_settings.get("CH_DATABASE", "default")
+        self.host = ch_settings.get("CH_HOST") if host is None else host
+        self.port = int(ch_settings.get("CH_PORT", 9000) if port is None else port)
+        self.user = ch_settings.get("CH_USERNAME", "default") if user is None else user
+        self.password = (
+            ch_settings.get("CH_PASSWORD", "") if password is None else password
+        )
+        self.database = (
+            ch_settings.get("CH_DATABASE", "default") if database is None else database
+        )
 
         # Connection settings
         self.connect_timeout = ch_settings.get("CH_CONNECT_TIMEOUT", 10)

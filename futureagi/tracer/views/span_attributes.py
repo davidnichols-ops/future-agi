@@ -25,12 +25,20 @@ from tracer.serializers.span_attributes import (
     SpanAttributeValuesQuerySerializer,
     SpanAttributeValuesResponseSerializer,
 )
-from tracer.services.clickhouse.client import ClickHouseClient, is_clickhouse_enabled
-from tracer.services.clickhouse.span_attribute_lookups import (
-    list_attribute_keys_for_project,
+from tracer.services.clickhouse.attribute_reads import (
+    AttributeDetailRead,
+    AttributeReadMetadata,
+    AttributeReadSelector,
 )
+from tracer.services.clickhouse.read_budget import (
+    is_clickhouse_query_error,
+    is_read_budget_error,
+)
+from tracer.utils.workspace_scope import project_queryset_for_request
 
 logger = structlog.get_logger(__name__)
+
+_DETAIL_TOP_VALUES = 100
 
 ERROR_RESPONSES = {
     400: ApiTextErrorResponseSerializer,
@@ -38,6 +46,28 @@ ERROR_RESPONSES = {
     500: ApiTextErrorResponseSerializer,
     503: ApiTextErrorResponseSerializer,
 }
+
+
+def _project_is_in_request_scope(request, project_id: str) -> bool:
+    """Run the only PostgreSQL query allowed by these telemetry endpoints."""
+
+    return project_queryset_for_request(request).filter(id=project_id).exists()
+
+
+def _attribute_error_code(exc: Exception) -> str:
+    return "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+
+
+def _is_expected_attribute_read_failure(exc: Exception) -> bool:
+    """Return whether an attribute read may safely become degraded metadata.
+
+    Only driver-typed ClickHouse failures and explicit read-budget exhaustion
+    are operational failures.  Arbitrary ``Exception`` values are programming
+    defects; turning those into an empty successful picker hid regressions in
+    production and made a broken attribute compiler look like "no values".
+    """
+
+    return is_read_budget_error(exc) or is_clickhouse_query_error(exc)
 
 
 class SpanAttributeKeysView(APIView):
@@ -58,24 +88,59 @@ class SpanAttributeKeysView(APIView):
         responses={200: SpanAttributeKeysResponseSerializer, **ERROR_RESPONSES},
     )
     def get(self, request, *args, **kwargs):
-        if not is_clickhouse_enabled():
-            return self._gm.custom_error_response(503, "ClickHouse is not enabled")
-
-        project_id = str(request.validated_query_data["project_id"])
-
+        project_id = ""
+        selector: AttributeReadSelector | None = None
         try:
-            keys = list_attribute_keys_for_project(project_id)
-            return Response(
-                {"result": [asdict(k) for k in keys]}, status=200
+            project_id = str(request.validated_query_data["project_id"])
+            exact_key = request.validated_query_data.get("q")
+            selector = AttributeReadSelector(
+                typed_only=True,
+                json_attribute_mode="arrays",
             )
-        except Exception as e:
-            logger.error(
+            if not _project_is_in_request_scope(request, project_id):
+                return self._gm.not_found("Project not found")
+            read = selector.discover_keys([project_id], exact_key=exact_key)
+            return Response(
+                {
+                    "result": [asdict(row) for row in read.rows],
+                    **read.metadata.public_payload(),
+                },
+                status=200,
+            )
+        except Exception as exc:
+            if not _is_expected_attribute_read_failure(exc):
+                logger.exception(
+                    "span_attribute_keys_programming_error",
+                    project_id=project_id,
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.internal_server_error_response(
+                    "Span attribute keys could not be loaded"
+                )
+            if selector is None:
+                logger.warning(
+                    "span_attribute_keys_unavailable",
+                    project_id=project_id,
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    503,
+                    "Span attribute keys are temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.warning(
                 "span_attribute_keys_failed",
                 project_id=project_id,
-                error=str(e),
+                error_type=type(exc).__name__,
             )
-            return self._gm.internal_server_error_response(
-                "Failed to fetch span attribute keys"
+            return Response(
+                {
+                    "result": [],
+                    **selector.degraded_metadata(
+                        _attribute_error_code(exc)
+                    ).public_payload(),
+                },
+                status=200,
             )
 
 
@@ -97,71 +162,66 @@ class SpanAttributeValuesView(APIView):
         responses={200: SpanAttributeValuesResponseSerializer, **ERROR_RESPONSES},
     )
     def get(self, request, *args, **kwargs):
-        if not is_clickhouse_enabled():
-            return self._gm.custom_error_response(503, "ClickHouse is not enabled")
-
-        query_params = request.validated_query_data
-        project_id = str(query_params["project_id"])
-        key = query_params["key"]
-        q = query_params.get("q")
-        limit = query_params.get("limit", 50)
-
-        params = {
-            "project_id": project_id,
-            "key": key,
-            "limit": limit,
-        }
-
-        if q:
-            query = """
-                SELECT attrs_string[%(key)s] AS value, count() AS cnt
-                FROM spans
-                WHERE project_id = %(project_id)s
-                  AND mapContains(attrs_string, %(key)s)
-                  AND attrs_string[%(key)s] != ''
-                  AND attrs_string[%(key)s] LIKE %(q_pattern)s
-                GROUP BY value
-                ORDER BY cnt DESC
-                LIMIT %(limit)s
-            """
-            params["q_pattern"] = f"%{q}%"
-        else:
-            query = """
-                SELECT attrs_string[%(key)s] AS value, count() AS cnt
-                FROM spans
-                WHERE project_id = %(project_id)s
-                  AND mapContains(attrs_string, %(key)s)
-                  AND attrs_string[%(key)s] != ''
-                GROUP BY value
-                ORDER BY cnt DESC
-                LIMIT %(limit)s
-            """
-
+        project_id = ""
+        key = ""
+        selector: AttributeReadSelector | None = None
         try:
-            client = ClickHouseClient()
-            rows, column_types, query_time_ms = client.execute_read(query, params)
-
-            result = [{"value": row[0], "count": row[1]} for row in rows]
-
-            logger.info(
-                "span_attribute_values_fetched",
-                project_id=project_id,
-                key=key,
-                value_count=len(result),
-                query_time_ms=query_time_ms,
+            query_params = request.validated_query_data
+            project_id = str(query_params["project_id"])
+            key = query_params["key"]
+            q = query_params.get("q")
+            limit = query_params.get("limit", 50)
+            selector = AttributeReadSelector(
+                typed_only=True,
+                json_attribute_mode="arrays",
             )
-
-            return Response({"result": result}, status=200)
-
-        except Exception as e:
-            logger.error(
+            if not _project_is_in_request_scope(request, project_id):
+                return self._gm.not_found("Project not found")
+            read = selector.read_values([project_id], key, search=q, max_values=limit)
+            return Response(
+                {
+                    "result": [asdict(row) for row in read.rows],
+                    **read.metadata.public_payload(),
+                },
+                status=200,
+            )
+        except Exception as exc:
+            if not _is_expected_attribute_read_failure(exc):
+                logger.exception(
+                    "span_attribute_values_programming_error",
+                    project_id=project_id,
+                    key=key,
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.internal_server_error_response(
+                    "Span attribute values could not be loaded"
+                )
+            if selector is None:
+                logger.warning(
+                    "span_attribute_values_unavailable",
+                    project_id=project_id,
+                    key=key,
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    503,
+                    "Span attribute values are temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.warning(
                 "span_attribute_values_failed",
                 project_id=project_id,
                 key=key,
-                error=str(e),
+                error_type=type(exc).__name__,
             )
-            return self._gm.internal_server_error_response(
-                "Failed to fetch span attribute values"
+            return Response(
+                {
+                    "result": [],
+                    **selector.degraded_metadata(
+                        _attribute_error_code(exc)
+                    ).public_payload(),
+                },
+                status=200,
             )
 
 
@@ -186,197 +246,152 @@ class SpanAttributeDetailView(APIView):
         responses={200: SpanAttributeDetailResponseSerializer, **ERROR_RESPONSES},
     )
     def get(self, request, *args, **kwargs):
-        if not is_clickhouse_enabled():
-            return self._gm.custom_error_response(503, "ClickHouse is not enabled")
-
-        query_params = request.validated_query_data
-        project_id = str(query_params["project_id"])
-        key = query_params["key"]
-
-        params = {"project_id": project_id, "key": key}
-
+        project_id = ""
+        key = ""
+        selector: AttributeReadSelector | None = None
         try:
-            client = ClickHouseClient()
-            attr_type = self._detect_type(client, params)
-
-            if attr_type == "string":
-                return self._string_detail(client, params)
-            elif attr_type == "number":
-                return self._number_detail(client, params)
-            elif attr_type == "boolean":
-                return self._boolean_detail(client, params)
-            else:
+            query_params = request.validated_query_data
+            project_id = str(query_params["project_id"])
+            key = query_params["key"]
+            selector = AttributeReadSelector(
+                typed_only=True,
+                json_attribute_mode="arrays",
+            )
+            if not _project_is_in_request_scope(request, project_id):
+                return self._gm.not_found("Project not found")
+            read = selector.read_detail([project_id], key)
+            if read.attribute_type is None and read.metadata.query_complete:
                 return self._gm.not_found(f"Attribute key '{key}' not found in project")
-
-        except Exception as e:
-            logger.error(
+            if read.attribute_type is None:
+                return Response(
+                    self._empty_degraded_payload(key, read.metadata),
+                    status=200,
+                )
+            return Response(self._detail_payload(key, read), status=200)
+        except Exception as exc:
+            if not _is_expected_attribute_read_failure(exc):
+                logger.exception(
+                    "span_attribute_detail_programming_error",
+                    project_id=project_id,
+                    key=key,
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.internal_server_error_response(
+                    "Span attribute details could not be loaded"
+                )
+            if selector is None:
+                logger.warning(
+                    "span_attribute_detail_unavailable",
+                    project_id=project_id,
+                    key=key,
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    503,
+                    "Span attribute details are temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.warning(
                 "span_attribute_detail_failed",
                 project_id=project_id,
                 key=key,
-                error=str(e),
+                error_type=type(exc).__name__,
             )
-            return self._gm.internal_server_error_response(
-                "Failed to fetch span attribute detail"
+            return Response(
+                self._empty_degraded_payload(
+                    key,
+                    selector.degraded_metadata(_attribute_error_code(exc)),
+                ),
+                status=200,
             )
 
-    def _detect_type(self, client: ClickHouseClient, params: dict) -> str | None:
-        """Determine which attribute map contains the given key."""
-        type_query = """
-            SELECT
-                countIf(mapContains(attrs_string, %(key)s))  AS str_cnt,
-                countIf(mapContains(attrs_number, %(key)s))  AS num_cnt,
-                countIf(mapContains(attrs_bool, %(key)s)) AS bool_cnt
-            FROM spans
-            WHERE project_id = %(project_id)s
-        """
-        rows, _, _ = client.execute_read(type_query, params)
+    @staticmethod
+    def _empty_degraded_payload(
+        key: str,
+        metadata: AttributeReadMetadata,
+    ) -> dict:
+        """Keep required legacy fields while making incompleteness explicit."""
 
-        if not rows:
+        return {
+            "key": key,
+            # The established response requires a concrete scalar type. No
+            # type claim is actionable while query_complete is false; string
+            # preserves the old response shape for existing clients.
+            "type": "string",
+            "count": 0,
+            "unique_values": 0,
+            "top_values": [],
+            **metadata.public_payload(),
+        }
+
+    @staticmethod
+    def _weighted_quantile(
+        values: list[tuple[float, int]],
+        quantile: float,
+    ) -> float | None:
+        total = sum(count for _, count in values)
+        if total <= 0:
             return None
+        target = max(1, int(total * quantile + 0.999999999))
+        cumulative = 0
+        for value, count in sorted(values):
+            cumulative += count
+            if cumulative >= target:
+                return value
+        return max(value for value, _ in values)
 
-        str_cnt, num_cnt, bool_cnt = rows[0]
-        max_cnt = max(str_cnt, num_cnt, bool_cnt)
+    @classmethod
+    def _detail_payload(cls, key: str, read: AttributeDetailRead) -> dict:
+        attribute_type = read.attribute_type
+        assert attribute_type is not None
+        total_count = sum(row.count for row in read.rows)
+        payload: dict = {
+            "key": key,
+            "type": attribute_type,
+            "count": total_count,
+            **read.metadata.public_payload(),
+        }
+        if attribute_type == "number":
+            weighted_values = [
+                (float(row.value), row.count)
+                for row in read.rows
+                if isinstance(row.value, (int, float))
+                and not isinstance(row.value, bool)
+            ]
+            weighted_sum = sum(value * count for value, count in weighted_values)
+            payload.update(
+                {
+                    "min": min((value for value, _ in weighted_values), default=None),
+                    "max": max((value for value, _ in weighted_values), default=None),
+                    "avg": (
+                        round(weighted_sum / total_count, 4)
+                        if total_count > 0
+                        else None
+                    ),
+                    "p50": cls._rounded_quantile(weighted_values, 0.50),
+                    "p95": cls._rounded_quantile(weighted_values, 0.95),
+                }
+            )
+            return payload
 
-        if max_cnt == 0:
-            return None
-        if str_cnt == max_cnt:
-            return "string"
-        if num_cnt == max_cnt:
-            return "number"
-        return "boolean"
-
-    def _string_detail(self, client: ClickHouseClient, params: dict) -> Response:
-        """Return top values with percentages for a string attribute."""
-        query = """
-            SELECT
-                attrs_string[%(key)s] AS value,
-                count() AS cnt
-            FROM spans
-            WHERE project_id = %(project_id)s
-              AND mapContains(attrs_string, %(key)s)
-              AND attrs_string[%(key)s] != ''
-            GROUP BY value
-            ORDER BY cnt DESC
-            LIMIT 100
-        """
-        rows, _, query_time_ms = client.execute_read(query, params)
-
-        total_count = sum(row[1] for row in rows)
-        unique_values = len(rows)
-        top_values = [
+        payload["unique_values"] = len(read.rows)
+        payload["top_values"] = [
             {
-                "value": row[0],
-                "count": row[1],
+                "value": row.value,
+                "count": row.count,
                 "percentage": (
-                    round(row[1] / total_count * 100, 1) if total_count > 0 else 0
+                    round(row.count / total_count * 100, 1) if total_count > 0 else 0
                 ),
             }
-            for row in rows
+            for row in read.rows[:_DETAIL_TOP_VALUES]
         ]
+        return payload
 
-        logger.info(
-            "span_attribute_string_detail_fetched",
-            project_id=params["project_id"],
-            key=params["key"],
-            unique_values=unique_values,
-            query_time_ms=query_time_ms,
-        )
-
-        return Response(
-            {
-                "key": params["key"],
-                "type": "string",
-                "count": total_count,
-                "unique_values": unique_values,
-                "top_values": top_values,
-            },
-            status=200,
-        )
-
-    def _number_detail(self, client: ClickHouseClient, params: dict) -> Response:
-        """Return numeric statistics for a number attribute."""
-        query = """
-            SELECT
-                count()                                          AS cnt,
-                min(attrs_number[%(key)s])                      AS min_val,
-                max(attrs_number[%(key)s])                      AS max_val,
-                avg(attrs_number[%(key)s])                      AS avg_val,
-                quantile(0.50)(attrs_number[%(key)s])           AS p50,
-                quantile(0.95)(attrs_number[%(key)s])           AS p95
-            FROM spans
-            WHERE project_id = %(project_id)s
-              AND mapContains(attrs_number, %(key)s)
-        """
-        rows, _, query_time_ms = client.execute_read(query, params)
-
-        if not rows:
-            return self._gm.not_found("No data found for this attribute")
-
-        row = rows[0]
-
-        logger.info(
-            "span_attribute_number_detail_fetched",
-            project_id=params["project_id"],
-            key=params["key"],
-            count=row[0],
-            query_time_ms=query_time_ms,
-        )
-
-        return Response(
-            {
-                "key": params["key"],
-                "type": "number",
-                "count": row[0],
-                "min": row[1],
-                "max": row[2],
-                "avg": round(row[3], 4) if row[3] is not None else None,
-                "p50": round(row[4], 4) if row[4] is not None else None,
-                "p95": round(row[5], 4) if row[5] is not None else None,
-            },
-            status=200,
-        )
-
-    def _boolean_detail(self, client: ClickHouseClient, params: dict) -> Response:
-        """Return true/false distribution for a boolean attribute."""
-        query = """
-            SELECT
-                attrs_bool[%(key)s] AS value,
-                count() AS cnt
-            FROM spans
-            WHERE project_id = %(project_id)s
-              AND mapContains(attrs_bool, %(key)s)
-            GROUP BY value
-            ORDER BY cnt DESC
-        """
-        rows, _, query_time_ms = client.execute_read(query, params)
-
-        total_count = sum(row[1] for row in rows)
-        top_values = [
-            {
-                "value": row[0],
-                "count": row[1],
-                "percentage": (
-                    round(row[1] / total_count * 100, 1) if total_count > 0 else 0
-                ),
-            }
-            for row in rows
-        ]
-
-        logger.info(
-            "span_attribute_boolean_detail_fetched",
-            project_id=params["project_id"],
-            key=params["key"],
-            count=total_count,
-            query_time_ms=query_time_ms,
-        )
-
-        return Response(
-            {
-                "key": params["key"],
-                "type": "boolean",
-                "count": total_count,
-                "unique_values": len(rows),
-                "top_values": top_values,
-            },
-            status=200,
-        )
+    @classmethod
+    def _rounded_quantile(
+        cls,
+        values: list[tuple[float, int]],
+        quantile: float,
+    ) -> float | None:
+        value = cls._weighted_quantile(values, quantile)
+        return round(value, 4) if value is not None else None

@@ -1,9 +1,10 @@
 """Resolve an eval task's desired (in-scope) row set, deterministically.
 
 The "did the row set change?" axis of the reconciler — the counterpart to the
-config hash. Streams the in-scope identity ids (span / trace / session ids, per
-the task's row_type) in deterministic order, in batches, so a large historical
-task never holds its whole row set in memory.
+config hash. Resolves the in-scope identity ids (span / trace / session ids, per
+the task's row_type) in deterministic order. Historical span/trace membership
+is kept bounded and fully buffered before any batch is yielded, so a failed
+proof can never create a partial task; other row types retain streaming reads.
 
 Selection reuses the UI list builders' filter compilation (the same builders
 ``list_spans_observe`` / ``list_voice_calls`` / ``list_traces_of_session`` /
@@ -14,11 +15,17 @@ the row limit. The entry FKs are batch-resolved by the materializer later.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from tracer.models.eval_task import RunType
+from tracer.models.eval_task import RowType, RunType
+from tracer.services.clickhouse.read_budget import (
+    is_clickhouse_query_error,
+    is_read_budget_error,
+)
 from tracer.services.clickhouse.v2 import get_reader
 
 if TYPE_CHECKING:
@@ -32,14 +39,123 @@ _BUILDER_BY_ROW_TYPE = {
     "sessions": ("SESSION_LIST", "session_id"),
 }
 
+_EVAL_TASK_TOTAL_READ_SECONDS = 10.0
+_EVAL_TASK_MAX_READ_ATTEMPTS = 128
+# Seed pages are identity-only and capped at the shared production-proven 512
+# rows. Classifiers remain separately chunked to 200 physical identities.
+_EVAL_TASK_MAX_CANDIDATES = 512
+_EVAL_TASK_CLASSIFY_BATCH_SIZE = 200
+_EVAL_TASK_BUFFERED_ID_LIMIT = 10_000
+_EVAL_TASK_STREAM_READ_SETTINGS = {
+    "max_execution_time": 10,
+    "timeout_overflow_mode": "throw",
+    "max_threads": 2,
+    "max_memory_usage": 512 * 1024 * 1024,
+    "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
+    "read_overflow_mode": "throw",
+}
+_SAFE_READ_BUDGET_MESSAGE = (
+    "Evaluation task row selection exceeded its read budget. "
+    "Narrow the time range and retry."
+)
+_SAFE_ROW_LIMIT_MESSAGE = (
+    "This evaluation task is too large for safe row selection. "
+    "Reduce the row limit and retry."
+)
+_SAFE_AMBIGUOUS_SPAN_MESSAGE = (
+    "Evaluation task row selection could not safely distinguish one or more "
+    "spans. Narrow the filters and retry."
+)
+_SAFE_UNSUPPORTED_FILTER_MESSAGE = (
+    "Evaluation task row selection contains a filter that cannot be resolved "
+    "safely. Update the filters and retry."
+)
+
+
+class EvalTaskReadBudgetExceeded(RuntimeError):
+    """Safe error used when exact task membership cannot be proven in budget."""
+
+
+@dataclass(frozen=True)
+class ResolvedRowSet:
+    """One completely-buffered desired-state proof.
+
+    ``candidate_ids`` is C (logical rows affected by the frozen arrival/change
+    window); ``matched_ids`` is M (the sampled subset of C matching latest full
+    state). Historical and cursor-null passes are full-state proofs. Normal
+    continuous passes are deltas, where only C may be removed/requeued.
+    """
+
+    candidate_ids: tuple[str, ...]
+    matched_ids: tuple[str, ...]
+    full_state: bool
+
 
 def iter_desired_rows(
     task: EvalTask, *, batch_size: int = 10_000, ceiling: datetime | None = None
 ) -> Iterator[list[str]]:
+    """Compatibility iterator over one already-buffered membership proof."""
+
+    resolved = resolve_desired_rows(task, ceiling=ceiling)
+    yield from _iter_id_batches(list(resolved.matched_ids), batch_size=batch_size)
+
+
+def resolve_desired_rows(
+    task: EvalTask, *, ceiling: datetime | None = None
+) -> ResolvedRowSet:
+    """Resolve C and M once, without yielding or writing partial results."""
+
     # Row limit applies to historical tasks only; continuous runs forever.
     limit = task.spans_limit if task.run_type == RunType.HISTORICAL else None
     sampling_rate = task.sampling_rate if task.sampling_rate is not None else 100.0
-    created_at_ceiling = ceiling if task.run_type == RunType.CONTINUOUS else None
+
+    if task.run_type == RunType.CONTINUOUS:
+        return _resolve_continuous_rows(
+            task,
+            ceiling=ceiling,
+            sampling_rate=float(sampling_rate),
+        )
+
+    # A strict datetime complement can make the requested interval provably
+    # empty (for example ``is_null`` on non-nullable start_time). Preserve the
+    # compatibility SQL for non-empty requests, but do zero CH reads when the
+    # filter algebra already proves an empty result.
+    from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
+
+    historical_ui_filters = _task_ui_filters(
+        task.filters or {}, row_type=task.row_type, bounded_trace_root=True
+    )
+    if BaseQueryBuilder.analyze_bounded_datetime_filters(
+        historical_ui_filters, strict=True
+    ).empty:
+        return ResolvedRowSet((), (), True)
+
+    if (
+        task.row_type in (RowType.SPANS, RowType.TRACES)
+        and task.run_type == RunType.HISTORICAL
+        and limit is not None
+    ):
+        if float(sampling_rate) <= 0:
+            return ResolvedRowSet((), (), True)
+
+        from tracer.services.clickhouse.v2.query_service import (
+            V2AnalyticsQueryService,
+        )
+
+        resolved_ids = _resolve_bounded_historical_span_ids(
+            V2AnalyticsQueryService(),
+            sql=None,
+            params=None,
+            project_id=str(task.project_id),
+            salt=str(task.id),
+            sampling_rate=float(sampling_rate),
+            filters=task.filters or {},
+            limit=int(limit),
+            batch_size=_EVAL_TASK_BUFFERED_ID_LIMIT,
+            row_type=task.row_type,
+        )
+        resolved = tuple(resolved_ids)
+        return ResolvedRowSet(resolved, resolved, True)
 
     sql, params = _build_sample_query(
         project_id=str(task.project_id),
@@ -48,18 +164,496 @@ def iter_desired_rows(
         sampling_rate=float(sampling_rate),
         filters=task.filters or {},
         limit=limit,
-        created_at_floor=_continuous_floor(task),
-        created_at_ceiling=created_at_ceiling,
     )
+    resolved_ids = _resolve_buffered_legacy_ids(
+        sql,
+        params,
+        batch_size=min(_EVAL_TASK_BUFFERED_ID_LIMIT, 10_000),
+        limit=int(limit or _EVAL_TASK_BUFFERED_ID_LIMIT),
+    )
+    resolved = tuple(resolved_ids)
+    return ResolvedRowSet(resolved, resolved, True)
+
+
+def _resolve_continuous_rows(
+    task: EvalTask,
+    *,
+    ceiling: datetime | None,
+    sampling_rate: float,
+) -> ResolvedRowSet:
+    """Resolve an arrival delta C, then classify C against complete latest M."""
+
+    from tracer.selectors.eval_tasks.continuous_candidates import (
+        ContinuousCandidateOverflow,
+        ContinuousCandidateReadError,
+        discover_continuous_candidates,
+        sample_public_ids,
+    )
+    from tracer.services.clickhouse.v2.dispatch import get_v2_class
+    from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
+
+    floor = _continuous_floor(task)
+    if floor is None:
+        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+    frozen_ceiling = ceiling or datetime.now(UTC)
+    if frozen_ceiling.tzinfo is None:
+        frozen_ceiling = frozen_ceiling.replace(tzinfo=UTC)
+    if floor.tzinfo is None:
+        floor = floor.replace(tzinfo=UTC)
+    full_state = task.continuous_cursor is None
+    ui_filters = _task_ui_filters(
+        task.filters or {},
+        row_type=task.row_type,
+        bounded_trace_root=True,
+        include_legacy_date_range=False,
+    )
+    from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
+
+    if BaseQueryBuilder.analyze_bounded_datetime_filters(ui_filters, strict=True).empty:
+        # This is a global predicate proof, not merely an empty arrival delta.
+        # Mark it FULL so reconciliation can remove every pending stale row
+        # without issuing any ClickHouse query.
+        return ResolvedRowSet((), (), True)
+    analytics = V2AnalyticsQueryService()
+    try:
+        candidates = discover_continuous_candidates(
+            analytics,
+            project_id=str(task.project_id),
+            row_type=task.row_type,
+            filters=ui_filters,
+            floor=floor,
+            ceiling=frozen_ceiling,
+            salt=str(task.id),
+            sampling_rate=sampling_rate,
+            deadline_seconds=_EVAL_TASK_TOTAL_READ_SECONDS * 0.4,
+        )
+        if not candidates.classifier_ids:
+            return ResolvedRowSet(candidates.public_ids, (), full_state)
+
+        query_type, key_field = _BUILDER_BY_ROW_TYPE[task.row_type]
+        builder_kwargs: dict[str, Any] = {
+            "project_id": str(task.project_id),
+            "filters": ui_filters,
+            "bounded_internal_scan": True,
+        }
+        if task.row_type in (RowType.SPANS, RowType.TRACES):
+            builder_kwargs["bounded_identity_only"] = True
+        if task.row_type == RowType.TRACES:
+            builder_kwargs["bounded_bulk_scan"] = True
+        builder = get_v2_class(query_type)(**builder_kwargs)
+        if not builder.supports_bounded_filter_scan():
+            raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+
+        classify_size = _EVAL_TASK_CLASSIFY_BATCH_SIZE
+        recommended = getattr(builder, "recommended_filter_classify_batch_size", None)
+        if callable(recommended):
+            recommended_size = recommended()
+            if recommended_size is not None:
+                classify_size = min(classify_size, max(1, int(recommended_size)))
+        deadline = time.monotonic() + _EVAL_TASK_TOTAL_READ_SECONDS * 0.5
+        matched: list[str] = []
+        for offset in range(0, len(candidates.classifier_ids), classify_size):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+            batch = list(candidates.classifier_ids[offset : offset + classify_size])
+            query, params = builder.build_filter_match_query(
+                batch,
+                candidate_full_state=True,
+            )
+            if not query:
+                continue
+            try:
+                result = analytics.execute_ch_query(
+                    query,
+                    params,
+                    timeout_ms=max(1, int(remaining * 1000)),
+                    settings=_EVAL_TASK_STREAM_READ_SETTINGS,
+                )
+            except Exception as exc:
+                if not is_read_budget_error(exc) and not is_clickhouse_query_error(exc):
+                    raise
+                raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
+            result_key = (
+                "root_span_id" if task.row_type == RowType.VOICE_CALLS else key_field
+            )
+            matched.extend(
+                str(row[result_key])
+                for row in result.data
+                if row.get(result_key) not in (None, "")
+            )
+
+        matched_ids = tuple(sorted(dict.fromkeys(matched)))
+        if task.row_type == RowType.VOICE_CALLS:
+            matched_ids = sample_public_ids(
+                analytics,
+                matched_ids,
+                salt=str(task.id),
+                sampling_rate=sampling_rate,
+                deadline_seconds=_EVAL_TASK_TOTAL_READ_SECONDS * 0.1,
+            )
+        # A classifier may only admit public identities proved by C. This also
+        # fences malformed/multi-root output before reconciliation can write.
+        candidate_public = set(candidates.public_ids)
+        matched_ids = tuple(value for value in matched_ids if value in candidate_public)
+        return ResolvedRowSet(candidates.public_ids, matched_ids, full_state)
+    except EvalTaskReadBudgetExceeded:
+        raise
+    except ContinuousCandidateOverflow:
+        raise EvalTaskReadBudgetExceeded(_SAFE_ROW_LIMIT_MESSAGE) from None
+    except ContinuousCandidateReadError:
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
+    except (TypeError, ValueError):
+        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE) from None
+
+
+def _resolve_bounded_historical_span_ids(
+    analytics,
+    *,
+    sql: str | None,
+    params: dict[str, Any] | None,
+    project_id: str,
+    salt: str,
+    sampling_rate: float,
+    filters: dict,
+    limit: int,
+    batch_size: int,
+    row_type: str = RowType.SPANS,
+) -> list[str]:
+    """Resolve a complete historical span/trace prefix with bounded CH reads.
+
+    Adjacent time slices produce only candidate identities. Every candidate is
+    then reclassified against global latest state before it can be returned.
+    The complete prefix stays buffered until the reader proves it; a timeout,
+    query cap, unsupported filter, or incomplete scan raises a sanitized error
+    and never leaks a partial task row set.
+    """
+
+    if limit <= 0:
+        return []
+    if row_type not in (RowType.SPANS, RowType.TRACES):
+        raise ValueError("Bounded historical resolution supports spans and traces")
+    if not 0 <= float(sampling_rate) <= 100:
+        raise ValueError("sampling_rate must be between 0 and 100")
+
+    from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+    from tracer.services.clickhouse.v2.dispatch import get_v2_class
+
+    ui_filters = _task_ui_filters(
+        filters,
+        row_type=row_type,
+        bounded_trace_root=True,
+    )
+    time_columns = {"created_at", "start_time"}
+    has_time_filter = any(
+        (item.get("column_id") or item.get("columnId")) in time_columns
+        for item in ui_filters
+    )
+    has_non_time_filter = any(
+        (item.get("column_id") or item.get("columnId")) not in time_columns
+        for item in ui_filters
+    )
+    bounded_limit = min(limit, _EVAL_TASK_BUFFERED_ID_LIMIT)
+    requires_population_proof = limit > _EVAL_TASK_BUFFERED_ID_LIMIT
+    if not has_non_time_filter and not requires_population_proof:
+        # The historical contract caps an ID-ascending deterministic prefix.
+        # The bounded reader is newest-first so it can prove a filtered UI
+        # page without scanning the whole window.  Keep unfiltered/time-only
+        # tasks on the compatibility query; otherwise changing the row limit
+        # across the bounded threshold would change the selected population.
+        compatibility_sql, compatibility_params = (
+            (sql, params)
+            if sql is not None and params is not None
+            else _build_sample_query(
+                project_id=str(project_id),
+                row_type=row_type,
+                salt=str(salt),
+                sampling_rate=float(sampling_rate),
+                filters=filters,
+                limit=limit,
+            )
+        )
+        return _resolve_buffered_legacy_ids(
+            compatibility_sql,
+            compatibility_params,
+            batch_size=batch_size,
+            limit=limit,
+        )
+
+    query_type, key_field = _BUILDER_BY_ROW_TYPE[row_type]
+    builder = get_v2_class(query_type)(
+        project_id=str(project_id),
+        filters=ui_filters,
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        # Trace classification normally hydrates presentation columns in
+        # 50-ID batches. Eval selection projects only identity + order, so the
+        # already-bounded bulk mode safely classifies 200 candidates per read.
+        # This keeps a 10k task below the shared 128-query proof ceiling.
+        bounded_bulk_scan=row_type == RowType.TRACES,
+        bounded_sampling_salt=str(salt),
+        bounded_sampling_rate=float(sampling_rate),
+    )
+    if not builder.supports_bounded_filter_scan():
+        # Never fall back to the broad compatibility statement for a filter
+        # the latest-state candidate classifier cannot prove. In particular,
+        # eval/annotation predicates must remain candidate-scoped.
+        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+
+    try:
+        start_date, end_date = builder.parse_time_range(ui_filters)
+    except (TypeError, ValueError):
+        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE) from None
+    if not isinstance(start_date, datetime) or not isinstance(end_date, datetime):
+        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+    if start_date >= end_date:
+        return []
+    if not has_time_filter:
+        # BaseQueryBuilder's default window is relative to ``utcnow()``. Pin
+        # that one resolved window before adjacent seed pages are built;
+        # otherwise every builder call advances the lower bound by a few
+        # microseconds and the final slice can fall just outside its own
+        # request window.
+        ui_filters = [
+            *ui_filters,
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "filter_type": "datetime",
+                    "filter_op": "between",
+                    "filter_value": [start_date, end_date],
+                },
+            },
+        ]
+        builder.filters = ui_filters
+
+    classify_batch_size = _EVAL_TASK_CLASSIFY_BATCH_SIZE
+    batch_recommendation = getattr(
+        builder, "recommended_filter_classify_batch_size", None
+    )
+    if callable(batch_recommendation):
+        recommended = batch_recommendation()
+        if recommended is not None:
+            classify_batch_size = min(
+                _EVAL_TASK_CLASSIFY_BATCH_SIZE,
+                max(1, int(recommended)),
+            )
+
+    try:
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=analytics,
+            filters=ui_filters,
+            key_field=key_field,
+            page_number=0,
+            page_size=bounded_limit,
+            deadline_ms=int(_EVAL_TASK_TOTAL_READ_SECONDS * 1000),
+            max_seed_attempts=_EVAL_TASK_MAX_READ_ATTEMPTS,
+            max_candidates=_EVAL_TASK_MAX_CANDIDATES,
+            max_query_count=_EVAL_TASK_MAX_READ_ATTEMPTS,
+            classify_batch_size=classify_batch_size,
+            retry_wide_read_budget=True,
+        )
+    except Exception as exc:
+        if not is_read_budget_error(exc) and not isinstance(exc, ValueError):
+            raise
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
+
+    if not page.complete:
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+    if requires_population_proof and page.has_more:
+        # The configured public limit may pre-date the executable safety cap.
+        # A bounded 10k+sentinel read proves whether the complete sampled set
+        # fits. Never materialize a partial prefix when it does not.
+        raise EvalTaskReadBudgetExceeded(_SAFE_ROW_LIMIT_MESSAGE)
+    if row_type == RowType.SPANS:
+        identities_by_span_id: dict[str, set[tuple[str, Any]]] = {}
+        for row in page.rows:
+            span_id = str(row.get("id") or "")
+            trace_id = str(row.get("trace_id") or "")
+            start_time = row.get("start_time")
+            if not span_id or not trace_id or start_time is None:
+                continue
+            identities = identities_by_span_id.setdefault(span_id, set())
+            identities.add((trace_id, start_time))
+            if len(identities) > 1:
+                # EvalTaskEntry's public/storage contract carries only the
+                # span ID. It cannot represent two distinct physical spans
+                # that reuse that ID, so never silently target one.
+                raise EvalTaskReadBudgetExceeded(_SAFE_AMBIGUOUS_SPAN_MESSAGE)
+        resolved = list(
+            dict.fromkeys(
+                str(row[key_field])
+                for row in page.rows
+                if row.get(key_field) not in (None, "")
+            )
+        )
+        return sorted(resolved) if requires_population_proof else resolved
+    resolved = [
+        str(row[key_field]) for row in page.rows if row.get(key_field) not in (None, "")
+    ]
+    return sorted(resolved) if requires_population_proof else resolved
+
+
+def _resolve_buffered_legacy_ids(
+    sql: str,
+    params: dict[str, Any],
+    *,
+    batch_size: int,
+    limit: int,
+) -> list[str]:
+    """Run the compatibility selector without ever exposing a partial prefix."""
+
+    if limit <= 0:
+        return []
+    resolved: list[str] = []
     reader = get_reader()
     try:
-        yield from reader.stream_query(sql, params, batch_size=batch_size)
+        for batch in reader.stream_query(
+            sql,
+            params,
+            batch_size=batch_size,
+            settings=_EVAL_TASK_STREAM_READ_SETTINGS,
+        ):
+            resolved.extend(str(value) for value in batch)
+            if len(resolved) > limit:
+                raise EvalTaskReadBudgetExceeded(_SAFE_ROW_LIMIT_MESSAGE)
+    except Exception as exc:
+        if isinstance(exc, EvalTaskReadBudgetExceeded):
+            raise
+        if not is_read_budget_error(exc) and not is_clickhouse_query_error(exc):
+            raise
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
     finally:
         reader.close()
+    return resolved
+
+
+def _iter_id_batches(row_ids: list[str], *, batch_size: int) -> Iterator[list[str]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be greater than zero")
+    for offset in range(0, len(row_ids), batch_size):
+        yield row_ids[offset : offset + batch_size]
+
+
+def _validated_task_filter_items(
+    task_filters: dict[str, Any], key: str
+) -> list[dict[str, Any]]:
+    if key not in task_filters or task_filters[key] is None:
+        return []
+    values = task_filters[key]
+    if not isinstance(values, list):
+        raise ValueError(f"{key} must be a list")
+    if any(not isinstance(item, dict) for item in values):
+        raise ValueError(f"{key} entries must be objects")
+    return list(values)
+
+
+def _validated_task_filters(filters: dict | None) -> dict[str, Any]:
+    if filters is None:
+        return {}
+    if not isinstance(filters, dict):
+        raise ValueError("task filters must be an object")
+    return filters
+
+
+def _validated_date_range(task_filters: dict[str, Any]) -> list[Any] | None:
+    if "date_range" not in task_filters or task_filters["date_range"] is None:
+        return None
+    date_range = task_filters["date_range"]
+    if not isinstance(date_range, list | tuple) or len(date_range) != 2:
+        raise ValueError("date_range must contain exactly two values")
+    if any(value in (None, "") for value in date_range):
+        raise ValueError("date_range values must be non-empty")
+    return list(date_range)
+
+
+def _task_ui_filters(
+    filters: dict | None,
+    *,
+    row_type: str | None = None,
+    bounded_trace_root: bool = False,
+    include_legacy_date_range: bool = True,
+) -> list[dict[str, Any]]:
+    """Normalize persisted task filters to the list-builder filter contract."""
+
+    task_filters = _validated_task_filters(filters)
+
+    ui_filters: list[dict[str, Any]] = []
+    for key in ("filters", "span_attributes_filters"):
+        ui_filters.extend(_validated_task_filter_items(task_filters, key))
+
+    date_range = (
+        _validated_date_range(task_filters) if include_legacy_date_range else None
+    )
+    if date_range is not None:
+        ui_filters.append(
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "filter_type": "datetime",
+                    "filter_op": "between",
+                    "filter_value": [date_range[0], date_range[1]],
+                },
+            }
+        )
+
+    for task_key, column_id in (
+        ("span_id", "span_id"),
+        ("trace_id", "trace_id"),
+        ("session_id", "session_id"),
+        ("observation_type", "observation_type"),
+    ):
+        raw_values = task_filters.get(task_key)
+        if raw_values is None:
+            continue
+        values = (
+            [str(value) for value in raw_values if value not in (None, "")]
+            if isinstance(raw_values, list | tuple | set)
+            else [str(raw_values)]
+        )
+        if not values:
+            continue
+        internal_trace_root = (
+            bounded_trace_root
+            and row_type == RowType.TRACES
+            and task_key == "observation_type"
+        )
+        item = {
+            "column_id": column_id,
+            "filter_config": {
+                "col_type": (
+                    "INTERNAL_ROOT_METRIC" if internal_trace_root else "SYSTEM_METRIC"
+                ),
+                "filter_type": "text",
+                "filter_op": "in",
+                "filter_value": values,
+            },
+        }
+        if internal_trace_root:
+            # FilterItemField rejects unknown keys on external requests.  This
+            # second marker keeps the internal col_type from becoming a
+            # user-selectable semantic switch if a caller guesses its string.
+            item["_eval_task_trace_root"] = True
+        ui_filters.append(item)
+
+    if task_filters.get("created_at"):
+        ui_filters.append(
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "datetime",
+                    "filter_op": "greater_than",
+                    "filter_value": task_filters["created_at"],
+                },
+            }
+        )
+    return ui_filters
 
 
 def _continuous_floor(task: EvalTask) -> datetime | None:
-    """Lower ``created_at`` bound for a continuous task's desired set.
+    """Lower arrival/change watermark for a continuous task's desired set.
 
     A continuous task only evaluates rows that arrive after it starts — it must
     never backfill the project history that pre-dates it. The floor is the
@@ -95,10 +689,11 @@ def _build_sample_query(
 
     # Reshape the eval task's stored filters into the frontend filter list the UI
     # builder consumes; the date range is read via parse_time_range.
-    f = filters or {}
-    ui_filters = list(f.get("filters") or [])
-    dr = f.get("date_range")
-    if isinstance(dr, list | tuple) and len(dr) == 2:
+    f = _validated_task_filters(filters)
+    ui_filters = _validated_task_filter_items(f, "filters")
+    ui_filters.extend(_validated_task_filter_items(f, "span_attributes_filters"))
+    dr = _validated_date_range(f)
+    if dr is not None:
         ui_filters.append(
             {
                 "column_id": "created_at",
@@ -110,9 +705,48 @@ def _build_sample_query(
             }
         )
 
-    # Continuous floor: passed to build_id_query to bind on arrival (created_at),
-    # not injected as a filter (parse_time_range would fold it onto start_time).
-    # None (historical) keeps the builder's start_time window.
+    for task_key, column_id in (
+        ("span_id", "span_id"),
+        ("trace_id", "trace_id"),
+        ("session_id", "session_id"),
+    ):
+        raw_values = f.get(task_key)
+        if raw_values is None:
+            continue
+        values = (
+            [str(value) for value in raw_values if value not in (None, "")]
+            if isinstance(raw_values, list | tuple | set)
+            else [str(raw_values)]
+        )
+        if values:
+            ui_filters.append(
+                {
+                    "column_id": column_id,
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "in",
+                        "filter_value": values,
+                    },
+                }
+            )
+
+    if f.get("created_at"):
+        ui_filters.append(
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "datetime",
+                    "filter_op": "greater_than",
+                    "filter_value": f["created_at"],
+                },
+            }
+        )
+
+    # Continuous bounds are passed directly to ``build_id_query`` so they bind
+    # on arrival time (``created_at``). Injecting the floor into ``ui_filters``
+    # would make ``parse_time_range`` apply it to historical ``start_time``.
     builder = get_v2_class(query_type)(project_id=str(project_id), filters=ui_filters)
     inner_sql, params = builder.build_id_query(
         created_at_floor=created_at_floor, created_at_ceiling=created_at_ceiling

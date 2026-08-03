@@ -4,17 +4,28 @@ TraceSession API Tests
 Tests for /tracer/trace-session/ endpoints.
 """
 
+import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 import pytest
+from clickhouse_driver.errors import ServerException
 from django.utils import timezone
 from rest_framework import status
 
 from tracer.models.observation_span import EvalLogger, EvalTargetType, ObservationSpan
 from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession, TraceSessionOverlay
+from tracer.services.clickhouse.bounded_graph_reads import (
+    BoundedGraphReadError,
+    GraphCandidateSample,
+)
+from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+from tracer.services.clickhouse.session_graph import fetch_session_graph_ch
+from tracer.services.clickhouse.v2.query_builders.trace_list import (
+    TraceListQueryBuilderV2,
+)
 from tracer.views.trace_session import TraceSessionView
 
 
@@ -294,8 +305,14 @@ class TestTraceSessionListAPI:
 
     def test_list_sessions_missing_project(self, auth_client):
         """List sessions supports org-scoped listing without project ID."""
-        response = auth_client.get("/tracer/trace-session/list_sessions/")
+        with mock.patch(
+            "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+        ) as analytics_cls:
+            response = auth_client.get("/tracer/trace-session/list_sessions/")
+
         assert response.status_code == status.HTTP_200_OK
+        assert get_result(response)["metadata"]["total_rows"] == 0
+        analytics_cls.assert_not_called()
 
     def test_list_sessions_success(
         self, auth_client, observe_project, trace_session, session_trace
@@ -329,6 +346,40 @@ class TestTraceSessionListAPI:
         assert response.status_code == status.HTTP_200_OK
         data = get_result(response)
         assert "metadata" in data
+
+    def test_deep_filtered_page_is_non_retryable_422_before_clickhouse(
+        self, auth_client, observe_project
+    ):
+        filters = [
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rechazado",
+                },
+            }
+        ]
+
+        with mock.patch(
+            "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+        ) as analytics_cls:
+            response = auth_client.get(
+                "/tracer/trace-session/list_sessions/",
+                {
+                    "project_id": str(observe_project.id),
+                    "filters": json.dumps(filters),
+                    "page_number": 159,
+                    "page_size": 30,
+                },
+            )
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert response.data["type"] == "client_error"
+        assert response.data["code"] == "page_depth_exceeded"
+        assert "earlier page" in response.data["message"]
+        analytics_cls.assert_not_called()
 
     def test_list_sessions_empty(self, auth_client, observe_project):
         """List returns empty when no sessions exist."""
@@ -399,16 +450,20 @@ class TestTraceSessionExportAPI:
 class TestTraceSessionGraphAPI:
     """Tests for POST /tracer/trace-session/get_session_graph_data/ endpoint."""
 
-    def test_session_filter_uses_clickhouse_graph(
-        self, auth_client, observe_project
-    ):
+    def test_session_filter_uses_clickhouse_graph(self, auth_client, observe_project):
         session_id = "003b76f1-2b4a-4af5-b0dc-224d687374d4"
         analytics = mock.Mock()
         analytics.execute_ch_query.return_value = mock.Mock(data=[], columns=[])
 
-        with mock.patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
-            return_value=analytics,
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=analytics,
+            ) as v2_service,
+            mock.patch(
+                "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+            ) as legacy_service,
+            mock.patch.object(Trace, "objects") as pg_trace_manager,
         ):
             response = auth_client.post(
                 "/tracer/trace-session/get_session_graph_data/",
@@ -448,10 +503,554 @@ class TestTraceSessionGraphAPI:
             )
 
         assert response.status_code == status.HTTP_200_OK
-        assert get_result(response)["metric_name"] == "session_count"
-        query, params = analytics.execute_ch_query.call_args.args[:2]
-        assert "IN %(session_id_1)s" in query
-        assert params["session_id_1"] == (session_id,)
+        payload = get_result(response)
+        assert payload["metric_name"] == "session_count"
+        assert payload["query_complete"] is True
+        assert payload["query_status"] == "complete"
+        assert payload["data"]
+        assert all(point["value"] == 0 for point in payload["data"])
+        query_text = "\n".join(
+            call.args[0] for call in analytics.execute_ch_query.call_args_list
+        )
+        assert "trace_session_id" in query_text
+        assert "SessionTimeSeriesQueryBuilder" not in query_text
+        for query_call in analytics.execute_ch_query.call_args_list:
+            assert 0 < query_call.kwargs["timeout_ms"] <= 1_200
+            settings = query_call.kwargs["settings"]
+            assert settings["max_threads"] == 1
+            assert settings["max_rows_to_read"] == 10_000_000
+            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["timeout_overflow_mode"] == "throw"
+        v2_service.assert_called_once_with()
+        legacy_service.assert_not_called()
+        pg_trace_manager.assert_not_called()
+
+    def test_session_system_graph_groups_only_proven_latest_trace_candidates(self):
+        window_start = datetime(2026, 7, 24, tzinfo=UTC)
+        window_end = window_start + timedelta(days=1)
+        survivor = "10000000-0000-0000-0000-000000000000"
+        duplicate_old = "20000000-0000-0000-0000-000000000000"
+        consolidated_new = "30000000-0000-0000-0000-000000000000"
+        other_session = "40000000-0000-0000-0000-000000000000"
+        rows = (
+            {
+                "trace_id": "trace-corrected",
+                "trace_session_id": consolidated_new,
+                "start_time": window_start + timedelta(hours=1),
+                "end_time": window_start + timedelta(hours=1, seconds=4),
+                "latency_ms": 10,
+                "cost": 2,
+                "total_tokens": 10,
+                "prompt_tokens": 6,
+                "completion_tokens": 4,
+                "status": "OK",
+            },
+            {
+                "trace_id": "trace-same-session",
+                "trace_session_id": duplicate_old,
+                "start_time": window_start + timedelta(hours=2),
+                "end_time": window_start + timedelta(hours=2, seconds=8),
+                "latency_ms": 30,
+                "cost": 3,
+                "total_tokens": 20,
+                "prompt_tokens": 12,
+                "completion_tokens": 8,
+                "status": "ERROR",
+            },
+            {
+                "trace_id": "trace-other-session",
+                "trace_session_id": other_session,
+                "start_time": window_start + timedelta(hours=3),
+                "end_time": window_start + timedelta(hours=3, seconds=2),
+                "latency_ms": 50,
+                "cost": 7,
+                "total_tokens": 5,
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "status": "OK",
+            },
+        )
+        sample = GraphCandidateSample(
+            rows=rows,
+            query_complete=True,
+            query_status="complete",
+            query_error_code=None,
+            window_start=window_start,
+            window_end=window_end,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=3,
+            result_payload_bytes=500,
+            total_rows_lower_bound=3,
+        )
+        analytics = mock.Mock()
+        analytics.execute_ch_query.return_value = mock.Mock(
+            data=[
+                {"old_id": survivor, "new_id": consolidated_new},
+                {"old_id": duplicate_old, "new_id": consolidated_new},
+            ],
+            columns=["old_id", "new_id"],
+        )
+
+        with mock.patch(
+            "tracer.services.clickhouse.session_graph.read_graph_candidates",
+            return_value=sample,
+        ) as candidate_read:
+            graph = fetch_session_graph_ch(
+                analytics=analytics,
+                project_id=str(uuid.uuid4()),
+                filters=[],
+                interval="day",
+                req_data_config={"id": "cost", "type": "SYSTEM_METRIC"},
+            )
+
+        assert graph["query_complete"] is True
+        assert graph["query_status"] == "complete"
+        # The two old/new IDs are one canonical session: its corrected latest
+        # traces sum to 5. The other session sums to 7; cost is their average.
+        assert graph["data"][0]["value"] == 6
+        assert graph["data"][0]["primary_traffic"] == 2
+        candidate_kwargs = candidate_read.call_args.kwargs
+        assert candidate_kwargs["observe_type"] == "trace"
+        assert candidate_kwargs["filters"][-1]["column_id"] == "trace_session_id"
+        remap_sql = analytics.execute_ch_query.call_args.args[0]
+        assert "trace_session_id_remap FINAL" in remap_sql
+        assert "relevant_new_ids" in remap_sql
+
+    def test_session_system_candidate_sql_replays_v2_updates_and_tombstones(self):
+        builder = TraceListQueryBuilderV2(
+            project_id=str(uuid.uuid4()),
+            filters=[
+                {
+                    "column_id": "created_at",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "datetime",
+                        "filter_op": "between",
+                        "filter_value": [
+                            "2026-07-24T00:00:00Z",
+                            "2026-07-25T00:00:00Z",
+                        ],
+                    },
+                },
+                {
+                    "column_id": "trace_session_id",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "is_not_null",
+                        "filter_value": None,
+                    },
+                },
+            ],
+        )
+
+        query, _ = builder.build_filter_match_query(["trace-1"])
+
+        assert "argMax(is_deleted, _version) AS latest_is_deleted" in query
+        assert "argMax(tuple(trace_session_id), _version).1" in query
+        assert "WHERE latest_is_deleted = 0" in query
+        assert "HAVING countIf" in query
+
+    def test_session_system_graph_incomplete_candidate_set_is_typed_503(
+        self,
+        auth_client,
+        observe_project,
+    ):
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.read_graph_candidates",
+                side_effect=BoundedGraphReadError("sample_limit"),
+            ),
+        ):
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                {
+                    "project_id": str(observe_project.id),
+                    "interval": "day",
+                    "property": "average",
+                    "req_data_config": {
+                        "id": "session_count",
+                        "type": "SYSTEM_METRIC",
+                    },
+                    "filters": [],
+                },
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        payload = get_result(response)
+        assert payload["query_complete"] is False
+        assert payload["query_error_code"] == "sample_limit"
+
+    def test_session_system_graph_rejects_returned_candidate_sample_before_remap(
+        self,
+    ):
+        window_start = datetime(2026, 7, 24, tzinfo=UTC)
+        sample = GraphCandidateSample(
+            rows=(
+                {
+                    "trace_id": "trace-proven-match",
+                    "trace_session_id": "003b76f1-2b4a-4af5-b0dc-224d687374d4",
+                    "start_time": window_start,
+                },
+            ),
+            query_complete=False,
+            query_status="degraded",
+            query_error_code="sample_limit",
+            window_start=window_start,
+            window_end=window_start + timedelta(days=1),
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=50,
+            result_payload_bytes=100,
+            total_rows_lower_bound=51,
+        )
+        analytics = mock.Mock()
+
+        with (
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.read_graph_candidates",
+                return_value=sample,
+            ),
+            pytest.raises(BoundedGraphReadError) as caught,
+        ):
+            fetch_session_graph_ch(
+                analytics=analytics,
+                project_id=str(uuid.uuid4()),
+                filters=[],
+                interval="day",
+                req_data_config={"id": "session_count", "type": "SYSTEM_METRIC"},
+            )
+
+        assert caught.value.error_code == "sample_limit"
+        analytics.execute_ch_query.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("failure", "error_code"),
+        [
+            (
+                ServerException("secret SQL and internal CH stack", 159),
+                "read_budget_exceeded",
+            ),
+            (ReadDeadlineExceeded("secret deadline context"), "read_budget_exceeded"),
+        ],
+    )
+    def test_session_graph_failure_is_sanitized_typed_503_without_pg_fallback(
+        self,
+        auth_client,
+        observe_project,
+        failure,
+        error_code,
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = failure
+
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=analytics,
+            ),
+            mock.patch.object(Trace, "objects") as pg_trace_manager,
+        ):
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                {
+                    "project_id": str(observe_project.id),
+                    "interval": "day",
+                    "property": "average",
+                    "req_data_config": {
+                        "id": "session_count",
+                        "type": "SYSTEM_METRIC",
+                    },
+                    "filters": [],
+                },
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.data["type"] == "service_unavailable"
+        assert response.data["code"] == "service_unavailable"
+        payload = get_result(response)
+        assert payload["query_complete"] is False
+        assert payload["query_status"] == "degraded"
+        assert payload["query_error_code"] == error_code
+        rendered = str(response.data)
+        assert "secret SQL" not in rendered
+        assert "internal CH stack" not in rendered
+        assert "secret deadline context" not in rendered
+        pg_trace_manager.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ServerException("secret unknown identifier", 47),
+            ServerException("secret unknown table", 60),
+            ServerException("secret syntax error", 62),
+            RuntimeError("secret compiler state"),
+        ],
+    )
+    def test_session_graph_query_defects_are_sanitized_500_without_pg_fallback(
+        self,
+        auth_client,
+        observe_project,
+        failure,
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = failure
+
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=analytics,
+            ),
+            mock.patch.object(Trace, "objects") as pg_trace_manager,
+        ):
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                {
+                    "project_id": str(observe_project.id),
+                    "interval": "day",
+                    "property": "average",
+                    "req_data_config": {
+                        "id": "session_count",
+                        "type": "SYSTEM_METRIC",
+                    },
+                    "filters": [],
+                },
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        rendered = str(response.data)
+        assert "secret" not in rendered
+        assert "unknown identifier" not in rendered
+        assert "unknown table" not in rendered
+        assert "syntax error" not in rendered
+        assert "compiler state" not in rendered
+        pg_trace_manager.assert_not_called()
+
+    def test_session_eval_graph_uses_same_deadline_caps_and_session_scope(
+        self,
+        auth_client,
+        observe_project,
+        eval_template,
+    ):
+        from tracer.models.custom_eval_config import CustomEvalConfig
+
+        eval_config = CustomEvalConfig.objects.create(
+            name=f"Session graph eval {uuid.uuid4()}",
+            project=observe_project,
+            eval_template=eval_template,
+        )
+        analytics = mock.Mock()
+        analytics.execute_ch_query.return_value = mock.Mock(data=[], columns=[])
+        helper_calls = []
+
+        def fake_eval_graph(**kwargs):
+            helper_calls.append(kwargs)
+            kwargs["analytics"].execute_ch_query(
+                "SELECT 1",
+                {},
+                timeout_ms=9_000,
+                settings={
+                    "max_threads": 8,
+                    "max_rows_to_read": 100_000_000,
+                    "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
+                },
+            )
+            return {
+                "metric_name": str(eval_config.id),
+                "data": [],
+                "query_complete": True,
+                "query_status": "complete",
+            }
+
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=analytics,
+            ),
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.fetch_eval_graph_ch",
+                side_effect=fake_eval_graph,
+            ),
+        ):
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                {
+                    "project_id": str(observe_project.id),
+                    "interval": "day",
+                    "property": "average",
+                    "req_data_config": {
+                        "id": str(eval_config.id),
+                        "type": "EVAL",
+                        "output_type": "SCORE",
+                    },
+                    "filters": [],
+                },
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert get_result(response)["query_complete"] is True
+        session_filter = helper_calls[0]["filters"][-1]
+        assert session_filter["column_id"] == "trace_session_id"
+        assert session_filter["filter_config"]["filter_op"] == "is_not_null"
+        query_call = analytics.execute_ch_query.call_args
+        assert 0 < query_call.kwargs["timeout_ms"] <= 1_200
+        assert query_call.kwargs["settings"]["max_threads"] == 1
+        assert query_call.kwargs["settings"]["max_rows_to_read"] == 10_000_000
+        assert query_call.kwargs["settings"]["max_bytes_to_read"] == 512 * 1024 * 1024
+
+    def test_session_annotation_incomplete_graph_is_typed_503(
+        self,
+        auth_client,
+        observe_project,
+    ):
+        helper_calls = []
+
+        def incomplete_annotation(**kwargs):
+            helper_calls.append(kwargs)
+            return {
+                "metric_name": "annotation-id",
+                "data": [
+                    {
+                        "timestamp": "2026-08-03T00:00:00Z",
+                        "value": 999,
+                        "primary_traffic": 999,
+                    }
+                ],
+                "query_complete": False,
+                "query_status": "degraded",
+                "query_error_code": "sample_limit",
+            }
+
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.fetch_annotation_graph_ch",
+                side_effect=incomplete_annotation,
+            ),
+        ):
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                {
+                    "project_id": str(observe_project.id),
+                    "interval": "day",
+                    "property": "average",
+                    "req_data_config": {
+                        "id": "annotation-id",
+                        "type": "ANNOTATION",
+                        "output_type": "SCORE",
+                    },
+                    "filters": [],
+                },
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        payload = get_result(response)
+        assert payload["data"] == []
+        assert payload["query_complete"] is False
+        assert payload["query_error_code"] == "sample_limit"
+        assert helper_calls[0]["filters"][-1]["column_id"] == "trace_session_id"
+
+    def test_session_graph_rejects_unsupported_type_without_any_ch_read(
+        self,
+        auth_client,
+        observe_project,
+    ):
+        with mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService"
+        ) as v2_service:
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                {
+                    "project_id": str(observe_project.id),
+                    "interval": "day",
+                    "property": "average",
+                    "req_data_config": {
+                        "id": "session_count",
+                        "type": "UNSUPPORTED",
+                    },
+                    "filters": [],
+                },
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        v2_service.assert_not_called()
+
+    def test_session_graph_rejects_unknown_system_metric_without_any_ch_read(
+        self,
+        auth_client,
+        observe_project,
+    ):
+        with mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService"
+        ) as v2_service:
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                {
+                    "project_id": str(observe_project.id),
+                    "interval": "day",
+                    "property": "average",
+                    "req_data_config": {
+                        "id": "not_a_session_metric",
+                        "type": "SYSTEM_METRIC",
+                    },
+                    "filters": [],
+                },
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        v2_service.assert_not_called()
+
+    def test_session_graph_rejects_foreign_eval_config_before_ch_read(
+        self,
+        auth_client,
+        observe_project,
+        project,
+        eval_template,
+    ):
+        from tracer.models.custom_eval_config import CustomEvalConfig
+
+        foreign_config = CustomEvalConfig.objects.create(
+            name=f"Foreign session eval {uuid.uuid4()}",
+            project=project,
+            eval_template=eval_template,
+        )
+        with mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService"
+        ) as v2_service:
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                {
+                    "project_id": str(observe_project.id),
+                    "interval": "day",
+                    "property": "average",
+                    "req_data_config": {
+                        "id": str(foreign_config.id),
+                        "type": "EVAL",
+                        "output_type": "SCORE",
+                    },
+                    "filters": [],
+                },
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        v2_service.assert_not_called()
 
 
 @pytest.mark.integration
@@ -554,9 +1153,14 @@ class TestTraceSessionWorkspaceScopeAPI:
             data=[{"val": "alice"}, {"val": "bob"}]
         )
 
-        with mock.patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
-            return_value=analytics,
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=analytics,
+            ) as v2_service,
+            mock.patch(
+                "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+            ) as legacy_service,
         ):
             response = auth_client.get(
                 "/tracer/trace-session/get_session_filter_values/",
@@ -564,10 +1168,342 @@ class TestTraceSessionWorkspaceScopeAPI:
             )
 
         assert response.status_code == status.HTTP_200_OK
+        v2_service.assert_called_once_with()
+        legacy_service.assert_not_called()
         assert get_result(response)["values"] == ["alice", "bob"]
         query = analytics.execute_ch_query.call_args.args[0]
         assert "FROM end_users FINAL" in query
         assert "user_id AS val" in query
+
+    @pytest.mark.parametrize(
+        ("column", "expected_aggregate"),
+        [
+            ("first_message", "argMin(latest_input, start_time) AS val"),
+            ("last_message", "argMax(latest_input, start_time) AS val"),
+        ],
+    )
+    def test_session_message_filter_values_are_finite_and_latest_state_safe(
+        self,
+        auth_client,
+        observe_project,
+        column,
+        expected_aggregate,
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.return_value = mock.Mock(
+            data=[{"val": "Needle message"}]
+        )
+
+        with mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService",
+            return_value=analytics,
+        ) as v2_service:
+            response = auth_client.get(
+                "/tracer/trace-session/get_session_filter_values/",
+                {
+                    "project_id": str(observe_project.id),
+                    "column": column,
+                    "search": "Needle",
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        v2_service.assert_called_once_with()
+        payload = get_result(response)
+        assert payload["values"] == ["Needle message"]
+        assert payload["next"] is False
+        assert payload["query_complete"] is True
+        assert payload["query_status"] == "complete"
+
+        call = analytics.execute_ch_query.call_args
+        query, params = call.args[:2]
+        assert "latest_roots AS" in query
+        assert "start_time >= %(window_start)s" in query
+        assert "start_time < %(window_end)s" in query
+        assert params["window_end"] - params["window_start"] == timedelta(days=30)
+        assert "argMax(is_deleted, _version) AS latest_is_deleted" in query
+        assert (
+            "argMax(tuple(parent_span_id), _version).1 "
+            "AS latest_parent_span_id" in query
+        )
+        assert "argMax(tuple(trace_session_id), _version).1" in query
+        assert "AS latest_trace_session_id" in query
+        assert "argMax(tuple(input), _version).1 AS latest_input" in query
+        assert "WHERE latest_is_deleted = 0" in query
+        assert expected_aggregate in query
+        assert "trace_session_id_remap" in query
+        assert "positionCaseInsensitiveUTF8(val, %(filter_value_search)s)" in query
+        assert params["filter_value_search"] == "Needle"
+        assert params["result_limit"] == 51
+        assert call.kwargs["timeout_ms"] == 4_000
+        settings = call.kwargs["settings"]
+        assert settings["max_rows_to_read"] == 2_000_000
+        assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+        assert settings["timeout_overflow_mode"] == "throw"
+        assert settings["read_overflow_mode"] == "throw"
+
+    def test_dense_session_message_page_uses_exact_has_more_sentinel(
+        self, auth_client, observe_project
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.return_value = mock.Mock(
+            data=[{"val": f"message-{index:03d}"} for index in range(501)]
+        )
+
+        with mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService",
+            return_value=analytics,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/get_session_filter_values/",
+                {
+                    "project_id": str(observe_project.id),
+                    "column": "first_message",
+                    "page": 2,
+                    "page_size": 500,
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        payload = get_result(response)
+        assert len(payload["values"]) == 500
+        assert payload["next"] is True
+        # A numbered page with a sentinel is exact even though another page exists.
+        assert payload["query_complete"] is True
+        assert payload["query_status"] == "complete"
+        _query, params = analytics.execute_ch_query.call_args.args[:2]
+        assert params["result_limit"] == 501
+        assert params["result_offset"] == 1_000
+        settings = analytics.execute_ch_query.call_args.kwargs["settings"]
+        assert settings["max_result_rows"] == 501
+
+    def test_session_message_filter_budget_is_explicit_degraded_and_sanitized(
+        self, auth_client, observe_project
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = ServerException(
+            "DB::Exception private dense-project query", 159
+        )
+
+        with mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService",
+            return_value=analytics,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/get_session_filter_values/",
+                {
+                    "project_id": str(observe_project.id),
+                    "column": "last_message",
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert get_result(response) == {
+            "values": [],
+            "next": False,
+            "query_complete": False,
+            "query_status": "degraded",
+            "query_error_code": "read_budget_exceeded",
+        }
+        assert "private dense-project query" not in str(response.data)
+        settings = analytics.execute_ch_query.call_args.kwargs["settings"]
+        assert settings["timeout_overflow_mode"] == "throw"
+        assert settings["read_overflow_mode"] == "throw"
+
+    def test_session_message_filter_query_defect_is_sanitized_500(
+        self, auth_client, observe_project
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = ServerException(
+            "DB::Exception secret unknown identifier", 47
+        )
+
+        with mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService",
+            return_value=analytics,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/get_session_filter_values/",
+                {
+                    "project_id": str(observe_project.id),
+                    "column": "first_message",
+                },
+            )
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        rendered = str(response.data)
+        assert "secret unknown identifier" not in rendered
+        assert "DB::Exception" not in rendered
+
+    def test_session_filter_values_sanitize_clickhouse_failure(
+        self, auth_client, observe_project
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = ServerException(
+            "DB::Exception secret-internal-query", 159
+        )
+
+        with mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService",
+            return_value=analytics,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/get_session_filter_values/",
+                {"project_id": str(observe_project.id), "column": "user_id"},
+            )
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        payload = str(get_result(response))
+        assert "secret-internal-query" not in payload
+        assert "DB::Exception" not in payload
+        settings = analytics.execute_ch_query.call_args.kwargs["settings"]
+        assert settings["max_rows_to_read"] == 500_000
+        assert settings["max_bytes_to_read"] == 256 * 1024 * 1024
+        assert settings["timeout_overflow_mode"] == "throw"
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ServerException("secret unknown identifier", 47),
+            ServerException("secret unknown table", 60),
+            ServerException("secret syntax error", 62),
+            RuntimeError("secret session filter compiler state"),
+        ],
+    )
+    def test_session_filter_values_query_defects_are_sanitized_500(
+        self,
+        auth_client,
+        observe_project,
+        failure,
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = failure
+
+        with mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService",
+            return_value=analytics,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/get_session_filter_values/",
+                {"project_id": str(observe_project.id), "column": "user_id"},
+            )
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        rendered = str(response.data)
+        assert "secret" not in rendered
+        assert "unknown identifier" not in rendered
+        assert "unknown table" not in rendered
+        assert "syntax error" not in rendered
+        assert "compiler state" not in rendered
+
+    def test_session_metric_filter_uses_narrow_candidate_and_exact_count(
+        self, auth_client, observe_project
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = [
+            mock.Mock(data=[]),
+            mock.Mock(data=[{"total": 0}]),
+        ]
+        filters = json.dumps(
+            [
+                {
+                    "column_id": "total_tokens",
+                    "filter_config": {
+                        "filter_type": "number",
+                        "filter_op": "greater_than",
+                        "filter_value": 10,
+                    },
+                }
+            ]
+        )
+
+        with mock.patch(
+            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+            return_value=analytics,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/list_sessions/",
+                {
+                    "project_id": str(observe_project.id),
+                    "filters": filters,
+                },
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert analytics.execute_ch_query.call_count == 2
+        page_sql = analytics.execute_ch_query.call_args_list[0].args[0]
+        count_sql = analytics.execute_ch_query.call_args_list[1].args[0]
+        for sql in (page_sql, count_sql):
+            assert "candidate_root_identities AS" in sql
+            assert "latest_roots AS" in sql
+            assert "sum(total_tokens) AS total_tokens" in sql
+            assert "HAVING total_tokens >" in sql
+        for call in analytics.execute_ch_query.call_args_list:
+            assert 0 < call.kwargs["timeout_ms"] <= 1_800
+            settings = call.kwargs["settings"]
+            assert settings["max_rows_to_read"] == 10_000_000
+            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_result_rows"] > 0
+            assert settings["max_result_bytes"] == 32 * 1024 * 1024
+            assert settings["result_overflow_mode"] == "throw"
+
+    def test_session_list_sanitizes_typed_clickhouse_failure(
+        self, auth_client, observe_project
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = ServerException(
+            "secret SQL and internal stack", 159
+        )
+
+        with mock.patch(
+            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+            return_value=analytics,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/list_sessions/",
+                {"project_id": str(observe_project.id)},
+            )
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        payload = str(get_result(response))
+        assert "secret SQL" not in payload
+        assert "internal stack" not in payload
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ServerException("secret unknown identifier", 47),
+            ServerException("secret unknown table", 60),
+            ServerException("secret syntax error", 62),
+            RuntimeError("secret session compiler invariant failed"),
+        ],
+    )
+    def test_session_list_query_defects_are_sanitized_500(
+        self,
+        auth_client,
+        observe_project,
+        failure,
+    ):
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = failure
+
+        with mock.patch(
+            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+            return_value=analytics,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/list_sessions/",
+                {"project_id": str(observe_project.id)},
+            )
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        rendered = str(response.data)
+        assert "secret" not in rendered
+        assert "unknown identifier" not in rendered
+        assert "unknown table" not in rendered
+        assert "syntax error" not in rendered
+        assert "compiler invariant" not in rendered
 
     def test_session_filter_values_use_external_id_as_label(
         self, auth_client, observe_project
@@ -580,7 +1516,7 @@ class TestTraceSessionWorkspaceScopeAPI:
 
         with (
             mock.patch(
-                "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+                "tracer.views.trace_session.V2AnalyticsQueryService",
                 return_value=analytics,
             ),
             mock.patch(
@@ -614,7 +1550,7 @@ class TestTraceSessionWorkspaceScopeAPI:
         )
 
         with mock.patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+            "tracer.views.trace_session.V2AnalyticsQueryService",
             return_value=analytics,
         ):
             response = auth_client.get(
@@ -1044,18 +1980,21 @@ class TestTraceSessionCHOnlyDestroyPath:
         session_id = uuid.uuid4()
         assert not TraceSession.objects.filter(id=session_id).exists()
 
-        with mock.patch(
-            "tracer.views.trace_session._resolve_ch_session_fields",
-            return_value={
-                "project_id": observe_project.id,
-                "external_session_id": "ext-session-1",
-                "first_seen": timezone.now(),
-                "bookmarked": False,
-                "display_name": None,
-            },
-        ), mock.patch(
-            "tracer.services.clickhouse.v2.curated_writer._get_client"
-        ) as mock_ch_client:
+        with (
+            mock.patch(
+                "tracer.views.trace_session._resolve_ch_session_fields",
+                return_value={
+                    "project_id": observe_project.id,
+                    "external_session_id": "ext-session-1",
+                    "first_seen": timezone.now(),
+                    "bookmarked": False,
+                    "display_name": None,
+                },
+            ),
+            mock.patch(
+                "tracer.services.clickhouse.v2.curated_writer._get_client"
+            ) as mock_ch_client,
+        ):
             mock_ch_client.return_value = mock.Mock()
             response = auth_client.delete(
                 f"/tracer/trace-session/{session_id}/",
@@ -1063,9 +2002,7 @@ class TestTraceSessionCHOnlyDestroyPath:
 
         assert response.status_code == status.HTTP_204_NO_CONTENT
 
-    def test_delete_ch_only_session_removes_overlay(
-        self, auth_client, observe_project
-    ):
+    def test_delete_ch_only_session_removes_overlay(self, auth_client, observe_project):
         session_id = uuid.uuid4()
         TraceSessionOverlay.objects.create(
             trace_session_id=session_id,
@@ -1074,18 +2011,21 @@ class TestTraceSessionCHOnlyDestroyPath:
             display_name="bookmarked-session",
         )
 
-        with mock.patch(
-            "tracer.views.trace_session._resolve_ch_session_fields",
-            return_value={
-                "project_id": observe_project.id,
-                "external_session_id": "ext-session-1",
-                "first_seen": timezone.now(),
-                "bookmarked": True,
-                "display_name": "bookmarked-session",
-            },
-        ), mock.patch(
-            "tracer.services.clickhouse.v2.curated_writer._get_client"
-        ) as mock_ch_client:
+        with (
+            mock.patch(
+                "tracer.views.trace_session._resolve_ch_session_fields",
+                return_value={
+                    "project_id": observe_project.id,
+                    "external_session_id": "ext-session-1",
+                    "first_seen": timezone.now(),
+                    "bookmarked": True,
+                    "display_name": "bookmarked-session",
+                },
+            ),
+            mock.patch(
+                "tracer.services.clickhouse.v2.curated_writer._get_client"
+            ) as mock_ch_client,
+        ):
             mock_ch_client.return_value = mock.Mock()
             response = auth_client.delete(
                 f"/tracer/trace-session/{session_id}/",
@@ -1101,18 +2041,21 @@ class TestTraceSessionCHOnlyDestroyPath:
     ):
         session_id = uuid.uuid4()
 
-        with mock.patch(
-            "tracer.views.trace_session._resolve_ch_session_fields",
-            return_value={
-                "project_id": observe_project.id,
-                "external_session_id": "ext-session-1",
-                "first_seen": timezone.now(),
-                "bookmarked": False,
-                "display_name": None,
-            },
-        ), mock.patch(
-            "tracer.services.clickhouse.v2.curated_writer._get_client"
-        ) as mock_ch_client:
+        with (
+            mock.patch(
+                "tracer.views.trace_session._resolve_ch_session_fields",
+                return_value={
+                    "project_id": observe_project.id,
+                    "external_session_id": "ext-session-1",
+                    "first_seen": timezone.now(),
+                    "bookmarked": False,
+                    "display_name": None,
+                },
+            ),
+            mock.patch(
+                "tracer.services.clickhouse.v2.curated_writer._get_client"
+            ) as mock_ch_client,
+        ):
             ch_client = mock.Mock()
             mock_ch_client.return_value = ch_client
             auth_client.delete(f"/tracer/trace-session/{session_id}/")
@@ -1233,17 +2176,19 @@ class TestTraceSessionUserIdFilterValidation:
     def test_contains_op_rejected(self, auth_client, observe_project):
         import json
 
-        filters = json.dumps([
-            {
-                "column_id": "user_id",
-                "filter_config": {
-                    "col_type": "SYSTEM_METRIC",
-                    "filter_type": "text",
-                    "filter_op": "contains",
-                    "filter_value": "alice",
-                },
-            }
-        ])
+        filters = json.dumps(
+            [
+                {
+                    "column_id": "user_id",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "contains",
+                        "filter_value": "alice",
+                    },
+                }
+            ]
+        )
         response = auth_client.get(
             "/tracer/trace-session/list_sessions/",
             {"project_id": str(observe_project.id), "filters": filters},
@@ -1253,17 +2198,19 @@ class TestTraceSessionUserIdFilterValidation:
     def test_starts_with_op_rejected(self, auth_client, observe_project):
         import json
 
-        filters = json.dumps([
-            {
-                "column_id": "user_id",
-                "filter_config": {
-                    "col_type": "SYSTEM_METRIC",
-                    "filter_type": "text",
-                    "filter_op": "starts_with",
-                    "filter_value": "ali",
-                },
-            }
-        ])
+        filters = json.dumps(
+            [
+                {
+                    "column_id": "user_id",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "starts_with",
+                        "filter_value": "ali",
+                    },
+                }
+            ]
+        )
         response = auth_client.get(
             "/tracer/trace-session/list_sessions/",
             {"project_id": str(observe_project.id), "filters": filters},
@@ -1273,17 +2220,19 @@ class TestTraceSessionUserIdFilterValidation:
     def test_equals_op_accepted(self, auth_client, observe_project):
         import json
 
-        filters = json.dumps([
-            {
-                "column_id": "user_id",
-                "filter_config": {
-                    "col_type": "SYSTEM_METRIC",
-                    "filter_type": "text",
-                    "filter_op": "equals",
-                    "filter_value": "alice",
-                },
-            }
-        ])
+        filters = json.dumps(
+            [
+                {
+                    "column_id": "user_id",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "alice",
+                    },
+                }
+            ]
+        )
         with mock.patch(
             "tracer.views.trace_session._resolve_end_user_ids_for_user_id",
             return_value=([], None),
@@ -1339,7 +2288,11 @@ class TestSessionListLatency:
             {},
         )
         if rows:
-            return rows[0][0] if isinstance(rows[0], (list, tuple)) else rows[0].get("project_id")
+            return (
+                rows[0][0]
+                if isinstance(rows[0], (list, tuple))
+                else rows[0].get("project_id")
+            )
         return None
 
     @pytest.fixture(autouse=True)
@@ -1365,22 +2318,33 @@ class TestSessionListLatency:
             "AND (parent_span_id IS NULL OR parent_span_id = '')",
             {"pid": self.project_id},
         )
-        row_count = rows[0][0] if rows and isinstance(rows[0], (list, tuple)) else (rows[0].get("count()", 0) if rows else 0)
+        row_count = (
+            rows[0][0]
+            if rows and isinstance(rows[0], (list, tuple))
+            else (rows[0].get("count()", 0) if rows else 0)
+        )
 
         eu_rows, _, _ = client.execute_read(
             "SELECT count() FROM end_users WHERE project_id = %(pid)s AND is_deleted = 0",
             {"pid": self.project_id},
         )
-        eu_count = eu_rows[0][0] if eu_rows and isinstance(eu_rows[0], (list, tuple)) else (eu_rows[0].get("count()", 0) if eu_rows else 0)
+        eu_count = (
+            eu_rows[0][0]
+            if eu_rows and isinstance(eu_rows[0], (list, tuple))
+            else (eu_rows[0].get("count()", 0) if eu_rows else 0)
+        )
 
         if row_count >= 1000 and eu_count >= 100:
             return
 
-        now = datetime.now(timezone.utc) if hasattr(timezone, 'utc') else datetime.utcnow()
+        now = (
+            datetime.now(timezone.utc)
+            if hasattr(timezone, "utc")
+            else datetime.utcnow()
+        )
         import os
 
         import clickhouse_connect
-
         from django.conf import settings
 
         ch_settings = getattr(settings, "CLICKHOUSE", {})
@@ -1459,7 +2423,9 @@ class TestSessionListLatency:
             "VALUES " + ", ".join(eu_values)
         )
 
-    def _run_session_list_query(self, filters, project_id=None, sort_params=None, page_number=0, page_size=30):
+    def _run_session_list_query(
+        self, filters, project_id=None, sort_params=None, page_number=0, page_size=30
+    ):
         import time
 
         from tracer.services.clickhouse.query_service import AnalyticsQueryService
@@ -1511,15 +2477,24 @@ class TestSessionListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
         main_ms, enrich_ms, count = self._run_session_list_query(filters)
         total = main_ms + enrich_ms
-        print(f"\n  [BENCHMARK] project_id + time: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}")
-        assert count >= 30, f"Benchmark should find seeded sessions (got {count}, expected >=30)"
-        assert total < 3000, f"Session list with project_id took {total:.0f}ms (threshold: 3000ms)"
+        print(
+            f"\n  [BENCHMARK] project_id + time: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}"
+        )
+        assert count >= 30, (
+            f"Benchmark should find seeded sessions (got {count}, expected >=30)"
+        )
+        assert total < 3000, (
+            f"Session list with project_id took {total:.0f}ms (threshold: 3000ms)"
+        )
 
     def test_latency_with_project_id_and_cost_filter(self):
         filters = [
@@ -1528,7 +2503,10 @@ class TestSessionListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             },
             {
@@ -1542,8 +2520,12 @@ class TestSessionListLatency:
         ]
         main_ms, enrich_ms, count = self._run_session_list_query(filters)
         total = main_ms + enrich_ms
-        print(f"\n  [BENCHMARK] project_id + time + cost>0: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}")
-        assert total < 3000, f"Session list with cost filter took {total:.0f}ms (threshold: 3000ms)"
+        print(
+            f"\n  [BENCHMARK] project_id + time + cost>0: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}"
+        )
+        assert total < 3000, (
+            f"Session list with cost filter took {total:.0f}ms (threshold: 3000ms)"
+        )
 
     def test_latency_without_project_id(self):
         filters = [
@@ -1552,14 +2534,23 @@ class TestSessionListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
-        main_ms, enrich_ms, count = self._run_session_list_query(filters, project_id=None)
+        main_ms, enrich_ms, count = self._run_session_list_query(
+            filters, project_id=None
+        )
         total = main_ms + enrich_ms
-        print(f"\n  [BENCHMARK] no project_id + time: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}")
-        assert total < 3000, f"Session list without project_id took {total:.0f}ms (threshold: 3000ms)"
+        print(
+            f"\n  [BENCHMARK] no project_id + time: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}"
+        )
+        assert total < 3000, (
+            f"Session list without project_id took {total:.0f}ms (threshold: 3000ms)"
+        )
 
     def test_latency_with_sort_by_duration(self):
         filters = [
@@ -1568,7 +2559,10 @@ class TestSessionListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
@@ -1577,7 +2571,9 @@ class TestSessionListLatency:
         )
         total = main_ms + enrich_ms
         print(f"\n  [BENCHMARK] sort by duration DESC: {total:.0f}ms sessions={count}")
-        assert total < 2000, f"Session list sorted by duration took {total:.0f}ms (threshold: 2000ms)"
+        assert total < 2000, (
+            f"Session list sorted by duration took {total:.0f}ms (threshold: 2000ms)"
+        )
 
     def test_latency_with_tokens_having_filter(self):
         filters = [
@@ -1586,7 +2582,10 @@ class TestSessionListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             },
             {
@@ -1600,8 +2599,12 @@ class TestSessionListLatency:
         ]
         main_ms, enrich_ms, count = self._run_session_list_query(filters)
         total = main_ms + enrich_ms
-        print(f"\n  [BENCHMARK] tokens>0 HAVING: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}")
-        assert total < 3000, f"Session list with tokens HAVING took {total:.0f}ms (threshold: 3000ms)"
+        print(
+            f"\n  [BENCHMARK] tokens>0 HAVING: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}"
+        )
+        assert total < 3000, (
+            f"Session list with tokens HAVING took {total:.0f}ms (threshold: 3000ms)"
+        )
 
     def test_latency_with_traces_count_filter(self):
         filters = [
@@ -1610,7 +2613,10 @@ class TestSessionListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             },
             {
@@ -1624,8 +2630,12 @@ class TestSessionListLatency:
         ]
         main_ms, enrich_ms, count = self._run_session_list_query(filters)
         total = main_ms + enrich_ms
-        print(f"\n  [BENCHMARK] traces_count>=1 HAVING: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}")
-        assert total < 3000, f"Session list with traces_count HAVING took {total:.0f}ms (threshold: 3000ms)"
+        print(
+            f"\n  [BENCHMARK] traces_count>=1 HAVING: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}"
+        )
+        assert total < 3000, (
+            f"Session list with traces_count HAVING took {total:.0f}ms (threshold: 3000ms)"
+        )
 
     def test_latency_sort_by_cost_asc(self):
         filters = [
@@ -1634,7 +2644,10 @@ class TestSessionListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
@@ -1643,7 +2656,9 @@ class TestSessionListLatency:
         )
         total = main_ms + enrich_ms
         print(f"\n  [BENCHMARK] sort by cost ASC: {total:.0f}ms sessions={count}")
-        assert total < 2000, f"Session list sorted by cost took {total:.0f}ms (threshold: 2000ms)"
+        assert total < 2000, (
+            f"Session list sorted by cost took {total:.0f}ms (threshold: 2000ms)"
+        )
 
     def test_latency_narrow_time_range_24h(self):
         from datetime import timedelta
@@ -1663,8 +2678,12 @@ class TestSessionListLatency:
         ]
         main_ms, enrich_ms, count = self._run_session_list_query(filters)
         total = main_ms + enrich_ms
-        print(f"\n  [BENCHMARK] 24h window: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}")
-        assert total < 1500, f"Session list with 24h window took {total:.0f}ms (threshold: 1500ms)"
+        print(
+            f"\n  [BENCHMARK] 24h window: main={main_ms:.0f}ms enrich={enrich_ms:.0f}ms total={total:.0f}ms sessions={count}"
+        )
+        assert total < 1500, (
+            f"Session list with 24h window took {total:.0f}ms (threshold: 1500ms)"
+        )
 
     def test_latency_combined_filters_and_sort(self):
         filters = [
@@ -1673,7 +2692,10 @@ class TestSessionListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             },
             {
@@ -1697,8 +2719,12 @@ class TestSessionListLatency:
             filters, sort_params=[{"column_id": "duration", "direction": "desc"}]
         )
         total = main_ms + enrich_ms
-        print(f"\n  [BENCHMARK] tokens+cost+sort_duration: {total:.0f}ms sessions={count}")
-        assert total < 3000, f"Combined filters + sort took {total:.0f}ms (threshold: 3000ms)"
+        print(
+            f"\n  [BENCHMARK] tokens+cost+sort_duration: {total:.0f}ms sessions={count}"
+        )
+        assert total < 3000, (
+            f"Combined filters + sort took {total:.0f}ms (threshold: 3000ms)"
+        )
 
     def test_latency_page_2(self):
         filters = [
@@ -1707,7 +2733,10 @@ class TestSessionListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
@@ -1716,11 +2745,13 @@ class TestSessionListLatency:
         )
         total = main_ms + enrich_ms
         print(f"\n  [BENCHMARK] page 2 (offset 10): {total:.0f}ms sessions={count}")
-        assert total < 2000, f"Session list page 2 took {total:.0f}ms (threshold: 2000ms)"
+        assert total < 2000, (
+            f"Session list page 2 took {total:.0f}ms (threshold: 2000ms)"
+        )
 
 
+@pytest.mark.benchmark
 class TestUserListLatency:
-
     @staticmethod
     def _ch_available():
         try:
@@ -1750,7 +2781,11 @@ class TestUserListLatency:
             {},
         )
         if rows:
-            return rows[0][0] if isinstance(rows[0], (list, tuple)) else rows[0].get("project_id")
+            return (
+                rows[0][0]
+                if isinstance(rows[0], (list, tuple))
+                else rows[0].get("project_id")
+            )
         return None
 
     @pytest.fixture(autouse=True)
@@ -1793,7 +2828,10 @@ class TestUserListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
@@ -1809,7 +2847,10 @@ class TestUserListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
@@ -1817,7 +2858,9 @@ class TestUserListLatency:
             filters, sort_params=[{"column_id": "total_cost", "direction": "desc"}]
         )
         print(f"\n  [BENCHMARK] users sort by cost: {ms:.0f}ms users={count}")
-        assert ms < 3000, f"User list sorted by cost took {ms:.0f}ms (threshold: 3000ms)"
+        assert ms < 3000, (
+            f"User list sorted by cost took {ms:.0f}ms (threshold: 3000ms)"
+        )
 
     def test_latency_sort_by_tokens(self):
         filters = [
@@ -1826,7 +2869,10 @@ class TestUserListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
@@ -1834,7 +2880,9 @@ class TestUserListLatency:
             filters, sort_params=[{"column_id": "total_tokens", "direction": "desc"}]
         )
         print(f"\n  [BENCHMARK] users sort by tokens: {ms:.0f}ms users={count}")
-        assert ms < 3000, f"User list sorted by tokens took {ms:.0f}ms (threshold: 3000ms)"
+        assert ms < 3000, (
+            f"User list sorted by tokens took {ms:.0f}ms (threshold: 3000ms)"
+        )
 
     def test_latency_sort_by_trace_count(self):
         filters = [
@@ -1843,7 +2891,10 @@ class TestUserListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
@@ -1851,7 +2902,9 @@ class TestUserListLatency:
             filters, sort_params=[{"column_id": "trace_count", "direction": "desc"}]
         )
         print(f"\n  [BENCHMARK] users sort by trace_count: {ms:.0f}ms users={count}")
-        assert ms < 3000, f"User list sorted by trace_count took {ms:.0f}ms (threshold: 3000ms)"
+        assert ms < 3000, (
+            f"User list sorted by trace_count took {ms:.0f}ms (threshold: 3000ms)"
+        )
 
     def test_latency_narrow_24h_window(self):
         from datetime import timedelta
@@ -1887,7 +2940,10 @@ class TestUserListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-01-01T00:00:00.000Z", "2026-12-31T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-01-01T00:00:00.000Z",
+                        "2026-12-31T23:59:59.000Z",
+                    ],
                 },
             }
         ]
@@ -1915,7 +2971,10 @@ class TestUserListLatency:
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": ["2025-12-01T00:00:00.000Z", "2026-06-30T23:59:59.000Z"],
+                    "filter_value": [
+                        "2025-12-01T00:00:00.000Z",
+                        "2026-06-30T23:59:59.000Z",
+                    ],
                 },
             }
         ]

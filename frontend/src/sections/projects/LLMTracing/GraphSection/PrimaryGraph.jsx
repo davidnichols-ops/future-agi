@@ -42,6 +42,11 @@ import CustomDateRangePicker from "src/components/custom-datepicker/DatePicker";
 import { formatDate } from "src/utils/report-utils";
 import { toBackendFilters } from "../common";
 import { combineGraphFilters } from "./graphFilterUtils";
+import {
+  getExactGraphData,
+  getQueryReadMessage,
+  getQueryReadState,
+} from "src/utils/queryReadState";
 
 // ---------------------------------------------------------------------------
 // Map dashboard category → graph API type
@@ -150,6 +155,7 @@ function useGraphMetrics() {
       return groups;
     },
     staleTime: 60_000,
+    meta: { errorHandled: true },
   });
 }
 
@@ -314,7 +320,11 @@ const PrimaryGraph = ({
 
   // Fetch graph data
   const apiEndpoint = graphEndpoint || endpoints.project.getTraceGraphData();
-  const { data: graphData, isLoading } = useQuery({
+  const {
+    data: graphData,
+    isLoading,
+    isError: graphError,
+  } = useQuery({
     queryKey: [
       "primary-graph",
       effectiveObserveId,
@@ -335,16 +345,25 @@ const PrimaryGraph = ({
         },
         project_id: effectiveObserveId,
       }),
-    select: (d) => d.data?.result,
+    select: (d) => ({
+      ...(d.data?.result || {}),
+      queryReadState: getQueryReadState(d.data),
+    }),
     enabled: !!effectiveObserveId && !!metricDef.id,
     staleTime: 30_000,
+    retry: false,
+    meta: { errorHandled: true },
   });
+  const graphReadState = graphError
+    ? "error"
+    : graphData?.queryReadState || getQueryReadState(graphData);
+  const graphReadMessage = getQueryReadMessage(graphReadState);
 
   // Parse API data → [{timestamp, value, primary_traffic}, ...]
   const { metricData, trafficData } = useMemo(() => {
     if (!graphData) return { metricData: [], trafficData: [] };
 
-    const items = Array.isArray(graphData.data) ? graphData.data : [];
+    const items = getExactGraphData(graphData);
     const mData = [];
     const tData = [];
 
@@ -823,6 +842,23 @@ const PrimaryGraph = ({
       </Box>
 
       {/* Chart */}
+      {graphReadMessage && hasData && (
+        <Box
+          role="status"
+          sx={{
+            mx: 1.5,
+            mb: 0.5,
+            px: 1,
+            py: 0.5,
+            borderRadius: "4px",
+            color: "warning.main",
+            bgcolor: "warning.lighter",
+            fontSize: 11,
+          }}
+        >
+          {graphReadMessage}
+        </Box>
+      )}
       {hasData ? (
         <Box sx={{ mx: -0.5 }}>
           <ReactApexChart
@@ -842,7 +878,7 @@ const PrimaryGraph = ({
           }}
         >
           <Typography sx={{ fontSize: 12, color: "text.disabled" }}>
-            No data available for this time range
+            {graphReadMessage || "No data available for this time range"}
           </Typography>
         </Box>
       )}

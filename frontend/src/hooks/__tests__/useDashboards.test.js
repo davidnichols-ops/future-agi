@@ -16,6 +16,7 @@ vi.mock("src/utils/axios", () => ({
   endpoints: {
     dashboard: {
       list: "/tracer/dashboard/",
+      filterValues: "/tracer/dashboard/filter_values/",
       widgets: (dashboardId) => `/tracer/dashboard/${dashboardId}/widgets/`,
       widgetDetail: (dashboardId, widgetId) =>
         `/tracer/dashboard/${dashboardId}/widgets/${widgetId}/`,
@@ -33,6 +34,7 @@ import {
   useDeleteWidget,
   useReorderWidgets,
   useDuplicateWidget,
+  useDashboardFilterValues,
 } from "../useDashboards";
 
 const DASHBOARD_LIST_KEY = ["dashboards", "list"];
@@ -175,5 +177,65 @@ describe("useDashboards widget mutations", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: DASHBOARD_LIST_KEY,
     });
+  });
+});
+
+describe("useDashboardFilterValues bounded-read state", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const renderValues = () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    return renderHook(
+      () =>
+        useDashboardFilterValues({
+          metricName: "final_status",
+          metricType: "custom_attribute",
+          projectIds: ["project-colly"],
+          source: "traces",
+          search: "Rechazado",
+        }),
+      { wrapper: createQueryWrapper(queryClient) },
+    );
+  };
+
+  it("does not turn a degraded value response into a legitimate empty result", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          values: ["Rechazado"],
+          query_complete: false,
+          query_status: "degraded",
+        },
+      },
+    });
+    const { result } = renderValues();
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual(["Rechazado"]);
+    expect(result.current.queryReadState).toBe("degraded");
+    expect(mocks.get).toHaveBeenCalledWith(
+      "/tracer/dashboard/filter_values/",
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        params: expect.objectContaining({
+          metric_name: "final_status",
+          project_ids: "project-colly",
+          search: "Rechazado",
+        }),
+      }),
+    );
+  });
+
+  it("reports request failure instead of silently converting it to empty", async () => {
+    mocks.get.mockRejectedValue({
+      result: "Code: 159 DB::Exception: Timeout exceeded",
+    });
+    const { result } = renderValues();
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toEqual([]);
+    expect(result.current.queryReadState).toBe("error");
   });
 });

@@ -1259,6 +1259,7 @@ const EvalPickerCreateNew = ({ onBack, onSave }) => {
                     isComposite={isComposite}
                     compositeAdhocConfig={compositeAdhocConfig}
                     localFilters={localApiFilters}
+                    allowCustomFieldPath
                   />
                 )}
                 {source === "tracing" && (

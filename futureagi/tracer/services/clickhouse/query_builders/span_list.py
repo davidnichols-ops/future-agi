@@ -16,19 +16,38 @@ span IDs, grouped by ``(observation_span_id, label_id)``.
 The three result sets are merged in Python to produce the final response.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from tracer.services.clickhouse.eval_logger_table import eval_logger_source
+from tracer.services.clickhouse.eval_logger_table import (
+    eval_logger_live_state_columns,
+    eval_logger_source,
+    eval_logger_version_column,
+)
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.eval_status import (
     non_terminal_eval_marker,
 )
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+    partition_span_filter_plans,
+    supports_span_filters,
+    targets_span_filter_domain,
+)
 from tracer.services.clickhouse.v2.id_remap_sql import (
     remap_left_join,
     resolved_id_expr,
 )
+
+
+def _unix_microseconds(value: datetime) -> int:
+    """Encode DateTime64(6) without driver tuple-datetime precision loss."""
+
+    utc_value = (
+        value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    )
+    delta = utc_value - datetime(1970, 1, 1, tzinfo=UTC)
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
 
 class SpanListQueryBuilder(BaseQueryBuilder):
@@ -49,6 +68,43 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     # Filter compiler class; the v2 list builder overrides this to the v2
     # builder so it reads the v2 dimension tables (end_users, etc.).
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
+
+    @staticmethod
+    def _normalize_span_entities(
+        span_entities: list[tuple[str, str]] | None,
+    ) -> tuple[tuple[str, str], ...] | None:
+        """Return a finite, de-duplicated set of trace-scoped span IDs.
+
+        ``None`` preserves the legacy bare-ID builder contract for callers that
+        have not yet propagated trace identity. An explicitly supplied empty or
+        malformed set stays empty and therefore fails closed.
+        """
+
+        if span_entities is None:
+            return None
+        return tuple(
+            dict.fromkeys(
+                (str(trace_id), str(span_id))
+                for trace_id, span_id in span_entities
+                if trace_id and span_id
+            )
+        )
+
+    @staticmethod
+    def _normalize_span_identities(
+        span_identities: list[tuple[str, str, str, Any]] | None,
+    ) -> tuple[tuple[str, str, str, Any], ...] | None:
+        """Normalize physical span identities used by the spans table."""
+
+        if span_identities is None:
+            return None
+        return tuple(
+            dict.fromkeys(
+                (str(project_id), str(trace_id), str(span_id), start_time)
+                for project_id, trace_id, span_id, start_time in span_identities
+                if project_id and trace_id and span_id and start_time is not None
+            )
+        )
 
     SORT_FIELD_MAP: dict[str, str] = {
         "created_at": "start_time",
@@ -74,6 +130,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         annotation_label_ids: list[str] | None = None,
         end_user_id: str | None = None,
         project_version_id: str | None = None,
+        bounded_internal_scan: bool = False,
+        bounded_identity_only: bool = False,
+        bounded_sampling_salt: str | None = None,
+        bounded_sampling_rate: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id=project_id, project_ids=project_ids, **kwargs)
@@ -85,6 +145,487 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         self.annotation_label_ids = annotation_label_ids or []
         self.end_user_id = end_user_id
         self.project_version_id = project_version_id
+        self._bounded_internal_scan = bool(bounded_internal_scan)
+        self._bounded_identity_only = bool(bounded_identity_only)
+        if (bounded_sampling_salt is None) != (bounded_sampling_rate is None):
+            raise ValueError(
+                "bounded_sampling_salt and bounded_sampling_rate must be paired"
+            )
+        if bounded_sampling_rate is not None and not (
+            0 <= float(bounded_sampling_rate) <= 100
+        ):
+            raise ValueError("bounded_sampling_rate must be between 0 and 100")
+        self._bounded_sampling_salt = bounded_sampling_salt
+        self._bounded_sampling_rate = bounded_sampling_rate
+        # The default range is derived from ``utcnow``. Pin it once so the
+        # bounded selector and every seed/classifier query use identical
+        # half-open boundaries instead of drifting forward by microseconds.
+        self._bounded_request_window = BaseQueryBuilder.parse_time_range(
+            self.filters, strict=True
+        )
+
+    def parse_time_range(
+        self, filters: list[dict]
+    ) -> tuple[datetime | None, datetime | None]:
+        if filters is self.filters or filters == self.filters:
+            return self._bounded_request_window
+        return BaseQueryBuilder.parse_time_range(filters, strict=True)
+
+    def supports_bounded_filter_scan(self) -> bool:
+        """Whether the latest-state bounded reader can represent this request."""
+
+        try:
+            partition_span_filter_plans(self.filters)
+        except (TypeError, ValueError):
+            return False
+        # An unfiltered/time-only custom sort or legacy remapped end-user read
+        # is intentionally handled by the finite top-N legacy builder below.
+        # The bounded selector has one fixed newest-first order and no remap
+        # join, so routing these requests through it would silently change the
+        # result even though no attribute filter requires bounded replay.
+        if (
+            self.sort_params or self.end_user_id
+        ) and not self._active_non_time_filters():
+            return False
+        return (
+            supports_span_filters(self.filters)
+            and self.bounded_filter_degraded_error_code() is None
+        )
+
+    def _active_non_time_filters(self) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in self.filters
+            if isinstance(item, dict)
+            and (item.get("column_id") or item.get("columnId"))
+            not in {"created_at", "start_time"}
+        ]
+
+    def bounded_filter_degraded_error_code(self) -> str | None:
+        """Explain why a supported filter must not use the broad legacy read."""
+
+        # With no row filter, the top-N legacy path is already project/time
+        # bounded and is the only implementation that honours a custom sort or
+        # the remapped end-user constraint.  Once a row filter is active those
+        # modifiers cannot be combined with the bounded selector's fixed order,
+        # so fail closed instead of widening back to a broad filtered scan.
+        if not self._active_non_time_filters():
+            return None
+        if not supports_span_filters(self.filters):
+            return (
+                "unsupported_filter_shape"
+                if targets_span_filter_domain(self.filters)
+                else None
+            )
+        if self.sort_params or self.end_user_id:
+            return "unsupported_filter_modifiers"
+        return None
+
+    def bounded_filter_row_identity(
+        self,
+        row: dict[str, Any],
+    ) -> tuple[str, str, str, Any]:
+        """Return the OTel span identity used by the direct-write table.
+
+        OTel span IDs are unique only inside a trace. Direct-write ``spans``
+        rows treat ``(project_id, trace_id, id, start_time)`` as immutable;
+        bounded pagination must use that same physical identity instead of
+        collapsing unrelated spans that happen to share the 8-byte span ID.
+        """
+
+        return (
+            str(row.get("project_id") or self.project_id or ""),
+            str(row.get("trace_id", "")),
+            str(row.get("id", "")),
+            row.get("start_time"),
+        )
+
+    @staticmethod
+    def bounded_filter_row_order_token(
+        row: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        """Stable keyset tiebreak matching the span seed query order."""
+
+        return (
+            str(row.get("id", "")),
+            str(row.get("trace_id", "")),
+            str(row.get("project_id", "")),
+        )
+
+    @staticmethod
+    def recommended_filter_seed_batch_size() -> int:
+        return 200
+
+    @staticmethod
+    def recommended_filter_classify_batch_size() -> int:
+        return 200
+
+    def build_filter_seed_page(
+        self,
+        *,
+        slice_start: Any,
+        slice_end: Any,
+        limit: int,
+        before_start_time: Any = None,
+        before_id: Any = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return bounded physical matches as a latest-state candidate superset."""
+
+        if not self.supports_bounded_filter_scan():
+            raise ValueError("unsupported bounded span filter scan")
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
+        if (before_start_time is None) != (before_id is None):
+            raise ValueError("span keyset values must be provided together")
+        request_start, request_end = self.parse_time_range(self.filters)
+        if not request_start <= slice_start < slice_end <= request_end:
+            raise ValueError("span seed slice must stay inside the request window")
+        self.params.update({"start_date": request_start, "end_date": request_end})
+
+        plans, _ = partition_span_filter_plans(self.filters)
+        params: dict[str, Any] = {
+            **self.params,
+            "filter_slice_start": slice_start,
+            "filter_slice_end": slice_end,
+            "filter_seed_limit": int(limit),
+        }
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = "AND project_version_id = %(project_version_id)s"
+        for plan in plans:
+            params.update(
+                {
+                    key: value
+                    for key, value in plan.params.items()
+                    if f"%({key})s" in plan.seed_predicate
+                }
+            )
+        predicate = " AND ".join(plan.seed_predicate for plan in plans) or "1 = 1"
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="span_seed_time_exclusion",
+            )
+        )
+        params.update(datetime_params)
+        datetime_fragment = (
+            f"\n          AND {datetime_predicate}" if datetime_predicate else ""
+        )
+
+        sampling_fragment = ""
+        if self._bounded_sampling_rate is not None:
+            params["bounded_sampling_salt"] = str(self._bounded_sampling_salt)
+            params["bounded_sampling_rate"] = float(self._bounded_sampling_rate)
+            sampling_fragment = """
+              AND modulo(
+                  cityHash64(
+                      %(bounded_sampling_salt)s,
+                      toString(project_id),
+                      toString(trace_id),
+                      toString(id)
+                  ), 100
+              ) < %(bounded_sampling_rate)s
+            """
+
+        keyset_fragment = ""
+        if before_start_time is not None:
+            if not slice_start <= before_start_time < slice_end:
+                raise ValueError("span keyset must stay inside its slice")
+            if not (
+                isinstance(before_id, tuple)
+                and len(before_id) == 3
+                and all(isinstance(value, str) for value in before_id)
+            ):
+                raise ValueError(
+                    "span keyset identity must be an (id, trace_id, project_id) tuple"
+                )
+            params["filter_before_start_us"] = _unix_microseconds(before_start_time)
+            params["filter_before_id"] = before_id[0]
+            params["filter_before_trace_id"] = before_id[1]
+            params["filter_before_project_id"] = before_id[2]
+            keyset_fragment = """
+              AND (
+                  toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
+                  OR (
+                      toUnixTimestamp64Micro(start_time) = %(filter_before_start_us)s
+                      AND (
+                          id < %(filter_before_id)s
+                          OR (
+                              id = %(filter_before_id)s
+                              AND (
+                                  trace_id < %(filter_before_trace_id)s
+                                  OR (
+                                      trace_id = %(filter_before_trace_id)s
+                                      AND project_id < toUUID(%(filter_before_project_id)s)
+                                  )
+                              )
+                          )
+                      )
+                  )
+              )
+            """
+
+        query = f"""
+        SELECT project_id, id, trace_id, start_time
+        FROM {self.TABLE}
+        PREWHERE {self.project_filter_sql()}
+          AND is_deleted = 0
+          {project_version_fragment}
+          AND start_time >= %(filter_slice_start)s
+          AND start_time < %(filter_slice_end)s
+        WHERE {predicate}{datetime_fragment}
+          {sampling_fragment}
+          {keyset_fragment}
+        ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC
+        LIMIT 1 BY project_id, trace_id, id, start_time
+        LIMIT %(filter_seed_limit)s
+        """
+        return query, params
+
+    def build_filter_match_query(
+        self,
+        candidate_ids: list[str],
+        *,
+        candidate_full_state: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        """Hydrate exact matching spans after resolving every latest version."""
+
+        span_ids = tuple(dict.fromkeys(str(value) for value in candidate_ids if value))
+        return self._build_filter_match_query(
+            span_ids=span_ids,
+            candidate_identities=None,
+            candidate_full_state=candidate_full_state,
+        )
+
+    def build_filter_match_query_from_seed_rows(
+        self,
+        candidate_rows: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Classify only the trace-scoped span identities returned by the seed."""
+
+        normalized_rows: list[dict[str, Any]] = []
+        for row in candidate_rows:
+            if row.get("project_id"):
+                normalized_rows.append(row)
+            elif self.project_id:
+                # Compatibility for single-project executors/tests that project
+                # the pre-hardening seed shape. Org-scoped reads must carry the
+                # project explicitly and therefore cannot take this fallback.
+                normalized_rows.append({**row, "project_id": self.project_id})
+
+        identities: tuple[tuple[str, str, str, Any], ...] = tuple(
+            dict.fromkeys(
+                self.bounded_filter_row_identity(row)
+                for row in normalized_rows
+                if row.get("project_id") and row.get("id") and row.get("trace_id")
+            )
+        )
+        span_ids = tuple(dict.fromkeys(identity[2] for identity in identities))
+        return self._build_filter_match_query(
+            span_ids=span_ids,
+            candidate_identities=identities,
+            candidate_full_state=False,
+        )
+
+    def _build_filter_match_query(
+        self,
+        *,
+        span_ids: tuple[str, ...],
+        candidate_identities: tuple[tuple[str, str, str, Any], ...] | None,
+        candidate_full_state: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        """Resolve candidates by full physical span identity and latest state."""
+
+        if not span_ids:
+            return "", {}
+        candidate_count = len(candidate_identities or span_ids)
+        if candidate_count > 200:
+            raise ValueError("candidate span batch exceeds bounded limit")
+        if not self.supports_bounded_filter_scan():
+            raise ValueError("unsupported bounded span filter scan")
+
+        request_start, request_end = self.parse_time_range(self.filters)
+        self.params.update({"start_date": request_start, "end_date": request_end})
+        has_explicit_time_filter = any(
+            (item.get("column_id") or item.get("columnId"))
+            in {"created_at", "start_time"}
+            for item in self.filters
+        )
+        scope_to_request_window = not candidate_full_state or has_explicit_time_filter
+        plans, residual_filters = partition_span_filter_plans(self.filters)
+        params: dict[str, Any] = {
+            **self.params,
+            "candidate_span_ids": span_ids,
+        }
+        if scope_to_request_window:
+            params.update(
+                {
+                    "candidate_start_date": request_start,
+                    "candidate_end_date": request_end,
+                }
+            )
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = "AND project_version_id = %(project_version_id)s"
+        candidate_scope_fragment = ""
+        candidate_entities_param = None
+        if candidate_identities is not None:
+            params["candidate_span_trace_ids"] = tuple(
+                dict.fromkeys(identity[1] for identity in candidate_identities)
+            )
+            params["candidate_span_project_ids"] = tuple(
+                dict.fromkeys(identity[0] for identity in candidate_identities)
+            )
+            params["candidate_span_dates"] = tuple(
+                dict.fromkeys(identity[3].date() for identity in candidate_identities)
+            )
+            params["candidate_span_identities"] = tuple(
+                (
+                    identity[0],
+                    identity[1],
+                    identity[2],
+                    _unix_microseconds(identity[3]),
+                )
+                for identity in candidate_identities
+            )
+            params["candidate_span_entities"] = tuple(
+                dict.fromkeys(
+                    (identity[1], identity[2]) for identity in candidate_identities
+                )
+            )
+            candidate_entities_param = "candidate_span_entities"
+            candidate_scope_fragment = """
+                  AND trace_id IN %(candidate_span_trace_ids)s
+                  AND project_id IN %(candidate_span_project_ids)s
+                WHERE toDate(start_time) IN %(candidate_span_dates)s
+                  AND (
+                      toString(project_id), trace_id, id,
+                      toUnixTimestamp64Micro(start_time)
+                  )
+                      IN %(candidate_span_identities)s
+            """
+        for plan in plans:
+            params.update(plan.params)
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="latest_start_time",
+                param_prefix="span_match_time_exclusion",
+            )
+        )
+        params.update(datetime_params)
+        datetime_fragment = (
+            f"\n              AND {datetime_predicate}" if datetime_predicate else ""
+        )
+        aggregates = [aggregate for plan in plans for aggregate in plan.aggregates]
+        aggregate_fragment = (
+            ",\n                " + ",\n                ".join(aggregates)
+            if aggregates
+            else ""
+        )
+        predicate = " AND ".join(plan.predicate for plan in plans) or "1 = 1"
+
+        residual_predicate = "1 = 1"
+        if residual_filters:
+            residual_builder = self._FILTER_BUILDER_CLS(
+                table=self.TABLE,
+                query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_SPAN,
+                annotation_label_ids=self.annotation_label_ids,
+                project_id=self.project_id,
+                project_ids=self.project_ids,
+                score_date_scope=scope_to_request_window,
+                span_date_scope=scope_to_request_window,
+                candidate_ids_param="candidate_span_ids",
+                candidate_entities_param=candidate_entities_param,
+            )
+            residual_predicate, residual_params = residual_builder.translate(
+                residual_filters
+            )
+            params.update(residual_params)
+            residual_predicate = residual_predicate or "1 = 1"
+
+        if self._bounded_identity_only:
+            select_fragment = (
+                "grouped_project_id AS project_id, grouped_id AS id, "
+                "latest_trace_id AS trace_id, "
+                "latest_start_time AS start_time"
+            )
+            hydrate_aggregate_fragment = ",\n                argMax(trace_id, _peerdb_version) AS latest_trace_id"
+        else:
+            select_fragment = """grouped_project_id AS project_id,
+            grouped_id AS id,
+            latest_trace_id AS trace_id,
+            latest_name AS name,
+            latest_observation_type AS observation_type,
+            latest_status AS status,
+            latest_start_time AS start_time,
+            latest_end_time AS end_time,
+            latest_latency_ms AS latency_ms,
+            latest_cost AS cost,
+            latest_total_tokens AS total_tokens,
+            latest_prompt_tokens AS prompt_tokens,
+            latest_completion_tokens AS completion_tokens,
+            latest_model AS model,
+            latest_provider AS provider,
+            latest_end_user_id AS end_user_id,
+            latest_created_at AS created_at"""
+            hydrate_aggregate_fragment = """,
+                argMax(trace_id, _peerdb_version) AS latest_trace_id,
+                argMax(name, _peerdb_version) AS latest_name,
+                argMax(observation_type, _peerdb_version)
+                    AS latest_observation_type,
+                argMax(tuple(status), _peerdb_version).1 AS latest_status,
+                argMax(tuple(end_time), _peerdb_version).1 AS latest_end_time,
+                argMax(tuple(latency_ms), _peerdb_version).1 AS latest_latency_ms,
+                argMax(tuple(cost), _peerdb_version).1 AS latest_cost,
+                argMax(tuple(total_tokens), _peerdb_version).1
+                    AS latest_total_tokens,
+                argMax(tuple(prompt_tokens), _peerdb_version).1
+                    AS latest_prompt_tokens,
+                argMax(tuple(completion_tokens), _peerdb_version).1
+                    AS latest_completion_tokens,
+                argMax(tuple(model), _peerdb_version).1 AS latest_model,
+                argMax(tuple(provider), _peerdb_version).1 AS latest_provider,
+                argMax(tuple(end_user_id), _peerdb_version).1 AS latest_end_user_id,
+                argMax(created_at, _peerdb_version) AS latest_created_at"""
+
+        latest_time_fragment = (
+            "\n              AND latest_start_time >= %(candidate_start_date)s"
+            "\n              AND latest_start_time < %(candidate_end_date)s"
+            if scope_to_request_window
+            else ""
+        )
+        query = f"""
+        SELECT *
+        FROM (
+            SELECT
+                {select_fragment}
+            FROM (
+                SELECT
+                    project_id AS grouped_project_id,
+                    id AS grouped_id,
+                    argMax(start_time, _peerdb_version) AS latest_start_time,
+                    argMax(is_deleted, _peerdb_version) AS latest_is_deleted
+                    {hydrate_aggregate_fragment}
+                    {aggregate_fragment}
+                FROM {self.TABLE}
+                PREWHERE {self.project_filter_sql()}
+                  {project_version_fragment}
+                  AND id IN %(candidate_span_ids)s
+                  {candidate_scope_fragment}
+                GROUP BY project_id, trace_id, id, start_time
+            )
+            WHERE latest_is_deleted = 0{latest_time_fragment}{datetime_fragment}
+              AND {predicate}
+        ) AS latest_candidates
+        WHERE {residual_predicate}
+        ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC
+        LIMIT {candidate_count}
+        """
+        return query, params
 
     # ------------------------------------------------------------------
     # Phase 1: Paginated span list
@@ -102,8 +643,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 slice that yields the full prefix IS the global prefix and the
                 caller can stop without scanning the whole window. The regular
                 ``start_date``/``end_date`` params are left untouched so
-                ``build_count_query()`` still counts the full window.
+            ``build_count_query()`` still counts the full window.
         """
+        if error_code := self.bounded_filter_degraded_error_code():
+            raise ValueError(f"unsafe legacy filtered span read blocked: {error_code}")
         start_date, end_date = self.parse_time_range(self.filters)
         self.params["start_date"] = start_date
         self.params["end_date"] = end_date
@@ -117,6 +660,14 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         )
         extra_where, extra_params = fb.translate(self.filters)
         self.params.update(extra_params)
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="span_list_time_exclusion",
+            )
+        )
+        self.params.update(datetime_params)
 
         order_clause = fb.translate_sort(
             self.sort_params, field_map=self.SORT_FIELD_MAP
@@ -128,7 +679,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             # must be ONE stable global order — without the tiebreak a row can
             # appear on two pages or be skipped. Deterministic order also makes
             # the progressive-slice prefix (see `since`) reproducible.
-            order_clause = "ORDER BY start_time DESC, id DESC"
+            order_clause = (
+                "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC"
+            )
 
         slice_fragment = ""
         if since is not None:
@@ -147,6 +700,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         self.params["limit"] = offset + 2 * self.page_size
 
         filter_fragment = f"AND {extra_where}" if extra_where else ""
+        datetime_fragment = (
+            f"\n          AND {datetime_predicate}" if datetime_predicate else ""
+        )
 
         end_user_fragment = ""
         if self.end_user_id:
@@ -180,6 +736,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             resolved_eu = resolved_id_expr("rs.end_user_id")
             inner_scan = f"""
             SELECT
+                project_id,
                 id,
                 trace_id,
                 name,
@@ -207,6 +764,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             """
             query = f"""
             SELECT
+                project_id,
                 id,
                 trace_id,
                 name,
@@ -250,6 +808,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         # project_where) still excludes soft-deleted rows.
         query = f"""
         SELECT
+            project_id,
             id,
             trace_id,
             name,
@@ -270,7 +829,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         {self.project_where()}
           AND created_at >= %(start_date)s - INTERVAL 1 DAY
           AND start_time >= %(start_date)s
-          AND start_time < %(end_date)s
+          AND start_time < %(end_date)s{datetime_fragment}
           {slice_fragment}
           {end_user_fragment}
           {pv_fragment}
@@ -325,7 +884,18 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         )
         extra_where, extra_params = fb.translate(self.filters)
         self.params.update(extra_params)
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="span_id_time_exclusion",
+            )
+        )
+        self.params.update(datetime_params)
         filter_fragment = f"AND {extra_where}" if extra_where else ""
+        datetime_fragment = (
+            f"\n          AND {datetime_predicate}" if datetime_predicate else ""
+        )
 
         pv_fragment = ""
         if self.project_version_id:
@@ -343,7 +913,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         SELECT id
         FROM {self.TABLE}
         {self.project_where()}
-          {time_where}
+          {time_where}{datetime_fragment}
           {pv_fragment}
           {filter_fragment}
         {order_fragment}
@@ -352,25 +922,76 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         """
         return query, self.params
 
-    def build_content_query(self, span_ids: list) -> tuple[str, dict[str, Any]]:
-        """Fetch input/output + typed attr maps for a page of span IDs."""
-        if not span_ids:
+    def build_content_query(
+        self,
+        span_ids: list[str],
+        *,
+        span_identities: list[tuple[str, str, str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Fetch latest content for exact physical spans on the returned page."""
+        identities = self._normalize_span_identities(span_identities)
+        if identities is not None:
+            span_ids = list(dict.fromkeys(span_id for _, _, span_id, _ in identities))
+        if not span_ids or identities == ():
             return "", {}
         if "start_date" not in self.params or "end_date" not in self.params:
             start_date, end_date = self.parse_time_range(self.filters)
             self.params["start_date"] = start_date
             self.params["end_date"] = end_date
         params = {**self.params, "content_span_ids": tuple(span_ids)}
+        trace_prewhere = ""
+        project_prewhere = ""
+        entity_where = ""
+        if identities is not None:
+            params["content_trace_ids"] = tuple(
+                dict.fromkeys(trace_id for _, trace_id, _, _ in identities)
+            )
+            params["content_project_ids"] = tuple(
+                dict.fromkeys(project_id for project_id, _, _, _ in identities)
+            )
+            params["content_span_dates"] = tuple(
+                dict.fromkeys(start_time.date() for _, _, _, start_time in identities)
+            )
+            params["content_span_identities"] = tuple(
+                (
+                    project_id,
+                    trace_id,
+                    span_id,
+                    _unix_microseconds(start_time),
+                )
+                for project_id, trace_id, span_id, start_time in identities
+            )
+            trace_prewhere = "AND trace_id IN %(content_trace_ids)s"
+            project_prewhere = "AND project_id IN %(content_project_ids)s"
+            entity_where = (
+                "AND toDate(start_time) IN %(content_span_dates)s "
+                "AND (toString(project_id), trace_id, id, "
+                "toUnixTimestamp64Micro(start_time)) "
+                "IN %(content_span_identities)s"
+            )
         query = f"""
-        SELECT id, input, output, attributes_extra,
-               span_attr_str AS attrs_string,
-               span_attr_num AS attrs_number,
-               span_attr_bool AS attrs_bool
-        FROM {self.TABLE}
-        PREWHERE id IN %(content_span_ids)s
-        WHERE {self.project_filter_sql()} AND is_deleted = 0
-          AND start_time >= %(start_date)s - INTERVAL 1 DAY
-          AND start_time < %(end_date)s + INTERVAL 1 DAY
+        SELECT project_id, trace_id, id, start_time, input, output,
+               attributes_extra,
+               attrs_string, attrs_number, attrs_bool
+        FROM (
+            SELECT project_id, trace_id, id, start_time, input, output,
+                   attributes_extra,
+                   span_attr_str AS attrs_string,
+                   span_attr_num AS attrs_number,
+                   span_attr_bool AS attrs_bool,
+                   _peerdb_is_deleted AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE id IN %(content_span_ids)s
+              {trace_prewhere}
+              {project_prewhere}
+            WHERE {self.project_filter_sql()}
+              {entity_where}
+              AND start_time >= %(start_date)s - INTERVAL 1 DAY
+              AND start_time < %(end_date)s + INTERVAL 1 DAY
+            ORDER BY _peerdb_version DESC
+            LIMIT 1 BY project_id, trace_id, id, start_time
+        )
+        WHERE latest_is_deleted = 0
         """
         return query, params
 
@@ -386,6 +1007,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         counted once extra, which is immaterial and self-heals on the next merge
         (and matches the list, which no longer de-dups via ``LIMIT 1 BY id``).
         """
+        if error_code := self.bounded_filter_degraded_error_code():
+            raise ValueError(f"unsafe legacy filtered span count blocked: {error_code}")
         fb = self._FILTER_BUILDER_CLS(
             table=self.TABLE,
             query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_SPAN,
@@ -396,8 +1019,24 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         extra_where, extra_params = fb.translate(self.filters)
         params = dict(self.params)
         params.update(extra_params)
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="span_count_time_exclusion",
+            )
+        )
+        params.update(datetime_params)
 
         filter_fragment = f"AND {extra_where}" if extra_where else ""
+        datetime_fragment = (
+            f"\n                      AND {datetime_predicate}"
+            if datetime_predicate
+            else ""
+        )
+        datetime_outer_fragment = (
+            f"\n          AND {datetime_predicate}" if datetime_predicate else ""
+        )
 
         end_user_fragment = ""
         if self.end_user_id:
@@ -428,7 +1067,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                     {self.project_where()}
                       AND created_at >= %(start_date)s - INTERVAL 1 DAY
                       AND start_time >= %(start_date)s
-                      AND start_time < %(end_date)s
+                      AND start_time < %(end_date)s{datetime_fragment}
                       {pv_fragment}
                       {filter_fragment}
                 ) AS rs
@@ -444,7 +1083,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         {self.project_where()}
           AND created_at >= %(start_date)s - INTERVAL 1 DAY
           AND start_time >= %(start_date)s
-          AND start_time < %(end_date)s
+          AND start_time < %(end_date)s{datetime_outer_fragment}
           {end_user_fragment}
           {pv_fragment}
           {filter_fragment}
@@ -459,6 +1098,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         self,
         span_ids: list[str],
         created_after: Any = None,
+        *,
+        span_entities: list[tuple[str, str]] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Build the Phase-2 eval-scores query for a page of span IDs.
 
@@ -471,7 +1112,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 (minus a 7-day safety margin) prunes to the relevant partitions
                 — measured 55x fewer rows read at 10M eval rows.
         """
-        if not span_ids or not self.eval_config_ids:
+        entities = self._normalize_span_entities(span_entities)
+        if entities is not None:
+            span_ids = list(dict.fromkeys(span_id for _, span_id in entities))
+        if not span_ids or not self.eval_config_ids or entities == ():
             return "", {}
 
         params: dict[str, Any] = {
@@ -485,14 +1129,38 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 "AND created_at >= %(evals_created_after)s - INTERVAL 7 DAY"
             )
 
-        eval_table, eval_not_deleted = eval_logger_source(
-            include_cdc_tombstone_guard=True
+        trace_select = ""
+        trace_inner_select = ""
+        trace_group = ""
+        entity_fragment = ""
+        if entities is not None:
+            params["eval_trace_ids"] = tuple(
+                dict.fromkeys(trace_id for trace_id, _ in entities)
+            )
+            params["eval_span_entities"] = entities
+            trace_select = "toString(trace_id) AS trace_id,"
+            trace_inner_select = "trace_id,"
+            trace_group = "trace_id,"
+            entity_fragment = """
+              AND NOT isNull(trace_id)
+              AND toString(trace_id) IN %(eval_trace_ids)s
+              AND (toString(trace_id), observation_span_id) IN %(eval_span_entities)s
+            """
+
+        eval_table, _ = eval_logger_source(include_cdc_tombstone_guard=True)
+        eval_version_col = eval_logger_version_column(eval_table)
+        live_columns = eval_logger_live_state_columns(eval_table)
+        live_projection = ",\n                ".join(
+            f"{column} AS latest_state_{index}"
+            for index, column in enumerate(live_columns)
         )
-        # ReplacingMergeTree version column: v2 uses `_version`, the legacy CDC
-        # mirror uses `_peerdb_version`. Used to keep the newest row per eval id
-        # when de-duplicating without FINAL (see the FROM clause below).
-        eval_version_col = (
-            "_version" if eval_table.endswith("_v2") else "_peerdb_version"
+        live_predicate = " AND ".join(
+            (
+                f"latest_state_{index} = 0"
+                if column != "deleted"
+                else f"(latest_state_{index} = 0 OR latest_state_{index} IS NULL)"
+            )
+            for index, column in enumerate(live_columns)
         )
 
         # Aggregates are computed only over *completed*, non-errored rows so a
@@ -515,6 +1183,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         # the comparison NULL-safe.
         query = f"""
         SELECT
+            {trace_select}
             observation_span_id,
             toString(custom_eval_config_id) AS eval_config_id,
             -- ifNotFinite(, NULL): avgIf over an all-NULL group returns NaN, which
@@ -542,21 +1211,12 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 output_str_list,
                 error = 0 AND ifNull(output_str, '') != 'ERROR' AND status NOT IN ('pending', 'running', 'skipped', 'errored')
             ) AS str_lists
-        -- PERF: no table-level FINAL. FINAL forces a merge across the WHOLE eval
-        -- table before the WHERE is applied, so a page of ~50 span ids dragged a
-        -- merge over tens of millions of rows — GBs of memory that OOM-crashed
-        -- the server. Instead we de-dup only the tiny page-scoped slice: the
-        -- inner scan is pruned to the page's span ids (idx_observation_span_id
-        -- bloom) + the config ids, then ORDER BY the version col DESC + LIMIT 1
-        -- BY id keeps the newest version of each eval row — verified identical
-        -- to FINAL for live rows (status transitions collapse to the newest
-        -- version), at O(rows-for-this-page) cost. One accepted divergence:
-        -- the not-deleted WHERE runs BEFORE dedup, so an eval whose newest
-        -- un-merged version is a soft-delete marker transiently surfaces its
-        -- previous version until the next merge collapses the parts (FINAL
-        -- merged first and hid it immediately).
+        -- Candidate-scoped latest replay. Live/tombstone predicates are
+        -- intentionally outside LIMIT 1 BY id so a newest deletion marker
+        -- cannot resurrect an older score.
         FROM (
             SELECT
+                {trace_inner_select}
                 observation_span_id,
                 custom_eval_config_id,
                 output_float,
@@ -565,16 +1225,18 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 output_str_list,
                 error,
                 status,
-                skipped_reason
+                skipped_reason,
+                {live_projection}
             FROM {eval_table}
-            WHERE {eval_not_deleted}
-              AND observation_span_id IN %(span_ids)s
+            WHERE observation_span_id IN %(span_ids)s
+              {entity_fragment}
               AND custom_eval_config_id IN %(eval_config_ids)s
               {created_fragment}
             ORDER BY {eval_version_col} DESC
             LIMIT 1 BY id
         )
-        GROUP BY observation_span_id, custom_eval_config_id
+        WHERE {live_predicate}
+        GROUP BY {trace_group}observation_span_id, custom_eval_config_id
         SETTINGS max_bytes_before_external_group_by = 1073741824, max_bytes_before_external_sort = 1073741824
         """
         return query, params
@@ -587,6 +1249,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         self,
         span_ids: list[str],
         created_after: Any = None,
+        *,
+        span_entities: list[tuple[str, str]] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Build the Phase-3 annotation query for a page of span IDs.
 
@@ -596,7 +1260,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 ``PARTITION BY toYYYYMM(created_at)``; a score row cannot
                 pre-date its span row).
         """
-        if not span_ids or not self.annotation_label_ids:
+        entities = self._normalize_span_entities(span_entities)
+        if entities is not None:
+            span_ids = list(dict.fromkeys(span_id for _, span_id in entities))
+        if not span_ids or not self.annotation_label_ids or entities == ():
             return "", {}
 
         params: dict[str, Any] = {
@@ -610,28 +1277,47 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 "AND created_at >= %(anns_created_after)s - INTERVAL 7 DAY"
             )
 
-        # PERF: no table-level FINAL (same OOM risk as the eval phase — FINAL
-        # merges the whole model_hub_score table before the page filter). De-dup
-        # only the page-scoped slice: prune to the page's span ids + labels, keep
-        # the newest version per score id via `ORDER BY _peerdb_version DESC
-        # LIMIT 1 BY id`, then `anyLast(value)` per (span, label).
+        trace_select = ""
+        trace_inner_select = ""
+        trace_group = ""
+        entity_fragment = ""
+        if entities is not None:
+            params["annotation_trace_ids"] = tuple(
+                dict.fromkeys(trace_id for trace_id, _ in entities)
+            )
+            params["annotation_span_entities"] = entities
+            trace_select = "toString(trace_id) AS trace_id,"
+            trace_inner_select = "trace_id,"
+            trace_group = "trace_id,"
+            entity_fragment = """
+              AND NOT isNull(trace_id)
+              AND toString(trace_id) IN %(annotation_trace_ids)s
+              AND (toString(trace_id), observation_span_id) IN %(annotation_span_entities)s
+            """
+
+        # Candidate-scoped latest replay. Deletion predicates remain outside
+        # LIMIT 1 BY id so an unmerged tombstone cannot resurrect an old score.
         query = f"""
         SELECT
+            {trace_select}
             observation_span_id,
             toString(label_id) AS label_id,
             anyLast(value) AS value
         FROM (
-            SELECT observation_span_id, label_id, value
+            SELECT {trace_inner_select} observation_span_id, label_id, value,
+                   _peerdb_is_deleted AS latest_cdc_deleted,
+                   deleted AS latest_soft_deleted
             FROM {self.ANNOTATION_TABLE}
-            WHERE _peerdb_is_deleted = 0
-              AND deleted = false
-              AND observation_span_id IN %(span_ids)s
+            WHERE observation_span_id IN %(span_ids)s
+              {entity_fragment}
               AND label_id IN %(label_ids)s
               {created_fragment}
             ORDER BY _peerdb_version DESC
             LIMIT 1 BY id
         )
-        GROUP BY observation_span_id, label_id
+        WHERE latest_cdc_deleted = 0
+          AND latest_soft_deleted = false
+        GROUP BY {trace_group}observation_span_id, label_id
         """
         return query, params
 
@@ -642,7 +1328,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     @staticmethod
     def pivot_eval_results(
         eval_rows: list[dict],
-    ) -> dict[str, dict[str, Any]]:
+        *,
+        key_by_trace: bool = False,
+    ) -> dict[Any, dict[str, Any]]:
         """Pivot eval query results into a nested dict keyed by span_id.
 
         Returns:
@@ -656,9 +1344,15 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         """
         import json as _json
 
-        result: dict[str, dict[str, Any]] = {}
+        result: dict[Any, dict[str, Any]] = {}
         for row in eval_rows:
             span_id = str(row.get("observation_span_id", ""))
+            trace_id = str(row.get("trace_id") or "")
+            if key_by_trace and (not trace_id or not span_id):
+                # A bare OTel span ID cannot prove ownership. Exact-identity
+                # callers intentionally exclude legacy rows lacking trace_id.
+                continue
+            span_key: Any = (trace_id, span_id) if key_by_trace else span_id
             config_id = str(row.get("eval_config_id", ""))
             avg_score = row.get("avg_score")
             pass_rate = row.get("pass_rate")
@@ -669,7 +1363,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             # All rows errored — surface an explicit error marker so the
             # UI can render an error state (distinct from "no eval run").
             if success_count == 0 and error_count > 0:
-                result.setdefault(span_id, {})[config_id] = {"error": True}
+                result.setdefault(span_key, {})[config_id] = {"error": True}
                 continue
 
             # CHOICES eval: compute per-choice percentage across all
@@ -701,7 +1395,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                     for choice in set(lst):
                         counts[choice] = counts.get(choice, 0) + 1
                 per_choice = {k: round(100.0 * v / total, 2) for k, v in counts.items()}
-                result.setdefault(span_id, {})[config_id] = per_choice
+                result.setdefault(span_key, {})[config_id] = per_choice
                 continue
 
             # Determine the score value matching PG format
@@ -716,11 +1410,11 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             # marker (skipped > running > pending) so the cell renders a
             # loading/pending/skipped state instead of a misleading blank.
             if score is None:
-                result.setdefault(span_id, {})[config_id] = non_terminal_eval_marker(
+                result.setdefault(span_key, {})[config_id] = non_terminal_eval_marker(
                     row
                 )
             else:
-                result.setdefault(span_id, {})[config_id] = score
+                result.setdefault(span_key, {})[config_id] = score
 
         return result
 
@@ -728,7 +1422,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     def pivot_annotation_results(
         annotation_rows: list[dict],
         label_types: dict[str, str] | None = None,
-    ) -> dict[str, dict[str, Any]]:
+        *,
+        key_by_trace: bool = False,
+    ) -> dict[Any, dict[str, Any]]:
         """Pivot annotation query results into a nested dict keyed by span_id.
 
         Args:
@@ -742,9 +1438,13 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         import json
 
         label_types = label_types or {}
-        result: dict[str, dict[str, Any]] = {}
+        result: dict[Any, dict[str, Any]] = {}
         for row in annotation_rows:
             span_id = str(row.get("observation_span_id", ""))
+            trace_id = str(row.get("trace_id") or "")
+            if key_by_trace and (not trace_id or not span_id):
+                continue
+            span_key: Any = (trace_id, span_id) if key_by_trace else span_id
             label_id = str(row.get("label_id", ""))
             label_type = label_types.get(label_id, "").lower()
 
@@ -770,6 +1470,6 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             else:
                 value = val
 
-            result.setdefault(span_id, {})[label_id] = value
+            result.setdefault(span_key, {})[label_id] = value
 
         return result

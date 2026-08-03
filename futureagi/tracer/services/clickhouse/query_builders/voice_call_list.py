@@ -7,7 +7,7 @@ multi-phase ClickHouse query strategy:
 Phase 1 -- Paginated root conversation spans from the denormalized ``spans``
 table (``WHERE parent_span_id IS NULL AND observation_type = 'conversation'``).
 
-Phase 2 -- Eval scores from ``tracer_eval_logger FINAL`` for those trace IDs.
+Phase 2 -- Candidate-scoped latest eval scores for those trace IDs.
 
 Phase 3 -- Annotations from ``model_hub_score FINAL`` for those trace IDs.
 
@@ -17,11 +17,13 @@ The result sets are merged in Python, with raw_log processing delegated to
 the existing ``ObservabilityService.process_raw_logs()``.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
+from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
 
 # Hardcoded simulator phone numbers (must match FilterEngine)
 VAPI_PHONE_NUMBERS = [
@@ -43,6 +45,31 @@ VAPI_PHONE_NUMBERS = [
 ]
 
 
+def _unix_microseconds(value: datetime) -> int:
+    """Encode a DateTime64(6) identity without driver precision loss."""
+
+    utc_value = (
+        value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    )
+    delta = utc_value - datetime(1970, 1, 1, tzinfo=UTC)
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+
+
+_VOICE_ROOT_FILTER = {
+    "column_id": "observation_type",
+    "filter_config": {
+        "col_type": "INTERNAL_ROOT_METRIC",
+        "filter_type": "text",
+        "filter_op": "equals",
+        "filter_value": "conversation",
+    },
+    # The latest-state compiler deliberately requires an unforgeable internal
+    # marker before treating observation_type as a root-only trace predicate.
+    # Voice calls use the same invariant as eval-task trace selection.
+    "_eval_task_trace_root": True,
+}
+
+
 class VoiceCallListQueryBuilder(BaseQueryBuilder):
     """Build queries for the paginated voice call list view.
 
@@ -58,6 +85,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
     TABLE = "spans"
     EVAL_TABLE = "tracer_eval_logger"
     ANNOTATION_TABLE = "model_hub_score"
+    _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
 
     def __init__(
         self,
@@ -77,6 +105,207 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         self.eval_config_ids = eval_config_ids or []
         self.remove_simulation_calls = remove_simulation_calls
         self.annotation_label_ids = annotation_label_ids or []
+        # ``parse_time_range([])`` derives its default end from ``utcnow``.
+        # The bounded selector asks for the request range and then delegates
+        # each seed/classifier query; recomputing that implicit range would
+        # move it forward by microseconds and reject the selector's exact
+        # slice. Pin one request window for the lifetime of this builder.
+        self._bounded_request_window = BaseQueryBuilder.parse_time_range(self.filters)
+
+    def parse_time_range(
+        self, filters: list[dict]
+    ) -> tuple[datetime | None, datetime | None]:
+        if filters is self.filters or filters == self.filters:
+            return self._bounded_request_window
+        return BaseQueryBuilder.parse_time_range(filters)
+
+    # ------------------------------------------------------------------
+    # Bounded latest-state page selection
+    # ------------------------------------------------------------------
+
+    def _bounded_delegate(
+        self, *, candidate_full_state: bool = False
+    ) -> TraceListQueryBuilder:
+        """Build the trace selector used by every voice-list page.
+
+        A voice call is a trace whose canonical live root is a conversation
+        span. Reusing the trace selector keeps text/Map/JSON/eval/annotation
+        filter semantics identical to the trace list while adding that root
+        invariant as an internal predicate. The delegate emits legacy column
+        tokens intentionally; ``VoiceCallListQueryBuilderV2`` rewrites the
+        returned statement exactly once at its normal builder boundary.
+        """
+
+        request_start, request_end = self._bounded_request_window
+        if candidate_full_state:
+            # Continuous arrival/change seeding is separate from membership.
+            # Retain explicit user time filters, but do not synthesize the
+            # delegate's implicit default request window.
+            delegate_filters = list(self.filters)
+        else:
+            delegate_filters = [
+                filter_item
+                for filter_item in self.filters
+                if (filter_item.get("column_id") or filter_item.get("columnId"))
+                not in {"created_at", "start_time"}
+            ]
+            delegate_filters.append(
+                {
+                    "column_id": "start_time",
+                    "filter_config": {
+                        "filter_type": "datetime",
+                        "filter_op": "between",
+                        "filter_value": [request_start, request_end],
+                    },
+                }
+            )
+        delegate = TraceListQueryBuilder(
+            project_id=self.project_id,
+            project_ids=self.project_ids,
+            page_number=self.page_number,
+            page_size=self.page_size,
+            filters=[*delegate_filters, _VOICE_ROOT_FILTER],
+            eval_config_ids=self.eval_config_ids,
+            annotation_label_ids=self.annotation_label_ids,
+            bounded_internal_scan=True,
+        )
+        delegate.TABLE = self.TABLE
+        # Residual end-user/eval/annotation filters must use the same schema
+        # compiler as this builder (v1 locally, v2 after dispatch).
+        delegate._FILTER_BUILDER_CLS = self._FILTER_BUILDER_CLS
+        return delegate
+
+    def supports_bounded_filter_scan(self) -> bool:
+        """Voice pages always use finite latest-state selection."""
+
+        return self._bounded_delegate().supports_bounded_filter_scan()
+
+    def bounded_filter_degraded_error_code(self) -> str | None:
+        return self._bounded_delegate().bounded_filter_degraded_error_code()
+
+    def filter_seed_proves_result_order(self) -> bool:
+        return self._bounded_delegate().filter_seed_proves_result_order()
+
+    @staticmethod
+    def recommended_filter_classify_batch_size() -> int:
+        return 50
+
+    def build_filter_seed_page(self, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return self._bounded_delegate().build_filter_seed_page(**kwargs)
+
+    def build_filter_ordered_seed_page(
+        self, **kwargs: Any
+    ) -> tuple[str, dict[str, Any]]:
+        return self._bounded_delegate().build_filter_ordered_seed_page(**kwargs)
+
+    def bounded_filter_seed_identity(self, row: dict[str, Any]) -> Any:
+        return self._bounded_delegate().bounded_filter_seed_identity(row)
+
+    def bounded_filter_seed_order_token(self, row: dict[str, Any]) -> Any:
+        return self._bounded_delegate().bounded_filter_seed_order_token(row)
+
+    def build_filter_match_query(
+        self,
+        candidate_ids: list[str],
+        *,
+        candidate_full_state: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        query, params = self._bounded_delegate(
+            candidate_full_state=candidate_full_state
+        ).build_filter_match_query(
+            candidate_ids,
+            candidate_full_state=candidate_full_state,
+        )
+        if not query or not self.remove_simulation_calls:
+            return query, params
+
+        # Simulator exclusion used to happen after pagination in Python. That
+        # returned short/incorrect pages whenever a simulator occupied a page
+        # slot. Keep the expensive raw-log JSON work candidate-scoped: at most
+        # the 50 trace IDs in this classifier batch are inspected, and every
+        # physical root is reduced to its latest version before the predicate.
+        params = {**params, "simulator_phone_numbers": tuple(VAPI_PHONE_NUMBERS)}
+        simulator_phone = """
+            coalesce(
+                nullIf(JSONExtractString(
+                    latest_span_attributes_raw, 'raw_log', 'customer', 'number'
+                ), ''),
+                nullIf(JSONExtractString(
+                    JSONExtractString(latest_span_attributes_raw, 'raw_log'),
+                    'customer', 'number'
+                ), ''),
+                nullIf(JSONExtractString(
+                    latest_span_attr_str['raw_log'], 'customer', 'number'
+                ), '')
+            )
+        """
+        retell_phone = """
+            coalesce(
+                nullIf(JSONExtractString(
+                    latest_span_attributes_raw, 'raw_log', 'from_number'
+                ), ''),
+                nullIf(JSONExtractString(
+                    JSONExtractString(latest_span_attributes_raw, 'raw_log'),
+                    'from_number'
+                ), ''),
+                nullIf(JSONExtractString(
+                    latest_span_attr_str['raw_log'], 'from_number'
+                ), '')
+            )
+        """
+        simulator_time_scope = (
+            """
+                  AND start_time >= %(candidate_start_date)s
+                  AND start_time < %(candidate_end_date)s
+        """
+            if "candidate_start_date" in params
+            else ""
+        )
+        query = f"""
+        SELECT *
+        FROM ({query}) AS bounded_voice_candidates
+        WHERE trace_id NOT IN (
+            SELECT grouped_trace_id
+            FROM (
+                SELECT
+                    trace_id AS grouped_trace_id,
+                    id AS grouped_id,
+                    start_time AS grouped_start_time,
+                    argMax(tuple(parent_span_id), _peerdb_version).1
+                        AS latest_parent_span_id,
+                    argMax(observation_type, _peerdb_version)
+                        AS latest_observation_type,
+                    argMax(provider, _peerdb_version) AS latest_provider,
+                    argMax(tuple(span_attributes_raw), _peerdb_version).1
+                        AS latest_span_attributes_raw,
+                    argMax(span_attr_str, _peerdb_version)
+                        AS latest_span_attr_str,
+                    argMax(_peerdb_is_deleted, _peerdb_version)
+                        AS latest_is_deleted
+                FROM {self.TABLE}
+                PREWHERE {self.project_filter_sql()}
+                  AND trace_id IN %(candidate_trace_ids)s
+                  {simulator_time_scope}
+                GROUP BY project_id, trace_id, id, start_time
+            ) AS latest_voice_roots
+            WHERE latest_is_deleted = 0
+              AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
+              AND latest_observation_type = 'conversation'
+              AND (
+                    (
+                        lowerUTF8(latest_provider) = 'vapi'
+                        AND ({simulator_phone}) IN %(simulator_phone_numbers)s
+                    )
+                    OR (
+                        lowerUTF8(latest_provider) = 'retell'
+                        AND ({retell_phone}) IN %(simulator_phone_numbers)s
+                    )
+              )
+        )
+        ORDER BY start_time DESC, trace_id DESC
+        LIMIT 50
+        """
+        return query, params
 
     # ------------------------------------------------------------------
     # Phase 1: Paginated root conversation spans
@@ -189,16 +418,117 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         """
         return query, self.params
 
-    def build_content_query(self, span_ids: list[str]) -> tuple[str, dict[str, Any]]:
-        """Fetch heavy attribute columns for a page of voice call span IDs."""
+    def build_content_query(
+        self,
+        span_ids: list[str],
+        *,
+        root_identities: list[tuple[str, str, str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Hydrate only the selected physical roots at their latest state.
+
+        A bare span ID is not globally unique and ``FINAL`` collapses on the
+        table sorting key rather than the application's physical identity.
+        The page selector supplies ``(project, trace, id, start_time)`` tuples;
+        use exact epoch-microsecond tuples plus partition dates, then resolve
+        versions with ``argMax``. ``call_logs`` is removed inside ClickHouse so
+        the list never transfers the ~900 KiB detail-only payload.
+        """
+
         if not span_ids:
             return "", {}
-        params = {**self.params, "content_span_ids": tuple(span_ids)}
+        identities = tuple(
+            dict.fromkeys(
+                (
+                    str(project_id),
+                    str(trace_id),
+                    str(span_id),
+                    _unix_microseconds(start_time),
+                )
+                for project_id, trace_id, span_id, start_time in (root_identities or [])
+                if project_id
+                and trace_id
+                and span_id
+                and isinstance(start_time, datetime)
+            )
+        )
+        if root_identities is not None and len(identities) != len(root_identities):
+            raise ValueError("voice root identities are incomplete")
+        if len(identities) > 200:
+            raise ValueError("voice content batch exceeds bounded limit")
+
+        params = {**self.params, "content_span_ids": tuple(dict.fromkeys(span_ids))}
+        identity_fragment = ""
+        if identities:
+            params["content_root_identities"] = identities
+            params["content_trace_ids"] = tuple(
+                dict.fromkeys(trace_id for _, trace_id, _, _ in identities)
+            )
+            params["content_root_dates"] = tuple(
+                dict.fromkeys(
+                    start_time.date()
+                    for _, _, _, start_time in (root_identities or [])
+                    if isinstance(start_time, datetime)
+                )
+            )
+            identity_fragment = """
+              AND trace_id IN %(content_trace_ids)s
+            WHERE toDate(start_time) IN %(content_root_dates)s
+              AND (
+                  toString(project_id), trace_id, id,
+                  toUnixTimestamp64Micro(start_time)
+              ) IN %(content_root_identities)s
+            """
+
         query = f"""
-        SELECT id AS span_id, span_attributes_raw, span_attr_str, span_attr_num, metadata_map
-        FROM {self.TABLE}
-        PREWHERE id IN %(content_span_ids)s
-        WHERE project_id = %(project_id)s AND is_deleted = 0
+        SELECT
+            toString(grouped_project_id) AS project_id,
+            grouped_trace_id AS trace_id,
+            grouped_id AS span_id,
+            grouped_start_time AS start_time,
+            latest_provider AS provider,
+            concat(
+                '{{',
+                arrayStringConcat(
+                    arrayMap(
+                        kv -> concat('\"', kv.1, '\":', kv.2),
+                        arrayFilter(
+                            kv -> kv.1 != 'call_logs',
+                            JSONExtractKeysAndValuesRaw(
+                                latest_span_attributes_raw
+                            )
+                        )
+                    ),
+                    ','
+                ),
+                '}}'
+            ) AS span_attributes,
+            mapFilter(
+                (k, v) -> k != 'call_logs', latest_span_attr_str
+            ) AS attrs_string,
+            latest_span_attr_num AS attrs_number,
+            latest_span_attr_bool AS attrs_bool
+        FROM (
+            SELECT
+                project_id AS grouped_project_id,
+                trace_id AS grouped_trace_id,
+                id AS grouped_id,
+                start_time AS grouped_start_time,
+                argMax(provider, _peerdb_version) AS latest_provider,
+                argMax(tuple(span_attributes_raw), _peerdb_version).1
+                    AS latest_span_attributes_raw,
+                argMax(span_attr_str, _peerdb_version) AS latest_span_attr_str,
+                argMax(span_attr_num, _peerdb_version) AS latest_span_attr_num,
+                argMax(span_attr_bool, _peerdb_version) AS latest_span_attr_bool,
+                argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE id IN %(content_span_ids)s
+              AND {self.project_filter_sql()}
+              {identity_fragment}
+            GROUP BY project_id, trace_id, id, start_time
+        ) AS latest_voice_content
+        WHERE latest_is_deleted = 0
+        ORDER BY grouped_start_time DESC, grouped_id DESC
+        LIMIT 200
         """
         return query, params
 
@@ -234,10 +564,9 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
     def _build_simulation_filter(self) -> str:
         """Build SQL fragment to exclude simulator calls.
 
-        NOTE: Simulation filtering is done in Python (post-Phase 1b) rather
-        than in SQL, because the phone numbers live inside the heavy
-        ``span_attributes_raw`` JSON blob and scanning it causes ClickHouse
-        OOM.  This method is kept as a no-op to avoid breaking callers.
+        The legacy broad Phase-1 query still keeps this fragment empty. The
+        bounded classifier applies simulator exclusion only to its <=50 trace
+        candidates, and Python retains a final defensive check after hydration.
         """
         return ""
 
@@ -249,7 +578,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
     def is_simulator_call(span_attrs: dict, provider: str) -> bool:
         """Return True if the call comes from a known simulator phone number.
 
-        Called after Phase 1b when span_attributes_raw has been parsed.
+        Called after Phase 1b as a defensive parity check.
         """
         raw_log = span_attrs.get("raw_log") or {}
         if provider == "vapi":
@@ -277,6 +606,24 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
             "eval_config_ids": tuple(self.eval_config_ids),
         }
 
+        table, _ = eval_logger_source()
+        is_v2 = table.endswith("_v2")
+        version = "_version" if is_v2 else "_peerdb_version"
+        status_aggregate = "'completed'" if is_v2 else f"argMax(status, {version})"
+        skipped_reason_aggregate = (
+            "CAST(NULL AS Nullable(String))"
+            if is_v2
+            else f"argMax(tuple(skipped_reason), {version}).1"
+        )
+        deleted_aggregate = (
+            f"argMax(is_deleted, {version})"
+            if is_v2
+            else (
+                f"greatest(argMax(_peerdb_is_deleted, {version}), "
+                f"coalesce(argMax(deleted, {version}), 0))"
+            )
+        )
+
         # Aggregates are computed only over *completed*, non-errored rows so a
         # non-terminal (pending/running) or skipped row never skews a score nor
         # masquerades as a real value. The per-status counts let the shared
@@ -292,39 +639,55 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         # appended after ``str_lists`` so the pivot's positional fallbacks hold.
         query = f"""
         SELECT
-            trace_id,
-            toString(custom_eval_config_id) AS eval_config_id,
+            latest_trace_id AS trace_id,
+            toString(latest_eval_config_id) AS eval_config_id,
             -- ifNotFinite(, NULL): avgIf over an all-NULL group returns NaN,
             -- which json.dumps(allow_nan=False) rejects. NULL serializes as null.
             ifNotFinite(avgIf(
-                output_float,
-                error = 0 AND ifNull(output_str, '') != 'ERROR' AND status NOT IN ('pending', 'running', 'skipped', 'errored')
+                latest_output_float,
+                latest_error = 0 AND ifNull(latest_output_str, '') != 'ERROR' AND latest_status NOT IN ('pending', 'running', 'skipped', 'errored')
             ), NULL) AS avg_score,
             ifNotFinite(avgIf(
-                CASE WHEN output_bool = 1 THEN 100.0 ELSE 0.0 END,
-                error = 0 AND ifNull(output_str, '') != 'ERROR' AND status NOT IN ('pending', 'running', 'skipped', 'errored')
+                CASE WHEN latest_output_bool = 1 THEN 100.0 ELSE 0.0 END,
+                latest_error = 0 AND ifNull(latest_output_str, '') != 'ERROR' AND latest_status NOT IN ('pending', 'running', 'skipped', 'errored')
             ), NULL) AS pass_rate,
             countIf(
-                error = 0 AND ifNull(output_str, '') != 'ERROR' AND status NOT IN ('pending', 'running', 'skipped', 'errored')
+                latest_error = 0 AND ifNull(latest_output_str, '') != 'ERROR' AND latest_status NOT IN ('pending', 'running', 'skipped', 'errored')
             ) AS success_count,
             countIf(
-                error = 1 OR ifNull(output_str, '') = 'ERROR' OR status = 'errored'
+                latest_error = 1 OR ifNull(latest_output_str, '') = 'ERROR' OR latest_status = 'errored'
             ) AS error_count,
             count() AS eval_count,
             groupArrayIf(
-                output_str_list,
-                error = 0 AND ifNull(output_str, '') != 'ERROR' AND status NOT IN ('pending', 'running', 'skipped', 'errored')
+                latest_output_str_list,
+                latest_error = 0 AND ifNull(latest_output_str, '') != 'ERROR' AND latest_status NOT IN ('pending', 'running', 'skipped', 'errored')
             ) AS str_lists,
-            countIf(status = 'skipped') AS skipped_count,
-            countIf(status = 'running') AS running_count,
-            countIf(status = 'pending') AS pending_count,
-            anyIf(skipped_reason, status = 'skipped') AS skipped_reason
-        FROM {self.EVAL_TABLE} FINAL
-        WHERE _peerdb_is_deleted = 0
-          AND (deleted = 0 OR deleted IS NULL)
-          AND trace_id IN %(trace_ids)s
-          AND custom_eval_config_id IN %(eval_config_ids)s
-        GROUP BY trace_id, custom_eval_config_id
+            countIf(latest_status = 'skipped') AS skipped_count,
+            countIf(latest_status = 'running') AS running_count,
+            countIf(latest_status = 'pending') AS pending_count,
+            anyIf(latest_skipped_reason, latest_status = 'skipped') AS skipped_reason
+        FROM (
+            SELECT
+                id AS grouped_eval_id,
+                argMax(trace_id, {version}) AS latest_trace_id,
+                argMax(custom_eval_config_id, {version}) AS latest_eval_config_id,
+                argMax(tuple(output_float), {version}).1 AS latest_output_float,
+                argMax(tuple(output_bool), {version}).1 AS latest_output_bool,
+                argMax(tuple(output_str), {version}).1 AS latest_output_str,
+                argMax(output_str_list, {version}) AS latest_output_str_list,
+                argMax(error, {version}) AS latest_error,
+                {status_aggregate} AS latest_status,
+                {skipped_reason_aggregate} AS latest_skipped_reason,
+                {deleted_aggregate} AS latest_is_deleted
+            FROM {table}
+            PREWHERE trace_id IN %(trace_ids)s
+              AND custom_eval_config_id IN %(eval_config_ids)s
+            GROUP BY id
+        ) AS latest_voice_evals
+        WHERE latest_is_deleted = 0
+        GROUP BY latest_trace_id, latest_eval_config_id
+        ORDER BY latest_trace_id ASC, latest_eval_config_id ASC
+        LIMIT 5001
         """
         return query, params
 

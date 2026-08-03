@@ -122,7 +122,7 @@ class TestCHMetricFilters:
 
     def test_errors_filter_generates_status_condition(self):
         where, params = self._builder().translate([_errors_filter()])
-        assert "lower(status)" in where
+        assert "lowerUTF8(toString(status))" in where
         assert "error" in params.values()
 
     # --- combinations ---
@@ -227,7 +227,7 @@ class TestCHMetricFilters:
     def test_has_eval_true_excludes_null_trace_ids(self):
         """has_eval subquery should exclude NULL trace_ids."""
         where, _ = self._builder().translate([_has_eval_filter(True)])
-        assert "trace_id IS NOT NULL" in where
+        assert "NOT isNull(eval_scan.trace_id)" in where
 
     # --- Type safety (String vs UUID) ---
 
@@ -246,7 +246,7 @@ class TestCHMetricFilters:
         """Subquery must use toString(trace_id) because spans.trace_id is String
         but tracer_eval_logger.trace_id is UUID."""
         where, _ = self._builder().translate([_has_eval_filter(True)])
-        assert "toString(el.trace_id)" in where
+        assert "toString(latest_eval.trace_id)" in where
 
 
 # ============================================================================

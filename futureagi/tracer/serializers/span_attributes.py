@@ -1,50 +1,108 @@
 from rest_framework import serializers
 
+from tfc.utils.serializer_fields import JsonValueField
+from tracer.services.clickhouse.attribute_reads import (
+    validate_attribute_key,
+    validate_attribute_search,
+)
+
+SPAN_ATTRIBUTE_TYPES = ("string", "number", "boolean", "array")
+
 
 class SpanAttributeProjectQuerySerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
+    q = serializers.CharField(
+        required=False,
+        allow_blank=False,
+        max_length=512,
+    )
+
+    def validate_q(self, value):
+        try:
+            return validate_attribute_key(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
 
 
 class SpanAttributeValuesQuerySerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
-    key = serializers.CharField()
-    q = serializers.CharField(required=False, allow_blank=True)
+    key = serializers.CharField(max_length=512)
+    q = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=512,
+    )
     limit = serializers.IntegerField(required=False, min_value=1, max_value=500)
+
+    def validate_key(self, value):
+        try:
+            return validate_attribute_key(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def validate_q(self, value):
+        try:
+            return validate_attribute_search(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
 
 
 class SpanAttributeDetailQuerySerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
-    key = serializers.CharField()
+    key = serializers.CharField(max_length=512)
+
+    def validate_key(self, value):
+        try:
+            return validate_attribute_key(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
 
 
 class SpanAttributeKeySerializer(serializers.Serializer):
     key = serializers.CharField()
-    type = serializers.ChoiceField(choices=["string", "number", "boolean"])
+    type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_TYPES)
     count = serializers.IntegerField()
 
 
 class SpanAttributeKeysResponseSerializer(serializers.Serializer):
     result = SpanAttributeKeySerializer(many=True)
+    query_complete = serializers.BooleanField()
+    query_status = serializers.ChoiceField(choices=["complete", "degraded"])
+    query_error_code = serializers.ChoiceField(
+        choices=["sample_limit", "read_budget_exceeded", "query_failed"],
+        required=False,
+    )
+    query_window_start = serializers.DateTimeField()
+    query_window_end = serializers.DateTimeField()
 
 
 class SpanAttributeValueSerializer(serializers.Serializer):
-    value = serializers.JSONField()
+    value = JsonValueField(allow_null=True)
     count = serializers.IntegerField()
+    type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_TYPES, required=False)
 
 
 class SpanAttributeValuesResponseSerializer(serializers.Serializer):
     result = SpanAttributeValueSerializer(many=True)
+    query_complete = serializers.BooleanField()
+    query_status = serializers.ChoiceField(choices=["complete", "degraded"])
+    query_error_code = serializers.ChoiceField(
+        choices=["sample_limit", "read_budget_exceeded", "query_failed"],
+        required=False,
+    )
+    query_window_start = serializers.DateTimeField()
+    query_window_end = serializers.DateTimeField()
 
 
 class SpanAttributeTopValueSerializer(serializers.Serializer):
-    value = serializers.JSONField()
+    value = JsonValueField(allow_null=True)
     count = serializers.IntegerField()
     percentage = serializers.FloatField()
 
 
 class SpanAttributeDetailResponseSerializer(serializers.Serializer):
     key = serializers.CharField()
-    type = serializers.ChoiceField(choices=["string", "number", "boolean"])
+    type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_TYPES)
     count = serializers.IntegerField()
     unique_values = serializers.IntegerField(required=False)
     top_values = SpanAttributeTopValueSerializer(many=True, required=False)
@@ -53,3 +111,11 @@ class SpanAttributeDetailResponseSerializer(serializers.Serializer):
     avg = serializers.FloatField(required=False, allow_null=True)
     p50 = serializers.FloatField(required=False, allow_null=True)
     p95 = serializers.FloatField(required=False, allow_null=True)
+    query_complete = serializers.BooleanField()
+    query_status = serializers.ChoiceField(choices=["complete", "degraded"])
+    query_error_code = serializers.ChoiceField(
+        choices=["sample_limit", "read_budget_exceeded", "query_failed"],
+        required=False,
+    )
+    query_window_start = serializers.DateTimeField()
+    query_window_end = serializers.DateTimeField()

@@ -10,6 +10,7 @@ Comprehensive tests covering:
 - Base query builder utilities
 """
 
+from datetime import datetime, timedelta
 from unittest import mock
 
 import pytest
@@ -408,9 +409,9 @@ class TestClickHouseSchema:
         assert names.index("span_metrics_hourly_mv") < names.index(
             "span_metrics_hourly"
         ), "MV must drop before its source table"
-        assert names.index("spans_mv") < names.index(
-            "tracer_observation_span"
-        ), "spans_mv must drop before tracer_observation_span"
+        assert names.index("spans_mv") < names.index("tracer_observation_span"), (
+            "spans_mv must drop before tracer_observation_span"
+        )
         # Idempotency: every drop wraps IF EXISTS so reruns are no-ops.
         for _, sql in drops:
             assert "IF EXISTS" in sql, f"drop must be idempotent: {sql}"
@@ -632,8 +633,10 @@ class TestClickHouseFilterBuilder:
             ]
         )
 
-        assert where.strip().startswith("id IN")
-        assert "trace_id IN" not in where
+        assert where.strip().startswith("tuple(trace_id, id) IN")
+        assert "SELECT DISTINCT tuple(toString(s.trace_id)" in where
+        assert "AND NOT isNull(s.trace_id)" in where
+        assert "s.trace_id != toUUID('00000000-0000-0000-0000-000000000000')" in where
         assert "s.annotator_id IN (toUUID(%(uid_1)s))" in where
         assert "FROM spans WHERE" in where
         assert params == {"uid_1": user_id}
@@ -877,7 +880,13 @@ class TestClickHouseFilterBuilder:
             ),
         )
 
-    def _eval_metric_where(self, score_date_scope=True):
+    def _eval_metric_where(
+        self,
+        score_date_scope=True,
+        *,
+        filter_op="greater_than",
+        filter_value=80,
+    ):
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -897,8 +906,8 @@ class TestClickHouseFilterBuilder:
                         "filter_config": {
                             "col_type": "EVAL_METRIC",
                             "filter_type": "number",
-                            "filter_op": "greater_than",
-                            "filter_value": 80,
+                            "filter_op": filter_op,
+                            "filter_value": filter_value,
                         },
                     }
                 ]
@@ -914,9 +923,11 @@ class TestClickHouseFilterBuilder:
 
         with override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2"):
             where, _ = self._eval_metric_where()
-        assert "FROM tracer_eval_logger_v2 " in where
+        assert "FROM tracer_eval_logger_v2 AS eval_scan " in where
         assert "FINAL" not in where
-        assert "is_deleted = 0" in where
+        assert "ORDER BY eval_scan._version DESC" in where
+        assert "LIMIT 1 BY eval_scan.id" in where
+        assert "latest_eval.is_deleted = 0" in where
         assert "_peerdb_is_deleted" not in where
         assert "created_at >= %(start_date)s - INTERVAL 7 DAY" in where
 
@@ -925,13 +936,12 @@ class TestClickHouseFilterBuilder:
 
         with override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger"):
             where, _ = self._eval_metric_where()
-        assert "FROM tracer_eval_logger " in where
+        assert "FROM tracer_eval_logger AS eval_scan " in where
         assert "tracer_eval_logger_v2" not in where
         assert "FINAL" not in where
-        # Migrated off the legacy CDC `_peerdb_is_deleted` guard to the
-        # rewrite-safe `deleted` marker.
-        assert "(deleted = 0 OR deleted IS NULL)" in where
-        assert "_peerdb_is_deleted" not in where
+        assert "ORDER BY eval_scan._peerdb_version DESC" in where
+        assert "latest_eval._peerdb_is_deleted = 0" in where
+        assert "(latest_eval.deleted = 0 OR latest_eval.deleted IS NULL)" in where
 
     def test_eval_metric_filter_omits_date_bound_without_scope(self):
         """Callers that don't bind %(start_date)s (score_date_scope=False)
@@ -939,6 +949,38 @@ class TestClickHouseFilterBuilder:
         otherwise (dependency-failure path)."""
         where, _ = self._eval_metric_where(score_date_scope=False)
         assert "created_at >=" not in where
+
+    def test_span_mode_eval_metric_uses_trace_scoped_span_identity(self):
+        where, _ = self._eval_metric_where()
+
+        assert where.strip().startswith("tuple(trace_id, id) IN")
+        assert (
+            "SELECT tuple(toString(latest_eval.trace_id), "
+            "toString(latest_eval.observation_span_id))" in where
+        )
+        assert "AND NOT isNull(eval_scan.trace_id)" in where
+        assert "AND notEmpty(toString(eval_scan.observation_span_id))" in where
+
+    @pytest.mark.parametrize(
+        ("filter_op", "filter_value", "outer_operator"),
+        [("not_equals", 80, "IN"), ("is_null", None, "NOT IN")],
+    )
+    def test_span_mode_negative_eval_filters_keep_trace_scoped_identity(
+        self,
+        filter_op,
+        filter_value,
+        outer_operator,
+    ):
+        where, _ = self._eval_metric_where(
+            filter_op=filter_op,
+            filter_value=filter_value,
+        )
+
+        assert where.strip().startswith(f"tuple(trace_id, id) {outer_operator}")
+        assert (
+            "SELECT tuple(toString(latest_eval.trace_id), "
+            "toString(latest_eval.observation_span_id))" in where
+        )
 
     def test_has_eval_no_final_and_window_bound(self):
         from django.test import override_settings
@@ -963,10 +1005,43 @@ class TestClickHouseFilterBuilder:
                     }
                 ]
             )
-        assert "tracer_eval_logger_v2 AS el" in where
+        assert "tracer_eval_logger_v2 AS eval_scan" in where
         assert "FINAL" not in where
-        assert "el.is_deleted = 0" in where
-        assert "el.created_at >= %(start_date)s - INTERVAL 7 DAY" in where
+        assert "ORDER BY eval_scan._version DESC" in where
+        assert "LIMIT 1 BY eval_scan.id" in where
+        assert "latest_eval.is_deleted = 0" in where
+        assert "eval_scan.created_at >= %(start_date)s - INTERVAL 7 DAY" in where
+
+    def test_span_mode_has_eval_uses_exact_trace_span_pair(self):
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        builder = ClickHouseFilterBuilder(
+            project_id="11111111-1111-1111-1111-111111111111",
+            query_mode=ClickHouseFilterBuilder.QUERY_MODE_SPAN,
+        )
+        where, _ = builder.translate(
+            [
+                {
+                    "column_id": "has_eval",
+                    "filter_config": {
+                        "filter_type": "boolean",
+                        "filter_op": "equals",
+                        "filter_value": True,
+                    },
+                }
+            ]
+        )
+
+        assert where.strip().startswith("tuple(trace_id, id) IN")
+        assert (
+            "SELECT DISTINCT tuple(toString(latest_eval.trace_id), "
+            "toString(latest_eval.observation_span_id))" in where
+        )
+        assert "sp.trace_id = toString(latest_eval.trace_id)" in where
+        assert "sp.id = toString(latest_eval.observation_span_id)" in where
+        assert "WHERE NOT isNull(eval_scan.trace_id)" in where
 
     def test_span_mode_my_annotations_filter_targets_span_id(self):
         """my_annotations uses span ids in span mode and trace ids elsewhere."""
@@ -992,8 +1067,10 @@ class TestClickHouseFilterBuilder:
             ]
         )
 
-        assert where.strip().startswith("id IN")
-        assert "trace_id IN" not in where
+        assert where.strip().startswith("tuple(trace_id, id) IN")
+        assert "SELECT DISTINCT tuple(toString(s.trace_id)" in where
+        assert "AND NOT isNull(s.trace_id)" in where
+        assert "s.trace_id != toUUID('00000000-0000-0000-0000-000000000000')" in where
         assert "s.annotator_id = toUUID(%(uid_1)s)" in where
         assert params == {"uid_1": user_id}
 
@@ -1066,7 +1143,7 @@ class TestClickHouseFilterBuilder:
 
         where, params = builder.translate(filters)
 
-        assert "lower(name) IN" in where
+        assert "lowerUTF8(toString(name)) IN" in where
         assert "span_attr_" not in where
         assert "trace_id IN" not in where
         assert tuple(params.values()) == (("response",),)
@@ -1095,7 +1172,7 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
 
         assert "trace_id IN" in where
-        assert "lower(name) IN" in where
+        assert "lowerUTF8(toString(name)) IN" in where
         assert "span_attr_" not in where
         assert "parent_span_id" not in where
         assert tuple(params.values()) == (("response",),)
@@ -1124,7 +1201,7 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
 
         assert "trace_id IN" in where
-        assert "lower(name) IN" in where
+        assert "lowerUTF8(toString(name)) IN" in where
         assert "parent_span_id IS NULL OR parent_span_id = ''" in where
         assert tuple(params.values()) == (("root trace",),)
 
@@ -1255,7 +1332,7 @@ class TestClickHouseFilterBuilder:
         assert "span_attr_bool" in where
 
     def test_translate_span_attribute_contains(self):
-        """SPAN_ATTRIBUTE contains filter should use LIKE with percent wildcards."""
+        """SPAN_ATTRIBUTE contains should use a literal UTF-8 substring."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -1273,8 +1350,9 @@ class TestClickHouseFilterBuilder:
             }
         ]
         where, params = builder.translate(filters)
-        assert "LIKE" in where
-        assert any("%" in str(v) for v in params.values())
+        assert "positionUTF8(" in where
+        assert "lowerUTF8(" in where
+        assert "gpt" in params.values()
 
     def test_translate_span_attribute_is_null(self):
         """SPAN_ATTRIBUTE is_null filter should check mapContains with NOT."""
@@ -1625,8 +1703,10 @@ class TestClickHouseFilterBuilder:
             ]
         )
 
-        assert "output_bool IN" in where
-        assert "output_float" not in where
+        assert "AND output_bool IN" in where
+        # Latest-state collapse projects every possible output shape, but the
+        # PASS_FAIL value predicate must still target only output_bool.
+        assert "AND output_float " not in where
         assert (1, 0) in params.values()
 
     @pytest.mark.django_db
@@ -1858,8 +1938,10 @@ class TestClickHouseFilterBuilder:
 
         where, params = builder.translate(filters)
 
-        assert where.strip().startswith("id IN")
-        assert "trace_id IN" not in where
+        assert where.strip().startswith("tuple(trace_id, id) IN")
+        assert "SELECT DISTINCT tuple(toString(s.trace_id)" in where
+        assert "AND NOT isNull(s.trace_id)" in where
+        assert "s.trace_id != toUUID('00000000-0000-0000-0000-000000000000')" in where
         assert "model_hub_score AS s FINAL" in where
         assert "s.observation_span_id" in where
         assert "FROM spans WHERE" in where
@@ -1889,7 +1971,8 @@ class TestClickHouseFilterBuilder:
             ]
         )
 
-        assert where.strip().startswith("id IN")
+        assert where.strip().startswith("tuple(trace_id, id) IN")
+        assert "SELECT DISTINCT tuple(toString(s.trace_id)" in where
         assert "lower(JSONExtractString(s.value, 'text')) IN" in where
         assert params["ann_2"] == ("good", "bad")
 
@@ -2106,8 +2189,10 @@ class TestClickHouseFilterBuilder:
 
         where, params = builder.translate(filters)
 
-        assert where.strip().startswith("id IN")
-        assert "trace_id IN" not in where
+        assert where.strip().startswith("tuple(trace_id, id) IN")
+        assert "SELECT tuple(toString(s.trace_id)" in where
+        assert "AND NOT isNull(s.trace_id)" in where
+        assert "s.trace_id != toUUID('00000000-0000-0000-0000-000000000000')" in where
         assert "GROUP BY entity_id" in where
         assert "uniq(s.label_id) >= 2" in where
         assert "parent_span_id" in where
@@ -2662,7 +2747,7 @@ class TestTraceListQueryBuilder:
         )
 
     def test_build_with_sort_params(self):
-        """Custom sort params should override default ORDER BY."""
+        """Legacy trace reads must reject custom sort instead of misordering."""
         from tracer.services.clickhouse.query_builders import TraceListQueryBuilder
 
         builder = TraceListQueryBuilder(
@@ -2672,9 +2757,8 @@ class TestTraceListQueryBuilder:
             page_size=10,
             sort_params=[{"column_id": "cost", "direction": "asc"}],
         )
-        query, params = builder.build()
-        assert "ORDER BY" in query
-        assert "cost ASC" in query
+        with pytest.raises(ValueError, match="unsupported_filter_modifiers"):
+            builder.build()
 
     def test_pagination_offset_calculation(self):
         """Offset should be page_number * page_size."""
@@ -2702,8 +2786,7 @@ class TestTraceListQueryBuilder:
         assert "SELECT" in query
         assert "trace_id" in query
         assert (
-            "dictGetOrDefault('enduser_dict', 'user_id', any(end_user_id), '')"
-            in query
+            "dictGetOrDefault('enduser_dict', 'user_id', any(end_user_id), '')" in query
         )
         assert "GROUP BY trace_id" in query
         assert "PREWHERE trace_id IN" in query
@@ -3145,7 +3228,9 @@ class TestSessionListQueryBuilder:
 
         query, params = builder.build_span_attributes_query(["session-1"])
 
-        assert "s.trace_session_id IN %(attr_session_ids)s" in query
+        assert "trace_session_id IN %(attr_session_ids)s" in query
+        assert "argMax(is_deleted, _version) AS latest_is_deleted" in query
+        assert "latest_is_deleted = 0" in query
         assert params["attr_session_ids"] == ("session-1",)
 
     def test_build_uses_uniq_not_uniqExact(self):
@@ -3640,7 +3725,7 @@ class TestEvalMetricsQueryBuilder:
 
         query, params = builder.build()
         assert "SELECT DISTINCT trace_id FROM spans" in query
-        assert "lower(status) =" in query
+        assert "lowerUTF8(toString(status)) =" in query
         assert "ok" in params.values()
 
     def test_build_with_filters_forces_raw_eval_query(self):
@@ -4551,7 +4636,7 @@ class TestTraceListQueryBuilderComprehensive:
         assert "00000000-0000-0000-0000-000000000000" in query
 
     def test_build_with_contains_filter(self):
-        """Contains filter should produce LIKE with percent wildcards."""
+        """Contains binds a literal and applies matching in ClickHouse SQL."""
         from tracer.services.clickhouse.query_builders import TraceListQueryBuilder
 
         builder = TraceListQueryBuilder(
@@ -4569,8 +4654,10 @@ class TestTraceListQueryBuilderComprehensive:
             ],
         )
         query, params = builder.build()
-        assert "LIKE" in query
-        assert any("%" in str(v) for v in params.values())
+        assert "positionUTF8" in query
+        assert "LIKE" not in query
+        assert "gpt" in params.values()
+        assert not any("%gpt%" == value for value in params.values())
 
     def test_build_with_between_filter(self):
         """Between filter should produce BETWEEN clause."""
@@ -4664,48 +4751,48 @@ class TestTraceListQueryBuilderComprehensive:
     # ------------------------------------------------------------------
 
     def test_sort_by_cost_ascending(self):
-        """Sort by cost ASC should map to cost column."""
+        """Legacy trace reads reject custom sort rather than misordering."""
         from tracer.services.clickhouse.query_builders import TraceListQueryBuilder
 
         builder = TraceListQueryBuilder(
             project_id="proj-1",
             sort_params=[{"column_id": "cost", "direction": "asc"}],
         )
-        query, _ = builder.build()
-        assert "cost ASC" in query
+        with pytest.raises(ValueError, match="unsupported_filter_modifiers"):
+            builder.build()
 
     def test_sort_by_latency_descending(self):
-        """Sort by latency should map to latency_ms column."""
+        """Legacy trace reads reject custom sort rather than misordering."""
         from tracer.services.clickhouse.query_builders import TraceListQueryBuilder
 
         builder = TraceListQueryBuilder(
             project_id="proj-1",
             sort_params=[{"column_id": "latency", "direction": "desc"}],
         )
-        query, _ = builder.build()
-        assert "latency_ms DESC" in query
+        with pytest.raises(ValueError, match="unsupported_filter_modifiers"):
+            builder.build()
 
     def test_sort_by_name(self):
-        """Sort by name should map to trace_name column."""
+        """Legacy trace reads reject custom sort rather than misordering."""
         from tracer.services.clickhouse.query_builders import TraceListQueryBuilder
 
         builder = TraceListQueryBuilder(
             project_id="proj-1",
             sort_params=[{"column_id": "name", "direction": "asc"}],
         )
-        query, _ = builder.build()
-        assert "trace_name ASC" in query
+        with pytest.raises(ValueError, match="unsupported_filter_modifiers"):
+            builder.build()
 
     def test_sort_by_total_tokens(self):
-        """Sort by total_tokens should map to total_tokens column."""
+        """Legacy trace reads reject custom sort rather than misordering."""
         from tracer.services.clickhouse.query_builders import TraceListQueryBuilder
 
         builder = TraceListQueryBuilder(
             project_id="proj-1",
             sort_params=[{"column_id": "total_tokens", "direction": "desc"}],
         )
-        query, _ = builder.build()
-        assert "total_tokens DESC" in query
+        with pytest.raises(ValueError, match="unsupported_filter_modifiers"):
+            builder.build()
 
     def test_default_sort_when_no_sort_params(self):
         """Should default to ORDER BY start_time DESC."""
@@ -4719,7 +4806,7 @@ class TestTraceListQueryBuilderComprehensive:
         assert "ORDER BY start_time DESC" in query
 
     def test_multi_column_sort(self):
-        """Multiple sort columns should all appear in ORDER BY."""
+        """Legacy trace reads reject multi-column sort fail-closed."""
         from tracer.services.clickhouse.query_builders import TraceListQueryBuilder
 
         builder = TraceListQueryBuilder(
@@ -4729,9 +4816,8 @@ class TestTraceListQueryBuilderComprehensive:
                 {"column_id": "latency", "direction": "asc"},
             ],
         )
-        query, _ = builder.build()
-        assert "cost DESC" in query
-        assert "latency_ms ASC" in query
+        with pytest.raises(ValueError, match="unsupported_filter_modifiers"):
+            builder.build()
 
     # ------------------------------------------------------------------
     # Pagination edge cases
@@ -5905,7 +5991,7 @@ class TestFilterBuilderEdgeCases:
         assert "!=" in where
 
     def test_not_contains_filter(self):
-        """not_contains should produce NOT ILIKE (case-insensitive)."""
+        """not_contains should reject a literal UTF-8 substring."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -5923,10 +6009,11 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, _ = builder.translate(filters)
-        assert "NOT ILIKE" in where
+        assert "positionUTF8(" in where
+        assert "= 0" in where
 
     def test_starts_with_filter(self):
-        """starts_with should produce LIKE with trailing %."""
+        """starts_with should compare a literal UTF-8 prefix."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -5944,13 +6031,11 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, params = builder.translate(filters)
-        assert "LIKE" in where
-        assert any(
-            str(v).endswith("%") and not str(v).startswith("%") for v in params.values()
-        )
+        assert "startsWith(" in where
+        assert "gpt" in params.values()
 
     def test_ends_with_filter(self):
-        """ends_with should produce LIKE with leading %."""
+        """ends_with should compare a literal UTF-8 suffix."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -5968,11 +6053,8 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, params = builder.translate(filters)
-        assert "LIKE" in where
-        assert any(
-            str(v).startswith("%") and not str(v).endswith("%%")
-            for v in params.values()
-        )
+        assert "endsWith(" in where
+        assert "turbo" in params.values()
 
     def test_not_between_filter(self):
         """not_between should produce NOT BETWEEN clause. (Canonical op
@@ -6049,7 +6131,7 @@ class TestFilterBuilderEdgeCases:
         assert "<=" in where
 
     def test_span_attr_not_contains(self):
-        """SPAN_ATTRIBUTE not_contains should produce NOT ILIKE (case-insensitive)."""
+        """SPAN_ATTRIBUTE not_contains should reject a literal UTF-8 substring."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
@@ -6067,7 +6149,8 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, _ = builder.translate(filters)
-        assert "NOT ILIKE" in where
+        assert "positionUTF8(" in where
+        assert "= 0" in where
         assert "span_attr_str" in where
 
     def test_span_attr_between(self):
@@ -6110,7 +6193,7 @@ class TestFilterBuilderEdgeCases:
             }
         ]
         where, params = builder.translate(filters)
-        assert "lower(model) = %(col_1)s" in where
+        assert "lowerUTF8(toString(model)) = %(col_1)s" in where
         assert params == {"col_1": "gpt-4"}
 
     def test_eval_metric_filter_subquery_structure(self):
@@ -6788,7 +6871,7 @@ class TestVoiceCallListQueryBuilder:
             ],
         )
         query, params = builder.build()
-        assert "lower(status) =" in query
+        assert "lowerUTF8(toString(status)) =" in query
 
     def test_voice_numeric_filter_without_col_type_uses_metric_expression(self):
         """API callers may omit col_type; voice metrics should still translate."""
@@ -6838,7 +6921,8 @@ class TestVoiceCallListQueryBuilder:
         query, _ = builder.build()
 
         assert "mapContains(span_attr_str, 'ended_reason')" in query
-        assert "span_attr_str['ended_reason'] ILIKE" in query
+        assert "positionUTF8(" in query
+        assert "span_attr_str['ended_reason']" in query
 
 
 @pytest.mark.unit
@@ -6853,9 +6937,10 @@ class TestVoiceCallListPhase1bMigration:
     cutover is the one thing standing between us and being able to
     decommission the PeerDB stream for that table.
 
-    The SQL is inline in the view method, not in a builder class, so we
-    pin it by inspecting the function source — same pattern used by
-    test_trace_workspace_scope.py for the agent_graph PG-fallback ban.
+    The view now delegates Phase 1b to ``build_content_query`` so the builder
+    can hydrate the exact physical roots selected by the bounded page read.
+    Pin both the delegation and the generated SQL: a regression to a broad
+    ``FINAL`` query would reintroduce the production timeout.
     """
 
     @staticmethod
@@ -6885,54 +6970,33 @@ class TestVoiceCallListPhase1bMigration:
             "_list_voice_calls_clickhouse references the legacy CDC mirror; "
             "the Phase 1b query must read from the v2 `spans` table."
         )
-        # Narrow the `_peerdb_is_deleted` ban to the Phase 1b block, found by
-        # anchoring on the unique `AS span_attributes` projection and slicing
-        # forward. Anything inside that slice belongs to the Phase 1b query.
-        anchor = "AS span_attributes"
-        assert anchor in src, (
-            "Phase 1b query no longer projects `span_attributes`; "
-            "this regression test needs a new anchor."
-        )
-        start = src.index(anchor)
-        phase_1b_block = src[start : start + 600]
-        assert "_peerdb_is_deleted" not in phase_1b_block, (
-            "Phase 1b query still filters on `_peerdb_is_deleted`; v2 "
-            "`spans` uses `is_deleted` (no CDC = no PeerDB tombstone)."
-        )
+        assert "builder.build_content_query(" in src
+        assert "root_identities=root_identities" in src
 
     def test_phase_1b_reads_v2_spans_table(self):
-        """Phase 1b must read v2 `spans` FINAL with the skip-index setting.
-
-        `FROM spans FINAL` dedupes ReplacingMergeTree versions; bare `FINAL`
-        disables the `idx_id` skip index and full-scans the table (~194M rows),
-        so it MUST be paired with `use_skip_indexes_if_final = 1` (the
-        CHSpanReader idiom) to prune the scan.
-        """
-        import re
+        """Phase 1b must resolve latest state without broad ``FINAL``."""
+        from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+            VoiceCallListQueryBuilderV2,
+        )
 
         src = self._voice_list_source()
-        # Reads the v2 `spans FINAL` (not the legacy `tracer_observation_span`).
-        assert re.search(
-            r"FROM\s+spans\s+FINAL", src
-        ), "_list_voice_calls_clickhouse must hydrate from v2 `spans FINAL`."
-        # FINAL without the setting full-scans; the setting re-enables idx_id.
-        assert "use_skip_indexes_if_final = 1" in src, (
-            "Phase 1b `FINAL` must set `use_skip_indexes_if_final = 1`, else it "
-            "disables the idx_id skip index and full-scans `spans`."
+        query, _ = VoiceCallListQueryBuilderV2(
+            project_id="00000000-0000-4000-8000-000000000001"
+        ).build_content_query(
+            ["root-1"],
+            root_identities=[
+                (
+                    "00000000-0000-4000-8000-000000000001",
+                    "trace-1",
+                    "root-1",
+                    datetime(2026, 7, 30, 0, 0),
+                )
+            ],
         )
-        # The Phase-1b block must NOT carry `is_deleted = 0`: with the skip-index
-        # setting it prunes tombstone granules before the FINAL merge and
-        # resurrects deleted spans (the two-arg ReplacingMergeTree engine already
-        # drops tombstones under FINAL). See `_FINAL_SKIP_INDEX_SETTINGS`. Slice
-        # the block so the page/count queries — which legitimately keep
-        # `is_deleted = 0` — don't trip this.
-        start = src.index("AS span_attributes")
-        phase_1b_block = src[start : start + 400]
-        assert "is_deleted = 0" not in phase_1b_block, (
-            "Phase 1b must NOT pair `is_deleted = 0` with "
-            "`use_skip_indexes_if_final = 1` — resurrection bug "
-            "(see _FINAL_SKIP_INDEX_SETTINGS)."
-        )
+        assert "FROM spans FINAL" not in src
+        assert "FROM spans FINAL" not in query
+        assert "argMax(is_deleted, _version) AS latest_is_deleted" in query
+        assert "WHERE latest_is_deleted = 0" in query
 
     def test_phase_1b_selects_typed_map_columns_for_reconstruction(self):
         """The Phase 1b query must SELECT the typed Maps + attributes_extra.
@@ -6942,14 +7006,18 @@ class TestVoiceCallListPhase1bMigration:
         only select `attributes_extra`, voice spans show empty
         `span_attributes` because nothing fell into the overflow tier.
         """
-        src = self._voice_list_source()
-        # Pin fragments unique to the SQL SELECT (not the docstring/comment or the
-        # Python fallback `arow.get("attrs_string")`), so dropping a Map from the
-        # query actually fails this test.
-        assert "AS span_attributes" in src  # attributes_extra rebuild alias
-        assert "AS attrs_string" in src  # mapFilter alias
-        assert "attrs_number, attrs_bool" in src  # SELECT column-list tail
-        assert "attributes_extra" in src  # the rebuild reads the overflow column
+        from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+            VoiceCallListQueryBuilderV2,
+        )
+
+        query, _ = VoiceCallListQueryBuilderV2(project_id="proj-1").build_content_query(
+            ["root-1"]
+        )
+        assert "AS span_attributes" in query
+        assert "AS attrs_string" in query
+        assert "latest_span_attr_num AS attrs_number" in query
+        assert "latest_span_attr_bool AS attrs_bool" in query
+        assert "attributes_extra" in query
 
     def test_phase_1b_python_fallback_merges_typed_maps(self):
         """Python-side: when `attributes_extra` is empty, fall back to Maps.
@@ -6976,16 +7044,36 @@ class TestVoiceCallListPhase1bMigration:
         and a `JSONExtractKeysAndValuesRaw` rebuild on the JSON overflow.
         `raw_log` is kept: process_raw_logs still needs it.
         """
-        src = self._voice_list_source()
-        assert "project_id = %(project_id)s" in src, (
+        from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+            VoiceCallListQueryBuilderV2,
+        )
+
+        query, params = VoiceCallListQueryBuilderV2(
+            project_id="00000000-0000-4000-8000-000000000001"
+        ).build_content_query(
+            ["root-1"],
+            root_identities=[
+                (
+                    "00000000-0000-4000-8000-000000000001",
+                    "trace-1",
+                    "root-1",
+                    datetime(2026, 7, 30, 0, 0, 0, 123456),
+                )
+            ],
+        )
+        assert "project_id = %(project_id)s" in query, (
             "Phase 1b must scope by project_id so the primary key can prune."
         )
+        assert "trace_id IN %(content_trace_ids)s" in query
+        assert "toDate(start_time) IN %(content_root_dates)s" in query
+        assert "toUnixTimestamp64Micro(start_time)" in query
+        assert params["content_root_identities"][0][3] % 1_000_000 == 123456
         # attrs_string Map strip.
-        assert "mapFilter" in src and "call_logs" in src, (
+        assert "mapFilter" in query and "call_logs" in query, (
             "Phase 1b must exclude `call_logs` from attrs_string at read time."
         )
         # attributes_extra JSON-overflow strip (backfill cohort).
-        assert "JSONExtractKeysAndValuesRaw" in src, (
+        assert "JSONExtractKeysAndValuesRaw" in query, (
             "Phase 1b must also strip `call_logs` from attributes_extra so the "
             "backfill cohort doesn't ship the blob CH->backend."
         )
@@ -7032,7 +7120,7 @@ class TestVoiceCallListQueryBuilderComprehensive:
             "span_attributes_raw",
             "span_attr_str",
             "span_attr_num",
-            "metadata_map",
+            "span_attr_bool",
         ]:
             assert col in content_query, f"Missing content column: {col}"
 
@@ -7303,9 +7391,8 @@ class TestVoiceCallListQueryBuilderComprehensive:
             ],
         )
         query, params = builder.build()
-        assert "LIKE" in query
-        # Value should be wrapped in %
-        assert any("%phone%" == v for v in params.values())
+        assert "positionUTF8" in query
+        assert any("phone" == v for v in params.values())
 
     def test_multiple_filters_combined(self):
         """Multiple filters should be ANDed together."""
@@ -7377,9 +7464,9 @@ class TestVoiceCallListQueryBuilderComprehensive:
         # Each phone number is still recognised as a simulator call in Python.
         for phone in VAPI_PHONE_NUMBERS:
             span_attrs = {"raw_log": {"customer": {"number": phone}}}
-            assert VoiceCallListQueryBuilder.is_simulator_call(
-                span_attrs, "vapi"
-            ), f"Missing phone number: {phone}"
+            assert VoiceCallListQueryBuilder.is_simulator_call(span_attrs, "vapi"), (
+                f"Missing phone number: {phone}"
+            )
 
     def test_simulation_filter_uses_json_extract(self):
         """Simulation filtering is now Python-side against parsed raw_log.
@@ -7488,8 +7575,8 @@ class TestVoiceCallListQueryBuilderComprehensive:
         assert query == ""
         assert params == {}
 
-    def test_eval_query_uses_final(self):
-        """Eval query should use FINAL to deduplicate."""
+    def test_eval_query_replays_latest_state_without_final(self):
+        """Eval query should deduplicate candidate IDs without broad FINAL."""
         from tracer.services.clickhouse.query_builders.voice_call_list import (
             VoiceCallListQueryBuilder,
         )
@@ -7499,7 +7586,9 @@ class TestVoiceCallListQueryBuilderComprehensive:
             eval_config_ids=["00000000-0000-0000-0000-000000000011"],
         )
         query, _ = builder.build_eval_query(["trace-1"])
-        assert "FINAL" in query
+        assert "FINAL" not in query
+        assert "GROUP BY id" in query
+        assert "WHERE latest_is_deleted = 0" in query
 
     def test_eval_query_groups_correctly(self):
         """Eval query should GROUP BY trace_id, config, and str_list."""
@@ -7512,7 +7601,7 @@ class TestVoiceCallListQueryBuilderComprehensive:
             eval_config_ids=["00000000-0000-0000-0000-000000000011"],
         )
         query, _ = builder.build_eval_query(["trace-1"])
-        assert "GROUP BY trace_id, custom_eval_config_id" in query
+        assert "GROUP BY latest_trace_id, latest_eval_config_id" in query
 
     def test_eval_query_computes_pass_rate(self):
         """Eval query should compute pass_rate from output_bool."""
@@ -7804,29 +7893,57 @@ class TestAnnotationGraphQueryBuilder:
             columns = []
 
         class Analytics:
-            def execute_ch_query(self, query, params, timeout_ms):
+            def execute_ch_query(self, query, params, *, timeout_ms, settings):
                 self.query = query
                 self.params = params
                 return Result()
 
         self_label_id = self.LABEL_ID
+        project_id = "ca3025a9-b5eb-4872-9973-2330956d40d2"
+        window_start = datetime(2026, 7, 24)
+        sample = graph_dispatch.GraphCandidateSample(
+            rows=(
+                {
+                    "id": "span-1",
+                    "trace_id": "trace-1",
+                    "start_time": window_start,
+                },
+            ),
+            query_complete=True,
+            query_status="complete",
+            query_error_code=None,
+            window_start=window_start,
+            window_end=window_start + timedelta(hours=1),
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=2,
+            result_payload_bytes=1,
+            total_rows_lower_bound=1,
+        )
         analytics = Analytics()
-        with mock.patch.object(
-            graph_dispatch,
-            "get_annotation_labels_for_project",
-            return_value=LabelQuery(),
-        ) as lookup:
+        with (
+            mock.patch.object(
+                graph_dispatch,
+                "get_annotation_labels_for_project",
+                return_value=LabelQuery(),
+            ) as lookup,
+            mock.patch.object(
+                graph_dispatch,
+                "read_graph_candidates",
+                return_value=sample,
+            ),
+        ):
             result = graph_dispatch.fetch_annotation_graph_ch(
                 analytics=analytics,
-                project_id="project-with-shared-label",
+                project_id=project_id,
                 filters=[],
                 interval="month",
                 req_data_config={"id": self.LABEL_ID, "type": "ANNOTATION"},
                 observe_type="span",
             )
 
-        lookup.assert_called_once_with("project-with-shared-label")
-        assert analytics.params["label_id"] == self.LABEL_ID
+        lookup.assert_called_once_with(project_id)
+        assert analytics.params["graph_label_id"] == self.LABEL_ID
         assert result["name"] == "Score-backed label"
 
     def test_build_bool_query(self):
@@ -8813,7 +8930,7 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="not_equals", filter_value="v"
             )
         )
-        assert "AND lower(span_attr_str['k']) != " in where
+        assert "AND lowerUTF8(toString(span_attr_str['k'])) != " in where
         assert "NOT mapContains" not in where
 
     def test_text_in(self):
@@ -8822,7 +8939,7 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="in", filter_value=["a", "b"]
             )
         )
-        assert "lower(span_attr_str['k']) IN" in where
+        assert "lowerUTF8(toString(span_attr_str['k'])) IN" in where
         assert ("a", "b") in params.values()
 
     def test_text_not_in_uses_exists_and(self):
@@ -8837,18 +8954,19 @@ class TestSpanAttrConditionContract:
             )
         )
         assert "mapContains(span_attr_str, 'ended_reason')" in where
-        assert "AND lower(span_attr_str['ended_reason']) NOT IN" in where
+        assert "AND lowerUTF8(toString(span_attr_str['ended_reason'])) NOT IN" in where
         assert "NOT mapContains" not in where
         assert ("voicemail", "assistant-ended-call") in params.values()
 
-    def test_text_contains_wildcard(self):
+    def test_text_contains_literal(self):
         where, params = _translate_one(
             _span_attr_filter(
                 "k", filter_type="text", filter_op="contains", filter_value="abc"
             )
         )
-        assert "LIKE" in where
-        assert "%abc%" in params.values()
+        assert "positionUTF8(" in where
+        assert "> 0" in where
+        assert "abc" in params.values()
 
     def test_text_not_contains_uses_exists_and(self):
         where, params = _translate_one(
@@ -8856,25 +8974,28 @@ class TestSpanAttrConditionContract:
                 "k", filter_type="text", filter_op="not_contains", filter_value="abc"
             )
         )
-        assert "AND span_attr_str['k'] NOT ILIKE" in where
+        assert "AND positionUTF8(" in where
+        assert "= 0" in where
         assert "NOT mapContains" not in where
-        assert "%abc%" in params.values()
+        assert "abc" in params.values()
 
     def test_text_starts_with(self):
-        _, params = _translate_one(
+        where, params = _translate_one(
             _span_attr_filter(
                 "k", filter_type="text", filter_op="starts_with", filter_value="abc"
             )
         )
-        assert "abc%" in params.values()
+        assert "startsWith(" in where
+        assert "abc" in params.values()
 
     def test_text_ends_with(self):
-        _, params = _translate_one(
+        where, params = _translate_one(
             _span_attr_filter(
                 "k", filter_type="text", filter_op="ends_with", filter_value="abc"
             )
         )
-        assert "%abc" in params.values()
+        assert "endsWith(" in where
+        assert "abc" in params.values()
 
     def test_text_is_null(self):
         where, _ = _translate_one(

@@ -7,9 +7,9 @@ attribute shape (call.total_turns, call.talk_ratio, etc.) — these live in
 by the voice observability surface. `V2RewriteMixin` routes every inherited
 `build*` method's SQL through the v2 rewriter at one boundary.
 
-`build_eval_query` / `build_annotation_query` read the legacy
-`tracer_eval_logger` / `model_hub_score` tables (not part of the CH 25.3
-migration; still carry `_peerdb_is_deleted`) and are excluded from the rewrite.
+`build_eval_query` resolves the configured legacy-or-direct-write eval table
+itself; `build_annotation_query` reads `model_hub_score`. Both are excluded
+from the span-schema token rewrite because neither query targets `spans`.
 """
 
 from __future__ import annotations
@@ -18,12 +18,16 @@ from tracer.services.clickhouse.query_builders.voice_call_list import (
     VoiceCallListQueryBuilder,
 )
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
+from tracer.services.clickhouse.v2.query_builders.filters import (
+    ClickHouseFilterBuilderV2,
+)
 
 
 class VoiceCallListQueryBuilderV2(V2RewriteMixin, VoiceCallListQueryBuilder):
     """Drop-in v2 VoiceCallList builder."""
 
     _v2_rewrite_exclude = frozenset({"build_eval_query", "build_annotation_query"})
+    _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
 
 
 __all__ = ["VoiceCallListQueryBuilderV2"]

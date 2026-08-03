@@ -18,7 +18,10 @@ from django.utils import timezone
 
 from tracer.models.eval_task import RowType
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, EvalTargetType
-from tracer.selectors.eval_tasks.row_resolver import iter_desired_rows
+from tracer.selectors.eval_tasks.row_resolver import (
+    EvalTaskReadBudgetExceeded,
+    iter_desired_rows,
+)
 from tracer.services.clickhouse.v2 import get_reader
 from tracer.services.eval_tasks.config_hash import resolved_config_hash
 
@@ -37,6 +40,10 @@ _TARGET_TYPE = {
 
 _MATERIALIZE_BATCH = 5_000
 _FK_CHUNK = 1000
+_SAFE_AMBIGUOUS_SPAN_MESSAGE = (
+    "Evaluation task row selection could not safely distinguish one or more "
+    "spans. Narrow the filters and retry."
+)
 
 # Set to the materialized entry's id while the engine runs one entry; the eval
 # core's result write then lands on that entry instead of creating a new row.
@@ -108,7 +115,12 @@ def persist_eval_result(logger_kwargs: dict[str, Any]) -> EvalLogger | None:
     return EvalLogger.objects.filter(id=entry_id).first()
 
 
-def materialize_pending(task: EvalTask, *, ceiling: datetime | None = None) -> int:
+def materialize_pending(
+    task: EvalTask,
+    resolved_row_ids: Iterable[str] | None = None,
+    *,
+    ceiling: datetime | None = None,
+) -> int:
     """Create one pending entry per (desired row, eval). Returns rows submitted.
 
     ``ceiling`` (the reconcile pass's frozen now) upper-bounds the continuous
@@ -122,9 +134,12 @@ def materialize_pending(task: EvalTask, *, ceiling: datetime | None = None) -> i
     submitted = 0
     reader = get_reader()
     try:
-        for batch in iter_desired_rows(
-            task, batch_size=_MATERIALIZE_BATCH, ceiling=ceiling
-        ):
+        batches = (
+            _iter_materialize_batches(resolved_row_ids)
+            if resolved_row_ids is not None
+            else iter_desired_rows(task, batch_size=_MATERIALIZE_BATCH, ceiling=ceiling)
+        )
+        for batch in batches:
             fk_by_id = _resolve_entry_fks(
                 reader, task.row_type, batch, project_id=str(task.project_id)
             )
@@ -151,6 +166,19 @@ def materialize_pending(task: EvalTask, *, ceiling: datetime | None = None) -> i
     finally:
         reader.close()
     return submitted
+
+
+def _iter_materialize_batches(row_ids: Iterable[str]) -> Iterator[list[str]]:
+    """Batch a caller-provided, already-buffered desired row set."""
+
+    batch: list[str] = []
+    for row_id in row_ids:
+        batch.append(str(row_id))
+        if len(batch) >= _MATERIALIZE_BATCH:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def soft_delete_live(task: EvalTask) -> int:
@@ -258,9 +286,22 @@ def _resolve_entry_fks(
             spans = reader.list_by_ids(
                 chunk, include_heavy=False, project_id=project_id
             )
+            trace_by_span_id: dict[str, str] = {}
+            for span in spans:
+                span_id = str(span.id)
+                trace_id = str(span.trace_id or "")
+                previous_trace = trace_by_span_id.setdefault(span_id, trace_id)
+                if previous_trace != trace_id:
+                    # EvalLogger stores only observation_span_id. If another
+                    # trace in this project reuses the OTel ID, materializing
+                    # either row would make the eventual target arbitrary.
+                    raise EvalTaskReadBudgetExceeded(_SAFE_AMBIGUOUS_SPAN_MESSAGE)
             fks.update(
                 {
-                    s.id: {"observation_span_id": s.id, "trace_id": s.trace_id}
+                    str(s.id): {
+                        "observation_span_id": str(s.id),
+                        "trace_id": s.trace_id,
+                    }
                     for s in spans
                 }
             )

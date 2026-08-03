@@ -5,6 +5,7 @@ import { AdvanceNumberFilterOperators } from "src/utils/constants";
 import {
   FILTER_COLUMN_TYPES,
   FILTER_TYPE_ALLOWED_OPS,
+  STRUCTURED_SPAN_ATTRIBUTE_ALLOWED_OPS,
 } from "src/api/contracts/filter-contract.generated";
 
 describe("ComplexFilter contract wiring", () => {
@@ -84,6 +85,42 @@ describe("ComplexFilter contract wiring", () => {
       expect(parsed.success, filterType).toBe(true);
       expect(parsed.data.filter_config.filter_value).toBeNull();
     }
+  });
+
+  it("accepts flat structured map filters and rejects nested values", () => {
+    const schema = getComplexFilterValidation();
+    const base = {
+      column_id: "customer.context",
+      filter_config: {
+        col_type: "SPAN_ATTRIBUTE",
+        filter_type: "map",
+        filter_op: "contains",
+      },
+    };
+
+    expect(STRUCTURED_SPAN_ATTRIBUTE_ALLOWED_OPS.map).toContain("contains");
+    const valid = schema.safeParse({
+      ...base,
+      filter_config: {
+        ...base.filter_config,
+        filter_value: { tier: "vip", attempt: 2, accepted: true },
+      },
+    });
+    expect(valid.success).toBe(true);
+    expect(valid.data.filter_config.filter_value).toEqual({
+      tier: "vip",
+      attempt: 2,
+      accepted: true,
+    });
+
+    const nested = schema.safeParse({
+      ...base,
+      filter_config: {
+        ...base.filter_config,
+        filter_value: { nested: { tier: "vip" } },
+      },
+    });
+    expect(nested.success).toBe(false);
   });
 
   it("validates every generated column type instead of a local subset", () => {

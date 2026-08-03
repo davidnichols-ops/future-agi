@@ -8,7 +8,6 @@ from tracer.serializers.filters import (
     filter_list_field,
 )
 
-
 DASHBOARD_METRIC_TYPES = (
     "system_metric",
     "eval_metric",
@@ -296,9 +295,7 @@ class DashboardQuerySerializer(StrictInputSerializer):
     )
     metrics = DashboardMetricSerializer(many=True)
     filters = filter_list_field(required=False, default=list)
-    breakdowns = DashboardBreakdownSerializer(
-        many=True, required=False, default=list
-    )
+    breakdowns = DashboardBreakdownSerializer(many=True, required=False, default=list)
 
     class Meta:
         swagger_schema_fields = {"additionalProperties": False}
@@ -384,6 +381,18 @@ class DashboardMetricsCatalogResponseSerializer(serializers.Serializer):
 class CommaSeparatedListField(serializers.Field):
     """Query-param helper for explicit comma-separated lists."""
 
+    class Meta:
+        swagger_schema_fields = {
+            "type": "string",
+            "default": "",
+        }
+
+    def run_validation(self, data=serializers.empty):
+        value = super().run_validation(data)
+        if data is serializers.empty:
+            return self.to_internal_value(value)
+        return value
+
     def to_internal_value(self, data):
         if data in (None, ""):
             return []
@@ -394,6 +403,8 @@ class CommaSeparatedListField(serializers.Field):
         return [str(item).strip() for item in items if str(item).strip()]
 
     def to_representation(self, value):
+        if isinstance(value, str):
+            return value
         return value or []
 
 
@@ -421,6 +432,49 @@ class DashboardFilterValuesQuerySerializer(serializers.Serializer):
         required=False,
         default="traces",
     )
-    project_ids = CommaSeparatedListField(required=False, default=list)
+    project_ids = CommaSeparatedListField(required=False, default="")
     dataset_id = serializers.UUIDField(required=False)
-    search = serializers.CharField(required=False, allow_blank=True, default="")
+    search = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        # The selector enforces the same limit in encoded UTF-8 bytes.  This
+        # character cap keeps obviously oversized requests out of every
+        # source-specific branch before any database work.
+        max_length=512,
+    )
+
+    def validate_search(self, value):
+        # Import lazily so serializer/OpenAPI discovery does not initialize the
+        # ClickHouse client package.  The shared validator also catches a
+        # 512-character non-ASCII value whose UTF-8 representation exceeds the
+        # actual 512-byte query contract.
+        from tracer.services.clickhouse.attribute_reads import (
+            InvalidAttributeSearch,
+            validate_attribute_search,
+        )
+
+        try:
+            return validate_attribute_search(value)
+        except InvalidAttributeSearch as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+
+class DashboardFilterValuesResultSerializer(serializers.Serializer):
+    values = serializers.ListField(child=serializers.JSONField())
+    query_complete = serializers.BooleanField(required=False)
+    query_status = serializers.ChoiceField(
+        choices=["complete", "sampled", "degraded"],
+        required=False,
+    )
+    query_error_code = serializers.ChoiceField(
+        choices=["sample_limit", "read_budget_exceeded", "query_failed"],
+        required=False,
+    )
+    query_window_start = serializers.DateTimeField(required=False)
+    query_window_end = serializers.DateTimeField(required=False)
+
+
+class DashboardFilterValuesResponseSerializer(serializers.Serializer):
+    status = serializers.BooleanField(default=True)
+    result = DashboardFilterValuesResultSerializer()

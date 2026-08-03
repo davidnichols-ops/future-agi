@@ -31,6 +31,11 @@ import { useLLMTracingStoreShallow } from "../states";
 import { logger } from "src/utils/logger";
 import { FILTER_FOR_HAS_EVAL, toBackendFilters } from "../common";
 import { buildDefaultDateEntry } from "./graphFilterUtils";
+import {
+  getExactGraphData,
+  getQueryReadMessage,
+  getQueryReadState,
+} from "src/utils/queryReadState";
 
 const deltaObject = {
   hour: { hours: 1 },
@@ -140,6 +145,7 @@ const GraphSection = ({
     data: traceGraphData,
     isFetching: traceGraphLoading,
     isPending: traceGraphPending,
+    isError: traceGraphError,
   } = useQuery({
     queryKey: [
       "llm-tracing-graph",
@@ -167,6 +173,7 @@ const GraphSection = ({
     data: spanGraphData,
     isFetching: spanGraphLoading,
     isPending: spanGraphPending,
+    isError: spanGraphError,
   } = useQuery({
     queryKey: [
       "llm-tracing-graph",
@@ -195,12 +202,18 @@ const GraphSection = ({
     selectedTab === "trace"
       ? traceGraphLoading && traceGraphPending
       : spanGraphLoading && spanGraphPending;
+  const apiGraphError =
+    selectedTab === "trace" ? traceGraphError : spanGraphError;
+  const apiGraphReadState = getQueryReadState(apiGraphData, {
+    isError: apiGraphError,
+  });
+  const apiGraphReadMessage = getQueryReadMessage(apiGraphReadState);
 
   const chartData = useMemo(() => {
     const primaryData = [];
     const trafficData = [];
 
-    const evalData = Array.isArray(apiGraphData?.data) ? apiGraphData.data : [];
+    const evalData = getExactGraphData(apiGraphData);
 
     for (const item of evalData) {
       if (item.timestamp != null) {
@@ -606,7 +619,8 @@ const GraphSection = ({
                 (selectedGraphConfig ||
                   selectedGraphEvals?.length > 0 ||
                   Object.keys(selectedGraphAttributes || {}).length > 0) &&
-                !apiGraphLoading
+                !apiGraphLoading &&
+                !apiGraphReadMessage
               }
             >
               <ReactApexChart
@@ -621,6 +635,24 @@ const GraphSection = ({
             <ShowComponent condition={apiGraphLoading}>
               <Box sx={{ height: isCollapsed ? 124 : 248 }}>
                 <GraphSkeleton />
+              </Box>
+            </ShowComponent>
+
+            <ShowComponent condition={!apiGraphLoading && apiGraphReadMessage}>
+              <Box
+                role="status"
+                sx={{
+                  minHeight: isCollapsed ? 124 : 248,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  color:
+                    apiGraphReadState === "error"
+                      ? "error.main"
+                      : "warning.main",
+                }}
+              >
+                <Typography fontSize="12px">{apiGraphReadMessage}</Typography>
               </Box>
             </ShowComponent>
           </Box>
@@ -687,8 +719,8 @@ GraphSection.propTypes = {
   compareType: PropTypes.string,
   setSelectedGraphEvals: PropTypes.func,
   setSelectedGraphProperty: PropTypes.func,
-  dateFilter: PropTypes.array,
-  selectedGraphAttributes: PropTypes.string,
+  dateFilter: PropTypes.object,
+  selectedGraphAttributes: PropTypes.object,
   setSelectedGraphAttributes: PropTypes.func,
   setDateFilter: PropTypes.func,
   index: PropTypes.number,

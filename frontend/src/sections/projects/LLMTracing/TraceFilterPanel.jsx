@@ -49,9 +49,12 @@ import {
   getPickerOptionSearchText,
   getPickerOptionSecondaryLabel,
   getPickerOptionValue,
+  normalizePickerValues,
   usesFreeTextValue,
 } from "./filterValuePickerUtils";
 import { ID_ONLY_FIELDS } from "./idFields";
+import { getQueryReadMessage } from "src/utils/queryReadState";
+import { useExactTraceAttributeProperties } from "./useExactTraceAttributeProperties";
 
 // ---------------------------------------------------------------------------
 // Trace filter fields (for Query tab via shared FilterPanel)
@@ -654,6 +657,7 @@ export function useTraceFilterProperties(
       buildTraceFilterProperties(metrics, { isSimulator, sourceScope }),
     staleTime: 5 * 60_000,
     gcTime: 15 * 60_000,
+    meta: { errorHandled: true },
   });
 }
 
@@ -667,27 +671,55 @@ function PropertyPicker({
   properties,
   onSelect,
   categories = CATEGORIES,
+  projectId,
+  source = "traces",
+  attributeLookupContext = "",
+  enableExactAttributeLookup = true,
+  catalogError = false,
 }) {
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("all");
   const hasCategorySidebar = categories && categories.length > 0;
+  const {
+    data: exactAttributeProperties,
+    isFetching: exactAttributeLoading,
+    queryReadState: exactAttributeReadState,
+    debouncedSearch,
+  } = useExactTraceAttributeProperties({
+    projectId,
+    search,
+    source,
+    enabled: enableExactAttributeLookup && open,
+    contextKey: attributeLookupContext,
+  });
+
+  const propertiesWithExactAttribute = useMemo(() => {
+    const byId = new Map(
+      (properties || []).map((property) => [property.id, property]),
+    );
+    for (const property of exactAttributeProperties) {
+      if (!byId.has(property.id)) byId.set(property.id, property);
+    }
+    return Array.from(byId.values());
+  }, [properties, exactAttributeProperties]);
 
   const filtered = useMemo(
     () =>
       filterPropertiesForPicker({
-        properties,
+        properties: propertiesWithExactAttribute,
         category,
         search,
         hasCategorySidebar,
       }),
-    [properties, category, search, hasCategorySidebar],
+    [propertiesWithExactAttribute, category, search, hasCategorySidebar],
   );
 
   const counts = useMemo(() => {
-    const c = { all: properties.length };
-    for (const p of properties) c[p.category] = (c[p.category] || 0) + 1;
+    const c = { all: propertiesWithExactAttribute.length };
+    for (const p of propertiesWithExactAttribute)
+      c[p.category] = (c[p.category] || 0) + 1;
     return c;
-  }, [properties]);
+  }, [propertiesWithExactAttribute]);
   const visibleProperties = filtered.slice(0, PROPERTY_PICKER_RENDER_LIMIT);
   const hiddenCount = Math.max(
     filtered.length - PROPERTY_PICKER_RENDER_LIMIT,
@@ -747,6 +779,24 @@ function PropertyPicker({
                 sx: { fontSize: 13 },
               }}
             />
+            {search.trim() &&
+              debouncedSearch === search.trim() &&
+              exactAttributeReadState !== "complete" && (
+                <Typography
+                  role="status"
+                  sx={{ mt: 0.75, fontSize: 11, color: "warning.main" }}
+                >
+                  {getQueryReadMessage(exactAttributeReadState)}
+                </Typography>
+              )}
+            {!search.trim() && catalogError && (
+              <Typography
+                role="status"
+                sx={{ mt: 0.75, fontSize: 11, color: "warning.main" }}
+              >
+                {getQueryReadMessage("error")}
+              </Typography>
+            )}
           </Box>
           <Divider />
           <Box sx={{ display: "flex", flex: 1, overflow: "hidden" }}>
@@ -818,7 +868,7 @@ function PropertyPicker({
               </Box>
             )}
             <Box sx={{ flex: 1, overflow: "auto", maxHeight: 280 }}>
-              {filtered.length === 0 && (
+              {filtered.length === 0 && !exactAttributeLoading && (
                 <Typography
                   sx={{
                     p: 2,
@@ -829,6 +879,11 @@ function PropertyPicker({
                 >
                   No properties found
                 </Typography>
+              )}
+              {filtered.length === 0 && exactAttributeLoading && (
+                <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
+                  <CircularProgress size={16} />
+                </Box>
               )}
               {visibleProperties.map((prop, idx) => (
                 <Box
@@ -928,13 +983,7 @@ const SESSION_VALUE_FIELDS = new Set([
 const FREE_TEXT_NO_OPTIONS_TEXT =
   "No values in the last 7 days — type to search, or add an exact value";
 
-function normalizePickerValues(values) {
-  const rawValues = Array.isArray(values) ? values : values ? [values] : [];
-  const cleanValues = rawValues
-    .map((item) => String(getPickerOptionValue(item)).trim())
-    .filter(Boolean);
-  return Array.from(new Set(cleanValues));
-}
+const pickerValueKey = (value) => `${typeof value}:${JSON.stringify(value)}`;
 
 function ValuePicker({
   propertyId,
@@ -979,14 +1028,14 @@ function ValuePicker({
   // page can only be found by the backend. Other field types keep
   // client-side filtering of the fetched page.
   const usesBackendSearch =
-    !hasStaticChoices &&
-    (isIdOnlyField || metricType === "custom_attribute");
+    !hasStaticChoices && (isIdOnlyField || metricType === "custom_attribute");
 
   // Primary: dashboard API values
   const {
     data: dashboardOptions = [],
     isLoading: dashLoading,
     isError: dashError,
+    queryReadState: dashboardReadState,
   } = useDashboardFilterValues({
     metricName: propertyId,
     metricType,
@@ -1000,7 +1049,11 @@ function ValuePicker({
   });
 
   // Fallback: session filter values endpoint (for session-specific fields)
-  const { data: sessionOptions = [], isLoading: sessionLoading } = useQuery({
+  const {
+    data: sessionOptions = [],
+    isLoading: sessionLoading,
+    isError: sessionError,
+  } = useQuery({
     queryKey: ["session-filter-values", projectId, propertyId, debouncedSearch],
     queryFn: () =>
       axios.get(endpoints.project.getSessionFilterValues(), {
@@ -1016,6 +1069,8 @@ function ValuePicker({
     enabled:
       !hasStaticChoices && isSessionField && !!projectId && Boolean(anchorEl),
     staleTime: 30_000,
+    retry: false,
+    meta: { errorHandled: true },
   });
 
   // Source: static choices > session endpoint > dashboard API
@@ -1029,7 +1084,16 @@ function ValuePicker({
     : isSessionField
       ? sessionLoading
       : dashLoading;
-  const isError = !hasStaticChoices && !isSessionField && dashError;
+  const readState = hasStaticChoices
+    ? "complete"
+    : isSessionField
+      ? sessionError
+        ? "error"
+        : "complete"
+      : dashError
+        ? "error"
+        : dashboardReadState;
+  const readMessage = getQueryReadMessage(readState);
 
   const filtered = useMemo(() => {
     if (!search || isSessionField || isIdOnlyField) return options;
@@ -1045,20 +1109,20 @@ function ValuePicker({
     (val) => {
       // Use the shared helper to read the picker option's stable value
       // (handles both string and {value, label} object shapes).
-      const strVal = getPickerOptionValue(val);
+      const optionValue = getPickerOptionValue(val);
       if (singleSelect) {
         // Clicking the already-selected value clears; clicking a different
         // value replaces — standard single-select dropdown UX.
-        onChange(value.includes(strVal) ? [] : [strVal]);
+        onChange(selectedValues.includes(optionValue) ? [] : [optionValue]);
         return;
       }
       onChange(
-        selectedValues.includes(strVal)
-          ? selectedValues.filter((v) => v !== strVal)
-          : [...selectedValues, strVal],
+        selectedValues.includes(optionValue)
+          ? selectedValues.filter((v) => v !== optionValue)
+          : [...selectedValues, optionValue],
       );
     },
-    [selectedValues, value, onChange, singleSelect],
+    [selectedValues, onChange, singleSelect],
   );
 
   const customSearchValue = search.trim();
@@ -1101,11 +1165,13 @@ function ValuePicker({
           <Typography sx={{ fontSize: 12, color: "text.disabled", flex: 1 }}>
             {isLoading
               ? "Loading..."
-              : options.length === 0
-                ? "No recent values"
-                : singleSelect
-                  ? "Select a value..."
-                  : "Select values..."}
+              : readMessage
+                ? "Values temporarily unavailable"
+                : options.length === 0
+                  ? "No recent values"
+                  : singleSelect
+                    ? "Select a value..."
+                    : "Select values..."}
           </Typography>
         ) : singleSelect ? (
           // Plain text instead of a chip — chips read as "removable token
@@ -1117,10 +1183,10 @@ function ValuePicker({
               return ov === v;
             });
             const displayLabel =
-              (typeof match === "string" ? match : match?.label) || v;
+              (typeof match === "string" ? match : match?.label) ?? String(v);
             return (
               <Typography
-                key={v}
+                key={pickerValueKey(v)}
                 noWrap
                 title={displayLabel}
                 sx={{
@@ -1143,14 +1209,14 @@ function ValuePicker({
               return ov === v;
             });
             const displayLabel =
-              (typeof match === "string" ? match : match?.label) || v;
+              (typeof match === "string" ? match : match?.label) ?? String(v);
             const secondaryLabel = getPickerOptionSecondaryLabel(match);
             const chipTitle = secondaryLabel
               ? `${displayLabel} (${secondaryLabel})`
               : displayLabel;
             return (
               <Chip
-                key={v}
+                key={pickerValueKey(v)}
                 label={displayLabel}
                 title={chipTitle}
                 size="small"
@@ -1232,7 +1298,20 @@ function ValuePicker({
               <CircularProgress size={16} />
             </Box>
           )}
-          {!isLoading && !search && (isError || filtered.length === 0) && (
+          {!isLoading && readMessage && (
+            <Typography
+              role="status"
+              sx={{
+                p: 1.5,
+                textAlign: "center",
+                fontSize: 12,
+                color: "warning.main",
+              }}
+            >
+              {readMessage}
+            </Typography>
+          )}
+          {!isLoading && !readMessage && !search && filtered.length === 0 && (
             <Typography
               sx={{
                 p: 1.5,
@@ -1241,23 +1320,21 @@ function ValuePicker({
                 color: "text.disabled",
               }}
             >
-              {isError
-                ? "Values not available for this property"
-                : FREE_TEXT_NO_OPTIONS_TEXT}
+              {FREE_TEXT_NO_OPTIONS_TEXT}
             </Typography>
           )}
           {/* Custom-value row is rendered below in the showCustomValueRow
               block — keeps a single source of truth for the "Specify"
               fallback (search did not match any fetched option). */}
           {filtered.map((opt) => {
-            const strVal = getPickerOptionValue(opt);
+            const optionValue = getPickerOptionValue(opt);
             const label = getPickerOptionLabel(opt);
             const secondaryLabel = getPickerOptionSecondaryLabel(opt);
-            const isSelected = selectedValues.includes(strVal);
+            const isSelected = selectedValues.includes(optionValue);
             return (
               <Box
-                key={strVal}
-                data-filter-value-option={strVal}
+                key={pickerValueKey(optionValue)}
+                data-filter-value-option={String(optionValue)}
                 onClick={() => toggleValue(opt)}
                 sx={{
                   display: "flex",
@@ -1402,6 +1479,10 @@ function FilterRow({
   freeSoloValues = false,
   operatorFilter,
   defaultOperatorForType,
+  attributeLookupContext,
+  enableExactAttributeLookup = true,
+  catalogError = false,
+  attributeSource,
 }) {
   const [pickerAnchor, setPickerAnchor] = useState(null);
   const selectedProp = properties.find((p) => p.id === filter.field);
@@ -1795,6 +1876,11 @@ function FilterRow({
         properties={properties}
         categories={categories}
         onSelect={handlePropertySelect}
+        projectId={projectId}
+        source={attributeSource || source}
+        attributeLookupContext={attributeLookupContext}
+        enableExactAttributeLookup={enableExactAttributeLookup}
+        catalogError={catalogError}
       />
 
       <Select
@@ -1866,13 +1952,19 @@ const TraceFilterPanel = ({
   const { observeId: routeObserveId } = useParams();
   const observeId = projectIdProp || routeObserveId;
   const skipDynamicProperties = Boolean(propertiesOverride);
-  const dynamicPropertySource = isSpansView ? "spans" : "traces";
-  const { data: dynamicProperties = [], isLoading: dynamicPropsLoading } =
-    useTraceFilterProperties(observeId, {
-      enabled: !skipDynamicProperties,
-      isSimulator,
-      sourceScope: dynamicPropertySource,
-    });
+  const dynamicPropertySource =
+    isSpansView || tab === "spans" ? "spans" : "traces";
+  const exactAttributeSource =
+    source === "traces" ? dynamicPropertySource : source;
+  const {
+    data: dynamicProperties = [],
+    isLoading: dynamicPropsLoading,
+    isError: dynamicPropsError,
+  } = useTraceFilterProperties(observeId, {
+    enabled: !skipDynamicProperties,
+    isSimulator,
+    sourceScope: dynamicPropertySource,
+  });
   // Merge: static trace fields + dynamic dashboard properties + any extra static fields
   const properties = useMemo(() => {
     if (propertiesOverride) {
@@ -1914,6 +2006,10 @@ const TraceFilterPanel = ({
     [properties],
   );
   const propsLoading = skipDynamicProperties ? false : dynamicPropsLoading;
+  const attributeLookupContext = useMemo(
+    () => JSON.stringify(currentFilters || []),
+    [currentFilters],
+  );
   const effectiveCategories = categoriesOverride ?? CATEGORIES;
   const effectiveDefaultRow = defaultRowOverride || DEFAULT_ROW;
   const [activeTab, setActiveTab] = useState("basic");
@@ -1976,13 +2072,20 @@ const TraceFilterPanel = ({
     if (cat === "attribute") return "custom_attribute";
     return "system_metric";
   })();
-  const { data: queryValueOptions = [], isLoading: queryValuesLoading } =
-    useDashboardFilterValues({
-      metricName: queryField || "",
-      metricType: queryMetricType,
-      projectIds: observeId ? [observeId] : [],
-      source,
-    });
+  const {
+    data: queryValueOptions = [],
+    isLoading: queryValuesLoading,
+    isError: queryValuesError,
+    queryReadState: queryValuesReadState,
+  } = useDashboardFilterValues({
+    metricName: queryField || "",
+    metricType: queryMetricType,
+    projectIds: observeId ? [observeId] : [],
+    source,
+  });
+  const queryValuesMessage = getQueryReadMessage(
+    queryValuesError ? "error" : queryValuesReadState,
+  );
 
   useEffect(() => {
     if (open) {
@@ -2356,6 +2459,10 @@ const TraceFilterPanel = ({
                     freeSoloValues={freeSoloValues}
                     operatorFilter={operatorFilter}
                     defaultOperatorForType={defaultOperatorForType}
+                    attributeLookupContext={attributeLookupContext}
+                    enableExactAttributeLookup={!skipDynamicProperties}
+                    catalogError={!skipDynamicProperties && dynamicPropsError}
+                    attributeSource={exactAttributeSource}
                   />
                 ))}
               </Stack>
@@ -2425,6 +2532,14 @@ const TraceFilterPanel = ({
               valueLoading={queryValuesLoading}
               onFieldChange={setQueryField}
             />
+            {queryField && queryValuesMessage && (
+              <Typography
+                role="status"
+                sx={{ fontSize: 11, color: "warning.main", mt: 0.75, px: 0.5 }}
+              >
+                {queryValuesMessage}
+              </Typography>
+            )}
             <Stack
               direction="row"
               justifyContent="flex-end"

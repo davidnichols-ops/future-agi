@@ -160,6 +160,9 @@ def resolve_user_ids(end_user_ids: Iterable[object]) -> dict[str, str | None]:
 
 def resolve_end_user_fields(
     end_user_ids: Iterable[object],
+    *,
+    timeout_ms: int | None = None,
+    settings: dict | None = None,
 ) -> dict[str, dict[str, str | None]]:
     """Batch-resolve ``{end_user_id (str) -> {user_id, user_id_type,
     user_id_hash}}`` from the CH ``end_users_dict`` — the curated fields the
@@ -203,6 +206,14 @@ def resolve_end_user_fields(
         # id (a new-id span is not a key in the OLD-keyed dict). The returned KEY
         # stays the ORIGINAL input id (`eid`) so callers key by the id they
         # passed. Pre-flip a no-op (no id matches a `new_id`) → gate B.
+        query_kwargs = {"parameters": {"ids": list(ids)}}
+        query_settings = dict(settings or {})
+        if timeout_ms is not None:
+            if timeout_ms <= 0:
+                raise ValueError("timeout_ms must be positive")
+            query_settings["max_execution_time"] = timeout_ms / 1000
+        if query_settings:
+            query_kwargs["settings"] = query_settings
         result = client.query(
             (
                 f"SELECT toString(ids.eid), "
@@ -212,7 +223,7 @@ def resolve_end_user_fields(
                 f"FROM (SELECT arrayJoin(%(ids)s::Array(UUID)) AS eid) AS ids "
                 f"{remap_join}"
             ),
-            parameters={"ids": list(ids)},
+            **query_kwargs,
         )
     except Exception:
         _reset_client()
@@ -237,6 +248,8 @@ def resolve_end_user_ids_by_user_id(
     project_id: object | None = None,
     organization_id: object | None = None,
     user_id_type: object | None = _UNSET,
+    timeout_ms: int | None = None,
+    settings: dict | None = None,
 ) -> list[str]:
     """Reverse-resolve a human ``user_id`` label → the curated ``end_user_id``
     SET from the CH ``end_users`` RMT (the state-robust reverse lookup,
@@ -314,9 +327,17 @@ def resolve_end_user_ids_by_user_id(
         params["utype"] = "" if user_id_type in (None, "") else str(user_id_type)
     where = " AND ".join(conds)
     try:
+        query_kwargs = {"parameters": params}
+        query_settings = dict(settings or {})
+        if timeout_ms is not None:
+            if timeout_ms <= 0:
+                raise ValueError("timeout_ms must be positive")
+            query_settings["max_execution_time"] = timeout_ms / 1000
+        if query_settings:
+            query_kwargs["settings"] = query_settings
         result = client.query(
             f"SELECT DISTINCT toString(end_user_id) FROM end_users FINAL WHERE {where}",
-            parameters=params,
+            **query_kwargs,
         )
     except Exception:
         _reset_client()

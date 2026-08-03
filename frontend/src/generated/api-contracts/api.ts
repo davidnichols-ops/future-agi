@@ -303,6 +303,7 @@ import type {
   CustomerInvoicesResponseApi,
   DashboardCreateUpdateApi,
   DashboardDetailApi,
+  DashboardFilterValuesResponseApi,
   DashboardMetricsCatalogResponseApi,
   DashboardPreviewQueryApi,
   DashboardQueryApi,
@@ -746,6 +747,7 @@ import type {
   ObservationAttributeListResponseApi,
   ObservationSpanApi,
   ObserveDatasetApi,
+  ObserveGraphDataErrorResponseApi,
   ObserveGraphDataRequestApi,
   ObserveGraphDataResponseApi,
   OperationConfigResponseApi,
@@ -785,6 +787,7 @@ import type {
   OrganizationUpdateResponseApi,
   OverviewApiResponseApi,
   PIIEntitiesResponseApi,
+  PageDepthExceededErrorApi,
   PasskeyCredentialRequestApi,
   PasskeyOptionsResponseApi,
   PasskeyRegisterVerifyApi,
@@ -1094,13 +1097,13 @@ import type {
   TraceTagsUpdateApi,
   TraceToGraphRequestApi,
   TraceToGraphResponseApi,
+  TraceVoiceCallListResponseApi,
   TracerChartsFetchGraph200,
   TracerChartsFetchGraphParams,
   TracerCustomEvalConfigList200,
   TracerCustomEvalConfigListCustomEvalConfigs200,
   TracerCustomEvalConfigListCustomEvalConfigsParams,
   TracerCustomEvalConfigListParams,
-  TracerDashboardFilterValues200,
   TracerDashboardFilterValuesParams,
   TracerDashboardList200,
   TracerDashboardListParams,
@@ -1150,7 +1153,6 @@ import type {
   TracerObservationSpanList200,
   TracerObservationSpanListParams,
   TracerObservationSpanListSpans200,
-  TracerObservationSpanListSpansObserve200,
   TracerObservationSpanListSpansObserveParams,
   TracerObservationSpanListSpansParams,
   TracerObservationSpanRetrieveLoading200,
@@ -1197,9 +1199,7 @@ import type {
   TracerTraceListTraces200,
   TracerTraceListTracesOfSessionParams,
   TracerTraceListTracesParams,
-  TracerTraceListVoiceCalls200,
   TracerTraceListVoiceCallsParams,
-  TracerTraceSessionGetSessionFilterValues200,
   TracerTraceSessionGetSessionFilterValuesParams,
   TracerTraceSessionGetTraceSessionExportData200,
   TracerTraceSessionGetTraceSessionExportDataParams,
@@ -58400,25 +58400,35 @@ export const tracerDashboardCreate = async (dashboardCreateUpdateApi: DashboardC
 
 
 export type tracerDashboardFilterValuesResponse200 = {
-  data: TracerDashboardFilterValues200
+  data: DashboardFilterValuesResponseApi
   status: 200
+}
+
+export type tracerDashboardFilterValuesResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerDashboardFilterValuesResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
 }
 
 export type tracerDashboardFilterValuesResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerDashboardFilterValuesResponseSuccess = (tracerDashboardFilterValuesResponse200) & {
   headers: Headers;
 };
-export type tracerDashboardFilterValuesResponseError = (tracerDashboardFilterValuesResponseDefault) & {
+export type tracerDashboardFilterValuesResponseError = (tracerDashboardFilterValuesResponse400 | tracerDashboardFilterValuesResponse500 | tracerDashboardFilterValuesResponseDefault) & {
   headers: Headers;
 };
 
 export type tracerDashboardFilterValuesResponse = (tracerDashboardFilterValuesResponseSuccess | tracerDashboardFilterValuesResponseError)
 
-export const getTracerDashboardFilterValuesUrl = (params?: TracerDashboardFilterValuesParams,) => {
+export const getTracerDashboardFilterValuesUrl = (params: TracerDashboardFilterValuesParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -58440,7 +58450,7 @@ export const getTracerDashboardFilterValuesUrl = (params?: TracerDashboardFilter
 /**
  * Return distinct values for a given metric/attribute, for filter value picker.
  */
-export const tracerDashboardFilterValues = async (params?: TracerDashboardFilterValuesParams, options?: RequestInit): Promise<tracerDashboardFilterValuesResponse> => {
+export const tracerDashboardFilterValues = async (params: TracerDashboardFilterValuesParams, options?: RequestInit): Promise<tracerDashboardFilterValuesResponse> => {
 
   return apiMutator<tracerDashboardFilterValuesResponse>(getTracerDashboardFilterValuesUrl(params),
   {
@@ -58524,15 +58534,25 @@ export type tracerDashboardQueryResponse400 = {
   status: 400
 }
 
+export type tracerDashboardQueryResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerDashboardQueryResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerDashboardQueryResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerDashboardQueryResponseSuccess = (tracerDashboardQueryResponse200) & {
   headers: Headers;
 };
-export type tracerDashboardQueryResponseError = (tracerDashboardQueryResponse400 | tracerDashboardQueryResponseDefault) & {
+export type tracerDashboardQueryResponseError = (tracerDashboardQueryResponse400 | tracerDashboardQueryResponse500 | tracerDashboardQueryResponse503 | tracerDashboardQueryResponseDefault) & {
   headers: Headers;
 };
 
@@ -58728,15 +58748,25 @@ export type tracerDashboardWidgetsPreviewQueryResponse400 = {
   status: 400
 }
 
+export type tracerDashboardWidgetsPreviewQueryResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerDashboardWidgetsPreviewQueryResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerDashboardWidgetsPreviewQueryResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerDashboardWidgetsPreviewQueryResponseSuccess = (tracerDashboardWidgetsPreviewQueryResponse200) & {
   headers: Headers;
 };
-export type tracerDashboardWidgetsPreviewQueryResponseError = (tracerDashboardWidgetsPreviewQueryResponse400 | tracerDashboardWidgetsPreviewQueryResponseDefault) & {
+export type tracerDashboardWidgetsPreviewQueryResponseError = (tracerDashboardWidgetsPreviewQueryResponse400 | tracerDashboardWidgetsPreviewQueryResponse500 | tracerDashboardWidgetsPreviewQueryResponse503 | tracerDashboardWidgetsPreviewQueryResponseDefault) & {
   headers: Headers;
 };
 
@@ -59042,15 +59072,25 @@ export type tracerDashboardWidgetsExecuteQueryResponse400 = {
   status: 400
 }
 
+export type tracerDashboardWidgetsExecuteQueryResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerDashboardWidgetsExecuteQueryResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerDashboardWidgetsExecuteQueryResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerDashboardWidgetsExecuteQueryResponseSuccess = (tracerDashboardWidgetsExecuteQueryResponse200) & {
   headers: Headers;
 };
-export type tracerDashboardWidgetsExecuteQueryResponseError = (tracerDashboardWidgetsExecuteQueryResponse400 | tracerDashboardWidgetsExecuteQueryResponseDefault) & {
+export type tracerDashboardWidgetsExecuteQueryResponseError = (tracerDashboardWidgetsExecuteQueryResponse400 | tracerDashboardWidgetsExecuteQueryResponse500 | tracerDashboardWidgetsExecuteQueryResponse503 | tracerDashboardWidgetsExecuteQueryResponseDefault) & {
   headers: Headers;
 };
 
@@ -59642,15 +59682,25 @@ export type tracerEvalTaskCreateResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskCreateResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskCreateResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskCreateResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerEvalTaskCreateResponseSuccess = (tracerEvalTaskCreateResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskCreateResponseError = (tracerEvalTaskCreateResponseDefault) & {
+export type tracerEvalTaskCreateResponseError = (tracerEvalTaskCreateResponse400 | tracerEvalTaskCreateResponse500 | tracerEvalTaskCreateResponseDefault) & {
   headers: Headers;
 };
 
@@ -59683,15 +59733,30 @@ export type tracerEvalTaskGetEvalDetailsResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskGetEvalDetailsResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskGetEvalDetailsResponse404 = {
+  data: ApiErrorResponseApi
+  status: 404
+}
+
+export type tracerEvalTaskGetEvalDetailsResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskGetEvalDetailsResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500>
 }
 
 export type tracerEvalTaskGetEvalDetailsResponseSuccess = (tracerEvalTaskGetEvalDetailsResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskGetEvalDetailsResponseError = (tracerEvalTaskGetEvalDetailsResponseDefault) & {
+export type tracerEvalTaskGetEvalDetailsResponseError = (tracerEvalTaskGetEvalDetailsResponse400 | tracerEvalTaskGetEvalDetailsResponse404 | tracerEvalTaskGetEvalDetailsResponse500 | tracerEvalTaskGetEvalDetailsResponseDefault) & {
   headers: Headers;
 };
 
@@ -59734,15 +59799,25 @@ export type tracerEvalTaskGetEvalTaskLogsResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskGetEvalTaskLogsResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskGetEvalTaskLogsResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskGetEvalTaskLogsResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerEvalTaskGetEvalTaskLogsResponseSuccess = (tracerEvalTaskGetEvalTaskLogsResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskGetEvalTaskLogsResponseError = (tracerEvalTaskGetEvalTaskLogsResponseDefault) & {
+export type tracerEvalTaskGetEvalTaskLogsResponseError = (tracerEvalTaskGetEvalTaskLogsResponse400 | tracerEvalTaskGetEvalTaskLogsResponse500 | tracerEvalTaskGetEvalTaskLogsResponseDefault) & {
   headers: Headers;
 };
 
@@ -59785,15 +59860,25 @@ export type tracerEvalTaskGetUsageResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskGetUsageResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskGetUsageResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskGetUsageResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerEvalTaskGetUsageResponseSuccess = (tracerEvalTaskGetUsageResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskGetUsageResponseError = (tracerEvalTaskGetUsageResponseDefault) & {
+export type tracerEvalTaskGetUsageResponseError = (tracerEvalTaskGetUsageResponse400 | tracerEvalTaskGetUsageResponse500 | tracerEvalTaskGetUsageResponseDefault) & {
   headers: Headers;
 };
 
@@ -59836,15 +59921,25 @@ export type tracerEvalTaskListEvalTasksResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskListEvalTasksResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskListEvalTasksResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskListEvalTasksResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerEvalTaskListEvalTasksResponseSuccess = (tracerEvalTaskListEvalTasksResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskListEvalTasksResponseError = (tracerEvalTaskListEvalTasksResponseDefault) & {
+export type tracerEvalTaskListEvalTasksResponseError = (tracerEvalTaskListEvalTasksResponse400 | tracerEvalTaskListEvalTasksResponse500 | tracerEvalTaskListEvalTasksResponseDefault) & {
   headers: Headers;
 };
 
@@ -59890,15 +59985,25 @@ export type tracerEvalTaskListEvalTasksWithProjectNameResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskListEvalTasksWithProjectNameResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskListEvalTasksWithProjectNameResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskListEvalTasksWithProjectNameResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerEvalTaskListEvalTasksWithProjectNameResponseSuccess = (tracerEvalTaskListEvalTasksWithProjectNameResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskListEvalTasksWithProjectNameResponseError = (tracerEvalTaskListEvalTasksWithProjectNameResponseDefault) & {
+export type tracerEvalTaskListEvalTasksWithProjectNameResponseError = (tracerEvalTaskListEvalTasksWithProjectNameResponse400 | tracerEvalTaskListEvalTasksWithProjectNameResponse500 | tracerEvalTaskListEvalTasksWithProjectNameResponseDefault) & {
   headers: Headers;
 };
 
@@ -59944,15 +60049,25 @@ export type tracerEvalTaskMarkEvalTasksDeletedResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskMarkEvalTasksDeletedResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskMarkEvalTasksDeletedResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskMarkEvalTasksDeletedResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerEvalTaskMarkEvalTasksDeletedResponseSuccess = (tracerEvalTaskMarkEvalTasksDeletedResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskMarkEvalTasksDeletedResponseError = (tracerEvalTaskMarkEvalTasksDeletedResponseDefault) & {
+export type tracerEvalTaskMarkEvalTasksDeletedResponseError = (tracerEvalTaskMarkEvalTasksDeletedResponse400 | tracerEvalTaskMarkEvalTasksDeletedResponse500 | tracerEvalTaskMarkEvalTasksDeletedResponseDefault) & {
   headers: Headers;
 };
 
@@ -59985,15 +60100,25 @@ export type tracerEvalTaskPauseEvalTaskResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskPauseEvalTaskResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskPauseEvalTaskResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskPauseEvalTaskResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerEvalTaskPauseEvalTaskResponseSuccess = (tracerEvalTaskPauseEvalTaskResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskPauseEvalTaskResponseError = (tracerEvalTaskPauseEvalTaskResponseDefault) & {
+export type tracerEvalTaskPauseEvalTaskResponseError = (tracerEvalTaskPauseEvalTaskResponse400 | tracerEvalTaskPauseEvalTaskResponse500 | tracerEvalTaskPauseEvalTaskResponseDefault) & {
   headers: Headers;
 };
 
@@ -60038,15 +60163,25 @@ export type tracerEvalTaskUnpauseEvalTaskResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskUnpauseEvalTaskResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskUnpauseEvalTaskResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskUnpauseEvalTaskResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerEvalTaskUnpauseEvalTaskResponseSuccess = (tracerEvalTaskUnpauseEvalTaskResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskUnpauseEvalTaskResponseError = (tracerEvalTaskUnpauseEvalTaskResponseDefault) & {
+export type tracerEvalTaskUnpauseEvalTaskResponseError = (tracerEvalTaskUnpauseEvalTaskResponse400 | tracerEvalTaskUnpauseEvalTaskResponse500 | tracerEvalTaskUnpauseEvalTaskResponseDefault) & {
   headers: Headers;
 };
 
@@ -60091,15 +60226,25 @@ export type tracerEvalTaskUpdateEvalTaskResponse200 = {
   status: 200
 }
 
+export type tracerEvalTaskUpdateEvalTaskResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerEvalTaskUpdateEvalTaskResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerEvalTaskUpdateEvalTaskResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerEvalTaskUpdateEvalTaskResponseSuccess = (tracerEvalTaskUpdateEvalTaskResponse200) & {
   headers: Headers;
 };
-export type tracerEvalTaskUpdateEvalTaskResponseError = (tracerEvalTaskUpdateEvalTaskResponseDefault) & {
+export type tracerEvalTaskUpdateEvalTaskResponseError = (tracerEvalTaskUpdateEvalTaskResponse400 | tracerEvalTaskUpdateEvalTaskResponse500 | tracerEvalTaskUpdateEvalTaskResponseDefault) & {
   headers: Headers;
 };
 
@@ -62004,15 +62149,30 @@ export type tracerObservationSpanGetEvalAttributesListResponse200 = {
   status: 200
 }
 
+export type tracerObservationSpanGetEvalAttributesListResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanGetEvalAttributesListResponse404 = {
+  data: ApiErrorResponseApi
+  status: 404
+}
+
+export type tracerObservationSpanGetEvalAttributesListResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerObservationSpanGetEvalAttributesListResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500>
 }
 
 export type tracerObservationSpanGetEvalAttributesListResponseSuccess = (tracerObservationSpanGetEvalAttributesListResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanGetEvalAttributesListResponseError = (tracerObservationSpanGetEvalAttributesListResponseDefault) & {
+export type tracerObservationSpanGetEvalAttributesListResponseError = (tracerObservationSpanGetEvalAttributesListResponse400 | tracerObservationSpanGetEvalAttributesListResponse404 | tracerObservationSpanGetEvalAttributesListResponse500 | tracerObservationSpanGetEvalAttributesListResponseDefault) & {
   headers: Headers;
 };
 
@@ -62062,15 +62222,30 @@ export type tracerObservationSpanGetEvaluationDetailsResponse200 = {
   status: 200
 }
 
+export type tracerObservationSpanGetEvaluationDetailsResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanGetEvaluationDetailsResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerObservationSpanGetEvaluationDetailsResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerObservationSpanGetEvaluationDetailsResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerObservationSpanGetEvaluationDetailsResponseSuccess = (tracerObservationSpanGetEvaluationDetailsResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanGetEvaluationDetailsResponseError = (tracerObservationSpanGetEvaluationDetailsResponseDefault) & {
+export type tracerObservationSpanGetEvaluationDetailsResponseError = (tracerObservationSpanGetEvaluationDetailsResponse400 | tracerObservationSpanGetEvaluationDetailsResponse500 | tracerObservationSpanGetEvaluationDetailsResponse503 | tracerObservationSpanGetEvaluationDetailsResponseDefault) & {
   headers: Headers;
 };
 
@@ -62113,15 +62288,25 @@ export type tracerObservationSpanGetGraphMethodsResponse200 = {
   status: 200
 }
 
+export type tracerObservationSpanGetGraphMethodsResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanGetGraphMethodsResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerObservationSpanGetGraphMethodsResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerObservationSpanGetGraphMethodsResponseSuccess = (tracerObservationSpanGetGraphMethodsResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanGetGraphMethodsResponseError = (tracerObservationSpanGetGraphMethodsResponseDefault) & {
+export type tracerObservationSpanGetGraphMethodsResponseError = (tracerObservationSpanGetGraphMethodsResponse400 | tracerObservationSpanGetGraphMethodsResponse500 | tracerObservationSpanGetGraphMethodsResponseDefault) & {
   headers: Headers;
 };
 
@@ -62208,15 +62393,30 @@ export type tracerObservationSpanGetSpanAttributesListResponse200 = {
   status: 200
 }
 
+export type tracerObservationSpanGetSpanAttributesListResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanGetSpanAttributesListResponse404 = {
+  data: ApiErrorResponseApi
+  status: 404
+}
+
+export type tracerObservationSpanGetSpanAttributesListResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerObservationSpanGetSpanAttributesListResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500>
 }
 
 export type tracerObservationSpanGetSpanAttributesListResponseSuccess = (tracerObservationSpanGetSpanAttributesListResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanGetSpanAttributesListResponseError = (tracerObservationSpanGetSpanAttributesListResponseDefault) & {
+export type tracerObservationSpanGetSpanAttributesListResponseError = (tracerObservationSpanGetSpanAttributesListResponse400 | tracerObservationSpanGetSpanAttributesListResponse404 | tracerObservationSpanGetSpanAttributesListResponse500 | tracerObservationSpanGetSpanAttributesListResponseDefault) & {
   headers: Headers;
 };
 
@@ -62425,15 +62625,35 @@ export type tracerObservationSpanListSpansResponse200 = {
   status: 200
 }
 
+export type tracerObservationSpanListSpansResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanListSpansResponse422 = {
+  data: PageDepthExceededErrorApi
+  status: 422
+}
+
+export type tracerObservationSpanListSpansResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerObservationSpanListSpansResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerObservationSpanListSpansResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
 }
 
 export type tracerObservationSpanListSpansResponseSuccess = (tracerObservationSpanListSpansResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanListSpansResponseError = (tracerObservationSpanListSpansResponseDefault) & {
+export type tracerObservationSpanListSpansResponseError = (tracerObservationSpanListSpansResponse400 | tracerObservationSpanListSpansResponse422 | tracerObservationSpanListSpansResponse500 | tracerObservationSpanListSpansResponse503 | tracerObservationSpanListSpansResponseDefault) & {
   headers: Headers;
 };
 
@@ -62475,19 +62695,39 @@ export const tracerObservationSpanListSpans = async (params?: TracerObservationS
 
 
 export type tracerObservationSpanListSpansObserveResponse200 = {
-  data: TracerObservationSpanListSpansObserve200
+  data: TraceObserveListResponseApi
   status: 200
+}
+
+export type tracerObservationSpanListSpansObserveResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanListSpansObserveResponse422 = {
+  data: PageDepthExceededErrorApi
+  status: 422
+}
+
+export type tracerObservationSpanListSpansObserveResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerObservationSpanListSpansObserveResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
 }
 
 export type tracerObservationSpanListSpansObserveResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
 }
 
 export type tracerObservationSpanListSpansObserveResponseSuccess = (tracerObservationSpanListSpansObserveResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanListSpansObserveResponseError = (tracerObservationSpanListSpansObserveResponseDefault) & {
+export type tracerObservationSpanListSpansObserveResponseError = (tracerObservationSpanListSpansObserveResponse400 | tracerObservationSpanListSpansObserveResponse422 | tracerObservationSpanListSpansObserveResponse500 | tracerObservationSpanListSpansObserveResponse503 | tracerObservationSpanListSpansObserveResponseDefault) & {
   headers: Headers;
 };
 
@@ -62766,15 +63006,30 @@ export type tracerObservationSpanReadResponse200 = {
   status: 200
 }
 
+export type tracerObservationSpanReadResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerObservationSpanReadResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerObservationSpanReadResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerObservationSpanReadResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerObservationSpanReadResponseSuccess = (tracerObservationSpanReadResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanReadResponseError = (tracerObservationSpanReadResponseDefault) & {
+export type tracerObservationSpanReadResponseError = (tracerObservationSpanReadResponse400 | tracerObservationSpanReadResponse500 | tracerObservationSpanReadResponse503 | tracerObservationSpanReadResponseDefault) & {
   headers: Headers;
 };
 
@@ -65747,25 +66002,40 @@ export const tracerTraceSessionCreate = async (traceSessionApi: NonReadonly<Trac
 
 
 export type tracerTraceSessionGetSessionFilterValuesResponse200 = {
-  data: TracerTraceSessionGetSessionFilterValues200
+  data: TraceSessionApi[]
   status: 200
+}
+
+export type tracerTraceSessionGetSessionFilterValuesResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceSessionGetSessionFilterValuesResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceSessionGetSessionFilterValuesResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
 }
 
 export type tracerTraceSessionGetSessionFilterValuesResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerTraceSessionGetSessionFilterValuesResponseSuccess = (tracerTraceSessionGetSessionFilterValuesResponse200) & {
   headers: Headers;
 };
-export type tracerTraceSessionGetSessionFilterValuesResponseError = (tracerTraceSessionGetSessionFilterValuesResponseDefault) & {
+export type tracerTraceSessionGetSessionFilterValuesResponseError = (tracerTraceSessionGetSessionFilterValuesResponse400 | tracerTraceSessionGetSessionFilterValuesResponse500 | tracerTraceSessionGetSessionFilterValuesResponse503 | tracerTraceSessionGetSessionFilterValuesResponseDefault) & {
   headers: Headers;
 };
 
 export type tracerTraceSessionGetSessionFilterValuesResponse = (tracerTraceSessionGetSessionFilterValuesResponseSuccess | tracerTraceSessionGetSessionFilterValuesResponseError)
 
-export const getTracerTraceSessionGetSessionFilterValuesUrl = (params?: TracerTraceSessionGetSessionFilterValuesParams,) => {
+export const getTracerTraceSessionGetSessionFilterValuesUrl = (params: TracerTraceSessionGetSessionFilterValuesParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -65796,7 +66066,7 @@ Query params:
     page: page number (0-based), default 0
     page_size: default 50
  */
-export const tracerTraceSessionGetSessionFilterValues = async (params?: TracerTraceSessionGetSessionFilterValuesParams, options?: RequestInit): Promise<tracerTraceSessionGetSessionFilterValuesResponse> => {
+export const tracerTraceSessionGetSessionFilterValues = async (params: TracerTraceSessionGetSessionFilterValuesParams, options?: RequestInit): Promise<tracerTraceSessionGetSessionFilterValuesResponse> => {
 
   return apiMutator<tracerTraceSessionGetSessionFilterValuesResponse>(getTracerTraceSessionGetSessionFilterValuesUrl(params),
   {
@@ -65809,20 +66079,35 @@ export const tracerTraceSessionGetSessionFilterValues = async (params?: TracerTr
 
 
 
-export type tracerTraceSessionGetSessionGraphDataResponse201 = {
-  data: TraceSessionGraphDataRequestApi
-  status: 201
+export type tracerTraceSessionGetSessionGraphDataResponse200 = {
+  data: ObserveGraphDataResponseApi
+  status: 200
+}
+
+export type tracerTraceSessionGetSessionGraphDataResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceSessionGetSessionGraphDataResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceSessionGetSessionGraphDataResponse503 = {
+  data: ObserveGraphDataErrorResponseApi
+  status: 503
 }
 
 export type tracerTraceSessionGetSessionGraphDataResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 201>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
-export type tracerTraceSessionGetSessionGraphDataResponseSuccess = (tracerTraceSessionGetSessionGraphDataResponse201) & {
+export type tracerTraceSessionGetSessionGraphDataResponseSuccess = (tracerTraceSessionGetSessionGraphDataResponse200) & {
   headers: Headers;
 };
-export type tracerTraceSessionGetSessionGraphDataResponseError = (tracerTraceSessionGetSessionGraphDataResponseDefault) & {
+export type tracerTraceSessionGetSessionGraphDataResponseError = (tracerTraceSessionGetSessionGraphDataResponse400 | tracerTraceSessionGetSessionGraphDataResponse500 | tracerTraceSessionGetSessionGraphDataResponse503 | tracerTraceSessionGetSessionGraphDataResponseDefault) & {
   headers: Headers;
 };
 
@@ -65919,15 +66204,35 @@ export type tracerTraceSessionListSessionsResponse200 = {
   status: 200
 }
 
+export type tracerTraceSessionListSessionsResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceSessionListSessionsResponse422 = {
+  data: PageDepthExceededErrorApi
+  status: 422
+}
+
+export type tracerTraceSessionListSessionsResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceSessionListSessionsResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerTraceSessionListSessionsResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
 }
 
 export type tracerTraceSessionListSessionsResponseSuccess = (tracerTraceSessionListSessionsResponse200) & {
   headers: Headers;
 };
-export type tracerTraceSessionListSessionsResponseError = (tracerTraceSessionListSessionsResponseDefault) & {
+export type tracerTraceSessionListSessionsResponseError = (tracerTraceSessionListSessionsResponse400 | tracerTraceSessionListSessionsResponse422 | tracerTraceSessionListSessionsResponse500 | tracerTraceSessionListSessionsResponse503 | tracerTraceSessionListSessionsResponseDefault) & {
   headers: Headers;
 };
 
@@ -66279,15 +66584,30 @@ export type tracerTraceAgentGraphResponse200 = {
   status: 200
 }
 
+export type tracerTraceAgentGraphResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceAgentGraphResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceAgentGraphResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerTraceAgentGraphResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerTraceAgentGraphResponseSuccess = (tracerTraceAgentGraphResponse200) & {
   headers: Headers;
 };
-export type tracerTraceAgentGraphResponseError = (tracerTraceAgentGraphResponseDefault) & {
+export type tracerTraceAgentGraphResponseError = (tracerTraceAgentGraphResponse400 | tracerTraceAgentGraphResponse500 | tracerTraceAgentGraphResponse503 | tracerTraceAgentGraphResponseDefault) & {
   headers: Headers;
 };
 
@@ -66420,15 +66740,30 @@ export type tracerTraceGetEvalNamesResponse200 = {
   status: 200
 }
 
+export type tracerTraceGetEvalNamesResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceGetEvalNamesResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceGetEvalNamesResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerTraceGetEvalNamesResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerTraceGetEvalNamesResponseSuccess = (tracerTraceGetEvalNamesResponse200) & {
   headers: Headers;
 };
-export type tracerTraceGetEvalNamesResponseError = (tracerTraceGetEvalNamesResponseDefault) & {
+export type tracerTraceGetEvalNamesResponseError = (tracerTraceGetEvalNamesResponse400 | tracerTraceGetEvalNamesResponse500 | tracerTraceGetEvalNamesResponse503 | tracerTraceGetEvalNamesResponseDefault) & {
   headers: Headers;
 };
 
@@ -66474,15 +66809,25 @@ export type tracerTraceGetGraphMethodsResponse200 = {
   status: 200
 }
 
+export type tracerTraceGetGraphMethodsResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceGetGraphMethodsResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
 export type tracerTraceGetGraphMethodsResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
 }
 
 export type tracerTraceGetGraphMethodsResponseSuccess = (tracerTraceGetGraphMethodsResponse200) & {
   headers: Headers;
 };
-export type tracerTraceGetGraphMethodsResponseError = (tracerTraceGetGraphMethodsResponseDefault) & {
+export type tracerTraceGetGraphMethodsResponseError = (tracerTraceGetGraphMethodsResponse400 | tracerTraceGetGraphMethodsResponse500 | tracerTraceGetGraphMethodsResponseDefault) & {
   headers: Headers;
 };
 
@@ -66735,15 +67080,35 @@ export type tracerTraceListTracesResponse200 = {
   status: 200
 }
 
+export type tracerTraceListTracesResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceListTracesResponse422 = {
+  data: PageDepthExceededErrorApi
+  status: 422
+}
+
+export type tracerTraceListTracesResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceListTracesResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerTraceListTracesResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
 }
 
 export type tracerTraceListTracesResponseSuccess = (tracerTraceListTracesResponse200) & {
   headers: Headers;
 };
-export type tracerTraceListTracesResponseError = (tracerTraceListTracesResponseDefault) & {
+export type tracerTraceListTracesResponseError = (tracerTraceListTracesResponse400 | tracerTraceListTracesResponse422 | tracerTraceListTracesResponse500 | tracerTraceListTracesResponse503 | tracerTraceListTracesResponseDefault) & {
   headers: Headers;
 };
 
@@ -66794,20 +67159,30 @@ export type tracerTraceListTracesOfSessionResponse400 = {
   status: 400
 }
 
+export type tracerTraceListTracesOfSessionResponse422 = {
+  data: PageDepthExceededErrorApi
+  status: 422
+}
+
 export type tracerTraceListTracesOfSessionResponse500 = {
   data: ApiErrorResponseApi
   status: 500
 }
 
+export type tracerTraceListTracesOfSessionResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerTraceListTracesOfSessionResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 422 | 500 | 503>
 }
 
 export type tracerTraceListTracesOfSessionResponseSuccess = (tracerTraceListTracesOfSessionResponse200) & {
   headers: Headers;
 };
-export type tracerTraceListTracesOfSessionResponseError = (tracerTraceListTracesOfSessionResponse400 | tracerTraceListTracesOfSessionResponse500 | tracerTraceListTracesOfSessionResponseDefault) & {
+export type tracerTraceListTracesOfSessionResponseError = (tracerTraceListTracesOfSessionResponse400 | tracerTraceListTracesOfSessionResponse422 | tracerTraceListTracesOfSessionResponse500 | tracerTraceListTracesOfSessionResponse503 | tracerTraceListTracesOfSessionResponseDefault) & {
   headers: Headers;
 };
 
@@ -66849,25 +67224,50 @@ export const tracerTraceListTracesOfSession = async (params?: TracerTraceListTra
 
 
 export type tracerTraceListVoiceCallsResponse200 = {
-  data: TracerTraceListVoiceCalls200
+  data: TraceVoiceCallListResponseApi
   status: 200
+}
+
+export type tracerTraceListVoiceCallsResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerTraceListVoiceCallsResponse404 = {
+  data: ApiErrorResponseApi
+  status: 404
+}
+
+export type tracerTraceListVoiceCallsResponse422 = {
+  data: PageDepthExceededErrorApi
+  status: 422
+}
+
+export type tracerTraceListVoiceCallsResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerTraceListVoiceCallsResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
 }
 
 export type tracerTraceListVoiceCallsResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 422 | 500 | 503>
 }
 
 export type tracerTraceListVoiceCallsResponseSuccess = (tracerTraceListVoiceCallsResponse200) & {
   headers: Headers;
 };
-export type tracerTraceListVoiceCallsResponseError = (tracerTraceListVoiceCallsResponseDefault) & {
+export type tracerTraceListVoiceCallsResponseError = (tracerTraceListVoiceCallsResponse400 | tracerTraceListVoiceCallsResponse404 | tracerTraceListVoiceCallsResponse422 | tracerTraceListVoiceCallsResponse500 | tracerTraceListVoiceCallsResponse503 | tracerTraceListVoiceCallsResponseDefault) & {
   headers: Headers;
 };
 
 export type tracerTraceListVoiceCallsResponse = (tracerTraceListVoiceCallsResponseSuccess | tracerTraceListVoiceCallsResponseError)
 
-export const getTracerTraceListVoiceCallsUrl = (params?: TracerTraceListVoiceCallsParams,) => {
+export const getTracerTraceListVoiceCallsUrl = (params: TracerTraceListVoiceCallsParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -66895,7 +67295,7 @@ Query params:
 - page (1-based, optional, default 1)
 - page_size (optional, default 30)
  */
-export const tracerTraceListVoiceCalls = async (params?: TracerTraceListVoiceCallsParams, options?: RequestInit): Promise<tracerTraceListVoiceCallsResponse> => {
+export const tracerTraceListVoiceCalls = async (params: TracerTraceListVoiceCallsParams, options?: RequestInit): Promise<tracerTraceListVoiceCallsResponse> => {
 
   return apiMutator<tracerTraceListVoiceCallsResponse>(getTracerTraceListVoiceCallsUrl(params),
   {
@@ -66979,15 +67379,20 @@ export type tracerTraceReadResponse500 = {
   status: 500
 }
 
+export type tracerTraceReadResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerTraceReadResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerTraceReadResponseSuccess = (tracerTraceReadResponse200) & {
   headers: Headers;
 };
-export type tracerTraceReadResponseError = (tracerTraceReadResponse400 | tracerTraceReadResponse500 | tracerTraceReadResponseDefault) & {
+export type tracerTraceReadResponseError = (tracerTraceReadResponse400 | tracerTraceReadResponse500 | tracerTraceReadResponse503 | tracerTraceReadResponseDefault) & {
   headers: Headers;
 };
 

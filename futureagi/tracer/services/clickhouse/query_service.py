@@ -11,18 +11,48 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 import structlog
 
+from tracer.services.clickhouse.attribute_reads import (
+    AttributeKeyInventory,
+    AttributeReadSelector,
+)
 from tracer.services.clickhouse.client import (
     ClickHouseClient,
     get_clickhouse_client,
     is_clickhouse_enabled,
 )
-from tracer.services.clickhouse.eval_logger_table import eval_logger_source
+from tracer.services.clickhouse.eval_logger_table import (
+    eval_logger_live_state_columns,
+    eval_logger_source,
+    eval_logger_version_column,
+)
+from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
 logger = structlog.get_logger(__name__)
+
+
+_PAGE_EVAL_READ_SETTINGS = {
+    "max_threads": 2,
+    "max_rows_to_read": 2_000_000,
+    "read_overflow_mode": "throw",
+    "max_bytes_to_read": 256 * 1024 * 1024,
+    "max_memory_usage": 128 * 1024 * 1024,
+    "timeout_overflow_mode": "throw",
+}
+
+# Kept as a code-owned constant (rather than a request-controlled identifier) so
+# CH25 integration tests can exercise tenant-collision handling against an
+# isolated table without weakening production SQL identifier safety.
+_SPANS_TABLE = "spans"
+
+
+def _eval_live_projection(table: str, alias: str = "eval_scan") -> str:
+    return ", ".join(
+        f"{alias}.{column}" for column in eval_logger_live_state_columns(table)
+    )
 
 
 class QueryType(StrEnum):
@@ -67,6 +97,19 @@ class QueryResult:
             query_time_ms=query_time_ms,
             columns=col_names,
         )
+
+
+class QueryExecutor(Protocol):
+    """Minimal read-query boundary shared by ClickHouse selectors."""
+
+    def execute_ch_query(
+        self,
+        query: str,
+        params: dict[str, Any],
+        *,
+        timeout_ms: int,
+        settings: dict[str, Any],
+    ) -> QueryResult: ...
 
 
 class AnalyticsQueryService:
@@ -121,73 +164,43 @@ class AnalyticsQueryService:
         self,
         project_ids: list[str],
         *,
-        recent_days: int | None = 7,
-        timeout_ms: int = 10000,
+        recent_days: int | None = None,
+        timeout_ms: int = 1500,
         outer_limit: int = 1000,
         include_counts: bool = False,
         order_by_count_desc: bool = False,
-    ) -> list[dict]:
-        """Get distinct span attribute keys with types for one or more projects."""
-        if not project_ids:
-            return []
+        window_start: datetime | None = None,
+        window_end: datetime | None = None,
+        exact_key: str | None = None,
+    ) -> AttributeKeyInventory:
+        """Return the bounded CH25 key inventory for one or more projects.
 
-        recent_filter = ""
-        params: dict[str, Any] = {
-            "project_ids": tuple(project_ids),
-        }
-        if recent_days is not None:
-            params["recent_days"] = int(recent_days)
-            recent_filter = "AND start_time >= now() - toIntervalDay(%(recent_days)s)"
-
-        outer_select = "SELECT key, argMax(type, cnt) AS type"
-        if include_counts:
-            outer_select += ", sum(cnt) AS count"
-        outer_order = (
-            "ORDER BY count DESC, key" if order_by_count_desc else "ORDER BY key"
-        )
-
-        query = f"""
-            {outer_select} FROM (
-                SELECT key, 'string' AS type, count() AS cnt FROM (
-                    SELECT attrs_string.keys AS ks FROM spans
-                    WHERE project_id IN %(project_ids)s
-                      AND is_deleted = 0
-                      {recent_filter}
-                    LIMIT 10000
-                ) ARRAY JOIN ks AS key
-                GROUP BY key
-                UNION ALL
-                SELECT key, 'number' AS type, count() AS cnt FROM (
-                    SELECT attrs_number.keys AS ks FROM spans
-                    WHERE project_id IN %(project_ids)s
-                      AND is_deleted = 0
-                      {recent_filter}
-                    LIMIT 10000
-                ) ARRAY JOIN ks AS key
-                GROUP BY key
-                UNION ALL
-                SELECT key, 'boolean' AS type, count() AS cnt FROM (
-                    SELECT attrs_bool.keys AS ks FROM spans
-                    WHERE project_id IN %(project_ids)s
-                      AND is_deleted = 0
-                      {recent_filter}
-                    LIMIT 10000
-                ) ARRAY JOIN ks AS key
-                GROUP BY key
-            )
-            GROUP BY key
-            {outer_order}
-            LIMIT {int(outer_limit)}
+        This compatibility facade intentionally does *not* call
+        :meth:`execute_ch_query`: that method is bound to the legacy ClickHouse
+        connection. Attribute reads construct an explicit CH25 executor from
+        ``CLICKHOUSE_V2`` so a split ``CH_DATABASE``/``CH25_DATABASE``
+        deployment cannot query the wrong ``spans`` table.
         """
-        result = self.execute_ch_query(query, params, timeout_ms=timeout_ms)
-        if include_counts:
-            return [
-                {"key": row["key"], "type": row["type"], "count": row["count"]}
-                for row in result.data
-            ]
-        return [{"key": row["key"], "type": row["type"]} for row in result.data]
 
-    def get_span_attribute_keys_ch(self, project_id: str) -> list[dict]:
+        horizon_days = 365 if recent_days is None else int(recent_days)
+        selector = AttributeReadSelector(
+            wall_timeout_ms=timeout_ms,
+            typed_only=True,
+        )
+        read = selector.discover_keys(
+            project_ids,
+            exact_key=exact_key,
+            horizon_days=horizon_days,
+            max_keys=outer_limit,
+            order_by_count_desc=order_by_count_desc,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        return AttributeKeyInventory(read, include_counts=include_counts)
+
+    def get_span_attribute_keys_ch(
+        self, project_id: str, *, exact_key: str | None = None
+    ) -> AttributeKeyInventory:
         """Get distinct span attribute keys with types from ClickHouse.
 
         Reads from the v2 ``spans`` table's typed attribute maps
@@ -204,7 +217,9 @@ class AnalyticsQueryService:
         #     ARRAY JOIN — without this, projects with millions of spans
         #     and wide `attrs_*` maps hit Code: 307 (max_bytes_to_read)
         #     because every row's Map gets exploded.
-        return self.get_span_attribute_keys_ch_for_projects([project_id])
+        return self.get_span_attribute_keys_ch_for_projects(
+            [project_id], exact_key=exact_key
+        )
 
     @staticmethod
     def _eval_config_ids_query(scope_sql: str, extra_where: str = "") -> str:
@@ -322,6 +337,7 @@ class AnalyticsQueryService:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         timeout_ms: int = 10000,
+        settings: dict | None = None,
     ) -> dict[str, str]:
         """Map span id -> trace id for spans in the given traces (CH-native).
 
@@ -349,6 +365,7 @@ class AnalyticsQueryService:
             f"FROM spans WHERE {' AND '.join(where)}",
             params,
             timeout_ms=timeout_ms,
+            settings=settings,
         )
         return {r["span_id"]: r["trace_id"] for r in result.data}
 
@@ -358,7 +375,10 @@ class AnalyticsQueryService:
         """Per-span eval rows for a set of child observation spans."""
         if not span_ids:
             return []
-        eval_table, eval_nd = eval_logger_source()
+        eval_table, _ = eval_logger_source()
+        _, eval_nd = eval_logger_source("latest_eval", include_cdc_tombstone_guard=True)
+        eval_version = eval_logger_version_column(eval_table)
+        live_projection = _eval_live_projection(eval_table)
         query = f"""
             SELECT
                 toString(observation_span_id) AS span_id,
@@ -372,20 +392,92 @@ class AnalyticsQueryService:
                 output_str,
                 status,
                 skipped_reason
-            FROM {eval_table} FINAL
-            WHERE observation_span_id IN %(span_ids)s
-              AND {eval_nd}
+            FROM (
+                SELECT
+                    eval_scan.id,
+                    eval_scan.observation_span_id,
+                    eval_scan.custom_eval_config_id,
+                    eval_scan.output_float,
+                    eval_scan.output_bool,
+                    eval_scan.output_str_list,
+                    eval_scan.eval_explanation,
+                    eval_scan.error,
+                    eval_scan.error_message,
+                    eval_scan.output_str,
+                    eval_scan.status,
+                    eval_scan.skipped_reason,
+                    {live_projection}
+                FROM {eval_table} AS eval_scan
+                WHERE eval_scan.observation_span_id IN %(span_ids)s
+                ORDER BY eval_scan.{eval_version} DESC
+                LIMIT 1 BY eval_scan.id
+            ) AS latest_eval
+            WHERE {eval_nd}
         """
         result = self.execute_ch_query(
-            query, {"span_ids": span_ids}, timeout_ms=timeout_ms
+            query,
+            {"span_ids": span_ids},
+            timeout_ms=timeout_ms,
+            settings=_PAGE_EVAL_READ_SETTINGS,
         )
         return result.data
 
     def get_eval_detail_ch(
-        self, span_id: str, config_id: str, timeout_ms: int = 5000
+        self,
+        span_id: str,
+        config_id: str,
+        *,
+        project_id: str,
+        timeout_ms: int = 5000,
     ) -> dict | None:
-        """Single span/trace-target eval detail row, or ``None`` if absent."""
-        eval_table, eval_nd = eval_logger_source()
+        """Return one tenant-anchored span/trace eval detail row.
+
+        ``observation_span_id`` is not globally unique in the CH25 ``spans``
+        table and the eval table does not carry ``project_id``.  Reading the
+        eval row by span/config alone therefore allows an ID collision to cross
+        a project boundary.  Resolve exactly one *live* physical span identity
+        inside the already-authorized project first, then bind its trace id into
+        the eval read.  Zero or multiple live anchors fail closed.
+
+        Both reads share one wall budget.  There is intentionally no Postgres
+        telemetry fallback.
+        """
+        started = time.monotonic()
+
+        def remaining_timeout_ms() -> int:
+            remaining = int(timeout_ms - ((time.monotonic() - started) * 1000))
+            if remaining <= 0:
+                raise ReadDeadlineExceeded("evaluation detail read deadline exceeded")
+            return remaining
+
+        span_anchor_query = f"""
+            SELECT toString(trace_id) AS trace_id
+            FROM {_SPANS_TABLE}
+            PREWHERE project_id = toUUID(%(project_id)s)
+            WHERE id = %(span_id)s
+            GROUP BY trace_id, id
+            HAVING argMax(is_deleted, _version) = 0
+            LIMIT 2
+        """
+        span_anchor = self.execute_ch_query(
+            span_anchor_query,
+            {"project_id": str(project_id), "span_id": str(span_id)},
+            timeout_ms=remaining_timeout_ms(),
+            settings={
+                **_PAGE_EVAL_READ_SETTINGS,
+                "max_result_rows": 2,
+                "max_result_bytes": 64 * 1024,
+                "result_overflow_mode": "throw",
+            },
+        )
+        if len(span_anchor.data) != 1:
+            return None
+        trace_id = str(span_anchor.data[0]["trace_id"])
+
+        eval_table, _ = eval_logger_source()
+        _, eval_nd = eval_logger_source("latest_eval", include_cdc_tombstone_guard=True)
+        eval_version = eval_logger_version_column(eval_table)
+        live_projection = _eval_live_projection(eval_table)
         query = f"""
             SELECT
                 output_float,
@@ -396,17 +488,49 @@ class AnalyticsQueryService:
                 error,
                 error_message,
                 output_metadata
-            FROM {eval_table} FINAL
-            WHERE observation_span_id = %(span_id)s
-              AND custom_eval_config_id = %(config_id)s
-              AND target_type IN ('span', 'trace')
-              AND {eval_nd}
+            FROM (
+                SELECT
+                    eval_scan.id,
+                    eval_scan.observation_span_id,
+                    eval_scan.custom_eval_config_id,
+                    eval_scan.target_type,
+                    eval_scan.output_float,
+                    eval_scan.output_bool,
+                    eval_scan.output_str_list,
+                    eval_scan.output_str,
+                    eval_scan.eval_explanation,
+                    eval_scan.error,
+                    eval_scan.error_message,
+                    eval_scan.output_metadata,
+                    eval_scan.created_at,
+                    eval_scan.updated_at,
+                    {live_projection}
+                FROM {eval_table} AS eval_scan
+                WHERE eval_scan.observation_span_id = %(span_id)s
+                  AND eval_scan.custom_eval_config_id = %(config_id)s
+                  AND eval_scan.trace_id = toUUID(%(trace_id)s)
+                  AND eval_scan.target_type IN ('span', 'trace')
+                ORDER BY eval_scan.{eval_version} DESC
+                LIMIT 1 BY eval_scan.id
+            ) AS latest_eval
+            WHERE {eval_nd}
+            ORDER BY created_at DESC, updated_at DESC, id DESC
             LIMIT 1
         """
         result = self.execute_ch_query(
             query,
-            {"span_id": str(span_id), "config_id": str(config_id)},
-            timeout_ms=timeout_ms,
+            {
+                "span_id": str(span_id),
+                "config_id": str(config_id),
+                "trace_id": trace_id,
+            },
+            timeout_ms=remaining_timeout_ms(),
+            settings={
+                **_PAGE_EVAL_READ_SETTINGS,
+                "max_result_rows": 1,
+                "max_result_bytes": 1024 * 1024,
+                "result_overflow_mode": "throw",
+            },
         )
         return result.data[0] if result.data else None
 
@@ -416,7 +540,10 @@ class AnalyticsQueryService:
         """Per-(trace, config) aggregated eval scores for a session's traces."""
         if not (trace_ids and config_ids):
             return []
-        eval_table, eval_nd = eval_logger_source()
+        eval_table, _ = eval_logger_source()
+        _, eval_nd = eval_logger_source("latest_eval", include_cdc_tombstone_guard=True)
+        eval_version = eval_logger_version_column(eval_table)
+        live_projection = _eval_live_projection(eval_table)
         query = f"""
             SELECT
                 toString(trace_id) AS trace_id,
@@ -443,16 +570,37 @@ class AnalyticsQueryService:
                 countIf(status = 'running') AS running_count,
                 countIf(status = 'pending') AS pending_count,
                 anyIf(skipped_reason, status = 'skipped') AS skipped_reason
-            FROM {eval_table} FINAL
-            WHERE trace_id IN %(trace_ids)s
-              AND custom_eval_config_id IN %(config_ids)s
-              AND {eval_nd}
+            FROM (
+                SELECT
+                    eval_scan.id,
+                    eval_scan.trace_id,
+                    eval_scan.custom_eval_config_id,
+                    eval_scan.output_float,
+                    eval_scan.output_bool,
+                    eval_scan.output_str,
+                    eval_scan.error,
+                    eval_scan.status,
+                    eval_scan.skipped_reason,
+                    {live_projection}
+                FROM {eval_table} AS eval_scan
+                WHERE eval_scan.trace_id IN %(trace_ids)s
+                  AND eval_scan.custom_eval_config_id IN %(config_ids)s
+                ORDER BY eval_scan.{eval_version} DESC
+                LIMIT 1 BY eval_scan.id
+            ) AS latest_eval
+            WHERE {eval_nd}
             GROUP BY trace_id, custom_eval_config_id
         """
         result = self.execute_ch_query(
             query,
             {"trace_ids": trace_ids, "config_ids": config_ids},
             timeout_ms=timeout_ms,
+            settings={
+                **_PAGE_EVAL_READ_SETTINGS,
+                "max_result_rows": max(len(trace_ids) * len(config_ids), 1),
+                "max_result_bytes": 8 * 1024 * 1024,
+                "result_overflow_mode": "throw",
+            },
         )
         return result.data
 

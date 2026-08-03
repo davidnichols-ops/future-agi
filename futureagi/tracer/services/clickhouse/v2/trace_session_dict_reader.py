@@ -200,6 +200,9 @@ def _reset_client() -> None:
 
 def resolve_external_session_ids(
     trace_session_ids: Iterable[object],
+    *,
+    timeout_ms: int | None = None,
+    settings: dict | None = None,
 ) -> dict[str, str | None]:
     """Batch-resolve ``{trace_session_id (str) -> external_session_id}`` from the
     CH ``trace_sessions_dict``.
@@ -224,13 +227,21 @@ def resolve_external_session_ids(
     try:
         # arrayJoin over the literal id list resolves the whole batch in ONE
         # round-trip. dictGetOrNull keeps the missing-key → NULL semantics.
+        query_kwargs = {"parameters": {"ids": list(ids)}}
+        query_settings = dict(settings or {})
+        if timeout_ms is not None:
+            if timeout_ms <= 0:
+                raise ValueError("timeout_ms must be positive")
+            query_settings["max_execution_time"] = timeout_ms / 1000
+        if query_settings:
+            query_kwargs["settings"] = query_settings
         result = client.query(
             (
                 f"SELECT toString(sid), "
                 f"dictGetOrNull('{_DICT_NAME}', '{_LABEL_ATTR}', sid) "
                 f"FROM (SELECT arrayJoin(%(ids)s::Array(UUID)) AS sid)"
             ),
-            parameters={"ids": list(ids)},
+            **query_kwargs,
         )
     except Exception:
         # A read error is real (parity must not silently degrade). Reset the

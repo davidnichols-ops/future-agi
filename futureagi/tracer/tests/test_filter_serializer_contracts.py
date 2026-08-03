@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from model_hub.serializers.contracts import (
     EvalApiLogTableQuerySerializer,
     EvalMetricQuerySerializer,
@@ -49,6 +51,7 @@ from tracer.serializers.trace_session import (
     TraceSessionListQuerySerializer,
     TraceSessionRetrieveQuerySerializer,
 )
+from tracer.views.trace_session import TraceSessionView
 
 
 def _span_attr_filter(filter_op="equals", filter_value="alpha"):
@@ -222,6 +225,24 @@ class TestFilterSerializerContracts:
             "project-b",
         ]
 
+    def test_dashboard_filter_values_project_ids_preserves_csv_wire_and_list_runtime(
+        self,
+    ):
+        field = DashboardFilterValuesQuerySerializer().fields["project_ids"]
+
+        assert field.default == ""
+        assert field.Meta.swagger_schema_fields == {
+            "type": "string",
+            "default": "",
+        }
+        assert field.to_representation("") == ""
+
+        serializer = DashboardFilterValuesQuerySerializer(
+            data={"metric_name": "final_status"}
+        )
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["project_ids"] == []
+
     def test_dashboard_filter_values_query_accepts_sessions_source(self):
         serializer = DashboardFilterValuesQuerySerializer(
             data={
@@ -233,6 +254,20 @@ class TestFilterSerializerContracts:
 
         assert serializer.is_valid(), serializer.errors
         assert serializer.validated_data["source"] == "sessions"
+
+    @pytest.mark.parametrize("search", ["x" * 513, "é" * 257])
+    def test_dashboard_filter_values_query_rejects_oversized_search(self, search):
+        serializer = DashboardFilterValuesQuerySerializer(
+            data={
+                "metric_name": "final_status",
+                "metric_type": "custom_attribute",
+                "source": "traces",
+                "search": search,
+            }
+        )
+
+        assert not serializer.is_valid()
+        assert "search" in serializer.errors
 
     def test_session_filter_values_query_accepts_canonical_columns_only(self):
         serializer = TraceSessionFilterValuesQuerySerializer(
@@ -254,6 +289,26 @@ class TestFilterSerializerContracts:
 
         assert not serializer.is_valid()
         assert "column" in serializer.errors
+
+    def test_session_filter_values_action_disables_automatic_pagination(self):
+        """The action owns its page/page_size query contract.
+
+        Leaving DRF's default paginator enabled makes drf-yasg reject the
+        action because both sources declare those parameters.
+        """
+        assert (
+            TraceSessionView.get_session_filter_values.kwargs["pagination_class"]
+            is None
+        )
+
+    def test_session_filter_values_uses_runtime_backed_query_contract(self):
+        contract = TraceSessionView.get_session_filter_values._swagger_auto_schema[
+            "get"
+        ]
+
+        assert contract["runtime_request_validation"] is True
+        assert contract["runtime_response_validation"] is True
+        assert contract["query_serializer"] is TraceSessionFilterValuesQuerySerializer
 
     def test_session_list_query_accepts_canonical_filters_and_sort(self):
         serializer = TraceSessionListQuerySerializer(

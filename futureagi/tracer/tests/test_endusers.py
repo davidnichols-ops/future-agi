@@ -128,6 +128,16 @@ def _empty_enrichment_result():
     )
 
 
+def _dimension_exists_result():
+    return QueryResult(
+        data=[{"has_curated_user": 1}],
+        row_count=1,
+        backend_used="clickhouse",
+        query_time_ms=0.0,
+        columns=["has_curated_user"],
+    )
+
+
 _EXECUTE_CH_PATH = (
     "tracer.services.clickhouse.query_service.AnalyticsQueryService.execute_ch_query"
 )
@@ -264,7 +274,10 @@ class TestUsersViewAPI(APITestCase):
             ),
         ]
         mock_get_spans.side_effect = [
+            _dimension_exists_result(),
             _make_user_list_result(mock_rows),
+            _empty_enrichment_result(),
+            _empty_enrichment_result(),
             _empty_enrichment_result(),
         ]
 
@@ -334,7 +347,11 @@ class TestUsersViewAPI(APITestCase):
         response = self.client.get(self.url, data)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("error fetching users", str(response.data["result"]))
+        self.assertEqual(
+            response.data["result"],
+            "User data could not be loaded",
+        )
+        self.assertNotIn("Database connection error", str(response.data))
 
     @patch(_EXECUTE_CH_PATH)
     def test_users_list_page_calculation_exact_division(self, mock_get_spans):
@@ -366,7 +383,10 @@ class TestUsersViewAPI(APITestCase):
             )
         ]
         mock_get_spans.side_effect = [
+            _dimension_exists_result(),
             _make_user_list_result(mock_rows),
+            _empty_enrichment_result(),
+            _empty_enrichment_result(),
             _empty_enrichment_result(),
         ]
 
@@ -407,7 +427,10 @@ class TestUsersViewAPI(APITestCase):
             )
         ]
         mock_get_spans.side_effect = [
+            _dimension_exists_result(),
             _make_user_list_result(mock_rows),
+            _empty_enrichment_result(),
+            _empty_enrichment_result(),
             _empty_enrichment_result(),
         ]
 

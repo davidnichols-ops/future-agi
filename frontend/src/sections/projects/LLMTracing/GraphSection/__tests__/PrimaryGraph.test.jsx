@@ -1,7 +1,7 @@
 import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, waitFor } from "src/utils/test-utils";
+import { render, screen, waitFor } from "src/utils/test-utils";
 import axios from "src/utils/axios";
 import PrimaryGraph from "../PrimaryGraph";
 
@@ -170,5 +170,55 @@ describe("PrimaryGraph", () => {
 
     const { id: _id, ...metricFilterWithoutId } = metricFilter;
     expect(postedFilters()).toEqual([metricFilterWithoutId]);
+  });
+
+  it("does not present a degraded graph read as an empty time range", async () => {
+    axios.post.mockResolvedValue({
+      data: {
+        query_complete: false,
+        query_status: "degraded",
+        result: {
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 999,
+              primary_traffic: 999,
+            },
+          ],
+        },
+      },
+    });
+
+    renderWithQueryClient(
+      <PrimaryGraph observeIdOverride="project-override" />,
+    );
+
+    expect(
+      await screen.findByText(
+        "Results are incomplete. Please retry in a moment.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("No data available for this time range"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
+  });
+
+  it("shows a generic graph error without exposing backend exception text", async () => {
+    axios.post.mockRejectedValue({
+      result: "Code: 159 DB::Exception: Timeout exceeded Stack trace...",
+    });
+
+    renderWithQueryClient(
+      <PrimaryGraph observeIdOverride="project-override" />,
+    );
+
+    expect(
+      await screen.findByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/DB::Exception/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Stack trace/i)).not.toBeInTheDocument();
   });
 });

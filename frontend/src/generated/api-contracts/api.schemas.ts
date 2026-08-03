@@ -3780,11 +3780,41 @@ export const SpanAttributeDetailResponseApiType = {
   string: 'string',
   number: 'number',
   boolean: 'boolean',
+  array: 'array',
 } as const;
 
-export type SpanAttributeTopValueApiValue = { [key: string]: unknown };
+export type SpanAttributeDetailResponseApiQueryStatus = typeof SpanAttributeDetailResponseApiQueryStatus[keyof typeof SpanAttributeDetailResponseApiQueryStatus];
+
+
+export const SpanAttributeDetailResponseApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
+export type SpanAttributeDetailResponseApiQueryErrorCode = typeof SpanAttributeDetailResponseApiQueryErrorCode[keyof typeof SpanAttributeDetailResponseApiQueryErrorCode];
+
+
+export const SpanAttributeDetailResponseApiQueryErrorCode = {
+  sample_limit: 'sample_limit',
+  read_budget_exceeded: 'read_budget_exceeded',
+  query_failed: 'query_failed',
+} as const;
+
+export type SpanAttributeJsonValueApi =
+  | string
+  | number
+  | boolean
+  | null
+  | SpanAttributeJsonValueApi[]
+  | { [key: string]: SpanAttributeJsonValueApi };
+
+/**
+ * Any valid JSON value.
+ */
+export type SpanAttributeTopValueApiValue = SpanAttributeJsonValueApi;
 
 export interface SpanAttributeTopValueApi {
+  /** Any valid JSON value. */
   value: SpanAttributeTopValueApiValue;
   count: number;
   percentage: number;
@@ -3802,7 +3832,29 @@ export interface SpanAttributeDetailResponseApi {
   avg?: number;
   p50?: number;
   p95?: number;
+  query_complete: boolean;
+  query_status: SpanAttributeDetailResponseApiQueryStatus;
+  query_error_code?: SpanAttributeDetailResponseApiQueryErrorCode;
+  query_window_start: string;
+  query_window_end: string;
 }
+
+export type SpanAttributeKeysResponseApiQueryStatus = typeof SpanAttributeKeysResponseApiQueryStatus[keyof typeof SpanAttributeKeysResponseApiQueryStatus];
+
+
+export const SpanAttributeKeysResponseApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
+export type SpanAttributeKeysResponseApiQueryErrorCode = typeof SpanAttributeKeysResponseApiQueryErrorCode[keyof typeof SpanAttributeKeysResponseApiQueryErrorCode];
+
+
+export const SpanAttributeKeysResponseApiQueryErrorCode = {
+  sample_limit: 'sample_limit',
+  read_budget_exceeded: 'read_budget_exceeded',
+  query_failed: 'query_failed',
+} as const;
 
 export type SpanAttributeKeyApiType = typeof SpanAttributeKeyApiType[keyof typeof SpanAttributeKeyApiType];
 
@@ -3811,6 +3863,7 @@ export const SpanAttributeKeyApiType = {
   string: 'string',
   number: 'number',
   boolean: 'boolean',
+  array: 'array',
 } as const;
 
 export interface SpanAttributeKeyApi {
@@ -3822,17 +3875,59 @@ export interface SpanAttributeKeyApi {
 
 export interface SpanAttributeKeysResponseApi {
   result: SpanAttributeKeyApi[];
+  query_complete: boolean;
+  query_status: SpanAttributeKeysResponseApiQueryStatus;
+  query_error_code?: SpanAttributeKeysResponseApiQueryErrorCode;
+  query_window_start: string;
+  query_window_end: string;
 }
 
-export type SpanAttributeValueApiValue = { [key: string]: unknown };
+export type SpanAttributeValuesResponseApiQueryStatus = typeof SpanAttributeValuesResponseApiQueryStatus[keyof typeof SpanAttributeValuesResponseApiQueryStatus];
+
+
+export const SpanAttributeValuesResponseApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
+export type SpanAttributeValuesResponseApiQueryErrorCode = typeof SpanAttributeValuesResponseApiQueryErrorCode[keyof typeof SpanAttributeValuesResponseApiQueryErrorCode];
+
+
+export const SpanAttributeValuesResponseApiQueryErrorCode = {
+  sample_limit: 'sample_limit',
+  read_budget_exceeded: 'read_budget_exceeded',
+  query_failed: 'query_failed',
+} as const;
+
+export type SpanAttributeValueApiType = typeof SpanAttributeValueApiType[keyof typeof SpanAttributeValueApiType];
+
+
+export const SpanAttributeValueApiType = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+  array: 'array',
+} as const;
+
+/**
+ * Any valid JSON value.
+ */
+export type SpanAttributeValueApiValue = SpanAttributeJsonValueApi;
 
 export interface SpanAttributeValueApi {
+  /** Any valid JSON value. */
   value: SpanAttributeValueApiValue;
   count: number;
+  type?: SpanAttributeValueApiType;
 }
 
 export interface SpanAttributeValuesResponseApi {
   result: SpanAttributeValueApi[];
+  query_complete: boolean;
+  query_status: SpanAttributeValuesResponseApiQueryStatus;
+  query_error_code?: SpanAttributeValuesResponseApiQueryErrorCode;
+  query_window_start: string;
+  query_window_end: string;
 }
 
 export interface CallWebsocketRequestApi {
@@ -5821,7 +5916,7 @@ export interface AutomationRuleScopeApi {
 }
 
 export type AutomationRuleConditionsApiFilterItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -6003,7 +6098,7 @@ export const SelectionApiSourceType = {
 } as const;
 
 export type SelectionApiFilterItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -8981,7 +9076,7 @@ export interface DatasetTableResponseApi {
 }
 
 export type DatasetRowDataRequestApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -9775,10 +9870,32 @@ export interface EvalTemplateListChartsItemApi {
   run_count: number;
 }
 
+export type EvalTemplateListChartsResponseResultApiQueryStatus = typeof EvalTemplateListChartsResponseResultApiQueryStatus[keyof typeof EvalTemplateListChartsResponseResultApiQueryStatus];
+
+
+export const EvalTemplateListChartsResponseResultApiQueryStatus = {
+  complete: 'complete',
+  stale: 'stale',
+  degraded: 'degraded',
+} as const;
+
+export type EvalTemplateListChartsResponseResultApiQueryErrorCode = typeof EvalTemplateListChartsResponseResultApiQueryErrorCode[keyof typeof EvalTemplateListChartsResponseResultApiQueryErrorCode];
+
+
+export const EvalTemplateListChartsResponseResultApiQueryErrorCode = {
+  read_budget_exceeded: 'read_budget_exceeded',
+  template_limit_exceeded: 'template_limit_exceeded',
+  query_failed: 'query_failed',
+} as const;
+
 export type EvalTemplateListChartsResponseResultApiCharts = {[key: string]: EvalTemplateListChartsItemApi};
 
 export interface EvalTemplateListChartsResponseResultApi {
   charts: EvalTemplateListChartsResponseResultApiCharts;
+  query_complete: boolean;
+  query_status: EvalTemplateListChartsResponseResultApiQueryStatus;
+  query_error_code?: EvalTemplateListChartsResponseResultApiQueryErrorCode;
+  data_stale: boolean;
 }
 
 export interface EvalTemplateListChartsResponseApi {
@@ -10308,6 +10425,14 @@ export interface EvalTemplateUpdateResponseApi {
   result: EvalTemplateUpdateResponseResultApi;
 }
 
+export type EvalUsageStatsResponseResultApiCompleteness = typeof EvalUsageStatsResponseResultApiCompleteness[keyof typeof EvalUsageStatsResponseResultApiCompleteness];
+
+
+export const EvalUsageStatsResponseResultApiCompleteness = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
 export interface EvalUsageStatsApi {
   total_runs: number;
   runs_period: number;
@@ -10409,6 +10534,8 @@ export interface EvalUsagePaginationApi {
 export interface EvalUsageStatsResponseResultApi {
   template_id: string;
   is_composite: boolean;
+  completeness?: EvalUsageStatsResponseResultApiCompleteness;
+  unavailable_fields?: string[];
   stats: EvalUsageStatsApi;
   chart: EvalUsageChartPointApi[];
   table: EvalUsageTableRowApi[];
@@ -11543,7 +11670,7 @@ export interface EvalMetricResponseApi {
 }
 
 export type EvalMetricRequestApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -16160,7 +16287,7 @@ export type SimulateEvalConfigResponseApiConfig = { [key: string]: unknown };
 export type SimulateEvalConfigResponseApiMapping = { [key: string]: unknown };
 
 export type SimulateEvalConfigResponseApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -16897,7 +17024,7 @@ export type EvalConfigDefinitionApiConfig = { [key: string]: unknown };
 export type EvalConfigDefinitionApiMapping = { [key: string]: unknown };
 
 export type EvalConfigDefinitionApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -17277,7 +17404,7 @@ export type EvalConfigUpdateRequestApiConfig = { [key: string]: unknown };
 export type EvalConfigUpdateRequestApiMapping = { [key: string]: unknown };
 
 export type EvalConfigUpdateRequestApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -18362,7 +18489,7 @@ export interface ApiErrorResponseApi {
 }
 
 export type FetchGraphApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -18440,6 +18567,40 @@ export interface DashboardCreateUpdateApi {
   description?: string;
 }
 
+export type DashboardFilterValuesResultApiQueryStatus = typeof DashboardFilterValuesResultApiQueryStatus[keyof typeof DashboardFilterValuesResultApiQueryStatus];
+
+
+export const DashboardFilterValuesResultApiQueryStatus = {
+  complete: 'complete',
+  sampled: 'sampled',
+  degraded: 'degraded',
+} as const;
+
+export type DashboardFilterValuesResultApiQueryErrorCode = typeof DashboardFilterValuesResultApiQueryErrorCode[keyof typeof DashboardFilterValuesResultApiQueryErrorCode];
+
+
+export const DashboardFilterValuesResultApiQueryErrorCode = {
+  sample_limit: 'sample_limit',
+  read_budget_exceeded: 'read_budget_exceeded',
+  query_failed: 'query_failed',
+} as const;
+
+export type DashboardFilterValuesResultApiValuesItem = { [key: string]: unknown };
+
+export interface DashboardFilterValuesResultApi {
+  values: DashboardFilterValuesResultApiValuesItem[];
+  query_complete?: boolean;
+  query_status?: DashboardFilterValuesResultApiQueryStatus;
+  query_error_code?: DashboardFilterValuesResultApiQueryErrorCode;
+  query_window_start?: string;
+  query_window_end?: string;
+}
+
+export interface DashboardFilterValuesResponseApi {
+  status?: boolean;
+  result: DashboardFilterValuesResultApi;
+}
+
 /**
  * Any valid JSON value.
  */
@@ -18490,7 +18651,7 @@ export const DashboardQueryApiGranularity = {
 } as const;
 
 export type DashboardQueryApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -18608,7 +18769,7 @@ export const DashboardMetricApiDataType = {
 } as const;
 
 export type DashboardMetricApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -18900,7 +19061,7 @@ export interface ObserveDatasetApi {
 }
 
 export type EvalTaskApiFiltersFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -18923,7 +19084,7 @@ export type EvalTaskApiFiltersFiltersItem = {
 };
 
 export type EvalTaskApiFiltersSpanAttributesFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -18949,12 +19110,12 @@ export type EvalTaskApiFilters = {
   /** Project scope for the evaluation task. */
   project_id?: string;
   /**
-     * Inclusive start/end ISO timestamps.
+     * Half-open [start, end) ISO timestamps, normalized to UTC.
      * @minItems 2
      * @maxItems 2
      */
   date_range?: string[];
-  /** Lower-bound ISO timestamp for legacy task filters. */
+  /** Exclusive lower-bound ISO timestamp for legacy task filters, normalized to UTC. */
   created_at?: string;
   /** Trace session id(s) to constrain the task. */
   session_id?: string[];
@@ -19059,7 +19220,7 @@ export interface EvalTaskMessageResponseApi {
 }
 
 export type EvalTaskUpdateRequestApiFiltersFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -19082,7 +19243,7 @@ export type EvalTaskUpdateRequestApiFiltersFiltersItem = {
 };
 
 export type EvalTaskUpdateRequestApiFiltersSpanAttributesFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -19108,12 +19269,12 @@ export type EvalTaskUpdateRequestApiFilters = {
   /** Project scope for the evaluation task. */
   project_id?: string;
   /**
-     * Inclusive start/end ISO timestamps.
+     * Half-open [start, end) ISO timestamps, normalized to UTC.
      * @minItems 2
      * @maxItems 2
      */
   date_range?: string[];
-  /** Lower-bound ISO timestamp for legacy task filters. */
+  /** Exclusive lower-bound ISO timestamp for legacy task filters, normalized to UTC. */
   created_at?: string;
   /** Trace session id(s) to constrain the task. */
   session_id?: string[];
@@ -19983,13 +20144,35 @@ export interface AddObservationSpanAnnotationsApi {
   notes?: string;
 }
 
+export type ObservationAttributeListResponseApiQueryStatus = typeof ObservationAttributeListResponseApiQueryStatus[keyof typeof ObservationAttributeListResponseApiQueryStatus];
+
+
+export const ObservationAttributeListResponseApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
+export type ObservationAttributeListResponseApiQueryErrorCode = typeof ObservationAttributeListResponseApiQueryErrorCode[keyof typeof ObservationAttributeListResponseApiQueryErrorCode];
+
+
+export const ObservationAttributeListResponseApiQueryErrorCode = {
+  sample_limit: 'sample_limit',
+  read_budget_exceeded: 'read_budget_exceeded',
+  query_failed: 'query_failed',
+} as const;
+
 export interface ObservationAttributeListResponseApi {
   status?: boolean;
   result: string[];
+  query_complete?: boolean;
+  query_status?: ObservationAttributeListResponseApiQueryStatus;
+  query_error_code?: ObservationAttributeListResponseApiQueryErrorCode;
+  query_window_start?: string;
+  query_window_end?: string;
 }
 
 export type ObserveGraphDataRequestApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -20043,12 +20226,16 @@ export type ObserveGraphDataRequestApiReqDataConfig = {
 
 export interface ObserveGraphDataRequestApi {
   project_id: string;
+  /** On trace, span, session, graph, and eval-task bounded reads, created_at/start_time datetime filters support equals, greater_than, greater_than_or_equal, less_than, less_than_or_equal, between, not_equals, not_between, is_null, and is_not_null. Missing bounds retain the finite default window: 30 days ago for the lower bound and request-time now for the upper bound. Between and not_between use half-open [start, end) ranges; not_equals excludes one DateTime64(6) microsecond. Because the physical created_at/start_time field is non-null, is_null returns an exact empty result without a ClickHouse read and is_not_null preserves the base window. Valid contradictions also return an exact empty result. */
   filters?: ObserveGraphDataRequestApiFiltersItem[];
   interval?: ObserveGraphDataRequestApiInterval;
   property?: string;
   req_data_config: ObserveGraphDataRequestApiReqDataConfig;
 }
 
+/**
+ * Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.
+ */
 export interface ObserveGraphDataPointApi {
   /** @minLength 1 */
   timestamp: string;
@@ -20056,14 +20243,176 @@ export interface ObserveGraphDataPointApi {
   primary_traffic?: number;
 }
 
+export type ObserveGraphDataResultApiQueryStatus = typeof ObserveGraphDataResultApiQueryStatus[keyof typeof ObserveGraphDataResultApiQueryStatus];
+
+
+export const ObserveGraphDataResultApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
+export type ObserveGraphDataResultApiQueryErrorCode = typeof ObserveGraphDataResultApiQueryErrorCode[keyof typeof ObserveGraphDataResultApiQueryErrorCode];
+
+
+export const ObserveGraphDataResultApiQueryErrorCode = {
+  sample_limit: 'sample_limit',
+  read_budget_exceeded: 'read_budget_exceeded',
+  query_failed: 'query_failed',
+} as const;
+
 export interface ObserveGraphDataResultApi {
   metric_name: string;
+  name?: string;
+  /** Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data. */
   data: ObserveGraphDataPointApi[];
+  query_complete?: boolean;
+  query_status?: ObserveGraphDataResultApiQueryStatus;
+  query_error_code?: ObserveGraphDataResultApiQueryErrorCode;
+  /** @minLength 1 */
+  query_window_start?: string;
+  /** @minLength 1 */
+  query_window_end?: string;
+  /** @minimum 0 */
+  query_sample_size?: number;
+  /** @minimum 0 */
+  query_count?: number;
+  /** @minimum 0 */
+  query_elapsed_ms?: number;
+  /** @minimum 0 */
+  query_rows_returned?: number;
+  /** @minimum 0 */
+  query_result_bytes?: number;
+  /** @minimum 0 */
+  query_total_rows_lower_bound?: number;
 }
 
 export interface ObserveGraphDataResponseApi {
   status?: boolean;
   result: ObserveGraphDataResultApi;
+}
+
+export type PageDepthExceededErrorApiType = typeof PageDepthExceededErrorApiType[keyof typeof PageDepthExceededErrorApiType];
+
+
+export const PageDepthExceededErrorApiType = {
+  validation_error: 'validation_error',
+  authentication_error: 'authentication_error',
+  payment_required: 'payment_required',
+  entitlement_error: 'entitlement_error',
+  permission_error: 'permission_error',
+  not_found: 'not_found',
+  conflict: 'conflict',
+  client_error: 'client_error',
+  rate_limit: 'rate_limit',
+  server_error: 'server_error',
+  service_unavailable: 'service_unavailable',
+  timeout: 'timeout',
+  api_error: 'api_error',
+} as const;
+
+export type PageDepthExceededErrorApiCode = typeof PageDepthExceededErrorApiCode[keyof typeof PageDepthExceededErrorApiCode];
+
+
+export const PageDepthExceededErrorApiCode = {
+  page_depth_exceeded: 'page_depth_exceeded',
+} as const;
+
+export type PageDepthExceededErrorApiDetails = {[key: string]: string[]};
+
+export interface PageDepthExceededErrorApi {
+  status?: boolean;
+  type?: PageDepthExceededErrorApiType;
+  code: PageDepthExceededErrorApiCode;
+  detail?: string;
+  result?: string;
+  message?: string;
+  error?: string;
+  attr?: string;
+  details?: PageDepthExceededErrorApiDetails;
+}
+
+export type TraceObserveListMetadataApiQueryStatus = typeof TraceObserveListMetadataApiQueryStatus[keyof typeof TraceObserveListMetadataApiQueryStatus];
+
+
+export const TraceObserveListMetadataApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
+export interface TraceObserveListMetadataApi {
+  total_rows: number;
+  total_rows_exact?: number;
+  total_rows_is_lower_bound?: boolean;
+  has_more?: boolean;
+  /** @minLength 1 */
+  next_cursor?: string;
+  query_complete?: boolean;
+  query_status?: TraceObserveListMetadataApiQueryStatus;
+  /** @minLength 1 */
+  query_error_code?: string;
+  query_elapsed_ms?: number;
+  /** @minimum 0 */
+  query_count?: number;
+  /** @minimum 0 */
+  query_rows_returned?: number;
+  /** @minimum 0 */
+  query_result_payload_bytes?: number;
+}
+
+/**
+ * Any valid JSON value.
+ */
+export type TraceObserveColumnConfigApiSettings = { [key: string]: unknown };
+
+/**
+ * Any valid JSON value.
+ */
+export type TraceObserveColumnConfigApiChoicesMap = { [key: string]: unknown };
+
+/**
+ * Any valid JSON value.
+ */
+export type TraceObserveColumnConfigApiAnnotators = { [key: string]: unknown };
+
+export interface TraceObserveColumnConfigApi {
+  /** @minLength 1 */
+  id: string;
+  /** @minLength 1 */
+  name: string;
+  is_visible: boolean;
+  /** @minLength 1 */
+  group_by?: string;
+  /** @minLength 1 */
+  output_type?: string;
+  reverse_output?: boolean;
+  /** @minLength 1 */
+  annotation_label_type?: string;
+  choices?: string[];
+  /** Any valid JSON value. */
+  settings?: TraceObserveColumnConfigApiSettings;
+  /** Any valid JSON value. */
+  choices_map?: TraceObserveColumnConfigApiChoicesMap;
+  /** @minLength 1 */
+  eval_template_id?: string;
+  /** Any valid JSON value. */
+  annotators?: TraceObserveColumnConfigApiAnnotators;
+  /** @minLength 1 */
+  source_field?: string;
+  /** @minLength 1 */
+  parent_eval_id?: string;
+}
+
+export type TraceObserveListResultApiTableItem = {[key: string]: { [key: string]: unknown }};
+
+export interface TraceObserveListResultApi {
+  metadata: TraceObserveListMetadataApi;
+  table: TraceObserveListResultApiTableItem[];
+  config: TraceObserveColumnConfigApi[];
+}
+
+export interface TraceObserveListResponseApi {
+  status: boolean;
+  result: TraceObserveListResultApi;
 }
 
 export type RootSpansResponseApiResult = {[key: string]: string};
@@ -20175,7 +20524,7 @@ export interface ProjectApi {
 }
 
 export type ProjectUserGraphDataRequestApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -20204,7 +20553,7 @@ export interface ProjectUserGraphDataRequestApi {
 }
 
 export type ProjectUserMetricsRequestApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -20235,7 +20584,7 @@ export interface ProjectUserMetricsRequestApi {
 }
 
 export type ProjectUsersAggregateGraphDataRequestApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -21131,7 +21480,7 @@ export interface TraceSessionApi {
 }
 
 export type TraceSessionGraphDataRequestApiFiltersItemFilterConfig = {
-  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, or array. */
+  /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
   /** Canonical operator from api_contracts/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null. */
   filter_op: string;
@@ -21185,10 +21534,89 @@ export type TraceSessionGraphDataRequestApiReqDataConfig = {
 
 export interface TraceSessionGraphDataRequestApi {
   project_id: string;
+  /** On trace, span, session, graph, and eval-task bounded reads, created_at/start_time datetime filters support equals, greater_than, greater_than_or_equal, less_than, less_than_or_equal, between, not_equals, not_between, is_null, and is_not_null. Missing bounds retain the finite default window: 30 days ago for the lower bound and request-time now for the upper bound. Between and not_between use half-open [start, end) ranges; not_equals excludes one DateTime64(6) microsecond. Because the physical created_at/start_time field is non-null, is_null returns an exact empty result without a ClickHouse read and is_not_null preserves the base window. Valid contradictions also return an exact empty result. */
   filters?: TraceSessionGraphDataRequestApiFiltersItem[];
   interval?: TraceSessionGraphDataRequestApiInterval;
   property?: string;
   req_data_config: TraceSessionGraphDataRequestApiReqDataConfig;
+}
+
+export type ObserveGraphDataErrorResponseApiType = typeof ObserveGraphDataErrorResponseApiType[keyof typeof ObserveGraphDataErrorResponseApiType];
+
+
+export const ObserveGraphDataErrorResponseApiType = {
+  validation_error: 'validation_error',
+  authentication_error: 'authentication_error',
+  payment_required: 'payment_required',
+  entitlement_error: 'entitlement_error',
+  permission_error: 'permission_error',
+  not_found: 'not_found',
+  conflict: 'conflict',
+  client_error: 'client_error',
+  rate_limit: 'rate_limit',
+  server_error: 'server_error',
+  service_unavailable: 'service_unavailable',
+  timeout: 'timeout',
+  api_error: 'api_error',
+} as const;
+
+export type ObserveGraphDataErrorResponseApiDetails = {[key: string]: string[]};
+
+export type ObserveGraphDataErrorResultApiQueryStatus = typeof ObserveGraphDataErrorResultApiQueryStatus[keyof typeof ObserveGraphDataErrorResultApiQueryStatus];
+
+
+export const ObserveGraphDataErrorResultApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
+export type ObserveGraphDataErrorResultApiQueryErrorCode = typeof ObserveGraphDataErrorResultApiQueryErrorCode[keyof typeof ObserveGraphDataErrorResultApiQueryErrorCode];
+
+
+export const ObserveGraphDataErrorResultApiQueryErrorCode = {
+  sample_limit: 'sample_limit',
+  read_budget_exceeded: 'read_budget_exceeded',
+  query_failed: 'query_failed',
+} as const;
+
+export interface ObserveGraphDataErrorResultApi {
+  metric_name: string;
+  name?: string;
+  /** Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data. */
+  data: ObserveGraphDataPointApi[];
+  query_complete?: boolean;
+  query_status?: ObserveGraphDataErrorResultApiQueryStatus;
+  query_error_code?: ObserveGraphDataErrorResultApiQueryErrorCode;
+  /** @minLength 1 */
+  query_window_start?: string;
+  /** @minLength 1 */
+  query_window_end?: string;
+  /** @minimum 0 */
+  query_sample_size?: number;
+  /** @minimum 0 */
+  query_count?: number;
+  /** @minimum 0 */
+  query_elapsed_ms?: number;
+  /** @minimum 0 */
+  query_rows_returned?: number;
+  /** @minimum 0 */
+  query_result_bytes?: number;
+  /** @minimum 0 */
+  query_total_rows_lower_bound?: number;
+  /** @minLength 1 */
+  message: string;
+}
+
+export interface ObserveGraphDataErrorResponseApi {
+  status?: boolean;
+  type?: ObserveGraphDataErrorResponseApiType;
+  code?: string;
+  detail?: string;
+  result: ObserveGraphDataErrorResultApi;
+  message?: string;
+  error?: string;
+  attr?: string;
+  details?: ObserveGraphDataErrorResponseApiDetails;
 }
 
 export type TraceApiMetadata = { [key: string]: unknown };
@@ -21217,64 +21645,26 @@ export interface TraceApi {
   tags?: TraceApiTags;
 }
 
-export interface TraceObserveListMetadataApi {
-  total_rows: number;
-}
+export type TraceVoiceCallListResponseApiResultsItem = {[key: string]: string};
 
-/**
- * Any valid JSON value.
- */
-export type TraceObserveColumnConfigApiSettings = { [key: string]: unknown };
+export type TraceVoiceCallListResponseApiConfigItem = {[key: string]: string};
 
-/**
- * Any valid JSON value.
- */
-export type TraceObserveColumnConfigApiChoicesMap = { [key: string]: unknown };
-
-/**
- * Any valid JSON value.
- */
-export type TraceObserveColumnConfigApiAnnotators = { [key: string]: unknown };
-
-export interface TraceObserveColumnConfigApi {
-  /** @minLength 1 */
-  id: string;
-  /** @minLength 1 */
-  name: string;
-  is_visible: boolean;
-  /** @minLength 1 */
-  group_by?: string;
-  /** @minLength 1 */
-  output_type?: string;
-  reverse_output?: boolean;
-  /** @minLength 1 */
-  annotation_label_type?: string;
-  choices?: string[];
-  /** Any valid JSON value. */
-  settings?: TraceObserveColumnConfigApiSettings;
-  /** Any valid JSON value. */
-  choices_map?: TraceObserveColumnConfigApiChoicesMap;
-  /** @minLength 1 */
-  eval_template_id?: string;
-  /** Any valid JSON value. */
-  annotators?: TraceObserveColumnConfigApiAnnotators;
-  /** @minLength 1 */
-  source_field?: string;
-  /** @minLength 1 */
-  parent_eval_id?: string;
-}
-
-export type TraceObserveListResultApiTableItem = {[key: string]: { [key: string]: unknown }};
-
-export interface TraceObserveListResultApi {
-  metadata: TraceObserveListMetadataApi;
-  table: TraceObserveListResultApiTableItem[];
-  config: TraceObserveColumnConfigApi[];
-}
-
-export interface TraceObserveListResponseApi {
-  status: boolean;
-  result: TraceObserveListResultApi;
+export interface TraceVoiceCallListResponseApi {
+  /** @minimum 0 */
+  count: number;
+  count_is_lower_bound: boolean;
+  /** @minimum 0 */
+  total_pages: number;
+  /** @minimum 1 */
+  current_page: number;
+  /** @minimum 1 */
+  next: number;
+  /** @minimum 1 */
+  previous: number;
+  results: TraceVoiceCallListResponseApiResultsItem[];
+  config: TraceVoiceCallListResponseApiConfigItem[];
+  has_more: boolean;
+  query_complete: boolean;
 }
 
 export type TraceDetailResultApiTrace = { [key: string]: unknown };
@@ -23915,20 +24305,30 @@ export type ApiTracesSpanAttributeDetailListParams = {
 project_id: string;
 /**
  * @minLength 1
+ * @maxLength 512
  */
 key: string;
 };
 
 export type ApiTracesSpanAttributeKeysListParams = {
 project_id: string;
+/**
+ * @minLength 1
+ * @maxLength 512
+ */
+q?: string;
 };
 
 export type ApiTracesSpanAttributeValuesListParams = {
 project_id: string;
 /**
  * @minLength 1
+ * @maxLength 512
  */
 key: string;
+/**
+ * @maxLength 512
+ */
 q?: string;
 /**
  * @minimum 1
@@ -25671,14 +26071,41 @@ page?: number;
  * Number of results to return per page.
  */
 limit?: number;
+/**
+ * @minLength 1
+ */
+metric_name: string;
+metric_type?: TracerDashboardFilterValuesMetricType;
+source?: TracerDashboardFilterValuesSource;
+project_ids?: string;
+dataset_id?: string;
+/**
+ * @maxLength 512
+ */
+search?: string;
 };
 
-export type TracerDashboardFilterValues200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: DashboardApi[];
-};
+export type TracerDashboardFilterValuesMetricType = typeof TracerDashboardFilterValuesMetricType[keyof typeof TracerDashboardFilterValuesMetricType];
+
+
+export const TracerDashboardFilterValuesMetricType = {
+  system_metric: 'system_metric',
+  eval_metric: 'eval_metric',
+  annotation_metric: 'annotation_metric',
+  custom_attribute: 'custom_attribute',
+  custom_column: 'custom_column',
+} as const;
+
+export type TracerDashboardFilterValuesSource = typeof TracerDashboardFilterValuesSource[keyof typeof TracerDashboardFilterValuesSource];
+
+
+export const TracerDashboardFilterValuesSource = {
+  traces: 'traces',
+  sessions: 'sessions',
+  datasets: 'datasets',
+  dataset_column: 'dataset_column',
+  simulation: 'simulation',
+} as const;
 
 export type TracerDashboardMetricsParams = {
 /**
@@ -26058,6 +26485,11 @@ limit?: number;
  */
 filters: string;
 row_type?: TracerObservationSpanGetEvalAttributesListRowType;
+/**
+ * @minLength 1
+ * @maxLength 512
+ */
+q?: string;
 };
 
 export type TracerObservationSpanGetEvalAttributesListRowType = typeof TracerObservationSpanGetEvalAttributesListRowType[keyof typeof TracerObservationSpanGetEvalAttributesListRowType];
@@ -26120,6 +26552,11 @@ limit?: number;
  */
 filters: string;
 row_type?: TracerObservationSpanGetSpanAttributesListRowType;
+/**
+ * @minLength 1
+ * @maxLength 512
+ */
+q?: string;
 };
 
 export type TracerObservationSpanGetSpanAttributesListRowType = typeof TracerObservationSpanGetSpanAttributesListRowType[keyof typeof TracerObservationSpanGetSpanAttributesListRowType];
@@ -26239,6 +26676,7 @@ user_id?: string;
  */
 filters?: string;
 /**
+ * Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.
  * @minimum 0
  */
 page_number?: number;
@@ -26247,13 +26685,13 @@ page_number?: number;
  * @maximum 500
  */
 page_size?: number;
-};
-
-export type TracerObservationSpanListSpansObserve200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: ObservationSpanApi[];
+/**
+ * Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.
+ * @minLength 1
+ * @maxLength 4096
+ */
+cursor?: string;
+cursor_mode?: boolean;
 };
 
 export type TracerObservationSpanRetrieveLoadingParams = {
@@ -26541,22 +26979,32 @@ export type TracerTraceSessionList200 = {
 };
 
 export type TracerTraceSessionGetSessionFilterValuesParams = {
+project_id: string;
+column: TracerTraceSessionGetSessionFilterValuesColumn;
 /**
- * A page number within the paginated result set.
+ * @maxLength 512
+ */
+search?: string;
+/**
+ * @minimum 0
  */
 page?: number;
 /**
- * Number of results to return per page.
+ * @minimum 1
+ * @maximum 500
  */
-limit?: number;
+page_size?: number;
 };
 
-export type TracerTraceSessionGetSessionFilterValues200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: TraceSessionApi[];
-};
+export type TracerTraceSessionGetSessionFilterValuesColumn = typeof TracerTraceSessionGetSessionFilterValuesColumn[keyof typeof TracerTraceSessionGetSessionFilterValuesColumn];
+
+
+export const TracerTraceSessionGetSessionFilterValuesColumn = {
+  session_id: 'session_id',
+  user_id: 'user_id',
+  first_message: 'first_message',
+  last_message: 'last_message',
+} as const;
 
 export type TracerTraceSessionGetTraceSessionExportDataParams = {
 /**
@@ -26597,6 +27045,7 @@ filters?: string;
  */
 sort_params?: string;
 /**
+ * Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.
  * @minimum 0
  */
 page_number?: number;
@@ -26778,6 +27227,7 @@ filters?: string;
  */
 sort_params?: string;
 /**
+ * Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.
  * @minimum 0
  */
 page_number?: number;
@@ -26812,6 +27262,7 @@ session_id?: string;
  */
 filters?: string;
 /**
+ * Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.
  * @minimum 0
  */
 page_number?: number;
@@ -26820,25 +27271,33 @@ page_number?: number;
  * @maximum 500
  */
 page_size?: number;
+/**
+ * Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.
+ * @minLength 1
+ * @maxLength 4096
+ */
+cursor?: string;
+cursor_mode?: boolean;
 interval?: string;
 };
 
 export type TracerTraceListVoiceCallsParams = {
+project_id: string;
 /**
- * A page number within the paginated result set.
+ * @minLength 1
+ */
+filters?: string;
+/**
+ * One-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.
+ * @minimum 1
  */
 page?: number;
 /**
- * Number of results to return per page.
+ * @minimum 1
+ * @maximum 500
  */
-limit?: number;
-};
-
-export type TracerTraceListVoiceCalls200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: TraceApi[];
+page_size?: number;
+remove_simulation_calls?: boolean;
 };
 
 export type TracerTraceVoiceCallDetailParams = {

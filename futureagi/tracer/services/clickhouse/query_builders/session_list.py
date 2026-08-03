@@ -15,6 +15,9 @@ from typing import Any
 
 from tracer.services.clickhouse.query_builders.base import NIL_UUID, BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+    partition_span_filter_plans,
+)
 from tracer.services.clickhouse.query_builders.session_filters import (
     SESSION_ID_FILTER_COLS,
     build_session_id_filter_clause,
@@ -22,6 +25,7 @@ from tracer.services.clickhouse.query_builders.session_filters import (
 from tracer.services.clickhouse.v2.id_remap_sql import (
     remap_left_join,
     resolved_id_expr,
+    survivor_map_subquery,
 )
 
 
@@ -47,6 +51,11 @@ class SessionListQueryBuilder(BaseQueryBuilder):
     """
 
     TABLE = "spans"
+    # The v2 subclass swaps this for the CH25-aware compiler.  Keeping the
+    # compiler behind a class attribute also lets the bounded session selector
+    # compile candidate-scoped residual predicates without leaking v1 column
+    # names into a v2-only deployment.
+    _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
 
     # Mapping from frontend sort column names to ClickHouse expressions
     SORT_FIELD_MAP: dict[str, str] = {
@@ -86,6 +95,15 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         "uniq(trace_id) AS traces_count"
     )
 
+    _CANDIDATE_SORT_FIELDS: dict[str, str] = {
+        **SORT_FIELD_MAP,
+        "session": "session_id",
+        "session_id": "session_id",
+        "trace_session_id": "session_id",
+        "first_message": "first_message",
+        "last_message": "last_message",
+    }
+
     def __init__(
         self,
         project_id: str | None = None,
@@ -95,6 +113,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         filters: list[dict] | None = None,
         sort_params: list[dict] | None = None,
         user_id: str | None = None,
+        bounded_internal_scan: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id=project_id, project_ids=project_ids, **kwargs)
@@ -103,8 +122,827 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         self.filters = filters or []
         self.sort_params = sort_params or []
         self.user_id = user_id
+        self._bounded_internal_scan = bool(bounded_internal_scan)
         self.start_date: datetime | None = None
         self.end_date: datetime | None = None
+        # The default range is derived from ``utcnow``. Pin it once so the
+        # bounded selector and every seed/classifier query use identical
+        # half-open boundaries instead of drifting forward by microseconds.
+        self._bounded_request_window = BaseQueryBuilder.parse_time_range(
+            self.filters, strict=True
+        )
+
+    def parse_time_range(
+        self, filters: list[dict]
+    ) -> tuple[datetime | None, datetime | None]:
+        if filters is self.filters or filters == self.filters:
+            return self._bounded_request_window
+        return BaseQueryBuilder.parse_time_range(filters, strict=True)
+
+    def _bounded_scalar_span_filters(self) -> list[dict[str, Any]]:
+        """Return root-span predicates not handled at session level.
+
+        Session identity, end-user membership, aggregate/message predicates and
+        the request window are evaluated by the session CTEs.  Everything else
+        (notably customer attributes such as ``final_status``) is compiled as a
+        latest-state root-span predicate for a finite candidate-session batch.
+        """
+
+        session_columns = {
+            "created_at",
+            "start_time",
+            "end_time",
+            *self._SESSION_ID_FILTER_COLS,
+            *self._ENDUSER_ID_FILTER_COLS,
+            *self.SESSION_FILTER_MAP,
+            *self.MESSAGE_FILTER_MAP,
+        }
+        return [
+            item
+            for item in self.filters
+            if (item.get("column_id") or item.get("columnId")) not in session_columns
+        ]
+
+    def _bounded_span_filter_parts(self):
+        return partition_span_filter_plans(self._bounded_scalar_span_filters())
+
+    def bounded_filter_degraded_error_code(self) -> str | None:
+        """Explain why the finite session bulk selector cannot represent a shape."""
+
+        if self.sort_params:
+            # Bulk selection has a fixed newest-session order.  An arbitrary UI
+            # sort would require a global aggregate before a finite prefix can
+            # be proven.
+            return "unsupported_filter_modifiers"
+        try:
+            _, residual = self._bounded_span_filter_parts()
+        except (TypeError, ValueError):
+            return "unsupported_filter_shape"
+        if residual:
+            # Score-label filters are removed by the caller and intersected in
+            # PG.  Other relational eval/annotation filters do not yet have a
+            # session-keyed finite classifier and must never fall back broad.
+            return "unsupported_relational_session_filter"
+        return None
+
+    def supports_bounded_filter_scan(self) -> bool:
+        active = any(
+            (item.get("column_id") or item.get("columnId"))
+            not in {"created_at", "start_time"}
+            for item in self.filters
+        )
+        return (
+            active or self._bounded_internal_scan
+        ) and self.bounded_filter_degraded_error_code() is None
+
+    @staticmethod
+    def recommended_filter_classify_batch_size() -> int:
+        return 200
+
+    @staticmethod
+    def filter_seed_proves_result_order() -> bool:
+        """The newest raw root is an upper bound for a session's true start.
+
+        Classification returns ``min(live root start_time)``.  An unseen
+        session whose newest raw root is below a proved cutoff cannot move ahead
+        of that cutoff after latest-version/tombstone replay.
+        """
+
+        return True
+
+    def supports_candidate_first_page(self) -> bool:
+        """Return true for the exact root-time ordered fast path.
+
+        The physical-root selector below proves the default/created-at ordering.
+        Session-id filters are applied to remap-resolved root IDs before paging.
+        Positive end-user filters use a user-ID-keyed membership selector;
+        negated/null filters use the same project/time-scoped latest-state
+        membership stream without unsafe ID pruning. Session aggregate/message
+        predicates and their sorts are computed from the narrow physical-latest
+        root stream before paging. Arbitrary span/eval/annotation filters remain
+        off the list path; the internal bulk selector can classify scalar span
+        filters after it has a finite session-ID batch.
+        """
+
+        for item in self.filters:
+            column_id = item.get("column_id") or item.get("columnId")
+            if column_id in {"created_at", "start_time"}:
+                continue
+            if column_id in self._SESSION_ID_FILTER_COLS:
+                continue
+            if column_id in self._ENDUSER_ID_FILTER_COLS:
+                config = item.get("filter_config") or item.get("filterConfig") or {}
+                operator = config.get("filter_op") or config.get("filterOp")
+                if operator in {
+                    "equals",
+                    "in",
+                    "not_equals",
+                    "not_in",
+                    "is_null",
+                    "is_not_null",
+                }:
+                    continue
+            if (
+                column_id in self.SESSION_FILTER_MAP
+                or column_id in self.MESSAGE_FILTER_MAP
+                or column_id == "end_time"
+            ):
+                continue
+            return False
+        return all(
+            (item.get("column_id") or item.get("columnId"))
+            in self._CANDIDATE_SORT_FIELDS
+            and str(item.get("direction") or "desc").lower() in {"asc", "desc"}
+            for item in self.sort_params
+        )
+
+    def _candidate_order_clause(self) -> str:
+        if not self.sort_params:
+            return "ORDER BY session_start DESC, session_id DESC"
+        parts: list[str] = []
+        sorted_by_session_id = False
+        tie_direction = "DESC"
+        for item in self.sort_params:
+            column_id = item.get("column_id") or item.get("columnId")
+            column = self._CANDIDATE_SORT_FIELDS[column_id]
+            direction = str(item.get("direction") or "desc").upper()
+            tie_direction = direction
+            parts.append(f"{column} {direction}")
+            sorted_by_session_id = sorted_by_session_id or column == "session_id"
+        if not sorted_by_session_id:
+            # A total order is required for stable numbered pages.
+            parts.append(f"session_id {tie_direction}")
+        return f"ORDER BY {', '.join(parts)}"
+
+    def _candidate_positive_filter_values(
+        self, columns: frozenset[str]
+    ) -> tuple[str, ...]:
+        """Return positive equality/IN IDs used to prune candidate identities."""
+
+        values: list[str] = []
+        for item in self.filters:
+            column_id = item.get("column_id") or item.get("columnId")
+            if column_id not in columns:
+                continue
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            operator = config.get("filter_op") or config.get("filterOp")
+            if operator not in {"equals", "in"}:
+                continue
+            raw = config.get("filter_value", config.get("filterValue"))
+            raw_values = raw if isinstance(raw, list) else [raw]
+            values.extend(str(value) for value in raw_values if value)
+        return tuple(dict.fromkeys(values))
+
+    def _candidate_session_ctes(
+        self,
+        params: dict[str, Any],
+        *,
+        candidate_session_ids: tuple[str, ...] = (),
+        root_filter_plans: tuple[Any, ...] = (),
+        candidate_full_state: bool = False,
+    ) -> str:
+        """Build the shared exact session candidate CTEs.
+
+        Root identities are selected from the root projection and replayed to
+        latest physical state. Structural session predicates bind to the
+        remap-resolved session ID. Positive end-user predicates build a narrow
+        membership set from only the requested user IDs, replaying those span
+        identities before resolving both user and session remaps.
+        """
+
+        if candidate_full_state and not candidate_session_ids:
+            raise ValueError("full-state session scan requires bounded candidates")
+
+        ts_map = survivor_map_subquery("trace_session_id_remap")
+        resolved_session = resolved_id_expr("latest_trace_session_id", "ts_remap")
+        resolved_session_clause = build_session_id_filter_clause(
+            self.filters,
+            params,
+            session_col="session_id",
+            param_prefix="candidate_sess_",
+        )
+        aggregate_clause = self._build_having_clauses()
+        # `_build_having_clauses` maintains the legacy builder contract by
+        # binding into `self.params`; copy those generated values into this
+        # candidate statement's independent parameter dict.
+        params.update(self.params)
+
+        candidate_columns = {
+            item.get("column_id") or item.get("columnId")
+            for item in [*self.filters, *self.sort_params]
+        }
+        needs_end_time = bool(candidate_columns & {"end_time", "duration"})
+        needs_cost = "total_cost" in candidate_columns
+        needs_tokens = "total_tokens" in candidate_columns
+        needs_traces = bool(candidate_columns & {"traces_count", "total_traces_count"})
+        needs_messages = bool(candidate_columns & {"first_message", "last_message"})
+
+        latest_metric_columns: list[str] = []
+        resolved_metric_columns: list[str] = []
+        session_metric_columns: list[str] = []
+        root_filter_predicates: list[str] = []
+        for plan in root_filter_plans:
+            params.update(plan.params)
+            root_filter_predicates.append(plan.predicate)
+            for aggregate in plan.aggregates:
+                latest_metric_columns.append(aggregate)
+                alias = aggregate.rsplit(" AS ", 1)[-1].strip()
+                if not alias or alias == aggregate:
+                    raise ValueError("latest-state session aggregate requires an alias")
+                resolved_metric_columns.append(alias)
+        if needs_end_time:
+            latest_metric_columns.append(
+                "argMax(tuple(end_time), _peerdb_version).1 AS latest_end_time"
+            )
+            resolved_metric_columns.append("latest_end_time AS end_time")
+            session_metric_columns.extend(
+                [
+                    "max(end_time) AS session_end",
+                    "dateDiff('second', min(start_time), max(end_time)) AS duration",
+                ]
+            )
+        if needs_cost:
+            latest_metric_columns.append(
+                "argMax(tuple(cost), _peerdb_version).1 AS latest_cost"
+            )
+            resolved_metric_columns.append("latest_cost AS cost")
+            session_metric_columns.append("sum(cost) AS total_cost")
+        if needs_tokens:
+            latest_metric_columns.append(
+                "argMax(tuple(total_tokens), _peerdb_version).1 AS latest_total_tokens"
+            )
+            resolved_metric_columns.append("latest_total_tokens AS total_tokens")
+            session_metric_columns.append("sum(total_tokens) AS total_tokens")
+        if needs_traces:
+            resolved_metric_columns.append("trace_id")
+            session_metric_columns.append("uniq(trace_id) AS traces_count")
+        if needs_messages:
+            latest_metric_columns.append(
+                "argMax(tuple(input), _peerdb_version).1 AS latest_input"
+            )
+            resolved_metric_columns.append("latest_input AS input")
+            session_metric_columns.extend(
+                [
+                    "argMin(input, start_time) AS first_message",
+                    "argMax(input, start_time) AS last_message",
+                ]
+            )
+        latest_metric_select = (
+            ",\n                " + ",\n                ".join(latest_metric_columns)
+            if latest_metric_columns
+            else ""
+        )
+        resolved_metric_select = (
+            ",\n                " + ",\n                ".join(resolved_metric_columns)
+            if resolved_metric_columns
+            else ""
+        )
+        session_metric_select = (
+            ",\n                " + ",\n                ".join(session_metric_columns)
+            if session_metric_columns
+            else ""
+        )
+
+        end_time_filters = [
+            item
+            for item in self.filters
+            if (item.get("column_id") or item.get("columnId")) == "end_time"
+        ]
+        root_value_clause = ""
+        if end_time_filters:
+            filter_builder = ClickHouseFilterBuilder(
+                table=self.TABLE,
+                project_id=self.project_id,
+                project_ids=self.project_ids,
+            )
+            root_value_clause, root_value_params = filter_builder.translate(
+                end_time_filters
+            )
+            params.update(root_value_params)
+
+        has_explicit_time_filter = any(
+            (item.get("column_id") or item.get("columnId"))
+            in {"created_at", "start_time"}
+            for item in self.filters
+        )
+        scope_to_request_window = not candidate_full_state or has_explicit_time_filter
+        span_time_scope = (
+            "\n              AND toDate(start_time) BETWEEN "
+            "toDate(%(start_date)s) AND toDate(%(end_date)s)"
+            "\n              AND start_time >= %(start_date)s"
+            "\n              AND start_time < %(end_date)s"
+            if scope_to_request_window
+            else ""
+        )
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="session_candidate_time_exclusion",
+            )
+        )
+        params.update(datetime_params)
+        if datetime_predicate:
+            span_time_scope += f"\n              AND {datetime_predicate}"
+
+        positive_session_ids = self._candidate_positive_filter_values(
+            self._SESSION_ID_FILTER_COLS
+        )
+        seed_session_ids = candidate_session_ids or positive_session_ids
+        root_session_seed = ""
+        if seed_session_ids:
+            params["candidate_filter_session_ids"] = seed_session_ids
+            root_session_seed = """
+              AND (
+                  trace_session_id IN %(candidate_filter_session_ids)s
+                  OR trace_session_id IN (
+                      SELECT any_id
+                      FROM ts_survivor_map
+                      WHERE survivor_id IN %(candidate_filter_session_ids)s
+                  )
+              )
+            """
+
+        user_filter_items = [
+            item
+            for item in self.filters
+            if (item.get("column_id") or item.get("columnId"))
+            in self._ENDUSER_ID_FILTER_COLS
+        ]
+        user_ids: list[str] = []
+        for item in user_filter_items:
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            raw = config.get("filter_value", config.get("filterValue"))
+            values = raw if isinstance(raw, list) else [raw]
+            user_ids.extend(str(value) for value in values if value)
+        if self.user_id:
+            user_ids.append(str(self.user_id))
+        user_ids = list(dict.fromkeys(user_ids))
+        user_null_op = self._user_null_filter_op()
+        resolved_user_clause = (
+            "" if user_null_op else self._build_resolved_user_clause(params)
+        )
+        user_ctes = ""
+        user_membership = ""
+        eu_map_cte = ""
+        if resolved_user_clause or user_null_op:
+            eu_map = survivor_map_subquery("end_user_id_remap")
+            resolved_user_session = resolved_id_expr(
+                "latest_trace_session_id", "user_ts_remap"
+            )
+            resolved_user = resolved_id_expr("latest_end_user_id", "user_eu_remap")
+            eu_map_cte = f",\n        eu_survivor_map AS ({eu_map})"
+
+            # Page-list user filters are positive and can seed by requested
+            # user IDs.  The bounded bulk classifier already has <=200 session
+            # IDs, so it scopes by those IDs instead; this also makes NOT IN and
+            # null-presence semantics exact without scanning every user span in
+            # the project.
+            user_filter_ops = {
+                (item.get("filter_config") or item.get("filterConfig") or {}).get(
+                    "filter_op"
+                )
+                or (item.get("filter_config") or item.get("filterConfig") or {}).get(
+                    "filterOp"
+                )
+                for item in user_filter_items
+            }
+            positive_user_seed = user_filter_ops <= {"equals", "in"}
+            if candidate_session_ids:
+                user_seed_clause = """
+              AND (
+                  trace_session_id IN %(candidate_filter_session_ids)s
+                  OR trace_session_id IN (
+                      SELECT any_id
+                      FROM ts_survivor_map
+                      WHERE survivor_id IN %(candidate_filter_session_ids)s
+                  )
+              )
+                """
+            elif positive_user_seed:
+                # A positive filter with an empty value list must match nothing,
+                # never widen into an unscoped scan.
+                params["candidate_filter_user_ids"] = tuple(user_ids or [NIL_UUID])
+                user_seed_clause = """
+              AND (
+                  end_user_id IN %(candidate_filter_user_ids)s
+                  OR end_user_id IN (
+                      SELECT any_id
+                      FROM eu_survivor_map
+                      WHERE survivor_id IN %(candidate_filter_user_ids)s
+                  )
+              )
+                """
+            else:
+                # NOT IN / null-presence predicates cannot be seeded by the
+                # requested user IDs without changing their meaning.  The scan
+                # remains project/time/root-column only and replays latest
+                # physical state before forming session membership.
+                user_seed_clause = ""
+            user_ctes = f""",
+        candidate_user_span_identities AS (
+            SELECT DISTINCT project_id, trace_id, id, start_time
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}{span_time_scope}
+              {user_seed_clause}
+        ),
+        latest_user_spans AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(trace_session_id), _peerdb_version).1 AS latest_trace_session_id,
+                argMax(tuple(end_user_id), _peerdb_version).1 AS latest_end_user_id,
+                argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}{span_time_scope}
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_user_span_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        resolved_user_spans AS (
+            SELECT
+                {resolved_user_session} AS session_id,
+                {resolved_user} AS end_user_id
+            FROM latest_user_spans
+            LEFT JOIN ts_survivor_map AS user_ts_remap
+                ON latest_trace_session_id = user_ts_remap.any_id
+            LEFT JOIN eu_survivor_map AS user_eu_remap
+                ON latest_end_user_id = user_eu_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND isNotNull(latest_trace_session_id)
+              AND latest_trace_session_id != toUUID('{NIL_UUID}')
+        ),
+        matching_user_sessions AS (
+            SELECT session_id
+            FROM resolved_user_spans
+            WHERE isNotNull(end_user_id)
+              AND end_user_id != toUUID('{NIL_UUID}')
+              {f"AND {resolved_user_clause}" if resolved_user_clause else ""}
+            GROUP BY session_id
+        )"""
+            membership_op = "NOT IN" if user_null_op == "is_null" else "IN"
+            user_membership = (
+                f"AND session_id {membership_op} "
+                "(SELECT session_id FROM matching_user_sessions)"
+            )
+
+        session_predicate = (
+            f"AND {resolved_session_clause}" if resolved_session_clause else ""
+        )
+        return f"""
+        ts_survivor_map AS ({ts_map})
+        {eu_map_cte},
+        candidate_root_identities AS (
+            SELECT DISTINCT project_id, trace_id, id, start_time
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}{span_time_scope}
+            WHERE (parent_span_id IS NULL OR parent_span_id = '')
+              {root_session_seed}
+        ),
+        latest_roots AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(parent_span_id), _peerdb_version).1 AS latest_parent_span_id,
+                argMax(tuple(trace_session_id), _peerdb_version).1 AS latest_trace_session_id,
+                argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
+                {latest_metric_select}
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}{span_time_scope}
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_root_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        resolved_root_sessions AS (
+            SELECT
+                {resolved_session} AS session_id,
+                start_time
+                {resolved_metric_select}
+            FROM latest_roots
+            LEFT JOIN ts_survivor_map AS ts_remap
+                ON latest_trace_session_id = ts_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
+              AND isNotNull(latest_trace_session_id)
+              AND latest_trace_session_id != toUUID('{NIL_UUID}')
+              {f"AND {root_value_clause}" if root_value_clause else ""}
+              {f"AND {' AND '.join(root_filter_predicates)}" if root_filter_predicates else ""}
+        )
+        {user_ctes},
+        sessions AS (
+            SELECT
+                session_id,
+                min(start_time) AS session_start
+                {session_metric_select}
+            FROM resolved_root_sessions
+            WHERE 1 = 1
+              {session_predicate}
+              {user_membership}
+            GROUP BY session_id
+            {f"HAVING {aggregate_clause}" if aggregate_clause else ""}
+        )
+        """
+
+    def build_filter_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        before_start_time: datetime | None = None,
+        before_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Seed a finite newest-first superset of session IDs.
+
+        This query deliberately reads only raw root identity/order columns.
+        Newer tombstones may create false-positive seeds, but cannot hide a
+        live session; ``build_filter_match_query`` replays latest state before
+        admitting any seed into the result.
+        """
+
+        if not self.supports_bounded_filter_scan():
+            raise ValueError("unsupported bounded session filter scan")
+        if limit <= 0 or limit > 200:
+            raise ValueError("session seed limit must be between 1 and 200")
+        if (before_start_time is None) != (before_id is None):
+            raise ValueError("session keyset values must be provided together")
+        request_start, request_end = self.parse_time_range(self.filters)
+        if not request_start <= slice_start < slice_end <= request_end:
+            raise ValueError("session seed slice must stay inside the request window")
+
+        params: dict[str, Any] = {
+            **self.params,
+            "filter_slice_start": slice_start,
+            "filter_slice_end": slice_end,
+            "filter_seed_limit": int(limit),
+        }
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="session_seed_time_exclusion",
+            )
+        )
+        params.update(datetime_params)
+        datetime_fragment = (
+            f"\n                  AND {datetime_predicate}"
+            if datetime_predicate
+            else ""
+        )
+        keyset_clause = ""
+        if before_start_time is not None:
+            if not slice_start <= before_start_time < slice_end:
+                raise ValueError("session keyset must stay inside its slice")
+            params["filter_before_start_time"] = before_start_time
+            params["filter_before_session_id"] = str(before_id)
+            keyset_clause = """
+            WHERE start_time < %(filter_before_start_time)s
+               OR (
+                   start_time = %(filter_before_start_time)s
+                   AND toString(session_id) < %(filter_before_session_id)s
+               )
+            """
+
+        ts_map = survivor_map_subquery("trace_session_id_remap")
+        resolved_session = resolved_id_expr("raw_trace_session_id", "seed_ts_remap")
+        query = f"""
+        WITH
+        ts_survivor_map AS ({ts_map}),
+        seed_sessions AS (
+            SELECT
+                {resolved_session} AS session_id,
+                max(start_time) AS start_time
+            FROM (
+                SELECT
+                    trace_session_id AS raw_trace_session_id,
+                    start_time
+                FROM {self.TABLE}
+                PREWHERE {self.project_filter_sql()}
+                  AND _peerdb_is_deleted = 0
+                  AND start_time >= %(filter_slice_start)s
+                  AND start_time < %(filter_slice_end)s{datetime_fragment}
+                WHERE (parent_span_id IS NULL OR parent_span_id = '')
+                  AND isNotNull(trace_session_id)
+                  AND trace_session_id != toUUID('{NIL_UUID}')
+            ) AS raw_roots
+            LEFT JOIN ts_survivor_map AS seed_ts_remap
+                ON raw_trace_session_id = seed_ts_remap.any_id
+            GROUP BY session_id
+        )
+        SELECT session_id, start_time
+        FROM seed_sessions
+        {keyset_clause}
+        ORDER BY start_time DESC, toString(session_id) DESC
+        LIMIT %(filter_seed_limit)s
+        """
+        return query, params
+
+    def build_filter_match_query(
+        self,
+        candidate_ids: list[str],
+        *,
+        candidate_full_state: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        """Classify at most 200 session IDs against exact latest root state."""
+
+        session_ids = tuple(
+            dict.fromkeys(str(value) for value in candidate_ids if value)
+        )
+        if not session_ids:
+            return "", {}
+        if len(session_ids) > 200:
+            raise ValueError("candidate session batch exceeds bounded limit")
+        if not self.supports_bounded_filter_scan():
+            raise ValueError("unsupported bounded session filter scan")
+
+        plans, residual = self._bounded_span_filter_parts()
+        if residual:
+            raise ValueError("unsupported relational bounded session filter")
+        start_date, end_date = self.parse_time_range(self.filters)
+        params: dict[str, Any] = {
+            **self.params,
+            "start_date": start_date,
+            "end_date": end_date,
+            "bounded_match_limit": len(session_ids),
+        }
+        candidate_ctes = self._candidate_session_ctes(
+            params,
+            candidate_session_ids=session_ids,
+            root_filter_plans=tuple(plans),
+            candidate_full_state=candidate_full_state,
+        )
+        query = f"""
+        WITH
+        {candidate_ctes}
+        SELECT session_id, session_start AS start_time
+        FROM sessions
+        ORDER BY start_time DESC, toString(session_id) DESC
+        LIMIT %(bounded_match_limit)s
+        """
+        return query, params
+
+    def build_candidate_page_query(self) -> tuple[str, dict[str, Any]]:
+        """Select only the exact session page from physical latest root spans.
+
+        Unlike the historical query, this first pass does not read cost/token/
+        enrichment columns for every session. It replays the direct-write
+        physical identity ``(project, trace, span id, start_time)`` with
+        latest-wins tombstone semantics. When membership or ordering depends on
+        aggregate/message metrics, only those narrow root columns are computed
+        before the page; full content/attribute enrichment remains page-scoped.
+        """
+
+        if not self.supports_candidate_first_page():
+            raise ValueError("session request is not candidate-page safe")
+        self.start_date, self.end_date = self.parse_time_range(self.filters)
+        params = {
+            **self.params,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "limit": self.page_size + 1,
+            "offset": self.page_number * self.page_size,
+        }
+        candidate_ctes = self._candidate_session_ctes(params)
+        order_clause = self._candidate_order_clause()
+        query = f"""
+        WITH
+        {candidate_ctes}
+        SELECT
+            session_id,
+            session_start,
+            count() OVER() AS total_count
+        FROM sessions
+        {order_clause}
+        LIMIT %(limit)s
+        OFFSET %(offset)s
+        """
+        return query, params
+
+    def build_candidate_count_query(self) -> tuple[str, dict[str, Any]]:
+        """Count exact candidate sessions when an out-of-range page is empty.
+
+        ``count() OVER()`` has no carrier row on an empty page.  This fallback
+        repeats only the physical identity/latest-state selector; it does not
+        run the historical content/cost/token aggregation.
+        """
+
+        if not self.supports_candidate_first_page():
+            raise ValueError("session request is not candidate-page safe")
+        start_date, end_date = self.parse_time_range(self.filters)
+        params = {
+            **self.params,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        candidate_ctes = self._candidate_session_ctes(params)
+        query = f"""
+        WITH
+        {candidate_ctes}
+        SELECT count() AS total
+        FROM sessions
+        """
+        return query, params
+
+    def build_page_metrics_query(
+        self, session_ids: list[str]
+    ) -> tuple[str, dict[str, Any]]:
+        """Hydrate aggregates for an already selected <=200-session page."""
+
+        ids = tuple(dict.fromkeys(str(value) for value in session_ids if value))
+        if not ids:
+            return "", {}
+        if len(ids) > 200:
+            raise ValueError("candidate session page exceeds bounded limit")
+        start_date, end_date = self.parse_time_range(self.filters)
+        params = {
+            **self.params,
+            "start_date": start_date,
+            "end_date": end_date,
+            "candidate_session_ids": ids,
+        }
+        ts_map = survivor_map_subquery("trace_session_id_remap")
+        resolved_session = resolved_id_expr("latest_trace_session_id", "ts_remap")
+        query = f"""
+        WITH
+        ts_survivor_map AS ({ts_map}),
+        candidate_root_identities AS (
+            SELECT DISTINCT
+                project_id,
+                trace_id,
+                id,
+                start_time
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND (
+                  trace_session_id IN %(candidate_session_ids)s
+                  OR trace_session_id IN (
+                      SELECT any_id
+                      FROM ts_survivor_map
+                      WHERE survivor_id IN %(candidate_session_ids)s
+                  )
+              )
+        ),
+        latest_roots AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(parent_span_id), _peerdb_version).1 AS latest_parent_span_id,
+                argMax(tuple(trace_session_id), _peerdb_version).1 AS latest_trace_session_id,
+                argMax(tuple(end_time), _peerdb_version).1 AS latest_end_time,
+                argMax(tuple(cost), _peerdb_version).1 AS latest_cost,
+                argMax(tuple(total_tokens), _peerdb_version).1 AS latest_total_tokens,
+                argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_root_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        resolved_roots AS (
+            SELECT
+                {resolved_session} AS session_id,
+                trace_id,
+                start_time,
+                latest_end_time AS end_time,
+                latest_cost AS cost,
+                latest_total_tokens AS total_tokens
+            FROM latest_roots
+            LEFT JOIN ts_survivor_map AS ts_remap
+                ON latest_trace_session_id = ts_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
+              AND {resolved_session} IN %(candidate_session_ids)s
+        )
+        SELECT
+            session_id,
+            min(start_time) AS session_start,
+            max(end_time) AS session_end,
+            dateDiff('second', min(start_time), max(end_time)) AS duration,
+            sum(cost) AS total_cost,
+            sum(total_tokens) AS total_tokens,
+            uniq(trace_id) AS traces_count
+        FROM resolved_roots
+        GROUP BY session_id
+        """
+        return query, params
 
     def build(self) -> tuple[str, dict[str, Any]]:
         """Build the session list query.
@@ -152,7 +990,21 @@ class SessionListQueryBuilder(BaseQueryBuilder):
 
         # Resolve session IDs new→old before grouping so cross-cutover spans
         # remain one session. User membership is handled separately below.
-        time_where = "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="session_list_time_exclusion",
+            )
+        )
+        self.params.update(datetime_params)
+        datetime_fragment = (
+            f"\n          AND {datetime_predicate}" if datetime_predicate else ""
+        )
+        time_where = (
+            "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+            f"{datetime_fragment}"
+        )
         from_where = self._session_from_where(
             self.params,
             time_where=time_where,
@@ -226,6 +1078,16 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             time_where = (
                 "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
             )
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="session_id_time_exclusion",
+            )
+        )
+        self.params.update(datetime_params)
+        if datetime_predicate:
+            time_where += f"\n          AND {datetime_predicate}"
         from_where = self._session_from_where(
             self.params,
             time_where=time_where,
@@ -255,35 +1117,66 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         straddler's first/last message is computed off only its old-id half.
         Pre-flip the remap is a no-op → byte-identical (gate B).
         """
-        if not session_ids:
+        ids = tuple(dict.fromkeys(str(value) for value in session_ids if value))
+        if not ids:
             return "", {}
-        params = {**self.params, "content_session_ids": tuple(session_ids)}
-        ts_join = remap_left_join(
-            "rs.trace_session_id", "trace_session_id_remap", "ts_remap"
-        )
-        resolved_ts = resolved_id_expr("rs.trace_session_id", "ts_remap")
+        if len(ids) > 200:
+            raise ValueError("content session page exceeds bounded limit")
+        params = {**self.params, "content_session_ids": ids}
+        ts_map = survivor_map_subquery("trace_session_id_remap")
+        resolved_ts = resolved_id_expr("latest_trace_session_id", "ts_remap")
         query = f"""
+        WITH
+        ts_survivor_map AS ({ts_map}),
+        candidate_root_identities AS (
+            SELECT DISTINCT project_id, trace_id, id, start_time
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND (
+                  trace_session_id IN %(content_session_ids)s
+                  OR trace_session_id IN (
+                      SELECT any_id
+                      FROM ts_survivor_map
+                      WHERE survivor_id IN %(content_session_ids)s
+                  )
+              )
+        ),
+        latest_roots AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(parent_span_id), _peerdb_version).1 AS latest_parent_span_id,
+                argMax(tuple(trace_session_id), _peerdb_version).1 AS latest_trace_session_id,
+                argMax(tuple(input), _peerdb_version).1 AS latest_input,
+                argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_root_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        resolved_roots AS (
+            SELECT
+                {resolved_ts} AS session_id,
+                start_time,
+                latest_input AS input
+            FROM latest_roots
+            LEFT JOIN ts_survivor_map AS ts_remap
+                ON latest_trace_session_id = ts_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
+              AND {resolved_ts} IN %(content_session_ids)s
+        )
         SELECT
-            trace_session_id AS session_id,
+            session_id,
             argMin(input, start_time) AS first_message,
             argMax(input, start_time) AS last_message
-        FROM (
-            SELECT
-                {resolved_ts} AS trace_session_id,
-                rs.input AS input,
-                rs.start_time AS start_time
-            FROM (
-                SELECT trace_session_id, input, start_time
-                FROM {self.TABLE}
-                WHERE {self.project_filter_sql()}
-                  AND is_deleted = 0
-                  AND (parent_span_id IS NULL OR parent_span_id = '')
-                  AND trace_session_id IN %(content_session_ids)s
-            ) AS rs
-            {ts_join}
-        )
-        WHERE trace_session_id IN %(content_session_ids)s
-        GROUP BY trace_session_id
+        FROM resolved_roots
+        GROUP BY session_id
         """
         return query, params
 
@@ -328,7 +1221,21 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         # always, end_user_id when filtered) so `count(DISTINCT trace_session_id)`
         # unifies a straddler and the count matches the listed rows (else
         # has_more/pagination lies). Pre-flip a byte-identical no-op (gate B).
-        time_where = "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="session_simple_count_time_exclusion",
+            )
+        )
+        params.update(datetime_params)
+        datetime_fragment = (
+            f"\n          AND {datetime_predicate}" if datetime_predicate else ""
+        )
+        time_where = (
+            "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+            f"{datetime_fragment}"
+        )
         from_where = self._session_from_where(
             params,
             time_where=time_where,
@@ -363,7 +1270,21 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         # P3b step1.5: same id-remap-resolved scan as build()/simple-count so the
         # HAVING-filtered session count unifies a straddler identically (group on
         # the resolved trace_session_id). Pre-flip a byte-identical no-op (gate B).
-        time_where = "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="session_aggregate_count_time_exclusion",
+            )
+        )
+        params.update(datetime_params)
+        datetime_fragment = (
+            f"\n          AND {datetime_predicate}" if datetime_predicate else ""
+        )
+        time_where = (
+            "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+            f"{datetime_fragment}"
+        )
         from_where = self._session_from_where(
             params,
             time_where=time_where,

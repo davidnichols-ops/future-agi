@@ -55,6 +55,14 @@ import {
 } from "../utils/rowPathWalker";
 import { buildCompositeRuntimeConfig } from "../Helpers/compositeRuntimeConfig";
 import { useExecuteCompositeEvalAdhoc } from "../hooks/useCompositeEval";
+import {
+  getQueryReadMessage,
+  getQueryReadState,
+} from "src/utils/queryReadState";
+import {
+  mergeTracingFieldNames,
+  useExactEvalAttributeFields,
+} from "./useExactEvalAttributeFields";
 
 const ROW_TYPE_OPTIONS = [
   { value: "Span", label: "Spans", icon: "solar:layers-outline" },
@@ -332,6 +340,7 @@ const TracingTestMode = React.forwardRef(
     const [columns, setColumns] = useState([]);
     const [rows, setRows] = useState([]);
     const [totalRows, setTotalRows] = useState(0);
+    const [listReadState, setListReadState] = useState("complete");
     const [currentRowIndex, setCurrentRowIndex] = useState(0);
     const [loading, setLoading] = useState(false);
     // Key the last-completed fetch so we can derive "is the current
@@ -342,8 +351,9 @@ const TracingTestMode = React.forwardRef(
     // against the last-fetched key tells us synchronously — in the same
     // render that the props changed — that new data is on the way.
     const [lastFetchedKey, setLastFetchedKey] = useState(null);
+    const effectiveFilterKey = JSON.stringify(effectiveFilters || []);
     const currentFetchKey = selectedProjectId
-      ? `${selectedProjectId}:${rowType}`
+      ? `${selectedProjectId}:${rowType}:${effectiveFilterKey}`
       : null;
     const isPendingNewFetch =
       !!currentFetchKey && lastFetchedKey !== currentFetchKey;
@@ -378,6 +388,20 @@ const TracingTestMode = React.forwardRef(
         ? { ...initialMapping }
         : {},
     );
+    const [mappingSearch, setMappingSearch] = useState("");
+    const {
+      data: exactAttributeFields,
+      queryReadState: exactAttributeReadState,
+      isFetching: isFetchingExactAttributes,
+    } = useExactEvalAttributeFields({
+      projectId: selectedProjectId,
+      rowType,
+      search: mappingSearch,
+      // Only the audited task trace/span flow enables server-side exact
+      // discovery. Session and voice mappings retain the existing freeSolo
+      // path until their attribute-path contracts are verified separately.
+      enabled: allowCustomFieldPath,
+    });
 
     // Template ID ref (updated via imperative handle for first-test flow)
     const templateIdRef = useRef(templateId);
@@ -449,12 +473,14 @@ const TracingTestMode = React.forwardRef(
         setTotalRows(0);
         setCurrentRowIndex(0);
         setLastFetchedKey(null);
+        setListReadState("complete");
         return;
       }
 
       setLoading(true);
+      setListReadState("complete");
       let cancelled = false;
-      const fetchKey = `${selectedProjectId}:${rowType}`;
+      const fetchKey = `${selectedProjectId}:${rowType}:${effectiveFilterKey}`;
 
       const fetchData = async () => {
         setRows([]);
@@ -470,6 +496,7 @@ const TracingTestMode = React.forwardRef(
             });
             if (cancelled) return;
             const result = data?.result || data || {};
+            setListReadState(getQueryReadState(data));
             const rowsOut = result.results || result.data || result.calls || [];
             setColumns([]);
             setRows(rowsOut);
@@ -495,6 +522,7 @@ const TracingTestMode = React.forwardRef(
           const { data } = await axios.get(endpoint, { params });
           if (cancelled) return;
           const res = data?.result || {};
+          setListReadState(getQueryReadState(data));
 
           const cols = res.config || [];
           const tableRows = res.table || [];
@@ -506,6 +534,7 @@ const TracingTestMode = React.forwardRef(
           setCurrentRowIndex(0);
         } catch {
           if (cancelled) return;
+          setListReadState("error");
           setColumns([]);
           setRows([]);
           setTotalRows(0);
@@ -522,7 +551,7 @@ const TracingTestMode = React.forwardRef(
         cancelled = true;
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [selectedProjectId, rowType, JSON.stringify(effectiveFilters || [])]);
+    }, [selectedProjectId, rowType, effectiveFilterKey]);
 
     // ── Current row ──
     const currentRow = rows[currentRowIndex] || null;
@@ -795,9 +824,11 @@ const TracingTestMode = React.forwardRef(
     // column keys before the detail has loaded.
     const fieldNames = useMemo(() => {
       const base = walkedFromDetail?.paths;
-      if (base?.length) return [...base, ...deepenedPaths];
-      return rowFields.map((f) => f?.colId || f?.key);
-    }, [walkedFromDetail, deepenedPaths, rowFields]);
+      const genericFields = base?.length
+        ? [...base, ...deepenedPaths]
+        : rowFields.map((f) => f?.colId || f?.key);
+      return mergeTracingFieldNames(genericFields, exactAttributeFields);
+    }, [walkedFromDetail, deepenedPaths, rowFields, exactAttributeFields]);
 
     const truncatedSet = useMemo(() => {
       const merged = new Set(walkedFromDetail?.truncated || []);
@@ -811,6 +842,7 @@ const TracingTestMode = React.forwardRef(
     // on demand here — their spans stay unknown, resolved silently).
     const handleMappingInputChange = useCallback(
       (_event, inputValue) => {
+        setMappingSearch(inputValue || "");
         if (!inputValue?.endsWith(".")) return;
         const prefix = inputValue.slice(0, -1);
         if (!truncatedSet.has(prefix)) return;
@@ -1592,6 +1624,29 @@ const TracingTestMode = React.forwardRef(
         {selectedProjectId &&
           !loading &&
           !isPendingNewFetch &&
+          getQueryReadMessage(listReadState) && (
+            <Box
+              role="status"
+              sx={(theme) => ({
+                px: 1.5,
+                py: 1,
+                mb: rows.length > 0 ? 1 : 0,
+                borderRadius: "6px",
+                border: "1px solid",
+                borderColor: alpha(theme.palette.warning.main, 0.35),
+                backgroundColor: alpha(theme.palette.warning.main, 0.08),
+              })}
+            >
+              <Typography variant="caption" color="warning.main">
+                {getQueryReadMessage(listReadState)}
+              </Typography>
+            </Box>
+          )}
+
+        {selectedProjectId &&
+          !loading &&
+          !isPendingNewFetch &&
+          listReadState === "complete" &&
           totalRows === 0 && (
             <Box
               sx={{
@@ -1629,10 +1684,16 @@ const TracingTestMode = React.forwardRef(
           (() => {
             const isFetchingColumns =
               !!selectedProjectId &&
-              (loading || isPendingNewFetch || loadingDetail);
+              (loading ||
+                isPendingNewFetch ||
+                loadingDetail ||
+                isFetchingExactAttributes);
             const mappingDisabledTooltip = isFetchingColumns
               ? "Columns are being fetched"
               : "";
+            const exactAttributeReadMessage = getQueryReadMessage(
+              exactAttributeReadState,
+            );
             return (
               <Box>
                 <Typography
@@ -1642,6 +1703,24 @@ const TracingTestMode = React.forwardRef(
                 >
                   Variable Mapping
                 </Typography>
+                {mappingSearch && exactAttributeReadMessage && (
+                  <Box
+                    role="status"
+                    sx={(theme) => ({
+                      px: 1,
+                      py: 0.5,
+                      mb: 0.75,
+                      borderRadius: "4px",
+                      border: "1px solid",
+                      borderColor: alpha(theme.palette.warning.main, 0.35),
+                      backgroundColor: alpha(theme.palette.warning.main, 0.08),
+                    })}
+                  >
+                    <Typography variant="caption" color="warning.main">
+                      {exactAttributeReadMessage}
+                    </Typography>
+                  </Box>
+                )}
                 <Box
                   sx={{ display: "flex", flexDirection: "column", gap: 0.75 }}
                 >
@@ -1658,6 +1737,11 @@ const TracingTestMode = React.forwardRef(
                             : fieldNames
                         }
                         value={mapping[variable] || null}
+                        onOpen={() => {
+                          if (allowCustomFieldPath) {
+                            setMappingSearch(mapping[variable] || variable);
+                          }
+                        }}
                         onChange={(_, val) =>
                           setMapping((prev) => ({
                             ...prev,

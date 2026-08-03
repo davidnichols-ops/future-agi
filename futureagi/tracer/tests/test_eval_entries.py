@@ -7,6 +7,7 @@ shape and stamping the config hash. Idempotent via the PR 3b unique indexes.
 
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from django.utils import timezone
@@ -21,8 +22,13 @@ from tracer.models.observation_span import (
 )
 from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession
+from tracer.selectors.eval_tasks.row_resolver import EvalTaskReadBudgetExceeded
 from tracer.services.eval_tasks.config_hash import resolved_config_hash
-from tracer.services.eval_tasks.entries import materialize_pending, soft_delete_live
+from tracer.services.eval_tasks.entries import (
+    _resolve_entry_fks,
+    materialize_pending,
+    soft_delete_live,
+)
 from tracer.tests._ch_seed import seed_ch_spans
 
 
@@ -90,6 +96,27 @@ def _make_spans(
 
 def _live(task, **filters):
     return EvalLogger.objects.filter(eval_task_id=str(task.id), **filters)
+
+
+@pytest.mark.unit
+def test_entry_fk_resolution_rejects_off_page_cross_trace_span_id_collision():
+    class CollisionReader:
+        def list_by_ids(self, *_args, **_kwargs):
+            return [
+                SimpleNamespace(id="shared", trace_id="trace-a"),
+                SimpleNamespace(id="shared", trace_id="trace-b"),
+            ]
+
+    with pytest.raises(
+        EvalTaskReadBudgetExceeded,
+        match="could not safely distinguish",
+    ):
+        _resolve_entry_fks(
+            CollisionReader(),
+            RowType.SPANS,
+            ["shared"],
+            project_id="project-a",
+        )
 
 
 @pytest.mark.integration

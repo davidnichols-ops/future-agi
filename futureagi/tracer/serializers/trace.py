@@ -6,9 +6,15 @@ from tracer.models.project import Project
 from tracer.models.project_version import ProjectVersion
 from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession
+from tracer.serializers.cursor_pagination import (
+    CURSOR_HELP_TEXT,
+    validate_cursor_exclusivity,
+)
 from tracer.serializers.filters import (
+    BOUNDED_PAGE_NUMBER_HELP_TEXT,
     SortParamListQueryParamField,
     StrictInputSerializer,
+    bounded_filter_list_query_param_field,
     filter_list_query_param_field,
 )
 
@@ -148,9 +154,14 @@ class CommaSeparatedStringListField(serializers.Field):
 class TraceListQuerySerializer(StrictInputSerializer):
     project_version_id = serializers.UUIDField(required=True)
     trace_ids = CommaSeparatedStringListField(required=False, default=list)
-    filters = filter_list_query_param_field(required=False, default=list)
+    filters = bounded_filter_list_query_param_field(required=False, default=list)
     sort_params = SortParamListQueryParamField(required=False, default=list)
-    page_number = serializers.IntegerField(required=False, default=0, min_value=0)
+    page_number = serializers.IntegerField(
+        required=False,
+        default=0,
+        min_value=0,
+        help_text=BOUNDED_PAGE_NUMBER_HELP_TEXT,
+    )
     page_size = serializers.IntegerField(
         required=False, default=30, min_value=1, max_value=500
     )
@@ -160,16 +171,42 @@ class TraceObserveListQuerySerializer(StrictInputSerializer):
     project_id = serializers.UUIDField(required=False)
     project_version_id = serializers.UUIDField(required=False)
     session_id = serializers.UUIDField(required=False)
-    filters = filter_list_query_param_field(required=False, default=list)
-    page_number = serializers.IntegerField(required=False, default=0, min_value=0)
+    filters = bounded_filter_list_query_param_field(required=False, default=list)
+    page_number = serializers.IntegerField(
+        required=False,
+        default=0,
+        min_value=0,
+        help_text=BOUNDED_PAGE_NUMBER_HELP_TEXT,
+    )
     page_size = serializers.IntegerField(
         required=False, default=30, min_value=1, max_value=500
     )
+    cursor = serializers.CharField(
+        required=False, allow_blank=False, max_length=4096, help_text=CURSOR_HELP_TEXT
+    )
+    cursor_mode = serializers.BooleanField(required=False, default=False)
     interval = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        return validate_cursor_exclusivity(self, attrs, page_field="page_number")
 
 
 class TraceObserveListMetadataSerializer(serializers.Serializer):
     total_rows = serializers.IntegerField()
+    total_rows_exact = serializers.IntegerField(required=False, allow_null=True)
+    total_rows_is_lower_bound = serializers.BooleanField(required=False)
+    has_more = serializers.BooleanField(required=False)
+    next_cursor = serializers.CharField(required=False, allow_null=True)
+    query_complete = serializers.BooleanField(required=False)
+    query_status = serializers.ChoiceField(
+        choices=("complete", "degraded"), required=False
+    )
+    query_error_code = serializers.CharField(required=False, allow_null=True)
+    query_elapsed_ms = serializers.FloatField(required=False)
+    query_count = serializers.IntegerField(required=False, min_value=0)
+    query_rows_returned = serializers.IntegerField(required=False, min_value=0)
+    query_result_payload_bytes = serializers.IntegerField(required=False, min_value=0)
 
 
 class TraceObserveColumnConfigSerializer(serializers.Serializer):
@@ -215,11 +252,35 @@ class TraceExportQuerySerializer(StrictInputSerializer):
 
 
 class TraceVoiceCallListQuerySerializer(TraceExportQuerySerializer):
-    page = serializers.IntegerField(required=False, default=1, min_value=1)
+    page = serializers.IntegerField(
+        required=False,
+        default=1,
+        min_value=1,
+        help_text=(
+            "One-based numbered page. Pages whose required ordered work exceeds "
+            "the finite read contract return HTTP 422 with code "
+            "page_depth_exceeded; request an earlier page or narrow the time "
+            "range. This endpoint does not provide cursor or unrestricted "
+            "deep-page traversal."
+        ),
+    )
     page_size = serializers.IntegerField(
         required=False, default=30, min_value=1, max_value=500
     )
     remove_simulation_calls = serializers.BooleanField(required=False, default=False)
+
+
+class TraceVoiceCallListResponseSerializer(serializers.Serializer):
+    count = serializers.IntegerField(min_value=0)
+    count_is_lower_bound = serializers.BooleanField()
+    total_pages = serializers.IntegerField(min_value=0)
+    current_page = serializers.IntegerField(min_value=1)
+    next = serializers.IntegerField(min_value=1, allow_null=True)
+    previous = serializers.IntegerField(min_value=1, allow_null=True)
+    results = serializers.ListField(child=serializers.DictField())
+    config = serializers.ListField(child=serializers.DictField())
+    has_more = serializers.BooleanField()
+    query_complete = serializers.BooleanField()
 
 
 class TraceIndexQuerySerializer(StrictInputSerializer):

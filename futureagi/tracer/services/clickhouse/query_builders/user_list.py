@@ -4,7 +4,14 @@ from typing import Any
 
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
-from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.v2.id_remap_sql import (
+    resolved_id_expr,
+    survivor_map_subquery,
+)
+
+
+class UnsupportedBoundedUserListQuery(ValueError):
+    """Raised when an exact user page cannot use the bounded query path."""
 
 
 class UserListQueryBuilder(BaseQueryBuilder):
@@ -50,6 +57,38 @@ class UserListQueryBuilder(BaseQueryBuilder):
         "project_id": "project_id",
         "end_user_id": "end_user_id",
     }
+
+    # Columns that can be selected by the exact latest-span page query.  The
+    # selector deliberately does *not* use ``span_user_rollup``: that table is
+    # populated by an insert-only AggregateMergeTree MV, so a later span
+    # tombstone/version reassignment cannot retract its contribution.  Using it
+    # for membership or ordering can therefore return the wrong page quickly.
+    # Raw-derived metrics that are hydrated only after pagination remain
+    # unsupported as page filters/sorts because applying them after ``LIMIT``
+    # would also change membership/order.
+    _CANDIDATE_FIRST_COLUMNS = frozenset(
+        {
+            "user_id",
+            "user_id_type",
+            "user_id_hash",
+            "activated_at",
+            "created_at",
+            "last_active",
+            "total_cost",
+            "cost",
+            "avg_cost",
+            "total_tokens",
+            "tokens",
+            "input_tokens",
+            "prompt_tokens",
+            "output_tokens",
+            "completion_tokens",
+            "num_traces",
+            "traffic",
+            "project_id",
+            "end_user_id",
+        }
+    )
 
     def __init__(
         self,
@@ -97,7 +136,84 @@ class UserListQueryBuilder(BaseQueryBuilder):
         # scoping entirely, re-introducing a cross-workspace leak.)
         self.empty_scope = empty_scope
 
-    def build(self) -> tuple[str, dict[str, Any]]:
+    def supports_candidate_first_page(self) -> bool:
+        """Whether the request can page exactly from latest physical spans.
+
+        Raw-span filters and raw-derived metric ordering cannot be moved after
+        pagination without changing which users belong on page N. Paginated
+        list/export callers fail closed for those shapes; this method is
+        deliberately conservative rather than returning a fast wrong page or
+        silently running the historical all-users aggregate.
+        """
+
+        if self._span_filters():
+            return False
+        for item in self.filters:
+            if self._is_date_filter(item):
+                continue
+            column_id = item.get("column_id") or item.get("columnId")
+            if column_id not in self._CANDIDATE_FIRST_COLUMNS:
+                return False
+        for item in self.sort_params:
+            column_id = item.get("column_id") or item.get("columnId")
+            # Preserve the existing API contract: unknown sort columns are
+            # ignored and the default ordering is used.
+            if column_id not in self.OUTPUT_FILTER_MAP:
+                continue
+            if column_id not in self._CANDIDATE_FIRST_COLUMNS:
+                return False
+        return True
+
+    def build_physical_user_presence_query(self) -> tuple[str, dict[str, Any]]:
+        """Return a cheap, conservative proof of physical user-span presence.
+
+        A negative result is exact: a live latest span with a user necessarily
+        has at least one physical version with a non-null user id.  A positive
+        result is intentionally only a hint because it may be a stale version
+        or tombstone; the full latest replay still decides membership.
+        """
+
+        start_date, end_date = self.parse_time_range(self.filters)
+        params: dict[str, Any] = {
+            "presence_start_date": start_date,
+            "presence_end_date": end_date,
+        }
+        if self.project_ids is not None:
+            params["project_ids"] = tuple(self.project_ids)
+        else:
+            params["project_id"] = self.project_id
+        query = f"""
+        SELECT 1 AS has_physical_user_span
+        FROM spans
+        PREWHERE {self._project_predicate("spans")}
+          AND toDate(start_time) BETWEEN
+              toDate(%(presence_start_date)s) AND toDate(%(presence_end_date)s)
+          AND start_time >= %(presence_start_date)s
+          AND start_time < %(presence_end_date)s
+          AND isNotNull(end_user_id)
+        LIMIT 1
+        """
+        return query, params
+
+    def _project_predicate(self, alias: str) -> str:
+        if self.project_ids is not None:
+            return f"{alias}.project_id IN %(project_ids)s"
+        return f"{alias}.project_id = %(project_id)s"
+
+    def _candidate_page_ctes(self) -> tuple[str, str, dict[str, Any]]:
+        """Build the exact latest-state page selector shared by list reads.
+
+        ``span_user_rollup`` is intentionally absent.  Its insert-only states
+        are useful for approximate analytics, but cannot retract a later span
+        tombstone, user reassignment, or corrected token/cost value.  This
+        selector instead replays every physical identity in the requested time
+        window with ``argMax(_version)``, rejects tombstones after replay, and
+        resolves id remaps before computing membership, metrics, order, and the
+        page count.  Server-side read/deadline caps at the manager boundary make
+        an over-budget exact read fail explicitly instead of returning a stale
+        successful page.
+        """
+
         start_date, end_date = self.parse_time_range(self.filters)
         self.params.update(
             {
@@ -106,7 +222,6 @@ class UserListQueryBuilder(BaseQueryBuilder):
                 "end_date": end_date,
             }
         )
-
         if self.search:
             self.params["search"] = self.search
         if self.end_user_id:
@@ -117,115 +232,291 @@ class UserListQueryBuilder(BaseQueryBuilder):
         if self.max_rows is not None:
             self.params["max_rows"] = int(self.max_rows)
 
-        span_filters = self._span_filters()
-        fb = ClickHouseFilterBuilder(
-            table=self.TABLE,
-            project_id=self.project_id,
-            query_mode=ClickHouseFilterBuilder.QUERY_MODE_TRACE,
-        )
-        span_where, span_params = fb.translate(span_filters)
-        self.params.update(span_params)
-
         output_where, output_params = self._output_where()
         self.params.update(output_params)
 
-        # Project scoping carries workspace isolation now that `end_users` has no
-        # `workspace_id` (the list view passes the workspace's projects as
-        # `project_ids`; the detail views pass a single validated `project_id`).
-        # `project_filter_sql()` (BaseQueryBuilder) emits `project_id = …` or
-        # `project_id IN …` depending on which mode the builder was built with,
-        # and is applied to BOTH the enduser set and the span set (spans also
-        # inherit isolation via `end_user_id IN (SELECT … FROM
-        # filtered_end_users)`).
-        project_filter = ""
-        if self.project_ids is not None or self.project_id:
-            project_filter = f"AND {self.project_filter_sql()}"
-
-        # Empty resolved workspace-project set ⇒ return nothing (a contradiction
-        # the planner prunes), rather than scanning the whole org.
         empty_scope_filter = "AND 0 = 1" if self.empty_scope else ""
-
-        search_filter = ""
-        if self.search:
-            search_filter = "AND positionCaseInsensitive(user_id, %(search)s) > 0"
-
-        end_user_filter = ""
-        if self.end_user_id:
-            end_user_filter = "AND end_user_id = toUUID(%(end_user_id)s)"
-
-        span_extra = f"AND {span_where}" if span_where else ""
+        search_filter = (
+            "AND positionCaseInsensitive(eu.user_id, %(search)s) > 0"
+            if self.search
+            else ""
+        )
+        end_user_filter = (
+            "AND eu.end_user_id = toUUID(%(end_user_id)s)" if self.end_user_id else ""
+        )
         final_filter = f"WHERE {output_where}" if output_where else ""
         order_by = self._order_by()
         paginated = self.limit is not None and self.offset is not None
         if paginated:
             pagination = "LIMIT %(limit)s OFFSET %(offset)s"
+            total_count_select = "count() OVER() AS total_count"
         elif self.max_rows is not None:
-            # Export path: cap rows WITHOUT the window count, so CH streams the
-            # ordered scan up to the cap instead of materializing a worktable
-            # to count the full (unbounded) result.
             pagination = "LIMIT %(max_rows)s"
+            total_count_select = "0 AS total_count"
         else:
             pagination = ""
-        # Skip the window count for unpaginated exports — avoids materializing a worktable.
-        total_count_select = (
-            "count() OVER() AS total_count" if paginated else "0 AS total_count"
-        )
+            total_count_select = "0 AS total_count"
 
-        eval_table, eval_nd_e = eval_logger_source("e")
+        eu_map = survivor_map_subquery("end_user_id_remap")
+        resolved_curated_eu = resolved_id_expr("eu.end_user_id", "eu_remap")
+        resolved_latest_eu = resolved_id_expr("latest_end_user_id", "span_eu_remap")
 
-        query = f"""
-        WITH
-        filtered_end_users AS (
+        ctes = f"""
+        eu_survivor_map AS ({eu_map}),
+        filtered_end_users_raw AS (
             SELECT
-                end_user_id,
-                user_id,
-                user_id_type,
-                user_id_hash,
-                first_seen,
-                project_id
-            FROM end_users FINAL
-            WHERE organization_id = toUUID(%(org_id)s)
-              AND is_deleted = 0
-              AND notEmpty(user_id)
+                eu.project_id,
+                eu.end_user_id,
+                eu.user_id,
+                eu.user_id_type,
+                eu.user_id_hash,
+                eu.first_seen,
+                eu.version
+            FROM end_users AS eu FINAL
+            WHERE eu.organization_id = toUUID(%(org_id)s)
+              AND eu.is_deleted = 0
+              AND notEmpty(eu.user_id)
+              AND {self._project_predicate("eu")}
               {empty_scope_filter}
-              {project_filter}
               {search_filter}
               {end_user_filter}
         ),
-        rollup_usage AS (
+        filtered_end_users AS (
             SELECT
-                end_user_id,
-                sumMerge(cost_sum) AS total_cost,
-                sumMerge(total_tokens_sum) AS total_tokens,
-                sumMerge(prompt_tokens_sum) AS input_tokens,
-                sumMerge(completion_tokens_sum) AS output_tokens,
-                uniqMerge(trace_count) AS num_traces,
-                maxMerge(last_seen) AS last_active
-            FROM span_user_rollup
-            WHERE end_user_id IN (SELECT end_user_id FROM filtered_end_users)
-              AND hour_first_seen >= %(start_date)s
-              AND hour_first_seen < %(end_date)s
-              {project_filter}
+                {resolved_curated_eu} AS end_user_id,
+                argMax(eu.user_id, tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)) AS user_id,
+                argMax(eu.user_id_type, tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)) AS user_id_type,
+                argMax(eu.user_id_hash, tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)) AS user_id_hash,
+                min(eu.first_seen) AS first_seen,
+                argMax(eu.project_id, tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)) AS project_id
+            FROM filtered_end_users_raw AS eu
+            LEFT JOIN eu_survivor_map AS eu_remap
+                ON eu.end_user_id = eu_remap.any_id
             GROUP BY end_user_id
         ),
-        raw_spans_light AS (
-            SELECT
-                end_user_id,
-                trace_session_id,
-                observation_type,
-                status,
-                start_time,
-                end_time,
-                latency_ms,
-                trace_id
+        expanded_filtered_end_user_ids AS (
+            SELECT any_id AS end_user_id
+            FROM eu_survivor_map
+            WHERE survivor_id IN (SELECT end_user_id FROM filtered_end_users)
+            UNION DISTINCT
+            SELECT end_user_id
+            FROM filtered_end_users
+        ),
+        candidate_span_identities AS (
+            SELECT DISTINCT
+                project_id,
+                trace_id,
+                id,
+                start_time
             FROM spans
-            WHERE is_deleted = 0
-              AND isNotNull(end_user_id)
-              AND end_user_id IN (SELECT end_user_id FROM filtered_end_users)
+            PREWHERE {self._project_predicate("spans")}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
               AND start_time >= %(start_date)s
               AND start_time < %(end_date)s
-              {project_filter}
-              {span_extra}
+              AND end_user_id IN (
+                  SELECT end_user_id FROM expanded_filtered_end_user_ids
+              )
+        ),
+        latest_candidate_spans AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(end_user_id), _version).1 AS latest_end_user_id,
+                argMax(tuple(end_time), _version).1 AS latest_end_time,
+                argMax(cost, _version) AS latest_cost,
+                argMax(total_tokens, _version) AS latest_total_tokens,
+                argMax(prompt_tokens, _version) AS latest_prompt_tokens,
+                argMax(completion_tokens, _version) AS latest_completion_tokens,
+                argMax(is_deleted, _version) AS latest_is_deleted
+            FROM spans
+            PREWHERE {self._project_predicate("spans")}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_span_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        exact_usage AS (
+            SELECT
+                {resolved_latest_eu} AS end_user_id,
+                sum(latest_cost) AS total_cost,
+                sum(toInt64(latest_total_tokens)) AS total_tokens,
+                sum(toInt64(latest_prompt_tokens)) AS input_tokens,
+                sum(toInt64(latest_completion_tokens)) AS output_tokens,
+                uniqExact(trace_id) AS num_traces,
+                max(latest_end_time) AS last_active
+            FROM latest_candidate_spans
+            LEFT JOIN eu_survivor_map AS span_eu_remap
+                ON latest_end_user_id = span_eu_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND {resolved_latest_eu} IN (
+                  SELECT end_user_id FROM filtered_end_users
+              )
+            GROUP BY end_user_id
+        ),
+        base_rows AS (
+            SELECT
+                eu.user_id AS user_id,
+                coalesce(xu.total_cost, 0) AS total_cost,
+                coalesce(xu.total_tokens, 0) AS total_tokens,
+                coalesce(xu.input_tokens, 0) AS input_tokens,
+                coalesce(xu.output_tokens, 0) AS output_tokens,
+                coalesce(xu.num_traces, 0) AS num_traces,
+                eu.first_seen AS activated_at,
+                xu.last_active AS last_active,
+                eu.project_id AS project_id,
+                eu.user_id_type AS user_id_type,
+                eu.user_id_hash AS user_id_hash,
+                eu.end_user_id AS end_user_id
+            FROM filtered_end_users AS eu
+            INNER JOIN exact_usage AS xu ON xu.end_user_id = eu.end_user_id
+        ),
+        candidate_users AS (
+            SELECT
+                *,
+                {total_count_select}
+            FROM base_rows
+            {final_filter}
+            {order_by}
+            {pagination}
+        )
+        """
+        return ctes, order_by, dict(self.params)
+
+    def build_candidate_page_query(self) -> tuple[str, dict[str, Any]]:
+        """Return only the finite user page selected from compact dimensions."""
+
+        if not self.supports_candidate_first_page():
+            raise UnsupportedBoundedUserListQuery(
+                "user list filter/sort is not supported by the bounded query path"
+            )
+        ctes, order_by, params = self._candidate_page_ctes()
+        query = f"""
+        WITH
+        {ctes}
+        SELECT
+            user_id,
+            total_cost,
+            total_tokens,
+            input_tokens,
+            output_tokens,
+            num_traces,
+            activated_at,
+            last_active,
+            project_id,
+            user_id_type,
+            user_id_hash,
+            end_user_id,
+            total_count
+        FROM candidate_users
+        {order_by}
+        """
+        return query, params
+
+    def build_page_metrics_query(
+        self, end_user_ids: list[str]
+    ) -> tuple[str, dict[str, Any]]:
+        """Hydrate raw-derived metrics for one already-selected user page.
+
+        Every physical span identity is replayed with ``argMax(_version)``;
+        tombstones are rejected only after replay, and both end-user/session
+        ids are canonicalized through the remap survivor tables.
+        """
+
+        if not end_user_ids:
+            return "", {}
+        start_date, end_date = self.parse_time_range(self.filters)
+        params: dict[str, Any] = {
+            "candidate_end_user_ids": tuple(str(value) for value in end_user_ids),
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        if self.project_ids:
+            params["project_ids"] = tuple(self.project_ids)
+        else:
+            params["project_id"] = self.project_id
+
+        eu_map = survivor_map_subquery("end_user_id_remap")
+        ts_map = survivor_map_subquery("trace_session_id_remap")
+        resolved_latest_eu = resolved_id_expr("latest_end_user_id", "span_eu_remap")
+        resolved_latest_session = resolved_id_expr(
+            "latest_trace_session_id", "span_ts_remap"
+        )
+
+        query = f"""
+        WITH
+        eu_survivor_map AS ({eu_map}),
+        ts_survivor_map AS ({ts_map}),
+        expanded_candidate_user_ids AS (
+            SELECT any_id AS end_user_id
+            FROM eu_survivor_map
+            WHERE survivor_id IN %(candidate_end_user_ids)s
+            UNION DISTINCT
+            SELECT end_user_id
+            FROM end_users FINAL
+            WHERE end_user_id IN %(candidate_end_user_ids)s
+        ),
+        candidate_span_identities AS (
+            SELECT DISTINCT
+                project_id,
+                trace_id,
+                id,
+                start_time
+            FROM spans
+            PREWHERE {self._project_predicate("spans")}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND end_user_id IN (
+                  SELECT end_user_id FROM expanded_candidate_user_ids
+              )
+        ),
+        latest_candidate_spans AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(end_user_id), _version).1 AS latest_end_user_id,
+                argMax(tuple(trace_session_id), _version).1 AS latest_trace_session_id,
+                argMax(observation_type, _version) AS latest_observation_type,
+                argMax(status, _version) AS latest_status,
+                argMax(tuple(end_time), _version).1 AS latest_end_time,
+                argMax(latency_ms, _version) AS latest_latency_ms,
+                argMax(is_deleted, _version) AS latest_is_deleted
+            FROM spans
+            PREWHERE {self._project_predicate("spans")}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_span_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        resolved_candidate_spans AS (
+            SELECT
+                {resolved_latest_eu} AS end_user_id,
+                {resolved_latest_session} AS trace_session_id,
+                trace_id,
+                start_time,
+                latest_end_time AS end_time,
+                latest_latency_ms AS latency_ms,
+                latest_observation_type AS observation_type,
+                latest_status AS status
+            FROM latest_candidate_spans
+            LEFT JOIN eu_survivor_map AS span_eu_remap
+                ON latest_end_user_id = span_eu_remap.any_id
+            LEFT JOIN ts_survivor_map AS span_ts_remap
+                ON latest_trace_session_id = span_ts_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND {resolved_latest_eu} IN %(candidate_end_user_ids)s
         ),
         extra_metrics AS (
             SELECT
@@ -233,9 +524,9 @@ class UserListQueryBuilder(BaseQueryBuilder):
                 countIf(observation_type = 'llm') AS num_llm_calls,
                 uniqIf(trace_id, observation_type = 'guardrail') AS num_guardrails_triggered,
                 round(avgIf(latency_ms, isNotNull(latency_ms)), 2) AS avg_trace_latency,
-                uniqExactIf(toDate(start_time), isNotNull(start_time)) AS num_active_days,
+                uniqExact(toDate(start_time)) AS num_active_days,
                 uniqIf(trace_id, status = 'ERROR') AS num_traces_with_errors
-            FROM raw_spans_light
+            FROM resolved_candidate_spans
             GROUP BY end_user_id
         ),
         session_durations AS (
@@ -243,9 +534,9 @@ class UserListQueryBuilder(BaseQueryBuilder):
                 end_user_id,
                 trace_session_id,
                 dateDiff('millisecond', min(start_time), max(end_time)) / 1000.0 AS duration_seconds
-            FROM raw_spans_light
+            FROM resolved_candidate_spans
             WHERE isNotNull(trace_session_id)
-              AND isNotNull(start_time)
+              AND trace_session_id != toUUID('00000000-0000-0000-0000-000000000000')
               AND isNotNull(end_time)
             GROUP BY end_user_id, trace_session_id
         ),
@@ -257,51 +548,356 @@ class UserListQueryBuilder(BaseQueryBuilder):
             FROM session_durations
             GROUP BY end_user_id
         ),
-        final_rows AS (
+        metric_user_ids AS (
+            SELECT end_user_id FROM extra_metrics
+            UNION DISTINCT
+            SELECT end_user_id FROM session_aggregates
+        )
+        SELECT
+            ids.end_user_id AS end_user_id,
+            coalesce(sa.num_sessions, 0) AS num_sessions,
+            coalesce(sa.avg_session_duration, 0) AS avg_session_duration,
+            coalesce(em.avg_trace_latency, 0) AS avg_trace_latency,
+            coalesce(em.num_llm_calls, 0) AS num_llm_calls,
+            coalesce(em.num_guardrails_triggered, 0) AS num_guardrails_triggered,
+            coalesce(em.num_active_days, 0) AS num_active_days,
+            coalesce(em.num_traces_with_errors, 0) AS num_traces_with_errors
+        FROM metric_user_ids AS ids
+        LEFT JOIN session_aggregates AS sa ON sa.end_user_id = ids.end_user_id
+        LEFT JOIN extra_metrics AS em ON em.end_user_id = ids.end_user_id
+        """
+        return query, params
+
+    def _build_candidate_first(self) -> tuple[str, dict[str, Any]]:
+        """Select the user page from rollups, then enrich only page users.
+
+        The raw enrichment replays each candidate physical span identity with
+        ``argMax(_version)`` before accepting it, so a newer tombstone cannot
+        leak into the metrics.  End-user and session ids are resolved through
+        the many-to-one survivor maps before grouping.
+        """
+
+        start_date, end_date = self.parse_time_range(self.filters)
+        self.params.update(
+            {
+                "org_id": self.organization_id,
+                "start_date": start_date,
+                "end_date": end_date,
+            }
+        )
+        if self.search:
+            self.params["search"] = self.search
+        if self.end_user_id:
+            self.params["end_user_id"] = self.end_user_id
+        if self.limit is not None and self.offset is not None:
+            self.params["limit"] = int(self.limit)
+            self.params["offset"] = int(self.offset)
+        if self.max_rows is not None:
+            self.params["max_rows"] = int(self.max_rows)
+
+        output_where, output_params = self._output_where()
+        self.params.update(output_params)
+
+        empty_scope_filter = "AND 0 = 1" if self.empty_scope else ""
+        search_filter = (
+            "AND positionCaseInsensitive(eu.user_id, %(search)s) > 0"
+            if self.search
+            else ""
+        )
+        end_user_filter = (
+            "AND eu.end_user_id = toUUID(%(end_user_id)s)" if self.end_user_id else ""
+        )
+        final_filter = f"WHERE {output_where}" if output_where else ""
+        order_by = self._order_by()
+        paginated = self.limit is not None and self.offset is not None
+        if paginated:
+            pagination = "LIMIT %(limit)s OFFSET %(offset)s"
+            total_count_select = "count() OVER() AS total_count"
+        elif self.max_rows is not None:
+            pagination = "LIMIT %(max_rows)s"
+            total_count_select = "0 AS total_count"
+        else:
+            pagination = ""
+            total_count_select = "0 AS total_count"
+
+        eu_map = survivor_map_subquery("end_user_id_remap")
+        ts_map = survivor_map_subquery("trace_session_id_remap")
+        resolved_curated_eu = resolved_id_expr("eu.end_user_id", "eu_remap")
+        resolved_usage_eu = resolved_id_expr(
+            "latest_usage_end_user_id", "usage_eu_remap"
+        )
+        resolved_latest_eu = resolved_id_expr("latest_end_user_id", "span_eu_remap")
+        resolved_latest_session = resolved_id_expr(
+            "latest_trace_session_id", "span_ts_remap"
+        )
+
+        query = f"""
+        WITH
+        eu_survivor_map AS ({eu_map}),
+        ts_survivor_map AS ({ts_map}),
+        filtered_end_users_raw AS (
+            SELECT
+                eu.project_id,
+                eu.end_user_id,
+                eu.user_id,
+                eu.user_id_type,
+                eu.user_id_hash,
+                eu.first_seen,
+                eu.version
+            FROM end_users AS eu FINAL
+            WHERE eu.organization_id = toUUID(%(org_id)s)
+              AND eu.is_deleted = 0
+              AND notEmpty(eu.user_id)
+              AND {self._project_predicate("eu")}
+              {empty_scope_filter}
+              {search_filter}
+              {end_user_filter}
+        ),
+        filtered_end_users AS (
+            SELECT
+                {resolved_curated_eu} AS end_user_id,
+                argMax(eu.user_id, tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)) AS user_id,
+                argMax(eu.user_id_type, tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)) AS user_id_type,
+                argMax(eu.user_id_hash, tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)) AS user_id_hash,
+                min(eu.first_seen) AS first_seen,
+                argMax(eu.project_id, tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)) AS project_id
+            FROM filtered_end_users_raw AS eu
+            LEFT JOIN eu_survivor_map AS eu_remap
+                ON eu.end_user_id = eu_remap.any_id
+            GROUP BY end_user_id
+        ),
+        expanded_filtered_end_user_ids AS (
+            SELECT any_id AS end_user_id
+            FROM eu_survivor_map
+            WHERE survivor_id IN (SELECT end_user_id FROM filtered_end_users)
+            UNION DISTINCT
+            SELECT end_user_id
+            FROM filtered_end_users
+        ),
+        usage_candidate_span_identities AS (
+            SELECT DISTINCT
+                project_id,
+                trace_id,
+                id,
+                start_time
+            FROM spans
+            PREWHERE {self._project_predicate("spans")}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND end_user_id IN (
+                  SELECT end_user_id FROM expanded_filtered_end_user_ids
+              )
+        ),
+        latest_usage_spans AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(end_user_id), _version).1 AS latest_usage_end_user_id,
+                argMax(tuple(end_time), _version).1 AS latest_usage_end_time,
+                argMax(cost, _version) AS latest_usage_cost,
+                argMax(total_tokens, _version) AS latest_usage_total_tokens,
+                argMax(prompt_tokens, _version) AS latest_usage_prompt_tokens,
+                argMax(completion_tokens, _version) AS latest_usage_completion_tokens,
+                argMax(is_deleted, _version) AS latest_usage_is_deleted
+            FROM spans
+            PREWHERE {self._project_predicate("spans")}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM usage_candidate_span_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        exact_usage AS (
+            SELECT
+                {resolved_usage_eu} AS end_user_id,
+                sum(latest_usage_cost) AS total_cost,
+                sum(toInt64(latest_usage_total_tokens)) AS total_tokens,
+                sum(toInt64(latest_usage_prompt_tokens)) AS input_tokens,
+                sum(toInt64(latest_usage_completion_tokens)) AS output_tokens,
+                uniqExact(trace_id) AS num_traces,
+                max(latest_usage_end_time) AS last_active
+            FROM latest_usage_spans
+            LEFT JOIN eu_survivor_map AS usage_eu_remap
+                ON latest_usage_end_user_id = usage_eu_remap.any_id
+            WHERE latest_usage_is_deleted = 0
+              AND {resolved_usage_eu} IN (
+                  SELECT end_user_id FROM filtered_end_users
+              )
+            GROUP BY end_user_id
+        ),
+        base_rows AS (
             SELECT
                 eu.user_id AS user_id,
-                coalesce(ru.total_cost, 0) AS total_cost,
-                coalesce(ru.total_tokens, 0) AS total_tokens,
-                coalesce(ru.input_tokens, 0) AS input_tokens,
-                coalesce(ru.output_tokens, 0) AS output_tokens,
-                coalesce(ru.num_traces, 0) AS num_traces,
-                coalesce(sa.num_sessions, 0) AS num_sessions,
-                coalesce(sa.avg_session_duration, 0) AS avg_session_duration,
-                coalesce(em.avg_trace_latency, 0) AS avg_trace_latency,
-                coalesce(em.num_llm_calls, 0) AS num_llm_calls,
-                coalesce(em.num_guardrails_triggered, 0) AS num_guardrails_triggered,
+                coalesce(xu.total_cost, 0) AS total_cost,
+                coalesce(xu.total_tokens, 0) AS total_tokens,
+                coalesce(xu.input_tokens, 0) AS input_tokens,
+                coalesce(xu.output_tokens, 0) AS output_tokens,
+                coalesce(xu.num_traces, 0) AS num_traces,
                 eu.first_seen AS activated_at,
-                ru.last_active AS last_active,
-                coalesce(em.num_active_days, 0) AS num_active_days,
-                coalesce(em.num_traces_with_errors, 0) AS num_traces_with_errors,
-                0 AS bool_eval_pass_rate,
-                0 AS avg_output_float,
+                xu.last_active AS last_active,
                 eu.project_id AS project_id,
                 eu.user_id_type AS user_id_type,
                 eu.user_id_hash AS user_id_hash,
                 eu.end_user_id AS end_user_id
             FROM filtered_end_users AS eu
-            INNER JOIN rollup_usage AS ru ON ru.end_user_id = eu.end_user_id
-            LEFT JOIN session_aggregates AS sa ON sa.end_user_id = eu.end_user_id
-            LEFT JOIN extra_metrics AS em ON em.end_user_id = eu.end_user_id
+            INNER JOIN exact_usage AS xu ON xu.end_user_id = eu.end_user_id
         ),
-        counted_rows AS (
+        candidate_users AS (
             SELECT
                 *,
                 {total_count_select}
-            FROM final_rows
+            FROM base_rows
             {final_filter}
+            {order_by}
+            {pagination}
+        ),
+        expanded_candidate_user_ids AS (
+            SELECT any_id AS end_user_id
+            FROM eu_survivor_map
+            WHERE survivor_id IN (SELECT end_user_id FROM candidate_users)
+            UNION DISTINCT
+            SELECT end_user_id FROM candidate_users
+        ),
+        candidate_span_identities AS (
+            SELECT DISTINCT
+                project_id,
+                trace_id,
+                id,
+                start_time
+            FROM spans
+            PREWHERE {self._project_predicate("spans")}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND end_user_id IN (
+                  SELECT end_user_id FROM expanded_candidate_user_ids
+              )
+        ),
+        latest_candidate_spans AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(end_user_id), _version).1 AS latest_end_user_id,
+                argMax(tuple(trace_session_id), _version).1 AS latest_trace_session_id,
+                argMax(observation_type, _version) AS latest_observation_type,
+                argMax(status, _version) AS latest_status,
+                argMax(tuple(end_time), _version).1 AS latest_end_time,
+                argMax(latency_ms, _version) AS latest_latency_ms,
+                argMax(is_deleted, _version) AS latest_is_deleted
+            FROM spans
+            PREWHERE {self._project_predicate("spans")}
+              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_span_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        resolved_candidate_spans AS (
+            SELECT
+                {resolved_latest_eu} AS end_user_id,
+                {resolved_latest_session} AS trace_session_id,
+                trace_id,
+                start_time,
+                latest_end_time AS end_time,
+                latest_latency_ms AS latency_ms,
+                latest_observation_type AS observation_type,
+                latest_status AS status
+            FROM latest_candidate_spans
+            LEFT JOIN eu_survivor_map AS span_eu_remap
+                ON latest_end_user_id = span_eu_remap.any_id
+            LEFT JOIN ts_survivor_map AS span_ts_remap
+                ON latest_trace_session_id = span_ts_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND {resolved_latest_eu} IN (
+                  SELECT end_user_id FROM candidate_users
+              )
+        ),
+        extra_metrics AS (
+            SELECT
+                end_user_id,
+                countIf(observation_type = 'llm') AS num_llm_calls,
+                uniqIf(trace_id, observation_type = 'guardrail') AS num_guardrails_triggered,
+                round(avgIf(latency_ms, isNotNull(latency_ms)), 2) AS avg_trace_latency,
+                uniqExact(toDate(start_time)) AS num_active_days,
+                uniqIf(trace_id, status = 'ERROR') AS num_traces_with_errors
+            FROM resolved_candidate_spans
+            GROUP BY end_user_id
+        ),
+        session_durations AS (
+            SELECT
+                end_user_id,
+                trace_session_id,
+                dateDiff('millisecond', min(start_time), max(end_time)) / 1000.0 AS duration_seconds
+            FROM resolved_candidate_spans
+            WHERE isNotNull(trace_session_id)
+              AND trace_session_id != toUUID('00000000-0000-0000-0000-000000000000')
+              AND isNotNull(end_time)
+            GROUP BY end_user_id, trace_session_id
+        ),
+        session_aggregates AS (
+            SELECT
+                end_user_id,
+                count() AS num_sessions,
+                round(avg(duration_seconds), 2) AS avg_session_duration
+            FROM session_durations
+            GROUP BY end_user_id
         )
-        SELECT *
-        FROM counted_rows
+        SELECT
+            cu.user_id AS user_id,
+            cu.total_cost AS total_cost,
+            cu.total_tokens AS total_tokens,
+            cu.input_tokens AS input_tokens,
+            cu.output_tokens AS output_tokens,
+            cu.num_traces AS num_traces,
+            coalesce(sa.num_sessions, 0) AS num_sessions,
+            coalesce(sa.avg_session_duration, 0) AS avg_session_duration,
+            coalesce(em.avg_trace_latency, 0) AS avg_trace_latency,
+            coalesce(em.num_llm_calls, 0) AS num_llm_calls,
+            coalesce(em.num_guardrails_triggered, 0) AS num_guardrails_triggered,
+            cu.activated_at AS activated_at,
+            cu.last_active AS last_active,
+            coalesce(em.num_active_days, 0) AS num_active_days,
+            coalesce(em.num_traces_with_errors, 0) AS num_traces_with_errors,
+            0 AS bool_eval_pass_rate,
+            0 AS avg_output_float,
+            cu.project_id AS project_id,
+            cu.user_id_type AS user_id_type,
+            cu.user_id_hash AS user_id_hash,
+            cu.end_user_id AS end_user_id,
+            cu.total_count AS total_count
+        FROM candidate_users AS cu
+        LEFT JOIN session_aggregates AS sa ON sa.end_user_id = cu.end_user_id
+        LEFT JOIN extra_metrics AS em ON em.end_user_id = cu.end_user_id
         {order_by}
-        {pagination}
         """
         return query, self.params
 
-    def build_eval_query(
-        self, end_user_ids: list[str]
-    ) -> tuple[str, dict[str, Any]]:
+    def build(self) -> tuple[str, dict[str, Any]]:
+        if self.supports_candidate_first_page():
+            return self._build_candidate_first()
+
+        # Observe Users list/export requests must never silently fall back to
+        # the historical all-users/raw-spans aggregation.  That query is exact,
+        # but on large tenants it is the known 15--30 second incident path.
+        # Raw-derived filters/sorts need a separately proven bounded selector;
+        # until one exists, fail closed so the API can return a sanitized,
+        # retryable response instead of consuming the full query deadline.
+        raise UnsupportedBoundedUserListQuery(
+            "user list filter/sort is not supported by the exact bounded query path"
+        )
+
+    def build_eval_query(self, end_user_ids: list[str]) -> tuple[str, dict[str, Any]]:
         """Build a lightweight eval-pass-rate query for a page of user IDs.
 
         Runs AFTER the main ``build()`` query returns the paginated page.
@@ -319,15 +915,62 @@ class UserListQueryBuilder(BaseQueryBuilder):
         }
         if self.project_ids:
             params["project_ids"] = tuple(self.project_ids)
-            project_filter = "AND project_id IN %(project_ids)s"
+            project_filter = "AND spans.project_id IN %(project_ids)s"
         elif self.project_id:
             params["project_id"] = self.project_id
-            project_filter = "AND project_id = %(project_id)s"
+            project_filter = "AND spans.project_id = %(project_id)s"
         else:
             project_filter = ""
+        eu_map = survivor_map_subquery("end_user_id_remap")
+        resolved_eu = resolved_id_expr("latest_end_user_id", "eval_eu_remap")
         query = f"""
+        WITH
+        eu_survivor_map AS ({eu_map}),
+        candidate_span_identities AS (
+            SELECT DISTINCT project_id, trace_id, id, start_time
+            FROM spans
+            PREWHERE start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              {project_filter}
+              AND (
+                  end_user_id IN %(eval_eu_ids)s
+                  OR end_user_id IN (
+                      SELECT any_id
+                      FROM eu_survivor_map
+                      WHERE survivor_id IN %(eval_eu_ids)s
+                  )
+              )
+        ),
+        latest_candidate_spans AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(end_user_id), _version).1 AS latest_end_user_id,
+                argMax(is_deleted, _version) AS latest_is_deleted
+            FROM spans
+            PREWHERE start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              {project_filter}
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_span_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        user_traces AS (
+            SELECT DISTINCT
+                {resolved_eu} AS end_user_id,
+                trace_id
+            FROM latest_candidate_spans
+            LEFT JOIN eu_survivor_map AS eval_eu_remap
+                ON latest_end_user_id = eval_eu_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND {resolved_eu} IN %(eval_eu_ids)s
+        )
         SELECT
-            end_user_id,
+            ut.end_user_id AS end_user_id,
             round(
                 100.0 * countIf(e.output_bool = 1)
                 / nullIf(countIf(isNotNull(e.output_bool)), 0),
@@ -335,17 +978,9 @@ class UserListQueryBuilder(BaseQueryBuilder):
             ) AS bool_eval_pass_rate,
             round(avg(e.output_float), 2) AS avg_output_float
         FROM {eval_table} AS e FINAL
-        INNER JOIN (
-            SELECT DISTINCT end_user_id, trace_id
-            FROM spans
-            WHERE is_deleted = 0
-              AND end_user_id IN %(eval_eu_ids)s
-              AND start_time >= %(start_date)s
-              AND start_time < %(end_date)s
-              {project_filter}
-        ) AS ut ON e.trace_id = toUUIDOrNull(ut.trace_id)
+        INNER JOIN user_traces AS ut ON e.trace_id = toUUIDOrNull(ut.trace_id)
         WHERE {eval_nd}
-        GROUP BY end_user_id
+        GROUP BY ut.end_user_id
         """
         return query, params
 
@@ -377,8 +1012,9 @@ class UserListQueryBuilder(BaseQueryBuilder):
 
     def _order_by(self) -> str:
         if not self.sort_params:
-            return "ORDER BY last_active DESC NULLS LAST"
+            return "ORDER BY last_active DESC NULLS LAST, end_user_id DESC"
         parts: list[str] = []
+        has_end_user_tiebreaker = False
         for sort in self.sort_params:
             column_id = sort.get("column_id")
             column = self.OUTPUT_FILTER_MAP.get(column_id)
@@ -388,10 +1024,16 @@ class UserListQueryBuilder(BaseQueryBuilder):
             if direction not in ("ASC", "DESC"):
                 direction = "DESC"
             parts.append(f"{column} {direction} NULLS LAST")
+            has_end_user_tiebreaker = has_end_user_tiebreaker or column == "end_user_id"
+        if parts and not has_end_user_tiebreaker:
+            # Stable pagination: equal metric/label values must not reshuffle
+            # between page requests as ClickHouse changes its parallel merge
+            # order. UUID is globally unique, so it is a total-order suffix.
+            parts.append("end_user_id DESC")
         return (
             f"ORDER BY {', '.join(parts)}"
             if parts
-            else "ORDER BY last_active DESC NULLS LAST"
+            else "ORDER BY last_active DESC NULLS LAST, end_user_id DESC"
         )
 
     @staticmethod

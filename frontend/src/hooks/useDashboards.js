@@ -5,6 +5,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
+import { getQueryReadState } from "src/utils/queryReadState";
 
 const DASHBOARD_KEYS = {
   all: ["dashboards"],
@@ -261,7 +262,7 @@ export function useDashboardFilterValues({
   enabled = true,
   search = "",
 }) {
-  return useQuery({
+  const query = useQuery({
     queryKey: [
       ...DASHBOARD_KEYS.all,
       "filterValues",
@@ -272,30 +273,41 @@ export function useDashboardFilterValues({
       workflow,
       search,
     ],
-    queryFn: async () => {
-      try {
-        const res = await axios.get(endpoints.dashboard.filterValues, {
-          params: {
-            metric_name: metricName,
-            metric_type: metricType,
-            project_ids: (projectIds || []).join(","),
-            source,
-            ...(workflow ? { workflow } : {}),
-            ...(search ? { search } : {}),
-          },
-        });
-        return res;
-      } catch {
-        // Return empty on error (e.g. column doesn't exist in CH)
-        return { data: { result: { values: [] } } };
-      }
+    queryFn: ({ signal }) =>
+      axios.get(endpoints.dashboard.filterValues, {
+        signal,
+        params: {
+          metric_name: metricName,
+          metric_type: metricType,
+          project_ids: (projectIds || []).join(","),
+          source,
+          ...(workflow ? { workflow } : {}),
+          ...(search ? { search } : {}),
+        },
+      }),
+    select: (res) => {
+      const result = res.data?.result || {};
+      return {
+        values: result.values || [],
+        queryReadState: getQueryReadState(result),
+      };
     },
-    select: (res) => res.data?.result?.values || [],
     enabled: enabled && Boolean(metricName),
     retry: false,
     staleTime: 5 * 60 * 1000,
     gcTime: 15 * 60 * 1000,
+    // This surface renders a deliberately generic retry state. Prevent the
+    // global query handler from echoing a backend/ClickHouse error payload.
+    meta: { errorHandled: true },
   });
+
+  return {
+    ...query,
+    data: query.data?.values || [],
+    queryReadState: query.isError
+      ? "error"
+      : query.data?.queryReadState || "complete",
+  };
 }
 
 export function useDatasetColumnValues({

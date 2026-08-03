@@ -56,7 +56,7 @@ class TestBuildContentQuery:
         assert "attrs_number" in query
         assert "attrs_bool" in query
         assert "attributes_extra" in query
-        assert "toJSONString(metadata) AS metadata" in query
+        assert "toJSONString(latest_metadata) AS metadata" in query
         assert "trace_dict" in query and "trace_tags" in query
 
     def test_prewhere_and_params(self, project_id, trace_ids):
@@ -70,15 +70,16 @@ class TestBuildContentQuery:
         query, params = builder.build_content_query(trace_ids)
         assert "project_id = %(project_id)s" in query
         assert params["project_id"] == project_id
-        # content query uses the v2 is_deleted column
-        assert "is_deleted = 0" in query
+        # Content is filtered only after every physical root is collapsed to
+        # its latest direct-write version.
+        assert "latest_is_deleted = 0" in query
         assert "_peerdb_is_deleted" not in query
 
     def test_root_span_only(self, project_id, trace_ids):
         builder = TraceListQueryBuilder(project_id=project_id)
         query, _ = builder.build_content_query(trace_ids)
-        assert "parent_span_id IS NULL OR parent_span_id = ''" in query
-        assert "LIMIT 1 BY trace_id" in query
+        assert "latest_parent_span_id IS NULL OR latest_parent_span_id = ''" in query
+        assert "LIMIT 1 BY project_id, trace_id" in query
 
     def test_multi_project_scoping(self, trace_ids):
         pids = [str(uuid.uuid4()), str(uuid.uuid4())]
@@ -99,7 +100,37 @@ class TestBuildContentQuery:
     def test_no_window_standalone(self, project_id, trace_ids):
         builder = TraceListQueryBuilder(project_id=project_id)
         query, _ = builder.build_content_query(trace_ids)
-        assert "start_time" not in query
+        assert "start_time >= %(start_date)s" not in query
+
+    def test_exact_page_root_identity_and_project_version_scope(self, project_id):
+        builder = TraceListQueryBuilder(
+            project_id=project_id,
+            project_version_id="00000000-0000-4000-8000-000000000099",
+        )
+        identity = (
+            project_id,
+            "trace-reused",
+            "selected-root",
+            datetime(2026, 7, 1, 12, 0),
+        )
+        query, params = builder.build_content_query(
+            ["trace-reused"], root_identities=[identity]
+        )
+
+        assert "toUnixTimestamp64Micro(start_time)" in query
+        assert "IN %(content_root_identities)s" in query
+        assert params["content_root_identities"] == (
+            (
+                project_id,
+                "trace-reused",
+                "selected-root",
+                1_782_907_200_000_000,
+            ),
+        )
+        assert params["content_root_dates"] == (identity[3].date(),)
+        assert "latest_project_version_id = %(project_version_id)s" in query
+        assert params["project_version_id"] == builder.project_version_id
+        assert "argMax(tuple(input), _peerdb_version).1" in query
 
 
 # ---------------------------------------------------------------------------
@@ -474,12 +505,11 @@ class TestBuildCountQuery:
         query, params = builder.build_count_query()
         assert "project_version_id" not in query
 
-    def test_search_fragment(self, project_id):
+    def test_search_count_requires_bounded_selector(self, project_id):
         builder = TraceListQueryBuilder(project_id=project_id, search="boom")
-        builder.build()
-        query, params = builder.build_count_query()
-        assert "trace_name ILIKE %(search)s" in query
-        assert params["search"] == "%boom%"
+        assert builder.supports_bounded_filter_scan() is True
+        with pytest.raises(ValueError, match="bounded_search_required"):
+            builder.build_count_query()
 
     def test_start_time_window_no_created_at_skew(self, project_id):
         builder = TraceListQueryBuilder(project_id=project_id)
@@ -547,21 +577,21 @@ class TestOuterWindowStartTime:
 
 @pytest.mark.unit
 class TestEvalQueryDeletionPredicate:
-    def test_rewrite_safe_deleted_predicate(self, project_id):
-        builder = TraceListQueryBuilder(
-            project_id=project_id, eval_config_ids=["ec1"]
-        )
+    def test_rewrite_safe_deleted_predicate(self, project_id, settings):
+        settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
+        builder = TraceListQueryBuilder(project_id=project_id, eval_config_ids=["ec1"])
         query, _ = builder.build_eval_query(["t1"])
-        # legacy tracer_eval_logger uses `deleted`, not `is_deleted` — the v2
-        # rewriter must leave this form untouched.
-        assert "(deleted = 0 OR deleted IS NULL)" in query
-        assert "_peerdb_is_deleted = 0" in query
+        # Collapse the newest physical eval version first, then apply both the
+        # CDC tombstone and app soft-delete state in the outer query. Filtering
+        # either marker inside LIMIT 1 BY would resurrect an older live row.
+        assert "_peerdb_is_deleted AS latest_state_0" in query
+        assert "deleted AS latest_state_1" in query
+        assert "latest_state_0 = 0" in query
+        assert "(latest_state_1 = 0 OR latest_state_1 IS NULL)" in query
 
     def test_created_at_pruning_only_after_build(self, project_id):
         # build_eval_query guards the created_at fragment on self.start_date
-        builder = TraceListQueryBuilder(
-            project_id=project_id, eval_config_ids=["ec1"]
-        )
+        builder = TraceListQueryBuilder(project_id=project_id, eval_config_ids=["ec1"])
         # no prior build(): start_date is None → no created_at fragment
         query_no_build, _ = builder.build_eval_query(["t1"])
         assert "created_at >= %(start_date)s" not in query_no_build

@@ -322,6 +322,13 @@ const rowTypeToFilterTab = (rowType) => {
   return null;
 };
 
+const rowTypeToFilterSource = (rowType) => {
+  const key = String(rowType || "").toLowerCase();
+  if (key === "sessions" || key === "session") return "sessions";
+  if (key.startsWith("voice")) return "simulation";
+  return "traces";
+};
+
 // ── Main ──
 const TaskFilterBar = ({
   control,
@@ -556,6 +563,7 @@ const TaskFilterBar = ({
         projectId={projectId}
         isSimulator={isSimulator}
         tab={rowTypeToFilterTab(rowType)}
+        source={rowTypeToFilterSource(rowType)}
         onApply={(next) => applyPanelFilters(next || [])}
       />
     </Box>

@@ -239,17 +239,58 @@ class TestListBuilderOutputContract:
             if name in exclude:
                 continue
             method = getattr(builder, name)
-            sig = inspect.signature(method)
-            required = [
-                p
-                for p in sig.parameters.values()
-                if p.default is inspect.Parameter.empty
-                and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-            ]
-            # Inherited id-list methods take one positional (trace_ids/span_ids);
-            # page/count methods take none.
-            args = [["dummy-id-1", "dummy-id-2"]] * len(required)
-            result = method(*args)
+            if name == "build_filter_anchor_probe":
+                # The anchor contract requires an explicit finite sentinel;
+                # there is deliberately no production default or time-only
+                # anchor that a caller could accidentally widen. Exercise it
+                # with the smallest supported any-span attribute predicate.
+                original_filters = builder.filters
+                builder.filters = [
+                    *original_filters,
+                    {
+                        "column_id": "contract.anchor",
+                        "filter_config": {
+                            "col_type": "SPAN_ATTRIBUTE",
+                            "filter_type": "text",
+                            "filter_op": "equals",
+                            "filter_value": "value",
+                        },
+                    },
+                ]
+                try:
+                    result = method(limit=2)
+                finally:
+                    builder.filters = original_filters
+            elif name in {
+                "build_filter_ordered_seed_page",
+                "build_filter_seed_page",
+            }:
+                start, end = builder.parse_time_range(builder.filters)
+                result = method(slice_start=start, slice_end=end, limit=2)
+            elif name == "build_filter_match_query_from_seed_rows":
+                start, _ = builder.parse_time_range(builder.filters)
+                result = method(
+                    [
+                        {
+                            "project_id": "contract-test-proj",
+                            "trace_id": "dummy-trace-id",
+                            "id": "dummy-span-id",
+                            "start_time": start,
+                        }
+                    ]
+                )
+            else:
+                sig = inspect.signature(method)
+                required = [
+                    p
+                    for p in sig.parameters.values()
+                    if p.default is inspect.Parameter.empty
+                    and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                ]
+                # Inherited id-list methods take one positional
+                # (trace_ids/span_ids); page/count methods take none.
+                args = [["dummy-id-1", "dummy-id-2"]] * len(required)
+                result = method(*args)
             if isinstance(result, tuple):
                 yield name, result[0]
             elif isinstance(result, list):
@@ -261,7 +302,23 @@ class TestListBuilderOutputContract:
         exercised = 0
         for qt in _LIST_BUILDER_TYPES:
             cls = _load(registry[qt])
-            builder = cls(project_id="contract-test-proj")
+            kwargs = {"project_id": "contract-test-proj"}
+            if "bounded_internal_scan" in inspect.signature(cls).parameters:
+                kwargs["bounded_internal_scan"] = True
+                kwargs["filters"] = [
+                    {
+                        "column_id": "created_at",
+                        "filter_config": {
+                            "filter_type": "datetime",
+                            "filter_op": "between",
+                            "filter_value": [
+                                "2026-01-01T00:00:00",
+                                "2026-01-02T00:00:00",
+                            ],
+                        },
+                    }
+                ]
+            builder = cls(**kwargs)
             for name, sql in self._exercise(builder):
                 exercised += 1
                 cleaned = _LEGIT_ALIAS_RE.sub("", sql or "")

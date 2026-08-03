@@ -37,6 +37,12 @@ import { REPLAY_MODULES } from "../SessionsView/ReplaySessions/configurations";
 import { useShallowToggleAnnotationsStore } from "../../agents/store";
 import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
+import {
+  failServerSideGridRead,
+  getQueryReadMessage,
+  getQueryReadState,
+} from "src/utils/queryReadState";
+import { createListCursorPagination } from "./listCursorPagination";
 
 const ROWS_LIMIT = 25;
 const EMPTY_EXTRA_FILTERS = [];
@@ -85,6 +91,9 @@ const TraceGrid = React.forwardRef(
     const activeTraceId = traceDetailDrawerOpen?.traceId || null;
     const [openQuickFilter, setOpenQuickFilter] = useState(null);
     const [selectedAll, setSelectedAll] = useState(false);
+    const [readState, setReadState] = useState("complete");
+    const readStateRef = useRef("complete");
+    const readMessage = getQueryReadMessage(readState);
 
     // Use ref to track latest columns for comparison without triggering dataSource recreation
     const columnsRef = useRef(columns);
@@ -94,12 +103,15 @@ const TraceGrid = React.forwardRef(
 
     // Prefetch cache: stores next page data so scroll feels instant
     const prefetchCache = useRef(new Map());
+    const cursorPagination = useRef(createListCursorPagination());
     const { showMetricsIds, reset: resetMetricIds } =
       useShallowToggleAnnotationsStore((state) => ({
         showMetricsIds: state.showMetricsIds,
         reset: state.reset,
       }));
     const refreshGrid = useCallback(() => {
+      prefetchCache.current.clear();
+      cursorPagination.current.reset();
       gridRef?.current?.api?.refreshServerSide({ purge: true });
     }, [gridRef]);
     const filterRequestKey = useMemo(
@@ -129,6 +141,7 @@ const TraceGrid = React.forwardRef(
       if (previousFilterRequestKeyRef.current === filterRequestKey) return;
       previousFilterRequestKeyRef.current = filterRequestKey;
       prefetchCache.current.clear();
+      cursorPagination.current.reset();
       refreshGrid();
     }, [filterRequestKey, refreshGrid]);
 
@@ -205,37 +218,44 @@ const TraceGrid = React.forwardRef(
     const dataSource = useMemo(
       () => {
         prefetchCache.current.clear();
+        cursorPagination.current.reset();
         return {
           getRows: async (params) => {
             if (!enabled) {
               params.success({ rowData: [], rowCount: 0 });
               return;
             }
+            let pageNumber = 0;
             try {
               setLoading(true);
               params.api?.hideOverlay();
               const { request } = params;
+              const requestGeneration = cursorPagination.current.generation();
 
               const pageSize = request.endRow - request.startRow;
-              const pageNumber = Math.floor(request.startRow / pageSize);
+              pageNumber = Math.floor(request.startRow / pageSize);
+              if (pageNumber === 0) {
+                readStateRef.current = "complete";
+                setReadState("complete");
+              }
 
-              const buildParams = (page) => ({
-                // Omit project_id when null — the backend treats absent
-                // project_id as org-scoped (used by the cross-project user
-                // detail page).
-                ...(projectId ? { project_id: projectId } : {}),
-                page_number: page,
-                page_size: ROWS_LIMIT,
-                filters: JSON.stringify(
-                  toBackendFilters([
-                    ...filters,
-                    ...(hasEvalFilter ? [FILTER_FOR_HAS_EVAL] : []),
-                    ...(extraFilters || EMPTY_EXTRA_FILTERS),
-                    ...(metricFilters || []),
-                  ]),
-                ),
-                ...(dateInterval && { interval: dateInterval }),
-              });
+              const buildParams = (page) =>
+                cursorPagination.current.requestParams(page, {
+                  // Omit project_id when null — the backend treats absent
+                  // project_id as org-scoped (used by the cross-project user
+                  // detail page).
+                  ...(projectId ? { project_id: projectId } : {}),
+                  page_size: ROWS_LIMIT,
+                  filters: JSON.stringify(
+                    toBackendFilters([
+                      ...filters,
+                      ...(hasEvalFilter ? [FILTER_FOR_HAS_EVAL] : []),
+                      ...(extraFilters || EMPTY_EXTRA_FILTERS),
+                      ...(metricFilters || []),
+                    ]),
+                  ),
+                  ...(dateInterval && { interval: dateInterval }),
+                });
 
               // Use prefetched data if available, otherwise fetch
               const cached = prefetchCache.current.get(pageNumber);
@@ -246,8 +266,17 @@ const TraceGrid = React.forwardRef(
                   endpoints.project.getTracesForObserveProject(),
                   { params: buildParams(pageNumber) },
                 ));
+              if (!cursorPagination.current.isCurrent(requestGeneration)) {
+                failServerSideGridRead(params);
+                return;
+              }
 
               const res = results?.data?.result;
+              const nextReadState = getQueryReadState(results?.data);
+              if (pageNumber === 0 || nextReadState !== "complete") {
+                readStateRef.current = nextReadState;
+                setReadState(nextReadState);
+              }
               const newCols = normalizeConfigKeys(res?.config);
 
               // Use ref to get latest columns for comparison without triggering dataSource recreation
@@ -306,14 +335,20 @@ const TraceGrid = React.forwardRef(
               }
 
               const rows = res?.table || [];
-              const totalRows = res?.metadata?.total_rows;
+              const metadata = res?.metadata || {};
+              cursorPagination.current.recordResponse(pageNumber, metadata);
+              const totalRows = metadata.total_rows;
               params.api.totalRowCount = totalRows;
               useTraceGridStore.setState({ totalRowCount: totalRows || 0 });
 
               // Infinite-scroll behavior: don't tell AG Grid the total upfront.
               // Use -1 (unknown) so it only extends the scrollbar as pages load.
               // When we get fewer rows than requested, that's the last page.
-              const isLastPage = rows.length < ROWS_LIMIT;
+              const isLastPage = cursorPagination.current.isLastPage(
+                metadata,
+                rows.length,
+                ROWS_LIMIT,
+              );
               const lastRow = isLastPage ? request.startRow + rows.length : -1;
 
               params.success({
@@ -343,12 +378,28 @@ const TraceGrid = React.forwardRef(
                     params: buildParams(pageNumber + 1),
                   })
                   .then((res) => {
-                    prefetchCache.current.set(pageNumber + 1, res);
+                    if (cursorPagination.current.isCurrent(requestGeneration)) {
+                      prefetchCache.current.set(pageNumber + 1, res);
+                    }
                   })
                   .catch(() => {});
               }
             } catch (error) {
-              params.fail();
+              if (
+                cursorPagination.current.canRecoverFromContinuationError(
+                  pageNumber,
+                  error,
+                )
+              ) {
+                prefetchCache.current.clear();
+                cursorPagination.current.disableCursor();
+                params.fail();
+                params.api?.refreshServerSide?.({ purge: true });
+                return;
+              }
+              readStateRef.current = "error";
+              setReadState("error");
+              failServerSideGridRead(params);
             } finally {
               setLoading(false);
             }
@@ -533,10 +584,31 @@ const TraceGrid = React.forwardRef(
 
     return (
       <Box
-        sx={{ height: "calc(100vh - 270px)" }}
+        sx={{
+          height: "calc(100vh - 270px)",
+          display: "flex",
+          flexDirection: "column",
+        }}
         className={cellHeight && cellHeight !== "Short" ? "cell-wrap" : ""}
       >
+        {readMessage && (
+          <Box
+            role="status"
+            sx={{
+              px: 1.5,
+              py: 0.75,
+              fontSize: 12,
+              color: "warning.main",
+              bgcolor: "warning.lighter",
+              borderBottom: "1px solid",
+              borderColor: "warning.light",
+            }}
+          >
+            {readMessage}
+          </Box>
+        )}
         <AgGridReact
+          style={{ flex: 1, minHeight: 0 }}
           className={`clean-data-table ${shouldDisable ? "ag-grid-disabled" : ""}`}
           theme={agTheme.withParams({
             columnBorder: false,
@@ -577,7 +649,8 @@ const TraceGrid = React.forwardRef(
                   color: "text.secondary",
                 }}
               >
-                {showErrors ? "No error found" : "No traces found"}
+                {getQueryReadMessage(readStateRef.current) ||
+                  (showErrors ? "No error found" : "No traces found")}
               </Typography>,
             )
           }

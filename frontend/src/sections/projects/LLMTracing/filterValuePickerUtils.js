@@ -6,12 +6,24 @@ export function usesFreeTextValue(fieldType, source) {
 }
 
 export function getPickerOptionValue(option) {
-  if (typeof option === "string") return option;
+  if (
+    typeof option === "string" ||
+    typeof option === "number" ||
+    typeof option === "boolean"
+  ) {
+    return option;
+  }
   return option?.value ?? option?.label ?? "";
 }
 
 export function getPickerOptionLabel(option) {
-  if (typeof option === "string") return option;
+  if (
+    typeof option === "string" ||
+    typeof option === "number" ||
+    typeof option === "boolean"
+  ) {
+    return String(option);
+  }
   return option?.label ?? option?.value ?? "";
 }
 
@@ -23,7 +35,13 @@ export function getPickerOptionSecondaryLabel(option) {
 }
 
 export function getPickerOptionSearchText(option) {
-  if (typeof option === "string") return option;
+  if (
+    typeof option === "string" ||
+    typeof option === "number" ||
+    typeof option === "boolean"
+  ) {
+    return String(option);
+  }
   return [
     option?.label,
     option?.name,
@@ -31,12 +49,19 @@ export function getPickerOptionSearchText(option) {
     option?.description,
     option?.value,
   ]
-    .filter(Boolean)
+    .filter((value) => value !== undefined && value !== null && value !== "")
+    .map(String)
     .join(" ");
 }
 
 export function getPickerOptionExactMatches(option) {
-  if (typeof option === "string") return [option];
+  if (
+    typeof option === "string" ||
+    typeof option === "number" ||
+    typeof option === "boolean"
+  ) {
+    return [String(option)];
+  }
   return [
     option?.value,
     option?.label,
@@ -44,6 +69,28 @@ export function getPickerOptionExactMatches(option) {
     option?.email,
     option?.description,
   ]
-    .filter(Boolean)
+    .filter((value) => value !== undefined && value !== null && value !== "")
     .map(String);
+}
+
+export function normalizePickerValues(values) {
+  const rawValues = Array.isArray(values)
+    ? values
+    : values !== undefined && values !== null && values !== ""
+      ? [values]
+      : [];
+  const cleanValues = rawValues
+    .map((item) => getPickerOptionValue(item))
+    .map((item) => (typeof item === "string" ? item.trim() : item))
+    .filter(
+      (item) =>
+        (typeof item === "string" && item.length > 0) ||
+        typeof item === "boolean" ||
+        (typeof item === "number" && Number.isFinite(item)),
+    );
+  const byIdentity = new Map();
+  for (const item of cleanValues) {
+    byIdentity.set(`${typeof item}:${JSON.stringify(item)}`, item);
+  }
+  return Array.from(byIdentity.values());
 }
