@@ -1365,14 +1365,14 @@ class TestMetricsEndpoint:
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
     @patch("tracer.views.dashboard.AttributeReadSelector")
-    def test_filter_values_custom_attribute_query_defect_is_500(
+    def test_filter_values_custom_attribute_query_defect_preserves_sanitized_400(
         self,
         mock_selector_cls,
         _mock_ch_enabled,
         auth_client,
         observe_project,
     ):
-        """ClickHouse query defects must not masquerade as an empty picker."""
+        """Query defects preserve sanitized 400, never an empty picker."""
         mock_selector_cls.return_value.read_values.side_effect = ServerException(
             "private ClickHouse query detail", code=47
         )
@@ -1383,7 +1383,7 @@ class TestMetricsEndpoint:
             f"&project_ids={observe_project.id}&source=traces"
         )
 
-        assert response.status_code == 500
+        assert response.status_code == 400
         payload = json.dumps(response.json())
         assert "could not be loaded" in payload
         assert "private ClickHouse" not in payload
@@ -1391,14 +1391,14 @@ class TestMetricsEndpoint:
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
     @patch("tracer.views.dashboard.AttributeReadSelector")
-    def test_filter_values_custom_attribute_programming_error_is_500(
+    def test_filter_values_custom_attribute_programming_error_preserves_sanitized_400(
         self,
         mock_selector_cls,
         _mock_ch_enabled,
         auth_client,
         observe_project,
     ):
-        """Programming defects must not masquerade as an empty picker."""
+        """Programming defects preserve sanitized 400, never an empty picker."""
         mock_selector_cls.return_value.read_values.side_effect = RuntimeError(
             "private attribute compiler invariant"
         )
@@ -1409,7 +1409,7 @@ class TestMetricsEndpoint:
             f"&project_ids={observe_project.id}&source=traces"
         )
 
-        assert response.status_code == 500
+        assert response.status_code == 400
         payload = json.dumps(response.json())
         assert "could not be loaded" in payload
         assert "compiler invariant" not in payload

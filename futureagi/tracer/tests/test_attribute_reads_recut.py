@@ -1855,7 +1855,7 @@ def test_observation_attribute_pickers_degrade_typed_ch_failures(
         ),
     ],
 )
-def test_observation_attribute_pickers_return_500_for_programming_defects(
+def test_observation_attribute_pickers_preserve_sanitized_400_for_programming_defects(
     monkeypatch, action_name, path
 ):
     from tracer.views.observation_span import ObservationSpanView
@@ -1876,7 +1876,7 @@ def test_observation_attribute_pickers_return_500_for_programming_defects(
 
     response = ObservationSpanView.as_view({"get": action_name})(request)
 
-    assert response.status_code == 500
+    assert response.status_code == 400
     payload = json.dumps(response.data)
     assert "could not be loaded" in payload
     assert "compiler invariant" not in payload
