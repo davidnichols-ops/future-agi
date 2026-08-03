@@ -22,6 +22,9 @@ from unittest.mock import Mock
 import pytest
 
 from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
+from tracer.services.clickhouse.v2.query_builders.trace_list import (
+    TraceListQueryBuilderV2,
+)
 
 
 @pytest.fixture
@@ -131,6 +134,53 @@ class TestBuildContentQuery:
         assert "latest_project_version_id = %(project_version_id)s" in query
         assert params["project_version_id"] == builder.project_version_id
         assert "argMax(tuple(input), _peerdb_version).1" in query
+
+
+@pytest.mark.unit
+class TestBuildContentQueryV2TraceTags:
+    def test_reads_bounded_latest_trace_tags_without_dictionary(
+        self, project_id, trace_ids
+    ):
+        query, params = TraceListQueryBuilderV2(
+            project_id=project_id
+        ).build_content_query(trace_ids)
+
+        assert "dictGet" not in query
+        assert "trace_dict" not in query
+        assert "FROM traces" in query
+        assert "AND id IN %(content_trace_ids)s" in query
+        assert params["content_trace_ids"] == tuple(trace_ids)
+
+    def test_collapses_latest_trace_version_and_discards_latest_tombstone(
+        self, project_id, trace_ids
+    ):
+        query, _ = TraceListQueryBuilderV2(project_id=project_id).build_content_query(
+            trace_ids
+        )
+
+        assert "argMax(tags, _version) AS latest_trace_tags" in query
+        assert "argMax(is_deleted, _version) AS latest_trace_is_deleted" in query
+        assert "GROUP BY project_id, id" in query
+        assert "HAVING latest_trace_is_deleted = 0" in query
+        assert "ifNull(nullIf(latest_trace_tags, ''), '[]') AS trace_tags" in query
+
+    def test_joins_tags_on_project_and_trace_identity(self, project_id, trace_ids):
+        query, _ = TraceListQueryBuilderV2(project_id=project_id).build_content_query(
+            trace_ids
+        )
+
+        assert "PREWHERE project_id = %(project_id)s" in query
+        assert "latest_physical_roots.project_id = trace_tags_project_id" in query
+        assert "latest_physical_roots.trace_id = trace_tags_trace_id" in query
+
+    def test_multi_project_tags_keep_the_same_project_scope(self, trace_ids):
+        project_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        query, params = TraceListQueryBuilderV2(
+            project_ids=project_ids
+        ).build_content_query(trace_ids)
+
+        assert query.count("project_id IN %(project_ids)s") == 2
+        assert params["project_ids"] == tuple(project_ids)
 
 
 # ---------------------------------------------------------------------------

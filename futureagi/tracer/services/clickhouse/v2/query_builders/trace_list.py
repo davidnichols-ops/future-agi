@@ -44,6 +44,39 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
     # (end_users, etc.) instead of the dropped legacy CDC tables.
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
 
+    @staticmethod
+    def _trace_tags_select_sql() -> str:
+        """Project tags from the bounded latest trace row, without a dictionary."""
+
+        return "ifNull(nullIf(latest_trace_tags, ''), '[]') AS trace_tags"
+
+    def _trace_tags_join_sql(self) -> str:
+        """Resolve trace tags directly from the CH25 ``traces`` table.
+
+        The page identity already limits this read to at most the requested
+        trace IDs. Collapse those rows by the ReplacingMergeTree version,
+        discard a latest tombstone, and join on both tenant and trace identity.
+        This preserves the dictionary's missing-row ``[]`` contract while
+        avoiding a runtime ``dictGet`` privilege dependency.
+        """
+
+        return f"""
+        LEFT ANY JOIN (
+            SELECT
+                project_id AS trace_tags_project_id,
+                toString(id) AS trace_tags_trace_id,
+                argMax(tags, _version) AS latest_trace_tags,
+                argMax(is_deleted, _version) AS latest_trace_is_deleted
+            FROM traces
+            PREWHERE {self.project_filter_sql()}
+              AND id IN %(content_trace_ids)s
+            GROUP BY project_id, id
+            HAVING latest_trace_is_deleted = 0
+        ) AS latest_trace_tags_rows
+          ON latest_physical_roots.project_id = trace_tags_project_id
+         AND latest_physical_roots.trace_id = trace_tags_trace_id
+        """
+
     def build_count_query(self) -> tuple[str, dict[str, Any]]:
         """Pagination count.
 

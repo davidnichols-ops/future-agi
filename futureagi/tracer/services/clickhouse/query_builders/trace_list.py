@@ -1204,7 +1204,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             latest_attrs_bool AS attrs_bool,
             latest_attributes_extra AS attributes_extra,
             toJSONString(latest_metadata) AS metadata,
-            dictGetOrDefault('trace_dict', 'tags', toUUID(trace_id), '[]') AS trace_tags
+            {self._trace_tags_select_sql()}
         FROM (
             SELECT
                 project_id,
@@ -1231,6 +1231,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
               {span_window}
             GROUP BY project_id, trace_id, id, start_time
         ) AS latest_physical_roots
+        {self._trace_tags_join_sql()}
         WHERE latest_is_deleted = 0
           AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
           {project_version_fragment}
@@ -1238,6 +1239,21 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         LIMIT 1 BY project_id, trace_id
         """
         return query, params
+
+    @staticmethod
+    def _trace_tags_select_sql() -> str:
+        """Return the legacy trace-tag projection used outside CH25."""
+
+        return (
+            "dictGetOrDefault('trace_dict', 'tags', toUUID(trace_id), '[]') "
+            "AS trace_tags"
+        )
+
+    @staticmethod
+    def _trace_tags_join_sql() -> str:
+        """Return an optional source join for the trace-tag projection."""
+
+        return ""
 
     def build_span_attributes_query(
         self, trace_ids: list[str]
