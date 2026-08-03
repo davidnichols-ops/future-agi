@@ -293,8 +293,9 @@ const SpanGrid = React.forwardRef(
     // Tells cell renderers (e.g. TagsCell) they are on the span grid (so tag
     // edits target the span) and whether the role may edit.
     const gridContext = useMemo(
-      () => ({ entityType: "span", canEditTags }),
-      [canEditTags],
+      // observeId feeds the tag picker — see TraceGrid for the rationale.
+      () => ({ entityType: "span", canEditTags, projectId: observeId }),
+      [canEditTags, observeId],
     );
 
     const { columnDefs } = useMemo(() => {

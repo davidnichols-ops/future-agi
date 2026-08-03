@@ -487,7 +487,7 @@ export const TRACE_DEFAULT_COLUMNS = [
   },
   { headerComponent: LoadingHeader, field: "cost", flex: 0, minWidth: 130 },
   { headerComponent: LoadingHeader, field: "model", flex: 1, minWidth: 130 },
-  { headerComponent: LoadingHeader, field: "tags", flex: 1, minWidth: 150 },
+  { headerComponent: LoadingHeader, field: "tags", flex: 1, minWidth: 170 },
   { headerComponent: LoadingHeader, field: "user_id", flex: 1, minWidth: 120 },
 ];
 
@@ -534,7 +534,7 @@ const COLUMN_SIZE_MAP = {
   start_time: { minWidth: 170, flex: 1 },
   input: { minWidth: 200, flex: 2 },
   output: { minWidth: 200, flex: 2 },
-  tags: { minWidth: 150, flex: 1 },
+  tags: { minWidth: 170, flex: 1 },
   labels: { minWidth: 150, flex: 1 },
   user_id: { minWidth: 120, flex: 1 },
   observation_levels: { minWidth: 140, maxWidth: 200, flex: 0 },

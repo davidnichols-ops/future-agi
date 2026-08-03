@@ -198,8 +198,10 @@ const TraceGrid = React.forwardRef(
     // Tells cell renderers (e.g. TagsCell) they are on the trace grid (so tag
     // edits target the trace, not its root span) and whether the role may edit.
     const gridContext = useMemo(
-      () => ({ entityType: "trace", canEditTags }),
-      [canEditTags],
+      // projectId feeds the tag picker: tags are reusable within a project, so
+      // the popover needs to know which project's vocabulary to offer.
+      () => ({ entityType: "trace", canEditTags, projectId }),
+      [canEditTags, projectId],
     );
 
     const dataSource = useMemo(

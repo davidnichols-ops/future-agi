@@ -58,6 +58,8 @@ const LLMTracingSpanDetailDrawer = ({ refreshGrid }) => {
       onNext={onNext}
       hasPrev={hasPrev}
       hasNext={hasNext}
+      // AG-Grid keeps its own row cache — edits here need an explicit refresh.
+      refreshParentGrid={refreshGrid}
     />
   );
 };

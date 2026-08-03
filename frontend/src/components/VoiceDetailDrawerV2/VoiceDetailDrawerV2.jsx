@@ -10,6 +10,8 @@ import ImagineTab from "src/components/imagine/ImagineTab";
 import ConfirmDialog from "src/components/custom-dialog/confirm-dialog";
 import { ShareDialog } from "src/components/share-dialog";
 import AddTagsPopover from "src/components/traceDetail/AddTagsPopover";
+import { useGetTraceDetail } from "src/api/project/trace-detail";
+import { resolveCallTags } from "src/components/traceDetail/tagUtils";
 import AddToQueueDialog from "src/sections/annotations/queues/components/add-to-queue-dialog";
 import AddDataset from "src/components/traceDetailDrawer/addToDataset/add-dataset";
 import { LLM_TABS } from "src/sections/projects/LLMTracing/common";
@@ -75,6 +77,12 @@ const VoiceDetailDrawerV2 = ({
   const queryClient = useQueryClient();
   const { observeId } = useParams();
   const projectId = observeId || data?.project_id;
+
+  // Same source as the chip row — the call payload has no `tags` for observe.
+  const isObserveCall = data?.module === "project";
+  const { data: tagTraceDetail } = useGetTraceDetail(
+    isObserveCall ? data?.trace_id : null,
+  );
 
   const [leftPanelWidth, setLeftPanelWidth] = useState(50); // percentage
   const [isFullscreen, setIsFullscreen] = useState(initialFullscreen);
@@ -539,7 +547,10 @@ const VoiceDetailDrawerV2 = ({
           open={Boolean(tagsAnchorEl)}
           onClose={() => setTagsAnchorEl(null)}
           traceId={data.trace_id}
-          currentTags={data?.tags || data?.trace?.tags || []}
+          // Without this the popover can list a tag but not rename, recolour
+          // or delete one — those act on the project's tag, not on this row.
+          projectId={projectId}
+          currentTags={resolveCallTags(tagTraceDetail, data)}
           onSuccess={() =>
             queryClient.invalidateQueries({ queryKey: ["voiceCallDetail"] })
           }

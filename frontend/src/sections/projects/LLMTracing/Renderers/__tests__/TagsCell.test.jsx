@@ -222,3 +222,33 @@ describe("TagsCell", () => {
     );
   });
 });
+
+describe("TagsCell overflow chip", () => {
+  const many = ["alpha", "beta", "gamma", "delta"];
+
+  it("renders +N for tags beyond the visible limit", () => {
+    render(<TagsCell value={many} traceId="trace-1" entityType="trace" />);
+
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+    expect(screen.getByText("beta")).toBeInTheDocument();
+    // gamma/delta are hidden behind the counter
+    expect(screen.queryByText("gamma")).not.toBeInTheDocument();
+    expect(screen.getByText("+2")).toBeInTheDocument();
+  });
+
+  it("reveals the hidden tag names on hover", async () => {
+    const user = userEvent.setup();
+    render(<TagsCell value={many} traceId="trace-1" entityType="trace" />);
+
+    await user.hover(screen.getByText("+2"));
+
+    expect(await screen.findByText("gamma")).toBeInTheDocument();
+    expect(screen.getByText("delta")).toBeInTheDocument();
+  });
+
+  it("shows no counter when everything fits", () => {
+    render(<TagsCell value={["alpha"]} traceId="trace-1" entityType="trace" />);
+
+    expect(screen.queryByText(/^\+\d/)).not.toBeInTheDocument();
+  });
+});

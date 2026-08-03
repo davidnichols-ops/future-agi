@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import PropTypes from "prop-types";
 import { Box, Chip } from "@mui/material";
+import CustomTooltip from "src/components/tooltip";
 import { normalizeTag } from "src/components/traceDetail/tagUtils";
 import TagChip from "src/components/traceDetail/TagChip";
 import AddTagsPopover from "src/components/traceDetail/AddTagsPopover";
@@ -12,6 +13,7 @@ const TagsCell = ({
   traceId,
   spanId,
   entityType,
+  projectId,
   canEditTags = true,
   onTagsUpdated,
 }) => {
@@ -33,7 +35,8 @@ const TagsCell = ({
   if (tags.length === 0 && !editable) return null;
 
   const visible = tags.slice(0, MAX_VISIBLE);
-  const overflowCount = tags.length - MAX_VISIBLE;
+  const hidden = tags.slice(MAX_VISIBLE).map(normalizeTag);
+  const overflowCount = hidden.length;
 
   const handleClick = (event) => {
     event.stopPropagation();
@@ -91,16 +94,41 @@ const TagsCell = ({
           );
         })}
         {overflowCount > 0 && (
-          <Chip
-            label={`+${overflowCount}`}
+          // Otherwise the overflow count is a dead end.
+          <CustomTooltip
+            show
+            arrow
             size="small"
-            sx={{
-              height: 20,
-              fontSize: 11,
-              "& .MuiChip-label": { px: 0.75 },
-              bgcolor: "action.hover",
-            }}
-          />
+            placement="top"
+            title={
+              <Box
+                sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, py: 0.25 }}
+              >
+                {hidden.map((tag) => (
+                  <TagChip
+                    key={tag.name}
+                    name={tag.name}
+                    color={tag.color}
+                    size="small"
+                    readOnly
+                  />
+                ))}
+              </Box>
+            }
+          >
+            <Chip
+              label={`+${overflowCount}`}
+              size="small"
+              sx={{
+                height: 20,
+                fontSize: 11,
+                fontWeight: 500,
+                color: "text.secondary",
+                "& .MuiChip-label": { px: 0.75 },
+                bgcolor: "action.selected",
+              }}
+            />
+          </CustomTooltip>
         )}
         {tags.length === 0 && editable && (
           <Chip
@@ -124,6 +152,7 @@ const TagsCell = ({
           onClose={handleClose}
           traceId={targetTraceId}
           spanId={targetSpanId}
+          projectId={projectId}
           currentTags={value}
         />
       )}
@@ -138,6 +167,8 @@ TagsCell.propTypes = {
   // "trace" | "span" — which entity this grid tags. Disambiguates rows that
   // carry both ids so the right endpoint is hit.
   entityType: PropTypes.oneOf(["trace", "span"]),
+  // Project whose reusable tags the picker offers.
+  projectId: PropTypes.string,
   // Whether the current role may edit tags; false renders the cell read-only.
   canEditTags: PropTypes.bool,
   // Called when the popover closes after editing, so the server-side grid can

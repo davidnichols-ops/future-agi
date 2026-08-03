@@ -555,6 +555,9 @@ const TraceDetailDrawerV2 = ({
     setSelectedSpanId(initialSpanId || rootSpanId || null);
   }, [traceId, rootSpanId, initialSpanId]);
 
+  // The root span stands in for the trace — editor and display must agree.
+  const isTagTargetTrace = !selectedSpanId || selectedSpanId === rootSpanId;
+
   // Find selected span in tree
   const selectedSpanData = useMemo(() => {
     if (!selectedSpanId || !spans) return null;
@@ -1142,6 +1145,7 @@ const TraceDetailDrawerV2 = ({
                   isRootSpan={selectedSpanId === rootSpanId}
                   traceTags={data?.trace?.tags || []}
                   projectId={projectId}
+                  onTagsUpdated={refreshParentGrid}
                   onClose={() => setSelectedSpanId(null)}
                   onAction={handleAction}
                   onSelectSpan={handleSelectSpan}
@@ -1225,6 +1229,7 @@ const TraceDetailDrawerV2 = ({
                   isRootSpan={selectedSpanId === rootSpanId}
                   traceTags={data?.trace?.tags || []}
                   projectId={projectId}
+                  onTagsUpdated={refreshParentGrid}
                   onClose={() => setSelectedSpanId(null)}
                   onAction={handleAction}
                   onSelectSpan={handleSelectSpan}
@@ -1412,18 +1417,23 @@ const TraceDetailDrawerV2 = ({
         }}
       />
 
-      {/* Add Tags Popover */}
+      {/* Must target the same entity the pane's chips show, or the save
+          succeeds and appears to do nothing. */}
       <AddTagsPopover
         anchorEl={tagsAnchorEl}
         open={Boolean(tagsAnchorEl)}
         onClose={() => setTagsAnchorEl(null)}
         traceId={traceId}
-        spanId={selectedSpanId}
+        spanId={isTagTargetTrace ? undefined : selectedSpanId}
+        projectId={projectId}
         currentTags={
-          selectedSpanData
-            ? getSpan(selectedSpanData)?.tags || []
-            : data?.trace?.tags || []
+          isTagTargetTrace
+            ? data?.trace?.tags || []
+            : getSpan(selectedSpanData)?.tags || []
         }
+        // The grid keeps its own server-side row cache, so the tag column on
+        // this trace's row only updates if we ask the grid to refresh.
+        onSuccess={refreshParentGrid}
       />
 
       {/* Save View Popover */}

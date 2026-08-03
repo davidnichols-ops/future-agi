@@ -1,16 +1,16 @@
 import React, { useMemo, useState } from "react";
 import PropTypes from "prop-types";
 import { Box, Stack } from "@mui/material";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { enqueueSnackbar } from "notistack";
-import axios from "src/utils/axios";
-import { apiPath } from "src/api/contracts/api-surface";
+import { useQueryClient } from "@tanstack/react-query";
 import { fDateTime } from "src/utils/format-time";
 import CustomTooltip from "src/components/tooltip/CustomTooltip";
 import Iconify from "src/components/iconify";
 import TagChip from "src/components/traceDetail/TagChip";
-import TagInput from "src/components/traceDetail/TagInput";
-import { normalizeTags } from "src/components/traceDetail/tagUtils";
+import AddTagsPopover from "src/components/traceDetail/AddTagsPopover";
+import {
+  normalizeTags,
+  resolveCallTags,
+} from "src/components/traceDetail/tagUtils";
 import { useGetTraceDetail } from "src/api/project/trace-detail";
 import VoiceActionsDropdown, {
   VOICE_ACTIONS,
@@ -109,83 +109,40 @@ const formatCost = (cost) => {
   return `$${n.toFixed(2)}`;
 };
 
-/**
- * Inline tags row with add/edit/remove — ported from
- * `VoiceDetailDrawerV2/CallDetailsBar.jsx`. Tags persist on the chat
- * row's underlying trace record via the same `/tracer/trace/{id}/tags/`
- * PATCH that voice uses.
- */
-const InlineTagsRow = ({ tags = [], traceId }) => {
-  const [isAdding, setIsAdding] = useState(false);
-  const queryClient = useQueryClient();
+/* Uses the shared AddTagsPopover so tagging behaves the same everywhere. */
+const InlineTagsRow = ({ tags = [], traceId, projectId }) => {
+  const [anchorEl, setAnchorEl] = useState(null);
 
   const normalized = useMemo(() => normalizeTags(tags), [tags]);
-
-  const { mutate: saveTags, isPending } = useMutation({
-    mutationFn: (newTags) =>
-      axios.patch(apiPath("/tracer/trace/{id}/tags/", { id: traceId }), {
-        tags: newTags,
-      }),
-    onSuccess: () => {
-      TAG_INVALIDATION_QUERY_KEYS.forEach((queryKey) =>
-        queryClient.invalidateQueries({ queryKey }),
-      );
-    },
-    onError: () => {
-      enqueueSnackbar("Failed to update tags", { variant: "error" });
-    },
-  });
+  const queryClient = useQueryClient();
 
   return (
-    <Stack
-      direction="row"
-      sx={{ flexWrap: "wrap", gap: 0.5, alignItems: "center" }}
-    >
-      <Iconify
-        icon="mdi:tag-outline"
-        width={13}
-        sx={{ color: "text.disabled" }}
-      />
-      {normalized.map((tag, idx) => (
-        <TagChip
-          key={`${tag.name}-${idx}`}
-          name={tag.name}
-          color={tag.color}
-          size="small"
-          onRemove={() => saveTags(normalized.filter((_, i) => i !== idx))}
-          onColorChange={(c) =>
-            saveTags(
-              normalized.map((t, i) => (i === idx ? { ...t, color: c } : t)),
-            )
-          }
-          onRename={(n) => {
-            if (normalized.some((t, i) => i !== idx && t.name === n)) return;
-            saveTags(
-              normalized.map((t, i) => (i === idx ? { ...t, name: n } : t)),
-            );
-          }}
+    <>
+      <Stack
+        direction="row"
+        onClick={(e) => setAnchorEl(e.currentTarget)}
+        sx={{
+          flexWrap: "wrap",
+          gap: 0.5,
+          alignItems: "center",
+          cursor: "pointer",
+        }}
+      >
+        <Iconify
+          icon="mdi:tag-outline"
+          width={13}
+          sx={{ color: "text.disabled" }}
         />
-      ))}
-      {isAdding ? (
-        <Box
-          sx={{ minWidth: 130 }}
-          onBlur={(e) => {
-            if (!e.currentTarget.contains(e.relatedTarget)) setIsAdding(false);
-          }}
-        >
-          <TagInput
-            onAdd={(newTag) => {
-              saveTags([...normalized, newTag]);
-              setIsAdding(false);
-            }}
-            existingNames={normalized.map((t) => t.name)}
-            disabled={isPending}
-            placeholder="tag name"
+        {normalized.map((tag, idx) => (
+          <TagChip
+            key={`${tag.name}-${idx}`}
+            name={tag.name}
+            color={tag.color}
+            size="small"
+            readOnly
           />
-        </Box>
-      ) : (
+        ))}
         <Box
-          onClick={() => setIsAdding(true)}
           sx={{
             display: "inline-flex",
             alignItems: "center",
@@ -197,7 +154,6 @@ const InlineTagsRow = ({ tags = [], traceId }) => {
             borderColor: "divider",
             fontSize: 11,
             color: "text.disabled",
-            cursor: "pointer",
             lineHeight: "16px",
             "&:hover": { borderColor: "primary.main", color: "primary.main" },
           }}
@@ -205,13 +161,30 @@ const InlineTagsRow = ({ tags = [], traceId }) => {
           <Iconify icon="mdi:plus" width={12} />
           tag
         </Box>
-      )}
-    </Stack>
+      </Stack>
+
+      <AddTagsPopover
+        open={Boolean(anchorEl)}
+        anchorEl={anchorEl}
+        onClose={() => setAnchorEl(null)}
+        traceId={traceId}
+        projectId={projectId}
+        currentTags={tags}
+        onSuccess={() => {
+          queryClient.invalidateQueries({ queryKey: ["chatCallDetail"] });
+          queryClient.invalidateQueries({ queryKey: ["trace-detail"] });
+        }}
+      />
+    </>
   );
 };
+
 InlineTagsRow.propTypes = {
   tags: PropTypes.array,
   traceId: PropTypes.string,
+  // Which project's reusable tags the popover offers, and what rename /
+  // recolour / delete act on.
+  projectId: PropTypes.string,
 };
 
 const ChatDetailsBar = ({ data, onAction }) => {
@@ -265,12 +238,7 @@ const ChatDetailsBar = ({ data, onAction }) => {
   const traceId = data?.trace_id;
   const isObserve = data?.module === DRAWER_MODULE.OBSERVE;
   const { data: traceDetail } = useGetTraceDetail(isObserve ? traceId : null);
-  const tags =
-    traceDetail?.trace?.tags ||
-    traceDetail?.tags ||
-    data?.tags ||
-    data?.trace?.tags ||
-    [];
+  const tags = resolveCallTags(traceDetail, data);
 
   if (chips.length === 0 && !onAction && !traceId) return null;
 
@@ -319,7 +287,11 @@ const ChatDetailsBar = ({ data, onAction }) => {
 
       {traceId && (
         <Box sx={{ mt: 0.75 }}>
-          <InlineTagsRow tags={tags} traceId={traceId} />
+          <InlineTagsRow
+            tags={tags}
+            traceId={traceId}
+            projectId={data?.project_id}
+          />
         </Box>
       )}
     </Box>

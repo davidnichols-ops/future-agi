@@ -57,3 +57,35 @@ export function normalizeTags(tags) {
 export function tagName(tag) {
   return typeof tag === "string" ? tag : tag?.name || "";
 }
+
+/**
+ * Tags for a voice/chat call. The call-detail endpoints omit `tags` for observe
+ * calls, so trace detail wins; the payload is the fallback for simulate.
+ * Shared so a drawer's chip row and its popover can't disagree.
+ */
+export function resolveCallTags(traceDetail, data) {
+  return (
+    traceDetail?.trace?.tags ||
+    traceDetail?.tags ||
+    data?.tags ||
+    data?.trace?.tags ||
+    []
+  );
+}
+
+/**
+ * Wire format for the tag-update endpoints: `{ name, color }` so the picked
+ * colour is applied in the same request. Colour is stored per project tag, so
+ * recolouring applies everywhere. A colourless tag goes out as a bare name.
+ */
+export function toTagPayload(tags) {
+  if (!Array.isArray(tags)) return [];
+  return tags
+    .map((tag) => {
+      const name = tagName(tag);
+      if (!name) return null;
+      const color = typeof tag === "string" ? null : tag?.color;
+      return color ? { name, color } : name;
+    })
+    .filter(Boolean);
+}
