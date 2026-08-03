@@ -1,26 +1,28 @@
 import time
 
 import structlog
+from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
-from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
-logger = structlog.get_logger(__name__)
 from accounts.utils import get_request_organization
 from tfc.utils.api_contracts import hide_swagger_schema_for_actions
 from tfc.utils.general_methods import GeneralMethods
-from tracer.models.observation_span import ObservationSpan
 from tracer.models.project import Project
 from tracer.serializers.monitor import (
     FetchGraphSerializer,
 )
 from tracer.utils.graphs_optimized import (
+    EvalGraphConfigurationError,
+    EvalGraphReadError,
     get_all_system_metrics,
     get_eval_graph_data,
     get_system_metric_data,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 @hide_swagger_schema_for_actions(
@@ -162,10 +164,28 @@ class ChartsView(GenericViewSet):
 
             return self._gm.success_response(metric_data)
 
-        except Exception as e:
+        except EvalGraphConfigurationError as exc:
+            return self._gm.bad_request(str(exc))
+        except EvalGraphReadError:
             elapsed_time = time.time() - start_time
-            logger.error(
-                f"fetch_graph_v2 failed after {elapsed_time:.3f}s: {str(e)}",
-                exc_info=True,
+            logger.exception(
+                "fetch_graph_eval_read_failed",
+                elapsed_seconds=round(elapsed_time, 3),
             )
-            return self._gm.bad_request(str(e))
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Evaluation graph data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+        except Exception as exc:
+            elapsed_time = time.time() - start_time
+            logger.exception(
+                "fetch_graph_v2_failed",
+                elapsed_seconds=round(elapsed_time, 3),
+                error_type=type(exc).__name__,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Unable to fetch graph data. Please retry.",
+                code="internal_error",
+            )

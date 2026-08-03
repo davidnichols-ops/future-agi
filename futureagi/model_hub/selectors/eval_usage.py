@@ -13,11 +13,13 @@ from tracer.services.clickhouse.read_budget import (
     is_clickhouse_query_error,
     is_read_budget_error,
 )
+from tracer.services.clickhouse.trace_project_scope import (
+    latest_live_trace_projects_sql,
+)
 
 READ_TIMEOUT_MS = 4_000
 MAX_PAGE_SIZE = 100
 _USAGE_TABLE = "usage_apicalllog"
-_TRACE_PROJECT_DICT = "trace_dict"
 
 _READ_SETTINGS = {
     "max_threads": 2,
@@ -127,17 +129,30 @@ def _latest_usage_slice(
                 "created_at <= %(end_date)s",
             ]
         )
+    project_join = ""
     project_scope = ""
     if project_scoped:
+        trace_candidates = f"""
+            SELECT DISTINCT toUUIDOrZero(eval_trace_id) AS trace_id
+            FROM {_USAGE_TABLE}
+            PREWHERE {" AND ".join(candidate_scope)}
+            WHERE eval_trace_id != ''
+        """
+        trace_projects = latest_live_trace_projects_sql(
+            candidate_trace_ids_sql=trace_candidates
+        )
+        project_join = (
+            f"LEFT JOIN ({trace_projects}) AS allowed_trace_projects "
+            "ON allowed_trace_projects.trace_id = toUUIDOrZero(eval_trace_id)"
+        )
         project_scope = (
-            "WHERE (eval_trace_id = '' OR dictGetOrDefault("
-            f"'{_TRACE_PROJECT_DICT}', 'project_id', toUUIDOrZero(eval_trace_id), "
-            "toUUID('00000000-0000-0000-0000-000000000000')) "
-            "IN %(project_ids)s)"
+            "WHERE (eval_trace_id = '' OR "
+            "allowed_trace_projects.project_id IN %(project_ids)s)"
         )
     return f"""
         SELECT {projection}
         FROM {_USAGE_TABLE}
+        {project_join}
         PREWHERE {" AND ".join(candidate_scope)}
         {project_scope}
         ORDER BY _peerdb_version DESC

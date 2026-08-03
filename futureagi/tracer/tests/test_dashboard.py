@@ -1662,8 +1662,49 @@ class TestChartsView:
         response = auth_client.get(f"/tracer/charts/fetch_graph/?{query}")
 
         assert response.status_code == 400
-        assert "Custom eval config does not exist" in str(response.json())
+        assert "Evaluation config is not available for this project" in str(
+            response.json()
+        )
         mock_analytics_cls.assert_not_called()
+
+    @pytest.mark.django_db
+    @patch("tracer.services.clickhouse.query_service.AnalyticsQueryService")
+    def test_fetch_eval_graph_does_not_fall_back_or_expose_ch_error(
+        self,
+        mock_analytics_cls,
+        auth_client,
+        observe_project,
+        custom_eval_config,
+    ):
+        custom_eval_config.project = observe_project
+        custom_eval_config.save(update_fields=["project"])
+        custom_eval_config.eval_template.config = {"output": "Pass/Fail"}
+        custom_eval_config.eval_template.save(update_fields=["config"])
+        mock_analytics_cls.return_value.execute_ch_query.side_effect = RuntimeError(
+            "secret ClickHouse host and stack"
+        )
+
+        query = urlencode(
+            {
+                "project_id": str(observe_project.id),
+                "interval": "day",
+                "property": "average",
+                "req_data_config": json.dumps(
+                    {"id": str(custom_eval_config.id), "type": "EVAL"}
+                ),
+            }
+        )
+
+        with patch(
+            "tracer.utils.graphs_optimized.EvalLogger.objects.filter"
+        ) as pg_filter:
+            response = auth_client.get(f"/tracer/charts/fetch_graph/?{query}")
+
+        assert response.status_code == 503
+        payload = str(response.json())
+        assert "temporarily unavailable" in payload
+        assert "secret ClickHouse host" not in payload
+        pg_filter.assert_not_called()
 
     @pytest.mark.django_db
     @patch("tracer.views.charts.get_system_metric_data")
@@ -1928,7 +1969,8 @@ class TestDashboardQueryBuilder:
         assert "' / '" in sql
         assert " AS breakdown_value" in sql
         assert sql.count(" AS breakdown_value") == 1
-        assert "dictGet('trace_dict', 'project_id'" in sql
+        assert "e.eval_project_id" in sql
+        assert "trace_dict" not in sql
         assert "e.eval_dataset_id" in sql
 
     def test_eval_metric_dedups_physical_rows_and_reruns_in_one_bounded_scan(
@@ -1988,11 +2030,23 @@ class TestDashboardQueryBuilder:
         for builder_cls in (DashboardQueryBuilder, DashboardQueryBuilderV2):
             sql, params, _ = builder_cls(config).build_all_queries()[0]
             compact_sql = " ".join(sql.split())
-            assert "dictGetOrDefault(" in compact_sql
-            assert "'trace_dict', 'project_id'" in compact_sql
+            assert "trace_dict" not in compact_sql
+            assert "FROM traces" in compact_sql
+            assert (
+                "PREWHERE trace_project_scan.project_id IN %(project_ids)s"
+                in compact_sql
+            )
+            assert "INNER JOIN (" in compact_sql
+            assert "AS bounded_trace_candidates" in compact_sql
+            assert "usage_trace_candidate" in compact_sql
+            assert (
+                "SELECT DISTINCT "
+                "toUUIDOrZero(usage_trace_candidate.eval_trace_id) AS trace_id"
+                in compact_sql
+            )
+            assert "GROUP BY trace_project_scan.id" in compact_sql
             assert "toUUIDOrZero(usage_main_latest.eval_trace_id)" in compact_sql
             assert "IN %(project_ids)s" in compact_sql
-            assert compact_sql.count("dictGetOrDefault(") == 1
             assert params["project_ids"] == [project_id]
             assert "usage_main_latest.eval_trace_id = ''" in sql
 
@@ -2061,8 +2115,9 @@ class TestDashboardQueryBuilder:
         }
         for builder_cls in (DashboardQueryBuilder, DashboardQueryBuilderV2):
             sql, _, _ = builder_cls(config).build_all_queries()[0]
-            # Trace resolution branch is still tried first.
-            assert "dictGet('trace_dict', 'project_id'" in sql
+            # Direct-write trace resolution branch is still tried first.
+            assert "e.eval_project_id" in sql
+            assert "trace_dict" not in sql
             # Fallback dispatches on eval source with human-readable labels.
             assert "e.source = 'eval_playground'" in sql
             assert "'(playground)'" in sql

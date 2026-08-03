@@ -21,6 +21,9 @@ from typing import Any
 from tracer.services.clickhouse.query_builders.expressions import (
     annotation_numeric_value_expr,
 )
+from tracer.services.clickhouse.trace_project_scope import (
+    latest_live_trace_projects_sql,
+)
 from tracer.services.clickhouse.v2.id_remap_sql import (
     remap_left_join,
     resolved_id_expr,
@@ -991,9 +994,24 @@ class DashboardQueryBuilder:
         # of the same data. On large tenants that pair is the Code 159 hot path.
         # Keeping the deletion predicates outside LIMIT 1 BY is required: an
         # inner live filter would resurrect a superseded row after a tombstone.
+        usage_trace_candidates = f"""
+            SELECT DISTINCT
+                toUUIDOrZero(usage_trace_candidate.eval_trace_id) AS trace_id
+            FROM usage_apicalllog AS usage_trace_candidate
+            PREWHERE {_usage_main_scope.replace("usage_main_scan", "usage_trace_candidate")}
+              AND usage_trace_candidate.source_id = %(eval_template_id)s
+              AND usage_trace_candidate.created_at >= %(start_date)s
+              AND usage_trace_candidate.created_at < %(end_date)s
+            WHERE usage_trace_candidate.eval_trace_id != ''
+        """
+        trace_projects = latest_live_trace_projects_sql(
+            candidate_trace_ids_sql=usage_trace_candidates
+        )
         eval_source = f"""
             (
-                SELECT *
+                SELECT
+                    usage_main_latest.*,
+                    usage_trace_project.project_id AS eval_project_id
                 FROM (
                     SELECT {_usage_eval_latest_projection("usage_main_scan")}
                     FROM usage_apicalllog AS usage_main_scan
@@ -1004,17 +1022,15 @@ class DashboardQueryBuilder:
                     ORDER BY usage_main_scan._peerdb_version DESC
                     LIMIT 1 BY usage_main_scan.id
                 ) AS usage_main_latest
+                LEFT JOIN ({trace_projects}) AS usage_trace_project
+                  ON usage_trace_project.trace_id =
+                     toUUIDOrZero(usage_main_latest.eval_trace_id)
                 WHERE usage_main_latest._peerdb_is_deleted = 0
                   AND usage_main_latest.deleted = 0
                   AND usage_main_latest.status = 'success'
                   AND (
                     usage_main_latest.eval_trace_id = ''
-                    OR dictGetOrDefault(
-                        'trace_dict',
-                        'project_id',
-                        toUUIDOrZero(usage_main_latest.eval_trace_id),
-                        toUUID('00000000-0000-0000-0000-000000000000')
-                    ) IN %(project_ids)s
+                    OR usage_trace_project.project_id IN %(project_ids)s
                   )
                 ORDER BY usage_main_latest.created_at DESC,
                          usage_main_latest.id DESC
@@ -1058,10 +1074,7 @@ class DashboardQueryBuilder:
                 )
 
             elif bd_name == "project":
-                _proj_uuid = (
-                    f"dictGet('trace_dict', 'project_id', "
-                    f"toUUIDOrZero({_trace_id_expr}))"
-                )
+                _proj_uuid = "e.eval_project_id"
                 bd_expr = (
                     f"if({_trace_id_expr} != '' "
                     f"AND {_proj_uuid} != toUUID('00000000-0000-0000-0000-000000000000'), "

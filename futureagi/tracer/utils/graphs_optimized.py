@@ -74,6 +74,14 @@ CHART_SPAN_FIELD_MAP = {
 }
 
 
+class EvalGraphConfigurationError(ValueError):
+    """The requested eval is missing or outside the authorized project."""
+
+
+class EvalGraphReadError(RuntimeError):
+    """The direct-write ClickHouse eval read could not be completed."""
+
+
 def parse_time_filters(filters: List[Dict]) -> tuple:
     """
     Extract start and end dates from filter configuration.
@@ -179,34 +187,39 @@ def get_eval_graph_data(
     # Extract configuration
     custom_eval_config_id = req_data_config.get("id")
     if not custom_eval_config_id:
-        raise ValueError("Custom eval config ID is required")
+        raise EvalGraphConfigurationError(
+            "Evaluation config is not available for this project"
+        )
 
     # The raw eval logger has no project column, so config ownership must be
-    # established before a config-scoped ClickHouse read can run.  The charts
-    # endpoint supplies the already-authorized project here; keep the fallback
-    # callers compatible when they only provide finite trace/span querysets.
+    # established before a config-scoped ClickHouse read can run. Direct-write
+    # deployments have no authoritative PostgreSQL telemetry fallback: every
+    # caller must supply the request-owned project or fail before any read.
     ch_project_id = eval_logger_filters.get("project_id")
+    if not ch_project_id:
+        raise EvalGraphConfigurationError(
+            "Evaluation config is not available for this project"
+        )
+
     config_lookup = {
         "id": custom_eval_config_id,
         "deleted": False,
+        "project_id": ch_project_id,
     }
-    if ch_project_id:
-        config_lookup["project_id"] = ch_project_id
 
     try:
         custom_eval_config = CustomEvalConfig.objects.select_related(
             "eval_template"
         ).get(**config_lookup)
     except CustomEvalConfig.DoesNotExist:
-        raise ValueError("Custom eval config does not exist")
+        raise EvalGraphConfigurationError(
+            "Evaluation config is not available for this project"
+        ) from None
 
     # --- ClickHouse dispatch ---
-    # Try CH if a project_id is available in eval_logger_filters
+    # A project ID is mandatory above, so every legitimate caller uses CH.
     if ch_project_id:
         try:
-            from tracer.services.clickhouse.query_builders import (
-                EvalMetricsQueryBuilder,
-            )
             from tracer.services.clickhouse.query_service import (
                 AnalyticsQueryService,
             )
@@ -215,9 +228,7 @@ def get_eval_graph_data(
             eval_output_type_ch = custom_eval_config.eval_template.config.get(
                 "output", "SCORE"
             )
-            choices = []
-            if eval_output_type_ch == "CHOICES":
-                choices = custom_eval_config.eval_template.choices or []
+            choices = custom_eval_config.eval_template.choices or []
 
             ch_start, ch_end = parse_time_filters(filters)
             # v1↔v2 dispatch — flips with CH25_QUERY_TYPES_V2_PRIMARY=EVAL_METRICS
@@ -240,17 +251,22 @@ def get_eval_graph_data(
             ch_data = builder.format_result(result.data, result.columns or [])
             # For observe_type="charts" with non-CHOICES types, the PG code
             # wraps single-series results in a list. Match that behavior.
-            if observe_type == "charts" and eval_output_type_ch != "CHOICES":
+            if observe_type == "charts" and builder.eval_output_type != "CHOICES":
                 if isinstance(ch_data, dict):
                     ch_data = [ch_data]
             return ch_data
-        except Exception as e:
-            logger.warning(
+        except Exception as exc:
+            logger.exception(
                 "ch_eval_graph_dispatch_failed",
-                error=str(e),
+                error_type=type(exc).__name__,
                 eval_config_id=str(custom_eval_config_id),
             )
-            # Fall through to existing PG code below
+            # Direct-write deployments have no authoritative PostgreSQL eval
+            # telemetry. Falling through would return stale/empty data and
+            # conceal the ClickHouse outage from callers.
+            raise EvalGraphReadError(
+                "Evaluation graph data is temporarily unavailable"
+            ) from None
 
     # Parse time filters
     start_date, end_date = parse_time_filters(filters)

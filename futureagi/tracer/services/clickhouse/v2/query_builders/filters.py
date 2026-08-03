@@ -80,6 +80,15 @@ _LEGACY_EVAL_COLUMN_MARKERS: dict[str, str] = {
     "eval_scan._peerdb_version": "eval_scan.__eval_legacy_version__",
     "eval_scan._peerdb_is_deleted": "eval_scan.__eval_legacy_cdc_deleted__",
     "latest_eval._peerdb_is_deleted": "latest_eval.__eval_legacy_cdc_deleted__",
+    "raw_eval_logger._peerdb_is_deleted": (
+        "raw_eval_logger.__eval_legacy_cdc_deleted__"
+    ),
+}
+
+_RAW_EVAL_LEGACY_COLUMN_MARKERS = {
+    "raw_eval_logger._peerdb_is_deleted": (
+        "raw_eval_logger.__eval_legacy_cdc_deleted__"
+    ),
 }
 
 
@@ -239,6 +248,14 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
          Word-boundary substitution; runs last.
       6. Append v2-required settings (use_skip_indexes_if_final etc).
     """
+    # A legacy raw eval table can be selected while the surrounding spans SQL
+    # uses the v2 schema.  The dedicated alias is emitted only for that legacy
+    # physical table, so preserve its CDC tombstone column through the global
+    # token rewrite.  A v2 eval table emits ``raw_eval_logger.is_deleted`` and
+    # does not need a marker.
+    for source, marker in _RAW_EVAL_LEGACY_COLUMN_MARKERS.items():
+        sql = sql.replace(source, marker)
+
     # 1. String JSON access. Replace only the first argument so nested paths
     # and escaped/unicode literals remain unchanged.
     sql = _ATTRIBUTES_EXTRA_JSON_FUNCTION_PATTERN.sub(
@@ -300,6 +317,8 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
     sql = _COL_RENAME_RE.sub(lambda m: _COL_RENAMES[m.group(1)], sql)
     # 5b. Legacy CDC dictionary names → v2 CH-native dictionary names.
     sql = _DICT_RENAME_RE.sub(lambda m: _DICT_RENAMES[m.group(1)], sql)
+    for source, marker in _RAW_EVAL_LEGACY_COLUMN_MARKERS.items():
+        sql = sql.replace(marker, source)
     # NOTE: this function does NOT append the v2 SETTINGS clause. The settings
     # are appended at the BUILDER boundary (v2 `build()`/`build_count_query()` etc)
     # via `_append_v2_settings()` — see ClickHouseFilterBuilderV2.translate.

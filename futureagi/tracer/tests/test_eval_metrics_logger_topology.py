@@ -16,7 +16,11 @@ import pytest
 
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.services.clickhouse.query_builders.eval_metrics import (
+    CHOICES,
+    PASS_FAIL,
+    SCORE,
     EvalMetricsQueryBuilder,
+    normalize_eval_output_type,
 )
 from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
     EvalMetricsQueryBuilderV2,
@@ -39,7 +43,9 @@ def test_eval_graph_common_boundary_scopes_config_to_request_project():
         scoped_configs = select_related.return_value
         scoped_configs.get.side_effect = CustomEvalConfig.DoesNotExist
 
-        with pytest.raises(ValueError, match="Custom eval config does not exist"):
+        with pytest.raises(
+            ValueError, match="Evaluation config is not available for this project"
+        ):
             get_eval_graph_data(
                 interval="day",
                 filters=[],
@@ -57,6 +63,26 @@ def test_eval_graph_common_boundary_scopes_config_to_request_project():
     )
 
 
+@pytest.mark.unit
+def test_eval_graph_common_boundary_rejects_missing_project_before_any_read():
+    with mock.patch.object(
+        CustomEvalConfig.objects, "select_related"
+    ) as select_related:
+        with pytest.raises(
+            ValueError, match="Evaluation config is not available for this project"
+        ):
+            get_eval_graph_data(
+                interval="day",
+                filters=[],
+                property="average",
+                observe_type="trace",
+                req_data_config={"id": EVAL_CONFIG_ID, "type": "EVAL"},
+                eval_logger_filters={},
+            )
+
+    select_related.assert_not_called()
+
+
 def _raw_builder(
     output_type: str,
     *,
@@ -69,7 +95,7 @@ def _raw_builder(
         end_date=END,
         interval="day",
         eval_output_type=output_type,
-        choices=["accepted", "rejected"] if output_type == "CHOICES" else None,
+        choices=["accepted", "rejected"],
         use_preaggregated=False,
         filters=filters or [],
     )
@@ -77,11 +103,15 @@ def _raw_builder(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("output_type", "metric_expression"),
+    ("output_type", "canonical_type", "metric_expression"),
     [
-        ("SCORE", "avg(output_float)"),
-        ("PASS_FAIL", "output_bool = 1"),
-        ("CHOICES", "JSONExtract(output_str_list, 'Array(String)')"),
+        ("SCORE", SCORE, "avg(output_float)"),
+        ("score", SCORE, "avg(output_float)"),
+        ("PASS_FAIL", PASS_FAIL, "output_bool = 1"),
+        ("Pass/Fail", PASS_FAIL, "output_bool = 1"),
+        ("pass-fail", PASS_FAIL, "output_bool = 1"),
+        ("CHOICES", CHOICES, "JSONExtract(output_str_list, 'Array(String)')"),
+        ("choices", CHOICES, "JSONExtract(output_str_list, 'Array(String)')"),
     ],
 )
 @pytest.mark.parametrize(
@@ -89,19 +119,21 @@ def _raw_builder(
     [
         (
             "tracer_eval_logger",
-            "(deleted = 0 OR deleted IS NULL)",
-            "is_deleted = 0",
+            "raw_eval_logger._peerdb_is_deleted = 0 AND "
+            "(raw_eval_logger.deleted = 0 OR raw_eval_logger.deleted IS NULL)",
+            "raw_eval_logger.is_deleted = 0",
         ),
         (
             "tracer_eval_logger_v2",
-            "is_deleted = 0",
-            "deleted = 0 OR deleted IS NULL",
+            "raw_eval_logger.is_deleted = 0",
+            "raw_eval_logger._peerdb_is_deleted",
         ),
     ],
 )
 def test_raw_terminal_graph_uses_configured_logger_without_project_column(
     settings,
     output_type,
+    canonical_type,
     metric_expression,
     logger_table,
     live_predicate,
@@ -114,10 +146,11 @@ def test_raw_terminal_graph_uses_configured_logger_without_project_column(
     query, params = _raw_builder(output_type).build()
     normalized = " ".join(query.split())
 
-    assert f"FROM {logger_table} FINAL" in normalized
+    assert f"FROM {logger_table} AS raw_eval_logger FINAL" in normalized
     assert live_predicate in normalized
     assert foreign_live_column not in normalized
     assert metric_expression in normalized
+    assert normalize_eval_output_type(output_type) == canonical_type
     # Neither physical logger has project_id. The config UUID is the authorized
     # tenant anchor for this unfiltered raw query.
     assert "project_id" not in normalized
@@ -128,6 +161,24 @@ def test_raw_terminal_graph_uses_configured_logger_without_project_column(
     assert params["start_date"] == START
     assert params["end_date"] == END
     assert EVAL_CONFIG_ID not in query
+
+
+@pytest.mark.unit
+def test_v1_legacy_raw_eval_graph_includes_cdc_tombstone_guard(settings):
+    settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
+    builder = EvalMetricsQueryBuilder(
+        custom_eval_config_id=EVAL_CONFIG_ID,
+        project_id=PROJECT_ID,
+        start_date=START,
+        end_date=END,
+        eval_output_type="score",
+        use_preaggregated=False,
+    )
+
+    query, _ = builder.build()
+
+    assert "raw_eval_logger._peerdb_is_deleted = 0" in query
+    assert "raw_eval_logger.is_deleted = 0" not in query
 
 
 @pytest.mark.unit

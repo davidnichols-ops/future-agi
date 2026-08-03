@@ -779,6 +779,15 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             if not self._get_project_in_scope(project_id):
                 return self._gm.bad_request("Project not found.")
 
+            if metric_type == "EVAL" and not CustomEvalConfig.objects.filter(
+                id=metric_id,
+                project_id=project_id,
+                deleted=False,
+            ).exists():
+                return self._gm.bad_request(
+                    "Evaluation config is not available for this project."
+                )
+
             analytics = AnalyticsQueryService()
 
             if metric_type == "SYSTEM_METRIC":

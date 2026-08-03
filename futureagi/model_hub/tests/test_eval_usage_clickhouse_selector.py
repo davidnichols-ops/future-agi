@@ -12,6 +12,7 @@ from clickhouse_driver.errors import NetworkError, ServerException
 
 from model_hub.selectors import eval_usage
 from model_hub.selectors.eval_usage import read_eval_usage
+from tracer.services.clickhouse import trace_project_scope
 from tracer.services.clickhouse.client import ClickHouseClient
 
 
@@ -95,18 +96,33 @@ def test_eval_usage_queries_are_project_scoped_bounded_and_page_only(monkeypatch
     page_query = next(query for query, *_ in fake.calls if "toString(log_id)" in query)
     assert "LIMIT %(limit)s OFFSET %(offset)s" in page_query
     total_query = next(query for query, *_ in fake.calls if "AS total_runs" in query)
-    assert "dictGetOrDefault('trace_dict', 'project_id'" not in total_query
+    assert "trace_dict" not in total_query
+    assert "FROM traces" not in total_query
     assert "IN %(project_ids)s" not in total_query
     assert "created_at >= %(start_date)s" not in total_query
     assert "created_at <= %(end_date)s" not in total_query
     period_queries = [query for query, *_ in fake.calls if "AS total_runs" not in query]
     assert all(
-        "dictGetOrDefault('trace_dict', 'project_id'" in query
-        and "IN %(project_ids)s" in query
+        "trace_dict" not in query
+        and "FROM traces" in query
+        and "INNER JOIN (" in query
+        and "AS bounded_trace_candidates" in query
+        and "PREWHERE trace_project_scan.project_id IN %(project_ids)s" in query
+        and "SELECT DISTINCT toUUIDOrZero(eval_trace_id) AS trace_id" in query
+        and "GROUP BY trace_project_scan.id" in query
+        and "LEFT JOIN (" in query
+        and "allowed_trace_projects.trace_id = toUUIDOrZero(eval_trace_id)" in query
+        and "allowed_trace_projects.project_id IN %(project_ids)s" in query
         and "created_at >= %(start_date)s" in query
         and "created_at <= %(end_date)s" in query
         for query in period_queries
     )
+
+
+@pytest.mark.unit
+def test_latest_trace_project_relation_requires_finite_candidates():
+    with pytest.raises(ValueError, match="bounded trace-ID candidate"):
+        trace_project_scope.latest_live_trace_projects_sql(candidate_trace_ids_sql="")
 
 
 @pytest.mark.unit
@@ -282,7 +298,6 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
     suffix = uuid.uuid4().hex[:10]
     usage_table = f"_test_eval_usage_{suffix}"
     trace_source = f"_test_eval_usage_trace_{suffix}"
-    trace_dictionary = f"_test_eval_usage_dict_{suffix}"
     organization_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     project_id = uuid.uuid4()
@@ -317,29 +332,20 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
         f"""
         CREATE TABLE {trace_source} (
             id UUID,
-            project_id UUID
-        ) ENGINE = MergeTree ORDER BY id
-        """
-    )
-    ch_client.execute(
-        f"""
-        CREATE DICTIONARY {trace_dictionary} (
-            id UUID,
-            project_id UUID
-        )
-        PRIMARY KEY id
-        SOURCE(CLICKHOUSE(
-            HOST '127.0.0.1' PORT 9000 USER 'default'
-            DB 'default' TABLE '{trace_source}'
-        ))
-        LIFETIME(0)
-        LAYOUT(HASHED())
+            project_id UUID,
+            is_deleted UInt8,
+            _version UInt64
+        ) ENGINE = ReplacingMergeTree(_version, is_deleted)
+        ORDER BY (project_id, id)
         """
     )
     try:
         ch_client.execute(
             f"INSERT INTO {trace_source} VALUES",
-            [(trace_id, project_id), (other_trace_id, other_project_id)],
+            [
+                (trace_id, project_id, 0, 1),
+                (other_trace_id, other_project_id, 0, 1),
+            ],
         )
         rows = [
             # Live selected-project trace row.
@@ -419,7 +425,7 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
         ]
         ch_client.execute(f"INSERT INTO {usage_table} VALUES", rows)
         monkeypatch.setattr(eval_usage, "_USAGE_TABLE", usage_table)
-        monkeypatch.setattr(eval_usage, "_TRACE_PROJECT_DICT", trace_dictionary)
+        monkeypatch.setattr(trace_project_scope, "_TRACE_TABLE", trace_source)
         read_client = ClickHouseClient(
             host=os.environ.get("CH25_HOST", "127.0.0.1"),
             port=int(os.environ.get("CH25_NATIVE_PORT", "19000")),
@@ -457,6 +463,5 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
     finally:
         if "read_client" in locals():
             read_client.close()
-        ch_client.execute(f"DROP DICTIONARY IF EXISTS {trace_dictionary}")
         ch_client.execute(f"DROP TABLE IF EXISTS {trace_source}")
         ch_client.execute(f"DROP TABLE IF EXISTS {usage_table}")

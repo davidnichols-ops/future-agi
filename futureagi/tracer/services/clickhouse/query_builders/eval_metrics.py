@@ -30,6 +30,34 @@ PASS_FAIL = "PASS_FAIL"
 CHOICES = "CHOICES"
 
 
+def normalize_eval_output_type(value: Any) -> str:
+    """Map persisted/model aliases to the query builder's canonical values.
+
+    ``EvalTemplate.config["output"]`` stores the model-facing spellings
+    (``score``, ``Pass/Fail``, and ``choices``), while older callers supplied
+    the uppercase query constants.  Normalize once at the builder boundary so
+    every API path selects the correct physical output column.
+    """
+
+    token = str(value or SCORE).strip().upper()
+    token = token.replace("/", "_").replace("-", "_").replace(" ", "_")
+    while "__" in token:
+        token = token.replace("__", "_")
+
+    aliases = {
+        "SCORE": SCORE,
+        "FLOAT": SCORE,
+        "PASS_FAIL": PASS_FAIL,
+        "PASSFAIL": PASS_FAIL,
+        "BOOL": PASS_FAIL,
+        "BOOLEAN": PASS_FAIL,
+        "CHOICE": CHOICES,
+        "CHOICES": CHOICES,
+        "STR_LIST": CHOICES,
+    }
+    return aliases.get(token, SCORE)
+
+
 class EvalMetricsQueryBuilder(BaseQueryBuilder):
     """Build time-series eval metric queries.
 
@@ -86,7 +114,7 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
 
         self.custom_eval_config_id = custom_eval_config_id
         self.interval = interval
-        self.eval_output_type = eval_output_type
+        self.eval_output_type = normalize_eval_output_type(eval_output_type)
         self.eval_name = eval_name or "Unknown"
         self.choices = choices or []
         self.filters = filters or []
@@ -215,12 +243,14 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         # project's matching trace set in ``_filter_fragment``. Keep the raw scan
         # config/time scoped and let the topology resolver select the matching
         # legacy ``deleted`` or direct-write ``is_deleted`` predicate.
-        raw_table, live_predicate = eval_logger_source()
+        raw_table, live_predicate = eval_logger_source(
+            "raw_eval_logger", include_cdc_tombstone_guard=True
+        )
         query = f"""
         SELECT
             {bucket_fn}(created_at) AS time_bucket,
             ifNotFinite(avg(output_float) * 100, NULL) AS value
-        FROM {raw_table} FINAL
+        FROM {raw_table} AS raw_eval_logger FINAL
         WHERE {live_predicate}
           AND custom_eval_config_id = toUUID(%(eval_config_id)s)
           AND created_at >= %(start_date)s
@@ -263,13 +293,15 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         """Pass/Fail query against the configured raw eval-logger table."""
         bucket_fn = self.time_bucket_expr(self.interval)
         filter_frag = self._filter_fragment()
-        raw_table, live_predicate = eval_logger_source()
+        raw_table, live_predicate = eval_logger_source(
+            "raw_eval_logger", include_cdc_tombstone_guard=True
+        )
         query = f"""
         SELECT
             {bucket_fn}(created_at) AS time_bucket,
             ifNotFinite(avg(CASE WHEN output_bool = 1 THEN 100.0 ELSE 0.0 END), NULL)
                 AS value
-        FROM {raw_table} FINAL
+        FROM {raw_table} AS raw_eval_logger FINAL
         WHERE {live_predicate}
           AND custom_eval_config_id = toUUID(%(eval_config_id)s)
           AND created_at >= %(start_date)s
@@ -313,13 +345,15 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         choice_select = ",\n            ".join(choice_cols)
 
         filter_frag = self._filter_fragment()
-        raw_table, live_predicate = eval_logger_source()
+        raw_table, live_predicate = eval_logger_source(
+            "raw_eval_logger", include_cdc_tombstone_guard=True
+        )
         query = f"""
         SELECT
             {bucket_fn}(created_at) AS time_bucket,
             count() AS total_count,
             {choice_select}
-        FROM {raw_table} FINAL
+        FROM {raw_table} AS raw_eval_logger FINAL
         WHERE {live_predicate}
           AND custom_eval_config_id = toUUID(%(eval_config_id)s)
           AND created_at >= %(start_date)s
