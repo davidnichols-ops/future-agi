@@ -67,6 +67,7 @@ import { buildDataInjection } from "src/sections/common/EvalPicker/evalPickerCon
 import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
 import {
+  MAPPING_MODE,
   buildVersionMappingPayload,
   resolveVersionMapping,
   resolveVersionTracingProjectId,
@@ -222,7 +223,20 @@ const EvalDetailPage = () => {
     return () => clearTimeout(timer);
   }, [testError]);
 
+  // Cancellable, so a stale timer can't clear `isTesting` for a later test.
+  const testTimeoutRef = useRef(null);
+  useEffect(
+    () => () => {
+      if (testTimeoutRef.current) clearTimeout(testTimeoutRef.current);
+    },
+    [],
+  );
+
   const handleTestResult = useCallback((success, result) => {
+    if (testTimeoutRef.current) {
+      clearTimeout(testTimeoutRef.current);
+      testTimeoutRef.current = null;
+    }
     setTestPassed(true);
     setTestError(
       success
@@ -309,10 +323,13 @@ const EvalDetailPage = () => {
   // panel: the one being viewed, or the default version when nothing is
   // explicitly selected. Both come from the versions list, which already
   // carries `mapping`/`tracing_project_id` per version.
-  const testMapping = useMemo(
-    () => resolveVersionMapping(viewingVersion || defaultVersion),
-    [viewingVersion, defaultVersion],
-  );
+  const testMapping = useMemo(() => {
+    const version = viewingVersion || defaultVersion;
+    return {
+      tracing: resolveVersionMapping(version, MAPPING_MODE.TRACING),
+      dataset: resolveVersionMapping(version, MAPPING_MODE.DATASET),
+    };
+  }, [viewingVersion, defaultVersion]);
   const testTracingProjectId = useMemo(
     () => resolveVersionTracingProjectId(viewingVersion || defaultVersion),
     [viewingVersion, defaultVersion],
@@ -879,14 +896,15 @@ const EvalDetailPage = () => {
         few_shot_examples: evalType === "llm" ? fewShotExamples : undefined,
       };
       const mappingState = testPlaygroundRef.current?.getMappingState?.();
+      const mappingPayload = buildVersionMappingPayload(
+        mappingState?.mapping,
+        mappingState?.tracingProjectId,
+      );
       const newVersion = await createVersion.mutateAsync({
         config_snapshot: configSnapshot,
         criteria: evalType === "code" ? code : instructions,
         model,
-        ...buildVersionMappingPayload(
-          mappingState?.mapping,
-          mappingState?.tracingProjectId,
-        ),
+        ...mappingPayload,
       });
       enqueueSnackbar(`Version V${newVersion?.version_number ?? ""} saved`, {
         variant: "success",
@@ -894,7 +912,18 @@ const EvalDetailPage = () => {
       setIsDirty(false);
       // Switch to viewing the newly created version
       if (newVersion?.version_number) {
-        setViewingVersion({ ...newVersion, config_snapshot: configSnapshot });
+        // The create response carries neither config_snapshot nor mapping, so
+        // both are patched on; without them the panel re-seeds from nothing and
+        // renders a mapping that saved correctly as cleared.
+        setViewingVersion({
+          ...newVersion,
+          config_snapshot: configSnapshot,
+          mapping: mappingPayload.mapping ?? newVersion.mapping ?? null,
+          tracing_project_id:
+            mappingPayload.tracing_project_id ??
+            newVersion.tracing_project_id ??
+            null,
+        });
         setSearchParams(
           (prev) => {
             const next = new URLSearchParams(prev);
@@ -1064,7 +1093,11 @@ const EvalDetailPage = () => {
       // mid-flight and would otherwise leave isTesting stuck true forever.
       // Same fallback EvalCreatePage.jsx already uses for the same class of
       // stuck-test state.
-      setTimeout(() => setIsTesting((v) => (v ? false : v)), 60000);
+      if (testTimeoutRef.current) clearTimeout(testTimeoutRef.current);
+      testTimeoutRef.current = setTimeout(() => {
+        testTimeoutRef.current = null;
+        setIsTesting((v) => (v ? false : v));
+      }, 60000);
     } catch (error) {
       const message =
         error?.response?.data?.result || error?.message || "Failed to run test";
@@ -1931,11 +1964,9 @@ const EvalDetailPage = () => {
               >
                 <Box sx={{ flex: 1, overflow: "auto", minHeight: 0 }}>
                   <TestPlayground
-                    // Remount on version switch so Tracing/Dataset re-seed
-                    // their mapping + project state from the version now
-                    // being viewed — both tabs only apply initialMapping /
-                    // initialTracingProjectId once per mount.
-                    key={viewingVersion?.id ?? "live"}
+                    // Re-seeds both tabs in place; remounting for this also
+                    // discarded the active tab and any test in flight.
+                    seedKey={viewingVersion?.id ?? "live"}
                     ref={testPlaygroundRef}
                     templateId={evalId}
                     model={model}
