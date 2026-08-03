@@ -233,6 +233,8 @@ const GraphSection = ({
       apiGraphReadState === "sampled"
         ? `Sampled ${baseLineSeriesName}`
         : baseLineSeriesName;
+    const trafficSeriesName =
+      apiGraphReadState === "sampled" ? "Sampled traffic" : "Traffic";
     const isEval = selectedGraphConfig?.type === "EVAL";
 
     const series = [
@@ -269,14 +271,14 @@ const GraphSection = ({
 
     if (!isEval) {
       series.push({
-        name: apiGraphReadState === "sampled" ? "Sampled traffic" : "Traffic",
+        name: trafficSeriesName,
         type: "column",
         data: trafficData,
         color: trafficColor,
         group: "apexcharts-axis-1",
       });
       yAxis.push({
-        seriesName: "Traffic",
+        seriesName: trafficSeriesName,
         title: {
           text: "Traffic",
           style: isCollapsed

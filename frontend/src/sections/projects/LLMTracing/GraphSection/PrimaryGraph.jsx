@@ -396,18 +396,20 @@ const PrimaryGraph = ({
     graphReadState === "sampled"
       ? `Sampled ${metricSeriesName}`
       : metricSeriesName;
+  const trafficSeriesName =
+    graphReadState === "sampled" ? "Sampled traffic" : "Traffic";
 
   // Series: metric line FIRST (left axis), traffic bars SECOND (right axis)
   const series = useMemo(
     () => [
       { name: lineSeriesName, type: "line", data: metricData },
       {
-        name: graphReadState === "sampled" ? "Sampled traffic" : "Traffic",
+        name: trafficSeriesName,
         type: "column",
         data: trafficData,
       },
     ],
-    [graphReadState, lineSeriesName, metricData, trafficData],
+    [lineSeriesName, metricData, trafficData, trafficSeriesName],
   );
 
   // Drag-to-zoom → apply as date filter
@@ -505,7 +507,7 @@ const PrimaryGraph = ({
           tickAmount: 4,
         },
         {
-          seriesName: "Traffic",
+          seriesName: trafficSeriesName,
           opposite: true,
           title: { text: undefined },
           labels: {
@@ -553,6 +555,7 @@ const PrimaryGraph = ({
       theme,
       handleZoomed,
       trafficLabel,
+      trafficSeriesName,
     ],
   );
 

@@ -238,6 +238,57 @@ class _LatestRareCandidateAnalytics(_CandidateAnalytics):
         )
 
 
+class _CrossStratumTraceAnalytics:
+    """Model one trace whose root and matching children occupy other strata."""
+
+    def __init__(self, *, root_time: datetime, child_times: tuple[datetime, ...]):
+        self.root_time = root_time
+        self.child_times = child_times
+        self.calls = []
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.calls.append((query, params, timeout_ms, settings))
+        if "filter_seed_limit" in params:
+            if (
+                params["filter_slice_start"]
+                <= self.root_time
+                < params["filter_slice_end"]
+            ):
+                return _Result(
+                    [
+                        {
+                            "trace_id": "cross-stratum-trace",
+                            "root_span_id": "root-span",
+                            "start_time": self.root_time,
+                        }
+                    ]
+                )
+            return _Result([])
+        if "candidate_trace_ids" in params:
+            request_start = params["candidate_start_date"]
+            request_end = params["candidate_end_date"]
+            children_match = all(
+                request_start <= child_time < request_end
+                for child_time in self.child_times
+            )
+            if (
+                "cross-stratum-trace" in params["candidate_trace_ids"]
+                and request_start <= self.root_time < request_end
+                and children_match
+            ):
+                return _Result(
+                    [
+                        {
+                            "trace_id": "cross-stratum-trace",
+                            "root_span_id": "root-span",
+                            "start_time": self.root_time,
+                        }
+                    ]
+                )
+            return _Result([])
+        raise AssertionError("unexpected graph query")
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("observe_type", "key", "value"),
@@ -382,6 +433,183 @@ def test_long_graph_map_filter_uses_bounded_strata_and_candidate_classifiers() -
     ]
     assert classifiers
     assert all("JSONExtractRaw(attributes_extra" in query for query, _ in classifiers)
+
+
+@pytest.mark.unit
+def test_trace_root_before_child_after_stratum_boundary_uses_full_membership_window():
+    window_start = datetime(2026, 1, 1)
+    window_end = window_start + timedelta(days=8)
+    boundary = window_start + timedelta(days=1)
+    root_time = boundary - timedelta(microseconds=1)
+    child_time = boundary + timedelta(microseconds=1)
+    analytics = _CrossStratumTraceAnalytics(
+        root_time=root_time,
+        child_times=(child_time,),
+    )
+
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _system_text_filter("call_type", "LLM"),
+        ],
+        observe_type="trace",
+    )
+
+    assert tuple(row["trace_id"] for row in sample.rows) == ("cross-stratum-trace",)
+    assert sample.query_complete is True
+    assert sample.query_status == "complete"
+    seed_calls = [call for call in analytics.calls if "filter_seed_limit" in call[1]]
+    assert all("parent_span_id IS NULL" in query for query, *_ in seed_calls)
+    assert any(
+        params["filter_slice_start"] <= root_time < params["filter_slice_end"]
+        for _, params, *_ in seed_calls
+    )
+    classifier_params = next(
+        params for _, params, *_ in analytics.calls if "candidate_trace_ids" in params
+    )
+    assert classifier_params["candidate_start_date"] == window_start
+    assert classifier_params["candidate_end_date"] == window_end
+
+
+@pytest.mark.unit
+def test_trace_multi_child_filters_match_across_separate_temporal_strata():
+    window_start = datetime(2026, 1, 1)
+    window_end = window_start + timedelta(days=8)
+    root_time = window_start + timedelta(hours=6)
+    child_times = (
+        window_start + timedelta(days=2, hours=6),
+        window_start + timedelta(days=6, hours=6),
+    )
+    analytics = _CrossStratumTraceAnalytics(
+        root_time=root_time,
+        child_times=child_times,
+    )
+
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter(
+                "customer.context",
+                {"tier": "vip"},
+                filter_type="json",
+                filter_op="contains",
+            ),
+        ],
+        observe_type="trace",
+    )
+
+    assert tuple(row["trace_id"] for row in sample.rows) == ("cross-stratum-trace",)
+    assert sample.query_complete is True
+    assert sample.query_status == "complete"
+    classifier_query, classifier_params, *_ = next(
+        call for call in analytics.calls if "candidate_trace_ids" in call[1]
+    )
+    assert classifier_params["candidate_start_date"] == window_start
+    assert classifier_params["candidate_end_date"] == window_end
+    assert classifier_query.count("countIf(") >= 3
+    assert "filter_witness_0" in classifier_query
+    assert "filter_witness_1" in classifier_query
+
+
+@pytest.mark.unit
+def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
+    window_start = datetime(2026, 1, 1)
+    window_end = window_start + timedelta(days=8)
+    stratum_width = (window_end - window_start) / 8
+    root_times: dict[str, datetime] = {}
+    child_times: dict[str, datetime] = {}
+    for stratum in range(8):
+        for index in range(60):
+            trace_id = f"trace-{stratum}-{index:02d}"
+            root_times[trace_id] = (
+                window_start
+                + (stratum_width * stratum)
+                + timedelta(hours=6, microseconds=index)
+            )
+            child_stratum = stratum + 1 if stratum < 7 else stratum - 1
+            child_times[trace_id] = (
+                window_start
+                + (stratum_width * child_stratum)
+                + timedelta(hours=12, microseconds=index)
+            )
+
+    class _SampleAnalytics:
+        def __init__(self):
+            self.calls = []
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.calls.append((query, params, timeout_ms, settings))
+            if "filter_seed_limit" in params:
+                rows = [
+                    {
+                        "trace_id": trace_id,
+                        "root_span_id": f"root-{trace_id}",
+                        "start_time": root_time,
+                    }
+                    for trace_id, root_time in root_times.items()
+                    if params["filter_slice_start"]
+                    <= root_time
+                    < params["filter_slice_end"]
+                ]
+                rows.sort(
+                    key=lambda row: (row["start_time"], row["trace_id"]),
+                    reverse=True,
+                )
+                return _Result(rows[: params["filter_seed_limit"]])
+            if "candidate_trace_ids" in params:
+                request_start = params["candidate_start_date"]
+                request_end = params["candidate_end_date"]
+                return _Result(
+                    [
+                        {
+                            "trace_id": trace_id,
+                            "root_span_id": f"root-{trace_id}",
+                            "start_time": root_times[trace_id],
+                        }
+                        for trace_id in params["candidate_trace_ids"]
+                        if request_start <= root_times[trace_id] < request_end
+                        and request_start <= child_times[trace_id] < request_end
+                    ]
+                )
+            raise AssertionError("unexpected graph query")
+
+    analytics = _SampleAnalytics()
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter(
+                "customer.context",
+                {"tier": "vip"},
+                filter_type="json",
+                filter_op="contains",
+            ),
+        ],
+        observe_type="trace",
+    )
+
+    assert len(sample.rows) == 8 * bounded_graph_reads.GRAPH_ANY_SPAN_ROWS_PER_STRATUM
+    assert sample.query_complete is False
+    assert sample.query_status == "sampled"
+    assert sample.query_error_code == "sample_limit"
+    assert sample.sampling_strata == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert sample.sampling_strata_completed == sample.sampling_strata
+    classifier_calls = [
+        call for call in analytics.calls if "candidate_trace_ids" in call[1]
+    ]
+    assert classifier_calls
+    assert all(
+        params["candidate_start_date"] == window_start
+        and params["candidate_end_date"] == window_end
+        for _, params, *_ in classifier_calls
+    )
 
 
 @pytest.mark.unit

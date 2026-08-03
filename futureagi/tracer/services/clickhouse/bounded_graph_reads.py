@@ -274,6 +274,10 @@ def _read_time_distributed_candidates(
         }
         if mode == "trace":
             stratum_builder_kwargs["bounded_identity_only"] = True
+            # The stratum constrains root seed/order only. Classification must
+            # replay each finite trace across the original request window so a
+            # root in one stratum can match children in another.
+            stratum_builder_kwargs["bounded_membership_filters"] = filters
         stratum_builder = builder_class(**stratum_builder_kwargs)
         # One extra identity is the finite has-more sentinel. Keeping the whole
         # stratum working set at 50 avoids the 512-row classifier that exceeded

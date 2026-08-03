@@ -118,6 +118,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         annotation_label_ids: list[str] | None = None,
         bounded_internal_scan: bool = False,
         bounded_identity_only: bool = False,
+        bounded_membership_filters: list[dict] | None = None,
         bounded_bulk_scan: bool = False,
         bounded_sampling_salt: str | None = None,
         bounded_sampling_rate: float | None = None,
@@ -135,6 +136,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self.annotation_label_ids = annotation_label_ids or []
         self._bounded_internal_scan = bool(bounded_internal_scan)
         self._bounded_identity_only = bool(bounded_identity_only)
+        # Graph sampling may narrow root seeding/order to one temporal
+        # stratum. Trace membership must still inspect latest state across the
+        # caller's complete request window: a root and its matching children
+        # can legitimately fall on opposite sides of a stratum boundary.
+        self._bounded_membership_filters = (
+            list(bounded_membership_filters)
+            if bounded_membership_filters is not None
+            else None
+        )
         self._bounded_bulk_scan = bool(bounded_bulk_scan)
         if self._bounded_bulk_scan and not self._bounded_identity_only:
             raise ValueError("bounded_bulk_scan requires bounded_identity_only")
@@ -156,6 +166,23 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self._bounded_request_window = BaseQueryBuilder.parse_time_range(
             self.filters, strict=True
         )
+        if self._bounded_membership_filters is not None:
+            membership_window = BaseQueryBuilder.parse_time_range(
+                self._bounded_membership_filters,
+                strict=True,
+            )
+            seed_start, seed_end = self._bounded_request_window
+            membership_start, membership_end = membership_window
+            if not (membership_start <= seed_start < seed_end <= membership_end):
+                raise ValueError(
+                    "bounded membership window must contain the seed window"
+                )
+            if self._bounded_membership_shape(
+                self.filters
+            ) != self._bounded_membership_shape(self._bounded_membership_filters):
+                raise ValueError(
+                    "bounded membership filters may differ only by positive time bounds"
+                )
 
     def parse_time_range(
         self, filters: list[dict]
@@ -202,6 +229,40 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 }
             )
         return filters
+
+    def _bounded_match_filters(self) -> list[dict[str, Any]]:
+        """Return the full-window predicates used for latest-state membership."""
+
+        filters = (
+            list(self._bounded_membership_filters)
+            if self._bounded_membership_filters is not None
+            else list(self.filters)
+        )
+        if self.search:
+            filters.append(
+                {
+                    "column_id": "trace_name",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "contains",
+                        "filter_value": self.search,
+                    },
+                }
+            )
+        return filters
+
+    @staticmethod
+    def _bounded_membership_shape(filters: list[dict]) -> list[dict]:
+        """Remove positive time bounds while retaining every membership leaf."""
+
+        return [
+            item
+            for item in filters
+            if (item.get("column_id") or item.get("columnId"))
+            not in {"created_at", "start_time"}
+            or BaseQueryBuilder.is_datetime_complement_filter(item)
+        ]
 
     def _active_non_time_filters(self) -> list[dict[str, Any]]:
         return [
@@ -667,13 +728,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if not self.supports_bounded_filter_scan():
             raise ValueError("unsupported bounded trace filter scan")
 
-        request_start, request_end = self.parse_time_range(self.filters)
+        match_filters = self._bounded_match_filters()
+        request_start, request_end = BaseQueryBuilder.parse_time_range(
+            match_filters, strict=True
+        )
         self.start_date, self.end_date = request_start, request_end
         self.params.update({"start_date": request_start, "end_date": request_end})
         has_explicit_time_filter = any(
             (item.get("column_id") or item.get("columnId"))
             in {"created_at", "start_time"}
-            for item in self.filters
+            for item in match_filters
         )
         # A continuous-task classifier receives identities from a separate
         # arrival/change seed.  Its default 30-day UI window is not membership:
@@ -681,7 +745,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # Preserve an explicit user time filter, however, because that *is*
         # part of the task's selection contract.
         scope_to_request_window = not candidate_full_state or has_explicit_time_filter
-        plans, residual_filters = partition_trace_filter_plans(self._bounded_filters())
+        plans, residual_filters = partition_trace_filter_plans(match_filters)
         root_plans = [plan for plan in plans if plan.scope == "root"]
         any_span_plans = [plan for plan in plans if plan.scope == "any"]
         params: dict[str, Any] = {
@@ -716,7 +780,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
-                self.filters,
+                match_filters,
                 column="latest_start_time",
                 param_prefix="trace_match_time_exclusion",
             )

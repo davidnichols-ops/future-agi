@@ -6,7 +6,13 @@ import axios from "src/utils/axios";
 import PrimaryGraph from "../PrimaryGraph";
 
 vi.mock("react-apexcharts", () => ({
-  default: () => <div data-testid="apex-chart" />,
+  default: ({ series, options }) => (
+    <div
+      data-testid="apex-chart"
+      data-traffic-series-name={series?.[1]?.name}
+      data-traffic-axis-series-name={options?.yaxis?.[1]?.seriesName}
+    />
+  ),
 }));
 
 vi.mock("src/components/custom-datepicker/DatePicker", () => ({
@@ -230,11 +236,18 @@ describe("PrimaryGraph", () => {
     );
 
     expect(
-      await screen.findByText(
-        "Showing sampled values, not full totals.",
-      ),
+      await screen.findByText("Showing sampled values, not full totals."),
     ).toBeInTheDocument();
-    expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
+    const chart = screen.getByTestId("apex-chart");
+    expect(chart).toBeInTheDocument();
+    expect(chart).toHaveAttribute(
+      "data-traffic-series-name",
+      "Sampled traffic",
+    );
+    expect(chart).toHaveAttribute(
+      "data-traffic-axis-series-name",
+      "Sampled traffic",
+    );
     expect(
       screen.queryByText("No data available for this time range"),
     ).not.toBeInTheDocument();

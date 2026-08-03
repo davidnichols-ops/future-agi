@@ -6,7 +6,13 @@ import axios from "src/utils/axios";
 import GraphSection from "../GraphSection";
 
 vi.mock("react-apexcharts", () => ({
-  default: () => <div data-testid="apex-chart" />,
+  default: ({ series, options }) => (
+    <div
+      data-testid="apex-chart"
+      data-traffic-series-name={series?.[1]?.name}
+      data-traffic-axis-series-name={options?.yaxis?.[1]?.seriesName}
+    />
+  ),
 }));
 
 vi.mock("../LeftControl", () => ({
@@ -150,11 +156,18 @@ describe("GraphSection exact graph boundary", () => {
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
     expect(
-      await screen.findByText(
-        "Showing sampled values, not full totals.",
-      ),
+      await screen.findByText("Showing sampled values, not full totals."),
     ).toBeInTheDocument();
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
-    expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
+    const chart = screen.getByTestId("apex-chart");
+    expect(chart).toBeInTheDocument();
+    expect(chart).toHaveAttribute(
+      "data-traffic-series-name",
+      "Sampled traffic",
+    );
+    expect(chart).toHaveAttribute(
+      "data-traffic-axis-series-name",
+      "Sampled traffic",
+    );
   });
 });
