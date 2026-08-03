@@ -24,6 +24,7 @@ from tracer.services.clickhouse.query_builders.expressions import (
 from tracer.services.clickhouse.v2.id_remap_sql import (
     remap_left_join,
     resolved_id_expr,
+    survivor_map_subquery,
 )
 
 logger = logging.getLogger(__name__)
@@ -322,27 +323,36 @@ GRANULARITY_TO_CH: dict[str, str] = {
 
 def _prefix_spans_columns(clause: str) -> str:
     """Add 's.' prefix to spans table columns in a WHERE clause for JOINed queries.
-    Only prefixes known column names, avoids touching parameter references like %(project_ids)s.
+    Only prefixes known column names outside SQL string literals, and avoids
+    parameter references like ``%(project_ids)s``. Customer attribute keys
+    and filter values are data: a key named ``start_time`` must never become
+    ``s.start_time`` inside quotes.
     """
-    import re
 
-    # Prefix bare column names (not already prefixed and not inside %(...))
-    for col in (
-        "project_id",
-        "_peerdb_is_deleted",
-        "start_time",
-        "parent_span_id",
-        "span_attr_str",
-        "span_attr_num",
-        "span_attr_bool",
-    ):
-        # Match bare column name not preceded by . or inside %(...)
-        clause = re.sub(
-            rf"(?<!\.)(?<!%\()(?<!\w){col}(?!\w)(?!s\))",
-            f"s.{col}",
-            clause,
-        )
-    return clause
+    # Odd pieces are complete SQL single-quoted literals (including doubled
+    # quote escapes); rewrite only the even, executable SQL pieces.
+    pieces = re.split(r"('(?:''|[^'])*')", clause)
+    for piece_index in range(0, len(pieces), 2):
+        sql = pieces[piece_index]
+        for col in (
+            "project_id",
+            "_peerdb_is_deleted",
+            "start_time",
+            "parent_span_id",
+            "end_user_id",
+            "trace_session_id",
+            "user_id",
+            "user_id_type",
+        ):
+            # Match bare column names not already qualified or inside a
+            # ``%(...)s`` parameter placeholder.
+            sql = re.sub(
+                rf"(?<!\.)(?<!%\()(?<!\w){col}(?!\w)(?!s\))",
+                f"s.{col}",
+                sql,
+            )
+        pieces[piece_index] = sql
+    return "".join(pieces)
 
 
 _ID_RESOLVED_NAMES = frozenset(
@@ -355,14 +365,25 @@ _ID_RESOLVED_NAMES = frozenset(
     }
 )
 
+_USER_DIMENSION_NAMES = frozenset({"user_count", "user", "user_id_type"})
+
 
 # ClickHouse omits materialized columns from sp.*. The current dashboard
 # dimensions only use stored columns, so no re-projection is needed.
 _MATERIALIZED_DASHBOARD_COLS: tuple[str, ...] = ()
 
 
-def _resolved_spans_source(alias: str | None = None) -> str:
-    """Return a spans source with user/session ids resolved through id_remap."""
+def _resolved_spans_source(
+    alias: str | None = None, *, include_end_user_dimension: bool = False
+) -> str:
+    """Return a spans source with user/session ids resolved through id-remap.
+
+    The v2 dashboard may additionally request the curated end-user label/type.
+    Resolve those from the project-scoped ``end_users`` table rather than the
+    optional ``end_users_dict``: ``FINAL`` selects the newest entity version,
+    the tombstone predicate keeps only live rows, and the same survivor map used
+    for spans collapses pre/post-cutover ids without fan-out.
+    """
     out_alias = alias or "spans"
     eu_join = remap_left_join("sp.end_user_id", "end_user_id_remap", "eu_remap")
     ts_join = remap_left_join(
@@ -371,12 +392,40 @@ def _resolved_spans_source(alias: str | None = None) -> str:
     resolved_eu = resolved_id_expr("sp.end_user_id", "eu_remap")
     resolved_ts = resolved_id_expr("sp.trace_session_id", "ts_remap")
     materialized = "".join(f"sp.{c} AS {c}, " for c in _MATERIALIZED_DASHBOARD_COLS)
+
+    dimension_projection = ""
+    dimension_join = ""
+    if include_end_user_dimension:
+        curated_map = survivor_map_subquery("end_user_id_remap")
+        resolved_curated_eu = resolved_id_expr("eu.end_user_id", "eu_dimension_remap")
+        exact_or_latest = f"tuple(eu.end_user_id = {resolved_curated_eu}, eu.version)"
+        dimension_join = (
+            "LEFT JOIN ("
+            "SELECT "
+            f"{resolved_curated_eu} AS resolved_end_user_id, "
+            f"argMax(eu.user_id, {exact_or_latest}) AS user_id, "
+            f"argMax(tuple(eu.user_id_type), {exact_or_latest}).1 AS user_id_type "
+            "FROM end_users AS eu FINAL "
+            f"LEFT JOIN ({curated_map}) AS eu_dimension_remap "
+            "ON eu.end_user_id = eu_dimension_remap.any_id "
+            "WHERE eu.project_id IN %(project_ids)s "
+            "AND eu.is_deleted = 0 "
+            "GROUP BY resolved_end_user_id"
+            ") AS eu_dimension "
+            f"ON {resolved_eu} = eu_dimension.resolved_end_user_id"
+        )
+        dimension_projection = (
+            ", ifNull(eu_dimension.user_id, '') AS user_id, "
+            "ifNull(eu_dimension.user_id_type, '') AS user_id_type"
+        )
+
     return (
         "(SELECT sp.* EXCEPT (end_user_id, trace_session_id), "
         f"{materialized}"
         f"{resolved_eu} AS end_user_id, "
-        f"{resolved_ts} AS trace_session_id "
-        f"FROM spans AS sp {eu_join} {ts_join}) AS {out_alias}"
+        f"{resolved_ts} AS trace_session_id"
+        f"{dimension_projection} "
+        f"FROM spans AS sp {eu_join} {ts_join} {dimension_join}) AS {out_alias}"
     )
 
 
@@ -390,6 +439,28 @@ class DashboardQueryBuilder:
     # dashboard_attr_rollup lives only in the v2 schema; the v2 subclass flips
     # this True. Base/v1 never routes to the rollup (fail-closed: missing table).
     _attr_rollup_available: bool = False
+
+    # The legacy dashboard can still run against the CDC schema, where curated
+    # user labels are dictionary-backed. The v2 subclass flips this on because
+    # the direct-write ``end_users`` table is authoritative there.
+    _direct_end_users_available: bool = False
+
+    _DIRECT_USER_METRIC_EXPRESSIONS = {
+        # Preserve the dictionary path's missing-label fallback: a live span
+        # with an unresolved curated row still counts by its stable user UUID.
+        "user_count": (
+            "if(end_user_id IS NULL "
+            "OR end_user_id = toUUID('00000000-0000-0000-0000-000000000000'), "
+            "NULL, if(user_id = '', toString(assumeNotNull(end_user_id)), user_id))"
+        ),
+        "user": "if(user_id = '', toString(end_user_id), user_id)",
+        "user_id_type": "user_id_type",
+    }
+
+    _DIRECT_USER_BREAKDOWN_EXPRESSIONS = {
+        "user": "if(user_id = '', toString(end_user_id), user_id)",
+        "user_id_type": "user_id_type",
+    }
 
     def __init__(self, query_config: dict) -> None:
         self.config = query_config
@@ -505,6 +576,35 @@ class DashboardQueryBuilder:
                 return True
         return False
 
+    def _query_references_user_dimension(
+        self, metric_name: str | None, per_metric_filters: list[dict]
+    ) -> bool:
+        """Whether this query needs a curated user label/type, not only its id."""
+
+        def is_user_dimension(*names: str | None) -> bool:
+            return any(
+                (name or "").lower() in _USER_DIMENSION_NAMES
+                for name in names
+                if name is not None
+            )
+
+        if is_user_dimension(metric_name):
+            return True
+        for breakdown in self.breakdowns:
+            if breakdown.get("type", "system_metric") != "system_metric":
+                continue
+            if is_user_dimension(breakdown.get("name"), breakdown.get("id")):
+                return True
+        for item in self.global_filters + (per_metric_filters or []):
+            filter_type = item.get("metric_type") or item.get("type", "")
+            if filter_type and filter_type != "system_metric":
+                continue
+            if is_user_dimension(
+                item.get("metric_name"), item.get("name"), item.get("id")
+            ):
+                return True
+        return False
+
     def _spans_source(
         self, metric_name: str | None, per_metric_filters: list[dict], alias: str
     ) -> str:
@@ -516,8 +616,87 @@ class DashboardQueryBuilder:
         table is aliased back to ``spans``) or ``"s"`` for the JOINed shapes.
         """
         if self._query_references_id(metric_name, per_metric_filters):
-            return _resolved_spans_source(None if alias == "spans" else alias)
+            return _resolved_spans_source(
+                None if alias == "spans" else alias,
+                include_end_user_dimension=(
+                    self._direct_end_users_available
+                    and self._query_references_user_dimension(
+                        metric_name, per_metric_filters
+                    )
+                ),
+            )
         return "spans" if alias == "spans" else f"spans AS {alias}"
+
+    @staticmethod
+    def _qualify_span_expression(expression: str, alias: str) -> str:
+        """Qualify known spans columns without touching SQL string literals."""
+
+        columns = (
+            "trace_session_id",
+            "prompt_version_id",
+            "completion_tokens",
+            "prompt_label_id",
+            "observation_type",
+            "parent_span_id",
+            "end_user_id",
+            "user_id_type",
+            "prompt_tokens",
+            "service_name",
+            "span_attr_num",
+            "total_tokens",
+            "project_id",
+            "latency_ms",
+            "start_time",
+            "trace_id",
+            "user_id",
+            "provider",
+            "status",
+            "model",
+            "cost",
+            "tags",
+            "id",
+        )
+        pieces = re.split(r"('(?:''|[^'])*')", expression)
+        for piece_index in range(0, len(pieces), 2):
+            sql = pieces[piece_index]
+            for column in columns:
+                sql = re.sub(
+                    rf"(?<!\.)(?<!\w){column}(?!\w)",
+                    f"{alias}.{column}",
+                    sql,
+                )
+            pieces[piece_index] = sql
+        return "".join(pieces)
+
+    def _system_metric_expression(
+        self, metric_name: str, alias: str | None = None
+    ) -> str:
+        if (
+            self._direct_end_users_available
+            and metric_name in self._DIRECT_USER_METRIC_EXPRESSIONS
+        ):
+            expression = self._DIRECT_USER_METRIC_EXPRESSIONS[metric_name]
+        else:
+            expression = SYSTEM_METRICS[metric_name][1]
+        if alias:
+            return self._qualify_span_expression(expression, alias)
+        return expression
+
+    def _breakdown_column_expression(self, breakdown_name: str) -> str | None:
+        if (
+            self._direct_end_users_available
+            and breakdown_name in self._DIRECT_USER_BREAKDOWN_EXPRESSIONS
+        ):
+            return self._DIRECT_USER_BREAKDOWN_EXPRESSIONS[breakdown_name]
+        return self._BREAKDOWN_COL_MAP.get(breakdown_name)
+
+    def _string_filter_column_expression(self, filter_name: str) -> str | None:
+        if (
+            self._direct_end_users_available
+            and filter_name in self._DIRECT_USER_BREAKDOWN_EXPRESSIONS
+        ):
+            return self._DIRECT_USER_BREAKDOWN_EXPRESSIONS[filter_name]
+        return self._STRING_FILTER_COL.get(filter_name)
 
     # ------------------------------------------------------------------
     # System metric
@@ -617,7 +796,7 @@ class DashboardQueryBuilder:
                 per_metric_filters,
                 params,
             )
-        _, col_expr = SYSTEM_METRICS[metric_name]
+        col_expr = self._system_metric_expression(metric_name)
         # Identifier metrics should count unique identities, not raw span rows.
         if metric_name in _COUNT_DISTINCT_METRICS and aggregation != "count_distinct":
             aggregation = "count_distinct"
@@ -679,9 +858,7 @@ class DashboardQueryBuilder:
                 bd_select = f"concat({parts}) AS breakdown_value"
 
             if has_annotation_bd:
-                agg_with_alias = (
-                    agg_expr.replace("(", "(s.") if "(" in agg_expr else agg_expr
-                )
+                agg_with_alias = self._qualify_span_expression(agg_expr, "s")
                 where_str = " AND ".join(_prefix_spans_columns(c) for c in all_where)
                 join_str = "\n".join(join_clauses)
                 query = (
@@ -894,8 +1071,8 @@ class DashboardQueryBuilder:
                 )
             elif bd_name in SYSTEM_METRICS:
                 need_spans_join = True
-                _, span_col = SYSTEM_METRICS[bd_name]
-                bd_expr = f"if(s.trace_id = '', '(not set)', toString(s.{span_col}))"
+                span_expr = self._system_metric_expression(bd_name, alias="s")
+                bd_expr = f"if(s.trace_id = '', '(not set)', toString({span_expr}))"
 
             elif bd_name in (
                 "model",
@@ -999,8 +1176,8 @@ class DashboardQueryBuilder:
             if f_type == "system_metric" and f_name.lower() in SYSTEM_METRICS:
                 # Trace dimension filter → JOIN spans
                 need_spans_join = True
-                _, span_col = SYSTEM_METRICS[f_name.lower()]
-                where_parts.append(f"s.{span_col} {op_symbol} %({val_key})s")
+                span_expr = self._system_metric_expression(f_name.lower(), alias="s")
+                where_parts.append(f"{span_expr} {op_symbol} %({val_key})s")
                 params[val_key] = _coerce_filter_value(val, op)
 
             elif f_type == "eval_metric":
@@ -1223,10 +1400,12 @@ class DashboardQueryBuilder:
     ) -> tuple[str, dict]:
         attr_key = _sanitize_attr_key(metric.get("attribute_key", ""))
         attr_type = metric.get("attribute_type", "number")
+        attr_key_param = "custom_metric_attr_key"
+        params[attr_key_param] = attr_key
 
         if attr_type == "number":
             attr_map = "span_attr_num"
-            col_expr = f"{attr_map}['{attr_key}']"
+            col_expr = f"{attr_map}[%({attr_key_param})s]"
         else:
             if aggregation in _NUMERIC_ONLY_AGGREGATIONS:
                 raise InvalidMetricCombinationError(
@@ -1235,7 +1414,7 @@ class DashboardQueryBuilder:
                     f"numeric attribute."
                 )
             attr_map = "span_attr_str"
-            col_expr = f"{attr_map}['{attr_key}']"
+            col_expr = f"{attr_map}[%({attr_key_param})s]"
 
         agg_expr = AGGREGATIONS.get(aggregation, "avg({col})").format(col=col_expr)
 
@@ -1243,7 +1422,15 @@ class DashboardQueryBuilder:
         group_parts = ["time_bucket"]
         order_parts = ["time_bucket"]
 
-        breakdown_expr = self._breakdown_select()
+        breakdown_infos = self._resolve_all_breakdowns(params)
+        breakdown_expr = None
+        if breakdown_infos:
+            first_breakdown = breakdown_infos[0]
+            breakdown_expr = (
+                "__ANNOTATION_BREAKDOWN__"
+                if first_breakdown["type"] == "annotation"
+                else first_breakdown["expr"]
+            )
         if breakdown_expr:
             select_parts.append(f"{breakdown_expr} AS breakdown_value")
             group_parts.append("breakdown_value")
@@ -1258,7 +1445,12 @@ class DashboardQueryBuilder:
         # default empty string/zero from entering count/avg results, this lets
         # ClickHouse use the deployed typed-Map key bloom index instead of
         # deserializing the value Map for every span in the window.
-        where_clauses.append(f"mapContains({attr_map}, '{attr_key}')")
+        where_clauses.append(f"mapContains({attr_map}, %({attr_key_param})s)")
+        where_clauses.extend(
+            breakdown["presence_predicate"]
+            for breakdown in breakdown_infos
+            if breakdown.get("presence_predicate")
+        )
 
         subquery_clauses = self._build_subquery_filters(
             self.global_filters + per_metric_filters, params, "ca_"
@@ -1451,6 +1643,22 @@ class DashboardQueryBuilder:
         "tag": "arrayJoin(JSONExtract(tags, 'Array(String)'))",
     }
 
+    _STRING_FILTER_COL = {
+        "project": "toString(project_id)",
+        "status": "status",
+        "model": "model",
+        "service_name": "service_name",
+        "span_kind": "observation_type",
+        "provider": "provider",
+        "session": "toString(trace_session_id)",
+        "user": "dictGetOrDefault('end_users_dict', 'user_id', end_user_id, toString(end_user_id))",
+        "user_id_type": "dictGetOrDefault('end_users_dict', 'user_id_type', end_user_id, '')",
+        "prompt_name": "dictGetOrDefault('prompt_dict', 'prompt_name', ifNull(prompt_version_id, toUUID('00000000-0000-0000-0000-000000000000')), '')",
+        "prompt_version": "concat(dictGetOrDefault('prompt_dict', 'prompt_name', ifNull(prompt_version_id, toUUID('00000000-0000-0000-0000-000000000000')), ''), ' v', dictGetOrDefault('prompt_dict', 'template_version', ifNull(prompt_version_id, toUUID('00000000-0000-0000-0000-000000000000')), ''))",
+        "prompt_label": "dictGetOrDefault('prompt_label_dict', 'name', ifNull(prompt_label_id, toUUID('00000000-0000-0000-0000-000000000000')), '')",
+        "tag": "arrayJoin(JSONExtract(tags, 'Array(String)'))",
+    }
+
     def _resolve_all_breakdowns(self, params: dict):
         """Resolve all breakdowns into a list of {type, expr, join_clause} dicts.
 
@@ -1462,6 +1670,7 @@ class DashboardQueryBuilder:
         """
         result = []
         ann_idx = 0
+        custom_attr_idx = 0
         for bd in self.breakdowns:
             bd_type = bd.get("type", "system_metric")
             bd_name = bd.get("name", "")
@@ -1472,30 +1681,34 @@ class DashboardQueryBuilder:
                 continue
 
             if bd_type == "system_metric":
-                if bd_name in self._BREAKDOWN_COL_MAP:
+                breakdown_expr = self._breakdown_column_expression(bd_name)
+                if breakdown_expr is not None:
                     result.append(
                         {
                             "type": "column",
-                            "expr": self._BREAKDOWN_COL_MAP[bd_name],
+                            "expr": breakdown_expr,
                             "join": None,
                         }
                     )
                 elif bd_name in SYSTEM_METRICS:
-                    _, col_expr = SYSTEM_METRICS[bd_name]
+                    col_expr = self._system_metric_expression(bd_name)
                     result.append({"type": "column", "expr": col_expr, "join": None})
 
             elif bd_type == "custom_attribute":
                 safe_name = _sanitize_attr_key(bd_name)
                 attr_type = bd.get("attribute_type", "string")
                 attr_map = "span_attr_num" if attr_type == "number" else "span_attr_str"
-                expr = f"{attr_map}['{safe_name}']"
+                param_key = f"_custom_bd_key_{custom_attr_idx}"
+                custom_attr_idx += 1
+                params[param_key] = safe_name
+                expr = f"{attr_map}[%({param_key})s]"
                 result.append(
                     {
                         "type": "column",
                         "expr": expr,
                         "join": None,
                         "presence_predicate": (
-                            f"mapContains({attr_map}, '{safe_name}')"
+                            f"mapContains({attr_map}, %({param_key})s)"
                         ),
                     }
                 )
@@ -1623,14 +1836,14 @@ class DashboardQueryBuilder:
 
         return result
 
-    def _breakdown_select(self) -> str | None:
+    def _breakdown_select(self, params: dict | None = None) -> str | None:
         """Return the SQL expression for the first breakdown, or None.
         Kept for backward compat — delegates to _resolve_all_breakdowns for single breakdown.
         """
         if not self.breakdowns:
             return None
         # For single-breakdown compat, just check first
-        breakdowns = self._resolve_all_breakdowns({})
+        breakdowns = self._resolve_all_breakdowns(params if params is not None else {})
         if not breakdowns:
             return None
         bd = breakdowns[0]
@@ -1662,21 +1875,6 @@ class DashboardQueryBuilder:
 
         # Apply global + per-metric system_metric filters directly
         # For string-comparable system metrics, use toString() to avoid UUID parse errors
-        _STRING_FILTER_COL = {
-            "project": "toString(project_id)",
-            "status": "status",
-            "model": "model",
-            "service_name": "service_name",
-            "span_kind": "observation_type",
-            "provider": "provider",
-            "session": "toString(trace_session_id)",
-            "user": "dictGetOrDefault('end_users_dict', 'user_id', end_user_id, toString(end_user_id))",
-            "user_id_type": "dictGetOrDefault('end_users_dict', 'user_id_type', end_user_id, '')",
-            "prompt_name": "dictGetOrDefault('prompt_dict', 'prompt_name', ifNull(prompt_version_id, toUUID('00000000-0000-0000-0000-000000000000')), '')",
-            "prompt_version": "concat(dictGetOrDefault('prompt_dict', 'prompt_name', ifNull(prompt_version_id, toUUID('00000000-0000-0000-0000-000000000000')), ''), ' v', dictGetOrDefault('prompt_dict', 'template_version', ifNull(prompt_version_id, toUUID('00000000-0000-0000-0000-000000000000')), ''))",
-            "prompt_label": "dictGetOrDefault('prompt_label_dict', 'name', ifNull(prompt_label_id, toUUID('00000000-0000-0000-0000-000000000000')), '')",
-            "tag": "arrayJoin(JSONExtract(tags, 'Array(String)'))",
-        }
         all_filters = self.global_filters + per_metric_filters
         # Skip filters that belong to other sources (e.g. simulation filters in trace queries)
         all_filters = [
@@ -1690,10 +1888,11 @@ class DashboardQueryBuilder:
                 op = f.get("operator", "")
                 val = f.get("value")
                 # Use string-safe column for non-numeric metrics
-                if f_name in _STRING_FILTER_COL:
-                    col = _STRING_FILTER_COL[f_name]
+                string_filter_col = self._string_filter_column_expression(f_name)
+                if string_filter_col is not None:
+                    col = string_filter_col
                 elif f_name in SYSTEM_METRICS:
-                    _, col = SYSTEM_METRICS[f_name]
+                    col = self._system_metric_expression(f_name)
                 else:
                     # Unknown filter metric — skip to prevent SQL injection
                     logger.warning("Skipping unknown filter metric: %s", f_name)

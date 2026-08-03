@@ -43,6 +43,7 @@ from tracer.services.clickhouse.query_builders.dashboard import (
     InvalidMetricCombinationError,
     _coerce_filter_value,
     _generate_time_buckets,
+    _prefix_spans_columns,
 )
 from tracer.services.clickhouse.query_builders.dashboard_base import (
     DashboardQueryBuilderBase,
@@ -66,6 +67,24 @@ def _attribute_value_read(values=(), *, complete=True, error_code=None):
             query_count=5,
         ),
     )
+
+
+def test_join_alias_prefixing_never_rewrites_quoted_customer_data():
+    clause = (
+        "project_id IN %(project_ids)s "
+        "AND start_time >= %(start_date)s "
+        "AND parent_span_id = '' "
+        "AND marker = 'project_id / start_time / parent_span_id' "
+        "AND escaped = 'it''s _peerdb_is_deleted'"
+    )
+
+    prefixed = _prefix_spans_columns(clause)
+
+    assert "s.project_id IN %(project_ids)s" in prefixed
+    assert "s.start_time >= %(start_date)s" in prefixed
+    assert "s.parent_span_id = ''" in prefixed
+    assert "'project_id / start_time / parent_span_id'" in prefixed
+    assert "'it''s _peerdb_is_deleted'" in prefixed
 
 
 def _get_metrics_with_annotation_labels(auth_client, project_id, label_ids):
@@ -2253,10 +2272,11 @@ class TestDashboardQueryBuilder:
         }
         builder = DashboardQueryBuilder(config)
         queries = builder.build_all_queries()
-        sql, _, _ = queries[0]
+        sql, params, _ = queries[0]
         assert "span_attr_num" in sql
-        assert "custom.score" in sql
-        assert "mapContains(span_attr_num, 'custom.score')" in sql
+        assert "span_attr_num[%(custom_metric_attr_key)s]" in sql
+        assert "mapContains(span_attr_num, %(custom_metric_attr_key)s)" in sql
+        assert params["custom_metric_attr_key"] == "custom.score"
 
     def test_v2_string_attribute_metric_uses_map_key_bloom_predicate(self):
         config = {
@@ -2275,11 +2295,47 @@ class TestDashboardQueryBuilder:
             ],
         }
 
-        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
 
-        assert "uniq(attrs_string['final_status'])" in sql
-        assert "mapContains(attrs_string, 'final_status')" in sql
+        assert "uniq(attrs_string[%(custom_metric_attr_key)s])" in sql
+        assert "mapContains(attrs_string, %(custom_metric_attr_key)s)" in sql
+        assert params["custom_metric_attr_key"] == "final_status"
         assert "span_attr_str" not in sql
+
+    @pytest.mark.parametrize(
+        "attribute_key",
+        [
+            "span_attr_str",
+            "span_attr_num",
+            "span_attr_bool",
+            "prefix.span_attr_str",
+            "span_attr_num.suffix",
+            "prefix.span_attr_bool.suffix",
+        ],
+    )
+    def test_v2_custom_metric_alias_like_key_is_bound_as_data(self, attribute_key):
+        config = {
+            "project_ids": ["00000000-0000-4000-8000-000000000001"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": attribute_key,
+                    "name": attribute_key,
+                    "type": "custom_attribute",
+                    "attribute_key": attribute_key,
+                    "attribute_type": "string",
+                    "aggregation": "count_distinct",
+                }
+            ],
+        }
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "attrs_string[%(custom_metric_attr_key)s]" in sql
+        assert "mapContains(attrs_string, %(custom_metric_attr_key)s)" in sql
+        assert params["custom_metric_attr_key"] == attribute_key
+        assert attribute_key not in sql
 
     def test_multiple_metrics(self, sample_query_config):
         sample_query_config["metrics"].append(
@@ -2334,10 +2390,11 @@ class TestDashboardQueryBuilder:
         }
         builder = DashboardQueryBuilder(config)
         queries = builder.build_all_queries()
-        sql, _, _ = queries[0]
+        sql, params, _ = queries[0]
         assert "span_attr_str" in sql
         assert "breakdown_value" in sql
-        assert "mapContains(span_attr_str, 'env')" in sql
+        assert "mapContains(span_attr_str, %(_custom_bd_key_0)s)" in sql
+        assert params["_custom_bd_key_0"] == "env"
 
     def test_v2_custom_attribute_breakdown_uses_map_key_bloom_predicate(self):
         config = {
@@ -2361,11 +2418,62 @@ class TestDashboardQueryBuilder:
             ],
         }
 
-        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
 
-        assert "attrs_string['final_status'] AS breakdown_value" in sql
-        assert "mapContains(attrs_string, 'final_status')" in sql
+        assert "attrs_string[%(_custom_bd_key_0)s] AS breakdown_value" in sql
+        assert "mapContains(attrs_string, %(_custom_bd_key_0)s)" in sql
+        assert params["_custom_bd_key_0"] == "final_status"
         assert "span_attr_str" not in sql
+
+    @pytest.mark.parametrize(
+        "attribute_key",
+        [
+            "span_attr_str",
+            "span_attr_num",
+            "span_attr_bool",
+            "prefix.span_attr_str",
+            "span_attr_num.suffix",
+            "prefix.span_attr_bool.suffix",
+        ],
+    )
+    def test_annotation_join_custom_breakdown_alias_like_key_is_bound_as_data(
+        self, attribute_key
+    ):
+        label_id = "00000000-0000-4000-8000-000000000077"
+        config = {
+            "project_ids": ["00000000-0000-4000-8000-000000000001"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": "latency",
+                    "name": "latency",
+                    "type": "system_metric",
+                    "aggregation": "avg",
+                }
+            ],
+            "breakdowns": [
+                {
+                    "type": "annotation_metric",
+                    "name": label_id,
+                    "label_id": label_id,
+                    "output_type": "thumbs_up_down",
+                },
+                {
+                    "type": "custom_attribute",
+                    "name": attribute_key,
+                    "attribute_type": "string",
+                },
+            ],
+        }
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "LEFT JOIN model_hub_score AS ann0" in sql
+        assert "attrs_string[%(_custom_bd_key_0)s]" in sql
+        assert "mapContains(attrs_string, %(_custom_bd_key_0)s)" in sql
+        assert params["_custom_bd_key_0"] == attribute_key
+        assert attribute_key not in sql
 
 
 class TestDashboardAttrRollupRouting:
@@ -5222,6 +5330,106 @@ class TestDashboardV2RewriteRouting:
         assert sql.count("use_skip_indexes_if_final") == 1
         assert sql.count("SETTINGS") == 1
 
+    def test_user_breakdown_reads_bounded_direct_end_users_not_dictionary(self):
+        config = _single_metric_config(
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "aggregation": "avg",
+            },
+            breakdowns=[{"name": "user", "type": "system_metric"}],
+        )
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "end_users_dict" not in sql
+        assert "FROM end_users AS eu FINAL" in compact_sql
+        assert "WHERE eu.project_id IN %(project_ids)s" in compact_sql
+        assert "AND eu.is_deleted = 0" in compact_sql
+        assert params["project_ids"] == config["project_ids"]
+
+    def test_user_breakdown_resolves_exact_and_remapped_ids_without_fanout(self):
+        config = _single_metric_config(
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "aggregation": "avg",
+            },
+            breakdowns=[{"name": "user_id_type", "type": "system_metric"}],
+        )
+
+        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        # One survivor-map lookup resolves span ids; the second resolves rows in
+        # the curated dimension before they are collapsed to one label/type.
+        assert compact_sql.count("end_user_id_remap FINAL") >= 4
+        assert "AS eu_remap ON sp.end_user_id = eu_remap.any_id" in compact_sql
+        assert (
+            "AS eu_dimension_remap ON eu.end_user_id = eu_dimension_remap.any_id"
+        ) in compact_sql
+        assert "GROUP BY resolved_end_user_id" in compact_sql
+        assert (
+            "ON if(eu_remap.survivor_id IS NULL OR "
+            "eu_remap.survivor_id = toUUID(" in compact_sql
+        )
+        # Prefer an exact survivor row; fall back to the newest live member of
+        # its many-to-one remap group.
+        assert "tuple(eu.end_user_id = if(" in compact_sql
+        assert "eu.version)) AS user_id" in compact_sql
+
+    def test_user_dimension_tombstones_are_removed_after_latest_state(self):
+        config = _single_metric_config(
+            {
+                "id": "user_count",
+                "name": "user_count",
+                "type": "system_metric",
+                "aggregation": "count",
+            }
+        )
+
+        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "end_users_dict" not in sql
+        # FINAL must be applied before the live-row predicate: filtering before
+        # version collapse could resurrect an older label after a tombstone.
+        assert (
+            "FROM end_users AS eu FINAL LEFT JOIN" in compact_sql
+            and "WHERE eu.project_id IN %(project_ids)s AND eu.is_deleted = 0"
+            in compact_sql
+        )
+        assert "uniq(if(" in compact_sql
+        assert "eu_dimension.user_id" in compact_sql
+
+    def test_user_filter_uses_direct_dimension_and_keeps_external_id_semantics(self):
+        config = _single_metric_config(
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "aggregation": "avg",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "equal_to",
+                "value": "customer@example.com",
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "end_users_dict" not in sql
+        assert "FROM end_users AS eu FINAL" in sql
+        assert "if(user_id = '', toString(end_user_id), user_id)" in sql
+        assert params["f_0_val"] == "customer@example.com"
+
     def test_eval_metric_keeps_legacy_columns(self):
         config = _single_metric_config(
             {
@@ -5289,8 +5497,9 @@ class TestInvalidMetricCombination:
                 "attribute_type": "string",
             }
         )
-        sql, _, _ = DashboardQueryBuilder(config).build_all_queries()[0]
-        assert "span_attr_str['bot_wpm']" in sql
+        sql, params, _ = DashboardQueryBuilder(config).build_all_queries()[0]
+        assert "span_attr_str[%(custom_metric_attr_key)s]" in sql
+        assert params["custom_metric_attr_key"] == "bot_wpm"
 
     def test_avg_of_numeric_attribute_is_allowed(self):
         config = _single_metric_config(
@@ -5303,8 +5512,9 @@ class TestInvalidMetricCombination:
                 "attribute_type": "number",
             }
         )
-        sql, _, _ = DashboardQueryBuilder(config).build_all_queries()[0]
-        assert "avg(span_attr_num['bot_wpm'])" in sql
+        sql, params, _ = DashboardQueryBuilder(config).build_all_queries()[0]
+        assert "avg(span_attr_num[%(custom_metric_attr_key)s])" in sql
+        assert params["custom_metric_attr_key"] == "bot_wpm"
 
     def test_format_metric_result_surfaces_error(self):
         base = DashboardQueryBuilderBase(

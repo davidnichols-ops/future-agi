@@ -82,6 +82,12 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
     # dashboard_attr_rollup ships only in the v2 schema, so the fast-path is safe only here.
     _attr_rollup_available: bool = True
 
+    # Product reads use the direct-write curated dimension. This avoids a
+    # runtime dependency on the optional ClickHouse dictionary (the locked
+    # read-only production identity is intentionally not granted dictionary
+    # access) while preserving latest-live + id-remap semantics.
+    _direct_end_users_available: bool = True
+
     _v2_rewrite_exclude = frozenset({"build_metric_query", "build_all_queries"})
 
     def build_metric_query(self, metric: dict) -> tuple[str, dict]:
