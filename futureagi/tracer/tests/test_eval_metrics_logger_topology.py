@@ -10,20 +10,51 @@ when row filters are present).
 from __future__ import annotations
 
 from datetime import datetime
+from unittest import mock
 
 import pytest
 
+from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.services.clickhouse.query_builders.eval_metrics import (
     EvalMetricsQueryBuilder,
 )
 from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
     EvalMetricsQueryBuilderV2,
 )
+from tracer.utils.graphs_optimized import get_eval_graph_data
 
 PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 EVAL_CONFIG_ID = "22222222-2222-4222-8222-222222222222"
 START = datetime(2026, 7, 20)
 END = datetime(2026, 8, 3)
+
+
+@pytest.mark.unit
+def test_eval_graph_common_boundary_scopes_config_to_request_project():
+    """Reject a foreign config before a project-less raw logger read can run."""
+
+    with mock.patch.object(
+        CustomEvalConfig.objects, "select_related"
+    ) as select_related:
+        scoped_configs = select_related.return_value
+        scoped_configs.get.side_effect = CustomEvalConfig.DoesNotExist
+
+        with pytest.raises(ValueError, match="Custom eval config does not exist"):
+            get_eval_graph_data(
+                interval="day",
+                filters=[],
+                property="average",
+                observe_type="charts",
+                req_data_config={"id": EVAL_CONFIG_ID, "type": "EVAL"},
+                eval_logger_filters={"project_id": PROJECT_ID},
+            )
+
+    select_related.assert_called_once_with("eval_template")
+    scoped_configs.get.assert_called_once_with(
+        id=EVAL_CONFIG_ID,
+        project_id=PROJECT_ID,
+        deleted=False,
+    )
 
 
 def _raw_builder(

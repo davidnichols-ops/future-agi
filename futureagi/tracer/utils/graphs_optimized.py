@@ -181,15 +181,27 @@ def get_eval_graph_data(
     if not custom_eval_config_id:
         raise ValueError("Custom eval config ID is required")
 
-    # Get custom eval config
+    # The raw eval logger has no project column, so config ownership must be
+    # established before a config-scoped ClickHouse read can run.  The charts
+    # endpoint supplies the already-authorized project here; keep the fallback
+    # callers compatible when they only provide finite trace/span querysets.
+    ch_project_id = eval_logger_filters.get("project_id")
+    config_lookup = {
+        "id": custom_eval_config_id,
+        "deleted": False,
+    }
+    if ch_project_id:
+        config_lookup["project_id"] = ch_project_id
+
     try:
-        custom_eval_config = CustomEvalConfig.objects.get(id=custom_eval_config_id)
+        custom_eval_config = CustomEvalConfig.objects.select_related(
+            "eval_template"
+        ).get(**config_lookup)
     except CustomEvalConfig.DoesNotExist:
         raise ValueError("Custom eval config does not exist")
 
     # --- ClickHouse dispatch ---
     # Try CH if a project_id is available in eval_logger_filters
-    ch_project_id = eval_logger_filters.get("project_id")
     if ch_project_id:
         try:
             from tracer.services.clickhouse.query_builders import (

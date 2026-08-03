@@ -1633,6 +1633,39 @@ class TestChartsView:
             assert "fetch_graph" in response.json()["detail"]
 
     @pytest.mark.django_db
+    @patch("tracer.services.clickhouse.query_service.AnalyticsQueryService")
+    def test_fetch_eval_graph_rejects_config_from_another_project_before_ch(
+        self,
+        mock_analytics_cls,
+        auth_client,
+        observe_project,
+        custom_eval_config,
+    ):
+        """A raw choice-eval read must not rely on the logger for project scope."""
+
+        template = custom_eval_config.eval_template
+        template.config = {"output": "CHOICES"}
+        template.choices = ["foreign-choice"]
+        template.save(update_fields=["config", "choices"])
+
+        query = urlencode(
+            {
+                "project_id": str(observe_project.id),
+                "interval": "day",
+                "property": "average",
+                "req_data_config": json.dumps(
+                    {"id": str(custom_eval_config.id), "type": "EVAL"}
+                ),
+            }
+        )
+
+        response = auth_client.get(f"/tracer/charts/fetch_graph/?{query}")
+
+        assert response.status_code == 400
+        assert "Custom eval config does not exist" in str(response.json())
+        mock_analytics_cls.assert_not_called()
+
+    @pytest.mark.django_db
     @patch("tracer.views.charts.get_system_metric_data")
     def test_fetch_graph_supports_single_system_metric(
         self, mock_system_metric_data, auth_client, observe_project
