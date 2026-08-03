@@ -1146,9 +1146,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 "session_filter_values_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Session filter values could not be loaded"
-            )
+            return self._gm.bad_request("Session filter values could not be loaded")
 
     @validated_request(
         request_serializer=TraceSessionGraphDataRequestSerializer,
@@ -1269,9 +1267,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 "session_graph_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Session graph data could not be loaded"
-            )
+            return self._gm.bad_request("Session graph data could not be loaded")
 
     @validated_request(
         query_serializer=TraceSessionListQuerySerializer,
@@ -1779,9 +1775,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 "session_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Session data could not be loaded"
-            )
+            return self._gm.bad_request("Session data could not be loaded")
 
     @staticmethod
     def _build_row(span, needs_first_last, end_user_map, session_name_map=None):

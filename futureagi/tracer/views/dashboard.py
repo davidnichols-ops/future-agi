@@ -599,9 +599,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "query_execution_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Dashboard query could not be completed"
-            )
+            return self._gm.bad_request("Dashboard query could not be completed")
 
     # ------------------------------------------------------------------
     # Unified metrics endpoint — all sources, no workflow selector
@@ -1172,9 +1170,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             metric_name=metric_name,
                             error_type=type(exc).__name__,
                         )
-                        return self._gm.bad_request(
-                            "Filter values could not be loaded"
-                        )
+                        return self._gm.bad_request("Filter values could not be loaded")
                     logger.warning(
                         "filter_values_ch_query_failed",
                         metric_name=metric_name,
@@ -1371,9 +1367,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             metric_name=metric_name,
                             error_type=type(exc).__name__,
                         )
-                        return self._gm.bad_request(
-                            "Filter values could not be loaded"
-                        )
+                        return self._gm.bad_request("Filter values could not be loaded")
                     logger.warning(
                         "filter_values_ch_query_failed",
                         metric_name=metric_name,
@@ -1399,9 +1393,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "fetch_filter_values_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Filter values could not be loaded"
-            )
+            return self._gm.bad_request("Filter values could not be loaded")
 
     def _filter_values_dataset(self, request, metric_name, metric_type):
         """Return distinct filter values for dataset source."""
@@ -1985,9 +1977,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "widget_query_execution_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Dashboard query could not be completed"
-            )
+            return self._gm.bad_request("Dashboard query could not be completed")
 
     @validated_request(
         request_serializer=DashboardPreviewQuerySerializer,
@@ -2024,6 +2014,4 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "query_preview_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Dashboard query could not be completed"
-            )
+            return self._gm.bad_request("Dashboard query could not be completed")

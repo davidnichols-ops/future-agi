@@ -168,7 +168,9 @@ def test_detail_preserves_sanitized_generic_bad_request(auth_client, user, monke
     def fail_with_private_detail(**_kwargs):
         raise RuntimeError("private compiler state and SQL")
 
-    monkeypatch.setattr("tracer.views.trace.read_trace_detail", fail_with_private_detail)
+    monkeypatch.setattr(
+        "tracer.views.trace.read_trace_detail", fail_with_private_detail
+    )
 
     response = auth_client.get(VOICE_CALL_DETAIL_URL, {"trace_id": str(uuid.uuid4())})
 

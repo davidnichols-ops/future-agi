@@ -480,9 +480,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 "eval_task.create_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation task could not be created"
-            )
+            return self._gm.bad_request("Evaluation task could not be created")
 
     @action(detail=False, methods=["get"], pagination_class=None)
     @validated_request(
@@ -584,9 +582,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 "eval_task.list_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation tasks could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation tasks could not be loaded")
 
     # Maximum number of distinct error groups returned per task. Most tasks
     # produce 1-5 distinct error types; this cap is a safety net for tasks
@@ -762,9 +758,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 "eval_task.logs_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation task logs could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation task logs could not be loaded")
 
     # ──────────────────────────────────────────────────────────────────
     # GET /tracer/eval-task/get_usage/?eval_task_id=<id>&period=<>&...
@@ -1231,9 +1225,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 error_type=type(exc).__name__,
                 eval_task_id=request.query_params.get("eval_task_id"),
             )
-            return self._gm.bad_request(
-                "Evaluation task usage could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation task usage could not be loaded")
 
     @validated_request(
         request_serializer=EvalTaskDeleteRequestSerializer,
@@ -1291,9 +1283,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 "eval_task.delete_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation tasks could not be deleted"
-            )
+            return self._gm.bad_request("Evaluation tasks could not be deleted")
 
     @validated_request(
         request_serializer=EmptyRequestSerializer,
@@ -1341,9 +1331,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 "eval_task.pause_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation task could not be paused"
-            )
+            return self._gm.bad_request("Evaluation task could not be paused")
 
     @validated_request(
         request_serializer=EmptyRequestSerializer,
@@ -1390,9 +1378,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 "eval_task.unpause_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation task could not be resumed"
-            )
+            return self._gm.bad_request("Evaluation task could not be resumed")
 
     @action(detail=False, methods=["get"], pagination_class=None)
     @validated_request(
@@ -1478,9 +1464,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 "eval_task.list_with_project_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation tasks could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation tasks could not be loaded")
 
     @validated_request(
         request_serializer=EvalTaskUpdateRequestSerializer,
@@ -1648,9 +1632,7 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 eval_task_id=eval_task_id,
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation task could not be updated"
-            )
+            return self._gm.bad_request("Evaluation task could not be updated")
 
     def _extract_update_fields(self, validated_data):
         """Extract valid update fields from validated data.
@@ -1745,6 +1727,4 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 "eval_task.details_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation task details could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation task details could not be loaded")

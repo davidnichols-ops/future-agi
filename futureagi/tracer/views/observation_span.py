@@ -667,9 +667,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 span_id=str(kwargs.get("pk") or ""),
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Span details could not be loaded"
-            )
+            return self._gm.bad_request("Span details could not be loaded")
 
     def _retrieve_clickhouse(
         self,
@@ -1315,9 +1313,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "span_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Span data could not be loaded"
-            )
+            return self._gm.bad_request("Span data could not be loaded")
 
     @action(detail=False, methods=["post"])
     def submit_feedback(self, request, *args, **kwargs):
@@ -1638,9 +1634,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "observe_span_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Span data could not be loaded"
-            )
+            return self._gm.bad_request("Span data could not be loaded")
 
     def _list_spans_clickhouse(
         self,
@@ -2859,9 +2853,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "span graph request failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Graph data could not be loaded"
-            )
+            return self._gm.bad_request("Graph data could not be loaded")
 
     @validated_request(
         query_serializer=ObservationAttributeListQuerySerializer,
@@ -2905,9 +2897,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     project_id=str(project_id),
                     error_type=type(exc).__name__,
                 )
-                return self._gm.bad_request(
-                    "Span attributes could not be loaded"
-                )
+                return self._gm.bad_request("Span attributes could not be loaded")
             logger.warning(
                 "span attribute discovery failed",
                 project_id=str(project_id),
@@ -3000,9 +2990,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     row_type=row_type,
                     error_type=type(exc).__name__,
                 )
-                return self._gm.bad_request(
-                    "Evaluation attributes could not be loaded"
-                )
+                return self._gm.bad_request("Evaluation attributes could not be loaded")
             logger.warning(
                 "evaluation attribute discovery failed",
                 project_id=str(project_id),
@@ -3359,9 +3347,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "evaluation_detail_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation details could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation details could not be loaded")
 
     @action(detail=False, methods=["get"])
     def get_spans_export_data(self, request, *args, **kwargs):

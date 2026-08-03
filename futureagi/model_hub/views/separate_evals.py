@@ -972,9 +972,7 @@ class CellErrorLocalizerView(APIView):
                 "cell_error_localizer_start_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Error localization could not be started"
-            )
+            return self._gm.bad_request("Error localization could not be started")
 
     @swagger_auto_schema(
         responses={
@@ -1078,9 +1076,7 @@ class CellErrorLocalizerView(APIView):
                 "cell_error_localizer_status_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Error localization status could not be loaded"
-            )
+            return self._gm.bad_request("Error localization status could not be loaded")
 
 
 class EvalMetricView(APIView):
@@ -1118,9 +1114,7 @@ class EvalMetricView(APIView):
                 "eval_metric_get_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation metrics could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation metrics could not be loaded")
 
     @validated_request(
         request_serializer=EvalMetricRequestSerializer,
@@ -1153,9 +1147,7 @@ class EvalMetricView(APIView):
                 "eval_metric_post_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation metrics could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation metrics could not be loaded")
 
 
 @workspace_read_only
@@ -1224,9 +1216,7 @@ class GetEvalTemplateNameView(APIView):
                 "eval_template_names_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation template names could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation template names could not be loaded")
 
 
 @workspace_read_only
@@ -1512,9 +1502,7 @@ class GetEvalTemplates(APIView):
                 "legacy_eval_template_list_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation templates could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation templates could not be loaded")
 
 
 @workspace_read_only
@@ -1692,9 +1680,7 @@ class EvalTemplateListView(APIView):
                 "eval_template_list_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluations could not be loaded"
-            )
+            return self._gm.bad_request("Evaluations could not be loaded")
 
 
 @workspace_read_only
@@ -1735,9 +1721,7 @@ class EvalTemplateListChartsView(APIView):
                 "eval_list_charts_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation charts could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation charts could not be loaded")
 
 
 class EvalTemplateBulkDeleteView(APIView):
@@ -1893,9 +1877,7 @@ class EvalTemplateBulkDeleteView(APIView):
                 "eval_template_bulk_delete_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation templates could not be deleted"
-            )
+            return self._gm.bad_request("Evaluation templates could not be deleted")
 
 
 class EvalTemplateCreateV2View(APIView):
@@ -2267,9 +2249,7 @@ class EvalTemplateCreateV2View(APIView):
                 "eval_template_create_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation template could not be created"
-            )
+            return self._gm.bad_request("Evaluation template could not be created")
 
 
 class EvalTemplateDetailView(APIView):
@@ -2413,9 +2393,7 @@ class EvalTemplateDetailView(APIView):
                 "eval_template_detail_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation template could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation template could not be loaded")
 
 
 class EvalTemplateUpdateView(APIView):
@@ -2775,9 +2753,7 @@ class EvalTemplateUpdateView(APIView):
                 "eval_template_update_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation template could not be updated"
-            )
+            return self._gm.bad_request("Evaluation template could not be updated")
 
 
 class EvalTemplateVersionListView(APIView):
@@ -3624,9 +3600,7 @@ class CompositeEvalCreateView(APIView):
                 "composite_eval_create_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Composite evaluation could not be created"
-            )
+            return self._gm.bad_request("Composite evaluation could not be created")
 
 
 class CompositeEvalDetailView(APIView):
@@ -3711,9 +3685,7 @@ class CompositeEvalDetailView(APIView):
                 "composite_eval_detail_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Composite evaluation could not be loaded"
-            )
+            return self._gm.bad_request("Composite evaluation could not be loaded")
 
     @validated_request(
         request_serializer=CompositeEvalUpdateRequestSerializer,
@@ -4041,9 +4013,7 @@ class CompositeEvalDetailView(APIView):
                 "composite_eval_update_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Composite evaluation could not be updated"
-            )
+            return self._gm.bad_request("Composite evaluation could not be updated")
 
 
 def _persist_composite_evaluation(
@@ -4256,9 +4226,7 @@ class CompositeEvalExecuteView(APIView):
                 "composite_eval_execute_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Composite evaluation could not be executed"
-            )
+            return self._gm.bad_request("Composite evaluation could not be executed")
 
 
 class CompositeEvalAdhocExecuteView(APIView):
@@ -4501,9 +4469,7 @@ class GroundTruthListView(APIView):
                 "ground_truth_list_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Ground truth entries could not be loaded"
-            )
+            return self._gm.bad_request("Ground truth entries could not be loaded")
 
 
 class GroundTruthUploadView(APIView):
@@ -4685,9 +4651,7 @@ class GroundTruthDataView(APIView):
                 "ground_truth_data_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Ground truth data could not be loaded"
-            )
+            return self._gm.bad_request("Ground truth data could not be loaded")
 
 
 class GroundTruthStatusView(APIView):
@@ -4739,9 +4703,7 @@ class GroundTruthStatusView(APIView):
                 "ground_truth_status_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Ground truth status could not be loaded"
-            )
+            return self._gm.bad_request("Ground truth status could not be loaded")
 
 
 class GroundTruthDeleteView(APIView):
@@ -4782,9 +4744,7 @@ class GroundTruthDeleteView(APIView):
                 "ground_truth_delete_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Ground truth entry could not be deleted"
-            )
+            return self._gm.bad_request("Ground truth entry could not be deleted")
 
 
 class GroundTruthTriggerEmbeddingView(APIView):
@@ -4862,9 +4822,7 @@ class GroundTruthTriggerEmbeddingView(APIView):
                 "ground_truth_embedding_trigger_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Ground truth embedding could not be started"
-            )
+            return self._gm.bad_request("Ground truth embedding could not be started")
 
 
 def _round_to_usage_bucket(ts, bucket_minutes):
@@ -5582,9 +5540,7 @@ class EvalFeedbackListView(APIView):
                 "eval_feedback_list_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation feedback could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation feedback could not be loaded")
 
 
 class TraceEvalView(APIView):
@@ -5706,9 +5662,7 @@ class TraceEvalView(APIView):
                 "trace_evaluation_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Trace evaluation could not be completed"
-            )
+            return self._gm.bad_request("Trace evaluation could not be completed")
 
 
 class VersionCompareView(APIView):
@@ -5783,9 +5737,7 @@ class VersionCompareView(APIView):
                 "evaluation_version_compare_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation versions could not be compared"
-            )
+            return self._gm.bad_request("Evaluation versions could not be compared")
 
 
 def _build_span_context(span) -> dict:
@@ -6773,9 +6725,7 @@ class EvalPlayGroundFeedbackAPIView(APIView):
                 "eval_playground_feedback_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation feedback could not be saved"
-            )
+            return self._gm.bad_request("Evaluation feedback could not be saved")
 
 
 class UpdateEvalTemplateView(APIView):
@@ -6901,9 +6851,7 @@ class UpdateEvalTemplateView(APIView):
                 "legacy_eval_template_update_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation template could not be updated"
-            )
+            return self._gm.bad_request("Evaluation template could not be updated")
 
 
 class DeleteEvalTemplateView(APIView):
@@ -6978,9 +6926,7 @@ class DeleteEvalTemplateView(APIView):
                 "legacy_eval_template_delete_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation template could not be deleted"
-            )
+            return self._gm.bad_request("Evaluation template could not be deleted")
 
 
 class DuplicateEvalTemplateView(APIView):
@@ -7048,9 +6994,7 @@ class DuplicateEvalTemplateView(APIView):
                 "legacy_eval_template_duplicate_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation template could not be duplicated"
-            )
+            return self._gm.bad_request("Evaluation template could not be duplicated")
 
 
 class TestEvaluationTemplateAPIView(APIView):

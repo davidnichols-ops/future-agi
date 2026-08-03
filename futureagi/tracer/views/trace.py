@@ -1295,9 +1295,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 trace_id=str(kwargs.get("pk") or ""),
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Trace details could not be loaded"
-            )
+            return self._gm.bad_request("Trace details could not be loaded")
 
     # Keys to strip from the list response (heavy / detail-only fields).
     _VOICE_CALL_HEAVY_KEYS = frozenset(
@@ -1879,9 +1877,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "evaluation_name_picker_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation names could not be loaded"
-            )
+            return self._gm.bad_request("Evaluation names could not be loaded")
 
     @validated_request(
         query_serializer=TraceListQuerySerializer,
@@ -1943,9 +1939,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "trace_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Trace data could not be loaded"
-            )
+            return self._gm.bad_request("Trace data could not be loaded")
 
     @validated_request(
         request_serializer=ObserveGraphDataRequestSerializer,
@@ -2068,9 +2062,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "trace graph request failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Graph data could not be loaded"
-            )
+            return self._gm.bad_request("Graph data could not be loaded")
 
     @action(detail=False, methods=["post"])
     def bulk_create(self, request, *args, **kwargs):
@@ -2786,9 +2778,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "observe_trace_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Trace data could not be loaded"
-            )
+            return self._gm.bad_request("Trace data could not be loaded")
 
     @validated_request(
         query_serializer=TraceVoiceCallListQuerySerializer,
@@ -2880,9 +2870,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "voice_call_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Voice call data could not be loaded"
-            )
+            return self._gm.bad_request("Voice call data could not be loaded")
 
     # ------------------------------------------------------------------
     # Voice call detail — returns heavy fields for a single call
@@ -5406,9 +5394,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 project_id=str(project_id or ""),
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Agent graph data could not be loaded"
-            )
+            return self._gm.bad_request("Agent graph data could not be loaded")
 
 
 class UsersView(APIView):
