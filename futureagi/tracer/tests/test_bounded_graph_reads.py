@@ -199,6 +199,45 @@ class _CandidateAnalytics:
         return _Result([row for row in self.rows if str(row[seed_column]) in allowed])
 
 
+class _LatestRareCandidateAnalytics(_CandidateAnalytics):
+    """Model a common raw attribute whose latest-state match is rare."""
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        if "graph_eval_config_id" in params:
+            self.calls.append((query, params, timeout_ms, settings))
+            return _Result(
+                [
+                    {
+                        "created_at": params["graph_start_date"] + timedelta(minutes=1),
+                        "output_bool": None,
+                        "output_float": 0.5,
+                        "output_str": None,
+                        "output_str_list": "[]",
+                        "error": 0,
+                    }
+                ]
+            )
+        candidate_key = (
+            "candidate_trace_ids"
+            if self.observe_type == "trace"
+            else "candidate_span_ids"
+        )
+        if candidate_key not in params:
+            return super().execute_ch_query(
+                query, params, timeout_ms=timeout_ms, settings=settings
+            )
+        self.calls.append((query, params, timeout_ms, settings))
+        seed_column = "trace_id" if self.observe_type == "trace" else "id"
+        allowed = set(params[candidate_key])
+        return _Result(
+            [
+                row
+                for row in self.rows
+                if str(row[seed_column]) in allowed and row.get("matches_latest")
+            ]
+        )
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("observe_type", "key", "value"),
@@ -544,7 +583,7 @@ def test_1600th_root_trace_returns_visible_sample_instead_of_blank_error():
 
     assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_ROOT_CANDIDATE_LIMIT
     assert sample.query_complete is False
-    assert sample.query_status == "degraded"
+    assert sample.query_status == "sampled"
     assert sample.query_error_code == "sample_limit"
 
 
@@ -601,7 +640,7 @@ def test_long_window_incomplete_rows_are_sampled_only_for_cardinality_limits(
         )
         assert sample.rows == (partial_row,)
         assert sample.query_complete is False
-        assert sample.query_status == "degraded"
+        assert sample.query_status == "sampled"
         assert sample.query_error_code == "sample_limit"
     else:
         with pytest.raises(BoundedGraphReadError) as caught:
@@ -628,10 +667,13 @@ def test_long_window_incomplete_rows_are_sampled_only_for_cardinality_limits(
     assert calls[0]["max_query_count"] == 5
     if public_error == "sample_limit":
         assert all(call["include_incomplete_rows"] is True for call in calls[1:])
-        assert all(call["page_size"] == 512 for call in calls[1:])
-        assert all(call["max_seed_attempts"] == 2 for call in calls[1:])
-        assert all(call["max_query_count"] == 5 for call in calls[1:])
-        assert all(call["max_candidates"] == 512 for call in calls[1:])
+        assert all(
+            call["page_size"] == bounded_graph_reads.GRAPH_ANY_SPAN_ROWS_PER_STRATUM
+            for call in calls[1:]
+        )
+        assert all(call["max_seed_attempts"] == 1 for call in calls[1:])
+        assert all(call["max_query_count"] == 2 for call in calls[1:])
+        assert all(call["max_candidates"] == 50 for call in calls[1:])
 
 
 @pytest.mark.unit
@@ -671,7 +713,7 @@ def test_incomplete_read_without_a_proven_match_raises_only_a_sanitized_code(
 
 
 @pytest.mark.unit
-def test_candidate_timeout_is_logged_internally_but_never_returned(monkeypatch):
+def test_anchor_timeout_falls_back_to_fully_covered_sanitized_sample(monkeypatch):
     raw_error = "Code: 159 DB::Exception secret-host SELECT private_payload"
     partial_row = {
         "trace_id": "trace-proven-match",
@@ -711,19 +753,19 @@ def test_candidate_timeout_is_logged_internally_but_never_returned(monkeypatch):
         ),
     )
 
-    with pytest.raises(BoundedGraphReadError) as caught:
-        read_graph_candidates(
-            analytics=object(),
-            project_id=PROJECT_ID,
-            filters=[
-                _date_filter(START, START + timedelta(days=7)),
-                _attribute_filter("customer.final_status", "Rejected"),
-            ],
-            observe_type="trace",
-        )
+    sample = read_graph_candidates(
+        analytics=object(),
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(START, START + timedelta(days=7)),
+            _attribute_filter("customer.final_status", "Rejected"),
+        ],
+        observe_type="trace",
+    )
 
-    assert caught.value.error_code == "read_budget_exceeded"
-    assert raw_error not in str(caught.value)
+    assert sample.query_status == "sampled"
+    assert sample.sampling_strata_completed == sample.sampling_strata
+    assert raw_error not in str(sample.metadata())
     assert warning_calls[0][1]["error_type"] == "ReadDeadlineExceeded"
     assert warning_calls[0][1]["exc_info"] is True
     assert raw_error not in str(warning_calls[0])
@@ -944,7 +986,7 @@ def test_sparse_span_anchor_replays_trace_scoped_ids_and_latest_tombstones():
 
 
 @pytest.mark.unit
-def test_long_sparse_anchor_timeout_never_becomes_exact_empty(monkeypatch):
+def test_long_sparse_anchor_and_strata_timeout_becomes_degraded_empty(monkeypatch):
     calls = []
 
     def _timed_out_page(**kwargs):
@@ -967,20 +1009,25 @@ def test_long_sparse_anchor_timeout_never_becomes_exact_empty(monkeypatch):
         bounded_graph_reads, "read_bounded_filter_page", _timed_out_page
     )
 
-    with pytest.raises(BoundedGraphReadError) as caught:
-        read_graph_candidates(
-            analytics=object(),
-            project_id=PROJECT_ID,
-            filters=[
-                _date_filter(START, START + timedelta(days=7)),
-                _attribute_filter("final_status", "Rejected"),
-            ],
-            observe_type="span",
-        )
+    sample = read_graph_candidates(
+        analytics=object(),
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(START, START + timedelta(days=7)),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="span",
+    )
 
+    assert sample.query_status == "degraded"
+    assert sample.query_error_code == "read_budget_exceeded"
+    assert sample.rows == ()
+    assert sample.sampling_strata_completed == 0
+    with pytest.raises(BoundedGraphReadError) as caught:
+        graph_dispatch._require_renderable_sample(sample)
     assert caught.value.error_code == "read_budget_exceeded"
     assert calls[0]["anchor_probe_only"] is True
-    assert len(calls) == 1
+    assert len(calls) == 1 + bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
 
 
 @pytest.mark.unit
@@ -1005,11 +1052,360 @@ def test_span_anchor_probe_is_graph_opt_in_not_a_list_behavior_change():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("window_days", [14, 180, 365])
+@pytest.mark.parametrize("structured_type", ["map", "json", "call_type"])
+def test_common_raw_latest_rare_filter_returns_deterministic_stratified_sample(
+    window_days,
+    structured_type,
+):
+    window_end = datetime(2026, 7, 31, 7)
+    window_start = window_end - timedelta(days=window_days)
+    window_width = window_end - window_start
+    rows = []
+    rows_per_stratum = 100
+    for stratum in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA):
+        stratum_start = window_start + (
+            window_width * stratum / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        )
+        stratum_width = window_width / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        for index in range(rows_per_stratum):
+            rows.append(
+                {
+                    "trace_id": f"trace-{stratum}-{index:03d}",
+                    "root_span_id": f"root-{stratum}-{index:03d}",
+                    "start_time": stratum_start
+                    + (stratum_width * index / rows_per_stratum),
+                    # The newest root in every stratum is the only current
+                    # match; all other raw final_status hits are stale.
+                    "matches_latest": index == rows_per_stratum - 1,
+                }
+            )
+
+    structured_filter = (
+        {
+            "column_id": "call_type",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "inbound",
+            },
+        }
+        if structured_type == "call_type"
+        else _attribute_filter(
+            "customer.context",
+            {"tier": "vip"},
+            filter_type=structured_type,
+            filter_op="contains" if structured_type == "json" else "equals",
+        )
+    )
+    filters = [
+        _date_filter(window_start, window_end),
+        _attribute_filter("final_status", "Rejected"),
+        _attribute_filter("score", 0.5, filter_type="number"),
+        structured_filter,
+    ]
+
+    def _read_once():
+        analytics = _LatestRareCandidateAnalytics(observe_type="trace", rows=rows)
+        sample = read_graph_candidates(
+            analytics=analytics,
+            project_id=PROJECT_ID,
+            filters=filters,
+            observe_type="trace",
+        )
+        return sample, analytics
+
+    first, analytics = _read_once()
+    second, _ = _read_once()
+
+    assert tuple(row["trace_id"] for row in first.rows) == tuple(
+        row["trace_id"] for row in second.rows
+    )
+    assert len(first.rows) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert first.query_complete is False
+    assert first.query_status == "sampled"
+    assert first.query_error_code == "sample_limit"
+    assert first.metadata()["query_sampling_strategy"] == (
+        "time_stratified_latest_state"
+    )
+    assert first.metadata()["query_sampling_strata_completed"] == (
+        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    )
+    classifier_sizes = [
+        len(params["candidate_trace_ids"])
+        for _, params, *_ in analytics.calls
+        if "candidate_trace_ids" in params
+    ]
+    assert classifier_sizes
+    assert max(classifier_sizes) <= 50
+
+
+@pytest.mark.unit
+def test_distributed_sample_uses_one_shared_deadline_instead_of_equal_slices(
+    monkeypatch,
+):
+    window_end = datetime(2026, 7, 31, 7)
+    window_start = window_end - timedelta(days=14)
+    calls = []
+
+    def _sample_page(**kwargs):
+        calls.append(kwargs)
+        is_anchor = kwargs.get("anchor_probe_only", False)
+        return BoundedFilterPage(
+            rows=[]
+            if is_anchor
+            else [
+                {
+                    "trace_id": f"trace-{len(calls)}",
+                    "root_span_id": f"root-{len(calls)}",
+                    "start_time": window_start + timedelta(hours=len(calls)),
+                }
+            ],
+            has_more=False,
+            complete=False,
+            status="degraded",
+            error_code="sample_limit",
+            total_rows_lower_bound=1,
+            elapsed_ms=1,
+            query_count=1,
+            rows_returned=1,
+            result_payload_bytes=10,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(bounded_graph_reads, "read_bounded_filter_page", _sample_page)
+
+    sample = read_graph_candidates(
+        analytics=object(),
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="trace",
+    )
+
+    distributed_calls = calls[1:]
+    old_equal_slice_ms = (
+        bounded_graph_reads.GRAPH_CANDIDATE_DEADLINE_MS
+        // bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    )
+    assert len(distributed_calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert all(call["deadline_ms"] > old_equal_slice_ms for call in distributed_calls)
+    assert sample.query_status == "sampled"
+    assert sample.sampling_strata_completed == (
+        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("completed_strata", [0, 1])
+def test_partial_or_empty_stratified_deadline_is_not_renderable(
+    monkeypatch,
+    completed_strata,
+):
+    window_end = datetime(2026, 7, 31, 7)
+    window_start = window_end - timedelta(days=14)
+    page_calls = 0
+
+    def _page(**kwargs):
+        nonlocal page_calls
+        page_calls += 1
+        if kwargs.get("anchor_probe_only"):
+            return BoundedFilterPage(
+                rows=[],
+                has_more=False,
+                complete=False,
+                status="degraded",
+                error_code="sample_limit",
+                total_rows_lower_bound=513,
+                elapsed_ms=1,
+                query_count=1,
+                rows_returned=513,
+                result_payload_bytes=100,
+                attempts=(),
+            )
+        return BoundedFilterPage(
+            rows=[
+                {
+                    "trace_id": "trace-proven",
+                    "root_span_id": "root-proven",
+                    "start_time": window_start + timedelta(minutes=1),
+                }
+            ],
+            has_more=False,
+            complete=False,
+            status="degraded",
+            error_code="sample_limit",
+            total_rows_lower_bound=1,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=2,
+            result_payload_bytes=20,
+            attempts=(),
+        )
+
+    # anchor_started, distributed_started, first-stratum check, and optional
+    # second-stratum check. Crossing the deadline before all eight strata must
+    # never turn zero or partial temporal coverage into a sampled graph.
+    clock = iter([0.0, 0.0, 4.0] if completed_strata == 0 else [0.0, 0.0, 0.0, 4.0])
+    monkeypatch.setattr(bounded_graph_reads, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(bounded_graph_reads, "read_bounded_filter_page", _page)
+
+    sample = read_graph_candidates(
+        analytics=object(),
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="trace",
+    )
+
+    assert sample.query_complete is False
+    assert sample.query_status == "degraded"
+    assert sample.query_error_code == "read_budget_exceeded"
+    assert sample.sampling_strata_completed == completed_strata
+    assert len(sample.rows) == completed_strata
+    with pytest.raises(BoundedGraphReadError) as caught:
+        graph_dispatch._require_renderable_sample(sample)
+    assert caught.value.error_code == "read_budget_exceeded"
+
+
+@pytest.mark.unit
+def test_code_307_sparse_anchor_falls_back_without_reusing_partial_rows(monkeypatch):
+    from clickhouse_driver.errors import ServerException
+
+    window_end = datetime(2026, 7, 31, 7)
+    window_start = window_end - timedelta(days=14)
+    calls = []
+
+    def _page(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("anchor_probe_only"):
+            raise ServerException("private Code 307 query details", code=307)
+        return BoundedFilterPage(
+            rows=[
+                {
+                    "trace_id": f"trace-{len(calls)}",
+                    "root_span_id": f"root-{len(calls)}",
+                    "start_time": window_start + timedelta(hours=len(calls)),
+                }
+            ],
+            has_more=False,
+            complete=False,
+            status="degraded",
+            error_code="sample_limit",
+            total_rows_lower_bound=1,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=2,
+            result_payload_bytes=20,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(bounded_graph_reads, "read_bounded_filter_page", _page)
+
+    sample = read_graph_candidates(
+        analytics=object(),
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="trace",
+    )
+
+    assert len(calls) == 1 + bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(sample.rows) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert sample.query_status == "sampled"
+    assert sample.sampling_strata_completed == sample.sampling_strata
+    assert "private" not in str(sample.metadata())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("observe_type", ["trace", "span"])
+@pytest.mark.parametrize("window_days", [180, 365])
+@pytest.mark.parametrize("structured_type", ["map", "json", "call_type"])
+def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
+    observe_type,
+    window_days,
+    structured_type,
+):
+    window_end = datetime(2026, 7, 31, 7)
+    window_start = window_end - timedelta(days=window_days)
+    window_width = window_end - window_start
+    rows = []
+    for stratum in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA):
+        stratum_start = window_start + (
+            window_width * stratum / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        )
+        stratum_width = window_width / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        for index in range(60):
+            row = {
+                "trace_id": f"trace-{stratum}-{index:03d}",
+                "root_span_id": f"root-{stratum}-{index:03d}",
+                "start_time": stratum_start + (stratum_width * index / 60),
+                "matches_latest": index == 59,
+            }
+            if observe_type == "span":
+                row["id"] = f"span-{stratum}-{index:03d}"
+            rows.append(row)
+    analytics = _LatestRareCandidateAnalytics(
+        observe_type=observe_type,
+        rows=rows,
+    )
+
+    structured_filter = (
+        {
+            "column_id": "call_type",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "inbound",
+            },
+        }
+        if structured_type == "call_type"
+        else _attribute_filter(
+            "customer.context",
+            {"tier": "vip"},
+            filter_type=structured_type,
+            filter_op="contains" if structured_type == "json" else "equals",
+        )
+    )
+    response = graph_dispatch.fetch_eval_graph_ch(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rejected"),
+            structured_filter,
+        ],
+        interval="day",
+        req_data_config={
+            "id": EVAL_ID,
+            "type": "EVAL",
+            "output_type": "SCORE",
+        },
+        observe_type=observe_type,
+    )
+
+    assert response["query_status"] == "sampled"
+    assert response["query_sample_size"] == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert any(point["value"] == 50 for point in response["data"])
+    assert not any(
+        call[1].get("filter_anchor_limit") == 513 for call in analytics.calls
+    )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("observe_type", "window_days", "row_count"),
     [("trace", 180, 1600), ("span", 365, 4096)],
 )
-def test_bounded_high_cardinality_long_window_is_exact_and_distributed(
+def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
     observe_type, window_days, row_count
 ):
     window_end = datetime(2026, 7, 31, 7)
@@ -1044,10 +1440,16 @@ def test_bounded_high_cardinality_long_window_is_exact_and_distributed(
     second_ids = tuple(row[identity_field] for row in second.rows)
 
     assert first_ids == second_ids
-    assert len(first.rows) == row_count
-    assert first.query_complete is True
-    assert first.query_status == "complete"
-    assert first.query_error_code is None
+    assert len(first.rows) == (
+        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        * bounded_graph_reads.GRAPH_ANY_SPAN_ROWS_PER_STRATUM
+    )
+    assert first.query_complete is False
+    assert first.query_status == "sampled"
+    assert first.query_error_code == "sample_limit"
+    assert first.sampling_strategy == "time_stratified_latest_state"
+    assert first.sampling_strata == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert first.sampling_strata_completed == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
     assert first.total_rows_lower_bound >= len(first.rows)
     first_analytics = _CandidateAnalytics(observe_type=observe_type, rows=rows)
     read_graph_candidates(
@@ -1064,9 +1466,8 @@ def test_bounded_high_cardinality_long_window_is_exact_and_distributed(
         for _, params, *_ in first_analytics.calls
         if "filter_anchor_limit" in params
     ]
-    assert len(anchor_ranges) == 1 + bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(anchor_ranges) == 1
     assert (window_start, window_end) in anchor_ranges
-    assert len(set(anchor_ranges)) == len(anchor_ranges)
     assert all(
         params["filter_seed_limit"] <= 512
         for _, params, *_ in first_analytics.calls
@@ -1128,10 +1529,13 @@ def test_dense_long_window_stratum_overflow_remains_explicitly_incomplete(
         observe_type=observe_type,
     )
 
-    assert len(sample.rows) == bounded_graph_reads.GRAPH_DENSE_ROWS_PER_STRATUM
+    assert len(sample.rows) == bounded_graph_reads.GRAPH_ANY_SPAN_ROWS_PER_STRATUM
     assert sample.query_complete is False
-    assert sample.query_status == "degraded"
+    assert sample.query_status == "sampled"
     assert sample.query_error_code == "sample_limit"
+    assert sample.metadata()["query_sampling_strategy"] == (
+        "time_stratified_latest_state"
+    )
     assert sample.total_rows_lower_bound >= len(sample.rows)
 
 
@@ -1287,7 +1691,7 @@ def test_system_graph_rejects_partial_rows_instead_of_rendering_a_sample(
 
 
 @pytest.mark.unit
-def test_system_graph_returns_cardinality_diagnostics_without_sampled_data(
+def test_span_system_graph_returns_explicit_sampled_points(
     monkeypatch,
 ):
     incomplete = replace(
@@ -1302,8 +1706,11 @@ def test_system_graph_returns_cardinality_diagnostics_without_sampled_data(
             },
         ),
         query_complete=False,
-        query_status="degraded",
+        query_status="sampled",
         query_error_code="sample_limit",
+        sampling_strategy="time_stratified_latest_state",
+        sampling_strata=8,
+        sampling_strata_completed=8,
     )
     monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: incomplete)
 
@@ -1316,21 +1723,26 @@ def test_system_graph_returns_cardinality_diagnostics_without_sampled_data(
         observe_type="span",
     )
 
-    assert response["data"] == []
+    assert response["data"][0]["value"] == 25
+    assert response["data"][0]["primary_traffic"] == 1
     assert response["query_complete"] is False
-    assert response["query_status"] == "degraded"
+    assert response["query_status"] == "sampled"
     assert response["query_error_code"] == "sample_limit"
     assert response["query_sample_size"] == 1
+    assert response["query_sampled"] is True
 
 
 @pytest.mark.unit
-def test_trace_system_graph_does_not_decorate_or_publish_candidate_sample(monkeypatch):
+def test_trace_system_graph_decorates_sample_with_any_live_span_semantics(monkeypatch):
     trace_id = "11111111-1111-4111-8111-111111111111"
     sampled = replace(
         _sample(),
         query_complete=False,
-        query_status="degraded",
+        query_status="sampled",
         query_error_code="sample_limit",
+        sampling_strategy="time_stratified_latest_state",
+        sampling_strata=8,
+        sampling_strata_completed=8,
     )
     analytics = _SequenceAnalytics(
         [
@@ -1360,11 +1772,14 @@ def test_trace_system_graph_does_not_decorate_or_publish_candidate_sample(monkey
         observe_type="trace",
     )
 
-    assert response["data"] == []
+    assert response["data"][0]["value"] == 12
+    assert response["data"][0]["primary_traffic"] == 1
     assert response["query_complete"] is False
-    assert response["query_status"] == "degraded"
+    assert response["query_status"] == "sampled"
     assert response["query_error_code"] == "sample_limit"
-    assert analytics.calls == []
+    assert len(analytics.calls) == 2
+    assert "argMax(is_deleted, _version)" in analytics.calls[1][0]
+    assert "latest_is_deleted = 0" in analytics.calls[1][0]
 
 
 class _DecorationAnalytics:
@@ -1914,13 +2329,16 @@ def test_eval_event_sentinel_returns_degraded_metadata_without_sampled_data(
 
 
 @pytest.mark.unit
-def test_eval_non_exhaustive_candidate_prefix_is_not_queried_or_published(monkeypatch):
+def test_eval_non_exhaustive_candidate_prefix_is_explicitly_sampled(monkeypatch):
     analytics = _DecorationAnalytics([])
     incomplete = replace(
         _sample(),
         query_complete=False,
-        query_status="degraded",
+        query_status="sampled",
         query_error_code="sample_limit",
+        sampling_strategy="time_stratified_latest_state",
+        sampling_strata=8,
+        sampling_strata_completed=8,
     )
     monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: incomplete)
 
@@ -1937,15 +2355,15 @@ def test_eval_non_exhaustive_candidate_prefix_is_not_queried_or_published(monkey
         observe_type="trace",
     )
 
-    assert analytics.calls == []
-    assert response["data"] == []
+    assert len(analytics.calls) == 1
+    assert response["data"]
     assert response["query_complete"] is False
-    assert response["query_status"] == "degraded"
+    assert response["query_status"] == "sampled"
     assert response["query_error_code"] == "sample_limit"
 
 
 @pytest.mark.unit
-def test_annotation_non_exhaustive_candidate_prefix_is_not_queried_or_published(
+def test_annotation_non_exhaustive_candidate_prefix_is_explicitly_sampled(
     monkeypatch,
 ):
     sample = replace(
@@ -1958,8 +2376,11 @@ def test_annotation_non_exhaustive_candidate_prefix_is_not_queried_or_published(
             },
         ),
         query_complete=False,
-        query_status="degraded",
+        query_status="sampled",
         query_error_code="sample_limit",
+        sampling_strategy="time_stratified_latest_state",
+        sampling_strata=8,
+        sampling_strata_completed=8,
     )
     analytics = _DecorationAnalytics([])
     label = SimpleNamespace(
@@ -1983,10 +2404,10 @@ def test_annotation_non_exhaustive_candidate_prefix_is_not_queried_or_published(
         observe_type="span",
     )
 
-    assert analytics.calls == []
-    assert response["data"] == []
+    assert len(analytics.calls) == 1
+    assert response["data"]
     assert response["query_complete"] is False
-    assert response["query_status"] == "degraded"
+    assert response["query_status"] == "sampled"
     assert response["query_error_code"] == "sample_limit"
 
 
@@ -2064,7 +2485,7 @@ def test_degraded_response_never_contains_clickhouse_stack_or_raw_message():
 
 
 @pytest.mark.unit
-def test_graph_response_contract_accepts_complete_or_degraded_not_sampled():
+def test_graph_response_contract_distinguishes_sampled_from_degraded():
     from tracer.serializers.filters import ObserveGraphDataResultSerializer
 
     complete = ObserveGraphDataResultSerializer(
@@ -2084,12 +2505,23 @@ def test_graph_response_contract_accepts_complete_or_degraded_not_sampled():
             "query_error_code": "sample_limit",
         }
     )
-    invalid = ObserveGraphDataResultSerializer(
+    sampled = ObserveGraphDataResultSerializer(
         data={
             "metric_name": "latency",
-            "data": [],
+            "data": [
+                {
+                    "timestamp": "2026-08-03T00:00:00Z",
+                    "value": 12,
+                    "primary_traffic": 1,
+                }
+            ],
             "query_complete": False,
             "query_status": "sampled",
+            "query_error_code": "sample_limit",
+            "query_sampled": True,
+            "query_sampling_strategy": "time_stratified_latest_state",
+            "query_sampling_strata": 8,
+            "query_sampling_strata_completed": 8,
         }
     )
     invalid_sampled_data = ObserveGraphDataResultSerializer(
@@ -2107,11 +2539,45 @@ def test_graph_response_contract_accepts_complete_or_degraded_not_sampled():
             "query_error_code": "sample_limit",
         }
     )
+    incomplete_sample_coverage = ObserveGraphDataResultSerializer(
+        data={
+            "metric_name": "latency",
+            "data": [],
+            "query_complete": False,
+            "query_status": "sampled",
+            "query_error_code": "sample_limit",
+            "query_sampling_strategy": "time_stratified_latest_state",
+            "query_sampling_strata": 8,
+            "query_sampling_strata_completed": 1,
+        }
+    )
     assert complete.is_valid(), complete.errors
     assert degraded.is_valid(), degraded.errors
-    assert not invalid.is_valid()
+    assert sampled.is_valid(), sampled.errors
     assert not invalid_sampled_data.is_valid()
     assert "data" in invalid_sampled_data.errors
+    assert not incomplete_sample_coverage.is_valid()
+    assert "query_sampling_strata_completed" in incomplete_sample_coverage.errors
+
+
+@pytest.mark.unit
+def test_graph_contract_empties_sampled_points_without_full_stratum_coverage():
+    response = graph_dispatch.enforce_exact_graph_data_contract(
+        {
+            "metric_name": "latency",
+            "data": [{"timestamp": START.isoformat(), "value": 999}],
+            "query_complete": False,
+            "query_status": "sampled",
+            "query_error_code": "sample_limit",
+            "query_sampling_strategy": "time_stratified_latest_state",
+            "query_sampling_strata": 8,
+            "query_sampling_strata_completed": 1,
+        }
+    )
+
+    assert response["data"] == []
+    assert response["query_status"] == "degraded"
+    assert response["query_sampled"] is False
 
 
 @pytest.mark.unit

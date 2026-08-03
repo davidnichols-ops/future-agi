@@ -37995,6 +37995,10 @@ export const tracerObservationSpanGetGraphMethodsResponseResultQueryResultBytesM
 
 export const tracerObservationSpanGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin = 0;
 
+export const tracerObservationSpanGetGraphMethodsResponseResultQuerySamplingStrataMin = 0;
+
+export const tracerObservationSpanGetGraphMethodsResponseResultQuerySamplingStrataCompletedMin = 0;
+
 
 
 export const TracerObservationSpanGetGraphMethodsResponse = zod.object({
@@ -38006,9 +38010,9 @@ export const TracerObservationSpanGetGraphMethodsResponse = zod.object({
   "timestamp": zod.string().min(1),
   "value": zod.number(),
   "primary_traffic": zod.number().optional()
-}).describe('Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.')).describe('Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.'),
+}).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.')).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.'),
   "query_complete": zod.boolean().optional(),
-  "query_status": zod.enum(['complete', 'degraded']).optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().min(1).optional(),
   "query_window_end": zod.string().min(1).optional(),
@@ -38017,7 +38021,11 @@ export const TracerObservationSpanGetGraphMethodsResponse = zod.object({
   "query_elapsed_ms": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQueryElapsedMsMin).optional(),
   "query_rows_returned": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQueryRowsReturnedMin).optional(),
   "query_result_bytes": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQueryResultBytesMin).optional(),
-  "query_total_rows_lower_bound": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin).optional()
+  "query_total_rows_lower_bound": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin).optional(),
+  "query_sampled": zod.boolean().optional(),
+  "query_sampling_strategy": zod.enum(['time_stratified_latest_state', 'bounded_latest_state_prefix']).optional(),
+  "query_sampling_strata": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQuerySamplingStrataMin).optional(),
+  "query_sampling_strata_completed": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQuerySamplingStrataCompletedMin).optional()
 })
 })
 
@@ -41531,6 +41539,10 @@ export const tracerTraceSessionGetSessionGraphDataResponseResultQueryResultBytes
 
 export const tracerTraceSessionGetSessionGraphDataResponseResultQueryTotalRowsLowerBoundMin = 0;
 
+export const tracerTraceSessionGetSessionGraphDataResponseResultQuerySamplingStrataMin = 0;
+
+export const tracerTraceSessionGetSessionGraphDataResponseResultQuerySamplingStrataCompletedMin = 0;
+
 
 
 export const TracerTraceSessionGetSessionGraphDataResponse = zod.object({
@@ -41542,9 +41554,9 @@ export const TracerTraceSessionGetSessionGraphDataResponse = zod.object({
   "timestamp": zod.string().min(1),
   "value": zod.number(),
   "primary_traffic": zod.number().optional()
-}).describe('Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.')).describe('Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.'),
+}).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.')).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.'),
   "query_complete": zod.boolean().optional(),
-  "query_status": zod.enum(['complete', 'degraded']).optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().min(1).optional(),
   "query_window_end": zod.string().min(1).optional(),
@@ -41553,7 +41565,11 @@ export const TracerTraceSessionGetSessionGraphDataResponse = zod.object({
   "query_elapsed_ms": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQueryElapsedMsMin).optional(),
   "query_rows_returned": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQueryRowsReturnedMin).optional(),
   "query_result_bytes": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQueryResultBytesMin).optional(),
-  "query_total_rows_lower_bound": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQueryTotalRowsLowerBoundMin).optional()
+  "query_total_rows_lower_bound": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQueryTotalRowsLowerBoundMin).optional(),
+  "query_sampled": zod.boolean().optional(),
+  "query_sampling_strategy": zod.enum(['time_stratified_latest_state', 'bounded_latest_state_prefix']).optional(),
+  "query_sampling_strata": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQuerySamplingStrataMin).optional(),
+  "query_sampling_strata_completed": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQuerySamplingStrataCompletedMin).optional()
 })
 })
 
@@ -42060,6 +42076,10 @@ export const tracerTraceGetGraphMethodsResponseResultQueryResultBytesMin = 0;
 
 export const tracerTraceGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin = 0;
 
+export const tracerTraceGetGraphMethodsResponseResultQuerySamplingStrataMin = 0;
+
+export const tracerTraceGetGraphMethodsResponseResultQuerySamplingStrataCompletedMin = 0;
+
 
 
 export const TracerTraceGetGraphMethodsResponse = zod.object({
@@ -42071,9 +42091,9 @@ export const TracerTraceGetGraphMethodsResponse = zod.object({
   "timestamp": zod.string().min(1),
   "value": zod.number(),
   "primary_traffic": zod.number().optional()
-}).describe('Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.')).describe('Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.'),
+}).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.')).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.'),
   "query_complete": zod.boolean().optional(),
-  "query_status": zod.enum(['complete', 'degraded']).optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().min(1).optional(),
   "query_window_end": zod.string().min(1).optional(),
@@ -42082,7 +42102,11 @@ export const TracerTraceGetGraphMethodsResponse = zod.object({
   "query_elapsed_ms": zod.number().min(tracerTraceGetGraphMethodsResponseResultQueryElapsedMsMin).optional(),
   "query_rows_returned": zod.number().min(tracerTraceGetGraphMethodsResponseResultQueryRowsReturnedMin).optional(),
   "query_result_bytes": zod.number().min(tracerTraceGetGraphMethodsResponseResultQueryResultBytesMin).optional(),
-  "query_total_rows_lower_bound": zod.number().min(tracerTraceGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin).optional()
+  "query_total_rows_lower_bound": zod.number().min(tracerTraceGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin).optional(),
+  "query_sampled": zod.boolean().optional(),
+  "query_sampling_strategy": zod.enum(['time_stratified_latest_state', 'bounded_latest_state_prefix']).optional(),
+  "query_sampling_strata": zod.number().min(tracerTraceGetGraphMethodsResponseResultQuerySamplingStrataMin).optional(),
+  "query_sampling_strata_completed": zod.number().min(tracerTraceGetGraphMethodsResponseResultQuerySamplingStrataCompletedMin).optional()
 })
 })
 

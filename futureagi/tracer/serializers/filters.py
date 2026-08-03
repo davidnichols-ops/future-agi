@@ -698,6 +698,8 @@ class ObserveGraphDataRequestSerializer(StrictInputSerializer):
 
 
 class ObserveGraphDataPointSerializer(serializers.Serializer):
+    """One exact or explicitly sampled graph point."""
+
     timestamp = serializers.CharField()
     value = serializers.FloatField(allow_null=True)
     primary_traffic = serializers.FloatField(required=False, allow_null=True)
@@ -709,14 +711,15 @@ class ObserveGraphDataResultSerializer(serializers.Serializer):
     data = ObserveGraphDataPointSerializer(
         many=True,
         help_text=(
-            "Exact graph points only. This list is empty whenever the bounded "
-            "read is incomplete or degraded; sampled aggregates are never "
-            "returned as ordinary graph data."
+            "Graph points for exact reads and explicitly bounded samples. "
+            "Inspect query_status before interpreting values: sampled values "
+            "describe selected rows, not full totals; degraded reads always "
+            "return an empty list."
         ),
     )
     query_complete = serializers.BooleanField(required=False)
     query_status = serializers.ChoiceField(
-        choices=("complete", "degraded"), required=False
+        choices=("complete", "sampled", "degraded"), required=False
     )
     query_error_code = serializers.ChoiceField(
         choices=("sample_limit", "read_budget_exceeded", "query_failed"),
@@ -730,6 +733,15 @@ class ObserveGraphDataResultSerializer(serializers.Serializer):
     query_rows_returned = serializers.IntegerField(required=False, min_value=0)
     query_result_bytes = serializers.IntegerField(required=False, min_value=0)
     query_total_rows_lower_bound = serializers.IntegerField(required=False, min_value=0)
+    query_sampled = serializers.BooleanField(required=False)
+    query_sampling_strategy = serializers.ChoiceField(
+        choices=("time_stratified_latest_state", "bounded_latest_state_prefix"),
+        required=False,
+    )
+    query_sampling_strata = serializers.IntegerField(required=False, min_value=0)
+    query_sampling_strata_completed = serializers.IntegerField(
+        required=False, min_value=0
+    )
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -737,15 +749,37 @@ class ObserveGraphDataResultSerializer(serializers.Serializer):
             attrs.get("query_complete") is False
             or attrs.get("query_status") == "degraded"
         )
-        if incomplete and attrs.get("data"):
+        explicitly_sampled = attrs.get("query_status") == "sampled"
+        if incomplete and not explicitly_sampled and attrs.get("data"):
             raise serializers.ValidationError(
                 {
                     "data": (
-                        "Incomplete graph reads cannot publish sampled points "
-                        "as exact graph data."
+                        "Incomplete graph reads must be explicitly sampled "
+                        "before publishing graph points."
                     )
                 }
             )
+        if explicitly_sampled and attrs.get("query_complete") is not False:
+            raise serializers.ValidationError(
+                {"query_complete": "Sampled graph reads must be incomplete."}
+            )
+        if explicitly_sampled:
+            planned = attrs.get("query_sampling_strata")
+            completed = attrs.get("query_sampling_strata_completed")
+            if (
+                not attrs.get("query_sampling_strategy")
+                or not isinstance(planned, int)
+                or planned < 1
+                or completed != planned
+            ):
+                raise serializers.ValidationError(
+                    {
+                        "query_sampling_strata_completed": (
+                            "Sampled graph reads require complete coverage of "
+                            "every declared sampling stratum."
+                        )
+                    }
+                )
         return attrs
 
 

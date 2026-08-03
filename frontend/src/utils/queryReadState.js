@@ -1,6 +1,9 @@
 export const QUERY_READ_RETRY_MESSAGE =
   "Results are incomplete. Please retry in a moment.";
 
+export const QUERY_READ_SAMPLED_MESSAGE =
+  "Showing sampled values, not full totals.";
+
 export const QUERY_FAILED_RETRY_MESSAGE =
   "We couldn't load this data. Please retry in a moment.";
 
@@ -11,6 +14,16 @@ const payloadCandidates = (payload) =>
     payload?.metadata,
     payload?.result?.metadata,
   ].filter(Boolean);
+
+const hasCompleteSamplingCoverage = (candidate) => {
+  const planned = candidate?.query_sampling_strata;
+  return (
+    Boolean(candidate?.query_sampling_strategy) &&
+    Number.isInteger(planned) &&
+    planned > 0 &&
+    candidate?.query_sampling_strata_completed === planned
+  );
+};
 
 /**
  * Interpret the bounded-read metadata returned by tracing APIs.
@@ -26,17 +39,25 @@ export function getQueryReadState(payload, { isError = false } = {}) {
     return "error";
   }
 
+  const sampledCandidates = candidates.filter(
+    (candidate) => candidate?.query_status === "sampled",
+  );
+  const sampled = sampledCandidates.some(hasCompleteSamplingCoverage);
+  const invalidSample = sampledCandidates.length > 0 && !sampled;
   const degraded = candidates.some(
     (candidate) =>
-      candidate?.query_complete === false ||
       candidate?.query_status === "degraded" ||
+      (candidate?.query_complete === false &&
+        candidate?.query_status !== "sampled") ||
       candidate?.queryReadState === "degraded",
   );
 
-  return degraded ? "degraded" : "complete";
+  if (degraded || invalidSample) return "degraded";
+  return sampled ? "sampled" : "complete";
 }
 
 export function getQueryReadMessage(state) {
+  if (state === "sampled") return QUERY_READ_SAMPLED_MESSAGE;
   if (state === "degraded") return QUERY_READ_RETRY_MESSAGE;
   if (state === "error") return QUERY_FAILED_RETRY_MESSAGE;
   return null;
@@ -52,6 +73,19 @@ export function getQueryReadMessage(state) {
  */
 export function getExactGraphData(payload) {
   if (getQueryReadState(payload) !== "complete") return [];
+
+  const data = payload?.data ?? payload?.result?.data;
+  return Array.isArray(data) ? data : [];
+}
+
+/**
+ * Return points that are safe to chart as exact data or as an explicitly
+ * labelled bounded sample. Unlabelled incomplete and degraded responses remain
+ * non-renderable.
+ */
+export function getRenderableGraphData(payload) {
+  const state = getQueryReadState(payload);
+  if (state !== "complete" && state !== "sampled") return [];
 
   const data = payload?.data ?? payload?.result?.data;
   return Array.isArray(data) ? data : [];

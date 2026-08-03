@@ -20234,7 +20234,7 @@ export interface ObserveGraphDataRequestApi {
 }
 
 /**
- * Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.
+ * Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.
  */
 export interface ObserveGraphDataPointApi {
   /** @minLength 1 */
@@ -20248,6 +20248,7 @@ export type ObserveGraphDataResultApiQueryStatus = typeof ObserveGraphDataResult
 
 export const ObserveGraphDataResultApiQueryStatus = {
   complete: 'complete',
+  sampled: 'sampled',
   degraded: 'degraded',
 } as const;
 
@@ -20260,10 +20261,18 @@ export const ObserveGraphDataResultApiQueryErrorCode = {
   query_failed: 'query_failed',
 } as const;
 
+export type ObserveGraphDataResultApiQuerySamplingStrategy = typeof ObserveGraphDataResultApiQuerySamplingStrategy[keyof typeof ObserveGraphDataResultApiQuerySamplingStrategy];
+
+
+export const ObserveGraphDataResultApiQuerySamplingStrategy = {
+  time_stratified_latest_state: 'time_stratified_latest_state',
+  bounded_latest_state_prefix: 'bounded_latest_state_prefix',
+} as const;
+
 export interface ObserveGraphDataResultApi {
   metric_name: string;
   name?: string;
-  /** Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data. */
+  /** Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list. */
   data: ObserveGraphDataPointApi[];
   query_complete?: boolean;
   query_status?: ObserveGraphDataResultApiQueryStatus;
@@ -20284,6 +20293,12 @@ export interface ObserveGraphDataResultApi {
   query_result_bytes?: number;
   /** @minimum 0 */
   query_total_rows_lower_bound?: number;
+  query_sampled?: boolean;
+  query_sampling_strategy?: ObserveGraphDataResultApiQuerySamplingStrategy;
+  /** @minimum 0 */
+  query_sampling_strata?: number;
+  /** @minimum 0 */
+  query_sampling_strata_completed?: number;
 }
 
 export interface ObserveGraphDataResponseApi {
@@ -21567,6 +21582,7 @@ export type ObserveGraphDataErrorResultApiQueryStatus = typeof ObserveGraphDataE
 
 export const ObserveGraphDataErrorResultApiQueryStatus = {
   complete: 'complete',
+  sampled: 'sampled',
   degraded: 'degraded',
 } as const;
 
@@ -21579,10 +21595,18 @@ export const ObserveGraphDataErrorResultApiQueryErrorCode = {
   query_failed: 'query_failed',
 } as const;
 
+export type ObserveGraphDataErrorResultApiQuerySamplingStrategy = typeof ObserveGraphDataErrorResultApiQuerySamplingStrategy[keyof typeof ObserveGraphDataErrorResultApiQuerySamplingStrategy];
+
+
+export const ObserveGraphDataErrorResultApiQuerySamplingStrategy = {
+  time_stratified_latest_state: 'time_stratified_latest_state',
+  bounded_latest_state_prefix: 'bounded_latest_state_prefix',
+} as const;
+
 export interface ObserveGraphDataErrorResultApi {
   metric_name: string;
   name?: string;
-  /** Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data. */
+  /** Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list. */
   data: ObserveGraphDataPointApi[];
   query_complete?: boolean;
   query_status?: ObserveGraphDataErrorResultApiQueryStatus;
@@ -21603,6 +21627,12 @@ export interface ObserveGraphDataErrorResultApi {
   query_result_bytes?: number;
   /** @minimum 0 */
   query_total_rows_lower_bound?: number;
+  query_sampled?: boolean;
+  query_sampling_strategy?: ObserveGraphDataErrorResultApiQuerySamplingStrategy;
+  /** @minimum 0 */
+  query_sampling_strata?: number;
+  /** @minimum 0 */
+  query_sampling_strata_completed?: number;
   /** @minLength 1 */
   message: string;
 }

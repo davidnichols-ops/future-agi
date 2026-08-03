@@ -32,9 +32,9 @@ import { logger } from "src/utils/logger";
 import { FILTER_FOR_HAS_EVAL, toBackendFilters } from "../common";
 import { buildDefaultDateEntry } from "./graphFilterUtils";
 import {
-  getExactGraphData,
   getQueryReadMessage,
   getQueryReadState,
+  getRenderableGraphData,
 } from "src/utils/queryReadState";
 
 const deltaObject = {
@@ -213,7 +213,7 @@ const GraphSection = ({
     const primaryData = [];
     const trafficData = [];
 
-    const evalData = getExactGraphData(apiGraphData);
+    const evalData = getRenderableGraphData(apiGraphData);
 
     for (const item of evalData) {
       if (item.timestamp != null) {
@@ -228,7 +228,11 @@ const GraphSection = ({
       }
     }
 
-    const lineSeriesName = getLineSeriesName(selectedGraphProperty);
+    const baseLineSeriesName = getLineSeriesName(selectedGraphProperty);
+    const lineSeriesName =
+      apiGraphReadState === "sampled"
+        ? `Sampled ${baseLineSeriesName}`
+        : baseLineSeriesName;
     const isEval = selectedGraphConfig?.type === "EVAL";
 
     const series = [
@@ -265,7 +269,7 @@ const GraphSection = ({
 
     if (!isEval) {
       series.push({
-        name: "Traffic",
+        name: apiGraphReadState === "sampled" ? "Sampled traffic" : "Traffic",
         type: "column",
         data: trafficData,
         color: trafficColor,
@@ -371,6 +375,7 @@ const GraphSection = ({
     };
   }, [
     apiGraphData,
+    apiGraphReadState,
     chartId,
     lineColor,
     selectedGraphProperty,
@@ -620,9 +625,19 @@ const GraphSection = ({
                   selectedGraphEvals?.length > 0 ||
                   Object.keys(selectedGraphAttributes || {}).length > 0) &&
                 !apiGraphLoading &&
-                !apiGraphReadMessage
+                ["complete", "sampled"].includes(apiGraphReadState)
               }
             >
+              <ShowComponent condition={apiGraphReadState === "sampled"}>
+                <Typography
+                  role="status"
+                  fontSize="11px"
+                  color="warning.main"
+                  sx={{ px: 1 }}
+                >
+                  {apiGraphReadMessage}
+                </Typography>
+              </ShowComponent>
               <ReactApexChart
                 ref={chartRef}
                 options={chartData.options}
@@ -638,7 +653,13 @@ const GraphSection = ({
               </Box>
             </ShowComponent>
 
-            <ShowComponent condition={!apiGraphLoading && apiGraphReadMessage}>
+            <ShowComponent
+              condition={
+                !apiGraphLoading &&
+                apiGraphReadMessage &&
+                apiGraphReadState !== "sampled"
+              }
+            >
               <Box
                 role="status"
                 sx={{

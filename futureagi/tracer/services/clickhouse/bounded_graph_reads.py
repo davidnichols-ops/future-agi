@@ -13,6 +13,7 @@ from collections.abc import Hashable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from time import monotonic
 from typing import Any
 
 import structlog
@@ -50,13 +51,11 @@ GRAPH_MAX_POINTS = 10_000
 GRAPH_ANY_SPAN_STRATA = 8
 GRAPH_ANY_SPAN_ROWS_PER_STRATUM = 49
 # A long-window sparse-anchor sentinel distinguishes a common predicate before
-# the ordered stratum reads begin. Once it is known to be common, retaining the
-# 49-row representative ceiling guarantees an exact-empty ``sample_limit``
-# graph even when the full match set is still safely finite. Give that path an
-# exact replay budget of 512 visible identities per stratum (4,096 total). An
-# exhausted per-stratum 513-row anchor proves exactness; every ordered fallback
-# and latest-state classifier remains batch-bounded.
-GRAPH_DENSE_ROWS_PER_STRATUM = 512
+# the ordered stratum reads begin. Common predicates deliberately switch to a
+# small representative ceiling: replaying 512 identities in each of eight
+# strata consumed the whole graph deadline in production before the first
+# stratum completed. Forty-nine identities still provide deterministic temporal
+# coverage while keeping every latest-state classifier safely bounded.
 GRAPH_ANY_SPAN_DISTRIBUTED_AFTER = timedelta(hours=1)
 # Before distributing a long window, give a directly-indexable predicate one
 # bounded chance to prove that the entire result is sparse.  The 513th raw
@@ -89,6 +88,9 @@ class GraphCandidateSample:
     rows_returned: int
     result_payload_bytes: int
     total_rows_lower_bound: int
+    sampling_strategy: str | None = None
+    sampling_strata: int = 0
+    sampling_strata_completed: int = 0
 
     def metadata(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -102,7 +104,12 @@ class GraphCandidateSample:
             "query_rows_returned": self.rows_returned,
             "query_result_bytes": self.result_payload_bytes,
             "query_total_rows_lower_bound": self.total_rows_lower_bound,
+            "query_sampled": self.query_status == "sampled",
         }
+        if self.sampling_strategy:
+            result["query_sampling_strategy"] = self.sampling_strategy
+            result["query_sampling_strata"] = self.sampling_strata
+            result["query_sampling_strata_completed"] = self.sampling_strata_completed
         if self.query_error_code:
             result["query_error_code"] = self.query_error_code
         return result
@@ -116,6 +123,17 @@ def _active_filters(filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
         not in {"created_at", "start_time"}
         or BaseQueryBuilder.is_datetime_complement_filter(item)
     ]
+
+
+def _has_structured_filter(filters: list[dict[str, Any]]) -> bool:
+    """Return whether a full-window raw anchor is unsafe for this shape."""
+
+    return any(
+        (item.get("column_id") or item.get("columnId")) == "call_type"
+        or str((item.get("filter_config") or {}).get("filter_type") or "").lower()
+        in {"json", "map"}
+        for item in _active_filters(filters)
+    )
 
 
 def _identity_seed_filter(observe_type: str) -> dict[str, Any]:
@@ -212,13 +230,13 @@ def _read_time_distributed_candidates(
     combined graph can never advertise a sample as exact.
     """
 
-    if not 1 <= rows_per_stratum <= GRAPH_DENSE_ROWS_PER_STRATUM:
+    if not 1 <= rows_per_stratum <= GRAPH_ANY_SPAN_ROWS_PER_STRATUM:
         raise ValueError("graph rows_per_stratum exceeds the bounded contract")
     stratum_count = min(
         GRAPH_ANY_SPAN_STRATA,
         max(1, deadline_ms // 250),
     )
-    per_stratum_deadline_ms = max(25, deadline_ms // stratum_count)
+    distributed_started = monotonic()
     window_width = window_end - window_start
     key_field = "trace_id" if mode == "trace" else "id"
     rows_by_id: dict[Hashable, dict[str, Any]] = {}
@@ -228,8 +246,15 @@ def _read_time_distributed_candidates(
     rows_returned = int(getattr(prior_page, "rows_returned", 0) or 0)
     result_payload_bytes = int(getattr(prior_page, "result_payload_bytes", 0) or 0)
     total_rows_lower_bound = int(getattr(prior_page, "total_rows_lower_bound", 0) or 0)
+    sampling_strata_completed = 0
+    sampling_error_code: str | None = None
 
     for index in range(stratum_count):
+        remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
+        if remaining_ms < 25:
+            complete = False
+            sampling_error_code = "read_budget_exceeded"
+            break
         stratum_start = window_start + (window_width * index / stratum_count)
         stratum_end = (
             window_end
@@ -249,18 +274,11 @@ def _read_time_distributed_candidates(
         }
         if mode == "trace":
             stratum_builder_kwargs["bounded_identity_only"] = True
-        elif rows_per_stratum == GRAPH_DENSE_ROWS_PER_STRATUM:
-            # The full-window anchor already proved this filter shape has a
-            # directly indexable span predicate. Reuse the same finite probe
-            # inside each time stratum: an exhausted 513-row sentinel can
-            # prove up to 512 exact matches regardless of where they fall in
-            # the stratum, without a broad ordered scan.
-            stratum_builder_kwargs["bounded_anchor_probe"] = True
         stratum_builder = builder_class(**stratum_builder_kwargs)
-        # The shared selector permits at most 512 candidates in one working
-        # batch. A 512-row page therefore needs a second ordered seed read to
-        # prove exhaustion (or observe its 513th has-more sentinel).
-        candidate_limit = min(rows_per_stratum + 1, GRAPH_DENSE_ROWS_PER_STRATUM)
+        # One extra identity is the finite has-more sentinel. Keeping the whole
+        # stratum working set at 50 avoids the 512-row classifier that exceeded
+        # the production graph deadline.
+        candidate_limit = rows_per_stratum + 1
         max_seed_attempts = (
             rows_per_stratum + 1 + candidate_limit - 1
         ) // candidate_limit
@@ -271,10 +289,7 @@ def _read_time_distributed_candidates(
         classifiers_per_seed = (
             candidate_limit + bounded_classify_batch_size - 1
         ) // bounded_classify_batch_size
-        anchor_query_budget = int(rows_per_stratum == GRAPH_DENSE_ROWS_PER_STRATUM)
-        max_query_count = anchor_query_budget + max_seed_attempts * (
-            1 + classifiers_per_seed
-        )
+        max_query_count = max_seed_attempts * (1 + classifiers_per_seed)
         try:
             page = read_bounded_filter_page(
                 builder=stratum_builder,
@@ -283,12 +298,17 @@ def _read_time_distributed_candidates(
                 key_field=key_field,
                 page_number=0,
                 page_size=rows_per_stratum,
-                deadline_ms=per_stratum_deadline_ms,
+                # Share one monotonic deadline across the complete stratified
+                # read instead of assigning one eighth up front. Per-query
+                # caps in the selector still bound a slow ClickHouse read, but
+                # a healthy classifier may use the otherwise-idle budget from
+                # adjacent strata.
+                deadline_ms=remaining_ms,
                 max_seed_attempts=max_seed_attempts,
                 max_query_count=max_query_count,
                 # The visible rows plus one has-more sentinel stay finite. A
                 # sparse/unattested path retains the 49-row representative
-                # ceiling; a dense anchor opts into the exact 512-row ceiling.
+                # ceiling.
                 max_candidates=candidate_limit,
                 classify_batch_size=bounded_classify_batch_size,
                 include_incomplete_rows=True,
@@ -316,6 +336,7 @@ def _read_time_distributed_candidates(
         rows_returned += page.rows_returned
         result_payload_bytes += page.result_payload_bytes
         total_rows_lower_bound += page.total_rows_lower_bound
+        public_code = None
         if not page.complete or page.has_more:
             complete = False
             public_code = (
@@ -324,7 +345,13 @@ def _read_time_distributed_candidates(
                 else _incomplete_error_code(page.error_code)
             )
             if public_code != "sample_limit":
-                raise BoundedGraphReadError(public_code)
+                sampling_error_code = public_code
+        # A resource/transport failure is not temporal coverage. Only an
+        # exhausted page or a bounded candidate/sample-limit response proves
+        # that this stratum was actually classified. This prevents eight
+        # failed reads from being advertised as an intentional sample.
+        if page.complete or page.has_more or public_code == "sample_limit":
+            sampling_strata_completed += 1
         for row in page.rows:
             if mode == "trace":
                 identity: Hashable = str(row.get("trace_id") or "")
@@ -343,16 +370,17 @@ def _read_time_distributed_candidates(
         key=lambda row: _candidate_row_key(row, key_field=key_field),
         reverse=True,
     )
-    if not complete and not rows:
-        raise BoundedGraphReadError("sample_limit")
-
+    full_strata_coverage = sampling_strata_completed == stratum_count
     error_code: str | None = None
     if not complete:
-        error_code = "sample_limit"
+        error_code = sampling_error_code or "sample_limit"
+    query_status = (
+        "complete" if complete else "sampled" if full_strata_coverage else "degraded"
+    )
     return GraphCandidateSample(
         rows=tuple(rows),
         query_complete=complete,
-        query_status="complete" if complete else "degraded",
+        query_status=query_status,
         query_error_code=error_code,
         window_start=window_start,
         window_end=window_end,
@@ -361,6 +389,9 @@ def _read_time_distributed_candidates(
         rows_returned=rows_returned,
         result_payload_bytes=result_payload_bytes,
         total_rows_lower_bound=max(len(rows), total_rows_lower_bound),
+        sampling_strategy=(None if complete else "time_stratified_latest_state"),
+        sampling_strata=stratum_count if not complete else 0,
+        sampling_strata_completed=(sampling_strata_completed if not complete else 0),
     )
 
 
@@ -422,7 +453,12 @@ def read_graph_candidates(
         sparse_page = None
         distributed_deadline_ms = deadline_ms
         anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
-        if callable(anchor_support) and bool(anchor_support()):
+        if (
+            callable(anchor_support)
+            and bool(anchor_support())
+            and not _has_structured_filter(effective_filters)
+        ):
+            anchor_started = monotonic()
             try:
                 sparse_page = read_bounded_filter_page(
                     builder=builder,
@@ -450,16 +486,26 @@ def read_graph_candidates(
                     error_type=type(exc).__name__,
                     exc_info=True,
                 )
-                public_code = (
-                    "read_budget_exceeded"
-                    if is_read_budget_error(exc)
-                    else "query_failed"
+                if not is_read_budget_error(exc):
+                    raise BoundedGraphReadError("query_failed") from None
+                # Code 307 / read-budget failures on a full-window anchor do
+                # not invalidate the smaller disjoint strata. Reuse no partial
+                # anchor rows and spend only the remaining request budget on
+                # deterministic latest-state samples.
+                distributed_deadline_ms = max(
+                    25,
+                    deadline_ms - int((monotonic() - anchor_started) * 1000),
                 )
-                raise BoundedGraphReadError(public_code) from None
+                if distributed_deadline_ms <= 25:
+                    raise BoundedGraphReadError("read_budget_exceeded") from None
             # ``complete`` alone can mean a proven *page prefix*.  Exact graph
             # membership requires the full sentinel probe to be exhausted,
             # represented here by a complete page with no has-more row.
-            if sparse_page.complete and not sparse_page.has_more:
+            if (
+                sparse_page is not None
+                and sparse_page.complete
+                and not sparse_page.has_more
+            ):
                 return GraphCandidateSample(
                     rows=tuple(sparse_page.rows),
                     query_complete=True,
@@ -476,16 +522,21 @@ def read_graph_candidates(
                         sparse_page.total_rows_lower_bound,
                     ),
                 )
-            if sparse_page.error_code != "sample_limit":
-                raise BoundedGraphReadError(
-                    _incomplete_error_code(sparse_page.error_code)
+            if sparse_page is not None:
+                if sparse_page.error_code not in {
+                    "sample_limit",
+                    "deadline_exceeded",
+                    "read_budget_exceeded",
+                }:
+                    raise BoundedGraphReadError(
+                        _incomplete_error_code(sparse_page.error_code)
+                    )
+                distributed_deadline_ms = max(
+                    25,
+                    deadline_ms - int(sparse_page.elapsed_ms),
                 )
-            distributed_deadline_ms = max(
-                25,
-                deadline_ms - int(sparse_page.elapsed_ms),
-            )
-            if distributed_deadline_ms <= 25:
-                raise BoundedGraphReadError("read_budget_exceeded")
+                if distributed_deadline_ms <= 25:
+                    raise BoundedGraphReadError("read_budget_exceeded")
         return _read_time_distributed_candidates(
             analytics=analytics,
             builder_class=builder_class,
@@ -496,11 +547,7 @@ def read_graph_candidates(
             window_end=window_end,
             deadline_ms=distributed_deadline_ms,
             classify_batch_size=int(classify_batch_size or 50),
-            rows_per_stratum=(
-                GRAPH_DENSE_ROWS_PER_STRATUM
-                if sparse_page is not None
-                else GRAPH_ANY_SPAN_ROWS_PER_STRATUM
-            ),
+            rows_per_stratum=GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
             prior_page=sparse_page,
         )
 
@@ -551,7 +598,7 @@ def read_graph_candidates(
         return GraphCandidateSample(
             rows=tuple(page.rows),
             query_complete=False,
-            query_status="degraded",
+            query_status="sampled",
             query_error_code=error_code,
             window_start=window_start,
             window_end=window_end,
@@ -560,6 +607,9 @@ def read_graph_candidates(
             rows_returned=page.rows_returned,
             result_payload_bytes=page.result_payload_bytes,
             total_rows_lower_bound=page.total_rows_lower_bound,
+            sampling_strategy="bounded_latest_state_prefix",
+            sampling_strata=1,
+            sampling_strata_completed=1,
         )
 
     # Every supported filter shape, including structured overflow arrays/maps,
@@ -570,7 +620,7 @@ def read_graph_candidates(
     return GraphCandidateSample(
         rows=tuple(page.rows),
         query_complete=not sampled,
-        query_status="degraded" if sampled else "complete",
+        query_status="sampled" if sampled else "complete",
         query_error_code="sample_limit" if sampled else None,
         window_start=window_start,
         window_end=window_end,
@@ -579,6 +629,9 @@ def read_graph_candidates(
         rows_returned=page.rows_returned,
         result_payload_bytes=page.result_payload_bytes,
         total_rows_lower_bound=page.total_rows_lower_bound,
+        sampling_strategy="bounded_latest_state_prefix" if sampled else None,
+        sampling_strata=1 if sampled else 0,
+        sampling_strata_completed=1 if sampled else 0,
     )
 
 
@@ -615,12 +668,11 @@ def aggregate_system_candidate_graph(
 ) -> dict[str, Any]:
     """Aggregate finite latest-state rows without another ClickHouse scan.
 
-    The public ``data`` field is exact-only. Candidate sampling can still
-    return useful bounded diagnostics, but incomplete rows must never become
-    ordinary traffic/count/cost/token/latency points.
+    Exact and explicitly sampled candidates use the same reducer. The response
+    metadata remains authoritative: sampled values are never labelled exact.
     """
 
-    if not sample.query_complete:
+    if not sample.query_complete and sample.query_status != "sampled":
         return {
             "metric_name": metric_id,
             "data": [],

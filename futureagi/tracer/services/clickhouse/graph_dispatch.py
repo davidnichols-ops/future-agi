@@ -189,19 +189,24 @@ def _candidate_trace_ids(sample: GraphCandidateSample) -> tuple[str, ...]:
 
 
 def _require_renderable_sample(sample: GraphCandidateSample) -> None:
-    """Accept only exact rows or an intentional cardinality sample marker.
+    """Accept only exact rows or an intentional bounded sample marker.
 
     A ``sample_limit`` candidate set contains proven matches selected by the
     deterministic full-window graph sampler. It is safe to return its bounded
-    diagnostics, but callers must keep ordinary graph ``data`` empty because
-    sampled counts, sums, costs, tokens, and averages are not exact. Partial
-    rows from a timed-out or failed query are not comparable coverage and
-    remain a typed degraded error.
+    diagnostics and graph points when its metadata remains explicitly sampled.
+    Partial rows from an unclassified or failed query remain a typed degraded
+    error.
     """
 
     if sample.query_complete:
         return
-    if sample.query_error_code == "sample_limit" and sample.rows:
+    if (
+        sample.query_status == "sampled"
+        and sample.sampling_strategy
+        and sample.rows
+        and sample.sampling_strata > 0
+        and sample.sampling_strata_completed == sample.sampling_strata
+    ):
         return
     raise BoundedGraphReadError(sample.query_error_code or "sample_limit")
 
@@ -209,43 +214,40 @@ def _require_renderable_sample(sample: GraphCandidateSample) -> None:
 def enforce_exact_graph_data_contract(
     response: dict[str, Any],
 ) -> dict[str, Any]:
-    """Keep the legacy ``data`` field exact-only.
+    """Publish points only for exact or explicitly sampled graph reads.
 
     Bounded candidate rows are useful internally for proving coverage and for
     exact finite decoration queries. Once any phase reports incomplete
-    coverage, however, aggregating those rows would produce a sample rather
-    than the traffic/count/cost/token/latency graph promised by ``data``.
-    Preserve the stable diagnostics but never publish sampled points under the
-    ordinary exact field.
+    coverage, aggregating those rows produces a sample. ``query_status`` must
+    say ``sampled`` before those values can enter ``data``; every other
+    incomplete/degraded response remains empty.
     """
 
+    if response.get("query_status") == "sampled":
+        planned = response.get("query_sampling_strata")
+        completed = response.get("query_sampling_strata_completed")
+        if (
+            response.get("query_sampling_strategy")
+            and isinstance(planned, int)
+            and not isinstance(planned, bool)
+            and planned > 0
+            and completed == planned
+        ):
+            return response
+        return {
+            **response,
+            "data": [],
+            "query_complete": False,
+            "query_status": "degraded",
+            "query_sampled": False,
+            "query_error_code": response.get("query_error_code") or "sample_limit",
+        }
     if (
         response.get("query_complete") is False
         or response.get("query_status") == "degraded"
     ):
         return {**response, "data": []}
     return response
-
-
-def _incomplete_candidate_response(
-    *,
-    metric_id: str,
-    sample: GraphCandidateSample,
-    started: float,
-    name: str | None = None,
-) -> dict[str, Any]:
-    """Return bounded sample diagnostics without publishing an estimate."""
-
-    _require_renderable_sample(sample)
-    response: dict[str, Any] = {
-        "metric_name": metric_id,
-        "data": [],
-        **sample.metadata(),
-        "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
-    }
-    if name is not None:
-        response["name"] = name
-    return enforce_exact_graph_data_contract(response)
 
 
 def _span_identity(row: dict[str, Any]) -> SpanIdentity | None:
@@ -540,12 +542,6 @@ def fetch_system_metric_graph_ch(
             observe_type=observe_type,
         )
         _require_renderable_sample(sample)
-        if not sample.query_complete:
-            return _incomplete_candidate_response(
-                metric_id=str(metric_id or ""),
-                sample=sample,
-                started=started,
-            )
         if str(observe_type or "").strip().lower() == "trace":
             return _fetch_trace_system_metric_graph(
                 analytics=analytics,
@@ -760,11 +756,14 @@ def _decoration_metadata(
     """Describe exact decoration reads without presenting a sample as complete."""
 
     complete = sample.query_complete and not truncated
+    sampled = sample.query_status == "sampled"
     metadata = sample.metadata()
     metadata.update(
         {
             "query_complete": complete,
-            "query_status": "complete" if complete else "degraded",
+            "query_status": (
+                "sampled" if sampled else "complete" if complete else "degraded"
+            ),
             "query_count": query_count,
             "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
             "query_rows_returned": rows_returned,
@@ -772,8 +771,10 @@ def _decoration_metadata(
     )
     if complete:
         metadata.pop("query_error_code", None)
-    else:
+    elif sampled:
         metadata["query_error_code"] = sample.query_error_code or "sample_limit"
+    else:
+        metadata["query_error_code"] = "sample_limit"
     return metadata
 
 
@@ -870,12 +871,6 @@ def fetch_eval_graph_ch(
         allow_time_only_seed=not _active_filters(filters),
     )
     _require_renderable_sample(sample)
-    if not sample.query_complete:
-        return _incomplete_candidate_response(
-            metric_id=str(req_data_config.get("id") or ""),
-            sample=sample,
-            started=started,
-        )
     return _finite_eval_graph(
         analytics=analytics,
         sample=sample,
@@ -1136,13 +1131,6 @@ def fetch_annotation_graph_ch(
         allow_time_only_seed=True,
     )
     _require_renderable_sample(sample)
-    if not sample.query_complete:
-        return _incomplete_candidate_response(
-            metric_id=label_id,
-            sample=sample,
-            started=started,
-            name=label.name,
-        )
     trace_span_identities: tuple[SpanIdentity, ...] = ()
     trace_span_ids_truncated = False
     span_identity_query_count = 0

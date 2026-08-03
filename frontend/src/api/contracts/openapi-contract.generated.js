@@ -85278,7 +85278,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string"
         },
         "data": {
-          "description": "Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.",
+          "description": "Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ObserveGraphDataPoint"
@@ -85293,6 +85293,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
+            "sampled",
             "degraded"
           ]
         },
@@ -85342,6 +85343,28 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "query_total_rows_lower_bound": {
           "title": "Query total rows lower bound",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_sampled": {
+          "title": "Query sampled",
+          "type": "boolean"
+        },
+        "query_sampling_strategy": {
+          "title": "Query sampling strategy",
+          "type": "string",
+          "enum": [
+            "time_stratified_latest_state",
+            "bounded_latest_state_prefix"
+          ]
+        },
+        "query_sampling_strata": {
+          "title": "Query sampling strata",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_sampling_strata_completed": {
+          "title": "Query sampling strata completed",
           "type": "integer",
           "minimum": 0
         },
@@ -85368,7 +85391,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string"
         },
         "data": {
-          "description": "Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.",
+          "description": "Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ObserveGraphDataPoint"
@@ -85383,6 +85406,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
+            "sampled",
             "degraded"
           ]
         },
@@ -85432,6 +85456,28 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "query_total_rows_lower_bound": {
           "title": "Query total rows lower bound",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_sampled": {
+          "title": "Query sampled",
+          "type": "boolean"
+        },
+        "query_sampling_strategy": {
+          "title": "Query sampling strategy",
+          "type": "string",
+          "enum": [
+            "time_stratified_latest_state",
+            "bounded_latest_state_prefix"
+          ]
+        },
+        "query_sampling_strata": {
+          "title": "Query sampling strata",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_sampling_strata_completed": {
+          "title": "Query sampling strata completed",
           "type": "integer",
           "minimum": 0
         }
@@ -97358,7 +97404,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
       }
     },
     "ObserveGraphDataPoint": {
-      "description": "Exact graph points only. This list is empty whenever the bounded read is incomplete or degraded; sampled aggregates are never returned as ordinary graph data.",
+      "description": "Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.",
       "required": [
         "timestamp",
         "value"

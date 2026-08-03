@@ -123,4 +123,38 @@ describe("GraphSection exact graph boundary", () => {
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
   });
+
+  it("charts explicitly sampled points with a visible sample warning", async () => {
+    axios.post.mockResolvedValue({
+      data: {
+        result: {
+          metric_name: "latency",
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 12,
+              primary_traffic: 1,
+            },
+          ],
+          query_complete: false,
+          query_status: "sampled",
+          query_error_code: "sample_limit",
+          query_sampling_strategy: "time_stratified_latest_state",
+          query_sampling_strata: 8,
+          query_sampling_strata_completed: 8,
+        },
+      },
+    });
+
+    renderGraph();
+    fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+
+    expect(
+      await screen.findByText(
+        "Showing sampled values, not full totals.",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
+    expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
+  });
 });

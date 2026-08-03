@@ -4,8 +4,10 @@ import {
   getExactGraphData,
   getQueryReadMessage,
   getQueryReadState,
+  getRenderableGraphData,
   QUERY_FAILED_RETRY_MESSAGE,
   QUERY_READ_RETRY_MESSAGE,
+  QUERY_READ_SAMPLED_MESSAGE,
 } from "../queryReadState";
 
 describe("queryReadState", () => {
@@ -31,6 +33,19 @@ describe("queryReadState", () => {
   ])("recognizes degraded metadata at every API response level", (payload) => {
     expect(getQueryReadState(payload)).toBe("degraded");
     expect(getQueryReadMessage("degraded")).toBe(QUERY_READ_RETRY_MESSAGE);
+  });
+
+  it("recognizes an explicitly sampled graph without treating it as a failure", () => {
+    const payload = {
+      query_complete: false,
+      query_status: "sampled",
+      query_sampling_strategy: "time_stratified_latest_state",
+      query_sampling_strata: 8,
+      query_sampling_strata_completed: 8,
+    };
+
+    expect(getQueryReadState(payload)).toBe("sampled");
+    expect(getQueryReadMessage("sampled")).toBe(QUERY_READ_SAMPLED_MESSAGE);
   });
 
   it("uses a generic message for request failures", () => {
@@ -71,6 +86,45 @@ describe("queryReadState", () => {
       ).toEqual([]);
     },
   );
+
+  it("renders only explicitly labelled samples", () => {
+    const points = [{ timestamp: "2026-08-03T00:00:00Z", value: 2 }];
+
+    expect(
+      getRenderableGraphData({
+        data: points,
+        query_complete: false,
+        query_status: "sampled",
+        query_sampling_strategy: "time_stratified_latest_state",
+        query_sampling_strata: 8,
+        query_sampling_strata_completed: 8,
+      }),
+    ).toEqual(points);
+    expect(
+      getRenderableGraphData({
+        data: points,
+        query_complete: false,
+        query_status: "degraded",
+      }),
+    ).toEqual([]);
+  });
+
+  it.each([
+    {},
+    { query_sampling_strata: 8, query_sampling_strata_completed: 0 },
+    { query_sampling_strata: 8, query_sampling_strata_completed: 1 },
+  ])("refuses a sampled graph without full temporal coverage", (coverage) => {
+    const payload = {
+      data: [{ timestamp: "2026-08-03T00:00:00Z", value: 999 }],
+      query_complete: false,
+      query_status: "sampled",
+      query_sampling_strategy: "time_stratified_latest_state",
+      ...coverage,
+    };
+
+    expect(getQueryReadState(payload)).toBe("degraded");
+    expect(getRenderableGraphData(payload)).toEqual([]);
+  });
 
   it("preserves server-side pagination failure semantics", () => {
     const params = {

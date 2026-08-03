@@ -43,9 +43,9 @@ import { formatDate } from "src/utils/report-utils";
 import { toBackendFilters } from "../common";
 import { combineGraphFilters } from "./graphFilterUtils";
 import {
-  getExactGraphData,
   getQueryReadMessage,
   getQueryReadState,
+  getRenderableGraphData,
 } from "src/utils/queryReadState";
 
 // ---------------------------------------------------------------------------
@@ -363,7 +363,7 @@ const PrimaryGraph = ({
   const { metricData, trafficData } = useMemo(() => {
     if (!graphData) return { metricData: [], trafficData: [] };
 
-    const items = getExactGraphData(graphData);
+    const items = getRenderableGraphData(graphData);
     const mData = [];
     const tData = [];
 
@@ -389,17 +389,25 @@ const PrimaryGraph = ({
       ? "rgba(147, 130, 220, 0.30)"
       : "rgba(147, 160, 230, 0.25)");
 
-  const lineSeriesName = metricDef.unit
+  const metricSeriesName = metricDef.unit
     ? `${metricDef.label} (${metricDef.unit})`
     : metricDef.label;
+  const lineSeriesName =
+    graphReadState === "sampled"
+      ? `Sampled ${metricSeriesName}`
+      : metricSeriesName;
 
   // Series: metric line FIRST (left axis), traffic bars SECOND (right axis)
   const series = useMemo(
     () => [
       { name: lineSeriesName, type: "line", data: metricData },
-      { name: "Traffic", type: "column", data: trafficData },
+      {
+        name: graphReadState === "sampled" ? "Sampled traffic" : "Traffic",
+        type: "column",
+        data: trafficData,
+      },
     ],
-    [lineSeriesName, metricData, trafficData],
+    [graphReadState, lineSeriesName, metricData, trafficData],
   );
 
   // Drag-to-zoom → apply as date filter

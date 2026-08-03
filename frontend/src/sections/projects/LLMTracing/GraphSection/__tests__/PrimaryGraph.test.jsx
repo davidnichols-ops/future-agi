@@ -204,6 +204,42 @@ describe("PrimaryGraph", () => {
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
   });
 
+  it("charts an explicitly sampled graph with a sample warning", async () => {
+    axios.post.mockResolvedValue({
+      data: {
+        result: {
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 12,
+              primary_traffic: 1,
+            },
+          ],
+          query_complete: false,
+          query_status: "sampled",
+          query_error_code: "sample_limit",
+          query_sampling_strategy: "time_stratified_latest_state",
+          query_sampling_strata: 8,
+          query_sampling_strata_completed: 8,
+        },
+      },
+    });
+
+    renderWithQueryClient(
+      <PrimaryGraph observeIdOverride="project-override" />,
+    );
+
+    expect(
+      await screen.findByText(
+        "Showing sampled values, not full totals.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
+    expect(
+      screen.queryByText("No data available for this time range"),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows a generic graph error without exposing backend exception text", async () => {
     axios.post.mockRejectedValue({
       result: "Code: 159 DB::Exception: Timeout exceeded Stack trace...",
