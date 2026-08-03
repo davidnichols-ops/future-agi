@@ -130,6 +130,26 @@ def _get_client():
     so a settings-client is never shared across threads and a concurrent caller
     with a different key cannot close a client this thread is mid-query on. The
     empty-settings path is unchanged."""
+    cfg = get_v2_config()
+    if cfg["server_enforced_readonly"]:
+        global _client
+        if _client is not None:
+            return _client
+        with _client_lock:
+            if _client is None:
+                from tracer.services.clickhouse.server_readonly import (
+                    ServerEnforcedReadOnlyNativeClient,
+                )
+
+                _client = ServerEnforcedReadOnlyNativeClient(
+                    host=cfg["host"],
+                    port=cfg["tcp_port"],
+                    username=cfg["user"],
+                    password=cfg["password"] or "",
+                    database=cfg["database"],
+                )
+        return _client
+
     overrides = current_settings()
     if overrides:
         key = tuple(sorted(overrides.items()))
@@ -146,7 +166,6 @@ def _get_client():
                 pass
         import clickhouse_connect
 
-        cfg = get_v2_config()
         client = clickhouse_connect.get_client(
             host=cfg["host"],
             port=cfg["http_port"],
@@ -159,14 +178,12 @@ def _get_client():
         _settings_tls.client = client
         _settings_tls.key = key
         return client
-    global _client
     if _client is not None:
         return _client
     with _client_lock:
         if _client is None:
             import clickhouse_connect
 
-            cfg = get_v2_config()
             _client = clickhouse_connect.get_client(
                 host=cfg["host"],
                 port=cfg["http_port"],

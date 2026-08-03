@@ -756,6 +756,40 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             f"\n              AND {any_span_having}" if any_span_having else ""
         )
 
+        # Identity-only eval/task selectors must retain the exact physical
+        # child span that proved each any-span filter.  A trace-level result id
+        # alone cannot later bind ``final_status`` (or another child attribute)
+        # to the evaluation mapping: separate leaves may be satisfied by
+        # separate children, and OTel span ids can be reused across start
+        # times.  Project + trace are carried by the surrounding result; each
+        # tuple below preserves the remaining immutable identity fields.
+        witness_selects: list[str] = []
+        witness_aliases: list[str] = []
+        if self._bounded_identity_only:
+            for witness_index, plan in enumerate(any_span_plans):
+                witness_alias = f"filter_witness_{witness_index}"
+                witness_aliases.append(witness_alias)
+                witness_condition = f"({plan.predicate})"
+                if scope_to_request_window:
+                    witness_condition = (
+                        f"{any_span_window_condition} AND {witness_condition}"
+                    )
+                witness_selects.append(
+                    "argMinIf("
+                    "tuple(grouped_id, latest_start_time), "
+                    "tuple(latest_start_time, grouped_id), "
+                    f"{witness_condition}"
+                    f") AS {witness_alias}"
+                )
+        witness_select_fragment = (
+            ",\n                " + ",\n                ".join(witness_selects)
+            if witness_selects
+            else ""
+        )
+        witness_public_fragment = (
+            ", " + ", ".join(witness_aliases) if witness_aliases else ""
+        )
+
         residual_predicate = "1 = 1"
         if residual_filters:
             residual_builder = self._FILTER_BUILDER_CLS(
@@ -780,8 +814,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     latest_start_time,
                     {canonical_root_order},
                     {canonical_root_condition}
-                ) AS start_time"""
-            public_select_fragment = "trace_id, start_time"
+                ) AS start_time{witness_select_fragment}"""
+            public_select_fragment = f"trace_id, start_time{witness_public_fragment}"
             hydrate_root_aggregate_fragment = ""
         else:
             root_fields = (

@@ -162,12 +162,20 @@ _SPAN_ATTR_TYPE_META_V2: dict[str, tuple[str, Callable[[Any], Any]]] = {
 
 
 _V2_REQUIRED_SETTINGS = (
-    # CRITICAL for trillion-row scale: FINAL on ReplacingMergeTree bypasses
-    # skip indexes by default. Without this, every dashboard query that uses
-    # FINAL (almost all of them) full-scans the parts. Measured 47× slowdown
-    # locally without this setting. See DECISIONS #026 in
-    # internal-docs/clickhouse-analytics/migration-to-ch25/.
-    "use_skip_indexes_if_final = 1",
+    # Correctness boundary for ReplacingMergeTree reads.  A skip index on a
+    # column outside the sorting key may hide the newest physical version from
+    # FINAL, allowing an older version to survive the merge.  List, graph, and
+    # eval-filter builders accept arbitrary mutable Map/JSON/custom-attribute
+    # predicates (and can include FINAL reads of dimension/score tables), so a
+    # blanket opt-in is not sound.  Pin the safe ClickHouse default explicitly;
+    # this also makes ordinary application reads match the server-enforced
+    # read-only A/B profile, which locks this setting to zero.
+    #
+    # Narrow point reads over stable identity keys opt in separately in
+    # ``v2.span_reader._FINAL_SKIP_INDEX_SETTINGS``.  Those queries deliberately
+    # omit mutable ``is_deleted``/attribute predicates, preserving their bloom-
+    # index speedup without weakening the general query-builder contract.
+    "use_skip_indexes_if_final = 0",
     # Encourage projection auto-routing for dashboard aggregates. Falls
     # through to base-table read if no projection matches — zero risk.
     "optimize_use_projections = 1",

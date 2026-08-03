@@ -5153,7 +5153,8 @@ class TestDashboardV2RewriteRouting:
         sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
         assert "is_deleted" in sql
         assert "_peerdb_is_deleted" not in sql
-        assert "use_skip_indexes_if_final" in sql
+        assert "use_skip_indexes_if_final = 0" in sql
+        assert "use_skip_indexes_if_final = 1" not in sql
 
     def test_settings_appended_exactly_once(self):
         config = _single_metric_config(

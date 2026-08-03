@@ -80,6 +80,15 @@ def get_v2_config() -> dict[str, Any]:
         "database": configured(
             "CH25_DATABASE", "CH25_DATABASE", legacy.get("CH_DATABASE", "futureagi")
         ),
+        "server_enforced_readonly": str(
+            configured(
+                "CH25_SERVER_ENFORCED_READONLY",
+                "CH25_SERVER_ENFORCED_READONLY",
+                legacy.get("CH_SERVER_ENFORCED_READONLY", False),
+                allow_empty=True,
+            )
+        ).lower()
+        in {"1", "true", "yes"},
     }
 
 
@@ -98,6 +107,8 @@ def get_reader():
         username=cfg["user"],
         password=cfg["password"],
         database=cfg["database"],
+        server_enforced_readonly=cfg["server_enforced_readonly"],
+        native_port=cfg["tcp_port"],
     )
 
 

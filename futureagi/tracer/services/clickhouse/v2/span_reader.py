@@ -462,16 +462,35 @@ class CHSpanReader:
         password: str = "",
         database: str = "default",
         timeout_sec: int = 30,
+        server_enforced_readonly: bool = False,
+        native_port: int | None = None,
     ):
-        self._client = clickhouse_connect.get_client(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            database=database,
-            send_receive_timeout=timeout_sec,
-            settings=current_settings() or None,
-        )
+        if server_enforced_readonly:
+            if native_port is None:
+                raise ValueError(
+                    "native_port is required for a server-enforced read-only reader"
+                )
+            from tracer.services.clickhouse.server_readonly import (
+                ServerEnforcedReadOnlyNativeClient,
+            )
+
+            self._client = ServerEnforcedReadOnlyNativeClient(
+                host=host,
+                port=native_port,
+                username=username,
+                password=password,
+                database=database,
+            )
+        else:
+            self._client = clickhouse_connect.get_client(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                database=database,
+                send_receive_timeout=timeout_sec,
+                settings=current_settings() or None,
+            )
 
     def close(self) -> None:
         self._client.close()

@@ -13,6 +13,11 @@ from typing import Any
 import structlog
 from django.conf import settings
 
+from tracer.services.clickhouse.server_readonly import (
+    ensure_read_statement,
+    without_query_settings,
+)
+
 logger = structlog.get_logger(__name__)
 
 # Try to import clickhouse-driver, gracefully handle if not installed
@@ -43,6 +48,7 @@ class ClickHouseClient:
         user: str | None = None,
         password: str | None = None,
         database: str | None = None,
+        server_enforced_readonly: bool | None = None,
     ):
         """
         Initialize ClickHouse client with connection settings.
@@ -59,6 +65,11 @@ class ClickHouseClient:
         )
         self.database = (
             ch_settings.get("CH_DATABASE", "default") if database is None else database
+        )
+        self.server_enforced_readonly = (
+            bool(ch_settings.get("CH_SERVER_ENFORCED_READONLY", False))
+            if server_enforced_readonly is None
+            else bool(server_enforced_readonly)
         )
 
         # Connection settings
@@ -98,6 +109,12 @@ class ClickHouseClient:
         if not self.host:
             raise ValueError("ClickHouse host is not configured")
 
+        driver_settings = (
+            None
+            if self.server_enforced_readonly
+            else {"use_numpy": False, "max_block_size": 100000}
+        )
+
         return CHDriver(
             host=self.host,
             port=self.port,
@@ -106,10 +123,7 @@ class ClickHouseClient:
             database=self.database,
             connect_timeout=self.connect_timeout,
             send_receive_timeout=max(self.send_timeout, self.receive_timeout),
-            settings={
-                "use_numpy": False,
-                "max_block_size": 100000,
-            },
+            settings=driver_settings,
         )
 
     def _get_client(self) -> CHDriver:
@@ -142,6 +156,11 @@ class ClickHouseClient:
             with client.connection() as conn:
                 conn.execute("SELECT 1")
         """
+        if self.server_enforced_readonly:
+            raise RuntimeError(
+                "Raw ClickHouse connections are disabled for the "
+                "server-enforced read-only client."
+            )
         client = self._get_client()
         try:
             yield client
@@ -169,6 +188,10 @@ class ClickHouseClient:
         Returns:
             List of result tuples, or (results, column_types) if with_column_types=True
         """
+        if self.server_enforced_readonly:
+            query = without_query_settings(query)
+            ensure_read_statement(query)
+            settings = None
         client = self._get_client()
         t_start = time.monotonic()
 
@@ -235,13 +258,30 @@ class ClickHouseClient:
         Returns:
             Tuple of (rows, column_types, query_time_ms)
         """
+        query_settings: dict[str, Any] | None
+        if self.server_enforced_readonly:
+            # A ClickHouse profile locked at readonly=1 rejects *all* client
+            # setting changes, including an otherwise harmless readonly=2 or
+            # max_execution_time override.  The SOS/read-replica lane relies on
+            # the server profile for those ceilings, so transmit no settings at
+            # connection or query scope.  Production's ordinary application
+            # role keeps the existing per-query guardrails below.
+            query_settings = None
+            query = without_query_settings(query)
+            ensure_read_statement(query)
+            logger.debug(
+                "Using server-enforced ClickHouse read settings",
+                requested_setting_keys=sorted((settings or {}).keys()),
+                requested_timeout_ms=timeout_ms,
+            )
+        else:
+            query_settings = {**(settings or {}), "readonly": 2}
+            if timeout_ms is not None:
+                # max_execution_time is in seconds
+                query_settings["max_execution_time"] = max(timeout_ms / 1000.0, 0.001)
+
         client = self._get_client()
         t_start = time.monotonic()
-
-        query_settings = {**(settings or {}), "readonly": 2}
-        if timeout_ms is not None:
-            # max_execution_time is in seconds
-            query_settings["max_execution_time"] = max(timeout_ms / 1000.0, 0.001)
 
         try:
             logger.debug(
@@ -293,6 +333,14 @@ class ClickHouseClient:
 
         Useful for large result sets to avoid loading all data into memory.
         """
+        if self.server_enforced_readonly:
+            query = without_query_settings(query)
+            ensure_read_statement(query)
+            raise RuntimeError(
+                "Direct execute_iter is disabled for the server-enforced "
+                "read-only client; use the managed native block stream."
+            )
+
         client = self._get_client()
 
         try:
@@ -319,6 +367,12 @@ class ClickHouseClient:
         Returns:
             Number of rows inserted
         """
+        if self.server_enforced_readonly:
+            raise RuntimeError(
+                "ClickHouse inserts are disabled for the server-enforced "
+                "read-only client."
+            )
+
         if not data:
             return 0
 

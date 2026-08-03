@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextvars
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from django.db import transaction
@@ -20,6 +21,7 @@ from tracer.models.eval_task import RowType
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, EvalTargetType
 from tracer.selectors.eval_tasks.row_resolver import (
     EvalTaskReadBudgetExceeded,
+    TraceFilterWitness,
     iter_desired_rows,
 )
 from tracer.services.clickhouse.v2 import get_reader
@@ -50,6 +52,9 @@ _SAFE_AMBIGUOUS_SPAN_MESSAGE = (
 _engine_entry_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "eval_engine_entry_id", default=None
 )
+_engine_task_selection: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("eval_engine_task_selection", default=None)
+)
 
 # Identity / FK / lifecycle columns the materialized entry already owns — the
 # result write must not touch them (status + hash are stamped by mark_terminal;
@@ -79,13 +84,25 @@ _RESULT_SKIP = {
 
 
 @contextmanager
-def writing_onto_entry(entry_id: str) -> Iterator[None]:
+def writing_onto_entry(
+    entry_id: str,
+    *,
+    output_metadata: dict[str, Any] | None = None,
+) -> Iterator[None]:
     """Within this block, eval result writes update the materialized entry in
     place instead of creating a new (colliding) EvalLogger row."""
     token = _engine_entry_id.set(str(entry_id))
+    selection = (
+        deepcopy(output_metadata.get("_task_selection"))
+        if isinstance(output_metadata, dict)
+        and isinstance(output_metadata.get("_task_selection"), dict)
+        else None
+    )
+    selection_token = _engine_task_selection.set(selection)
     try:
         yield
     finally:
+        _engine_task_selection.reset(selection_token)
         _engine_entry_id.reset(token)
 
 
@@ -107,6 +124,15 @@ def persist_eval_result(logger_kwargs: dict[str, Any]) -> EvalLogger | None:
     fields = {
         k: v for k, v in logger_kwargs.items() if k in valid and k not in _RESULT_SKIP
     }
+    selection = _engine_task_selection.get()
+    if selection is not None and "output_metadata" in fields:
+        result_metadata = fields.get("output_metadata")
+        if not isinstance(result_metadata, dict):
+            result_metadata = {}
+        fields["output_metadata"] = {
+            **result_metadata,
+            "_task_selection": deepcopy(selection),
+        }
     # Fence on RUNNING so a stale worker's late result write no-ops after a
     # reaper requeue + re-claim (see mark_terminal).
     EvalLogger.objects.filter(id=entry_id, status=EvalEntryStatus.RUNNING).update(
@@ -120,6 +146,7 @@ def materialize_pending(
     resolved_row_ids: Iterable[str] | None = None,
     *,
     ceiling: datetime | None = None,
+    trace_filter_witnesses: Iterable[TraceFilterWitness] = (),
 ) -> int:
     """Create one pending entry per (desired row, eval). Returns rows submitted.
 
@@ -131,6 +158,19 @@ def materialize_pending(
         return 0
     hashes = {cfg.id: resolved_config_hash(cfg) for cfg in evals}
     target_type = _TARGET_TYPE[task.row_type]
+    witnesses_by_trace: dict[str, list[dict[str, Any]]] = {}
+    for witness in trace_filter_witnesses:
+        witnesses_by_trace.setdefault(str(witness.trace_id), []).append(
+            {
+                "filter_ordinal": int(witness.filter_ordinal),
+                "column_id": str(witness.column_id),
+                "col_type": str(witness.col_type),
+                "project_id": str(witness.project_id),
+                "trace_id": str(witness.trace_id),
+                "span_id": str(witness.span_id),
+                "start_time": witness.start_time.isoformat(),
+            }
+        )
     submitted = 0
     reader = get_reader()
     try:
@@ -150,6 +190,17 @@ def materialize_pending(
                     # e.g. a trace with no root span, or a span gone from CH.
                     continue
                 for cfg in evals:
+                    entry_fields = dict(fks)
+                    trace_witnesses = witnesses_by_trace.get(str(identity), [])
+                    if target_type == EvalTargetType.TRACE and trace_witnesses:
+                        entry_fields["output_metadata"] = {
+                            "_task_selection": {
+                                "filter_witnesses": sorted(
+                                    trace_witnesses,
+                                    key=lambda item: item["filter_ordinal"],
+                                )
+                            }
+                        }
                     rows.append(
                         EvalLogger(
                             target_type=target_type,
@@ -157,15 +208,85 @@ def materialize_pending(
                             eval_task_id=str(task.id),
                             status=EvalEntryStatus.PENDING,
                             config_hash=hashes[cfg.id],
-                            **fks,
+                            **entry_fields,
                         )
                     )
             if rows:
                 EvalLogger.objects.bulk_create(rows, ignore_conflicts=True)
                 submitted += len(rows)
+            if target_type == EvalTargetType.TRACE and witnesses_by_trace:
+                _refresh_waiting_trace_witnesses(
+                    task,
+                    batch,
+                    witnesses_by_trace=witnesses_by_trace,
+                    config_hashes=hashes,
+                )
     finally:
         reader.close()
     return submitted
+
+
+def _refresh_waiting_trace_witnesses(
+    task: EvalTask,
+    trace_ids: Iterable[str],
+    *,
+    witnesses_by_trace: dict[str, list[dict[str, Any]]],
+    config_hashes: dict[Any, str],
+) -> None:
+    """Backfill witness metadata on idempotent/requeued trace entries.
+
+    ``bulk_create(ignore_conflicts=True)`` cannot update an entry that an
+    earlier reconcile already materialized. Refresh only entries that are
+    waiting/retryable (plus completed entries whose config is about to be
+    requeued); never rewrite a completed paid result or an in-flight worker.
+    """
+
+    updates: list[EvalLogger] = []
+    entries = EvalLogger.objects.filter(
+        eval_task_id=str(task.id),
+        target_type=EvalTargetType.TRACE,
+        trace_id__in=list(trace_ids),
+    ).only(
+        "id",
+        "trace_id",
+        "status",
+        "config_hash",
+        "custom_eval_config_id",
+        "output_metadata",
+    )
+    for entry in entries:
+        expected_hash = config_hashes.get(entry.custom_eval_config_id)
+        retryable = entry.status in {
+            EvalEntryStatus.PENDING,
+            EvalEntryStatus.ERRORED,
+            EvalEntryStatus.SKIPPED,
+        }
+        stale_completed = (
+            entry.status == EvalEntryStatus.COMPLETED
+            and bool(entry.config_hash)
+            and expected_hash is not None
+            and entry.config_hash != expected_hash
+        )
+        trace_witnesses = witnesses_by_trace.get(str(entry.trace_id), [])
+        if not trace_witnesses or not (retryable or stale_completed):
+            continue
+        metadata = (
+            deepcopy(entry.output_metadata)
+            if isinstance(entry.output_metadata, dict)
+            else {}
+        )
+        selection = metadata.get("_task_selection")
+        selection = deepcopy(selection) if isinstance(selection, dict) else {}
+        selection["filter_witnesses"] = sorted(
+            trace_witnesses,
+            key=lambda item: item["filter_ordinal"],
+        )
+        metadata["_task_selection"] = selection
+        if metadata != entry.output_metadata:
+            entry.output_metadata = metadata
+            updates.append(entry)
+    if updates:
+        EvalLogger.objects.bulk_update(updates, ["output_metadata"])
 
 
 def _iter_materialize_batches(row_ids: Iterable[str]) -> Iterator[list[str]]:

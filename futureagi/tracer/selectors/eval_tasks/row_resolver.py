@@ -16,7 +16,7 @@ the row limit. The entry FKs are batch-resolved by the materializer later.
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -77,6 +77,19 @@ class EvalTaskReadBudgetExceeded(RuntimeError):
 
 
 @dataclass(frozen=True)
+class TraceFilterWitness:
+    """Latest-state child identity that proved one trace filter leaf."""
+
+    trace_id: str
+    filter_ordinal: int
+    column_id: str
+    col_type: str
+    project_id: str
+    span_id: str
+    start_time: datetime
+
+
+@dataclass(frozen=True)
 class ResolvedRowSet:
     """One completely-buffered desired-state proof.
 
@@ -89,6 +102,85 @@ class ResolvedRowSet:
     candidate_ids: tuple[str, ...]
     matched_ids: tuple[str, ...]
     full_state: bool
+    trace_filter_witnesses: tuple[TraceFilterWitness, ...] = ()
+
+
+@dataclass(frozen=True)
+class _BoundedHistoricalResult:
+    ids: tuple[str, ...]
+    trace_filter_witnesses: tuple[TraceFilterWitness, ...] = ()
+
+
+def _trace_any_span_filter_descriptors(
+    ui_filters: list[dict[str, Any]],
+) -> tuple[tuple[str, str], ...]:
+    """Return ``(column_id, col_type)`` in classifier witness order."""
+
+    from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+        compile_trace_filter_plans,
+    )
+
+    descriptors: list[tuple[str, str]] = []
+    for item in ui_filters:
+        if not isinstance(item, dict):
+            continue
+        column_id = item.get("column_id") or item.get("columnId")
+        if column_id in {"created_at", "start_time"}:
+            continue
+        try:
+            plans = compile_trace_filter_plans([item])
+        except (TypeError, ValueError):
+            continue
+        for plan in plans:
+            if plan.scope != "any":
+                continue
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            descriptors.append(
+                (
+                    str(column_id),
+                    str(config.get("col_type") or config.get("colType") or ""),
+                )
+            )
+    return tuple(descriptors)
+
+
+def _trace_filter_witnesses_from_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    ui_filters: list[dict[str, Any]],
+    project_id: str,
+) -> tuple[TraceFilterWitness, ...]:
+    descriptors = _trace_any_span_filter_descriptors(ui_filters)
+    witnesses: list[TraceFilterWitness] = []
+    seen: set[tuple[str, int]] = set()
+    for row in rows:
+        trace_id = str(row.get("trace_id") or "")
+        if not trace_id:
+            continue
+        for ordinal, (column_id, col_type) in enumerate(descriptors):
+            raw_identity = row.get(f"filter_witness_{ordinal}")
+            if not isinstance(raw_identity, (list, tuple)) or len(raw_identity) != 2:
+                continue
+            span_id = str(raw_identity[0] or "")
+            start_time = raw_identity[1]
+            if not span_id or not isinstance(start_time, datetime):
+                continue
+            identity = (trace_id, ordinal)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            witnesses.append(
+                TraceFilterWitness(
+                    trace_id=trace_id,
+                    filter_ordinal=ordinal,
+                    column_id=column_id,
+                    col_type=col_type,
+                    project_id=str(project_id),
+                    span_id=span_id,
+                    start_time=start_time,
+                )
+            )
+    return tuple(witnesses)
 
 
 def iter_desired_rows(
@@ -142,7 +234,7 @@ def resolve_desired_rows(
             V2AnalyticsQueryService,
         )
 
-        resolved_ids = _resolve_bounded_historical_span_ids(
+        bounded_result = _resolve_bounded_historical_span_ids(
             V2AnalyticsQueryService(),
             sql=None,
             params=None,
@@ -153,9 +245,20 @@ def resolve_desired_rows(
             limit=int(limit),
             batch_size=_EVAL_TASK_BUFFERED_ID_LIMIT,
             row_type=task.row_type,
+            include_trace_filter_witnesses=True,
         )
-        resolved = tuple(resolved_ids)
-        return ResolvedRowSet(resolved, resolved, True)
+        if not isinstance(bounded_result, _BoundedHistoricalResult):
+            # Preserve compatibility with test/fallback selectors that return
+            # the historical list shape and therefore cannot supply witnesses.
+            bounded_result = _BoundedHistoricalResult(
+                tuple(str(value) for value in bounded_result)
+            )
+        return ResolvedRowSet(
+            bounded_result.ids,
+            bounded_result.ids,
+            True,
+            bounded_result.trace_filter_witnesses,
+        )
 
     sql, params = _build_sample_query(
         project_id=str(task.project_id),
@@ -252,6 +355,7 @@ def _resolve_continuous_rows(
                 classify_size = min(classify_size, max(1, int(recommended_size)))
         deadline = time.monotonic() + _EVAL_TASK_TOTAL_READ_SECONDS * 0.5
         matched: list[str] = []
+        matched_rows: list[dict[str, Any]] = []
         for offset in range(0, len(candidates.classifier_ids), classify_size):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -277,6 +381,7 @@ def _resolve_continuous_rows(
             result_key = (
                 "root_span_id" if task.row_type == RowType.VOICE_CALLS else key_field
             )
+            matched_rows.extend(result.data)
             matched.extend(
                 str(row[result_key])
                 for row in result.data
@@ -296,7 +401,24 @@ def _resolve_continuous_rows(
         # fences malformed/multi-root output before reconciliation can write.
         candidate_public = set(candidates.public_ids)
         matched_ids = tuple(value for value in matched_ids if value in candidate_public)
-        return ResolvedRowSet(candidates.public_ids, matched_ids, full_state)
+        witnesses: tuple[TraceFilterWitness, ...] = ()
+        if task.row_type == RowType.TRACES:
+            matched_set = set(matched_ids)
+            witnesses = tuple(
+                witness
+                for witness in _trace_filter_witnesses_from_rows(
+                    matched_rows,
+                    ui_filters=ui_filters,
+                    project_id=str(task.project_id),
+                )
+                if witness.trace_id in matched_set
+            )
+        return ResolvedRowSet(
+            candidates.public_ids,
+            matched_ids,
+            full_state,
+            witnesses,
+        )
     except EvalTaskReadBudgetExceeded:
         raise
     except ContinuousCandidateOverflow:
@@ -319,7 +441,8 @@ def _resolve_bounded_historical_span_ids(
     limit: int,
     batch_size: int,
     row_type: str = RowType.SPANS,
-) -> list[str]:
+    include_trace_filter_witnesses: bool = False,
+) -> list[str] | _BoundedHistoricalResult:
     """Resolve a complete historical span/trace prefix with bounded CH reads.
 
     Adjacent time slices produce only candidate identities. Every candidate is
@@ -329,8 +452,26 @@ def _resolve_bounded_historical_span_ids(
     and never leaks a partial task row set.
     """
 
+    def resolved_result(
+        ids: Iterable[str],
+        rows: Iterable[dict[str, Any]] = (),
+        *,
+        ui_filters: list[dict[str, Any]] | None = None,
+    ) -> list[str] | _BoundedHistoricalResult:
+        normalized_ids = tuple(str(value) for value in ids)
+        if not include_trace_filter_witnesses:
+            return list(normalized_ids)
+        witnesses: tuple[TraceFilterWitness, ...] = ()
+        if row_type == RowType.TRACES and ui_filters is not None:
+            witnesses = _trace_filter_witnesses_from_rows(
+                rows,
+                ui_filters=ui_filters,
+                project_id=str(project_id),
+            )
+        return _BoundedHistoricalResult(normalized_ids, witnesses)
+
     if limit <= 0:
-        return []
+        return resolved_result(())
     if row_type not in (RowType.SPANS, RowType.TRACES):
         raise ValueError("Bounded historical resolution supports spans and traces")
     if not 0 <= float(sampling_rate) <= 100:
@@ -373,11 +514,13 @@ def _resolve_bounded_historical_span_ids(
                 limit=limit,
             )
         )
-        return _resolve_buffered_legacy_ids(
-            compatibility_sql,
-            compatibility_params,
-            batch_size=batch_size,
-            limit=limit,
+        return resolved_result(
+            _resolve_buffered_legacy_ids(
+                compatibility_sql,
+                compatibility_params,
+                batch_size=batch_size,
+                limit=limit,
+            )
         )
 
     query_type, key_field = _BUILDER_BY_ROW_TYPE[row_type]
@@ -407,7 +550,7 @@ def _resolve_bounded_historical_span_ids(
     if not isinstance(start_date, datetime) or not isinstance(end_date, datetime):
         raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
     if start_date >= end_date:
-        return []
+        return resolved_result(())
     if not has_time_filter:
         # BaseQueryBuilder's default window is relative to ``utcnow()``. Pin
         # that one resolved window before adjacent seed pages are built;
@@ -488,11 +631,13 @@ def _resolve_bounded_historical_span_ids(
                 if row.get(key_field) not in (None, "")
             )
         )
-        return sorted(resolved) if requires_population_proof else resolved
+        final_ids = sorted(resolved) if requires_population_proof else resolved
+        return resolved_result(final_ids, page.rows, ui_filters=ui_filters)
     resolved = [
         str(row[key_field]) for row in page.rows if row.get(key_field) not in (None, "")
     ]
-    return sorted(resolved) if requires_population_proof else resolved
+    final_ids = sorted(resolved) if requires_population_proof else resolved
+    return resolved_result(final_ids, page.rows, ui_filters=ui_filters)
 
 
 def _resolve_buffered_legacy_ids(

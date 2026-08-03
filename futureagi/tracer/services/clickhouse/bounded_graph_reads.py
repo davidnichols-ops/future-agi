@@ -2,8 +2,8 @@
 
 Filtered Observe graphs must not materialize a tenant/window-wide ``IN
 (SELECT ...)`` set. This module reuses the list endpoint's selective-anchor /
-ordered-prefix protocol. Small result sets remain exact; high-cardinality
-result sets use a deterministic, full-window sample that is always marked
+ordered-prefix protocol. Results within the finite graph ceiling remain exact;
+larger result sets use a deterministic full-window sample that is always marked
 incomplete. Budget or query failures never become an allegedly exact graph.
 """
 
@@ -32,9 +32,9 @@ from tracer.services.clickhouse.v2.query_builders.trace_list import (
 
 # The shared selector performs at most 24 finite 200-ID seed/classify batches.
 # Keep one sentinel below that 4,800-row mechanical ceiling: results through
-# 4,095 can be proven exhaustive, while row 4,096 proves a bounded degraded
+# 4,096 can be proven exhaustive, while row 4,097 proves a bounded degraded
 # sample without ever constructing a tenant-wide Set.
-GRAPH_CANDIDATE_LIMIT = 4_095
+GRAPH_CANDIDATE_LIMIT = 4_096
 # A root-only trace classifier intentionally hydrates complete presentation
 # rows in batches of 50 (the production-safe memory ceiling).  Asking the
 # shared selector for 4,095 rows would require 83 minimum queries including
@@ -42,13 +42,21 @@ GRAPH_CANDIDATE_LIMIT = 4_095
 # one-trace equality filter would fail before ClickHouse was queried.  Keep
 # the exact root-only ceiling at 1,599: its 1,600-row sentinel needs at most
 # four 512-row seeds plus 32 classifier batches.  Any-span trace filters retain the
-# 4,095 ceiling because their directly-indexable classifier safely uses 512.
+# 4,096 ceiling because their directly-indexable classifier safely uses 512.
 GRAPH_TRACE_ROOT_CANDIDATE_LIMIT = 1_599
 GRAPH_CANDIDATE_DEADLINE_MS = 3_900
 GRAPH_DECORATION_CANDIDATE_DEADLINE_MS = 3_100
 GRAPH_MAX_POINTS = 10_000
 GRAPH_ANY_SPAN_STRATA = 8
 GRAPH_ANY_SPAN_ROWS_PER_STRATUM = 49
+# A long-window sparse-anchor sentinel distinguishes a common predicate before
+# the ordered stratum reads begin. Once it is known to be common, retaining the
+# 49-row representative ceiling guarantees an exact-empty ``sample_limit``
+# graph even when the full match set is still safely finite. Give that path an
+# exact replay budget of 512 visible identities per stratum (4,096 total). An
+# exhausted per-stratum 513-row anchor proves exactness; every ordered fallback
+# and latest-state classifier remains batch-bounded.
+GRAPH_DENSE_ROWS_PER_STRATUM = 512
 GRAPH_ANY_SPAN_DISTRIBUTED_AFTER = timedelta(hours=1)
 # Before distributing a long window, give a directly-indexable predicate one
 # bounded chance to prove that the entire result is sparse.  The 513th raw
@@ -192,17 +200,20 @@ def _read_time_distributed_candidates(
     window_end: datetime,
     deadline_ms: int,
     classify_batch_size: int,
+    rows_per_stratum: int = GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
     prior_page: Any | None = None,
 ) -> GraphCandidateSample:
-    """Sample arbitrary child-span filters across the full requested window.
+    """Read arbitrary child-span filters across bounded full-window strata.
 
     Trace attributes may live on any child span.  A single newest-first scan
     can consume its budget in the latest dense slice and show no older shape.
-    Eight disjoint time strata keep the work finite (at most sixteen queries)
-    and deterministic.  A stratum is marked complete only when its seed was
-    exhausted, so the combined graph can never advertise a sample as exact.
+    Eight disjoint time strata keep the work finite and deterministic. A
+    stratum is marked complete only when its seed was exhausted, so the
+    combined graph can never advertise a sample as exact.
     """
 
+    if not 1 <= rows_per_stratum <= GRAPH_DENSE_ROWS_PER_STRATUM:
+        raise ValueError("graph rows_per_stratum exceeds the bounded contract")
     stratum_count = min(
         GRAPH_ANY_SPAN_STRATA,
         max(1, deadline_ms // 250),
@@ -233,12 +244,37 @@ def _read_time_distributed_candidates(
         stratum_builder_kwargs: dict[str, Any] = {
             "project_id": project_id,
             "page_number": 0,
-            "page_size": GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
+            "page_size": rows_per_stratum,
             "filters": stratum_filters,
         }
         if mode == "trace":
             stratum_builder_kwargs["bounded_identity_only"] = True
+        elif rows_per_stratum == GRAPH_DENSE_ROWS_PER_STRATUM:
+            # The full-window anchor already proved this filter shape has a
+            # directly indexable span predicate. Reuse the same finite probe
+            # inside each time stratum: an exhausted 513-row sentinel can
+            # prove up to 512 exact matches regardless of where they fall in
+            # the stratum, without a broad ordered scan.
+            stratum_builder_kwargs["bounded_anchor_probe"] = True
         stratum_builder = builder_class(**stratum_builder_kwargs)
+        # The shared selector permits at most 512 candidates in one working
+        # batch. A 512-row page therefore needs a second ordered seed read to
+        # prove exhaustion (or observe its 513th has-more sentinel).
+        candidate_limit = min(rows_per_stratum + 1, GRAPH_DENSE_ROWS_PER_STRATUM)
+        max_seed_attempts = (
+            rows_per_stratum + 1 + candidate_limit - 1
+        ) // candidate_limit
+        bounded_classify_batch_size = min(
+            classify_batch_size,
+            candidate_limit,
+        )
+        classifiers_per_seed = (
+            candidate_limit + bounded_classify_batch_size - 1
+        ) // bounded_classify_batch_size
+        anchor_query_budget = int(rows_per_stratum == GRAPH_DENSE_ROWS_PER_STRATUM)
+        max_query_count = anchor_query_budget + max_seed_attempts * (
+            1 + classifiers_per_seed
+        )
         try:
             page = read_bounded_filter_page(
                 builder=stratum_builder,
@@ -246,21 +282,15 @@ def _read_time_distributed_candidates(
                 filters=stratum_filters,
                 key_field=key_field,
                 page_number=0,
-                page_size=GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
+                page_size=rows_per_stratum,
                 deadline_ms=per_stratum_deadline_ms,
-                max_seed_attempts=1,
-                max_query_count=2,
-                # Fifty rows include the 49-row visible sample plus one
-                # has-more sentinel. Keeping the working set below the
-                # selective-anchor threshold intentionally chooses the
-                # ordered finite seed for common any-span trace attributes;
-                # otherwise the 513-ID probe would consume this stratum's
-                # complete two-query budget before classification began.
-                max_candidates=GRAPH_ANY_SPAN_ROWS_PER_STRATUM + 1,
-                classify_batch_size=min(
-                    classify_batch_size,
-                    GRAPH_ANY_SPAN_ROWS_PER_STRATUM + 1,
-                ),
+                max_seed_attempts=max_seed_attempts,
+                max_query_count=max_query_count,
+                # The visible rows plus one has-more sentinel stay finite. A
+                # sparse/unattested path retains the 49-row representative
+                # ceiling; a dense anchor opts into the exact 512-row ceiling.
+                max_candidates=candidate_limit,
+                classify_batch_size=bounded_classify_batch_size,
                 include_incomplete_rows=True,
             )
         except Exception as exc:
@@ -466,6 +496,11 @@ def read_graph_candidates(
             window_end=window_end,
             deadline_ms=distributed_deadline_ms,
             classify_batch_size=int(classify_batch_size or 50),
+            rows_per_stratum=(
+                GRAPH_DENSE_ROWS_PER_STRATUM
+                if sparse_page is not None
+                else GRAPH_ANY_SPAN_ROWS_PER_STRATUM
+            ),
             prior_page=sparse_page,
         )
 

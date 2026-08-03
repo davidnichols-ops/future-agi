@@ -98,7 +98,14 @@ def _apply_resolved(
     now: datetime,
 ) -> ReconcileResult:
     before = _live_count(task)
-    materialize_pending(task, resolved.matched_ids)
+    if resolved.trace_filter_witnesses:
+        materialize_pending(
+            task,
+            resolved.matched_ids,
+            trace_filter_witnesses=resolved.trace_filter_witnesses,
+        )
+    else:
+        materialize_pending(task, resolved.matched_ids)
     created = _live_count(task) - before
     if before == 0:
         result = ReconcileResult(created=created)

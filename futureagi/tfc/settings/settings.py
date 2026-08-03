@@ -340,6 +340,13 @@ CLICKHOUSE = {
     "CH_CONNECT_TIMEOUT": int(os.getenv("CH_CONNECT_TIMEOUT", "10")),
     "CH_SEND_TIMEOUT": int(os.getenv("CH_SEND_TIMEOUT", "300")),
     "CH_RECEIVE_TIMEOUT": int(os.getenv("CH_RECEIVE_TIMEOUT", "300")),
+    # Dedicated SOS/read-replica profiles may lock readonly=1 and every
+    # resource ceiling server-side. Such profiles reject per-query setting
+    # overrides, so the client must transmit none.
+    "CH_SERVER_ENFORCED_READONLY": os.getenv(
+        "CH_SERVER_ENFORCED_READONLY", "false"
+    ).lower()
+    in ("true", "1", "yes"),
 }
 
 # Password validation
@@ -813,6 +820,10 @@ CLICKHOUSE_V2 = {
     "CH25_USER": os.getenv("CH25_USER"),
     "CH25_PASSWORD": os.getenv("CH25_PASSWORD"),
     "CH25_DATABASE": os.getenv("CH25_DATABASE"),
+    "CH25_SERVER_ENFORCED_READONLY": os.getenv(
+        "CH25_SERVER_ENFORCED_READONLY", "false"
+    ).lower()
+    in ("true", "1", "yes"),
     # ─── Per-query-type routing for the shadow-mode rollout ──────────────────
     # Comma-separated query type names. See tracer/services/clickhouse/v2/shadow.py
     # for RoutingMode definitions. Anything not listed defaults to V1_ONLY.

@@ -112,10 +112,21 @@ class _CandidateAnalytics:
         self.calls.append((query, params, timeout_ms, settings))
         seed_column = "trace_id" if self.observe_type == "trace" else "id"
         if "filter_anchor_limit" in params:
+            anchor_start = params.get("filter_anchor_start")
+            anchor_end = params.get("filter_anchor_end")
+            anchor_rows = [
+                row
+                for row in self.rows
+                if (
+                    anchor_start is None
+                    or anchor_end is None
+                    or anchor_start <= row["start_time"] < anchor_end
+                )
+            ]
             if self.observe_type == "span":
                 seen = set()
                 rows = []
-                for row in self.rows:
+                for row in anchor_rows:
                     identity = (
                         str(row.get("trace_id") or ""),
                         str(row.get("id") or ""),
@@ -139,7 +150,7 @@ class _CandidateAnalytics:
                 [
                     {"trace_id": trace_id}
                     for trace_id in list(
-                        dict.fromkeys(str(row["trace_id"]) for row in self.rows)
+                        dict.fromkeys(str(row["trace_id"]) for row in anchor_rows)
                     )[: params["filter_anchor_limit"]]
                 ]
             )
@@ -486,7 +497,7 @@ def test_sparse_root_trace_filter_is_not_rejected_by_query_count_preflight():
 
 
 @pytest.mark.unit
-def test_4096th_match_returns_visible_deterministic_sample_metadata():
+def test_4096_matches_complete_at_exact_graph_ceiling():
     rows = [
         {
             "id": f"span-{index:04d}",
@@ -505,11 +516,11 @@ def test_4096th_match_returns_visible_deterministic_sample_metadata():
     )
 
     assert len(sample.rows) == bounded_graph_reads.GRAPH_CANDIDATE_LIMIT
-    assert sample.query_complete is False
-    assert sample.query_status == "degraded"
-    assert sample.query_error_code == "sample_limit"
+    assert sample.query_complete is True
+    assert sample.query_status == "complete"
+    assert sample.query_error_code is None
     assert sample.metadata()["query_sample_size"] == len(sample.rows)
-    assert sample.metadata()["query_total_rows_lower_bound"] >= len(sample.rows) + 1
+    assert sample.metadata()["query_total_rows_lower_bound"] == len(sample.rows)
 
 
 @pytest.mark.unit
@@ -617,8 +628,10 @@ def test_long_window_incomplete_rows_are_sampled_only_for_cardinality_limits(
     assert calls[0]["max_query_count"] == 5
     if public_error == "sample_limit":
         assert all(call["include_incomplete_rows"] is True for call in calls[1:])
-        assert all(call["max_query_count"] == 2 for call in calls[1:])
-        assert all(call["max_candidates"] == 50 for call in calls[1:])
+        assert all(call["page_size"] == 512 for call in calls[1:])
+        assert all(call["max_seed_attempts"] == 2 for call in calls[1:])
+        assert all(call["max_query_count"] == 5 for call in calls[1:])
+        assert all(call["max_candidates"] == 512 for call in calls[1:])
 
 
 @pytest.mark.unit
@@ -996,7 +1009,7 @@ def test_span_anchor_probe_is_graph_opt_in_not_a_list_behavior_change():
     ("observe_type", "window_days", "row_count"),
     [("trace", 180, 1600), ("span", 365, 4096)],
 )
-def test_high_cardinality_long_window_sample_is_deterministic_and_distributed(
+def test_bounded_high_cardinality_long_window_is_exact_and_distributed(
     observe_type, window_days, row_count
 ):
     window_end = datetime(2026, 7, 31, 7)
@@ -1031,14 +1044,11 @@ def test_high_cardinality_long_window_sample_is_deterministic_and_distributed(
     second_ids = tuple(row[identity_field] for row in second.rows)
 
     assert first_ids == second_ids
-    assert len(first.rows) == (
-        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
-        * bounded_graph_reads.GRAPH_ANY_SPAN_ROWS_PER_STRATUM
-    )
-    assert first.query_complete is False
-    assert first.query_status == "degraded"
-    assert first.query_error_code == "sample_limit"
-    assert first.total_rows_lower_bound >= len(first.rows) + 8
+    assert len(first.rows) == row_count
+    assert first.query_complete is True
+    assert first.query_status == "complete"
+    assert first.query_error_code is None
+    assert first.total_rows_lower_bound >= len(first.rows)
     first_analytics = _CandidateAnalytics(observe_type=observe_type, rows=rows)
     read_graph_candidates(
         analytics=first_analytics,
@@ -1049,12 +1059,21 @@ def test_high_cardinality_long_window_sample_is_deterministic_and_distributed(
         ],
         observe_type=observe_type,
     )
-    assert (
-        sum("filter_anchor_limit" in params for _, params, *_ in first_analytics.calls)
-        == 1
+    anchor_ranges = [
+        (params["filter_anchor_start"], params["filter_anchor_end"])
+        for _, params, *_ in first_analytics.calls
+        if "filter_anchor_limit" in params
+    ]
+    assert len(anchor_ranges) == 1 + bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert (window_start, window_end) in anchor_ranges
+    assert len(set(anchor_ranges)) == len(anchor_ranges)
+    assert all(
+        params["filter_seed_limit"] <= 512
+        for _, params, *_ in first_analytics.calls
+        if "filter_seed_limit" in params
     )
-    assert any(
-        "filter_slice_start" in params for _, params, *_ in first_analytics.calls
+    assert len(first_analytics.calls) <= (
+        1 + bounded_graph_reads.GRAPH_ANY_SPAN_STRATA * 5
     )
     if observe_type == "trace":
         classifiers = [
@@ -1074,6 +1093,46 @@ def test_high_cardinality_long_window_sample_is_deterministic_and_distributed(
         )
         for index in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA)
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("observe_type", ["trace", "span"])
+def test_dense_long_window_stratum_overflow_remains_explicitly_incomplete(
+    observe_type,
+):
+    window_end = datetime(2026, 7, 31, 7)
+    window_start = window_end - timedelta(days=365)
+    stratum_start = window_start + (
+        (window_end - window_start)
+        * (bounded_graph_reads.GRAPH_ANY_SPAN_STRATA - 1)
+        / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    )
+    rows = []
+    for index in range(513):
+        row = {
+            "trace_id": f"trace-{index:05d}",
+            "root_span_id": f"root-{index:05d}",
+            "start_time": stratum_start + timedelta(microseconds=index + 1),
+        }
+        if observe_type == "span":
+            row["id"] = f"span-{index:05d}"
+        rows.append(row)
+
+    sample = read_graph_candidates(
+        analytics=_CandidateAnalytics(observe_type=observe_type, rows=rows),
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rechazado"),
+        ],
+        observe_type=observe_type,
+    )
+
+    assert len(sample.rows) == bounded_graph_reads.GRAPH_DENSE_ROWS_PER_STRATUM
+    assert sample.query_complete is False
+    assert sample.query_status == "degraded"
+    assert sample.query_error_code == "sample_limit"
+    assert sample.total_rows_lower_bound >= len(sample.rows)
 
 
 @pytest.mark.unit
@@ -1444,9 +1503,9 @@ def test_filtered_trace_system_graph_aggregates_all_live_child_spans(monkeypatch
     query, params, timeout_ms, settings = analytics.calls[1]
     assert "FROM spans" in seed_query
     assert "GROUP BY trace_id, id, start_time" in seed_query
-    assert seed_params["graph_entity_limit"] == 4096
+    assert seed_params["graph_entity_limit"] == 4097
     assert seed_timeout_ms <= 1_200
-    assert seed_settings["max_result_rows"] == 4096
+    assert seed_settings["max_result_rows"] == 4097
     assert "FROM spans" in query
     assert "argMax(" in query
     assert "GROUP BY trace_id, id, start_time" in query
@@ -1646,9 +1705,9 @@ def test_annotation_graph_is_candidate_scoped_and_score_values_are_sanitized(
     score_query, score_params, score_timeout, score_settings = analytics.calls[2]
     assert "FROM spans" in seed_query
     assert "GROUP BY trace_id, id, start_time" in seed_query
-    assert seed_params["graph_entity_limit"] == 4096
+    assert seed_params["graph_entity_limit"] == 4097
     assert seed_timeout <= 900
-    assert seed_settings["max_result_rows"] == 4096
+    assert seed_settings["max_result_rows"] == 4097
     assert "FROM spans" in identity_query
     assert "argMax(" in identity_query
     assert "FINAL" not in identity_query
@@ -1664,9 +1723,9 @@ def test_annotation_graph_is_candidate_scoped_and_score_values_are_sanitized(
         ),
     )
     assert identity_params["graph_span_dates"] == (START.date(),)
-    assert identity_params["graph_entity_limit"] == 4096
+    assert identity_params["graph_entity_limit"] == 4097
     assert identity_timeout <= 900
-    assert identity_settings["max_result_rows"] == 4096
+    assert identity_settings["max_result_rows"] == 4097
     replay_scope = identity_query.split("FROM spans", 1)[1].split(
         "GROUP BY trace_id, id, start_time", 1
     )[0]
@@ -1942,7 +2001,7 @@ def test_annotation_child_span_identity_sentinel_stays_degraded(monkeypatch):
                     "id": f"span-{index}",
                     "start_time": START + timedelta(microseconds=index),
                 }
-                for index in range(4096)
+                for index in range(4097)
             ],
             [
                 {
@@ -1950,7 +2009,7 @@ def test_annotation_child_span_identity_sentinel_stays_degraded(monkeypatch):
                     "id": f"span-{index}",
                     "start_time": START + timedelta(microseconds=index),
                 }
-                for index in range(4095)
+                for index in range(4096)
             ],
             [],
         ]
@@ -1975,8 +2034,8 @@ def test_annotation_child_span_identity_sentinel_stays_degraded(monkeypatch):
         observe_type="trace",
     )
 
-    assert len(analytics.calls[1][1]["graph_span_identities"]) == 4095
-    assert len(analytics.calls[2][1]["graph_span_entities"]) == 4095
+    assert len(analytics.calls[1][1]["graph_span_identities"]) == 4096
+    assert len(analytics.calls[2][1]["graph_span_entities"]) == 4096
     assert response["query_complete"] is False
     assert response["query_status"] == "degraded"
     assert response["query_error_code"] == "sample_limit"

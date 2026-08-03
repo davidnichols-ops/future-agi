@@ -332,6 +332,85 @@ def test_eval_internal_classifier_projects_only_identity_and_order(
     assert "latest_total_tokens AS total_tokens" not in sql
 
 
+def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filters = [
+        _time_filter(),
+        _attribute_filter("final_status", "Rechazado"),
+        _attribute_filter("customer_tier", "vip"),
+    ]
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=filters,
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_sampling_salt="task-salt",
+        bounded_sampling_rate=100.0,
+    )
+
+    sql, _ = builder.build_filter_match_query(["trace-a"])
+
+    assert "filter_witness_0" in sql
+    assert "filter_witness_1" in sql
+    assert sql.count("argMinIf(tuple(grouped_id, latest_start_time)") == 2
+    assert "tuple(latest_start_time, grouped_id)" in sql
+
+    witness_start = END - timedelta(minutes=1)
+
+    def fake_read(**_kwargs):
+        return BoundedFilterPage(
+            rows=[
+                {
+                    "trace_id": "trace-a",
+                    "start_time": witness_start,
+                    "filter_witness_0": ("span-status", witness_start),
+                    "filter_witness_1": ("span-tier", witness_start),
+                }
+            ],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=1,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=2,
+            result_payload_bytes=20,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+    result = row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={
+            "filters": filters,
+            "date_range": [START, END],
+        },
+        limit=25,
+        batch_size=25,
+        row_type=RowType.TRACES,
+        include_trace_filter_witnesses=True,
+    )
+
+    assert result.ids == ("trace-a",)
+    assert [witness.span_id for witness in result.trace_filter_witnesses] == [
+        "span-status",
+        "span-tier",
+    ]
+    assert [witness.column_id for witness in result.trace_filter_witnesses] == [
+        "final_status",
+        "customer_tier",
+    ]
+
+
 def test_trace_legacy_observation_type_is_root_scoped_before_cap() -> None:
     filters = row_resolver._task_ui_filters(
         {

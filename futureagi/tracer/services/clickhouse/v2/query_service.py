@@ -30,6 +30,7 @@ def get_v2_query_client() -> ClickHouseClient:
                     user=config["user"],
                     password=config["password"],
                     database=config["database"],
+                    server_enforced_readonly=config["server_enforced_readonly"],
                 )
     return _client
 

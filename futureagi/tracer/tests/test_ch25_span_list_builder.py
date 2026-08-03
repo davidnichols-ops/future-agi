@@ -98,23 +98,75 @@ def test_filter_compiler_class_yields_v2_columns():
 
 def test_v2_builder_output_includes_critical_settings():
     """Every v2 builder's build*() output MUST end with the SETTINGS clause
-    that enables use_skip_indexes_if_final, optimize_use_projections,
-    optimize_aggregation_in_order. These are required for sub-second query
-    behavior at trillion-row scale — see DECISIONS #026.
+    that keeps FINAL semantically exact while enabling the safe projection and
+    aggregation optimizers.
+
+    Arbitrary list/graph/eval filters can target mutable Map/JSON attributes,
+    so enabling skip indexes globally under FINAL can hide a newer replacement
+    row and return stale state. Stable-key point reads opt in separately.
     """
     for method in ("build", "build_count_query"):
         sql, _ = getattr(_make_builder(), method)()
         assert "SETTINGS" in sql, (
             f"{method}() output missing SETTINGS clause — required for "
-            f"trillion-row scale (use_skip_indexes_if_final etc.)"
+            "the CH25 query-builder correctness/performance contract"
         )
-        assert "use_skip_indexes_if_final = 1" in sql
+        assert "use_skip_indexes_if_final = 0" in sql
+        assert "use_skip_indexes_if_final = 1" not in sql
         assert "optimize_use_projections = 1" in sql
         assert "optimize_aggregation_in_order = 1" in sql
 
     # build_content_query takes args
     sql, _ = _make_builder().build_content_query(span_ids=["s1"])
-    assert "use_skip_indexes_if_final = 1" in sql
+    assert "use_skip_indexes_if_final = 0" in sql
+    assert "use_skip_indexes_if_final = 1" not in sql
+
+
+def test_mutable_map_and_json_filter_statements_keep_final_skip_indexes_off():
+    """The generic setting must remain safe for every attribute representation.
+
+    Typed scalar attributes live in Maps while structured attributes live in
+    the JSON overflow column. Both are mutable across physical span versions,
+    so neither may inherit a blanket FINAL skip-index opt-in.
+    """
+    cases = (
+        (
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rechazado",
+                },
+            },
+            "attrs_string",
+        ),
+        (
+            {
+                "column_id": "customer.context",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "map",
+                    "filter_op": "contains",
+                    "filter_value": {"tier": "vip"},
+                },
+            },
+            "attributes_extra",
+        ),
+    )
+
+    for filter_item, storage_column in cases:
+        sql, _ = _make_builder(filters=[filter_item]).build_filter_match_query(
+            ["span-1"]
+        )
+
+        assert storage_column in sql
+        assert "use_skip_indexes_if_final = 0" in sql
+        assert "use_skip_indexes_if_final = 1" not in sql
+        # The bounded candidate classifier performs explicit latest-state
+        # replay; it does not need table-level FINAL on the spans scan.
+        assert "FROM spans FINAL" not in sql
 
 
 # ---------------------------------------------------------------------------

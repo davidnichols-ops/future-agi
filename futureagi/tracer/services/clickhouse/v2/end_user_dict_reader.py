@@ -80,17 +80,30 @@ def _get_client():
         return _client
     with _client_lock:
         if _client is None:
-            import clickhouse_connect
-
             cfg = get_v2_config()
-            _client = clickhouse_connect.get_client(
-                host=cfg["host"],
-                port=cfg["http_port"],
-                username=cfg["user"],
-                password=cfg["password"] or "",
-                database=cfg["database"],
-                send_receive_timeout=15,
-            )
+            if cfg["server_enforced_readonly"]:
+                from tracer.services.clickhouse.server_readonly import (
+                    ServerEnforcedReadOnlyNativeClient,
+                )
+
+                _client = ServerEnforcedReadOnlyNativeClient(
+                    host=cfg["host"],
+                    port=cfg["tcp_port"],
+                    username=cfg["user"],
+                    password=cfg["password"] or "",
+                    database=cfg["database"],
+                )
+            else:
+                import clickhouse_connect
+
+                _client = clickhouse_connect.get_client(
+                    host=cfg["host"],
+                    port=cfg["http_port"],
+                    username=cfg["user"],
+                    password=cfg["password"] or "",
+                    database=cfg["database"],
+                    send_receive_timeout=15,
+                )
     return _client
 
 

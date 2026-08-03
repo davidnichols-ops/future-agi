@@ -2816,7 +2816,9 @@ class TestTraceListQueryBuilder:
 
         assert "end_users_dict" in query
         assert "is_deleted" in query
-        assert "use_skip_indexes_if_final" in query  # v2 SETTINGS appended
+        # General builders must retain exact FINAL semantics. Only stable-key
+        # point reads opt in to skip indexes under FINAL.
+        assert "use_skip_indexes_if_final = 0" in query
         assert "'enduser_dict'" not in query
         assert "_peerdb_is_deleted" not in query
         assert params["user_trace_ids"] == ("trace-1", "trace-2")
