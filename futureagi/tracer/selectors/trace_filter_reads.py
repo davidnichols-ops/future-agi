@@ -217,6 +217,7 @@ def read_bounded_filter_page(
     cursor_start_time: datetime | None = None,
     cursor_order_token: Any = None,
     read_settings: dict[str, Any] | None = None,
+    anchor_probe_only: bool = False,
 ) -> BoundedFilterPage:
     """Return one exact numbered page or an explicit sanitized degradation.
 
@@ -226,6 +227,9 @@ def read_bounded_filter_page(
     retried as control flow, and a partial prefix is never exposed as page N.
     Graph callers may opt into proven-but-incomplete page-zero rows; numbered
     list/eval callers retain the exact/empty default.
+    ``anchor_probe_only`` stops after a selective-anchor sentinel instead of
+    entering the ordered seed loop; it is reserved for callers that provide a
+    separate bounded fallback for non-sparse values.
     """
 
     if page_number < 0 or page_size <= 0 or deadline_ms <= 0:
@@ -548,9 +552,9 @@ def read_bounded_filter_page(
         elif (
             anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
             and callable(anchor_builder)
-            and callable(ordered_seed_builder)
             and callable(anchor_support)
             and bool(anchor_support())
+            and (callable(ordered_seed_builder) or seed_proves_result_order)
         ):
             try:
                 anchor_query, anchor_params = anchor_builder(limit=anchor_limit)
@@ -571,14 +575,26 @@ def read_bounded_filter_page(
                     )
                     page_complete = True
                     use_seed_loop = False
+                elif anchor_probe_only:
+                    # The sentinel proves only that this value is not sparse.
+                    # Do not spend the graph's remaining wall budget on an
+                    # ordered prefix here; its full-window distributed fallback
+                    # is responsible for deterministic incomplete coverage.
+                    degraded_error_code = "sample_limit"
+                    use_seed_loop = False
                 else:
-                    seed_page_builder = ordered_seed_builder
-                    seed_proves_result_order = True
+                    if callable(ordered_seed_builder):
+                        seed_page_builder = ordered_seed_builder
+                        seed_proves_result_order = True
             except _BudgetExceeded as exc:
                 if exc.error_code != "read_budget_exceeded":
                     raise
-                seed_page_builder = ordered_seed_builder
-                seed_proves_result_order = True
+                if anchor_probe_only:
+                    degraded_error_code = exc.error_code
+                    use_seed_loop = False
+                elif callable(ordered_seed_builder):
+                    seed_page_builder = ordered_seed_builder
+                    seed_proves_result_order = True
         elif (
             callable(ordered_seed_builder)
             and callable(anchor_support)

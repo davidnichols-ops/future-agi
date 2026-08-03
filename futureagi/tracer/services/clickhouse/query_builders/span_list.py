@@ -132,6 +132,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         project_version_id: str | None = None,
         bounded_internal_scan: bool = False,
         bounded_identity_only: bool = False,
+        bounded_anchor_probe: bool = False,
         bounded_sampling_salt: str | None = None,
         bounded_sampling_rate: float | None = None,
         **kwargs: Any,
@@ -147,6 +148,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         self.project_version_id = project_version_id
         self._bounded_internal_scan = bool(bounded_internal_scan)
         self._bounded_identity_only = bool(bounded_identity_only)
+        self._bounded_anchor_probe = bool(bounded_anchor_probe)
         if (bounded_sampling_salt is None) != (bounded_sampling_rate is None):
             raise ValueError(
                 "bounded_sampling_salt and bounded_sampling_rate must be paired"
@@ -259,6 +261,107 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     @staticmethod
     def recommended_filter_classify_batch_size() -> int:
         return 200
+
+    def supports_filter_anchor_probe(self) -> bool:
+        """Whether a direct span predicate can seed a sparse full-window read.
+
+        Unlike trace filters, every span filter applies to one physical span,
+        so all directly-indexable leaves can be combined in one unordered
+        sentinel probe.  Residual eval/annotation predicates are deliberately
+        left for the finite latest-state classifier.
+        """
+
+        plans, _ = partition_span_filter_plans(self.filters)
+        return self._bounded_anchor_probe and any(
+            plan.seed_predicate.strip().replace(" ", "") not in {"", "1=1"}
+            for plan in plans
+        )
+
+    def build_filter_anchor_probe(self, *, limit: int) -> tuple[str, dict[str, Any]]:
+        """Return at most ``limit`` unordered physical span candidates.
+
+        An exhausted probe is a complete *superset*, not a final result.  The
+        bounded reader still replays every returned physical identity against
+        global latest state, which removes stale values and tombstones.  A
+        probe that reaches its sentinel is intentionally abandoned in favour
+        of the existing ordered/distributed path.
+        """
+
+        if limit <= 1:
+            raise ValueError("anchor probe limit must include a sentinel")
+        if not self.supports_filter_anchor_probe():
+            raise ValueError("span anchor probe requires a direct span filter")
+
+        request_start, request_end = self.parse_time_range(self.filters)
+        self.params.update({"start_date": request_start, "end_date": request_end})
+        plans, _ = partition_span_filter_plans(self.filters)
+        seeded_plans = [
+            plan
+            for plan in plans
+            if plan.seed_predicate.strip().replace(" ", "") not in {"", "1=1"}
+        ]
+        params: dict[str, Any] = {
+            **self.params,
+            "filter_anchor_start": request_start,
+            "filter_anchor_end": request_end,
+            "filter_anchor_limit": int(limit),
+        }
+        for plan in seeded_plans:
+            params.update(
+                {
+                    key: value
+                    for key, value in plan.params.items()
+                    if f"%({key})s" in plan.seed_predicate
+                }
+            )
+        predicate = " AND ".join(plan.seed_predicate for plan in seeded_plans)
+
+        datetime_predicate, datetime_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="span_anchor_time_exclusion",
+            )
+        )
+        params.update(datetime_params)
+        datetime_fragment = (
+            f"\n          AND {datetime_predicate}" if datetime_predicate else ""
+        )
+
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = "AND project_version_id = %(project_version_id)s"
+
+        sampling_fragment = ""
+        if self._bounded_sampling_rate is not None:
+            params["bounded_sampling_salt"] = str(self._bounded_sampling_salt)
+            params["bounded_sampling_rate"] = float(self._bounded_sampling_rate)
+            sampling_fragment = """
+              AND modulo(
+                  cityHash64(
+                      %(bounded_sampling_salt)s,
+                      toString(project_id),
+                      toString(trace_id),
+                      toString(id)
+                  ), 100
+              ) < %(bounded_sampling_rate)s
+            """
+
+        query = f"""
+        SELECT project_id, id, trace_id, start_time
+        FROM {self.TABLE}
+        PREWHERE {self.project_filter_sql()}
+          AND is_deleted = 0
+          {project_version_fragment}
+          AND start_time >= %(filter_anchor_start)s
+          AND start_time < %(filter_anchor_end)s
+        WHERE {predicate}{datetime_fragment}
+          {sampling_fragment}
+        LIMIT 1 BY project_id, trace_id, id, start_time
+        LIMIT %(filter_anchor_limit)s
+        """
+        return query, params
 
     def build_filter_seed_page(
         self,

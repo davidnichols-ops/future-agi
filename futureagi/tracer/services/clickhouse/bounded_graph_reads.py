@@ -50,6 +50,12 @@ GRAPH_MAX_POINTS = 10_000
 GRAPH_ANY_SPAN_STRATA = 8
 GRAPH_ANY_SPAN_ROWS_PER_STRATUM = 49
 GRAPH_ANY_SPAN_DISTRIBUTED_AFTER = timedelta(hours=1)
+# Before distributing a long window, give a directly-indexable predicate one
+# bounded chance to prove that the entire result is sparse.  The 513th raw
+# identity is a sentinel; only an exhausted probe followed by latest-state
+# classification is accepted as exact.
+GRAPH_SPARSE_ANCHOR_LIMIT = 512
+GRAPH_SPARSE_ANCHOR_DEADLINE_MS = 1_800
 
 logger = structlog.get_logger(__name__)
 
@@ -186,6 +192,7 @@ def _read_time_distributed_candidates(
     window_end: datetime,
     deadline_ms: int,
     classify_batch_size: int,
+    prior_page: Any | None = None,
 ) -> GraphCandidateSample:
     """Sample arbitrary child-span filters across the full requested window.
 
@@ -205,11 +212,11 @@ def _read_time_distributed_candidates(
     key_field = "trace_id" if mode == "trace" else "id"
     rows_by_id: dict[Hashable, dict[str, Any]] = {}
     complete = True
-    elapsed_ms = 0.0
-    query_count = 0
-    rows_returned = 0
-    result_payload_bytes = 0
-    total_rows_lower_bound = 0
+    elapsed_ms = float(getattr(prior_page, "elapsed_ms", 0.0) or 0.0)
+    query_count = int(getattr(prior_page, "query_count", 0) or 0)
+    rows_returned = int(getattr(prior_page, "rows_returned", 0) or 0)
+    result_payload_bytes = int(getattr(prior_page, "result_payload_bytes", 0) or 0)
+    total_rows_lower_bound = int(getattr(prior_page, "total_rows_lower_bound", 0) or 0)
 
     for index in range(stratum_count):
         stratum_start = window_start + (window_width * index / stratum_count)
@@ -223,12 +230,15 @@ def _read_time_distributed_candidates(
             window_start=stratum_start,
             window_end=stratum_end,
         )
-        stratum_builder = builder_class(
-            project_id=project_id,
-            page_number=0,
-            page_size=GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
-            filters=stratum_filters,
-        )
+        stratum_builder_kwargs: dict[str, Any] = {
+            "project_id": project_id,
+            "page_number": 0,
+            "page_size": GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
+            "filters": stratum_filters,
+        }
+        if mode == "trace":
+            stratum_builder_kwargs["bounded_identity_only"] = True
+        stratum_builder = builder_class(**stratum_builder_kwargs)
         try:
             page = read_bounded_filter_page(
                 builder=stratum_builder,
@@ -356,11 +366,21 @@ def read_graph_candidates(
     builder_class = (
         TraceListQueryBuilderV2 if mode == "trace" else SpanListQueryBuilderV2
     )
+    builder_kwargs: dict[str, Any] = {
+        "project_id": str(project_id),
+        "page_number": 0,
+        "page_size": GRAPH_CANDIDATE_LIMIT,
+        "filters": effective_filters,
+    }
+    # Trace graph decoration performs its own finite metric replay after the
+    # trace set is proven. Candidate discovery therefore needs identities and
+    # root order only, avoiding needless presentation-column hydration.
+    if mode == "trace":
+        builder_kwargs["bounded_identity_only"] = True
+    else:
+        builder_kwargs["bounded_anchor_probe"] = True
     builder = builder_class(
-        project_id=str(project_id),
-        page_number=0,
-        page_size=GRAPH_CANDIDATE_LIMIT,
-        filters=effective_filters,
+        **builder_kwargs,
     )
     if not builder.supports_bounded_filter_scan():
         error_code = builder.bounded_filter_degraded_error_code()
@@ -369,6 +389,73 @@ def read_graph_candidates(
     window_start, window_end = builder.parse_time_range(effective_filters)
     classify_batch_size = builder.recommended_filter_classify_batch_size()
     if window_end - window_start > GRAPH_ANY_SPAN_DISTRIBUTED_AFTER:
+        sparse_page = None
+        distributed_deadline_ms = deadline_ms
+        anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
+        if callable(anchor_support) and bool(anchor_support()):
+            try:
+                sparse_page = read_bounded_filter_page(
+                    builder=builder,
+                    analytics=analytics,
+                    filters=effective_filters,
+                    key_field="trace_id" if mode == "trace" else "id",
+                    page_number=0,
+                    page_size=GRAPH_SPARSE_ANCHOR_LIMIT,
+                    deadline_ms=min(deadline_ms, GRAPH_SPARSE_ANCHOR_DEADLINE_MS),
+                    max_seed_attempts=2,
+                    max_query_count=5,
+                    max_candidates=GRAPH_SPARSE_ANCHOR_LIMIT,
+                    classify_batch_size=min(
+                        int(classify_batch_size or 50),
+                        GRAPH_SPARSE_ANCHOR_LIMIT,
+                    ),
+                    include_incomplete_rows=False,
+                    anchor_probe_only=True,
+                )
+            except Exception as exc:
+                if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+                    raise
+                logger.warning(
+                    "graph sparse anchor degraded",
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
+                public_code = (
+                    "read_budget_exceeded"
+                    if is_read_budget_error(exc)
+                    else "query_failed"
+                )
+                raise BoundedGraphReadError(public_code) from None
+            # ``complete`` alone can mean a proven *page prefix*.  Exact graph
+            # membership requires the full sentinel probe to be exhausted,
+            # represented here by a complete page with no has-more row.
+            if sparse_page.complete and not sparse_page.has_more:
+                return GraphCandidateSample(
+                    rows=tuple(sparse_page.rows),
+                    query_complete=True,
+                    query_status="complete",
+                    query_error_code=None,
+                    window_start=window_start,
+                    window_end=window_end,
+                    elapsed_ms=sparse_page.elapsed_ms,
+                    query_count=sparse_page.query_count,
+                    rows_returned=sparse_page.rows_returned,
+                    result_payload_bytes=sparse_page.result_payload_bytes,
+                    total_rows_lower_bound=max(
+                        len(sparse_page.rows),
+                        sparse_page.total_rows_lower_bound,
+                    ),
+                )
+            if sparse_page.error_code != "sample_limit":
+                raise BoundedGraphReadError(
+                    _incomplete_error_code(sparse_page.error_code)
+                )
+            distributed_deadline_ms = max(
+                25,
+                deadline_ms - int(sparse_page.elapsed_ms),
+            )
+            if distributed_deadline_ms <= 25:
+                raise BoundedGraphReadError("read_budget_exceeded")
         return _read_time_distributed_candidates(
             analytics=analytics,
             builder_class=builder_class,
@@ -377,8 +464,9 @@ def read_graph_candidates(
             mode=mode,
             window_start=window_start,
             window_end=window_end,
-            deadline_ms=deadline_ms,
+            deadline_ms=distributed_deadline_ms,
             classify_batch_size=int(classify_batch_size or 50),
+            prior_page=sparse_page,
         )
 
     candidate_limit = GRAPH_CANDIDATE_LIMIT
@@ -389,6 +477,7 @@ def read_graph_candidates(
             page_number=0,
             page_size=candidate_limit,
             filters=effective_filters,
+            bounded_identity_only=True,
         )
 
     try:

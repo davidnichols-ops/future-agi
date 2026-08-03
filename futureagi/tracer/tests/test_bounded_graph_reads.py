@@ -112,6 +112,29 @@ class _CandidateAnalytics:
         self.calls.append((query, params, timeout_ms, settings))
         seed_column = "trace_id" if self.observe_type == "trace" else "id"
         if "filter_anchor_limit" in params:
+            if self.observe_type == "span":
+                seen = set()
+                rows = []
+                for row in self.rows:
+                    identity = (
+                        str(row.get("trace_id") or ""),
+                        str(row.get("id") or ""),
+                        row.get("start_time"),
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    rows.append(
+                        {
+                            "project_id": PROJECT_ID,
+                            "trace_id": identity[0],
+                            "id": identity[1],
+                            "start_time": identity[2],
+                        }
+                    )
+                    if len(rows) >= params["filter_anchor_limit"]:
+                        break
+                return _Result(rows)
             return _Result(
                 [
                     {"trace_id": trace_id}
@@ -218,8 +241,9 @@ def test_filtered_graph_candidates_are_finite_latest_state_samples(
         assert "SELECT DISTINCT trace_id" in seed_query
         assert seed_params["filter_anchor_limit"] == 513
     else:
-        assert "LIMIT %(filter_seed_limit)s" in seed_query
-        assert seed_params["filter_seed_limit"] <= 512
+        assert "LIMIT %(filter_anchor_limit)s" in seed_query
+        assert seed_params["filter_anchor_limit"] == 513
+        assert "LIMIT 1 BY project_id, trace_id, id, start_time" in seed_query
     assert "argMax(" in classify_query
     assert "FINAL" not in classify_query
     assert classify_params[candidate_param] in {("trace-1",), ("span-1",)}
@@ -519,7 +543,7 @@ def test_1600th_root_trace_returns_visible_sample_instead_of_blank_error():
     [
         (7, "deadline_exceeded", "read_budget_exceeded"),
         (180, "read_budget_exceeded", "read_budget_exceeded"),
-        (365, "scan_budget_exceeded", "sample_limit"),
+        (365, "sample_limit", "sample_limit"),
     ],
 )
 def test_long_window_incomplete_rows_are_sampled_only_for_cardinality_limits(
@@ -543,7 +567,7 @@ def test_long_window_incomplete_rows_are_sampled_only_for_cardinality_limits(
             status="degraded",
             error_code=selector_error,
             total_rows_lower_bound=1,
-            elapsed_ms=3899.0,
+            elapsed_ms=1.0 if public_error == "sample_limit" else 3899.0,
             query_count=24,
             rows_returned=25,
             result_payload_bytes=512,
@@ -583,14 +607,18 @@ def test_long_window_incomplete_rows_are_sampled_only_for_cardinality_limits(
         assert caught.value.error_code == public_error
 
     expected_calls = (
-        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA + 1
         if public_error == "sample_limit"
         else 1
     )
     assert len(calls) == expected_calls
-    assert all(call["include_incomplete_rows"] is True for call in calls)
-    assert all(call["max_query_count"] == 2 for call in calls)
-    assert all(call["max_candidates"] == 50 for call in calls)
+    assert calls[0]["anchor_probe_only"] is True
+    assert calls[0]["include_incomplete_rows"] is False
+    assert calls[0]["max_query_count"] == 5
+    if public_error == "sample_limit":
+        assert all(call["include_incomplete_rows"] is True for call in calls[1:])
+        assert all(call["max_query_count"] == 2 for call in calls[1:])
+        assert all(call["max_candidates"] == 50 for call in calls[1:])
 
 
 @pytest.mark.unit
@@ -720,7 +748,7 @@ def test_compiler_error_is_never_recast_as_a_cardinality_sample(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("window_days", [7, 180, 365])
-def test_sparse_old_and_new_matches_cover_every_long_window_stratum(window_days):
+def test_sparse_old_and_new_matches_use_exact_full_window_anchor(window_days):
     window_end = datetime(2026, 7, 31, 7)
     window_start = window_end - timedelta(days=window_days)
     rows = [
@@ -749,20 +777,15 @@ def test_sparse_old_and_new_matches_cover_every_long_window_stratum(window_days)
 
     assert sample.query_complete is True
     assert {row["trace_id"] for row in sample.rows} == {"trace-old", "trace-new"}
-    seed_windows = sorted(
-        {
-            (call[1]["filter_slice_start"], call[1]["filter_slice_end"])
-            for call in analytics.calls
-            if "filter_slice_start" in call[1]
-        }
-    )
-    assert len(seed_windows) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
-    assert seed_windows[0][0] == window_start
-    assert seed_windows[-1][1] == window_end
-    assert all(
-        seed_windows[index][1] == seed_windows[index + 1][0]
-        for index in range(len(seed_windows) - 1)
-    )
+    anchor_calls = [
+        call for call in analytics.calls if "filter_anchor_limit" in call[1]
+    ]
+    assert len(anchor_calls) == 1
+    _, anchor_params, *_ = anchor_calls[0]
+    assert anchor_params["filter_anchor_start"] == window_start
+    assert anchor_params["filter_anchor_end"] == window_end
+    assert anchor_params["filter_anchor_limit"] == 513
+    assert not any("filter_slice_start" in call[1] for call in analytics.calls)
 
 
 @pytest.mark.unit
@@ -773,7 +796,7 @@ def test_sparse_old_and_new_matches_cover_every_long_window_stratum(window_days)
         ("greater_than_or_equal", "less_than_or_equal"),
     ],
 )
-def test_long_window_scalar_datetime_bounds_are_canonicalized_per_stratum(
+def test_long_window_scalar_datetime_bounds_are_preserved_by_sparse_anchor(
     lower_op,
     upper_op,
 ):
@@ -802,12 +825,16 @@ def test_long_window_scalar_datetime_bounds_are_canonicalized_per_stratum(
     assert sample.query_complete is True
     assert filters[0]["filter_config"]["filter_op"] == lower_op
     assert filters[1]["filter_config"]["filter_op"] == upper_op
-    seed_windows = {
-        (call[1]["filter_slice_start"], call[1]["filter_slice_end"])
-        for call in analytics.calls
-        if "filter_slice_start" in call[1]
-    }
-    assert len(seed_windows) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    anchor_params = next(
+        params for _, params, *_ in analytics.calls if "filter_anchor_limit" in params
+    )
+    assert anchor_params["filter_anchor_start"] == window_start + (
+        timedelta(microseconds=1) if lower_op == "greater_than" else timedelta(0)
+    )
+    assert anchor_params["filter_anchor_end"] == window_end + (
+        timedelta(microseconds=1) if upper_op == "less_than_or_equal" else timedelta(0)
+    )
+    assert not any("filter_slice_start" in call[1] for call in analytics.calls)
 
 
 @pytest.mark.unit
@@ -830,6 +857,138 @@ def test_empty_long_window_is_exact_and_not_mislabeled_as_sampled():
     assert sample.query_complete is True
     assert sample.query_status == "complete"
     assert sample.query_error_code is None
+
+
+@pytest.mark.unit
+def test_sparse_span_anchor_replays_trace_scoped_ids_and_latest_tombstones():
+    window_end = START + timedelta(days=7)
+    anchor_rows = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": "trace-a",
+            "id": "shared",
+            "start_time": START + timedelta(minutes=1),
+        },
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": "trace-b",
+            "id": "shared",
+            "start_time": START + timedelta(minutes=2),
+        },
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": "trace-deleted",
+            "id": "gone",
+            "start_time": START + timedelta(minutes=3),
+        },
+    ]
+    latest_live = {
+        **anchor_rows[1],
+        "latency_ms": 11,
+        "cost": 0.1,
+        "total_tokens": 7,
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+        "status": "OK",
+    }
+
+    class _SparseReplayAnalytics:
+        def __init__(self):
+            self.calls = []
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.calls.append((query, params, timeout_ms, settings))
+            if "filter_anchor_limit" in params:
+                return _Result(anchor_rows)
+            return _Result([latest_live])
+
+    analytics = _SparseReplayAnalytics()
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(START, window_end),
+            _attribute_filter("final_status", "Rechazado"),
+        ],
+        observe_type="span",
+    )
+
+    assert sample.query_complete is True
+    assert sample.rows == (latest_live,)
+    assert len(analytics.calls) == 2
+    anchor_query, anchor_params, *_ = analytics.calls[0]
+    classify_query, classify_params, *_ = analytics.calls[1]
+    assert "project_id = %(project_id)s" in anchor_query
+    assert anchor_params["project_id"] == PROJECT_ID
+    assert "argMax(is_deleted" in classify_query
+    assert "latest_is_deleted = 0" in classify_query
+    assert classify_params["candidate_span_entities"] == (
+        ("trace-a", "shared"),
+        ("trace-b", "shared"),
+        ("trace-deleted", "gone"),
+    )
+    assert len(classify_params["candidate_span_identities"]) == 3
+
+
+@pytest.mark.unit
+def test_long_sparse_anchor_timeout_never_becomes_exact_empty(monkeypatch):
+    calls = []
+
+    def _timed_out_page(**kwargs):
+        calls.append(kwargs)
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=False,
+            status="degraded",
+            error_code="deadline_exceeded",
+            total_rows_lower_bound=0,
+            elapsed_ms=500,
+            query_count=1,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        bounded_graph_reads, "read_bounded_filter_page", _timed_out_page
+    )
+
+    with pytest.raises(BoundedGraphReadError) as caught:
+        read_graph_candidates(
+            analytics=object(),
+            project_id=PROJECT_ID,
+            filters=[
+                _date_filter(START, START + timedelta(days=7)),
+                _attribute_filter("final_status", "Rechazado"),
+            ],
+            observe_type="span",
+        )
+
+    assert caught.value.error_code == "read_budget_exceeded"
+    assert calls[0]["anchor_probe_only"] is True
+    assert len(calls) == 1
+
+
+@pytest.mark.unit
+def test_span_anchor_probe_is_graph_opt_in_not_a_list_behavior_change():
+    from tracer.services.clickhouse.v2.query_builders.span_list import (
+        SpanListQueryBuilderV2,
+    )
+
+    filters = [
+        _date_filter(START, START + timedelta(days=7)),
+        _attribute_filter("final_status", "Rechazado"),
+    ]
+    list_builder = SpanListQueryBuilderV2(project_id=PROJECT_ID, filters=filters)
+    graph_builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=filters,
+        bounded_anchor_probe=True,
+    )
+
+    assert list_builder.supports_filter_anchor_probe() is False
+    assert graph_builder.supports_filter_anchor_probe() is True
 
 
 @pytest.mark.unit
@@ -880,6 +1039,31 @@ def test_high_cardinality_long_window_sample_is_deterministic_and_distributed(
     assert first.query_status == "degraded"
     assert first.query_error_code == "sample_limit"
     assert first.total_rows_lower_bound >= len(first.rows) + 8
+    first_analytics = _CandidateAnalytics(observe_type=observe_type, rows=rows)
+    read_graph_candidates(
+        analytics=first_analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rechazado"),
+        ],
+        observe_type=observe_type,
+    )
+    assert (
+        sum("filter_anchor_limit" in params for _, params, *_ in first_analytics.calls)
+        == 1
+    )
+    assert any(
+        "filter_slice_start" in params for _, params, *_ in first_analytics.calls
+    )
+    if observe_type == "trace":
+        classifiers = [
+            query
+            for query, params, *_ in first_analytics.calls
+            if "candidate_trace_ids" in params
+        ]
+        assert classifiers
+        assert all("latest_latency_ms" not in query for query in classifiers)
     stratum_width = window_width / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
     assert all(
         any(
