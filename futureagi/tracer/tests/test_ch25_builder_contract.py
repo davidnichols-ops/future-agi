@@ -245,6 +245,7 @@ class TestListBuilderOutputContract:
                 # anchor that a caller could accidentally widen. Exercise it
                 # with the smallest supported any-span attribute predicate.
                 original_filters = builder.filters
+                original_anchor_probe = getattr(builder, "_bounded_anchor_probe", None)
                 builder.filters = [
                     *original_filters,
                     {
@@ -257,10 +258,14 @@ class TestListBuilderOutputContract:
                         },
                     },
                 ]
+                if original_anchor_probe is not None:
+                    builder._bounded_anchor_probe = True
                 try:
                     result = method(limit=2)
                 finally:
                     builder.filters = original_filters
+                    if original_anchor_probe is not None:
+                        builder._bounded_anchor_probe = original_anchor_probe
             elif name in {
                 "build_filter_ordered_seed_page",
                 "build_filter_seed_page",

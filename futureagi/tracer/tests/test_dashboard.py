@@ -4442,9 +4442,11 @@ class TestFrontendPayloadSimulation:
         }
         builder = DashboardQueryBuilder(config)
         queries = builder.build_all_queries()
-        sql, _, _ = queries[0]
+        sql, params, _ = queries[0]
         assert "span_attr_num" in sql
-        assert "llm.token_count.prompt" in sql
+        assert "%(custom_metric_attr_key)s" in sql
+        assert "llm.token_count.prompt" not in sql
+        assert params["custom_metric_attr_key"] == "llm.token_count.prompt"
 
     def test_custom_attr_string_frontend_payload(self):
         config = {

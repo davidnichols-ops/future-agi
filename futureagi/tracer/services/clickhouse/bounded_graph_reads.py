@@ -248,6 +248,18 @@ def _read_time_distributed_candidates(
     total_rows_lower_bound = int(getattr(prior_page, "total_rows_lower_bound", 0) or 0)
     sampling_strata_completed = 0
     sampling_error_code: str | None = None
+    # Freeze the outer request window into an explicit positive time leaf.
+    # When the caller omits a date filter, each builder otherwise derives its
+    # own ``now - 30 days`` default a few microseconds apart.  Passing the raw
+    # filters as the membership window can then make membership_start newer
+    # than the first stratum_start and fail the containment guard before any
+    # ClickHouse query runs.  Complements remain intact via
+    # ``_filters_for_window`` while every stratum shares these exact bounds.
+    membership_filters = _filters_for_window(
+        filters,
+        window_start=window_start,
+        window_end=window_end,
+    )
 
     for index in range(stratum_count):
         remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
@@ -277,7 +289,7 @@ def _read_time_distributed_candidates(
             # The stratum constrains root seed/order only. Classification must
             # replay each finite trace across the original request window so a
             # root in one stratum can match children in another.
-            stratum_builder_kwargs["bounded_membership_filters"] = filters
+            stratum_builder_kwargs["bounded_membership_filters"] = membership_filters
         stratum_builder = builder_class(**stratum_builder_kwargs)
         # One extra identity is the finite has-more sentinel. Keeping the whole
         # stratum working set at 50 avoids the 512-row classifier that exceeded

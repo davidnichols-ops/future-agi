@@ -16,6 +16,7 @@ from tracer.services.clickhouse.bounded_graph_reads import (
     aggregate_system_candidate_graph,
     read_graph_candidates,
 )
+from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
 PROJECT_ID = "00000000-0000-4000-8000-000000000901"
@@ -392,6 +393,110 @@ def test_short_graph_map_filter_is_candidate_scoped(observe_type: str) -> None:
     assert "JSONExtractRaw(attributes_extra" in classify_query
     assert "vip" not in classify_query
     assert "vip" in classify_params.values()
+
+
+@pytest.mark.unit
+def test_zero_width_trace_graph_window_is_exact_without_a_query() -> None:
+    analytics = _CandidateAnalytics(observe_type="trace", rows=[])
+
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(START, START),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="trace",
+    )
+
+    assert sample.rows == ()
+    assert sample.query_complete is True
+    assert sample.query_status == "complete"
+    assert sample.window_start == sample.window_end == START
+    assert analytics.calls == []
+
+
+@pytest.mark.unit
+def test_one_microsecond_trace_graph_window_keeps_exact_membership_bounds() -> None:
+    window_end = START + timedelta(microseconds=1)
+    row = {
+        "trace_id": "trace-short",
+        "root_span_id": "root-short",
+        "start_time": START,
+    }
+    analytics = _CandidateAnalytics(observe_type="trace", rows=[row])
+
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(START, window_end),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="trace",
+    )
+
+    assert sample.rows == (row,)
+    classifier_params = next(
+        params for _, params, *_ in analytics.calls if "candidate_trace_ids" in params
+    )
+    assert classifier_params["candidate_start_date"] == START
+    assert classifier_params["candidate_end_date"] == window_end
+
+
+@pytest.mark.unit
+def test_default_long_window_is_frozen_once_for_every_trace_stratum(
+    monkeypatch,
+) -> None:
+    """A missing date filter must not derive a new ``now`` per builder."""
+
+    frozen_start = datetime(2026, 6, 1)
+    frozen_end = frozen_start + timedelta(days=30)
+    original_parse_time_range = BaseQueryBuilder.parse_time_range
+    default_calls = 0
+
+    def drifting_default(filters, *, strict=False):
+        nonlocal default_calls
+        has_positive_time_leaf = any(
+            (item.get("column_id") or item.get("columnId"))
+            in {"created_at", "start_time"}
+            and not BaseQueryBuilder.is_datetime_complement_filter(item)
+            for item in filters
+        )
+        if has_positive_time_leaf:
+            return original_parse_time_range(filters, strict=strict)
+        default_calls += 1
+        drift = timedelta(microseconds=default_calls)
+        return frozen_start + drift, frozen_end + drift
+
+    monkeypatch.setattr(
+        BaseQueryBuilder,
+        "parse_time_range",
+        staticmethod(drifting_default),
+    )
+    analytics = _CandidateAnalytics(observe_type="trace", rows=[])
+
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[_system_text_filter("call_type", "LLM")],
+        observe_type="trace",
+    )
+
+    assert sample.rows == ()
+    assert sample.query_complete is True
+    assert sample.query_status == "complete"
+    assert default_calls == 1
+    seed_ranges = [
+        (params["filter_slice_start"], params["filter_slice_end"])
+        for _, params, *_ in analytics.calls
+        if "filter_seed_limit" in params
+    ]
+    assert seed_ranges
+    assert min(start for start, _ in seed_ranges) == frozen_start + timedelta(
+        microseconds=1
+    )
+    assert max(end for _, end in seed_ranges) == frozen_end + timedelta(microseconds=1)
 
 
 @pytest.mark.unit
