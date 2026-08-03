@@ -849,15 +849,15 @@ def test_attribute_detail_executes_latest_state_and_tombstones_on_ch25(
         VALUES
         """,
         [
-            row("live", 1, "Rechazado"),
+            row("live", 1, "Rejected"),
             row("updated", 1, "stale-value"),
-            row("updated", 2, "Rechazado"),
+            row("updated", 2, "Rejected"),
             row("deleted", 1, "must-not-resurrect"),
             row("deleted", 2, "must-not-resurrect", deleted=1),
             row(
                 "shared",
                 1,
-                "Rechazado",
+                "Rejected",
                 trace_id="trace-shared-a",
                 started_at=shared_start,
             ),
@@ -879,7 +879,7 @@ def test_attribute_detail_executes_latest_state_and_tombstones_on_ch25(
             row(
                 "shared",
                 1,
-                "Rechazado",
+                "Rejected",
                 trace_id="trace-shared-a",
                 started_at=shared_start + timedelta(minutes=1),
             ),
@@ -912,7 +912,7 @@ def test_attribute_detail_executes_latest_state_and_tombstones_on_ch25(
     ).read_detail([project_id], key, horizon_days=7)
 
     assert read.attribute_type == "string"
-    assert [(item.value, item.count) for item in read.rows] == [("Rechazado", 4)]
+    assert [(item.value, item.count) for item in read.rows] == [("Rejected", 4)]
     assert read.metadata.query_complete is True
     assert read.metadata.query_count == 2
 
@@ -967,7 +967,7 @@ def test_exact_attribute_discovery_exclusion_pages_past_stale_sample_on_ch25(
             live_started_at,
             0,
             1,
-            {key: "Rechazado"},
+            {key: "Rejected"},
         )
     )
     ch_client.execute(
@@ -1108,7 +1108,7 @@ def test_json_array_picker_replays_tombstones_project_versions_and_older_key_ch2
             0,
             2,
             {},
-            f'{{"{key}":["Rechazado",true,18446744073709551615]}}',
+            f'{{"{key}":["Rejected",true,18446744073709551615]}}',
         ),
         # Typed Maps remain discoverable when JSON array mode is enabled.
         (
@@ -1120,7 +1120,7 @@ def test_json_array_picker_replays_tombstones_project_versions_and_older_key_ch2
             older - timedelta(minutes=1),
             0,
             1,
-            {"final_status": "Rechazado"},
+            {"final_status": "Rejected"},
             "{}",
         ),
         # Eval mapping may expose this path; a filter picker must not claim an
@@ -1185,7 +1185,7 @@ def test_json_array_picker_replays_tombstones_project_versions_and_older_key_ch2
     assert {
         (type(row.value).__name__, row.value, row.count) for row in values.rows
     } == {
-        ("str", "Rechazado", 1),
+        ("str", "Rejected", 1),
         ("bool", True, 1),
         ("int", 18446744073709551615, 1),
     }
@@ -1255,30 +1255,30 @@ def test_bounded_reader_handles_duplicates_tombstone_and_latest_updates(
         )
 
     rows = [
-        row("duplicate", version, window_end - timedelta(minutes=1), "Rechazado")
+        row("duplicate", version, window_end - timedelta(minutes=1), "Rejected")
         for version in range(1, 151)
     ]
     rows.extend(
         [
-            row("stable", 1, window_end - timedelta(minutes=2), "Rechazado"),
-            row("moved", 1, window_end - timedelta(minutes=3), "Rechazado"),
-            row("moved", 2, window_end - timedelta(minutes=3), "Rechazado"),
-            row("tombstoned", 1, window_end - timedelta(minutes=4), "Rechazado"),
+            row("stable", 1, window_end - timedelta(minutes=2), "Rejected"),
+            row("moved", 1, window_end - timedelta(minutes=3), "Rejected"),
+            row("moved", 2, window_end - timedelta(minutes=3), "Rejected"),
+            row("tombstoned", 1, window_end - timedelta(minutes=4), "Rejected"),
             row(
                 "tombstoned",
                 2,
                 window_end - timedelta(minutes=4),
-                "Rechazado",
+                "Rejected",
                 deleted=1,
             ),
             row(
-                "changed", 1, window_end - timedelta(minutes=4, seconds=30), "Rechazado"
+                "changed", 1, window_end - timedelta(minutes=4, seconds=30), "Rejected"
             ),
             row(
                 "changed",
                 2,
                 window_end - timedelta(minutes=4, seconds=30),
-                "Aprobado",
+                "Approved",
             ),
         ]
     )
@@ -1358,7 +1358,7 @@ def test_bounded_reader_handles_duplicates_tombstone_and_latest_updates(
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
     ]
@@ -1419,7 +1419,7 @@ def test_bounded_span_reader_isolates_reused_ids_by_trace_on_ch25(
             started,
             deleted,
             version,
-            {key: "Rechazado"},
+            {key: "Rejected"},
             {},
             {},
             "{}",
@@ -1504,7 +1504,7 @@ def test_bounded_span_reader_isolates_reused_ids_by_trace_on_ch25(
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
     ]
@@ -1549,7 +1549,7 @@ def test_eval_identity_only_span_and_trace_classifiers_execute_on_ch25(
                 end - timedelta(minutes=1),
                 0,
                 1,
-                {"final_status": "Rechazado"},
+                {"final_status": "Rejected"},
             )
         ],
     )
@@ -1568,7 +1568,7 @@ def test_eval_identity_only_span_and_trace_classifiers_execute_on_ch25(
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
     ]
@@ -1641,7 +1641,7 @@ def test_eval_candidate_reader_proves_large_prefix_on_ch25(
                 window_end - timedelta(minutes=1, microseconds=index),
                 0,
                 1,
-                {"final_status": "Rechazado"},
+                {"final_status": "Rejected"},
             )
             for index in range(limit + 1)
         ],
@@ -1662,7 +1662,7 @@ def test_eval_candidate_reader_proves_large_prefix_on_ch25(
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
     ]
@@ -2066,7 +2066,7 @@ def test_json_map_composes_with_array_typed_maps_and_trace_any_span_on_ch25(
                 started_at + timedelta(microseconds=1),
                 0,
                 1,
-                {"final_status": "Rechazado"},
+                {"final_status": "Rejected"},
                 {"score": 0.9},
                 {"reviewed": 1},
                 '{"context":{"tier":"vip","attempt":2},"tags":["priority","customer"]}',
@@ -2101,7 +2101,7 @@ def test_json_map_composes_with_array_typed_maps_and_trace_any_span_on_ch25(
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
         {
@@ -2194,23 +2194,23 @@ def test_trace_classifier_resolves_latest_update_and_tombstone_in_trace(
         )
 
     rows = [
-        row("root-a", 1, "trace-a", None, "Aprobado", minute=1),
-        row("child-updated", 1, "trace-a", "root-a", "Rechazado", minute=2),
+        row("root-a", 1, "trace-a", None, "Approved", minute=1),
+        row("child-updated", 1, "trace-a", "root-a", "Rejected", minute=2),
         row(
             "child-updated",
             2,
             "trace-a",
             "root-a",
-            "Aprobado",
+            "Approved",
             minute=2,
         ),
-        row("child-deleted", 1, "trace-a", "root-a", "Rechazado", minute=3),
+        row("child-deleted", 1, "trace-a", "root-a", "Rejected", minute=3),
         row(
             "child-deleted",
             2,
             "trace-a",
             "root-a",
-            "Rechazado",
+            "Rejected",
             minute=3,
             is_deleted=1,
         ),
@@ -2265,7 +2265,7 @@ def test_trace_classifier_resolves_latest_update_and_tombstone_in_trace(
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
     ]
@@ -2329,7 +2329,7 @@ def test_trace_classifier_keeps_reused_span_ids_isolated_by_trace_identity(
                 "trace-a",
                 "root-a",
                 3,
-                {"final_status": "Rechazado"},
+                {"final_status": "Rejected"},
                 version=1,
             ),
             row(
@@ -2337,7 +2337,7 @@ def test_trace_classifier_keeps_reused_span_ids_isolated_by_trace_identity(
                 "trace-b",
                 "root-b",
                 4,
-                {"final_status": "Rechazado"},
+                {"final_status": "Rejected"},
                 version=2,
             ),
         ],
@@ -2358,7 +2358,7 @@ def test_trace_classifier_keeps_reused_span_ids_isolated_by_trace_identity(
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
     ]
@@ -2407,7 +2407,7 @@ def test_trace_pages_keep_older_live_root_when_newer_raw_root_is_tombstoned(
             started,
             is_deleted,
             version,
-            {key: "Rechazado"},
+            {key: "Rejected"},
         )
 
     ch_client.execute(
@@ -2451,7 +2451,7 @@ def test_trace_pages_keep_older_live_root_when_newer_raw_root_is_tombstoned(
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
         {
@@ -2566,7 +2566,7 @@ def test_trace_root_seed_and_any_span_match_execute_on_different_spans(
             "trace-both",
             "root-both",
             9,
-            {"customer.final_status": "Rechazado"},
+            {"customer.final_status": "Rejected"},
         ),
         row(
             "child-country",
@@ -2581,7 +2581,7 @@ def test_trace_root_seed_and_any_span_match_execute_on_different_spans(
             "trace-partial",
             "root-partial",
             6,
-            {"customer.final_status": "Rechazado"},
+            {"customer.final_status": "Rejected"},
         ),
         row("root-other", "trace-other", None, 5, {}, tenant=other_project_id),
         row(
@@ -2589,7 +2589,7 @@ def test_trace_root_seed_and_any_span_match_execute_on_different_spans(
             "trace-other",
             "root-other",
             4,
-            {"customer.final_status": "Rechazado"},
+            {"customer.final_status": "Rejected"},
             tenant=other_project_id,
         ),
         row(
@@ -2631,7 +2631,7 @@ def test_trace_root_seed_and_any_span_match_execute_on_different_spans(
                 "filter_value": [window_start.isoformat(), window_end.isoformat()],
             },
         },
-        attribute_filter("customer.final_status", "Rechazado"),
+        attribute_filter("customer.final_status", "Rejected"),
         attribute_filter("customer.country", "ES"),
     ]
 
@@ -2704,7 +2704,7 @@ def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
         )
 
     rows = [
-        # The raw anchor sees this old in-window Rechazado version, but latest
+        # The raw anchor sees this old in-window Rejected version, but latest
         # state for the same immutable identity no longer matches.
         span(
             "root-stale",
@@ -2718,14 +2718,14 @@ def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
             "trace-stale",
             "root-stale",
             window_end - timedelta(minutes=9),
-            {"customer.final_status": "Rechazado"},
+            {"customer.final_status": "Rejected"},
         ),
         span(
             "child-stale",
             "trace-stale",
             "root-stale",
             window_end - timedelta(minutes=9),
-            {"customer.final_status": "Aceptado"},
+            {"customer.final_status": "Accepted"},
             version=2,
         ),
         span(
@@ -2741,7 +2741,7 @@ def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
             "trace-stale",
             "root-stale",
             window_end,
-            {"customer.final_status": "Rechazado"},
+            {"customer.final_status": "Rejected"},
         ),
         # Nor may a current match just before the lower boundary rescue it.
         span(
@@ -2749,7 +2749,7 @@ def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
             "trace-stale",
             "root-stale",
             window_start - timedelta(microseconds=1),
-            {"customer.final_status": "Rechazado"},
+            {"customer.final_status": "Rejected"},
         ),
         # A normal in-window trace can satisfy independent leaves on different
         # children.
@@ -2765,7 +2765,7 @@ def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
             "trace-live",
             "root-live",
             window_end - timedelta(minutes=5),
-            {"customer.final_status": "Rechazado"},
+            {"customer.final_status": "Rejected"},
         ),
         span(
             "child-live-country",
@@ -2787,7 +2787,7 @@ def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
             "trace-boundary",
             "root-boundary",
             window_start,
-            {"customer.final_status": "Rechazado"},
+            {"customer.final_status": "Rejected"},
         ),
         span(
             "child-boundary-country",
@@ -2827,7 +2827,7 @@ def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
                 "filter_value": [window_start.isoformat(), window_end.isoformat()],
             },
         },
-        attribute_filter("customer.final_status", "Rechazado"),
+        attribute_filter("customer.final_status", "Rejected"),
         attribute_filter("customer.country", "ES"),
     ]
 

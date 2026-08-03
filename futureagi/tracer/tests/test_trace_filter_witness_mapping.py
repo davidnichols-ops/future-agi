@@ -24,8 +24,8 @@ def _span(span_id: str, offset: int, **attributes):
 def _trace_and_spans():
     trace = SimpleNamespace(id=TRACE_ID, project_id=PROJECT_ID)
     spans = [
-        _span("root", 0, final_status="Aprobado", customer_tier="free"),
-        _span("status-child", 1, final_status="Rechazado"),
+        _span("root", 0, final_status="Approved", customer_tier="free"),
+        _span("status-child", 1, final_status="Rejected"),
         _span("tier-child", 2, customer_tier="vip"),
     ]
     return trace, spans
@@ -59,9 +59,9 @@ def test_saved_positional_mapping_reads_the_child_that_matched_the_filter() -> N
     trace, spans = _trace_and_spans()
     witnesses = [_witness(spans[1], 0, "final_status")]
 
-    # The old positional resolver would read root/Aprobado here. A unique
+    # The old positional resolver would read root/Approved here. A unique
     # filter key now binds the saved path to the physical matching child.
-    assert _resolve(trace, spans, witnesses, "spans.0.final_status") == "Rechazado"
+    assert _resolve(trace, spans, witnesses, "spans.0.final_status") == "Rejected"
 
 
 def test_multiple_filter_leaves_can_bind_to_different_children() -> None:
@@ -72,7 +72,7 @@ def test_multiple_filter_leaves_can_bind_to_different_children() -> None:
     ]
 
     assert (
-        _resolve(trace, spans, witnesses, "filter_spans.0.final_status") == "Rechazado"
+        _resolve(trace, spans, witnesses, "filter_spans.0.final_status") == "Rejected"
     )
     assert _resolve(trace, spans, witnesses, "filter_spans.1.customer_tier") == "vip"
 

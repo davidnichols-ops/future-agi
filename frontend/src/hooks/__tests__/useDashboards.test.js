@@ -192,9 +192,9 @@ describe("useDashboardFilterValues bounded-read state", () => {
         useDashboardFilterValues({
           metricName: "final_status",
           metricType: "custom_attribute",
-          projectIds: ["project-colly"],
+          projectIds: ["project-synthetic"],
           source: "traces",
-          search: "Rechazado",
+          search: "Rejected",
         }),
       { wrapper: createQueryWrapper(queryClient) },
     );
@@ -204,7 +204,7 @@ describe("useDashboardFilterValues bounded-read state", () => {
     mocks.get.mockResolvedValue({
       data: {
         result: {
-          values: ["Rechazado"],
+          values: ["Rejected"],
           query_complete: false,
           query_status: "degraded",
         },
@@ -213,7 +213,7 @@ describe("useDashboardFilterValues bounded-read state", () => {
     const { result } = renderValues();
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toEqual(["Rechazado"]);
+    expect(result.current.data).toEqual(["Rejected"]);
     expect(result.current.queryReadState).toBe("degraded");
     expect(mocks.get).toHaveBeenCalledWith(
       "/tracer/dashboard/filter_values/",
@@ -221,8 +221,8 @@ describe("useDashboardFilterValues bounded-read state", () => {
         signal: expect.any(AbortSignal),
         params: expect.objectContaining({
           metric_name: "final_status",
-          project_ids: "project-colly",
-          search: "Rechazado",
+          project_ids: "project-synthetic",
+          search: "Rejected",
         }),
       }),
     );

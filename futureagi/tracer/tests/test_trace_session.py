@@ -357,7 +357,7 @@ class TestTraceSessionListAPI:
                     "col_type": "SPAN_ATTRIBUTE",
                     "filter_type": "text",
                     "filter_op": "equals",
-                    "filter_value": "Rechazado",
+                    "filter_value": "Rejected",
                 },
             }
         ]
@@ -527,7 +527,7 @@ class TestTraceSessionGraphAPI:
         pg_trace_manager.assert_not_called()
 
     def test_session_system_graph_groups_only_proven_latest_trace_candidates(self):
-        window_start = datetime(2026, 7, 24, tzinfo=UTC)
+        window_start = datetime(2026, 1, 1, tzinfo=UTC)
         window_end = window_start + timedelta(days=1)
         survivor = "10000000-0000-0000-0000-000000000000"
         duplicate_old = "20000000-0000-0000-0000-000000000000"
@@ -629,8 +629,8 @@ class TestTraceSessionGraphAPI:
                         "filter_type": "datetime",
                         "filter_op": "between",
                         "filter_value": [
-                            "2026-07-24T00:00:00Z",
-                            "2026-07-25T00:00:00Z",
+                            "2026-01-01T00:00:00Z",
+                            "2026-01-02T00:00:00Z",
                         ],
                     },
                 },
@@ -691,7 +691,7 @@ class TestTraceSessionGraphAPI:
     def test_session_system_graph_rejects_returned_candidate_sample_before_remap(
         self,
     ):
-        window_start = datetime(2026, 7, 24, tzinfo=UTC)
+        window_start = datetime(2026, 1, 1, tzinfo=UTC)
         sample = GraphCandidateSample(
             rows=(
                 {

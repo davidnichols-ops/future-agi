@@ -522,7 +522,7 @@ def test_v2_span_query_mixes_array_and_all_typed_maps_under_latest_identity() ->
             "final_status",
             filter_type="text",
             filter_op="equals",
-            filter_value="Rechazado",
+            filter_value="Rejected",
         ),
         _attribute_filter(
             "score",
@@ -551,13 +551,13 @@ def test_v2_span_query_mixes_array_and_all_typed_maps_under_latest_identity() ->
     assert "_version" in sql
     assert "argMax(is_deleted, _version)" in sql
     assert "candidate_span_ids" in sql
-    for literal in ("customer.tags", "vip", "final_status", "Rechazado"):
+    for literal in ("customer.tags", "vip", "final_status", "Rejected"):
         assert literal not in sql
     assert params["candidate_span_ids"] == ("span-a",)
     assert params["latest_filter_key_0"] == "customer.tags"
     assert params["latest_filter_json_0_string"] == ("vip",)
     assert params["latest_filter_key_1"] == "final_status"
-    assert params["latest_filter_param_1"] == "rechazado"
+    assert params["latest_filter_param_1"] == "rejected"
 
 
 def test_v2_span_query_composes_map_array_typed_map_and_date_filters() -> None:
@@ -579,7 +579,7 @@ def test_v2_span_query_composes_map_array_typed_map_and_date_filters() -> None:
             "final_status",
             filter_type="text",
             filter_op="equals",
-            filter_value="Rechazado",
+            filter_value="Rejected",
         ),
     ]
     builder = SpanListQueryBuilderV2(project_id=PROJECT_ID, filters=filters)

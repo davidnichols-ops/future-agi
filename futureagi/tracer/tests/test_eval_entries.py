@@ -228,7 +228,7 @@ class TestMaterializeTracesAndSessions:
             name="child",
             observation_type="tool",
             parent_span_id=root.id,
-            span_attributes={"final_status": "Rechazado"},
+            span_attributes={"final_status": "Rejected"},
             start_time=started_at + timedelta(seconds=1),
         )
         _seed_past([root, child])

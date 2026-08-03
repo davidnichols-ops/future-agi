@@ -137,7 +137,7 @@ def test_mutable_map_and_json_filter_statements_keep_final_skip_indexes_off():
                     "col_type": "SPAN_ATTRIBUTE",
                     "filter_type": "text",
                     "filter_op": "equals",
-                    "filter_value": "Rechazado",
+                    "filter_value": "Rejected",
                 },
             },
             "attrs_string",

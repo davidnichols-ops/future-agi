@@ -287,7 +287,7 @@ def test_general_exact_key_probe_finds_rare_key_in_later_band(
                 PROJECT_A,
                 "rare-span",
                 start_time=NOW - timedelta(days=start_days),
-                string="Rechazado",
+                string="Rejected",
             )
         ]
 
@@ -353,7 +353,7 @@ def test_exact_key_probe_exclusion_pages_past_512_stale_latest_states() -> None:
                     "trace-rare-live" if span_id == "rare-live" else f"trace-{span_id}"
                 ),
                 start_time=starts_by_id[span_id],
-                string="Rechazado" if span_id == "rare-live" else None,
+                string="Rejected" if span_id == "rare-live" else None,
             )
             for span_id in candidate_ids
         ]
@@ -552,14 +552,14 @@ def test_latest_replay_uses_index_pruning_and_exact_physical_identities():
     ]
     latest = [
         # Same id in two projects: one live value and one opposite tombstone.
-        _target_row(PROJECT_A, "duplicate-id", string="Rechazado"),
+        _target_row(PROJECT_A, "duplicate-id", string="Rejected"),
         _target_row(
             PROJECT_B,
             "duplicate-id",
             is_deleted=1,
             string="must-not-resurrect",
         ),
-        _target_row(PROJECT_A, "string-second", string="Rechazado"),
+        _target_row(PROJECT_A, "string-second", string="Rejected"),
         _target_row(PROJECT_A, "number", number=42),
         _target_row(PROJECT_A, "boolean", boolean=True),
         _target_row(PROJECT_A, "legacy-string", legacy_raw='"legacy"'),
@@ -585,7 +585,7 @@ def test_latest_replay_uses_index_pruning_and_exact_physical_identities():
     )
 
     assert read.rows == (
-        AttributeValueRow("Rechazado", "string", 2),
+        AttributeValueRow("Rejected", "string", 2),
         AttributeValueRow(42.0, "number", 1),
         AttributeValueRow(7.0, "number", 1),
         AttributeValueRow(False, "boolean", 1),
@@ -664,7 +664,7 @@ def test_reused_span_ids_keep_trace_and_start_time_scoped_tombstones():
             "shared",
             trace_id="trace-a",
             start_time=first,
-            string="Rechazado",
+            string="Rejected",
         ),
         _target_row(
             PROJECT_A,
@@ -679,14 +679,14 @@ def test_reused_span_ids_keep_trace_and_start_time_scoped_tombstones():
             "shared",
             trace_id="trace-a",
             start_time=second,
-            string="Rechazado",
+            string="Rejected",
         ),
         _target_row(
             PROJECT_A,
             "empty-trace",
             trace_id="",
             start_time=first,
-            string="Rechazado",
+            string="Rejected",
         ),
     ]
     emitted = False
@@ -707,7 +707,7 @@ def test_reused_span_ids_keep_trace_and_start_time_scoped_tombstones():
         typed_only=True,
     ).read_values([PROJECT_A], "final_status")
 
-    assert read.rows == (AttributeValueRow("Rechazado", "string", 3),)
+    assert read.rows == (AttributeValueRow("Rejected", "string", 3),)
     replay = next(call for call in executor.calls if "segment_start" not in call.params)
     assert replay.params["candidate_ids_0"] == ("shared", "empty-trace")
     assert replay.params["candidate_trace_ids_0"] == ("trace-a", "trace-b", "")
@@ -1327,7 +1327,7 @@ def test_value_search_pages_past_512_stale_matches_to_live_value():
                 span_id,
                 trace_id=rows_by_id[span_id]["trace_id"],
                 start_time=rows_by_id[span_id]["start_time"],
-                string="Rechazado" if span_id == "live-value" else None,
+                string="Rejected" if span_id == "live-value" else None,
             )
             for span_id in call.params["candidate_ids_0"]
         ]
@@ -1337,12 +1337,12 @@ def test_value_search_pages_past_512_stale_matches_to_live_value():
         executor,
         now=NOW,
         typed_only=True,
-    ).read_values([PROJECT_A], "final_status", search="Rechazado")
+    ).read_values([PROJECT_A], "final_status", search="Rejected")
 
-    assert read.rows == (AttributeValueRow("Rechazado", "string", 1),)
+    assert read.rows == (AttributeValueRow("Rejected", "string", 1),)
     assert read.metadata.query_complete is True
     candidates = [call for call in executor.calls if "segment_start" in call.params]
-    assert all(call.params["attribute_search"] == "Rechazado" for call in candidates)
+    assert all(call.params["attribute_search"] == "Rejected" for call in candidates)
     continuation = next(
         call for call in candidates if "excluded_candidate_identities" in call.params
     )
@@ -1598,7 +1598,7 @@ def test_eval_attribute_picker_contract_accepts_general_exact_key_probe():
     } <= set(ObservationAttributeListResponseSerializer().fields)
 
 
-def test_dashboard_final_status_picker_returns_rechazado_from_selector(
+def test_dashboard_final_status_picker_returns_rejected_from_selector(
     monkeypatch,
 ):
     from tracer.views.dashboard import DashboardViewSet
@@ -1614,7 +1614,7 @@ def test_dashboard_final_status_picker_returns_rechazado_from_selector(
             kwargs=kwargs,
         )
         return AttributeValueRead(
-            (AttributeValueRow("Rechazado", "string", 1),),
+            (AttributeValueRow("Rejected", "string", 1),),
             _metadata(),
         )
 
@@ -1642,7 +1642,7 @@ def test_dashboard_final_status_picker_returns_rechazado_from_selector(
 
     assert response.status_code == 200
     payload = response.data["result"]
-    assert payload["values"] == [{"value": "Rechazado", "label": "Rechazado"}]
+    assert payload["values"] == [{"value": "Rejected", "label": "Rejected"}]
     assert payload["query_complete"] is True
     assert captured["project_ids"] == [PROJECT_A]
     assert captured["key"] == "final_status"
@@ -1951,8 +1951,8 @@ def test_span_attribute_detail_uses_bounded_v2_latest_state_distribution(monkeyp
         return AttributeDetailRead(
             "string",
             (
-                AttributeValueRow("Rechazado", "string", 2),
-                AttributeValueRow("Aceptado", "string", 1),
+                AttributeValueRow("Rejected", "string", 2),
+                AttributeValueRow("Accepted", "string", 1),
             ),
             _metadata(),
         )
@@ -1975,8 +1975,8 @@ def test_span_attribute_detail_uses_bounded_v2_latest_state_distribution(monkeyp
     assert response.data["count"] == 3
     assert response.data["unique_values"] == 2
     assert response.data["top_values"] == [
-        {"value": "Rechazado", "count": 2, "percentage": 66.7},
-        {"value": "Aceptado", "count": 1, "percentage": 33.3},
+        {"value": "Rejected", "count": 2, "percentage": 66.7},
+        {"value": "Accepted", "count": 1, "percentage": 33.3},
     ]
     assert response.data["query_complete"] is True
     contract = SpanAttributeDetailResponseSerializer(data=response.data)

@@ -19,7 +19,7 @@ def _attribute_filter() -> dict:
             "col_type": "SPAN_ATTRIBUTE",
             "filter_type": "text",
             "filter_op": "in",
-            "filter_value": ["Rechazado"],
+            "filter_value": ["Rejected"],
         },
     }
 

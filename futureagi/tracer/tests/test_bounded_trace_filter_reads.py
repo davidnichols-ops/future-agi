@@ -173,7 +173,7 @@ def test_dispatched_v2_query_service_uses_split_host_without_legacy_singleton() 
 def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> None:
     filters = [
         _time_filter(),
-        _attribute_filter("final_status", ["Rechazado"], operation="in"),
+        _attribute_filter("final_status", ["Rejected"], operation="in"),
     ]
     builder = TraceListQueryBuilder(project_id=PROJECT_ID, filters=filters)
 
@@ -216,7 +216,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
 def test_root_seed_replay_does_not_trust_one_raw_physical_root_id() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
     )
 
     sql, params = builder.build_filter_match_query_from_seed_rows(
@@ -276,7 +276,7 @@ def test_span_seed_replay_uses_trace_scoped_otel_identity() -> None:
     builder = SpanListQueryBuilder(
         project_id=PROJECT_ID,
         project_version_id=project_version_id,
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
     )
     assert builder.supports_bounded_filter_scan() is True
 
@@ -338,7 +338,7 @@ def test_span_seed_replay_uses_trace_scoped_otel_identity() -> None:
 def test_v2_span_seed_uses_deployed_string_value_bloom_companion() -> None:
     filters = [
         _time_filter(),
-        _attribute_filter("final_status", ["Rechazado"], operation="in"),
+        _attribute_filter("final_status", ["Rejected"], operation="in"),
     ]
     builder = SpanListQueryBuilderV2(project_id=PROJECT_ID, filters=filters)
 
@@ -352,7 +352,7 @@ def test_v2_span_seed_uses_deployed_string_value_bloom_companion() -> None:
         "hasAny(arrayMap(x -> lower(x), mapValues(attrs_string)), "
         "[%(latest_filter_index_0_0)s])" in sql
     )
-    assert params["latest_filter_index_0_0"] == "rechazado"
+    assert params["latest_filter_index_0_0"] == "rejected"
 
     prompt_builder = SpanListQueryBuilderV2(
         project_id=PROJECT_ID,
@@ -443,7 +443,7 @@ def test_trace_attribute_can_match_only_a_child_span() -> None:
         project_id=PROJECT_ID,
         filters=[
             _time_filter(),
-            _attribute_filter("customer.final_status", ["Rechazado"], operation="in"),
+            _attribute_filter("customer.final_status", ["Rejected"], operation="in"),
         ],
     )
 
@@ -487,7 +487,7 @@ def test_trace_mixed_root_and_any_span_filters_keep_distinct_scopes() -> None:
         filters=[
             _time_filter(),
             _system_filter("trace_name", "Café"),
-            _attribute_filter("customer.final_status", "Rechazado"),
+            _attribute_filter("customer.final_status", "Rejected"),
         ],
     )
 
@@ -503,7 +503,7 @@ def test_trace_mixed_root_and_any_span_filters_keep_distinct_scopes() -> None:
     assert "argMax(trace_name, _peerdb_version)" in match_sql
     assert "mapContains(span_attr_str, %(latest_filter_key_1)s)" in match_sql
     assert params["latest_filter_param_0"] == "café"
-    assert params["latest_filter_param_1"] == "rechazado"
+    assert params["latest_filter_param_1"] == "rejected"
 
 
 def test_mixed_attribute_and_annotation_stays_in_one_bounded_trace_classifier() -> None:
@@ -512,7 +512,7 @@ def test_mixed_attribute_and_annotation_stays_in_one_bounded_trace_classifier() 
         project_id=PROJECT_ID,
         filters=[
             _time_filter(),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
             _annotation_filter(label_id, "approved"),
         ],
     )
@@ -709,7 +709,7 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
         project_id=PROJECT_ID,
         filters=[
             _time_filter(),
-            _attribute_filter("customer.final_status", "Rechazado"),
+            _attribute_filter("customer.final_status", "Rejected"),
             _attribute_filter("customer.country", "ES"),
         ],
         bounded_internal_scan=True,
@@ -741,11 +741,20 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
     assert match_sql.count("GROUP BY grouped_trace_id") == 1
     assert match_sql.count("countIf(") == 3
     # Canonical root + both independent any-span leaves are constrained to
-    # the same half-open request window after latest-version collapse.
-    # The canonical-root condition is used by both argMaxIf and HAVING; each
-    # any-span leaf contributes one additional window gate.
-    assert match_sql.count("latest_start_time >= %(candidate_start_date)s") == 4
-    assert match_sql.count("latest_start_time < %(candidate_end_date)s") == 4
+    # the same half-open request window after latest-version collapse. The
+    # root gate is used by argMaxIf and HAVING. Each any-span leaf uses the
+    # gate once to project its physical witness and once in its countIf HAVING.
+    any_span_leaf_count = 2
+    expected_window_gate_uses = 2 + (2 * any_span_leaf_count)
+    assert match_sql.count("argMinIf(") == any_span_leaf_count
+    assert (
+        match_sql.count("latest_start_time >= %(candidate_start_date)s")
+        == expected_window_gate_uses
+    )
+    assert (
+        match_sql.count("latest_start_time < %(candidate_end_date)s")
+        == expected_window_gate_uses
+    )
     assert first_filter in match_sql and second_filter in match_sql
     assert "AND trace_id IN %(candidate_trace_ids)s" in match_sql
     assert "%(candidate_start_date)s - INTERVAL 1 DAY" not in match_sql
@@ -759,7 +768,7 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
 def test_trace_candidate_classifier_enforces_production_proven_512_trace_cap() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
     )
 
     with pytest.raises(ValueError, match="candidate trace batch"):
@@ -769,7 +778,7 @@ def test_trace_candidate_classifier_enforces_production_proven_512_trace_cap() -
 def test_span_candidate_classifier_enforces_200_identity_hard_cap() -> None:
     builder = SpanListQueryBuilder(
         project_id=PROJECT_ID,
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
     )
 
     with pytest.raises(ValueError, match="candidate .* batch exceeds bounded limit"):
@@ -796,7 +805,7 @@ def test_unicode_text_equality_and_membership_use_utf8_case_folding() -> None:
 
 def test_attribute_key_is_bound_and_preserved_for_all_map_expressions() -> None:
     key = "café final status '50%_\\path"
-    value = "Rechazado%_\\literal"
+    value = "Rejected%_\\literal"
     builder = SpanListQueryBuilderV2(
         project_id=PROJECT_ID,
         filters=[_time_filter(), _attribute_filter(key, value)],
@@ -904,7 +913,7 @@ def test_v2_bounded_builders_emit_only_ch25_columns() -> None:
         project_id=PROJECT_ID,
         filters=[
             _time_filter(),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
         ],
     )
     trace_seed_sql, _ = trace_builder.build_filter_seed_page(
@@ -946,7 +955,7 @@ def test_v2_bounded_builders_emit_only_ch25_columns() -> None:
 def test_trace_custom_sort_never_falls_back_to_legacy_query() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
         sort_params=[{"column_id": "latency", "order": "desc"}],
     )
 
@@ -1001,9 +1010,9 @@ def test_trace_search_and_any_span_filter_share_bounded_classifier() -> None:
         project_id=PROJECT_ID,
         filters=[
             _time_filter(),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
         ],
-        search="Colly",
+        search="SyntheticAgent",
     )
 
     anchor_sql, anchor_params = builder.build_filter_anchor_probe(limit=513)
@@ -1019,11 +1028,11 @@ def test_trace_search_and_any_span_filter_share_bounded_classifier() -> None:
     assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in anchor_sql
     assert "latest_filter_param_1" not in anchor_params
     assert "positionUTF8(lowerUTF8(toString(trace_name))" in ordered_sql
-    assert ordered_params["latest_filter_param_1"] == "Colly"
+    assert ordered_params["latest_filter_param_1"] == "SyntheticAgent"
     assert "latest_attr_value_0" in match_sql
     assert "latest_column_value_1" in match_sql
-    assert match_params["latest_filter_param_0"] == "rechazado"
-    assert match_params["latest_filter_param_1"] == "Colly"
+    assert match_params["latest_filter_param_0"] == "rejected"
+    assert match_params["latest_filter_param_1"] == "SyntheticAgent"
     assert builder.filter_seed_proves_result_order() is False
 
 
@@ -1068,7 +1077,7 @@ def test_trace_project_version_filter_is_scoped_in_bounded_seed_and_replay() -> 
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         project_version_id=project_version_id,
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
     )
 
     assert builder.supports_bounded_filter_scan() is True
@@ -1097,7 +1106,7 @@ def test_span_supported_filter_modifiers_never_fall_back_to_legacy_query(
 ) -> None:
     builder = SpanListQueryBuilder(
         project_id=PROJECT_ID,
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
         **modifier,
     )
 
@@ -1201,7 +1210,7 @@ def test_trace_list_view_selects_bounded_path_under_v2_only() -> None:
             validated_data={
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
                 "page_size": 25,
@@ -1311,7 +1320,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
             validated_data={
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
                 "page_size": 25,
@@ -1396,7 +1405,7 @@ def test_trace_list_enrichment_timeout_is_sanitized_503_not_empty_200() -> None:
             validated_data={
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
                 "page_size": 25,
@@ -1469,7 +1478,7 @@ def test_eval_task_trace_list_project_version_selects_bounded_path() -> None:
             {
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                 ],
                 "sort_params": [],
                 "page_number": 3,
@@ -1594,7 +1603,7 @@ def test_eval_task_project_version_enrichments_share_deadline_and_caps() -> None
             {
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                 ],
                 "sort_params": [],
                 "page_number": 0,
@@ -1669,7 +1678,7 @@ def test_eval_task_trace_list_incomplete_page_fails_closed_before_enrichment() -
             {
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                 ],
                 "sort_params": [],
                 "page_number": 0,
@@ -1858,7 +1867,7 @@ def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
             validated_data={
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
                 "page_size": 25,
@@ -1921,7 +1930,7 @@ def test_trace_route_returns_sanitized_degraded_page_for_filtered_sort() -> None
             validated_data={
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
                 "page_size": 25,
@@ -1979,7 +1988,7 @@ def test_span_route_returns_sanitized_degraded_page_for_filtered_end_user() -> N
             validated_data={
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
                 "page_size": 25,
@@ -2214,7 +2223,7 @@ def test_default_window_is_pinned_for_empty_bounded_reads(
         START + timedelta(microseconds=1),
         END + timedelta(microseconds=1),
     )
-    filters = [_attribute_filter("final_status", "Rechazado")]
+    filters = [_attribute_filter("final_status", "Rejected")]
 
     with mock.patch.object(
         BaseQueryBuilder,
@@ -2536,7 +2545,7 @@ def test_observe_trace_page_depth_is_typed_422_without_ch_enrichment() -> None:
             validated_data={
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                     _attribute_filter("tenant_tier", "enterprise"),
                 ],
                 "page_number": 999,
@@ -2593,7 +2602,7 @@ def test_prototype_trace_page_depth_is_typed_422_without_ch_enrichment() -> None
             {
                 "filters": [
                     _time_filter(),
-                    _attribute_filter("final_status", "Rechazado"),
+                    _attribute_filter("final_status", "Rejected"),
                     _attribute_filter("tenant_tier", "enterprise"),
                 ],
                 "sort_params": [],
@@ -2630,7 +2639,7 @@ def test_span_deep_filtered_page_preflight_returns_422_before_ch(
     validated_data = {
         "filters": [
             _time_filter(),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
             _attribute_filter("tenant_tier", "enterprise"),
         ],
         "page_number": 999,
@@ -2677,7 +2686,7 @@ def test_session_deep_filtered_page_preflight_returns_422_before_ch() -> None:
             "project_id": PROJECT_ID,
             "filters": [
                 _time_filter(),
-                _attribute_filter("final_status", "Rechazado"),
+                _attribute_filter("final_status", "Rejected"),
                 _attribute_filter("tenant_tier", "enterprise"),
             ],
             "sort_params": [],
@@ -2839,7 +2848,7 @@ def test_safe_legacy_upper_only_multifilter_can_prove_exact_empty_without_ch() -
         analytics=executor,
         filters=[
             _time_filter(),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
             _attribute_filter("tenant_tier", "enterprise"),
         ],
         key_field="id",

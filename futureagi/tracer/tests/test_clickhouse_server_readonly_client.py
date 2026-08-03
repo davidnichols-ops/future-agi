@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from tracer.services.clickhouse import client as client_module
+from tracer.services.clickhouse import server_readonly as server_readonly_module
 from tracer.services.clickhouse.client import ClickHouseClient
 from tracer.services.clickhouse.server_readonly import (
     ServerEnforcedReadOnlyNativeClient,
@@ -194,6 +195,24 @@ def test_native_block_stream_retires_connection_when_iterator_raises():
 
     pool._return_client.assert_not_called()
     connection.disconnect.assert_called_once_with()
+
+
+def test_native_block_stream_logs_disconnect_failure_without_surfacing(monkeypatch):
+    connection = Mock()
+    connection.disconnect.side_effect = RuntimeError("disconnect failed")
+    warning = Mock()
+    monkeypatch.setattr(server_readonly_module.logger, "warning", warning)
+    stream = _NativeBlockStream(Mock(), "SELECT 1", {})
+    stream._connection = connection
+
+    stream._retire_connection()
+
+    warning.assert_called_once_with(
+        "server_readonly_native_disconnect_failed",
+        error_type="RuntimeError",
+        exc_info=True,
+    )
+    assert stream._connection is None
 
 
 @pytest.mark.parametrize(

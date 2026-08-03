@@ -1,5 +1,6 @@
 import json
 import math
+from typing import Any
 
 from rest_framework import serializers
 
@@ -120,8 +121,7 @@ BOUNDED_FILTER_LIST_QUERY_PARAM_SCHEMA = {
 BOUNDED_PAGE_NUMBER_HELP_TEXT = (
     "Zero-based numbered page. Pages whose required ordered work exceeds the "
     "finite read contract return HTTP 422 with code "
-    "page_depth_exceeded; request an earlier page or narrow the time range. "
-    "This endpoint does not provide cursor or unrestricted deep-page traversal."
+    "page_depth_exceeded; request an earlier page or narrow the time range."
 )
 JSON_OBJECT_QUERY_PARAM_SCHEMA = {
     "type": "string",
@@ -890,7 +890,9 @@ def filter_list_query_param_field(**kwargs):
     return FilterListQueryParamField(**kwargs)
 
 
-def bounded_filter_list_query_param_field(**kwargs):
+def bounded_filter_list_query_param_field(
+    **kwargs: Any,
+) -> BoundedFilterListQueryParamField:
     return BoundedFilterListQueryParamField(**kwargs)
 
 

@@ -45,7 +45,7 @@ from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
 from tracer.services.eval_tasks.config_hash import resolved_config_hash
 
 
-def _attribute_filter(key: str = "final_status", value: str = "Rechazado") -> dict:
+def _attribute_filter(key: str = "final_status", value: str = "Rejected") -> dict:
     return {
         "column_id": key,
         "filter_config": {

@@ -67,6 +67,21 @@ def _span_attr_filter(filter_op="equals", filter_value="alpha"):
 
 
 class TestFilterSerializerContracts:
+    @pytest.mark.parametrize(
+        "serializer_class",
+        [TraceObserveListQuerySerializer, SpanObserveListQuerySerializer],
+    )
+    def test_cursor_capable_page_help_does_not_deny_cursor_support(
+        self, serializer_class
+    ):
+        serializer = serializer_class()
+
+        assert "cursor" in serializer.fields
+        assert "page_depth_exceeded" in serializer.fields["page_number"].help_text
+        assert (
+            "does not provide cursor" not in serializer.fields["page_number"].help_text
+        )
+
     def test_users_query_serializer_decodes_strict_filter_query_param(self):
         serializer = UsersQuerySerializer(
             data={

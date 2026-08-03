@@ -7901,8 +7901,8 @@ class TestAnnotationGraphQueryBuilder:
                 return Result()
 
         self_label_id = self.LABEL_ID
-        project_id = "ca3025a9-b5eb-4872-9973-2330956d40d2"
-        window_start = datetime(2026, 7, 24)
+        project_id = "00000000-0000-4000-8000-000000000901"
+        window_start = datetime(2026, 1, 1)
         sample = graph_dispatch.GraphCandidateSample(
             rows=(
                 {

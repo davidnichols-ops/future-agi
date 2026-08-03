@@ -49,7 +49,7 @@ describe("useExactTraceAttributeProperties", () => {
     const { result } = renderHook(
       () =>
         useExactTraceAttributeProperties({
-          projectId: "project-colly",
+          projectId: "project-synthetic",
           search: "final_status",
           source: "traces",
           contextKey: "past-7-days",
@@ -63,7 +63,7 @@ describe("useExactTraceAttributeProperties", () => {
       expect.objectContaining({
         signal: expect.any(AbortSignal),
         params: {
-          project_id: "project-colly",
+          project_id: "project-synthetic",
           q: "final_status",
         },
       }),
@@ -91,7 +91,7 @@ describe("useExactTraceAttributeProperties", () => {
     const { rerender } = renderHook(
       ({ search }) =>
         useExactTraceAttributeProperties({
-          projectId: "project-colly",
+          projectId: "project-synthetic",
           search,
           source: "traces",
           contextKey: "past-7-days",
@@ -135,7 +135,7 @@ describe("useExactTraceAttributeProperties", () => {
 
     expect(mocks.get).not.toHaveBeenCalled();
     rerender({
-      projectId: "project-colly",
+      projectId: "project-synthetic",
       search: "final_status",
       source: "sessions",
     });
@@ -158,7 +158,7 @@ describe("useExactTraceAttributeProperties", () => {
     const { result } = renderHook(
       () =>
         useExactTraceAttributeProperties({
-          projectId: "project-colly",
+          projectId: "project-synthetic",
           search: key,
           source: "traces",
         }),

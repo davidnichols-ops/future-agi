@@ -76,7 +76,7 @@ vi.mock("../hooks/useCompositeEval", () => ({
 
 import TracingTestMode from "./TracingTestMode";
 
-const PROJECT_ID = "ca3025a9-b5eb-4872-9973-2330956d40d2";
+const PROJECT_ID = "00000000-0000-4000-8000-000000000901";
 
 function renderTaskMapping(onReadyChange) {
   const queryClient = new QueryClient({

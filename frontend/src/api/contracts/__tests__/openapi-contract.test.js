@@ -587,8 +587,8 @@ describe("OpenAPI runtime contract", () => {
     const readState = {
       query_complete: true,
       query_status: "complete",
-      query_window_start: "2026-07-24T02:43:12Z",
-      query_window_end: "2026-07-31T06:59:59Z",
+      query_window_start: "2026-01-01T00:00:00Z",
+      query_window_end: "2026-01-08T00:00:00Z",
     };
 
     expect(
@@ -614,7 +614,7 @@ describe("OpenAPI runtime contract", () => {
         },
         data: {
           result: [
-            { value: "Rechazado", type: "array", count: 4 },
+            { value: "Rejected", type: "array", count: 4 },
             { value: 7, type: "array", count: 3 },
             { value: false, type: "array", count: 2 },
             { value: null, type: "array", count: 1 },

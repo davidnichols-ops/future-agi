@@ -18,10 +18,10 @@ from tracer.services.clickhouse.bounded_graph_reads import (
 )
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
-PROJECT_ID = "ca3025a9-b5eb-4872-9973-2330956d40d2"
-EVAL_ID = "109f6d0d-9446-4f19-b11c-19646649a4bd"
-LABEL_ID = "9cefe781-4146-488f-ac75-f013d5a725ea"
-START = datetime(2026, 7, 24, 2, 40)
+PROJECT_ID = "00000000-0000-4000-8000-000000000901"
+EVAL_ID = "00000000-0000-4000-8000-000000000902"
+LABEL_ID = "00000000-0000-4000-8000-000000000903"
+START = datetime(2026, 1, 1, 0, 0)
 END = START + timedelta(minutes=5)
 
 
@@ -203,7 +203,7 @@ class _CandidateAnalytics:
 @pytest.mark.parametrize(
     ("observe_type", "key", "value"),
     [
-        ("trace", "final_status", "Rechazado"),
+        ("trace", "final_status", "Rejected"),
         ("span", "prompt_slug", "agent_2_identity_disclosure"),
     ],
 )
@@ -357,7 +357,7 @@ def test_map_number_boolean_and_multiple_predicates_share_one_finite_classifier(
         _date_filter(),
         _attribute_filter("score", 0.5, filter_type="number", filter_op="greater_than"),
         _attribute_filter("accepted", True, filter_type="boolean"),
-        _attribute_filter("final_status", ["Rechazado", "Aceptado"], filter_op="in"),
+        _attribute_filter("final_status", ["Rejected", "Accepted"], filter_op="in"),
     ]
 
     read_graph_candidates(
@@ -371,7 +371,7 @@ def test_map_number_boolean_and_multiple_predicates_share_one_finite_classifier(
     assert "attrs_bool" in query
     assert "attrs_string" in query
     assert query.count(" AND ") >= 3
-    assert ("rechazado", "aceptado") in params.values()
+    assert ("rejected", "accepted") in params.values()
 
 
 @pytest.mark.unit
@@ -395,7 +395,7 @@ def test_mixed_annotation_graph_reuses_candidate_scoped_list_classifier(
         project_id=PROJECT_ID,
         filters=[
             _date_filter(),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
             _annotation_filter(LABEL_ID, "approved"),
         ],
         observe_type=observe_type,
@@ -454,7 +454,7 @@ def test_customer_final_status_1090_rows_completes_below_any_span_ceiling():
     sample = read_graph_candidates(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
         observe_type="trace",
     )
 
@@ -511,7 +511,7 @@ def test_4096_matches_complete_at_exact_graph_ceiling():
     sample = read_graph_candidates(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
         observe_type="span",
     )
 
@@ -594,7 +594,7 @@ def test_long_window_incomplete_rows_are_sampled_only_for_cardinality_limits(
             project_id=PROJECT_ID,
             filters=[
                 _date_filter(window_start, window_end),
-                _attribute_filter("customer.final_status", "Rechazado"),
+                _attribute_filter("customer.final_status", "Rejected"),
                 _attribute_filter("score", 0.5, filter_type="number"),
             ],
             observe_type="trace",
@@ -610,7 +610,7 @@ def test_long_window_incomplete_rows_are_sampled_only_for_cardinality_limits(
                 project_id=PROJECT_ID,
                 filters=[
                     _date_filter(window_start, window_end),
-                    _attribute_filter("customer.final_status", "Rechazado"),
+                    _attribute_filter("customer.final_status", "Rejected"),
                     _attribute_filter("score", 0.5, filter_type="number"),
                 ],
                 observe_type="trace",
@@ -717,7 +717,7 @@ def test_candidate_timeout_is_logged_internally_but_never_returned(monkeypatch):
             project_id=PROJECT_ID,
             filters=[
                 _date_filter(START, START + timedelta(days=7)),
-                _attribute_filter("customer.final_status", "Rechazado"),
+                _attribute_filter("customer.final_status", "Rejected"),
             ],
             observe_type="trace",
         )
@@ -747,7 +747,7 @@ def test_compiler_error_is_never_recast_as_a_cardinality_sample(monkeypatch):
             project_id=PROJECT_ID,
             filters=[
                 _date_filter(START, START + timedelta(days=180)),
-                _attribute_filter("customer.final_status", "Rechazado"),
+                _attribute_filter("customer.final_status", "Rejected"),
             ],
             observe_type="trace",
         )
@@ -783,7 +783,7 @@ def test_sparse_old_and_new_matches_use_exact_full_window_anchor(window_days):
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
         ],
         observe_type="trace",
     )
@@ -824,7 +824,7 @@ def test_long_window_scalar_datetime_bounds_are_preserved_by_sparse_anchor(
     filters = [
         _date_bound_filter(lower_op, window_start),
         _date_bound_filter(upper_op, window_end),
-        _attribute_filter("final_status", "Rechazado"),
+        _attribute_filter("final_status", "Rejected"),
     ]
 
     sample = read_graph_candidates(
@@ -861,7 +861,7 @@ def test_empty_long_window_is_exact_and_not_mislabeled_as_sampled():
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
         ],
         observe_type="trace",
     )
@@ -921,7 +921,7 @@ def test_sparse_span_anchor_replays_trace_scoped_ids_and_latest_tombstones():
         project_id=PROJECT_ID,
         filters=[
             _date_filter(START, window_end),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
         ],
         observe_type="span",
     )
@@ -973,7 +973,7 @@ def test_long_sparse_anchor_timeout_never_becomes_exact_empty(monkeypatch):
             project_id=PROJECT_ID,
             filters=[
                 _date_filter(START, START + timedelta(days=7)),
-                _attribute_filter("final_status", "Rechazado"),
+                _attribute_filter("final_status", "Rejected"),
             ],
             observe_type="span",
         )
@@ -991,7 +991,7 @@ def test_span_anchor_probe_is_graph_opt_in_not_a_list_behavior_change():
 
     filters = [
         _date_filter(START, START + timedelta(days=7)),
-        _attribute_filter("final_status", "Rechazado"),
+        _attribute_filter("final_status", "Rejected"),
     ]
     list_builder = SpanListQueryBuilderV2(project_id=PROJECT_ID, filters=filters)
     graph_builder = SpanListQueryBuilderV2(
@@ -1032,7 +1032,7 @@ def test_bounded_high_cardinality_long_window_is_exact_and_distributed(
             project_id=PROJECT_ID,
             filters=[
                 _date_filter(window_start, window_end),
-                _attribute_filter("final_status", "Rechazado"),
+                _attribute_filter("final_status", "Rejected"),
             ],
             observe_type=observe_type,
         )
@@ -1055,7 +1055,7 @@ def test_bounded_high_cardinality_long_window_is_exact_and_distributed(
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
         ],
         observe_type=observe_type,
     )
@@ -1123,7 +1123,7 @@ def test_dense_long_window_stratum_overflow_remains_explicitly_incomplete(
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
         ],
         observe_type=observe_type,
     )
@@ -1165,7 +1165,7 @@ def test_distributed_span_sample_keeps_reused_ids_trace_scoped(monkeypatch):
         project_id=PROJECT_ID,
         filters=[
             _date_filter(START, window_end),
-            _attribute_filter("final_status", "Rechazado"),
+            _attribute_filter("final_status", "Rejected"),
         ],
         observe_type="span",
     )
@@ -1354,7 +1354,7 @@ def test_trace_system_graph_does_not_decorate_or_publish_candidate_sample(monkey
     response = graph_dispatch.fetch_system_metric_graph_ch(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
         interval="hour",
         metric_id="latency",
         observe_type="trace",
@@ -1493,7 +1493,7 @@ def test_filtered_trace_system_graph_aggregates_all_live_child_spans(monkeypatch
     response = graph_dispatch.fetch_system_metric_graph_ch(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
         interval="hour",
         metric_id="traffic",
         observe_type="trace",
@@ -1572,7 +1572,7 @@ def test_filtered_eval_graph_is_candidate_scoped_no_final_or_membership_subquery
     response = graph_dispatch.fetch_eval_graph_ch(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
         interval="hour",
         req_data_config={"id": EVAL_ID, "type": "EVAL", "output_type": "SCORE"},
         observe_type="trace",
@@ -1901,7 +1901,7 @@ def test_eval_event_sentinel_returns_degraded_metadata_without_sampled_data(
     response = graph_dispatch.fetch_eval_graph_ch(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
         interval="hour",
         req_data_config={"id": EVAL_ID, "type": "EVAL", "output_type": "SCORE"},
         observe_type="trace",
@@ -1927,7 +1927,7 @@ def test_eval_non_exhaustive_candidate_prefix_is_not_queried_or_published(monkey
     response = graph_dispatch.fetch_eval_graph_ch(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
         interval="hour",
         req_data_config={
             "id": EVAL_ID,
@@ -1977,7 +1977,7 @@ def test_annotation_non_exhaustive_candidate_prefix_is_not_queried_or_published(
     response = graph_dispatch.fetch_annotation_graph_ch(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
         interval="hour",
         req_data_config={"id": LABEL_ID, "type": "ANNOTATION"},
         observe_type="span",

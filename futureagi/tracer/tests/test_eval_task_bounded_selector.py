@@ -58,7 +58,7 @@ def test_internal_bounded_seed_pushes_sampling_before_limit(
 ) -> None:
     builder = builder_class(
         project_id=PROJECT_ID,
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
         bounded_internal_scan=True,
         bounded_sampling_salt="task-salt",
         bounded_sampling_rate=25.0,
@@ -140,7 +140,7 @@ def test_time_only_eval_resolution_preserves_legacy_id_prefix(
 
 def test_task_filters_merge_legacy_and_canonical_lists() -> None:
     canonical = _attribute_filter("prompt_slug", "agent_2_identity_disclosure")
-    legacy = _attribute_filter("final_status", "Rechazado")
+    legacy = _attribute_filter("final_status", "Rejected")
 
     normalized = row_resolver._task_ui_filters(
         {
@@ -200,7 +200,7 @@ def test_bounded_resolver_returns_only_a_complete_latest_state_page(
     )
     filters = {
         "filters": [_attribute_filter("prompt_slug", "agent_2_identity_disclosure")],
-        "span_attributes_filters": [_attribute_filter("final_status", "Rechazado")],
+        "span_attributes_filters": [_attribute_filter("final_status", "Rejected")],
         "date_range": [START, END],
     }
 
@@ -315,7 +315,7 @@ def test_eval_internal_classifier_projects_only_identity_and_order(
 ) -> None:
     builder = builder_class(
         project_id=PROJECT_ID,
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
         bounded_internal_scan=True,
         bounded_identity_only=True,
         bounded_sampling_salt="task-salt",
@@ -337,7 +337,7 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
 ) -> None:
     filters = [
         _time_filter(),
-        _attribute_filter("final_status", "Rechazado"),
+        _attribute_filter("final_status", "Rejected"),
         _attribute_filter("customer_tier", "vip"),
     ]
     builder = TraceListQueryBuilder(
@@ -685,7 +685,7 @@ def test_task_at_10k_routes_directly_to_bounded_selector_without_legacy_sql(
         id="task-id",
         filters={
             "date_range": [START, END],
-            "filters": [_attribute_filter("final_status", "Rechazado")],
+            "filters": [_attribute_filter("final_status", "Rejected")],
         },
         continuous_cursor=None,
         start_time=None,
@@ -732,7 +732,7 @@ def test_bounded_resolver_rejects_incomplete_page_without_partial_ids(
             salt="task-salt",
             sampling_rate=100.0,
             filters={
-                "filters": [_attribute_filter("final_status", "Rechazado")],
+                "filters": [_attribute_filter("final_status", "Rejected")],
                 "date_range": [START, END],
             },
             limit=25,
@@ -782,7 +782,7 @@ def test_bounded_span_resolver_rejects_cross_trace_id_collision(
             salt="task-salt",
             sampling_rate=100.0,
             filters={
-                "filters": [_attribute_filter("final_status", "Rechazado")],
+                "filters": [_attribute_filter("final_status", "Rejected")],
                 "date_range": [START, END],
             },
             limit=25,
@@ -832,7 +832,7 @@ def test_bounded_span_resolver_rejects_same_trace_distinct_physical_spans(
             salt="task-salt",
             sampling_rate=100.0,
             filters={
-                "filters": [_attribute_filter("final_status", "Rechazado")],
+                "filters": [_attribute_filter("final_status", "Rejected")],
                 "date_range": [START, END],
             },
             limit=25,
@@ -872,7 +872,7 @@ def test_bounded_span_resolver_dedupes_duplicate_exact_physical_rows(
         salt="task-salt",
         sampling_rate=100.0,
         filters={
-            "filters": [_attribute_filter("final_status", "Rechazado")],
+            "filters": [_attribute_filter("final_status", "Rejected")],
             "date_range": [START, END],
         },
         limit=25,
@@ -1052,7 +1052,7 @@ def test_shared_candidate_reader_proves_large_eval_prefix_within_query_cap(
     page = read_bounded_filter_page(
         builder=SyntheticBuilder(),
         analytics=SyntheticAnalytics(),
-        filters=[_time_filter(), _attribute_filter("final_status", "Rechazado")],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
         key_field=identity_key,
         page_number=0,
         page_size=limit,

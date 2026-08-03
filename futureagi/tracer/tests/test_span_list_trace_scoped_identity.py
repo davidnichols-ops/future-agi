@@ -112,7 +112,7 @@ def _run_non_observe_bounded_page(monkeypatch, page):
                     "filter_config": {
                         "filter_type": "text",
                         "filter_op": "equals",
-                        "filter_value": "Rechazado",
+                        "filter_value": "Rejected",
                         "col_type": "SPAN_ATTRIBUTE",
                     },
                 }

@@ -38,7 +38,7 @@ def _attribute_filter(
     *,
     filter_type: str = "text",
     filter_op: str = "equals",
-    filter_value: object = "Rechazado",
+    filter_value: object = "Rejected",
     key: str = "final_status",
 ) -> dict:
     return {
@@ -215,9 +215,9 @@ def test_final_status_plan_is_typed_map_only_with_bound_key_and_value() -> None:
     assert "span_attributes_raw" not in plan.seed_predicate
     assert "JSON" not in plan.seed_predicate
     assert "final_status" not in plan.seed_predicate
-    assert "Rechazado" not in plan.seed_predicate
+    assert "Rejected" not in plan.seed_predicate
     assert plan.params["latest_filter_key_0"] == "final_status"
-    assert plan.params["latest_filter_param_0"] == "rechazado"
+    assert plan.params["latest_filter_param_0"] == "rejected"
 
 
 @pytest.mark.parametrize(
@@ -244,7 +244,7 @@ def test_final_status_v2_seed_respects_trace_any_span_scope(
         assert "mapContains(attrs_string, %(latest_filter_key_0)s)" in sql
         assert "mapValues(attrs_string)" in sql
         assert params["latest_filter_key_0"] == "final_status"
-        assert params["latest_filter_param_0"] == "rechazado"
+        assert params["latest_filter_param_0"] == "rejected"
     else:
         assert "mapContains(attrs_string" not in sql
         assert "mapValues(attrs_string)" not in sql
@@ -254,7 +254,7 @@ def test_final_status_v2_seed_respects_trace_any_span_scope(
     assert "JSONType" not in sql
     assert "JSONExtract" not in sql
     assert "final_status" not in sql
-    assert "Rechazado" not in sql
+    assert "Rejected" not in sql
 
 
 def test_final_status_v2_match_classifies_latest_typed_map_state_only() -> None:

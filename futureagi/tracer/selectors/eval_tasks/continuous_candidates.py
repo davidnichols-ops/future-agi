@@ -78,7 +78,7 @@ class _ReadBudget:
 
 
 def discover_continuous_candidates(
-    analytics,
+    analytics: Any,
     *,
     project_id: str,
     row_type: str,
@@ -258,7 +258,7 @@ def discover_continuous_candidates(
 
 
 def sample_public_ids(
-    analytics,
+    analytics: Any,
     ids: tuple[str, ...] | list[str],
     *,
     salt: str,

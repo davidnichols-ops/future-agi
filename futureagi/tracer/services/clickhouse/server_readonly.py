@@ -13,6 +13,10 @@ from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 
+import structlog
+
+logger = structlog.get_logger(__name__)
+
 _ASSIGNMENT_AFTER_SETTINGS = re.compile(r"\s+[A-Za-z_][A-Za-z0-9_]*\s*=")
 _BLOCKED_HTTP_METHODS = frozenset(
     {
@@ -152,8 +156,12 @@ class _NativeBlockStream:
             return
         try:
             self._connection.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "server_readonly_native_disconnect_failed",
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
         finally:
             self._connection = None
 
@@ -226,8 +234,8 @@ class ServerEnforcedReadOnlyNativeClient:
         *,
         parameters: dict[str, Any] | None = None,
         settings: dict[str, Any] | None = None,
-        **_kwargs,
-    ):
+        **_kwargs: Any,
+    ) -> SimpleNamespace:
         del settings
         query = without_query_settings(query)
         ensure_read_statement(query)
@@ -244,7 +252,7 @@ class ServerEnforcedReadOnlyNativeClient:
         *,
         parameters: dict[str, Any] | None = None,
         settings: dict[str, Any] | None = None,
-        **_kwargs,
+        **_kwargs: Any,
     ) -> _NativeBlockStream:
         del settings
         query = without_query_settings(query)

@@ -3112,8 +3112,8 @@ def _heavy_span_ids_for_trace_mapping(mapping: dict | None, trace) -> frozenset[
 
 def resolve_trace_mapping_lean_first(
     mapping: dict | None,
-    trace,
-    template_id,
+    trace: Trace,
+    template_id: int,
     *,
     filter_witnesses: list[dict] | tuple[dict, ...] | None = None,
 ) -> dict:

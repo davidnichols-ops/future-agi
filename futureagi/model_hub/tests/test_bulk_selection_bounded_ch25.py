@@ -103,7 +103,7 @@ def _attribute_filter() -> dict:
             "col_type": "SPAN_ATTRIBUTE",
             "filter_type": "text",
             "filter_op": "equals",
-            "filter_value": "Rechazado",
+            "filter_value": "Rejected",
         },
     }
 
@@ -143,7 +143,7 @@ def _row(
         start_time,
         input_value,
         "",
-        {"final_status": "Rechazado"},
+        {"final_status": "Rejected"},
         {},
         {},
         "{}",

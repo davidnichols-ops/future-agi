@@ -50,7 +50,7 @@ describe("useExactEvalAttributeFields", () => {
       const { result } = renderHook(
         () =>
           useExactEvalAttributeFields({
-            projectId: "ca3025a9-b5eb-4872-9973-2330956d40d2",
+            projectId: "00000000-0000-4000-8000-000000000901",
             rowType,
             search: " final_status ",
           }),
@@ -61,7 +61,7 @@ describe("useExactEvalAttributeFields", () => {
       expect(mocks.getEvalAttributes).toHaveBeenCalledWith(
         {
           filters: JSON.stringify({
-            project_id: "ca3025a9-b5eb-4872-9973-2330956d40d2",
+            project_id: "00000000-0000-4000-8000-000000000901",
           }),
           row_type: expectedRowType,
           q: "final_status",
@@ -89,7 +89,7 @@ describe("useExactEvalAttributeFields", () => {
         }),
       {
         initialProps: {
-          projectId: "project-colly",
+          projectId: "project-synthetic",
           rowType: "traces",
           search: "final_status",
         },
@@ -143,7 +143,7 @@ describe("useExactEvalAttributeFields", () => {
     const { result } = renderHook(
       () =>
         useExactEvalAttributeFields({
-          projectId: "project-colly",
+          projectId: "project-synthetic",
           rowType: "traces",
           search: "final_status",
         }),
@@ -161,7 +161,7 @@ describe("useExactEvalAttributeFields", () => {
     const { result } = renderHook(
       () =>
         useExactEvalAttributeFields({
-          projectId: "project-colly",
+          projectId: "project-synthetic",
           rowType: "spans",
           search: "final_status",
         }),
@@ -179,7 +179,7 @@ describe("useExactEvalAttributeFields", () => {
       renderHook(
         () =>
           useExactEvalAttributeFields({
-            projectId: "project-colly",
+            projectId: "project-synthetic",
             rowType,
             search: "final_status",
           }),

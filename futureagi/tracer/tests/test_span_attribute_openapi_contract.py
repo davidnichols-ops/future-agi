@@ -57,7 +57,7 @@ def test_span_attribute_json_values_match_generated_openapi(
 ):
     field = serializer_cls().fields["value"]
     assert isinstance(field, JsonValueField)
-    for value in ("Rechazado", 7, 1.5, False, None, ["nested"], {"nested": True}):
+    for value in ("Rejected", 7, 1.5, False, None, ["nested"], {"nested": True}):
         assert field.run_validation(value) == value
 
     value_schema = _swagger_definitions()[definition_name]["properties"]["value"]

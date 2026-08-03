@@ -432,7 +432,7 @@ def test_every_list_serializer_preserves_documented_page_size_bounds(
                             "col_type": "SPAN_ATTRIBUTE",
                             "filter_type": "text",
                             "filter_op": "equals",
-                            "filter_value": "Rechazado",
+                            "filter_value": "Rejected",
                         },
                     },
                 ]
@@ -918,7 +918,7 @@ def test_trace_multifilter_classifier_keeps_attribute_and_datetime_complement():
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
     ]

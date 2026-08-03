@@ -347,7 +347,7 @@ def test_trace_multi_filter_payload_reaches_same_bounded_builder(monkeypatch):
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "in",
-                "filter_value": ["Rechazado", "Aceptado"],
+                "filter_value": ["Rejected", "Accepted"],
             },
         },
         {

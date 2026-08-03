@@ -191,13 +191,13 @@ describe("EvalPickerCreateNew — task preview time window", () => {
 
   it("enables exact/freeSolo attribute mapping on the create-task route", () => {
     renderWithSource("task", {
-      sourceId: "ca3025a9-b5eb-4872-9973-2330956d40d2",
+      sourceId: "00000000-0000-4000-8000-000000000901",
       sourceRowType: "spans",
     });
 
     expect(capturedProps.tracing).not.toBeNull();
     expect(capturedProps.tracing.initialProjectId).toBe(
-      "ca3025a9-b5eb-4872-9973-2330956d40d2",
+      "00000000-0000-4000-8000-000000000901",
     );
     expect(capturedProps.tracing.initialRowType).toBe("spans");
     expect(capturedProps.tracing.allowCustomFieldPath).toBe(true);

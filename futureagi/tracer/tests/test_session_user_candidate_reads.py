@@ -184,7 +184,7 @@ def test_attribute_bulk_filter_uses_bounded_seed_and_latest_candidate_classifier
                     "col_type": "SPAN_ATTRIBUTE",
                     "filter_type": "text",
                     "filter_op": "in",
-                    "filter_value": ["Rechazado"],
+                    "filter_value": ["Rejected"],
                 },
             },
         ],
@@ -207,7 +207,7 @@ def test_attribute_bulk_filter_uses_bounded_seed_and_latest_candidate_classifier
     assert "latest_attr_value_0" in match_sql
     assert "candidate_filter_session_ids" in match_sql
     assert match_params["candidate_filter_session_ids"] == (session_id,)
-    assert "rechazado" in match_params.values()
+    assert "rejected" in match_params.values()
 
 
 @pytest.mark.unit
@@ -749,10 +749,10 @@ def test_candidate_reads_on_ch25_preserve_remap_and_tombstone_semantics():
         12,
         20,
         2.0,
-        {"live_key": "yes", "final_status": "Rechazado"},
+        {"live_key": "yes", "final_status": "Rejected"},
         {"score": 2.0},
         {},
-        '{"live_key":"yes","final_status":"Rechazado"}',
+        '{"live_key":"yes","final_status":"Rejected"}',
         "live-message",
         "live-output",
         0,
@@ -897,7 +897,7 @@ def test_candidate_reads_on_ch25_preserve_remap_and_tombstone_semantics():
                     "col_type": "SPAN_ATTRIBUTE",
                     "filter_type": "text",
                     "filter_op": "in",
-                    "filter_value": ["Rechazado"],
+                    "filter_value": ["Rejected"],
                 },
             },
         ],
@@ -1026,7 +1026,7 @@ def test_candidate_reads_on_ch25_preserve_remap_and_tombstone_semantics():
     assert results["content"][0]["last_message"] == "live-message"
     assert results["attributes"][0]["attrs_string"] == {
         "live_key": "yes",
-        "final_status": "Rechazado",
+        "final_status": "Rejected",
     }
     assert "deleted_key" not in results["attributes"][0]["span_attributes_raw"]
 

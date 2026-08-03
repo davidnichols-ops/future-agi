@@ -364,7 +364,7 @@ def test_span_multi_filter_payload_reaches_same_bounded_builder(monkeypatch):
                 "col_type": "SPAN_ATTRIBUTE",
                 "filter_type": "text",
                 "filter_op": "equals",
-                "filter_value": "Rechazado",
+                "filter_value": "Rejected",
             },
         },
     ]
