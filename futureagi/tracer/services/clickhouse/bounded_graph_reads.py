@@ -877,9 +877,7 @@ def read_graph_candidates(
     if window_end - window_start > GRAPH_ANY_SPAN_DISTRIBUTED_AFTER:
         anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
         indexed_trace_sample = (
-            mode == "trace"
-            and callable(anchor_support)
-            and bool(anchor_support())
+            mode == "trace" and callable(anchor_support) and bool(anchor_support())
         )
         return _read_time_distributed_candidates(
             analytics=analytics,
@@ -892,9 +890,7 @@ def read_graph_candidates(
             deadline_ms=deadline_ms,
             classify_batch_size=int(classify_batch_size or 50),
             stratum_ceiling=(
-                GRAPH_TRACE_STRATA
-                if indexed_trace_sample
-                else GRAPH_ANY_SPAN_STRATA
+                GRAPH_TRACE_STRATA if indexed_trace_sample else GRAPH_ANY_SPAN_STRATA
             ),
             rows_per_stratum=(
                 GRAPH_TRACE_ROWS_PER_STRATUM

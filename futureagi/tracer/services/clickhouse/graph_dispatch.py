@@ -817,9 +817,7 @@ def fetch_system_metric_graph_ch(
         # the same reservation already used by eval, annotation, and session
         # graphs instead of allowing the selector to consume the whole request
         # wall deadline.
-        candidate_read_options["deadline_ms"] = (
-            GRAPH_DECORATION_CANDIDATE_DEADLINE_MS
-        )
+        candidate_read_options["deadline_ms"] = GRAPH_DECORATION_CANDIDATE_DEADLINE_MS
     sample = read_graph_candidates(
         analytics=analytics,
         project_id=project_id,

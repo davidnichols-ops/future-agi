@@ -709,9 +709,7 @@ def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
                 + (stratum_width * stratum)
                 + timedelta(hours=6, microseconds=index)
             )
-            child_stratum = (
-                stratum + 1 if stratum < stratum_count - 1 else stratum - 1
-            )
+            child_stratum = stratum + 1 if stratum < stratum_count - 1 else stratum - 1
             child_times[trace_id] = (
                 window_start
                 + (stratum_width * child_stratum)
@@ -802,9 +800,8 @@ def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
     classifier_sizes = [
         len(params["candidate_trace_ids"]) for _, params, *_ in classifier_calls
     ]
-    expected_union_size = (
-        (bounded_graph_reads.GRAPH_TRACE_STRATA - 1)
-        * (bounded_graph_reads.GRAPH_TRACE_ROWS_PER_STRATUM + 1)
+    expected_union_size = (bounded_graph_reads.GRAPH_TRACE_STRATA - 1) * (
+        bounded_graph_reads.GRAPH_TRACE_ROWS_PER_STRATUM + 1
     )
     assert classifier_sizes == [expected_union_size]
     classifier_ids = [
@@ -2469,9 +2466,7 @@ def test_distributed_sample_uses_one_shared_deadline_instead_of_equal_slices(
     assert len(distributed_calls) == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert all(call["deadline_ms"] > old_equal_slice_ms for call in distributed_calls)
     assert sample.query_status == "sampled"
-    assert sample.sampling_strata_completed == (
-        bounded_graph_reads.GRAPH_TRACE_STRATA
-    )
+    assert sample.sampling_strata_completed == (bounded_graph_reads.GRAPH_TRACE_STRATA)
 
 
 @pytest.mark.unit
@@ -2614,9 +2609,7 @@ def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
     )
     rows = []
     for stratum in range(stratum_count):
-        stratum_start = window_start + (
-            window_width * stratum / stratum_count
-        )
+        stratum_start = window_start + (window_width * stratum / stratum_count)
         stratum_width = window_width / stratum_count
         for index in range(60):
             row = {
@@ -2780,9 +2773,7 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
     assert len(first_analytics.calls) <= (stratum_count * 2)
     if observe_type == "trace":
         classifier_calls = [
-            call
-            for call in first_analytics.calls
-            if "candidate_trace_ids" in call[1]
+            call for call in first_analytics.calls if "candidate_trace_ids" in call[1]
         ]
         classifiers = [
             query
