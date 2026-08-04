@@ -106,6 +106,15 @@ ATTRIBUTE_READ_SETTINGS: dict[str, Any] = {
     "timeout_overflow_mode": "throw",
 }
 
+# JSON overflow has no key skip index. An absent key must therefore fail inside
+# one tightly bounded probe instead of reading another full attributes block in
+# every adaptive band. These settings only tighten the shared read-only limits.
+_JSON_VALUE_CANDIDATE_SETTINGS: dict[str, Any] = {
+    "max_block_size": 2_048,
+    "max_bytes_to_read": 64 * _MIB,
+    "max_rows_to_read": 100_000,
+}
+
 _TYPE_PRIORITY: dict[AttributeType, int] = {
     "string": 0,
     "number": 1,
@@ -325,12 +334,19 @@ class V2AttributeQueryExecutor:
         timeout_ms: int,
         settings: dict[str, Any],
     ) -> AttributeQueryPage:
-        rows, columns, query_time_ms = self._client.execute_read(
-            query,
-            params,
-            timeout_ms=timeout_ms,
-            settings=settings,
-        )
+        try:
+            rows, columns, query_time_ms = self._client.execute_read(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+        except TimeoutError as exc:
+            # Some native-driver wrappers surface socket/read deadlines as the
+            # built-in timeout type. Normalize only at this CH25 read boundary;
+            # the shared budget classifier intentionally rejects arbitrary
+            # application TimeoutError instances.
+            raise ReadDeadlineExceeded("Attribute ClickHouse query timed out") from exc
         names = [
             column[0] if isinstance(column, tuple) else column for column in columns
         ]
@@ -980,6 +996,7 @@ class AttributeReadSelector:
         before_identity: PhysicalSpanIdentity | None = None,
         candidate_limit: int,
         query_timeout_ms: int | None = None,
+        candidate_query_settings: dict[str, Any] | None = None,
         include_versions: bool = False,
     ) -> tuple[
         tuple[PhysicalSpanIdentity, ...],
@@ -999,7 +1016,7 @@ class AttributeReadSelector:
             params["attribute_search"] = attribute_search
         ordered = ordered or before_identity is not None
         candidate_sql = _ORDERED_CANDIDATE_SQL if ordered else _CANDIDATE_SQL
-        query_settings: dict[str, Any] = {}
+        query_settings = dict(candidate_query_settings or {})
         if include_versions:
             if stratified:
                 raise ValueError("Versioned attribute candidates cannot be stratified")
@@ -1981,15 +1998,18 @@ class AttributeReadSelector:
                 )
             return usable_value_seen
 
-        # Phase one gives each lane and adaptive band one storage-order probe.
-        # This is the normal fast path and guarantees older bands are not
-        # starved by a dense recent week. Only truncated pages whose latest-state
-        # replay produced no usable value need deterministic continuation.
+        # Phase one walks every typed adaptive band before touching the JSON
+        # overflow lane. JSON has no key skip index and can consume the whole
+        # picker deadline while an older typed value is still cheap to find.
+        # Once typed replay yields a usable sample, omit JSON and report the
+        # intentionally partial distribution as sampled. JSON-only keys still
+        # fall through after typed absence has been checked in every band.
         fallback_states: list[dict[str, Any]] = []
         candidate_pages = 0
         usable_sample_found = False
-        for segment in windows:
-            for lane_name, predicate, replay_sql, json_mode, timeout_ms in lanes:
+        typed_usable_sample_found = False
+        for lane_name, predicate, replay_sql, json_mode, timeout_ms in lanes:
+            for segment in windows:
                 if candidate_pages >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT:
                     truncated = True
                     break
@@ -2010,6 +2030,11 @@ class AttributeReadSelector:
                         ),
                         candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
                         query_timeout_ms=timeout_ms,
+                        candidate_query_settings=(
+                            _JSON_VALUE_CANDIDATE_SETTINGS
+                            if lane_name == "json"
+                            else None
+                        ),
                         include_versions=lane_name == "typed",
                     )
                     rows = (
@@ -2043,6 +2068,8 @@ class AttributeReadSelector:
                 candidate_pages += 1
                 covered_start = min(covered_start, segment[0])
                 usable_value_seen = consume_rows(rows, json_mode=json_mode)
+                if lane_name == "typed" and usable_value_seen:
+                    typed_usable_sample_found = True
                 if segment_truncated and usable_value_seen:
                     # The picker has useful verified values. Stop immediately
                     # instead of scanning JSON and older bands; the sentinel
@@ -2067,6 +2094,17 @@ class AttributeReadSelector:
 
             if typed_lane_halted or usable_sample_found:
                 break
+            if (
+                lane_name == "typed"
+                and typed_usable_sample_found
+                and self._reads_json_overflow
+            ):
+                # Typed values are filterable and have strict precedence over
+                # legacy JSON. Skipping the independent JSON population is a
+                # useful sample, never a claim of global completeness.
+                truncated = True
+                usable_sample_found = True
+                break
         if candidate_pages >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT and any(
             not state["complete"] for state in fallback_states
         ):
@@ -2077,6 +2115,7 @@ class AttributeReadSelector:
         # preceding page with that same deterministic order.
         while (
             not typed_lane_halted
+            and not usable_sample_found
             and candidate_pages < ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
             and any(not state["complete"] for state in fallback_states)
         ):
@@ -2110,6 +2149,11 @@ class AttributeReadSelector:
                         before_identity=state["before_identity"],
                         candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
                         query_timeout_ms=state["timeout_ms"],
+                        candidate_query_settings=(
+                            _JSON_VALUE_CANDIDATE_SETTINGS
+                            if state["lane_name"] == "json"
+                            else None
+                        ),
                         include_versions=state["lane_name"] == "typed",
                     )
                     rows = (

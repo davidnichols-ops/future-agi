@@ -433,6 +433,22 @@ def test_v2_executor_reuses_the_process_singleton_ch25_pool(monkeypatch):
     assert page.data == [{"value": "ok"}]
 
 
+def test_v2_executor_normalizes_builtin_driver_timeout_to_read_deadline():
+    class TimeoutClient:
+        def execute_read(self, query, params, *, timeout_ms, settings):
+            raise TimeoutError("private driver timeout detail")
+
+    executor = V2AttributeQueryExecutor(client=TimeoutClient())
+
+    with pytest.raises(ReadDeadlineExceeded, match="ClickHouse query timed out"):
+        executor.execute(
+            "SELECT 1",
+            {},
+            timeout_ms=100,
+            settings={"max_threads": 1},
+        )
+
+
 @pytest.mark.parametrize(
     ("candidate_call", "start_days"),
     [(4, 90), (5, 250)],
@@ -969,11 +985,10 @@ def test_latest_replay_uses_index_pruning_and_exact_physical_identities():
     assert read.rows == (
         AttributeValueRow("Rejected", "string", 2),
         AttributeValueRow(42.0, "number", 1),
-        AttributeValueRow(7.0, "number", 1),
-        AttributeValueRow(False, "boolean", 1),
-        AttributeValueRow("legacy", "string", 1),
         AttributeValueRow(True, "boolean", 1),
     )
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
     replay = next(call for call in executor.calls if "segment_start" not in call.params)
     replay_prewhere = replay.sql.split("PREWHERE", 1)[1].split("GROUP BY", 1)[0]
     assert "start_time >=" not in replay_prewhere
@@ -1977,7 +1992,7 @@ def test_typed_value_all_stale_versions_skip_value_hydration():
     assert "attributes_extra" not in certificate_call.sql
 
 
-def test_explicit_window_json_value_runs_after_empty_typed_probe():
+def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
     json_emitted = False
 
     def respond(call, _):
@@ -2016,12 +2031,82 @@ def test_explicit_window_json_value_runs_after_empty_typed_probe():
     )
 
     assert read.rows == (AttributeValueRow("accepted", "array", 1),)
+    assert read.metadata.query_complete is True
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
     ]
     assert len(candidate_calls) == 14
-    assert "JSONHas(attributes_extra" not in candidate_calls[0].sql
-    assert "JSONHas(attributes_extra" in candidate_calls[1].sql
+    assert all(
+        "JSONHas(attributes_extra" not in call.sql for call in candidate_calls[:7]
+    )
+    assert all(
+        "JSONHas(attributes_extra" in call.sql for call in candidate_calls[7:]
+    )
+    first_json_call = candidate_calls[7]
+    assert first_json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
+    assert first_json_call.settings["max_rows_to_read"] == 100_000
+    assert first_json_call.settings["max_block_size"] == 2_048
+
+
+def test_older_typed_value_is_verified_before_json_overflow_lane():
+    windows = adaptive_attribute_windows(NOW)
+    recent = _candidate(
+        PROJECT_A,
+        "recent-cleared",
+        start_time=NOW - timedelta(days=1),
+    )
+    older = _candidate(
+        PROJECT_A,
+        "older-live",
+        start_time=NOW - timedelta(days=10),
+    )
+    candidates = {str(row["id"]): row for row in (recent, older)}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            if "JSONHas(attributes_extra" in call.sql:
+                pytest.fail("JSON overflow ran before a verified typed sample")
+            if call.params["segment_start"] == windows[0][0]:
+                return [recent]
+            if call.params["segment_start"] == windows[1][0]:
+                return [older]
+            return []
+        requested_ids = call.params["candidate_ids_0"]
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    span_id,
+                    start_time=candidates[span_id]["start_time"],
+                    latest_version=2 if span_id == "recent-cleared" else 1,
+                )
+                for span_id in requested_ids
+            ]
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                start_time=candidates[span_id]["start_time"],
+                string="Rejected",
+            )
+            for span_id in requested_ids
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).read_values(
+        [PROJECT_A], "final_status"
+    )
+
+    assert read.rows == (AttributeValueRow("Rejected", "string", 1),)
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert [call.params["segment_start"] for call in candidate_calls] == [
+        segment[0] for segment in windows
+    ]
+    assert all("JSONHas(attributes_extra" not in call.sql for call in candidate_calls)
 
 
 def test_value_search_pages_past_seed_stale_matches_to_live_value():
@@ -2169,14 +2254,13 @@ def test_json_budget_failure_keeps_verified_typed_key_inventory_usable(code: int
     assert "attributes_extra" not in typed_call.sql
 
 
-@pytest.mark.parametrize("code", [241, 307])
-def test_json_budget_failure_keeps_verified_typed_searched_value_usable(code: int):
+def test_verified_typed_searched_value_skips_json_budget_risk():
     recent_start = adaptive_attribute_windows(NOW)[0][0]
 
     def respond(call, _):
         if "segment_start" in call.params:
             if "JSONHas(attributes_extra" in call.sql:
-                return ServerException("private JSON lane failure", code)
+                pytest.fail("JSON overflow ran after a verified typed sample")
             if call.params["segment_start"] == recent_start:
                 return [_candidate(PROJECT_A, "typed-rejected")]
             return []
@@ -2202,10 +2286,41 @@ def test_json_budget_failure_keeps_verified_typed_searched_value_usable(code: in
         )
         for call in candidate_calls
     )
-    json_call = next(
-        call for call in candidate_calls if "JSONHas(attributes_extra" in call.sql
+    assert all("JSONHas(attributes_extra" not in call.sql for call in candidate_calls)
+
+
+def test_absent_heavy_json_key_degrades_after_one_strictly_bounded_probe():
+    windows = adaptive_attribute_windows(NOW)
+
+    def respond(call, _):
+        if "segment_start" not in call.params:
+            pytest.fail("an absent candidate key must not enter latest-state replay")
+        if "JSONHas(attributes_extra" in call.sql:
+            return ReadDeadlineExceeded("sanitized attribute query timeout")
+        return []
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).read_values(
+        [PROJECT_A], "absent_heavy_key"
     )
+
+    assert read.rows == ()
+    assert read.metadata.query_status == "degraded"
+    assert read.metadata.query_error_code == "read_budget_exceeded"
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert len(candidate_calls) == len(windows) + 1
+    assert all(
+        "JSONHas(attributes_extra" not in call.sql
+        for call in candidate_calls[: len(windows)]
+    )
+    json_call = candidate_calls[-1]
+    assert "JSONHas(attributes_extra" in json_call.sql
     assert json_call.timeout_ms <= 750
+    assert json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
+    assert json_call.settings["max_rows_to_read"] == 100_000
+    assert json_call.settings["max_block_size"] == 2_048
 
 
 def test_timeout_on_first_segment_has_no_retry():
