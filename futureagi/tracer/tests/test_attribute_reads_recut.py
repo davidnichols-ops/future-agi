@@ -29,6 +29,7 @@ from tracer.services.clickhouse.attribute_reads import (
     _STRATIFIED_CANDIDATE_SQL,
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_MAX_PROJECTS,
+    ATTRIBUTE_READ_MAX_QUERY_COUNT,
     ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT,
     ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
@@ -1275,7 +1276,7 @@ def test_structured_json_value_picker_is_explicitly_degraded():
         if "segment_start" in call.params:
             if (
                 call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]
-                or "JSONHas(attributes_extra" not in call.sql
+                or "candidate_version" in call.sql
             ):
                 return []
             return [_candidate(PROJECT_A, "structured")]
@@ -1432,7 +1433,7 @@ def test_array_value_picker_flattens_supported_json_scalars_type_exactly():
         if "segment_start" in call.params:
             if (
                 call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]
-                or "JSONHas(attributes_extra" not in call.sql
+                or "candidate_version" in call.sql
             ):
                 return []
             return [
@@ -1998,7 +1999,7 @@ def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
     def respond(call, _):
         nonlocal json_emitted
         if "segment_start" in call.params:
-            if "JSONHas(attributes_extra" not in call.sql or json_emitted:
+            if "candidate_version" in call.sql or json_emitted:
                 return []
             json_emitted = True
             return [
@@ -2026,6 +2027,7 @@ def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
     ).read_values(
         [PROJECT_A],
         "json_array",
+        search="CEPT",
         window_start=NOW - timedelta(days=7),
         window_end=NOW,
     )
@@ -2037,15 +2039,25 @@ def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
     ]
     assert len(candidate_calls) == 14
     assert all(
-        "JSONHas(attributes_extra" not in call.sql for call in candidate_calls[:7]
+        "candidate_version" in call.sql for call in candidate_calls[:7]
     )
     assert all(
-        "JSONHas(attributes_extra" in call.sql for call in candidate_calls[7:]
+        "candidate_version" not in call.sql for call in candidate_calls[7:]
     )
+    assert all("attributes_extra" not in call.sql for call in candidate_calls)
+    assert all("JSONHas(attributes_extra" not in call.sql for call in candidate_calls)
+    assert all("attribute_search" not in call.params for call in candidate_calls)
     first_json_call = candidate_calls[7]
     assert first_json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
     assert first_json_call.settings["max_rows_to_read"] == 100_000
     assert first_json_call.settings["max_block_size"] == 2_048
+    json_hydration = next(
+        call
+        for call in executor.calls
+        if "segment_start" not in call.params
+        and "JSONHas(attributes_extra" in call.sql
+    )
+    assert len(json_hydration.params["candidate_ids_0"]) == 1
 
 
 def test_older_typed_value_is_verified_before_json_overflow_lane():
@@ -2289,15 +2301,39 @@ def test_verified_typed_searched_value_skips_json_budget_risk():
     assert all("JSONHas(attributes_extra" not in call.sql for call in candidate_calls)
 
 
-def test_absent_heavy_json_key_degrades_after_one_strictly_bounded_probe():
-    windows = adaptive_attribute_windows(NOW)
+def test_absent_heavy_json_key_uses_only_bounded_identity_seeds():
+    starts_by_id: dict[str, datetime] = {}
+    json_candidate_page = 0
 
     def respond(call, _):
-        if "segment_start" not in call.params:
-            pytest.fail("an absent candidate key must not enter latest-state replay")
-        if "JSONHas(attributes_extra" in call.sql:
-            return ReadDeadlineExceeded("sanitized attribute query timeout")
-        return []
+        nonlocal json_candidate_page
+        if "segment_start" in call.params:
+            if "candidate_version" in call.sql:
+                return []
+            page = json_candidate_page
+            json_candidate_page += 1
+            rows = [
+                _candidate(
+                    PROJECT_A,
+                    f"raw-json-{page:02d}-{index:02d}",
+                    start_time=call.params["segment_start"]
+                    + timedelta(seconds=index + 1),
+                )
+                for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
+            ]
+            starts_by_id.update(
+                (str(row["id"]), row["start_time"]) for row in rows
+            )
+            return rows
+
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                start_time=starts_by_id[span_id],
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
 
     executor = RecordingExecutor(respond)
     read = AttributeReadSelector(executor, now=NOW).read_values(
@@ -2306,21 +2342,36 @@ def test_absent_heavy_json_key_degrades_after_one_strictly_bounded_probe():
 
     assert read.rows == ()
     assert read.metadata.query_status == "degraded"
-    assert read.metadata.query_error_code == "read_budget_exceeded"
+    assert read.metadata.query_error_code == "sample_limit"
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
     ]
-    assert len(candidate_calls) == len(windows) + 1
+    assert len(candidate_calls) == ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+    assert all("attributes_extra" not in call.sql for call in candidate_calls)
+    assert all("JSONHas(attributes_extra" not in call.sql for call in candidate_calls)
+    json_calls = [
+        call for call in candidate_calls if "candidate_version" not in call.sql
+    ]
+    assert json_calls
+    assert all(call.timeout_ms <= 750 for call in json_calls)
     assert all(
-        "JSONHas(attributes_extra" not in call.sql
-        for call in candidate_calls[: len(windows)]
+        call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
+        and call.settings["max_rows_to_read"] == 100_000
+        and call.settings["max_block_size"] == 2_048
+        for call in json_calls
     )
-    json_call = candidate_calls[-1]
-    assert "JSONHas(attributes_extra" in json_call.sql
-    assert json_call.timeout_ms <= 750
-    assert json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
-    assert json_call.settings["max_rows_to_read"] == 100_000
-    assert json_call.settings["max_block_size"] == 2_048
+    hydration_calls = [
+        call
+        for call in executor.calls
+        if "segment_start" not in call.params
+        and "JSONHas(attributes_extra" in call.sql
+    ]
+    assert hydration_calls
+    assert all(
+        len(call.params["candidate_ids_0"])
+        <= ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT
+        for call in hydration_calls
+    )
 
 
 def test_timeout_on_first_segment_has_no_retry():
@@ -2469,6 +2520,140 @@ def test_candidate_sample_cap_is_explicitly_degraded_and_query_count_bounded():
     assert read.metadata.query_count <= (
         2 * ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
     )
+
+
+def test_value_search_miss_never_exceeds_hard_query_ceiling():
+    starts_by_id: dict[str, datetime] = {}
+    typed_candidate_page = 0
+
+    def respond(call, _):
+        nonlocal typed_candidate_page
+        if "segment_start" in call.params:
+            if "JSONHas(attributes_extra" in call.sql:
+                return []
+            page = typed_candidate_page
+            typed_candidate_page += 1
+            rows = [
+                _candidate(
+                    PROJECT_A,
+                    f"miss-{page:02d}-{index:02d}",
+                    start_time=NOW
+                    - timedelta(days=1, seconds=page * 100 + index + 1),
+                )
+                for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
+            ]
+            starts_by_id.update(
+                (str(row["id"]), row["start_time"]) for row in rows
+            )
+            return rows
+
+        requested_ids = call.params["candidate_ids_0"]
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    span_id,
+                    start_time=starts_by_id[span_id],
+                    latest_version=1,
+                )
+                for span_id in requested_ids
+            ]
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                start_time=starts_by_id[span_id],
+                string="does-not-match",
+            )
+            for span_id in requested_ids
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        wall_timeout_ms=600_000,
+    ).read_values([PROJECT_A], "final_status", search="needle")
+
+    assert read.rows == ()
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "degraded"
+    assert read.metadata.query_error_code == "read_budget_exceeded"
+    assert read.metadata.query_count == ATTRIBUTE_READ_MAX_QUERY_COUNT
+    assert len(executor.calls) == ATTRIBUTE_READ_MAX_QUERY_COUNT
+
+
+def test_query_ceiling_retains_values_but_never_claims_complete(monkeypatch):
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.attribute_reads.ATTRIBUTE_READ_MAX_QUERY_COUNT",
+        4,
+    )
+    candidate = _candidate(PROJECT_A, "retained-before-cap")
+
+    def respond(call, call_number):
+        if "segment_start" in call.params:
+            return [candidate] if call_number == 1 else []
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    "retained-before-cap",
+                    start_time=candidate["start_time"],
+                    latest_version=1,
+                )
+            ]
+        return [
+            _target_row(
+                PROJECT_A,
+                "retained-before-cap",
+                start_time=candidate["start_time"],
+                string="Rejected",
+            )
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).read_values(
+        [PROJECT_A], "final_status"
+    )
+
+    assert read.rows == (AttributeValueRow("Rejected", "string", 1),)
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "degraded"
+    assert read.metadata.query_error_code == "read_budget_exceeded"
+    assert read.metadata.query_count == 4
+    assert len(executor.calls) == 4
+
+
+def test_query_ceiling_without_decoded_values_returns_degraded(monkeypatch):
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.attribute_reads.ATTRIBUTE_READ_MAX_QUERY_COUNT",
+        4,
+    )
+    candidate = _candidate(PROJECT_A, "empty-before-cap")
+
+    def respond(call, call_number):
+        if "segment_start" in call.params:
+            return [candidate] if call_number == 1 else []
+        return [
+            _target_row(
+                PROJECT_A,
+                "empty-before-cap",
+                start_time=candidate["start_time"],
+                latest_version=1,
+            )
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).read_values(
+        [PROJECT_A], "final_status"
+    )
+
+    assert read.rows == ()
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "degraded"
+    assert read.metadata.query_error_code == "read_budget_exceeded"
+    assert read.metadata.query_count == 4
+    assert len(executor.calls) == 4
 
 
 def test_malformed_keys_and_oversized_project_scopes_fail_before_ch():

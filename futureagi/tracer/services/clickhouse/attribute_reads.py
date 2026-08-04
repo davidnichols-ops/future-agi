@@ -51,6 +51,11 @@ ATTRIBUTE_READ_HORIZON_DAYS = (7, 14, 30, 180, 365)
 # descheduled. Row, byte, result, and per-query ceilings remain unchanged.
 ATTRIBUTE_READ_WALL_TIMEOUT_MS = 6_000
 ATTRIBUTE_READ_QUERY_TIMEOUT_MS = 1_500
+# Keep one operation below the production low-load harness ceiling (32) even
+# when a typed value page needs candidate, version-certificate, and hydration
+# queries. Candidate-page caps bound discovery breadth; this separate ceiling
+# bounds the actual ClickHouse attempts those pages can expand into.
+ATTRIBUTE_READ_MAX_QUERY_COUNT = 30
 # JSON overflow has no key skip index. Keep its independent lane short so a
 # rare/absent JSON key cannot consume the whole picker deadline after typed Map
 # rows have already been verified.
@@ -106,9 +111,10 @@ ATTRIBUTE_READ_SETTINGS: dict[str, Any] = {
     "timeout_overflow_mode": "throw",
 }
 
-# JSON overflow has no key skip index. An absent key must therefore fail inside
-# one tightly bounded probe instead of reading another full attributes block in
-# every adaptive band. These settings only tighten the shared read-only limits.
+# JSON overflow has no key skip index. Its candidate phase therefore samples
+# only narrow physical identities; these settings further tighten that seed
+# without being required for correctness. Exact JSON key/value inspection runs
+# only during latest-state hydration of the finite sampled identities.
 _JSON_VALUE_CANDIDATE_SETTINGS: dict[str, Any] = {
     "max_block_size": 2_048,
     "max_bytes_to_read": 64 * _MIB,
@@ -134,6 +140,10 @@ class InvalidAttributeSearch(ValueError):
 
 class IncompleteLatestStateReplay(RuntimeError):
     """A candidate set could not be fully verified at its latest state."""
+
+
+class AttributeReadQueryLimitExceeded(ReadDeadlineExceeded):
+    """A bounded attribute operation exhausted its ClickHouse query ceiling."""
 
 
 @dataclass(frozen=True)
@@ -834,6 +844,10 @@ class AttributeReadSelector:
             remaining_ms = int((self._deadline - self._clock()) * 1000)
             if remaining_ms < 25:
                 raise ReadDeadlineExceeded("Attribute read deadline exceeded")
+            if self._query_count >= ATTRIBUTE_READ_MAX_QUERY_COUNT:
+                raise AttributeReadQueryLimitExceeded(
+                    "Attribute read query limit exceeded"
+                )
             self._query_count += 1
             timeout_cap_ms = (
                 ATTRIBUTE_READ_QUERY_TIMEOUT_MS
@@ -990,7 +1004,6 @@ class AttributeReadSelector:
         *,
         predicate: str,
         attribute_key: str | None,
-        attribute_search: str | None = None,
         stratified: bool = False,
         ordered: bool = False,
         before_identity: PhysicalSpanIdentity | None = None,
@@ -1012,8 +1025,6 @@ class AttributeReadSelector:
         }
         if attribute_key is not None:
             params["attribute_key"] = attribute_key
-        if attribute_search is not None:
-            params["attribute_search"] = attribute_search
         ordered = ordered or before_identity is not None
         candidate_sql = _ORDERED_CANDIDATE_SQL if ordered else _CANDIDATE_SQL
         query_settings = dict(candidate_query_settings or {})
@@ -1647,6 +1658,10 @@ class AttributeReadSelector:
                         query_timeout_ms=timeout_ms,
                     )
                 except Exception as exc:
+                    if isinstance(exc, AttributeReadQueryLimitExceeded):
+                        typed_lane_halted = True
+                        mark_budget_exceeded()
+                        break
                     if lane_name == "json" and is_read_budget_error(exc):
                         # JSON overflow has no skip index. Its independent short
                         # lane may degrade, but must never erase verified typed
@@ -1740,6 +1755,10 @@ class AttributeReadSelector:
                         query_timeout_ms=state["timeout_ms"],
                     )
                 except Exception as exc:
+                    if isinstance(exc, AttributeReadQueryLimitExceeded):
+                        typed_lane_halted = True
+                        mark_budget_exceeded()
+                        break
                     if state["lane_name"] == "json" and is_read_budget_error(exc):
                         json_lane_available = False
                         state["complete"] = True
@@ -1882,19 +1901,11 @@ class AttributeReadSelector:
             "OR (indexHint(has(mapKeys(attrs_bool), %(attribute_key)s)) "
             "AND has(attrs_bool.keys, %(attribute_key)s))"
         )
-        json_predicate = "JSONHas(attributes_extra, %(attribute_key)s)"
-        pushed_search: str | None = None
-        # Typed Map acquisition remains key-only; exact search is applied in
-        # Python after finite latest-state replay. Preserve the existing ASCII
-        # pushdown only for the independent JSON lane.
-        if normalized_search and normalized_search.isascii():
-            pushed_search = normalized_search
-            json_predicate = (
-                "JSONHas(attributes_extra, %(attribute_key)s) "
-                "AND positionCaseInsensitiveUTF8("
-                "JSONExtractRaw(attributes_extra, %(attribute_key)s), "
-                "%(attribute_search)s) > 0"
-            )
+        # JSON overflow has no usable key index. Candidate discovery must never
+        # evaluate attributes_extra across the tenant: sample narrow physical
+        # identities first, then inspect the requested key/search only in the
+        # exact latest-state hydration and Python decoder below.
+        json_predicate = "1"
         lanes: list[tuple[str, str, str, JsonAttributeMode, int | None]] = [
             (
                 "typed",
@@ -2025,9 +2036,6 @@ class AttributeReadSelector:
                         segment,
                         predicate=predicate,
                         attribute_key=key,
-                        attribute_search=(
-                            pushed_search if lane_name == "json" else None
-                        ),
                         candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
                         query_timeout_ms=timeout_ms,
                         candidate_query_settings=(
@@ -2055,6 +2063,10 @@ class AttributeReadSelector:
                         )
                     )
                 except Exception as exc:
+                    if isinstance(exc, AttributeReadQueryLimitExceeded):
+                        typed_lane_halted = True
+                        mark_budget_exceeded()
+                        break
                     if lane_name == "json" and is_read_budget_error(exc):
                         json_lane_available = False
                         mark_json_budget_exceeded()
@@ -2068,6 +2080,12 @@ class AttributeReadSelector:
                 candidate_pages += 1
                 covered_start = min(covered_start, segment[0])
                 usable_value_seen = consume_rows(rows, json_mode=json_mode)
+                if lane_name == "json" and segment_truncated:
+                    # The JSON lane samples raw physical identities because no
+                    # safe key index exists. Once that raw seed truncates, later
+                    # keyset continuation can improve the sample but must never
+                    # upgrade it into a global absence/completeness claim.
+                    truncated = True
                 if lane_name == "typed" and usable_value_seen:
                     typed_usable_sample_found = True
                 if segment_truncated and usable_value_seen:
@@ -2142,9 +2160,6 @@ class AttributeReadSelector:
                         state["segment"],
                         predicate=state["predicate"],
                         attribute_key=key,
-                        attribute_search=(
-                            pushed_search if state["lane_name"] == "json" else None
-                        ),
                         ordered=True,
                         before_identity=state["before_identity"],
                         candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
@@ -2174,6 +2189,10 @@ class AttributeReadSelector:
                         )
                     )
                 except Exception as exc:
+                    if isinstance(exc, AttributeReadQueryLimitExceeded):
+                        typed_lane_halted = True
+                        mark_budget_exceeded()
+                        break
                     if state["lane_name"] == "json" and is_read_budget_error(exc):
                         json_lane_available = False
                         state["complete"] = True
