@@ -301,6 +301,19 @@ def test_long_window_trace_presentation_batches_stay_at_fifty() -> None:
 
     assert builder.recommended_filter_seed_batch_size() == 50
     assert builder.recommended_filter_classify_batch_size() == 50
+    assert builder.skip_full_window_filter_anchor_probe() is True
+
+
+def test_short_window_trace_keeps_full_sparse_anchor_probe() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(hours=1), END),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+        ],
+    )
+
+    assert builder.skip_full_window_filter_anchor_probe() is False
 
 
 def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
@@ -3059,6 +3072,12 @@ class _AnchorFakeBuilder(_FakeBuilder):
         return "ordered_seed", params
 
 
+class _SkipFullAnchorFakeBuilder(_AnchorFakeBuilder):
+    @staticmethod
+    def skip_full_window_filter_anchor_probe() -> bool:
+        return True
+
+
 class _AnchorFakeExecutor(_FakeExecutor):
     def execute_ch_query(
         self,
@@ -3978,6 +3997,81 @@ def test_graph_stratum_anchor_classifies_one_finite_sentinel_without_ordered_see
     assert page.error_code == "sample_limit"
     assert [query for query, _ in executor.calls] == ["anchor", "match"]
     assert executor.calls[0][1]["limit"] == 3
+
+
+def test_long_window_list_skips_full_anchor_but_keeps_graph_custom_anchor() -> None:
+    rows = _rows(1, 2, 3)
+    builder = _SkipFullAnchorFakeBuilder(rows, seed_proves_order=False)
+
+    list_executor = _AnchorFakeExecutor(builder)
+    list_page = read_bounded_filter_page(
+        builder=builder,
+        analytics=list_executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert list_page.complete is True
+    assert [query for query, _ in list_executor.calls] == ["ordered_seed", "match"]
+
+    paged_rows: list[list[str]] = []
+    for page_number in (0, 1):
+        page_executor = _AnchorFakeExecutor(builder)
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=page_executor,
+            filters=[_time_filter()],
+            key_field="id",
+            page_number=page_number,
+            page_size=1,
+            deadline_ms=5_000,
+        )
+        paged_rows.append([row["id"] for row in page.rows])
+        assert "anchor" not in [query for query, _ in page_executor.calls]
+
+    assert paged_rows == [["span-0"], ["span-1"]]
+    assert set(paged_rows[0]).isdisjoint(paged_rows[1])
+
+    graph_executor = _AnchorFakeExecutor(builder)
+    graph_page = read_bounded_filter_page(
+        builder=builder,
+        analytics=graph_executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        max_seed_attempts=1,
+        max_candidates=3,
+        max_query_count=2,
+        classify_batch_size=3,
+        include_incomplete_rows=True,
+        anchor_probe_only=True,
+        anchor_probe_limit=3,
+    )
+
+    assert graph_page.complete is False
+    assert [query for query, _ in graph_executor.calls] == ["anchor", "match"]
+
+    default_anchor_only_executor = _AnchorFakeExecutor(builder)
+    read_bounded_filter_page(
+        builder=builder,
+        analytics=default_anchor_only_executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        include_incomplete_rows=True,
+        anchor_probe_only=True,
+    )
+    assert [query for query, _ in default_anchor_only_executor.calls] == [
+        "anchor",
+        "match",
+    ]
 
 
 def test_lower_anchor_limit_is_opt_in_and_keeps_list_sentinel_unchanged() -> None:

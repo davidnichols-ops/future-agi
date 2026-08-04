@@ -227,6 +227,7 @@ def test_bounded_resolver_returns_only_a_complete_latest_state_page(
     assert captured["builder"]._bounded_identity_only is True
     if row_type == RowType.TRACES:
         assert captured["builder"]._bounded_bulk_scan is True
+        assert captured["builder"].skip_full_window_filter_anchor_probe() is True
 
 
 @pytest.mark.parametrize(

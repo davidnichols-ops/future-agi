@@ -238,10 +238,11 @@ def read_bounded_filter_page(
     entering the ordered seed loop; it is reserved for callers that provide a
     separate bounded fallback for non-sparse values.
     ``anchor_probe_limit`` lowers that sentinel for a caller whose surrounding
-    protocol already partitions the complete request window.  It is graph-only
-    in practice: numbered pages retain the 513-row sparse/common proof, while a
-    graph stratum can classify its visible rows plus one finite sentinel without
-    sorting the stratum's full match set.
+    protocol already partitions the complete request window. It is graph-only
+    in practice: short-window numbered pages retain the 513-row sparse/common
+    proof, while long-window trace builders may opt directly into ordered root
+    batches. A graph stratum can classify its visible rows plus one finite
+    sentinel without sorting the stratum's full match set.
     ``defer_classification`` is an internal graph-only acquisition contract. It
     returns finite seeds in ``deferred_candidate_rows`` and always leaves public
     ``rows`` empty; the caller must replay the union through the same builder's
@@ -574,11 +575,12 @@ def read_bounded_filter_page(
                     matched_by_id[identity] = row
 
     try:
-        # Any-span trace filters first ask a direct key+value predicate for a
-        # finite DISTINCT trace-id sentinel.  If it exhausts, that is an exact
-        # candidate superset and no root-history scan is needed.  If it reaches
-        # the sentinel (or its read budget), the predicate is common: switch to
-        # ordered root batches, where a proven page prefix can close without
+        # Eligible any-span trace filters first ask a direct key+value predicate
+        # for a finite DISTINCT trace-id sentinel. If it exhausts, that is an
+        # exact candidate superset and no root-history scan is needed. Long
+        # windows may skip that broad sentinel and start with ordered roots. If
+        # an attempted probe reaches the sentinel (or its read budget), switch
+        # to ordered root batches, where a proven page prefix can close without
         # materialising the tenant-wide set that triggered Code 159.
         anchor_builder = getattr(builder, "build_filter_anchor_probe", None)
         anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
@@ -588,6 +590,18 @@ def read_bounded_filter_page(
         anchor_limit = anchor_probe_limit or min(
             _SELECTIVE_ANCHOR_SENTINEL,
             max_candidates + 1,
+        )
+        skip_full_anchor_builder = getattr(
+            builder,
+            "skip_full_window_filter_anchor_probe",
+            None,
+        )
+        skip_full_window_anchor = (
+            anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
+            and anchor_probe_limit is None
+            and not anchor_probe_only
+            and callable(skip_full_anchor_builder)
+            and bool(skip_full_anchor_builder())
         )
         if cursor_key is not None:
             # Continuations must start from the signed *result* tuple. Trace
@@ -605,6 +619,7 @@ def read_bounded_filter_page(
             and callable(anchor_builder)
             and callable(anchor_support)
             and bool(anchor_support())
+            and not skip_full_window_anchor
             and (callable(ordered_seed_builder) or seed_proves_result_order)
         ):
             try:

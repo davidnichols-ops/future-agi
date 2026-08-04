@@ -528,6 +528,19 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         return bool(self._filter_anchor_plans())
 
+    def skip_full_window_filter_anchor_probe(self) -> bool:
+        """Avoid the 513-row broad sentinel outside a short trace window.
+
+        The full sparse/common probe is useful for short windows, but on the
+        largest tenant its fixed 513-row scan crosses the 750 ms native client
+        deadline under load before the ordered fallback can start. Graph
+        strata provide a smaller explicit ``anchor_probe_limit`` and are not
+        covered by this full-window recommendation.
+        """
+
+        request_start, request_end = self._bounded_request_window
+        return request_end - request_start > timedelta(hours=1)
+
     def build_filter_anchor_probe(self, *, limit: int) -> tuple[str, dict[str, Any]]:
         """Return a finite unordered any-span candidate sentinel.
 
