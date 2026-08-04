@@ -55,7 +55,13 @@ ATTRIBUTE_READ_QUERY_TIMEOUT_MS = 1_500
 # rare/absent JSON key cannot consume the whole picker deadline after typed Map
 # rows have already been verified.
 ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS = 750
-ATTRIBUTE_READ_CANDIDATE_LIMIT = 512
+ATTRIBUTE_READ_EXPLICIT_SEGMENT = timedelta(days=1)
+# Keep each storage-order seed small enough that dense projects stop inside the
+# read envelope before ClickHouse pulls another large attribute block.  The
+# extra row requested by ``_candidate_ids`` remains an explicit truncation
+# sentinel, so callers never mistake this discovery sample for a complete
+# distribution.
+ATTRIBUTE_READ_CANDIDATE_LIMIT = 64
 # Exact-key discovery may continue through a small number of deterministic
 # candidate pages when a storage-order first probe replays entirely to
 # cleared/tombstoned latest state. This cap is shared across adaptive bands and
@@ -626,11 +632,11 @@ class AttributeReadSelector:
     """Thin typed selector shared by every production attribute picker.
 
     Each public operation gets one six-second wall budget shared by all of its
-    adaptive candidate and latest-state replay queries. With both typed Map and
-    JSON lanes enabled, generic key browse is at most twenty queries, exact-key
-    discovery at most twenty-two, and value reads at most thirty under their
-    fair round-robin continuation cap. Common typed exact-key reads remain two
-    queries. Reusing a
+    adaptive candidate and latest-state replay queries. Default-horizon reads
+    keep the existing finite band/page caps; caller-supplied windows are split
+    into adjacent day probes under the same whole-operation deadline. Common
+    dense typed reads stop after one candidate/replay pair and explicitly
+    report a sample. Reusing a
     selector for a second public operation starts a fresh operation budget;
     per-query caps remain 1.5 s.
     """
@@ -766,7 +772,16 @@ class AttributeReadSelector:
             end = _utc(window_end)
             if start >= end:
                 raise ValueError("window_start must be before window_end")
-            return ((start, end),)
+            # Explicit dashboard/eval windows can be dense even at seven days.
+            # Walk adjacent newest-first day slices so a single picker probe
+            # cannot turn the entire requested range into one physical scan.
+            windows: list[tuple[datetime, datetime]] = []
+            segment_end = end
+            while segment_end > start:
+                segment_start = max(start, segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT)
+                windows.append((segment_start, segment_end))
+                segment_end = segment_start
+            return tuple(windows)
         return adaptive_attribute_windows(
             self._window_end,
             horizon_days=horizon_days,
@@ -1380,10 +1395,10 @@ class AttributeReadSelector:
             *,
             json_mode: JsonAttributeMode,
         ) -> bool:
-            """Merge one independently verified lane; return exact-key success."""
+            """Merge one independently verified lane; report a usable key."""
 
             nonlocal truncated
-            exact_found = False
+            usable_key_seen = False
             for row in rows:
                 identity = self._physical_identity(row)
                 if not self._row_is_active_in_window(row, overall_start, overall_end):
@@ -1413,7 +1428,7 @@ class AttributeReadSelector:
                         or _TYPE_PRIORITY[decoded[0]] < _TYPE_PRIORITY[prior_type]
                     ):
                         current[exact_key] = decoded[0]
-                    exact_found = True
+                    usable_key_seen = True
                     continue
 
                 row_keys, unsupported_value_seen = self._browse_row_keys(
@@ -1428,8 +1443,9 @@ class AttributeReadSelector:
                         or _TYPE_PRIORITY[attr_type] < _TYPE_PRIORITY[prior_type]
                     ):
                         current[key] = attr_type
+                usable_key_seen = usable_key_seen or bool(row_keys)
                 truncated = truncated or unsupported_value_seen
-            return exact_found
+            return usable_key_seen
 
         # Every lane gets a cheap storage-order first probe in every adaptive
         # band. Exact-key probes that replay entirely stale/cleared state are
@@ -1476,6 +1492,11 @@ class AttributeReadSelector:
                 lane_found = consume_rows(rows, json_mode=json_mode)
                 if exact_key is None:
                     truncated = truncated or segment_truncated
+                    if lane_found and segment_truncated:
+                        # Discovery pickers need a useful inventory, not an
+                        # accounting scan. A verified dense page is sufficient
+                        # and its sentinel makes the partial coverage explicit.
+                        break
                 elif lane_found:
                     exact_found = True
                     truncated = truncated or segment_truncated
@@ -1495,7 +1516,11 @@ class AttributeReadSelector:
                         }
                     )
 
-            if exact_found or typed_lane_halted:
+            if (
+                exact_found
+                or typed_lane_halted
+                or (exact_key is None and lane_found and segment_truncated)
+            ):
                 break
             discovered_key_count = len(
                 {key for keys in latest_keys.values() for key in keys}
@@ -1819,6 +1844,7 @@ class AttributeReadSelector:
         # replay produced no usable value need deterministic continuation.
         fallback_states: list[dict[str, Any]] = []
         candidate_pages = 0
+        usable_sample_found = False
         for segment in windows:
             for lane_name, predicate, replay_sql, json_mode, timeout_ms in lanes:
                 if candidate_pages >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT:
@@ -1858,9 +1884,12 @@ class AttributeReadSelector:
                 covered_start = min(covered_start, segment[0])
                 usable_value_seen = consume_rows(rows, json_mode=json_mode)
                 if segment_truncated and usable_value_seen:
-                    # The picker has useful sampled values and need not pay the
-                    # global-sort fallback cost. The sentinel keeps this honest.
+                    # The picker has useful verified values. Stop immediately
+                    # instead of scanning JSON and older bands; the sentinel
+                    # keeps the intentionally partial distribution honest.
                     truncated = True
+                    usable_sample_found = True
+                    break
                 elif segment_truncated:
                     fallback_states.append(
                         {
@@ -1876,7 +1905,7 @@ class AttributeReadSelector:
                         }
                     )
 
-            if typed_lane_halted:
+            if typed_lane_halted or usable_sample_found:
                 break
         if candidate_pages >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT and any(
             not state["complete"] for state in fallback_states
