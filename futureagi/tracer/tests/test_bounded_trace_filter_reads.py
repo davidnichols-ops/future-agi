@@ -357,6 +357,7 @@ def test_trace_candidate_witness_probe_is_finite_typed_map_superset(
     assert params["filter_candidate_start_us"] == 1_735_689_600_000_000
     assert params["filter_candidate_end_us"] == 1_767_225_600_000_000
     assert params["latest_filter_key_0"] == "final_status"
+    assert builder.prefer_filter_candidate_witness_probe_first() is True
 
 
 def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
@@ -453,6 +454,7 @@ def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
 def test_trace_candidate_witness_probe_is_unavailable_for_unsafe_shapes(
     builder: TraceListQueryBuilder,
 ) -> None:
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
     assert builder.build_filter_candidate_witness_probe([{"trace_id": "trace-a"}]) == (
         "",
         {},
@@ -489,6 +491,7 @@ def test_short_window_trace_keeps_full_sparse_anchor_probe() -> None:
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
     assert builder.recommended_filter_anchor_probe_strata() is None
     assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
 
 
 def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
@@ -3402,6 +3405,10 @@ class _IdentityHydrationFakeExecutor(_FakeExecutor):
 @dataclass
 class _CandidateWitnessHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
     @staticmethod
+    def prefer_filter_candidate_witness_probe_first():
+        return True
+
+    @staticmethod
     def build_filter_candidate_witness_probe(rows):
         return "prefilter", {"candidate_ids": tuple(row["id"] for row in rows)}
 
@@ -3418,6 +3425,7 @@ class _CandidateWitnessHydrationFakeExecutor(_IdentityHydrationFakeExecutor):
         super().__init__(builder, **kwargs)
         self.witness_ids = set(witness_ids)
         self.fail_prefilter = fail_prefilter
+        self.prefilter_settings = []
 
     def execute_ch_query(self, query, params, *, timeout_ms, settings):
         if query != "prefilter":
@@ -3429,6 +3437,7 @@ class _CandidateWitnessHydrationFakeExecutor(_IdentityHydrationFakeExecutor):
             )
         self.calls.append((query, params))
         self.timeouts.append((query, timeout_ms))
+        self.prefilter_settings.append(dict(settings))
         if self.fail_prefilter:
             raise ReadDeadlineExceeded("candidate witness budget")
         rows = [
@@ -6229,6 +6238,12 @@ def test_broad_candidate_witness_prefilter_falls_through_to_exact_classifier() -
         "match_identity",
         "hydrate",
     ]
+    assert next(timeout for query, timeout in executor.timeouts if query == "prefilter") == 250
+    assert len(executor.prefilter_settings) == 1
+    assert (
+        executor.prefilter_settings[0]["max_bytes_to_read"] == 96 * 1024 * 1024
+    )
+    assert executor.prefilter_settings[0]["max_threads"] == 1
 
 
 def test_candidate_witness_read_failure_falls_back_to_exact_classifier() -> None:

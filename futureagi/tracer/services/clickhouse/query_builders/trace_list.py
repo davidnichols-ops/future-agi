@@ -716,52 +716,31 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """
         return query, params
 
-    def build_filter_candidate_witness_probe(
-        self,
-        seed_rows: list[dict[str, Any]],
-    ) -> tuple[str, dict[str, Any]]:
-        """Return raw positive-Map witnesses for a finite trace batch.
-
-        This optional probe is deliberately narrower than the general latest-
-        state classifier. It remains finite at 512 identities and is a
-        complete *superset* only when the request
-        has one positive typed-Map equality/IN leaf: a trace whose latest live
-        span satisfies that leaf must have at least one raw live row satisfying
-        the same leaf.  Returned identities still require latest-state
-        classification; identities absent from this finite result cannot
-        satisfy the request.
-
-        Every other shape returns an unavailable sentinel instead of widening
-        the query.  In particular, JSON, negative/root/residual/multi-filter
-        requests and explicit identity-only/internal consumers retain their
-        existing classifier path.
-        """
+    def _candidate_witness_anchor_plan(self) -> LatestFilterPredicate | None:
+        """Return the raw predicate that is a complete candidate superset."""
 
         if (
-            not isinstance(seed_rows, list)
-            or not seed_rows
-            or len(seed_rows) > 512
-            or self._bounded_identity_only
+            self._bounded_identity_only
             or self._bounded_internal_scan
             or self._bounded_membership_filters is not None
             or self.search
         ):
-            return "", {}
+            return None
 
         try:
             plans, residual_filters = partition_trace_filter_plans(
                 self._bounded_filters()
             )
         except (TypeError, ValueError):
-            return "", {}
+            return None
         active_filters = self._active_non_time_filters()
         if len(active_filters) != 1 or len(plans) != 1 or residual_filters:
-            return "", {}
+            return None
 
         item = active_filters[0]
         config = item.get("filter_config") or item.get("filterConfig") or {}
         if not isinstance(config, dict):
-            return "", {}
+            return None
         column_type = str(config.get("col_type") or config.get("colType") or "").upper()
         operation = normalize_filter_op(
             str(config.get("filter_op") or config.get("filterOp") or "")
@@ -779,6 +758,36 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 seed_predicate,
             )
         ):
+            return None
+        return anchor
+
+    def prefer_filter_candidate_witness_probe_first(self) -> bool:
+        """Prefer the indexed witness superset before a long-window argMax scan."""
+
+        request_start, request_end = self._bounded_request_window
+        return bool(
+            request_end - request_start > timedelta(hours=1)
+            and self._candidate_witness_anchor_plan() is not None
+        )
+
+    def build_filter_candidate_witness_probe(
+        self,
+        seed_rows: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Return raw positive-Map witnesses for a finite trace batch.
+
+        This optional probe is deliberately narrower than the general latest-
+        state classifier. It remains finite at 512 identities and is a
+        complete *superset* only when the request has one positive typed-Map
+        equality/IN leaf: a trace whose latest live span satisfies that leaf
+        must have at least one raw live row satisfying the same leaf. Returned
+        identities still require latest-state classification.
+        """
+
+        if not isinstance(seed_rows, list) or not seed_rows or len(seed_rows) > 512:
+            return "", {}
+        anchor = self._candidate_witness_anchor_plan()
+        if anchor is None:
             return "", {}
 
         org_scope = self.project_ids is not None

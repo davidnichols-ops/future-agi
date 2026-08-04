@@ -26,6 +26,9 @@ _MAX_OPTIONAL_ANCHOR_STRATA = 4
 # at 0.79-1.26 s under load; the caller's wall deadline, query count, rows,
 # bytes, memory, and single-thread settings remain the authoritative envelope.
 _QUERY_TIMEOUT_MS = 1_500
+_CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS = 250
+_CANDIDATE_WITNESS_PREFILTER_MAX_BYTES = 96 * 1024 * 1024
+_CANDIDATE_WITNESS_EXACT_RESERVE_MS = 1_000
 # Trace/span list queries fetch one additional page-sized de-duplication
 # margin; 5,000 is also the existing server-side result ceiling used by those
 # endpoints.  Keeping one public ceiling makes numbered-page work finite for
@@ -342,6 +345,11 @@ def read_bounded_filter_page(
         "build_filter_candidate_witness_probe",
         None,
     )
+    candidate_witness_probe_preference = getattr(
+        builder,
+        "prefer_filter_candidate_witness_probe_first",
+        None,
+    )
     hydration_identity_builder = getattr(
         builder, "bounded_filter_page_hydration_identity", None
     )
@@ -582,7 +590,10 @@ def read_bounded_filter_page(
     # exact classifier still validates every surviving identity. Unsupported
     # filter shapes return no probe and retain the existing exact path.
     candidate_witness_probe_enabled = bool(
-        identity_only_classification and callable(candidate_witness_probe_builder)
+        identity_only_classification
+        and callable(candidate_witness_probe_builder)
+        and callable(candidate_witness_probe_preference)
+        and candidate_witness_probe_preference()
     )
     candidate_witness_probe_abandoned = False
     if cursor_key is not None and cursor_key[0] < request_start:
@@ -786,6 +797,22 @@ def read_bounded_filter_page(
             return False
 
         probe_classified_tail: Hashable | None = None
+        prefilter_query_reserve = (
+            1
+            + ceil(len(candidate_identities) / classify_batch_size)
+            + reserved_hydration_queries
+        )
+        prefilter_time_reserve_ms = (
+            _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS
+            + _CANDIDATE_WITNESS_EXACT_RESERVE_MS
+        )
+        if candidate_witness_probe_enabled and (
+            len(attempts) + prefilter_query_reserve > max_query_count
+            or int((classification_deadline - monotonic()) * 1000)
+            < prefilter_time_reserve_ms
+        ):
+            candidate_witness_probe_enabled = False
+            candidate_witness_probe_abandoned = True
         if (
             identity_only_classification
             and candidate_witness_probe_enabled
@@ -803,10 +830,12 @@ def read_bounded_filter_page(
                         active_start=active_start,
                         active_end=active_end,
                         result_limit=len(candidate_identities),
+                        timeout_cap_ms=_CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS,
+                        max_bytes_to_read_cap=(
+                            _CANDIDATE_WITNESS_PREFILTER_MAX_BYTES
+                        ),
                     )
-                except _BudgetExceeded as exc:
-                    if exc.error_code != "read_budget_exceeded":
-                        raise
+                except _BudgetExceeded:
                     # The probe is optional. A resource failure proves
                     # nothing, so permanently fall back to the unchanged
                     # exact classifier for this request.
