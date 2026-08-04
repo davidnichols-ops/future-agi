@@ -1524,9 +1524,7 @@ class AttributeReadSelector:
             )
         )
         json_predicate = (
-            "attributes_extra NOT IN ('', '{}', 'null')"
-            if exact_key is None
-            else "JSONHas(attributes_extra, %(attribute_key)s)"
+            "attributes_extra NOT IN ('', '{}', 'null')" if exact_key is None else "1"
         )
         lanes: list[tuple[str, str, str, JsonAttributeMode, int | None]] = [
             (
@@ -1630,16 +1628,38 @@ class AttributeReadSelector:
                 truncated = truncated or unsupported_value_seen
             return usable_key_seen
 
-        # Every lane gets a cheap storage-order first probe in every adaptive
-        # band. Exact-key probes that replay entirely stale/cleared state are
-        # queued for deterministic continuation only after all bands have had
-        # their fair first chance.
+        # Generic browse preserves its segment-first typed/JSON sampling order.
+        # Exact lookup gives indexed typed Maps every first probe and permitted
+        # deterministic continuation page before the unindexed JSON overflow
+        # may use the candidate-page budget that remains. This prevents a rare
+        # JSON key from blocking an older Map key hidden behind stale versions.
         fallback_states: list[dict[str, Any]] = []
         exact_found = False
-        for segment in windows:
-            for lane_name, predicate, replay_sql, json_mode, timeout_ms in lanes:
+        candidate_pages = 0
+        probe_groups = (
+            tuple((segment, tuple(lanes)) for segment in windows)
+            if exact_key is None
+            else tuple((segment, (lanes[0],)) for segment in windows)
+        )
+        for segment, segment_lanes in probe_groups:
+            lane_found = False
+            for (
+                lane_name,
+                predicate,
+                replay_sql,
+                json_mode,
+                timeout_ms,
+            ) in segment_lanes:
                 if lane_name == "json" and not json_lane_available:
                     continue
+                if (
+                    exact_key is not None
+                    and candidate_pages
+                    >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+                ):
+                    typed_lane_halted = True
+                    truncated = True
+                    break
                 try:
                     candidate_ids, segment_truncated, _ = self._candidate_ids(
                         projects,
@@ -1650,6 +1670,7 @@ class AttributeReadSelector:
                         candidate_limit=ATTRIBUTE_READ_CANDIDATE_LIMIT,
                         query_timeout_ms=timeout_ms,
                     )
+                    candidate_pages += 1
                     rows = self._verify_latest(
                         sql=replay_sql,
                         project_ids=projects,
@@ -1688,7 +1709,11 @@ class AttributeReadSelector:
                     exact_found = True
                     truncated = truncated or segment_truncated
                     break
-                elif segment_truncated:
+                elif segment_truncated and lane_name != "json":
+                    # Indexed typed candidates may page past stale versions.
+                    # Identity-only JSON candidates deliberately get one
+                    # bounded sample per temporal segment; continuing them
+                    # cannot prove absence and recreates the production scan.
                     fallback_states.append(
                         {
                             "lane_name": lane_name,
@@ -1716,15 +1741,17 @@ class AttributeReadSelector:
                 truncated = True
                 break
 
-        # Restart stale-only exact probes from a deterministic ordered first
-        # page, then keyset-page them. The unordered/storage-order cursor is
-        # deliberately never reused as an ordered cursor.
+        # Restart stale-only typed exact probes from a deterministic ordered
+        # first page, then keyset-page them. The unordered/storage-order cursor
+        # is deliberately never reused as an ordered cursor. JSON seeds never
+        # enter this continuation phase.
         ordered_pages = 0
         while (
             exact_key is not None
             and not exact_found
             and not typed_lane_halted
             and ordered_pages < ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
+            and candidate_pages < ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
             and any(not state["complete"] for state in fallback_states)
         ):
             progressed = False
@@ -1732,6 +1759,9 @@ class AttributeReadSelector:
                 if state["complete"]:
                     continue
                 if ordered_pages >= ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT:
+                    break
+                if candidate_pages >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT:
+                    truncated = True
                     break
                 if state["lane_name"] == "json" and not json_lane_available:
                     state["complete"] = True
@@ -1747,6 +1777,7 @@ class AttributeReadSelector:
                         candidate_limit=ATTRIBUTE_READ_CANDIDATE_LIMIT,
                         query_timeout_ms=state["timeout_ms"],
                     )
+                    candidate_pages += 1
                     rows = self._verify_latest(
                         sql=state["replay_sql"],
                         project_ids=projects,
@@ -1801,6 +1832,66 @@ class AttributeReadSelector:
         ):
             truncated = True
 
+        # JSON overflow is deliberately last for exact lookups. Its raw
+        # identity seed has no key index, gets no continuation, and may consume
+        # only pages left after typed probes and typed keyset continuation.
+        if (
+            exact_key is not None
+            and not exact_found
+            and not typed_lane_halted
+            and json_lane_available
+            and len(lanes) > 1
+        ):
+            (
+                lane_name,
+                predicate,
+                replay_sql,
+                json_mode,
+                timeout_ms,
+            ) = lanes[1]
+            for segment in windows:
+                if candidate_pages >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT:
+                    truncated = True
+                    break
+                try:
+                    candidate_ids, segment_truncated, _ = self._candidate_ids(
+                        projects,
+                        segment,
+                        predicate=predicate,
+                        attribute_key=exact_key,
+                        candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
+                        query_timeout_ms=timeout_ms,
+                        candidate_query_settings=_JSON_VALUE_CANDIDATE_SETTINGS,
+                    )
+                    candidate_pages += 1
+                    rows = self._verify_latest(
+                        sql=replay_sql,
+                        project_ids=projects,
+                        candidate_ids=candidate_ids,
+                        attribute_key=exact_key,
+                        query_timeout_ms=timeout_ms,
+                    )
+                except Exception as exc:
+                    if isinstance(exc, AttributeReadQueryLimitExceeded) or (
+                        is_read_budget_error(exc)
+                    ):
+                        # A finite JSON sample cannot prove absence. Publish an
+                        # explicit sample instead of converting its independent
+                        # short-lane ceiling into an indexed typed-key failure.
+                        truncated = True
+                        if not budget_warning_emitted:
+                            self._warn_partial_budget("discover_keys")
+                            budget_warning_emitted = True
+                        break
+                    raise
+
+                covered_start = min(covered_start, segment[0])
+                lane_found = consume_rows(rows, json_mode=json_mode)
+                truncated = truncated or segment_truncated
+                if lane_found:
+                    exact_found = True
+                    break
+
         counts: Counter[tuple[str, AttributeType]] = Counter()
         key_totals: Counter[str] = Counter()
         for keys in latest_keys.values():
@@ -1851,7 +1942,9 @@ class AttributeReadSelector:
                     else None
                 ),
                 sampled=(
-                    effective_truncated and not effective_budget_exceeded and bool(rows)
+                    effective_truncated
+                    and not effective_budget_exceeded
+                    and (bool(rows) or exact_key is not None)
                 ),
                 window_start=covered_start,
                 window_end=overall_end,

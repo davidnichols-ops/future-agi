@@ -161,9 +161,18 @@ class AnalyticsQueryService:
     ) -> QueryResult:
         """Execute a query on ClickHouse and return QueryResult."""
         start = time.monotonic()
-        rows, columns, qt = self.ch_client.execute_read(
-            query, params or {}, timeout_ms=timeout_ms, settings=settings
-        )
+        try:
+            rows, columns, qt = self.ch_client.execute_read(
+                query, params or {}, timeout_ms=timeout_ms, settings=settings
+            )
+        except TimeoutError as exc:
+            # Some native-driver wrappers surface socket/read deadlines as the
+            # built-in timeout type. Normalize only at this ClickHouse boundary;
+            # the shared classifier deliberately rejects arbitrary application
+            # TimeoutError instances.
+            if isinstance(exc, ReadDeadlineExceeded):
+                raise
+            raise ReadDeadlineExceeded("ClickHouse query timed out") from exc
         elapsed = (time.monotonic() - start) * 1000
 
         col_names = [c[0] if isinstance(c, tuple) else c for c in columns]

@@ -1,4 +1,4 @@
-"""Runtime/OpenAPI parity for span-attribute discovery responses."""
+"""Runtime/OpenAPI parity for attribute-discovery response values."""
 
 import json
 from pathlib import Path
@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from tfc.utils.serializer_fields import JsonValueField
+from tracer.serializers.dashboard import DashboardFilterValueOptionSerializer
 from tracer.serializers.observation_span import (
     ObservationAttributeListResponseSerializer,
 )
@@ -67,11 +68,12 @@ def test_attribute_query_status_enum_is_declared_for_openapi(serializer_cls):
 @pytest.mark.parametrize(
     ("serializer_cls", "definition_name"),
     (
+        (DashboardFilterValueOptionSerializer, "DashboardFilterValueOption"),
         (SpanAttributeValueSerializer, "SpanAttributeValue"),
         (SpanAttributeTopValueSerializer, "SpanAttributeTopValue"),
     ),
 )
-def test_span_attribute_json_values_match_generated_openapi(
+def test_attribute_picker_json_values_match_generated_openapi(
     serializer_cls, definition_name
 ):
     field = serializer_cls().fields["value"]

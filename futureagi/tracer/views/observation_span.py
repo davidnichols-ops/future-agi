@@ -2941,7 +2941,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 exact_key=exact_key,
             )
             if not self._attribute_metadata_allows_success(
-                metadata, has_verified_results=bool(keys)
+                metadata,
+                has_verified_results=bool(keys),
+                allow_empty_sample=exact_key is not None,
             ):
                 return self._attribute_read_unavailable_response()
             return self._attribute_list_response(keys, metadata)
@@ -3021,6 +3023,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             if not self._attribute_metadata_allows_success(
                 discovery_metadata,
                 has_verified_results=bool(span_attribute_keys),
+                allow_empty_sample=exact_key is not None,
             ):
                 return self._attribute_read_unavailable_response()
             if row_type in ("spans", "voiceCalls"):
@@ -3105,11 +3108,12 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         metadata: AttributeReadMetadata,
         *,
         has_verified_results: bool,
+        allow_empty_sample: bool = False,
     ) -> bool:
         """Accept exact reads or an explicitly labelled finite-cap sample only."""
 
         return metadata.query_complete or (
-            has_verified_results
+            (has_verified_results or allow_empty_sample)
             and metadata.query_status == "sampled"
             and metadata.query_error_code == "sample_limit"
         )

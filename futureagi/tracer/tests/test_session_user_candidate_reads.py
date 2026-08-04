@@ -202,6 +202,8 @@ def test_attribute_bulk_filter_uses_bounded_seed_and_latest_candidate_classifier
     assert seed_params["filter_seed_limit"] == 200
     assert "SELECT session_id, start_time" in seed_sql
     assert "LIMIT %(filter_seed_limit)s" in seed_sql
+    assert "trace_session_id_remap" not in seed_sql
+    assert " FINAL" not in seed_sql
     assert "argMax(is_deleted, _version) AS latest_is_deleted" in match_sql
     assert "argMax(mapContains(attrs_string" in match_sql
     assert "latest_attr_value_0" in match_sql
@@ -216,9 +218,237 @@ def test_attribute_bulk_filter_uses_bounded_seed_and_latest_candidate_classifier
     # and matching-root ordering retain the existing classifier semantics.
     assert "latest_attr_exists_0 AND" in match_sql
     assert "min(start_time) AS session_start" in match_sql
-    assert "candidate_filter_session_ids" in match_sql
+    assert "candidate_filter_session_id_array" in match_sql
     assert match_params["candidate_filter_session_ids"] == (session_id,)
+    assert match_params["candidate_filter_session_id_array"] == [session_id]
+    assert "candidate_filter_sessions AS" in match_sql
+    assert "candidate_raw_session_id = candidate_ts_remap.any_id" in match_sql
+    assert "SELECT session_id FROM candidate_filter_sessions" in match_sql
+    assert "WHERE survivor_id IN (" in match_sql
     assert "rejected" in match_params.values()
+
+
+@pytest.mark.unit
+def test_raw_new_session_seed_classifier_expands_group_and_keeps_all_filters():
+    now = datetime(2026, 7, 31, 12, 0)
+    new_session_id = str(uuid.uuid4())
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            *_window(now),
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rejected",
+                },
+            },
+            {
+                "column_id": "customer.region",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "US",
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+    )
+
+    seed_sql, seed_params = builder.build_filter_seed_page(
+        slice_start=now - timedelta(minutes=5),
+        slice_end=now,
+        limit=200,
+    )
+    match_sql, match_params = builder.build_filter_match_query([new_session_id])
+
+    # The per-slice query is a raw superset: no remap FINAL can repeat for
+    # every empty/adjacent slice. Only one safe witness narrows the seed.
+    assert "trace_session_id_remap" not in seed_sql
+    assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in seed_sql
+    assert "latest_filter_key_1" not in seed_params
+
+    # Exact classification resolves a raw new/old candidate to its survivor,
+    # expands that survivor back to every group member, and evaluates both
+    # customer filters against latest state before returning the canonical ID.
+    assert "trace_session_id_remap FINAL" in match_sql
+    assert "argMin(old_id, toString(old_id)) OVER" not in match_sql
+    assert match_sql.count("FROM trace_session_id_remap FINAL") == 2
+    assert "PREWHERE old_id IN (" in match_sql
+    assert "WHERE new_id IN (" in match_sql
+    assert "AS Array(UUID)" in match_sql
+    assert "candidate_filter_sessions AS" in match_sql
+    assert "candidate_raw_session_id = candidate_ts_remap.any_id" in match_sql
+    assert "SELECT any_id" in match_sql
+    assert "SELECT session_id FROM candidate_filter_sessions" in match_sql
+    assert "latest_attr_exists_0 AND" in match_sql
+    assert "latest_attr_exists_1 AND" in match_sql
+    assert match_params["candidate_filter_session_id_array"] == [new_session_id]
+    assert match_params["latest_filter_param_0"] == "rejected"
+    assert match_params["latest_filter_param_1"] == "us"
+
+
+class _RawAliasSessionBuilder:
+    def __init__(self, rows, canonical_rows, *, start, end):
+        self.rows = rows
+        self.canonical_rows = canonical_rows
+        self.start = start
+        self.end = end
+
+    def parse_time_range(self, _filters):
+        return self.start, self.end
+
+    @staticmethod
+    def filter_seed_proves_result_order():
+        return True
+
+    @staticmethod
+    def recommended_filter_classify_batch_size():
+        return 2
+
+    def build_filter_seed_page(
+        self,
+        *,
+        slice_start,
+        slice_end,
+        limit,
+        before_start_time=None,
+        before_id=None,
+    ):
+        return "seed", {
+            "slice_start": slice_start,
+            "slice_end": slice_end,
+            "limit": limit,
+            "before_start_time": before_start_time,
+            "before_id": before_id,
+        }
+
+    @staticmethod
+    def build_filter_match_query(candidate_ids):
+        return "match", {"candidate_ids": tuple(candidate_ids)}
+
+
+class _RawAliasSessionExecutor:
+    def __init__(self, builder):
+        self.builder = builder
+        self.calls = []
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.calls.append((query, params))
+        if query == "seed":
+            rows = [
+                row
+                for row in self.builder.rows
+                if params["slice_start"] <= row["start_time"] < params["slice_end"]
+            ]
+            before = params["before_start_time"]
+            if before is not None:
+                boundary = (before, str(params["before_id"]))
+                rows = [
+                    row
+                    for row in rows
+                    if (row["start_time"], str(row["session_id"])) < boundary
+                ]
+            rows = sorted(
+                rows,
+                key=lambda row: (row["start_time"], str(row["session_id"])),
+                reverse=True,
+            )[: params["limit"]]
+        else:
+            rows_by_canonical = {}
+            for raw_id in params["candidate_ids"]:
+                row = self.builder.canonical_rows.get(raw_id)
+                if row is not None:
+                    rows_by_canonical[row["session_id"]] = row
+            rows = list(rows_by_canonical.values())
+        return SimpleNamespace(data=rows)
+
+
+@pytest.mark.unit
+def test_raw_alias_duplicates_keep_page_one_and_page_n_disjoint():
+    end = datetime(2026, 7, 31, 12, 0)
+    start = end - timedelta(hours=1)
+    canonical = {
+        "new-a": {"session_id": "old-a", "start_time": end - timedelta(minutes=1)},
+        "old-a": {"session_id": "old-a", "start_time": end - timedelta(minutes=1)},
+        "session-b": {
+            "session_id": "session-b",
+            "start_time": end - timedelta(minutes=2),
+        },
+        "session-c": {
+            "session_id": "session-c",
+            "start_time": end - timedelta(minutes=3),
+        },
+        "session-d": {
+            "session_id": "session-d",
+            "start_time": end - timedelta(minutes=4),
+        },
+    }
+    builder = _RawAliasSessionBuilder(
+        [
+            {"session_id": "new-a", "start_time": end - timedelta(seconds=30)},
+            *canonical.values(),
+        ],
+        canonical,
+        start=start,
+        end=end,
+    )
+
+    pages = []
+    for page_number in (0, 1):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=_RawAliasSessionExecutor(builder),
+            filters=_window(end),
+            key_field="session_id",
+            page_number=page_number,
+            page_size=2,
+            deadline_ms=5_000,
+            max_candidates=200,
+        )
+        assert page.complete is True
+        pages.append([row["session_id"] for row in page.rows])
+
+    assert pages == [["old-a", "session-b"], ["session-c", "session-d"]]
+    assert set(pages[0]).isdisjoint(pages[1])
+
+
+@pytest.mark.unit
+def test_raw_session_seed_crosses_empty_recent_slices_to_late_match():
+    end = datetime(2026, 7, 31, 12, 0)
+    start = end - timedelta(days=365)
+    late = {"session_id": "late-session", "start_time": start + timedelta(days=20)}
+    builder = _RawAliasSessionBuilder(
+        [late],
+        {"late-session": late},
+        start=start,
+        end=end,
+    )
+    executor = _RawAliasSessionExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=_window(end),
+        key_field="session_id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        max_candidates=200,
+    )
+
+    seed_calls = [params for query, params in executor.calls if query == "seed"]
+    assert page.complete is True
+    assert [row["session_id"] for row in page.rows] == ["late-session"]
+    assert len(seed_calls) > 1
+    assert seed_calls[-1]["slice_start"] == start
+    assert all(
+        newer["slice_start"] == older["slice_end"]
+        for newer, older in zip(seed_calls, seed_calls[1:], strict=False)
+    )
 
 
 @pytest.mark.unit
@@ -270,9 +500,12 @@ def test_negated_end_user_bulk_filter_is_candidate_session_scoped():
 
     assert builder.supports_bounded_filter_scan() is True
     assert params["candidate_filter_session_ids"] == (session_id,)
+    assert params["candidate_filter_session_id_array"] == [session_id]
     assert params["eu_remap_1"] == (end_user_id,)
     assert "end_user_id NOT IN %(eu_remap_1)s" in sql
-    assert "trace_session_id IN %(candidate_filter_session_ids)s" in sql
+    assert "candidate_filter_sessions AS" in sql
+    assert sql.count("SELECT session_id FROM candidate_filter_sessions") >= 2
+    assert "WHERE survivor_id IN (" in sql
     assert "session_id IN (SELECT session_id FROM matching_user_sessions)" in sql
 
 
@@ -418,8 +651,7 @@ def test_session_page_enrichments_replay_tombstones_and_resolve_remaps():
         assert "(parent_span_id IS NULL OR parent_span_id = '')" in candidate_sql
         assert "trace_session_id_remap" in sql
         assert (
-            "argMax(tuple(parent_span_id), _version).1 AS latest_parent_span_id"
-            in sql
+            "argMax(tuple(parent_span_id), _version).1 AS latest_parent_span_id" in sql
         )
         assert "argMax(is_deleted, _version) AS latest_is_deleted" in sql
         assert "latest_is_deleted = 0" in sql
@@ -962,9 +1194,12 @@ def test_candidate_reads_on_ch25_preserve_remap_and_tombstone_semantics():
         seed_sql, seed_params, with_column_types=True
     )
     seed_rows = _dict_rows(seed_raw, seed_columns)
-    assert [str(row["session_id"]) for row in seed_rows] == [old_session_id]
+    # The old physical root is tombstoned, so the raw live-row seed exposes
+    # only the deterministic new alias. The finite classifier below must still
+    # expand that alias's remap group and return the canonical old survivor.
+    assert {str(row["session_id"]) for row in seed_rows} == {new_session_id}
     match_sql, match_params = attribute_builder.build_filter_match_query(
-        [old_session_id]
+        [new_session_id]
     )
     match_raw = client.execute(match_sql, match_params)
     assert len(match_raw) == 1

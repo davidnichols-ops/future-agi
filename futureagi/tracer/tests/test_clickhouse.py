@@ -3967,6 +3967,25 @@ class TestAnalyticsQueryService:
         assert result.data[1]["count"] == 200
         assert result.query_time_ms == 42.0
 
+    def test_execute_query_normalizes_builtin_driver_timeout(self):
+        from tracer.services.clickhouse.query_service import AnalyticsQueryService
+        from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+
+        class TimeoutClient:
+            def execute_read(self, query, params, *, timeout_ms, settings):
+                raise TimeoutError("private ClickHouse driver timeout detail")
+
+        service = AnalyticsQueryService()
+        service._ch_client = TimeoutClient()
+
+        with pytest.raises(ReadDeadlineExceeded, match="ClickHouse query timed out"):
+            service.execute_ch_query(
+                "SELECT 1",
+                {},
+                timeout_ms=100,
+                settings={"max_threads": 1},
+            )
+
     def test_query_type_enum_values(self):
         """QueryType should have all expected query types."""
         from tracer.services.clickhouse.query_service import QueryType

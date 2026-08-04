@@ -93260,7 +93260,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "value": {
           "title": "Value",
           "type": "object",
-          "x-nullable": true
+          "x-nullable": true,
+          "x-json-value": true,
+          "description": "Any valid JSON value."
         },
         "label": {
           "title": "Label",

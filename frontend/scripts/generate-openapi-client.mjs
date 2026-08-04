@@ -310,6 +310,18 @@ export type SpanAttributeValueApiValue = { [key: string]: unknown };`,
 export type SpanAttributeValueApiValue = SpanAttributeJsonValueApi;`,
       "SpanAttributeValueApiValue → recursive JSON value",
     );
+    schemas = assertReplace(
+      schemas,
+      `/**
+ * Any valid JSON value.
+ */
+export type DashboardFilterValueOptionApiValue = { [key: string]: unknown };`,
+      `/**
+ * Any valid JSON value.
+ */
+export type DashboardFilterValueOptionApiValue = SpanAttributeJsonValueApi;`,
+      "DashboardFilterValueOptionApiValue → recursive JSON value",
+    );
 
     fs.writeFileSync(schemasOutputPath, schemas);
   }
@@ -354,6 +366,12 @@ export const ApiTracesSpanAttributeDetailListResponse = zod.object({`,
       /(export const ApiTracesSpanAttributeValuesListResponse = zod\.object\(\{[\s\S]*?"result": zod\.array\(zod\.object\(\{\n  "value": )zod\.object\(\{\n\n\}\)\.passthrough\(\)\.describe\('Any valid JSON value\.'\),/,
       "$1spanAttributeJsonValueSchema,",
       "SpanAttributeValue zod value → recursive JSON value",
+    );
+    zod = assertReplaceRegex(
+      zod,
+      /(export const TracerDashboardFilterValuesResponse = zod\.object\(\{[\s\S]*?"values": zod\.array\(zod\.object\(\{\n  "value": )zod\.object\(\{\n\n\}\)\.passthrough\(\)\.describe\('Any valid JSON value\.'\),/,
+      "$1spanAttributeJsonValueSchema,",
+      "DashboardFilterValueOption zod value → recursive JSON value",
     );
 
     // x-string-or-array: orval generates zod.object({}).passthrough() for these

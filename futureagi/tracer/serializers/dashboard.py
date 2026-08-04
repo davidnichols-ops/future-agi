@@ -469,7 +469,7 @@ class DashboardFilterValueOptionSerializer(serializers.Serializer):
     member cannot be mistaken for a typed-Map text value by API consumers.
     """
 
-    value = serializers.JSONField(allow_null=True)
+    value = JsonValueField(allow_null=True)
     label = serializers.CharField()
     type = serializers.ChoiceField(
         choices=["string", "number", "boolean", "array"],

@@ -34361,9 +34361,7 @@ export const TracerDashboardFilterValuesResponse = zod.object({
   "status": zod.boolean().default(tracerDashboardFilterValuesResponseStatusDefault),
   "result": zod.object({
   "values": zod.array(zod.object({
-  "value": zod.object({
-
-}).passthrough(),
+  "value": spanAttributeJsonValueSchema,
   "label": zod.string().min(1),
   "type": zod.enum(['string', 'number', 'boolean', 'array']).optional(),
   "name": zod.string().min(1).optional(),

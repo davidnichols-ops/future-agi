@@ -350,7 +350,6 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         if candidate_full_state and not candidate_session_ids:
             raise ValueError("full-state session scan requires bounded candidates")
 
-        ts_map = survivor_map_subquery("trace_session_id_remap")
         resolved_session = resolved_id_expr("latest_trace_session_id", "ts_remap")
         resolved_session_clause = build_session_id_filter_clause(
             self.filters,
@@ -493,16 +492,85 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             self._SESSION_ID_FILTER_COLS
         )
         seed_session_ids = candidate_session_ids or positive_session_ids
+        ts_map = survivor_map_subquery("trace_session_id_remap")
+        candidate_session_cte = ""
         root_session_seed = ""
         if seed_session_ids:
             params["candidate_filter_session_ids"] = seed_session_ids
+            params["candidate_filter_session_id_array"] = list(seed_session_ids)
+            # A seed may carry any member of a consolidation group: its
+            # survivor old ID, a non-survivor old ID, or the deterministic new
+            # ID. Resolve only the finite input set to target new-ID groups,
+            # then expand those groups once. This preserves the exact
+            # many-old→one-new survivor rule without rebuilding the 1M+ row
+            # global survivor map in every classifier batch.
+            ts_map = """
+            WITH
+            candidate_filter_ids AS (
+                SELECT arrayJoin(
+                    CAST(%(candidate_filter_session_id_array)s AS Array(UUID))
+                ) AS candidate_id
+            ),
+            candidate_target_new_ids AS (
+                SELECT DISTINCT new_id
+                FROM trace_session_id_remap FINAL
+                PREWHERE old_id IN (
+                    SELECT candidate_id FROM candidate_filter_ids
+                )
+                UNION DISTINCT
+                SELECT candidate_id AS new_id
+                FROM candidate_filter_ids
+            ),
+            candidate_remap_rows AS (
+                SELECT old_id, new_id
+                FROM trace_session_id_remap FINAL
+                WHERE new_id IN (
+                    SELECT new_id FROM candidate_target_new_ids
+                )
+            ),
+            candidate_remap_groups AS (
+                SELECT
+                    new_id,
+                    argMin(old_id, toString(old_id)) AS survivor_id
+                FROM candidate_remap_rows
+                GROUP BY new_id
+            )
+            SELECT any_id, min(survivor_id) AS survivor_id
+            FROM (
+                SELECT rows.old_id AS any_id, groups.survivor_id AS survivor_id
+                FROM candidate_remap_rows AS rows
+                INNER JOIN candidate_remap_groups AS groups USING (new_id)
+                UNION ALL
+                SELECT new_id AS any_id, survivor_id
+                FROM candidate_remap_groups
+            )
+            GROUP BY any_id
+            """
+            resolved_candidate_session = resolved_id_expr(
+                "candidate_raw_session_id", "candidate_ts_remap"
+            )
+            candidate_session_cte = f""",
+        candidate_filter_sessions AS (
+            SELECT DISTINCT {resolved_candidate_session} AS session_id
+            FROM (
+                SELECT arrayJoin(
+                    CAST(%(candidate_filter_session_id_array)s AS Array(UUID))
+                ) AS candidate_raw_session_id
+            ) AS candidate_raw_sessions
+            LEFT JOIN ts_survivor_map AS candidate_ts_remap
+                ON candidate_raw_session_id = candidate_ts_remap.any_id
+        )"""
             root_session_seed = """
               AND (
-                  trace_session_id IN %(candidate_filter_session_ids)s
+                  trace_session_id IN (
+                      SELECT session_id FROM candidate_filter_sessions
+                  )
                   OR trace_session_id IN (
                       SELECT any_id
                       FROM ts_survivor_map
-                      WHERE survivor_id IN %(candidate_filter_session_ids)s
+                      WHERE survivor_id IN (
+                          SELECT session_id FROM candidate_filter_sessions
+                      )
                   )
               )
             """
@@ -555,11 +623,15 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             if candidate_session_ids:
                 user_seed_clause = """
               AND (
-                  trace_session_id IN %(candidate_filter_session_ids)s
+                  trace_session_id IN (
+                      SELECT session_id FROM candidate_filter_sessions
+                  )
                   OR trace_session_id IN (
                       SELECT any_id
                       FROM ts_survivor_map
-                      WHERE survivor_id IN %(candidate_filter_session_ids)s
+                      WHERE survivor_id IN (
+                          SELECT session_id FROM candidate_filter_sessions
+                      )
                   )
               )
                 """
@@ -639,6 +711,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         )
         return f"""
         ts_survivor_map AS ({ts_map})
+        {candidate_session_cte}
         {eu_map_cte},
         candidate_root_identities AS (
             SELECT DISTINCT project_id, trace_id, id, start_time
@@ -715,10 +788,13 @@ class SessionListQueryBuilder(BaseQueryBuilder):
 
         if not self.supports_bounded_filter_scan():
             raise ValueError("unsupported bounded session filter scan")
-        # Seed rows contain only the remap-resolved identity/order tuple. Eval
-        # population proofs may acquire the shared 512-row working set, while
-        # callers split exact latest-state replay using the smaller recommended
-        # classifier batch.
+        # Seed rows contain only an identity/order tuple. Normal list reads use
+        # raw session IDs so every adjacent slice avoids a broad FINAL remap;
+        # the finite classifier resolves each raw ID to its survivor and expands
+        # the complete consolidation group exactly once. Eval sampling retains
+        # its canonical-ID hash contract below. Population proofs may acquire
+        # the shared 512-row working set, while callers split exact latest-state
+        # replay using the smaller recommended classifier batch.
         if limit <= 0 or limit > 512:
             raise ValueError("session seed limit must be between 1 and 512")
         if (before_start_time is None) != (before_id is None):
@@ -760,6 +836,13 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 param_prefix="session_seed_time_exclusion",
             )
         )
+        # The helper deliberately accepts only a bare identifier. Qualify its
+        # trusted output at the call site so ClickHouse's analyzer cannot
+        # substitute the outer ``max(...) AS start_time`` aggregate alias back
+        # into this physical-row predicate.
+        datetime_predicate = datetime_predicate.replace(
+            "start_time", "seed_spans.start_time"
+        )
         params.update(datetime_params)
         datetime_fragment = (
             f"\n                  AND {datetime_predicate}"
@@ -788,31 +871,50 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             f"WHERE {' AND '.join(outer_predicates)}" if outer_predicates else ""
         )
 
-        ts_map = survivor_map_subquery("trace_session_id_remap")
-        resolved_session = resolved_id_expr("raw_trace_session_id", "seed_ts_remap")
-        query = f"""
-        WITH
-        ts_survivor_map AS ({ts_map}),
-        seed_sessions AS (
+        seed_source = f"""
+            SELECT
+                seed_spans.trace_session_id AS session_id,
+                max(seed_spans.start_time) AS start_time
+            FROM {self.TABLE} AS seed_spans
+            PREWHERE {self.project_filter_sql()}
+              AND seed_spans._peerdb_is_deleted = 0
+              AND seed_spans.start_time >= %(filter_slice_start)s
+              AND seed_spans.start_time < %(filter_slice_end)s{datetime_fragment}
+            WHERE (seed_spans.parent_span_id IS NULL OR seed_spans.parent_span_id = '')
+              AND isNotNull(seed_spans.trace_session_id)
+              AND seed_spans.trace_session_id != toUUID('{NIL_UUID}'){root_witness_clause}
+            GROUP BY seed_spans.trace_session_id
+        """
+        if self._bounded_sampling_rate is not None:
+            # Sampling is defined on the canonical public session ID. Keep the
+            # pre-existing remap only for this internal sampled lane; moving the
+            # hash to raw aliases would change which straddlers are selected.
+            ts_map = survivor_map_subquery("trace_session_id_remap")
+            resolved_session = resolved_id_expr("raw_trace_session_id", "seed_ts_remap")
+            seed_source = f"""
             SELECT
                 {resolved_session} AS session_id,
                 max(start_time) AS start_time
             FROM (
                 SELECT
-                    trace_session_id AS raw_trace_session_id,
-                    start_time
-                FROM {self.TABLE}
+                    seed_spans.trace_session_id AS raw_trace_session_id,
+                    seed_spans.start_time AS start_time
+                FROM {self.TABLE} AS seed_spans
                 PREWHERE {self.project_filter_sql()}
-                  AND _peerdb_is_deleted = 0
-                  AND start_time >= %(filter_slice_start)s
-                  AND start_time < %(filter_slice_end)s{datetime_fragment}
-                WHERE (parent_span_id IS NULL OR parent_span_id = '')
-                  AND isNotNull(trace_session_id)
-                  AND trace_session_id != toUUID('{NIL_UUID}'){root_witness_clause}
+                  AND seed_spans._peerdb_is_deleted = 0
+                  AND seed_spans.start_time >= %(filter_slice_start)s
+                  AND seed_spans.start_time < %(filter_slice_end)s{datetime_fragment}
+                WHERE (seed_spans.parent_span_id IS NULL OR seed_spans.parent_span_id = '')
+                  AND isNotNull(seed_spans.trace_session_id)
+                  AND seed_spans.trace_session_id != toUUID('{NIL_UUID}'){root_witness_clause}
             ) AS raw_roots
-            LEFT JOIN ts_survivor_map AS seed_ts_remap
+            LEFT JOIN ({ts_map}) AS seed_ts_remap
                 ON raw_trace_session_id = seed_ts_remap.any_id
             GROUP BY session_id
+            """
+        query = f"""
+        WITH seed_sessions AS (
+            {seed_source}
         )
         SELECT session_id, start_time
         FROM seed_sessions

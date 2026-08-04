@@ -624,4 +624,34 @@ describe("OpenAPI runtime contract", () => {
       }),
     ).toMatchObject({ ok: true });
   });
+
+  it("accepts every JSON value shape in dashboard filter-picker options", () => {
+    expect(
+      OPENAPI_CONTRACT.definitions.DashboardFilterValueOption.properties.value[
+        "x-json-value"
+      ],
+    ).toBe(true);
+
+    expect(
+      validateContractedResponse({
+        status: 200,
+        config: {
+          url: "/tracer/dashboard/filter_values/?metric_name=final_status",
+          method: "get",
+        },
+        data: {
+          status: true,
+          result: {
+            values: [
+              { value: "Rechazado", label: "Rechazado" },
+              { value: 7, label: "7" },
+              { value: false, label: "false" },
+              { value: ["nested", 1], label: "nested array" },
+              { value: { nested: true }, label: "nested object" },
+            ],
+          },
+        },
+      }),
+    ).toMatchObject({ ok: true });
+  });
 });

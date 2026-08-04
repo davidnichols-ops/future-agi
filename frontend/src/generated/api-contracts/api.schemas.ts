@@ -18582,9 +18582,13 @@ export const DashboardFilterValueOptionApiType = {
   array: 'array',
 } as const;
 
-export type DashboardFilterValueOptionApiValue = { [key: string]: unknown };
+/**
+ * Any valid JSON value.
+ */
+export type DashboardFilterValueOptionApiValue = SpanAttributeJsonValueApi;
 
 export interface DashboardFilterValueOptionApi {
+  /** Any valid JSON value. */
   value: DashboardFilterValueOptionApiValue;
   /** @minLength 1 */
   label: string;

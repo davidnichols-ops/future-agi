@@ -765,7 +765,7 @@ def test_exact_key_continuation_stops_at_hard_page_cap_and_degrades() -> None:
 
     assert read.rows == ()
     assert read.metadata.query_complete is False
-    assert read.metadata.query_status == "degraded"
+    assert read.metadata.query_status == "sampled"
     assert read.metadata.query_error_code == "sample_limit"
     assert candidate_page == (
         len(adaptive_attribute_windows(NOW))
@@ -844,6 +844,132 @@ def test_exact_key_page_cap_is_global_across_horizon_bands() -> None:
     assert sum("LIMIT 1 BY" in call.sql for call in candidate_calls) == (
         ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
     )
+
+
+def test_json_enabled_adaptive_exact_key_runs_typed_continuation_before_json():
+    starts_by_id: dict[str, datetime] = {}
+    live_id = "adaptive-live-final-status"
+    continuation_calls = 0
+
+    def respond(call, _):
+        nonlocal continuation_calls
+        if "segment_start" in call.params:
+            if "mapKeys(attrs_string)" not in call.sql:
+                pytest.fail("JSON sampling ran before typed continuation completed")
+            if "LIMIT 1 BY" in call.sql:
+                continuation_calls += 1
+                if continuation_calls == ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT:
+                    row = _candidate(
+                        PROJECT_A,
+                        live_id,
+                        start_time=call.params["segment_end"] - timedelta(minutes=1),
+                    )
+                    starts_by_id[live_id] = row["start_time"]
+                    return [row]
+                rows = [
+                    _candidate(
+                        PROJECT_A,
+                        f"adaptive-continuation-{continuation_calls:02d}-{index:04d}",
+                        start_time=call.params["segment_end"]
+                        - timedelta(minutes=continuation_calls, seconds=index + 1),
+                    )
+                    for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+                ]
+                starts_by_id.update((str(row["id"]), row["start_time"]) for row in rows)
+                return rows
+            rows = [
+                _candidate(
+                    PROJECT_A,
+                    f"adaptive-stale-{call.params['segment_start']:%j}-{index:04d}",
+                    start_time=call.params["segment_end"]
+                    - timedelta(seconds=index + 1),
+                )
+                for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+            ]
+            starts_by_id.update((str(row["id"]), row["start_time"]) for row in rows)
+            return rows
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                start_time=starts_by_id[span_id],
+                string="Rechazado" if span_id == live_id else None,
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).discover_keys(
+        [PROJECT_A], exact_key="final_status"
+    )
+
+    assert read.rows == (AttributeKeyRow("final_status", "string", 1),)
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert len(candidate_calls) == (
+        len(adaptive_attribute_windows(NOW))
+        + ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
+    )
+    assert sum("LIMIT 1 BY" in call.sql for call in candidate_calls) == (
+        ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
+    )
+    assert all("mapKeys(attrs_string)" in call.sql for call in candidate_calls)
+
+
+def test_explicit_fourteen_day_stale_typed_key_uses_last_page_before_json():
+    starts_by_id: dict[str, datetime] = {}
+    live_id = "explicit-live-final-status"
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            if "mapKeys(attrs_string)" not in call.sql:
+                pytest.fail("JSON sampling consumed the typed continuation page")
+            if "LIMIT 1 BY" in call.sql:
+                row = _candidate(
+                    PROJECT_A,
+                    live_id,
+                    start_time=call.params["segment_end"] - timedelta(minutes=1),
+                )
+                starts_by_id[live_id] = row["start_time"]
+                return [row]
+            rows = [
+                _candidate(
+                    PROJECT_A,
+                    f"explicit-stale-{call.params['segment_start']:%j}-{index:04d}",
+                    start_time=call.params["segment_end"]
+                    - timedelta(seconds=index + 1),
+                )
+                for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+            ]
+            starts_by_id.update((str(row["id"]), row["start_time"]) for row in rows)
+            return rows
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                start_time=starts_by_id[span_id],
+                string="Rechazado" if span_id == live_id else None,
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).discover_keys(
+        [PROJECT_A],
+        exact_key="final_status",
+        window_start=NOW - timedelta(days=14),
+        window_end=NOW,
+    )
+
+    assert read.rows == (AttributeKeyRow("final_status", "string", 1),)
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert len(candidate_calls) == ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+    assert sum("LIMIT 1 BY" in call.sql for call in candidate_calls) == 1
+    assert all("mapKeys(attrs_string)" in call.sql for call in candidate_calls)
+    assert read.metadata.query_count == ATTRIBUTE_READ_MAX_QUERY_COUNT
 
 
 def test_browse_inventory_stops_after_first_verified_dense_sample():
@@ -1251,7 +1377,7 @@ def test_exact_structured_json_key_is_not_reported_as_complete_empty():
         if "segment_start" in call.params:
             if (
                 call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]
-                or "JSONHas(attributes_extra" not in call.sql
+                or "mapKeys(attrs_string)" in call.sql
             ):
                 return []
             return [_candidate(PROJECT_A, "structured")]
@@ -1263,12 +1389,138 @@ def test_exact_structured_json_key_is_not_reported_as_complete_empty():
             )
         ]
 
-    selector = AttributeReadSelector(RecordingExecutor(respond), now=NOW)
+    executor = RecordingExecutor(respond)
+    selector = AttributeReadSelector(executor, now=NOW)
     key_read = selector.discover_keys([PROJECT_A], exact_key="structured")
 
     assert key_read.rows == ()
     assert key_read.metadata.query_complete is False
     assert key_read.metadata.query_error_code == "sample_limit"
+    json_seed = next(
+        call
+        for call in executor.calls
+        if "segment_start" in call.params and "mapKeys(attrs_string)" not in call.sql
+    )
+    assert "attributes_extra" not in json_seed.sql
+    assert "JSONHas(" not in json_seed.sql
+    assert json_seed.params["candidate_limit"] == (
+        ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1
+    )
+    assert json_seed.settings["max_bytes_to_read"] == 64 * 1024 * 1024
+    assert json_seed.settings["max_rows_to_read"] == 100_000
+
+
+def test_explicit_fourteen_day_exact_json_key_uses_one_bounded_identity_sample():
+    starts_by_id: dict[str, datetime] = {}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            if "mapKeys(attrs_string)" in call.sql:
+                return []
+            rows = [
+                _candidate(
+                    PROJECT_A,
+                    f"raw-json-{index}",
+                    start_time=call.params["segment_start"]
+                    + timedelta(seconds=index + 1),
+                )
+                for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
+            ]
+            starts_by_id.update((str(row["id"]), row["start_time"]) for row in rows)
+            return rows
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                start_time=starts_by_id[span_id],
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).discover_keys(
+        [PROJECT_A],
+        exact_key="absent_json_key",
+        window_start=NOW - timedelta(days=14),
+        window_end=NOW,
+    )
+
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    typed_calls = [
+        call for call in candidate_calls if "mapKeys(attrs_string)" in call.sql
+    ]
+    json_calls = [
+        call for call in candidate_calls if "mapKeys(attrs_string)" not in call.sql
+    ]
+    hydration_calls = [
+        call for call in executor.calls if "segment_start" not in call.params
+    ]
+
+    assert read.rows == ()
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
+    assert len(typed_calls) == 14
+    assert len(json_calls) == 1
+    assert len(candidate_calls) == ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+    assert len(hydration_calls) == 1
+    assert read.metadata.query_count == 16
+    assert all("attributes_extra" not in call.sql for call in candidate_calls)
+    assert all("JSONHas(" not in call.sql for call in candidate_calls)
+    assert json_calls[0].params["candidate_limit"] == (
+        ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1
+    )
+    assert json_calls[0].settings["max_bytes_to_read"] == 64 * 1024 * 1024
+    assert json_calls[0].settings["max_rows_to_read"] == 100_000
+    assert len(hydration_calls[0].params["candidate_ids_0"]) <= (
+        ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT
+    )
+
+
+def test_exact_json_key_read_budget_becomes_an_explicit_sample():
+    def respond(call, _):
+        if "segment_start" in call.params and "mapKeys(attrs_string)" not in call.sql:
+            return ReadDeadlineExceeded("private JSON identity timeout")
+        return []
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).discover_keys(
+        [PROJECT_A],
+        exact_key="rare_json_key",
+        horizon_days=7,
+    )
+
+    assert read.rows == ()
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
+    assert read.metadata.query_count == 2
+    json_call = executor.calls[-1]
+    assert "attributes_extra" not in json_call.sql
+    assert "JSONHas(" not in json_call.sql
+    assert json_call.timeout_ms <= 750
+    assert json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
+
+
+def test_exact_typed_key_read_budget_is_not_published_as_a_sample():
+    def respond(call, _):
+        if "segment_start" in call.params and "mapKeys(attrs_string)" in call.sql:
+            return ReadDeadlineExceeded("private typed identity timeout")
+        return []
+
+    executor = RecordingExecutor(respond)
+
+    with pytest.raises(ReadDeadlineExceeded, match="private typed identity timeout"):
+        AttributeReadSelector(executor, now=NOW).discover_keys(
+            [PROJECT_A],
+            exact_key="final_status",
+            horizon_days=7,
+        )
+
+    assert len(executor.calls) == 1
+    assert "mapKeys(attrs_string)" in executor.calls[0].sql
 
 
 def test_structured_json_value_picker_is_explicitly_degraded():
@@ -3213,7 +3465,7 @@ def test_observation_attribute_pickers_only_publish_labelled_samples(
         ),
     ],
 )
-def test_observation_attribute_pickers_reject_empty_sample_limit_results(
+def test_observation_attribute_pickers_publish_empty_labelled_exact_sample_results(
     monkeypatch, action_name, path
 ):
     from tracer.views.observation_span import ObservationSpanView
@@ -3223,7 +3475,55 @@ def test_observation_attribute_pickers_reject_empty_sample_limit_results(
         "discover_keys",
         lambda *_args, **_kwargs: AttributeKeyRead(
             (),
-            _metadata(complete=False, error_code="sample_limit"),
+            _metadata(complete=False, error_code="sample_limit", sampled=True),
+        ),
+    )
+    monkeypatch.setattr(
+        ObservationSpanView,
+        "_attribute_project_for_request",
+        staticmethod(lambda _request, _project_id: True),
+    )
+    request = _authenticated_get(
+        path,
+        {
+            "filters": json.dumps({"project_id": PROJECT_A}),
+            "q": "rare_json_key",
+        },
+    )
+
+    response = ObservationSpanView.as_view({"get": action_name})(request)
+
+    assert response.status_code == 200
+    assert response.data["result"] == []
+    assert response.data["query_complete"] is False
+    assert response.data["query_status"] == "sampled"
+    assert response.data["query_error_code"] == "sample_limit"
+
+
+@pytest.mark.parametrize(
+    ("action_name", "path"),
+    [
+        (
+            "get_span_attributes_list",
+            "/tracer/observation-span/get_span_attributes_list/",
+        ),
+        (
+            "get_eval_attributes_list",
+            "/tracer/observation-span/get_eval_attributes_list/",
+        ),
+    ],
+)
+def test_observation_attribute_pickers_reject_empty_generic_sample_results(
+    monkeypatch, action_name, path
+):
+    from tracer.views.observation_span import ObservationSpanView
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "discover_keys",
+        lambda *_args, **_kwargs: AttributeKeyRead(
+            (),
+            _metadata(complete=False, error_code="sample_limit", sampled=True),
         ),
     )
     monkeypatch.setattr(
@@ -3240,7 +3540,50 @@ def test_observation_attribute_pickers_reject_empty_sample_limit_results(
 
     assert response.status_code == 503
     assert "temporarily unavailable" in json.dumps(response.data)
-    assert "sample_limit" not in json.dumps(response.data)
+
+
+@pytest.mark.parametrize(
+    ("action_name", "path"),
+    [
+        (
+            "get_span_attributes_list",
+            "/tracer/observation-span/get_span_attributes_list/",
+        ),
+        (
+            "get_eval_attributes_list",
+            "/tracer/observation-span/get_eval_attributes_list/",
+        ),
+    ],
+)
+def test_observation_attribute_pickers_reject_empty_read_budget_results(
+    monkeypatch, action_name, path
+):
+    from tracer.views.observation_span import ObservationSpanView
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "discover_keys",
+        lambda *_args, **_kwargs: AttributeKeyRead(
+            (),
+            _metadata(complete=False, error_code="read_budget_exceeded"),
+        ),
+    )
+    monkeypatch.setattr(
+        ObservationSpanView,
+        "_attribute_project_for_request",
+        staticmethod(lambda _request, _project_id: True),
+    )
+    request = _authenticated_get(
+        path,
+        {"filters": json.dumps({"project_id": PROJECT_A})},
+    )
+
+    response = ObservationSpanView.as_view({"get": action_name})(request)
+
+    assert response.status_code == 503
+    payload = json.dumps(response.data)
+    assert "temporarily unavailable" in payload
+    assert "read_budget_exceeded" not in payload
 
 
 def test_span_attribute_ownership_gate_precedes_any_ch_read(monkeypatch):
