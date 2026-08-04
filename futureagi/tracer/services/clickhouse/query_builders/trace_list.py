@@ -15,7 +15,7 @@ The two result sets are merged in Python.
 
 import math
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from tracer.services.clickhouse.eval_logger_table import (
@@ -418,12 +418,25 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         )
 
     def recommended_filter_seed_batch_size(self) -> int:
-        """Use the production-proven finite 512-trace seed/classifier batch."""
+        """Keep presentation reads within the finite trace working set.
 
+        Bulk identity-only eval/task selection has its own 200-row envelope.
+        Normal list, navigation, and graph reads hydrate root presentation
+        state and therefore retain the production-safe 50-trace ceiling even
+        when an any-span leaf has a selective anchor.
+        """
+
+        if self._bounded_bulk_scan:
+            return 200
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
-        if self._has_unindexed_any_span_filter():
-            return 50
-        return 512 if any(plan.scope == "any" for plan in plans) else 50
+        request_start, request_end = self._bounded_request_window
+        if (
+            request_end - request_start <= timedelta(hours=1)
+            and any(plan.scope == "any" for plan in plans)
+            and not self._has_unindexed_any_span_filter()
+        ):
+            return 512
+        return 50
 
     def recommended_filter_classify_batch_size(self) -> int | None:
         """Keep the candidate-trace latest-state scan below CH's memory ceiling."""
@@ -436,9 +449,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if self._bounded_bulk_scan:
             return 200
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
-        if self._has_unindexed_any_span_filter():
-            return 50
-        return 512 if any(plan.scope == "any" for plan in plans) else 50
+        request_start, request_end = self._bounded_request_window
+        if (
+            request_end - request_start <= timedelta(hours=1)
+            and any(plan.scope == "any" for plan in plans)
+            and not self._has_unindexed_any_span_filter()
+        ):
+            return 512
+        return 50
 
     def bounded_filter_seed_identity(
         self, row: dict[str, Any]

@@ -675,6 +675,12 @@ def test_trace_multi_child_filters_match_across_separate_temporal_strata():
     classifier_query, classifier_params, *_ = next(
         call for call in analytics.calls if "candidate_trace_ids" in call[1]
     )
+    assert sum(
+        "filter_anchor_limit" in params for _, params, *_ in analytics.calls
+    ) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert sum(
+        "candidate_trace_ids" in params for _, params, *_ in analytics.calls
+    ) == 1
     assert classifier_params["candidate_start_date"] == window_start
     assert classifier_params["candidate_end_date"] == window_end
     assert classifier_query.count("countIf(") >= 3
@@ -785,7 +791,11 @@ def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
     classifier_calls = [
         call for call in analytics.calls if "candidate_trace_ids" in call[1]
     ]
-    assert classifier_calls
+    assert len(classifier_calls) == 1
+    assert len(classifier_calls[0][1]["candidate_trace_ids"]) <= (
+        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        * (bounded_graph_reads.GRAPH_ANY_SPAN_ROWS_PER_STRATUM + 1)
+    )
     assert all(
         params["candidate_start_date"] == window_start
         and params["candidate_end_date"] == window_end
@@ -2300,8 +2310,14 @@ def test_common_raw_latest_rare_filter_returns_deterministic_stratified_sample(
         for _, params, *_ in analytics.calls
         if "candidate_trace_ids" in params
     ]
-    assert classifier_sizes
-    assert max(classifier_sizes) <= 50
+    # Eight 50-ID anchor sentinels are de-duplicated into one full-window
+    # latest-state replay. Only its proven rows are visible: the other 392 raw
+    # anchors in this fixture must never leak into the sample.
+    assert classifier_sizes == [
+        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        * (bounded_graph_reads.GRAPH_ANY_SPAN_ROWS_PER_STRATUM + 1)
+    ]
+    assert len(first.rows) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
 
 
 @pytest.mark.unit

@@ -99,6 +99,11 @@ class BoundedFilterPage:
     rows_returned: int
     result_payload_bytes: int
     attempts: tuple[FilterReadAttempt, ...]
+    # Graph-only two-phase reads may acquire a finite identity superset now and
+    # classify the union once later. Keep raw seeds out of ``rows`` so a caller
+    # can never mistake an unclassified anchor for a proven match.
+    deferred_candidate_rows: tuple[dict[str, Any], ...] = ()
+    classification_deferred: bool = False
 
 
 class _BudgetExceeded(Exception):
@@ -219,6 +224,7 @@ def read_bounded_filter_page(
     read_settings: dict[str, Any] | None = None,
     anchor_probe_only: bool = False,
     anchor_probe_limit: int | None = None,
+    defer_classification: bool = False,
 ) -> BoundedFilterPage:
     """Return one exact numbered page or an explicit sanitized degradation.
 
@@ -236,6 +242,10 @@ def read_bounded_filter_page(
     in practice: numbered pages retain the 513-row sparse/common proof, while a
     graph stratum can classify its visible rows plus one finite sentinel without
     sorting the stratum's full match set.
+    ``defer_classification`` is an internal graph-only acquisition contract. It
+    returns finite seeds in ``deferred_candidate_rows`` and always leaves public
+    ``rows`` empty; the caller must replay the union through the same builder's
+    latest-state classifier before exposing any result.
     """
 
     if page_number < 0 or page_size <= 0 or deadline_ms <= 0:
@@ -246,6 +256,10 @@ def read_bounded_filter_page(
         raise ValueError("cursor reads must use page_number zero")
     if include_incomplete_rows and page_number != 0:
         raise ValueError("incomplete rows are available only for page zero")
+    if defer_classification and (page_number != 0 or not include_incomplete_rows):
+        raise ValueError(
+            "deferred classification requires graph page-zero incomplete rows"
+        )
     if not 1 <= max_seed_attempts <= _ABSOLUTE_MAX_QUERIES:
         raise ValueError("max_seed_attempts exceeds the bounded read contract")
     if not 1 <= max_candidates <= _ABSOLUTE_MAX_CANDIDATES:
@@ -257,6 +271,20 @@ def read_bounded_filter_page(
             raise ValueError("anchor_probe_limit exceeds max_candidates")
         if page_size >= anchor_probe_limit:
             raise ValueError("anchor_probe_limit must include a page sentinel")
+    if defer_classification:
+        bounded_anchor_acquisition = (
+            anchor_probe_only and anchor_probe_limit is not None
+        )
+        bounded_fallback_acquisition = (
+            not anchor_probe_only
+            and max_seed_attempts == 1
+            and max_candidates <= 50
+            and page_size < max_candidates
+        )
+        if not (bounded_anchor_acquisition or bounded_fallback_acquisition):
+            raise ValueError(
+                "deferred classification requires one bounded graph acquisition"
+            )
     if max_query_count is None:
         max_query_count = min(max_seed_attempts * 2, _ABSOLUTE_MAX_QUERIES)
     if not 1 <= max_query_count <= _ABSOLUTE_MAX_QUERIES:
@@ -353,6 +381,7 @@ def read_bounded_filter_page(
     seen_seed_ids: set[Hashable] = set()
     seen_candidate_ids: set[Hashable] = set()
     matched_by_id: dict[Hashable, dict[str, Any]] = {}
+    deferred_candidate_by_id: dict[Hashable, dict[str, Any]] = {}
     if cursor_key is not None and cursor_key[0] < request_start:
         return BoundedFilterPage(
             rows=[],
@@ -500,6 +529,9 @@ def read_bounded_filter_page(
             candidate_seed_rows[candidate_identity] = row
 
         candidate_identities = list(candidate_seed_rows)
+        if defer_classification:
+            deferred_candidate_by_id.update(candidate_seed_rows)
+            return
         for batch_offset in range(0, len(candidate_identities), classify_batch_size):
             identity_batch = candidate_identities[
                 batch_offset : batch_offset + classify_batch_size
@@ -751,7 +783,10 @@ def read_bounded_filter_page(
         None if page_complete else degraded_error_code or "scan_budget_exceeded"
     )
     return BoundedFilterPage(
-        rows=page_rows,
+        # Raw seeds are not latest-state matches. Even graph callers that opt
+        # into incomplete rows may expose only the outer union classifier's
+        # result, never this acquisition phase.
+        rows=[] if defer_classification else page_rows,
         has_more=has_more if page_complete or include_incomplete_rows else False,
         complete=page_complete,
         status="complete" if page_complete else "degraded",
@@ -762,6 +797,8 @@ def read_bounded_filter_page(
         rows_returned=sum(attempt.rows_returned for attempt in attempts),
         result_payload_bytes=sum(attempt.result_payload_bytes for attempt in attempts),
         attempts=tuple(attempts),
+        deferred_candidate_rows=tuple(deferred_candidate_by_id.values()),
+        classification_deferred=defer_classification,
     )
 
 

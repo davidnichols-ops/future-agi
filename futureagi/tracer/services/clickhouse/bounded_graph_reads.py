@@ -9,6 +9,7 @@ incomplete. Budget or query failures never become an allegedly exact graph.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Hashable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -66,6 +67,21 @@ GRAPH_ANY_SPAN_DISTRIBUTED_AFTER = timedelta(hours=1)
 # intentionally incomplete and is always published as sampled metadata.
 GRAPH_UNINDEXED_SAMPLE_SLICE = timedelta(minutes=5)
 
+# Keep the one graph-union classifier inside the same finite resource envelope
+# as the shared bounded selector. The query is scoped to at most eight 50-ID
+# anchor sentinels; it never constructs a tenant/window-wide membership Set.
+GRAPH_TRACE_UNION_QUERY_TIMEOUT_MS = 750
+GRAPH_TRACE_UNION_READ_SETTINGS = {
+    "max_threads": 1,
+    "max_block_size": 8192,
+    "max_memory_usage": 256 * 1024 * 1024,
+    "max_bytes_to_read": 512 * 1024 * 1024,
+    "read_overflow_mode": "throw",
+    "max_result_rows": GRAPH_ANY_SPAN_STRATA
+    * (GRAPH_ANY_SPAN_ROWS_PER_STRATUM + 1),
+    "result_overflow_mode": "throw",
+}
+
 logger = structlog.get_logger(__name__)
 
 
@@ -120,6 +136,14 @@ class GraphCandidateSample:
         if self.query_error_code:
             result["query_error_code"] = self.query_error_code
         return result
+
+
+@dataclass(frozen=True)
+class _DeferredTraceStratum:
+    """Finite graph-only candidates awaiting one full-window classifier."""
+
+    builder: Any
+    candidate_rows: tuple[dict[str, Any], ...]
 
 
 def _active_filters(filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -203,6 +227,121 @@ def _candidate_row_key(
     return start_time, str(row.get(key_field) or "")
 
 
+def _result_payload_bytes(rows: list[dict[str, Any]]) -> int:
+    return len(
+        json.dumps(rows, default=str, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+
+def _classify_deferred_trace_strata(
+    *,
+    analytics: Any,
+    strata: list[_DeferredTraceStratum],
+    distributed_started: float,
+    deadline_ms: int,
+    rows_per_stratum: int,
+) -> tuple[dict[Hashable, dict[str, Any]], float, int, int, int, int]:
+    """Classify the de-duplicated trace union once across the full window.
+
+    Every input row is still only an untrusted anchor/root seed. This helper is
+    the sole boundary that turns those finite identities into graph candidates.
+    It reuses the trace list builder's full latest-state, multi-filter query and
+    reapplies each stratum's 49-row visible ceiling after classification.
+    """
+
+    union_by_id: dict[str, dict[str, Any]] = {}
+    for stratum in strata:
+        for row in stratum.candidate_rows:
+            trace_id = str(row.get("trace_id") or "")
+            if trace_id:
+                union_by_id.setdefault(trace_id, row)
+    if not union_by_id:
+        return {}, 0.0, 0, 0, 0, 0
+
+    absolute_ceiling = GRAPH_ANY_SPAN_STRATA * (
+        GRAPH_ANY_SPAN_ROWS_PER_STRATUM + 1
+    )
+    if len(union_by_id) > absolute_ceiling:
+        raise AssertionError("trace graph union exceeds its finite identity ceiling")
+
+    remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
+    if remaining_ms < 25:
+        raise BoundedGraphReadError("read_budget_exceeded")
+    classifier_builder = strata[0].builder
+    classifier_query, classifier_params = (
+        classifier_builder.build_filter_match_query_from_seed_rows(
+            list(union_by_id.values())
+        )
+    )
+    if not classifier_query:
+        return {}, 0.0, 0, 0, 0, 0
+
+    classifier_started = monotonic()
+    try:
+        classifier_result = analytics.execute_ch_query(
+            classifier_query,
+            classifier_params,
+            timeout_ms=min(GRAPH_TRACE_UNION_QUERY_TIMEOUT_MS, remaining_ms),
+            settings={
+                **GRAPH_TRACE_UNION_READ_SETTINGS,
+                "max_result_rows": len(union_by_id),
+            },
+        )
+    except Exception as exc:
+        if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+            raise
+        logger.warning(
+            "trace graph union classifier degraded",
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        public_code = (
+            "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+        )
+        raise BoundedGraphReadError(public_code, retryable=True) from None
+
+    classifier_elapsed_ms = (monotonic() - classifier_started) * 1000
+    classified_rows = list(classifier_result.data or [])
+    classified_by_id = {
+        str(row.get("trace_id") or ""): row
+        for row in classified_rows
+        if row.get("trace_id")
+    }
+    visible_by_id: dict[Hashable, dict[str, Any]] = {}
+    total_rows_lower_bound = 0
+    for stratum in strata:
+        stratum_ids = {
+            str(row.get("trace_id") or "")
+            for row in stratum.candidate_rows
+            if row.get("trace_id")
+        }
+        stratum_matches = sorted(
+            (
+                classified_by_id[trace_id]
+                for trace_id in stratum_ids
+                if trace_id in classified_by_id
+            ),
+            key=lambda row: _candidate_row_key(row, key_field="trace_id"),
+            reverse=True,
+        )
+        total_rows_lower_bound += len(stratum_matches)
+        for row in stratum_matches[:rows_per_stratum]:
+            trace_id = str(row.get("trace_id") or "")
+            if trace_id:
+                visible_by_id[trace_id] = row
+
+    return (
+        visible_by_id,
+        classifier_elapsed_ms,
+        1,
+        len(classified_rows),
+        _result_payload_bytes(classified_rows),
+        total_rows_lower_bound,
+    )
+
+
 def _read_time_distributed_candidates(
     *,
     analytics: Any,
@@ -257,6 +396,12 @@ def _read_time_distributed_candidates(
         window_end=window_end,
     )
     force_temporal_sample = False
+    # Indexed any-span trace filters acquire every disjoint stratum first, then
+    # replay the de-duplicated <=400-ID union once. If an indexed anchor times
+    # out, the existing five-minute root fallback feeds the same union; raw
+    # anchors/root seeds never enter ``rows_by_id`` directly.
+    defer_trace_classification = False
+    deferred_trace_strata: list[_DeferredTraceStratum] = []
 
     for index in range(stratum_count):
         remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
@@ -299,6 +444,8 @@ def _read_time_distributed_candidates(
             and callable(anchor_support)
             and bool(anchor_support())
         )
+        if mode == "trace" and use_stratum_anchor:
+            defer_trace_classification = True
         unindexed_sample_support = getattr(
             stratum_builder,
             "requires_unindexed_graph_sample_slice",
@@ -356,6 +503,7 @@ def _read_time_distributed_candidates(
             query_limit: int,
             candidate_count: int,
             classify_size: int,
+            defer_classify: bool,
         ):
             return read_bounded_filter_page(
                 builder=active_builder,
@@ -384,6 +532,7 @@ def _read_time_distributed_candidates(
                 # ORDER BY seed path for directly anchorable predicates.
                 anchor_probe_only=use_anchor,
                 anchor_probe_limit=(candidate_count if use_anchor else None),
+                defer_classification=defer_classify,
             )
 
         page = None
@@ -398,6 +547,7 @@ def _read_time_distributed_candidates(
                 query_limit=max_query_count,
                 candidate_count=candidate_limit,
                 classify_size=bounded_classify_batch_size,
+                defer_classify=defer_trace_classification,
             )
         except Exception as exc:
             if use_stratum_anchor and is_read_budget_error(exc):
@@ -486,6 +636,7 @@ def _read_time_distributed_candidates(
                     query_limit=max_query_count,
                     candidate_count=candidate_limit,
                     classify_size=bounded_classify_batch_size,
+                    defer_classify=defer_trace_classification,
                 )
             except Exception as exc:
                 if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
@@ -532,6 +683,13 @@ def _read_time_distributed_candidates(
         # failed reads from being advertised as an intentional sample.
         if page.complete or page.has_more or public_code == "sample_limit":
             sampling_strata_completed += 1
+        if page.classification_deferred:
+            deferred_trace_strata.append(
+                _DeferredTraceStratum(
+                    builder=stratum_builder,
+                    candidate_rows=page.deferred_candidate_rows,
+                )
+            )
         for row in page.rows:
             if mode == "trace":
                 identity: Hashable = str(row.get("trace_id") or "")
@@ -544,6 +702,31 @@ def _read_time_distributed_candidates(
             )
             if identity_is_valid:
                 rows_by_id[identity] = row
+
+    # Only the latest-state classifier may publish trace rows. One union query
+    # preserves cross-stratum root/child and multi-leaf semantics while removing
+    # the prior eight repeated full-window classifier scans.
+    if deferred_trace_strata:
+        (
+            classified_rows_by_id,
+            classifier_elapsed_ms,
+            classifier_query_count,
+            classifier_rows_returned,
+            classifier_payload_bytes,
+            classifier_total_rows_lower_bound,
+        ) = _classify_deferred_trace_strata(
+            analytics=analytics,
+            strata=deferred_trace_strata,
+            distributed_started=distributed_started,
+            deadline_ms=deadline_ms,
+            rows_per_stratum=rows_per_stratum,
+        )
+        rows_by_id.update(classified_rows_by_id)
+        elapsed_ms += classifier_elapsed_ms
+        query_count += classifier_query_count
+        rows_returned += classifier_rows_returned
+        result_payload_bytes += classifier_payload_bytes
+        total_rows_lower_bound += classifier_total_rows_lower_bound
 
     rows = sorted(
         rows_by_id.values(),

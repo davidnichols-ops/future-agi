@@ -286,8 +286,21 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert "%(candidate_start_date)s - INTERVAL 1 DAY" not in match_sql
     assert "%(candidate_end_date)s + INTERVAL 1 DAY" not in match_sql
     assert builder.filter_seed_proves_result_order() is False
-    assert builder.recommended_filter_seed_batch_size() == 512
-    assert builder.recommended_filter_classify_batch_size() == 512
+    assert builder.recommended_filter_seed_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 50
+
+
+def test_long_window_trace_presentation_batches_stay_at_fifty() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(days=14), END),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+        ],
+    )
+
+    assert builder.recommended_filter_seed_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 50
 
 
 def test_call_type_trace_filter_skips_unindexed_window_anchor() -> None:
@@ -1237,7 +1250,7 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
     assert "SELECT id\n" not in match_sql
     assert match_params["candidate_trace_ids"] == ("trace-a",)
     assert builder.filter_seed_proves_result_order() is False
-    assert builder.recommended_filter_classify_batch_size() == 512
+    assert builder.recommended_filter_classify_batch_size() == 50
 
 
 def test_trace_candidate_classifier_enforces_production_proven_512_trace_cap() -> None:
