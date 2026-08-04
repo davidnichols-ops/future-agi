@@ -241,7 +241,7 @@ def test_final_status_v2_seed_respects_trace_any_span_scope(
     )
 
     if seed_applies_attribute:
-        assert "mapContains(attrs_string, %(latest_filter_key_0)s)" in sql
+        assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in sql
         assert "mapValues(attrs_string)" not in sql
         assert params["latest_filter_key_0"] == "final_status"
         assert "latest_filter_param_0" not in params

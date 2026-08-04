@@ -307,6 +307,11 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         # no production skip index and must never be placed in a broad anchor.
         if "JSONExtract" in predicate:
             return False
+        # A direct Map keys subcolumn witness avoids materializing wide values.
+        # It is a safe positive superset even when the expression bloom cannot
+        # be used on older parts.
+        if re.search(r"\bhas\(span_attr_(?:str|num|bool)\.keys,", predicate):
+            return True
         # Typed Maps have deployed key/value blooms. Positive key predicates
         # remain valid anchors except for literal substring/negative forms whose
         # compiled expressions cannot use those indexes. String equals/IN is

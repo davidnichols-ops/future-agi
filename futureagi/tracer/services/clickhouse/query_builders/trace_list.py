@@ -402,6 +402,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return False
         if "JSONExtract" in predicate:
             return False
+        if re.search(r"\bhas\(span_attr_(?:str|num|bool)\.keys,", predicate):
+            return True
         if "mapContains(span_attr_" in predicate:
             if "NOT mapContains(span_attr_" in predicate:
                 return False

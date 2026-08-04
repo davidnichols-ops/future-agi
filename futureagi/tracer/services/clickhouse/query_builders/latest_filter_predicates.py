@@ -410,7 +410,8 @@ def _attribute_plan(
         params=params,
         scope=scope,
         raw_witness_predicate=(
-            f"mapContains({map_column}, {bound_key})"
+            f"(indexHint(has(mapKeys({map_column}), {bound_key})) AND "
+            f"has({map_column}.keys, {bound_key}))"
             if operation
             in {
                 "equals",

@@ -63,9 +63,11 @@ def test_session_seed_pushes_indexed_scalar_witness_before_group_and_limit() -> 
         limit=200,
     )
 
-    witness = "mapContains(attrs_string, %(latest_filter_key_0)s)"
+    witness = "has(attrs_string.keys, %(latest_filter_key_0)s)"
+    index_companion = "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))"
     value_bloom = "hasAny(arrayMap(x -> lower(x), mapValues(attrs_string))"
     assert witness in sql
+    assert index_companion in sql
     assert value_bloom not in sql
     assert sql.index(witness) < sql.index("GROUP BY session_id")
     assert sql.index(witness) < sql.index("LIMIT %(filter_seed_limit)s")
@@ -96,7 +98,7 @@ def test_session_seed_prefers_indexed_scalar_when_json_filter_comes_first() -> N
         limit=200,
     )
 
-    assert "mapContains(attrs_string, %(latest_filter_key_1)s)" in sql
+    assert "has(attrs_string.keys, %(latest_filter_key_1)s)" in sql
     assert "mapValues(attrs_string)" not in sql
     assert "%(latest_filter_key_0)s" not in sql
     assert params["latest_filter_key_1"] == "final_status"

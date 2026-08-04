@@ -263,7 +263,8 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
         "start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)" in seed_sql
     )
     assert "start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)" in seed_sql
-    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in seed_sql
+    assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in seed_sql
+    assert "indexHint(has(mapKeys(span_attr_str), %(latest_filter_key_0)s))" in seed_sql
     assert "mapValues(span_attr_str)" not in seed_sql
     assert seed_params["latest_filter_key_0"] == "final_status"
     assert "latest_filter_param_0" not in seed_params
@@ -587,7 +588,7 @@ def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
     anchor_sql, anchor_params = builder.build_filter_anchor_probe(limit=513)
 
     assert builder.supports_filter_anchor_probe() is True
-    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in anchor_sql
+    assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in anchor_sql
     assert "JSONExtract" not in anchor_sql
     assert anchor_params["latest_filter_key_0"] == "final_status"
     assert "latest_filter_param_1" not in anchor_params
@@ -1011,7 +1012,8 @@ def test_v2_span_seed_uses_key_only_witness_before_exact_replay() -> None:
         limit=100,
     )
 
-    assert "mapContains(attrs_string, %(latest_filter_key_0)s)" in sql
+    assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in sql
+    assert "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))" in sql
     assert "mapValues(attrs_string)" not in sql
     assert params["latest_filter_key_0"] == "final_status"
     assert "latest_filter_param_0" not in params
@@ -1029,7 +1031,10 @@ def test_v2_span_seed_uses_key_only_witness_before_exact_replay() -> None:
         slice_end=END,
         limit=100,
     )
-    assert "mapContains(attrs_string, %(latest_filter_key_0)s)" in prompt_sql
+    assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in prompt_sql
+    assert (
+        "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))" in prompt_sql
+    )
     assert "mapValues(attrs_string)" not in prompt_sql
     assert prompt_params["latest_filter_key_0"] == "prompt_slug"
     assert "latest_filter_param_0" not in prompt_params
@@ -1116,7 +1121,7 @@ def test_trace_attribute_can_match_only_a_child_span() -> None:
     )
     match_sql, _ = builder.build_filter_match_query(["trace-with-child-value"])
 
-    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in seed_sql
+    assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in seed_sql
     assert "parent_span_id IS NULL" not in seed_sql
     assert "HAVING countIf(" in match_sql
     assert "GROUP BY trace_id, id, start_time" in match_sql
@@ -1138,7 +1143,7 @@ def test_covered_rollup_names_retain_public_any_span_semantics(key: str) -> None
     match_sql, _ = builder.build_filter_match_query(["trace-a"])
 
     assert "parent_span_id IS NULL" not in seed_sql
-    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in seed_sql
+    assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in seed_sql
     assert "HAVING countIf(" in match_sql
     assert builder.filter_seed_proves_result_order() is False
 
@@ -1161,7 +1166,7 @@ def test_trace_mixed_root_and_any_span_filters_keep_distinct_scopes() -> None:
     match_sql, params = builder.build_filter_match_query(["trace-a"])
 
     assert "lowerUTF8(toString(trace_name))" not in seed_sql
-    assert "mapContains(span_attr_str, %(latest_filter_key_1)s)" in seed_sql
+    assert "has(span_attr_str.keys, %(latest_filter_key_1)s)" in seed_sql
     assert "argMax(trace_name, _peerdb_version)" in match_sql
     assert "mapContains(span_attr_str, %(latest_filter_key_1)s)" in match_sql
     assert params["latest_filter_param_0"] == "café"
@@ -1189,7 +1194,7 @@ def test_mixed_attribute_and_annotation_stays_in_one_bounded_trace_classifier() 
     match_sql, params = builder.build_filter_match_query(["trace-a"])
 
     assert "model_hub_score" not in seed_sql
-    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in seed_sql
+    assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in seed_sql
     assert "model_hub_score AS s FINAL" in match_sql
     assert "tracer_project_id" not in match_sql
     assert "latest_attr_exists_0" in match_sql
@@ -1528,7 +1533,7 @@ def test_legacy_system_aliases_keep_latest_state_without_broad_fallback() -> Non
     match_sql, params = builder.build_filter_match_query(["trace-a"])
 
     assert "total_tokens" not in seed_sql
-    assert "mapContains(span_attr_str, %(latest_filter_key_1)s)" in seed_sql
+    assert "has(span_attr_str.keys, %(latest_filter_key_1)s)" in seed_sql
     assert "argMax(tuple(total_tokens), _peerdb_version).1" in match_sql
     assert "argMax(mapContains(span_attr_str" in match_sql
     assert params["latest_filter_key_1"] == "legacy.customer.level"
@@ -1555,9 +1560,9 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
     )
     match_sql, match_params = builder.build_filter_match_query(["trace-a"])
 
-    first_filter = "mapContains(span_attr_str, %(latest_filter_key_0)s)"
-    second_filter = "mapContains(span_attr_str, %(latest_filter_key_1)s)"
-    assert first_filter in seed_sql and second_filter not in seed_sql
+    first_seed_filter = "has(span_attr_str.keys, %(latest_filter_key_0)s)"
+    second_seed_filter = "has(span_attr_str.keys, %(latest_filter_key_1)s)"
+    assert first_seed_filter in seed_sql and second_seed_filter not in seed_sql
     assert "parent_span_id IS NULL" not in seed_sql
     assert seed_sql.index("cityHash64") < seed_sql.index("LIMIT %(filter_seed_limit)s")
     assert "toString(trace_id)" in seed_sql
@@ -1589,7 +1594,9 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
         )
         == expected_window_gate_uses
     )
-    assert first_filter in match_sql and second_filter in match_sql
+    first_match_filter = "mapContains(span_attr_str, %(latest_filter_key_0)s)"
+    second_match_filter = "mapContains(span_attr_str, %(latest_filter_key_1)s)"
+    assert first_match_filter in match_sql and second_match_filter in match_sql
     assert "AND trace_id IN %(candidate_trace_ids)s" in match_sql
     assert "%(candidate_start_date)s - INTERVAL 1 DAY" not in match_sql
     assert "%(candidate_end_date)s + INTERVAL 1 DAY" not in match_sql
@@ -1655,7 +1662,7 @@ def test_attribute_key_is_bound_and_preserved_for_all_map_expressions() -> None:
     for sql in (seed_sql, match_sql):
         assert key not in sql
         assert "%(latest_filter_key_0)s" in sql
-    assert "mapContains(attrs_string, %(latest_filter_key_0)s)" in seed_sql
+    assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in seed_sql
     assert "attrs_string[%(latest_filter_key_0)s]" not in seed_sql
     assert "argMax(mapContains(attrs_string, %(latest_filter_key_0)s)" in match_sql
     assert "argMax(attrs_string[%(latest_filter_key_0)s], _version)" in match_sql
@@ -1862,7 +1869,7 @@ def test_trace_search_and_any_span_filter_share_bounded_classifier() -> None:
 
     # The sparse/common anchor stays on the indexed child attribute. Search is
     # a root predicate, so it belongs in the ordered-root seed and classifier.
-    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in anchor_sql
+    assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in anchor_sql
     assert "latest_filter_param_1" not in anchor_params
     assert "positionUTF8(lowerUTF8(toString(trace_name))" in ordered_sql
     assert ordered_params["latest_filter_param_1"] == "SyntheticAgent"
@@ -3280,7 +3287,6 @@ class _FakeExecutor:
         self.builder = builder
         self.fail = fail
         self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.settings_by_query: list[tuple[str, dict[str, Any]]] = []
 
     def execute_ch_query(
         self,
@@ -3291,7 +3297,6 @@ class _FakeExecutor:
         settings: dict[str, Any],
     ) -> QueryResult:
         self.calls.append((query, params))
-        self.settings_by_query.append((query, dict(settings)))
         if self.fail is not None:
             raise self.fail
         if query == "match":
@@ -3319,31 +3324,6 @@ class _FakeExecutor:
                 ]
             rows = rows[: params["limit"]]
         return QueryResult(rows, len(rows), "clickhouse", 1.0)
-
-
-@pytest.mark.parametrize("key_field", ["session_id", "span_id", "trace_id"])
-def test_bounded_reads_enable_map_key_subcolumn_optimization(key_field: str) -> None:
-    rows = _rows(1, 2)
-    for row in rows:
-        row[key_field] = row["id"]
-    builder = _FakeBuilder(rows)
-    executor = _FakeExecutor(builder)
-
-    page = read_bounded_filter_page(
-        builder=builder,
-        analytics=executor,
-        filters=[_time_filter()],
-        key_field=key_field,
-        page_number=0,
-        page_size=1,
-    )
-
-    assert page.complete is True
-    assert executor.settings_by_query
-    assert all(
-        settings["optimize_functions_to_subcolumns"] == 1
-        for _, settings in executor.settings_by_query
-    )
 
 
 @dataclass

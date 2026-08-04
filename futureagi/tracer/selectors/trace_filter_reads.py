@@ -37,7 +37,6 @@ MAX_NUMBERED_PAGE_WORK_ROWS = 5_000
 _READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
-    "optimize_functions_to_subcolumns": 1,
     "max_memory_usage": 256 * 1024 * 1024,
     "max_bytes_to_read": 512 * 1024 * 1024,
     "read_overflow_mode": "throw",
