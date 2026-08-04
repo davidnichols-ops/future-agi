@@ -205,6 +205,15 @@ def test_attribute_bulk_filter_uses_bounded_seed_and_latest_candidate_classifier
     assert "argMax(is_deleted, _version) AS latest_is_deleted" in match_sql
     assert "argMax(mapContains(attrs_string" in match_sql
     assert "latest_attr_value_0" in match_sql
+    assert "mapContains(attrs_string" in seed_sql
+    candidate_roots = match_sql.split("candidate_root_identities AS (", 1)[1].split(
+        "latest_roots AS (", 1
+    )[0]
+    assert "mapContains(attrs_string" in candidate_roots
+    # The witness only narrows physical identities. Exact latest-state replay
+    # and matching-root ordering retain the existing classifier semantics.
+    assert "latest_attr_exists_0 AND" in match_sql
+    assert "min(start_time) AS session_start" in match_sql
     assert "candidate_filter_session_ids" in match_sql
     assert match_params["candidate_filter_session_ids"] == (session_id,)
     assert "rejected" in match_params.values()

@@ -178,6 +178,17 @@ class SessionListQueryBuilder(BaseQueryBuilder):
     def _bounded_span_filter_parts(self):
         return partition_span_filter_plans(self._bounded_scalar_span_filters())
 
+    @staticmethod
+    def _bounded_root_witness_plan(plans: list[Any] | tuple[Any, ...]):
+        """Choose the most selective safe raw-row witness deterministically."""
+
+        candidates = [
+            (getattr(plan, "raw_witness_rank", 100), index, plan)
+            for index, plan in enumerate(plans)
+            if getattr(plan, "raw_witness_predicate", None) is not None
+        ]
+        return min(candidates, default=(None, None, None))[-1]
+
     def bounded_filter_degraded_error_code(self) -> str | None:
         """Explain why the finite session bulk selector cannot represent a shape."""
 
@@ -362,6 +373,13 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 if not alias or alias == aggregate:
                     raise ValueError("latest-state session aggregate requires an alias")
                 resolved_metric_columns.append(alias)
+        # A raw witness is only a candidate superset.  It narrows expensive
+        # attribute argMax replay to matching physical roots; exact latest-state
+        # predicates below remain authoritative.
+        root_witness_plan = self._bounded_root_witness_plan(root_filter_plans)
+        root_witness_predicate = (
+            root_witness_plan.raw_witness_predicate if root_witness_plan else None
+        )
         if needs_end_time:
             latest_metric_columns.append(
                 "argMax(tuple(end_time), _peerdb_version).1 AS latest_end_time"
@@ -614,6 +632,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             PREWHERE {self.project_filter_sql()}{span_time_scope}
             WHERE (parent_span_id IS NULL OR parent_span_id = '')
               {root_session_seed}
+              {f"AND ({root_witness_predicate})" if root_witness_predicate else ""}
         ),
         latest_roots AS (
             SELECT
@@ -699,6 +718,26 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             "filter_slice_end": slice_end,
             "filter_seed_limit": int(limit),
         }
+        plans, residual = self._bounded_span_filter_parts()
+        if residual:
+            raise ValueError("unsupported relational bounded session filter")
+        root_witness_plan = self._bounded_root_witness_plan(plans)
+        root_witness_predicate = (
+            root_witness_plan.raw_witness_predicate if root_witness_plan else None
+        )
+        if root_witness_plan is not None:
+            params.update(
+                {
+                    key: value
+                    for key, value in root_witness_plan.params.items()
+                    if f"%({key})s" in root_witness_predicate
+                }
+            )
+        root_witness_clause = (
+            f"\n                  AND ({root_witness_predicate})"
+            if root_witness_predicate
+            else ""
+        )
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
                 self.filters,
@@ -754,7 +793,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                   AND start_time < %(filter_slice_end)s{datetime_fragment}
                 WHERE (parent_span_id IS NULL OR parent_span_id = '')
                   AND isNotNull(trace_session_id)
-                  AND trace_session_id != toUUID('{NIL_UUID}')
+                  AND trace_session_id != toUUID('{NIL_UUID}'){root_witness_clause}
             ) AS raw_roots
             LEFT JOIN ts_survivor_map AS seed_ts_remap
                 ON raw_trace_session_id = seed_ts_remap.any_id

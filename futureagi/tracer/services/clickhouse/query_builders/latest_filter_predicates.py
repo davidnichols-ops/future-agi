@@ -168,6 +168,12 @@ class LatestFilterPredicate:
     seed_predicate: str
     params: dict[str, Any]
     scope: str
+    # Optional raw-row predicate that is guaranteed to contain every physical
+    # identity whose latest state satisfies ``predicate``.  Callers must still
+    # replay those identities and apply ``predicate``; this is only a witness
+    # selector, never the source of truth.
+    raw_witness_predicate: str | None = None
+    raw_witness_rank: int | None = None
 
 
 def _parts(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -403,6 +409,42 @@ def _attribute_plan(
         seed_predicate=seed_predicate,
         params=params,
         scope=scope,
+        raw_witness_predicate=(
+            seed_predicate
+            if operation
+            in {
+                "equals",
+                "in",
+                "contains",
+                "starts_with",
+                "ends_with",
+                "between",
+                "greater_than",
+                "greater_than_or_equal",
+                "less_than",
+                "less_than_or_equal",
+                "is_not_null",
+            }
+            else None
+        ),
+        raw_witness_rank=(
+            {"equals": 0, "in": 0}.get(operation, 10)
+            if operation
+            in {
+                "equals",
+                "in",
+                "contains",
+                "starts_with",
+                "ends_with",
+                "between",
+                "greater_than",
+                "greater_than_or_equal",
+                "less_than",
+                "less_than_or_equal",
+                "is_not_null",
+            }
+            else None
+        ),
     )
 
 
@@ -578,11 +620,13 @@ def _json_array_attribute_plan(
     # project/date primary key and parse JSON only while replaying its bounded
     # candidate identities against latest state.
     seed_predicate = "1 = 1"
+    raw_witness_predicate: str | None = None
 
     if operation == "is_null":
         predicate = f"NOT {exists_alias}"
     elif operation == "is_not_null":
         predicate = exists_alias
+        raw_witness_predicate = source_exists
     else:
         predicate_membership, predicate_params = _json_array_membership_predicate(
             array_expression=value_alias,
@@ -592,6 +636,16 @@ def _json_array_attribute_plan(
         )
         params.update(predicate_params)
         predicate = f"{exists_alias} AND {predicate_membership}"
+        if operation == "contains":
+            raw_membership, raw_params = _json_array_membership_predicate(
+                array_expression=source_value,
+                values=values,
+                operation=operation,
+                index=index,
+            )
+            if raw_params != predicate_params:
+                raise AssertionError("latest and raw JSON predicates must agree")
+            raw_witness_predicate = f"({source_exists}) AND ({raw_membership})"
 
     return LatestFilterPredicate(
         aggregates=(
@@ -602,6 +656,8 @@ def _json_array_attribute_plan(
         seed_predicate=seed_predicate,
         params=params,
         scope=scope,
+        raw_witness_predicate=raw_witness_predicate,
+        raw_witness_rank=(20 if raw_witness_predicate is not None else None),
     )
 
 
@@ -728,12 +784,15 @@ def _json_map_attribute_plan(
     # The JSON overflow has no matching skip index.  Never parse it in the
     # ordered seed scan; parsing is limited to latest-state candidate replay.
     seed_predicate = "1 = 1"
+    raw_witness_predicate: str | None = None
     if operation == "is_null":
         predicate = f"NOT {exists_alias}"
     elif operation == "is_not_null":
         predicate = exists_alias
+        raw_witness_predicate = source_exists
     else:
         member_predicates: list[str] = []
+        raw_member_predicates: list[str] = []
         for member_index, (member_key, member_value) in enumerate(members.items()):
             member_predicate, member_params = _json_map_member_predicate(
                 object_expression=value_alias,
@@ -744,12 +803,30 @@ def _json_map_attribute_plan(
             )
             member_predicates.append(f"({member_predicate})")
             params.update(member_params)
+            raw_member_predicate, raw_member_params = _json_map_member_predicate(
+                object_expression=source_value,
+                member_key=member_key,
+                member_value=member_value,
+                index=index,
+                member_index=member_index,
+            )
+            if raw_member_params != member_params:
+                raise AssertionError("latest and raw JSON predicates must agree")
+            raw_member_predicates.append(f"({raw_member_predicate})")
         containment = " AND ".join(member_predicates)
         exact = f"JSONLength({value_alias}) = {len(members)} AND {containment}"
         core = exact if operation in {"equals", "not_equals"} else containment
         if operation in {"not_equals", "not_contains"}:
             core = f"NOT ({core})"
         predicate = f"{exists_alias} AND ({core})"
+        if operation in {"equals", "contains"}:
+            raw_containment = " AND ".join(raw_member_predicates)
+            raw_core = (
+                f"JSONLength({source_value}) = {len(members)} AND {raw_containment}"
+                if operation == "equals"
+                else raw_containment
+            )
+            raw_witness_predicate = f"({source_exists}) AND ({raw_core})"
 
     return LatestFilterPredicate(
         aggregates=(
@@ -760,6 +837,8 @@ def _json_map_attribute_plan(
         seed_predicate=seed_predicate,
         params=params,
         scope=scope,
+        raw_witness_predicate=raw_witness_predicate,
+        raw_witness_rank=(20 if raw_witness_predicate is not None else None),
     )
 
 
