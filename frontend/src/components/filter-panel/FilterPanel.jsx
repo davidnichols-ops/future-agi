@@ -699,9 +699,9 @@ const QueryInput = forwardRef(function QueryInput(
       // Dynamic values from parent (fetched from CH)
       if (valueOptions.length > 0) {
         return valueOptions.map((o) => {
-          const val = typeof o === "string" ? o : o.value || o.label;
-          const label = typeof o === "string" ? o : o.label || o.value;
-          return { id: val, label, type: "value" };
+          const val = typeof o === "string" ? o : o.value ?? o.label;
+          const label = typeof o === "string" ? o : o.label ?? o.value;
+          return { id: val, label: String(label ?? ""), type: "value" };
         });
       }
     }
@@ -721,16 +721,18 @@ const QueryInput = forwardRef(function QueryInput(
     return options.filter((o) => o.label.toLowerCase().includes(q));
   }, [options, inputValue]);
 
-  const hasExactInputOption = useMemo(() => {
+  const exactInputOption = useMemo(() => {
     const candidate = inputValue.trim().toLowerCase();
-    if (!candidate) return false;
-    return options.some((option) =>
-      [option.id, option.label].some(
-        (value) =>
-          String(value ?? "")
-            .trim()
-            .toLowerCase() === candidate,
-      ),
+    if (!candidate) return null;
+    return (
+      options.find((option) =>
+        [option.id, option.label].some(
+          (value) =>
+            String(value ?? "")
+              .trim()
+              .toLowerCase() === candidate,
+        ),
+      ) ?? null
     );
   }, [inputValue, options]);
 
@@ -807,11 +809,16 @@ const QueryInput = forwardRef(function QueryInput(
         }
         const v = inputValue.trim();
         if (!v) return null;
+        if (hasStaticValueChoices && !exactInputOption) return null;
         // Don't commit a partial/invalid numeric on close (TH-5195).
         if (isNumericScalar && !isCompleteNumericInput(v)) return null;
         const updated = [
           ...tokens,
-          { field: partialField, operator: partialOp, value: v },
+          {
+            field: partialField,
+            operator: partialOp,
+            value: hasStaticValueChoices ? exactInputOption.id : v,
+          },
         ];
         setTokens(updated);
         setPartialField(null);
@@ -832,6 +839,8 @@ const QueryInput = forwardRef(function QueryInput(
       isNumericRange,
       isNumericScalar,
       inputValue,
+      hasStaticValueChoices,
+      exactInputOption,
     ],
   );
 
@@ -948,14 +957,19 @@ const QueryInput = forwardRef(function QueryInput(
         e.key === "Enter" &&
         inputValue.trim() &&
         !hasStaticValueChoices &&
-        !hasExactInputOption &&
         (!isNumericScalar || isCompleteNumericInput(inputValue.trim()))
       ) {
-        // MUI's Autocomplete otherwise commits the first highlighted fuzzy
-        // suggestion after this input-level handler returns.
+        // MUI otherwise commits the first highlighted fuzzy suggestion after
+        // this input-level handler returns. Resolve an exact option ourselves
+        // so its typed id (including false / 0) wins regardless of ordering;
+        // otherwise preserve the user's explicit free-form text.
         e.defaultMuiPrevented = true;
         e.preventDefault();
-        commitFilter(partialField, partialOp, inputValue.trim());
+        commitFilter(
+          partialField,
+          partialOp,
+          exactInputOption?.id ?? inputValue.trim(),
+        );
         return;
       }
       if ((e.key === "Backspace" || e.key === "Delete") && !inputValue) {
@@ -984,7 +998,7 @@ const QueryInput = forwardRef(function QueryInput(
       commitFilter,
       editToken,
       hasStaticValueChoices,
-      hasExactInputOption,
+      exactInputOption,
     ],
   );
 
