@@ -17,6 +17,9 @@ from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     targets_span_filter_domain,
     targets_trace_filter_domain,
 )
+from tracer.services.clickhouse.query_builders.session_list import (
+    SessionListQueryBuilder,
+)
 from tracer.services.clickhouse.query_builders.span_list import SpanListQueryBuilder
 from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
 from tracer.services.clickhouse.query_service import QueryResult
@@ -51,7 +54,11 @@ def _attribute_filter(key: str, value: str) -> dict:
 
 @pytest.mark.parametrize(
     ("builder_class", "identity"),
-    [(SpanListQueryBuilder, "id"), (TraceListQueryBuilder, "trace_id")],
+    [
+        (SpanListQueryBuilder, "id"),
+        (TraceListQueryBuilder, "trace_id"),
+        (SessionListQueryBuilder, "session_id"),
+    ],
 )
 def test_internal_bounded_seed_pushes_sampling_before_limit(
     builder_class, identity: str
@@ -228,6 +235,111 @@ def test_bounded_resolver_returns_only_a_complete_latest_state_page(
     if row_type == RowType.TRACES:
         assert captured["builder"]._bounded_bulk_scan is True
         assert captured["builder"].skip_full_window_filter_anchor_probe() is True
+
+
+def test_bounded_historical_session_selector_proves_and_sorts_full_population(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def fake_read(**kwargs):
+        captured.update(kwargs)
+        return BoundedFilterPage(
+            rows=[
+                {
+                    "session_id": "session-b",
+                    "start_time": END - timedelta(minutes=1),
+                },
+                {
+                    "session_id": "session-a",
+                    "start_time": END - timedelta(minutes=2),
+                },
+            ],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=2,
+            elapsed_ms=10,
+            query_count=2,
+            rows_returned=4,
+            result_payload_bytes=100,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    ids = row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=25.0,
+        filters={
+            "filters": [_attribute_filter("final_status", "Rejected")],
+            "date_range": [START, END],
+        },
+        limit=25,
+        batch_size=256,
+        row_type=RowType.SESSIONS,
+    )
+
+    assert ids == ["session-a", "session-b"]
+    assert captured["key_field"] == "session_id"
+    assert captured["page_size"] == 25
+    assert captured["deadline_ms"] == 10_000
+    assert captured["max_query_count"] == 128
+    assert captured["max_candidates"] == 512
+    assert captured["classify_batch_size"] == 200
+    assert captured["builder"]._bounded_internal_scan is True
+    assert captured["builder"]._bounded_sampling_salt == "task-salt"
+    assert captured["builder"]._bounded_sampling_rate == 25.0
+
+
+def test_bounded_historical_session_selector_rejects_capped_population(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_read(**_kwargs):
+        return BoundedFilterPage(
+            rows=[{"session_id": "must-not-escape", "start_time": END}],
+            has_more=True,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=26,
+            elapsed_ms=10,
+            query_count=2,
+            rows_returned=26,
+            result_payload_bytes=100,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="too large",
+    ):
+        row_resolver._resolve_bounded_historical_span_ids(
+            object(),
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "filters": [_attribute_filter("final_status", "Rejected")],
+                "date_range": [START, END],
+            },
+            limit=25,
+            batch_size=256,
+            row_type=RowType.SESSIONS,
+        )
 
 
 @pytest.mark.parametrize(
@@ -657,7 +769,7 @@ def test_configured_1m_task_returns_complete_small_population_deterministically(
     assert captured["page_size"] == 10_000
 
 
-@pytest.mark.parametrize("row_type", [RowType.SPANS, RowType.TRACES])
+@pytest.mark.parametrize("row_type", [RowType.SPANS, RowType.TRACES, RowType.SESSIONS])
 def test_task_at_10k_routes_directly_to_bounded_selector_without_legacy_sql(
     monkeypatch: pytest.MonkeyPatch,
     row_type: str,

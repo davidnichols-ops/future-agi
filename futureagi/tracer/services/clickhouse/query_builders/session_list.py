@@ -114,6 +114,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         sort_params: list[dict] | None = None,
         user_id: str | None = None,
         bounded_internal_scan: bool = False,
+        bounded_sampling_salt: str | None = None,
+        bounded_sampling_rate: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id=project_id, project_ids=project_ids, **kwargs)
@@ -123,6 +125,16 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         self.sort_params = sort_params or []
         self.user_id = user_id
         self._bounded_internal_scan = bool(bounded_internal_scan)
+        if (bounded_sampling_salt is None) != (bounded_sampling_rate is None):
+            raise ValueError(
+                "bounded_sampling_salt and bounded_sampling_rate must be paired"
+            )
+        if bounded_sampling_rate is not None and not (
+            0 <= float(bounded_sampling_rate) <= 100
+        ):
+            raise ValueError("bounded_sampling_rate must be between 0 and 100")
+        self._bounded_sampling_salt = bounded_sampling_salt
+        self._bounded_sampling_rate = bounded_sampling_rate
         self.start_date: datetime | None = None
         self.end_date: datetime | None = None
         # The default range is derived from ``utcnow``. Pin it once so the
@@ -670,8 +682,11 @@ class SessionListQueryBuilder(BaseQueryBuilder):
 
         if not self.supports_bounded_filter_scan():
             raise ValueError("unsupported bounded session filter scan")
-        if limit <= 0 or limit > 200:
-            raise ValueError("session seed limit must be between 1 and 200")
+        # Seed rows contain only the remap-resolved identity/order tuple. Eval
+        # population proofs may acquire the shared 512-row working set, while
+        # the latest-state classifier remains independently capped at 200.
+        if limit <= 0 or limit > 512:
+            raise ValueError("session seed limit must be between 1 and 512")
         if (before_start_time is None) != (before_id is None):
             raise ValueError("session keyset values must be provided together")
         request_start, request_end = self.parse_time_range(self.filters)
@@ -697,19 +712,27 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             if datetime_predicate
             else ""
         )
-        keyset_clause = ""
+        outer_predicates: list[str] = []
         if before_start_time is not None:
             if not slice_start <= before_start_time < slice_end:
                 raise ValueError("session keyset must stay inside its slice")
             params["filter_before_start_time"] = before_start_time
             params["filter_before_session_id"] = str(before_id)
-            keyset_clause = """
-            WHERE start_time < %(filter_before_start_time)s
-               OR (
-                   start_time = %(filter_before_start_time)s
-                   AND toString(session_id) < %(filter_before_session_id)s
-               )
-            """
+            outer_predicates.append(
+                "(start_time < %(filter_before_start_time)s OR ("
+                "start_time = %(filter_before_start_time)s AND "
+                "toString(session_id) < %(filter_before_session_id)s))"
+            )
+        if self._bounded_sampling_rate is not None:
+            params["bounded_sampling_salt"] = str(self._bounded_sampling_salt)
+            params["bounded_sampling_rate"] = float(self._bounded_sampling_rate)
+            outer_predicates.append(
+                "modulo(cityHash64(%(bounded_sampling_salt)s, "
+                "toString(session_id)), 100) < %(bounded_sampling_rate)s"
+            )
+        outer_where = (
+            f"WHERE {' AND '.join(outer_predicates)}" if outer_predicates else ""
+        )
 
         ts_map = survivor_map_subquery("trace_session_id_remap")
         resolved_session = resolved_id_expr("raw_trace_session_id", "seed_ts_remap")
@@ -739,7 +762,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         )
         SELECT session_id, start_time
         FROM seed_sessions
-        {keyset_clause}
+        {outer_where}
         ORDER BY start_time DESC, toString(session_id) DESC
         LIMIT %(filter_seed_limit)s
         """

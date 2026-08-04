@@ -223,7 +223,7 @@ def resolve_desired_rows(
         return ResolvedRowSet((), (), True)
 
     if (
-        task.row_type in (RowType.SPANS, RowType.TRACES)
+        task.row_type in (RowType.SPANS, RowType.TRACES, RowType.SESSIONS)
         and task.run_type == RunType.HISTORICAL
         and limit is not None
     ):
@@ -443,7 +443,7 @@ def _resolve_bounded_historical_span_ids(
     row_type: str = RowType.SPANS,
     include_trace_filter_witnesses: bool = False,
 ) -> list[str] | _BoundedHistoricalResult:
-    """Resolve a complete historical span/trace prefix with bounded CH reads.
+    """Resolve a complete historical span/trace/session set with bounded CH reads.
 
     Adjacent time slices produce only candidate identities. Every candidate is
     then reclassified against global latest state before it can be returned.
@@ -472,8 +472,10 @@ def _resolve_bounded_historical_span_ids(
 
     if limit <= 0:
         return resolved_result(())
-    if row_type not in (RowType.SPANS, RowType.TRACES):
-        raise ValueError("Bounded historical resolution supports spans and traces")
+    if row_type not in (RowType.SPANS, RowType.TRACES, RowType.SESSIONS):
+        raise ValueError(
+            "Bounded historical resolution supports spans, traces, and sessions"
+        )
     if not 0 <= float(sampling_rate) <= 100:
         raise ValueError("sampling_rate must be between 0 and 100")
 
@@ -495,7 +497,14 @@ def _resolve_bounded_historical_span_ids(
         for item in ui_filters
     )
     bounded_limit = min(limit, _EVAL_TASK_BUFFERED_ID_LIMIT)
-    requires_population_proof = limit > _EVAL_TASK_BUFFERED_ID_LIMIT
+    # Historical session tasks have always selected a deterministic ID-sorted
+    # population before LIMIT.  The bounded reader is newest-first, so a
+    # session task may use it only as a complete-population proof: exhaust the
+    # sampled set, sort the IDs below, and fail closed when the sentinel proves
+    # that the configured limit would truncate it.
+    requires_population_proof = (
+        row_type == RowType.SESSIONS or limit > _EVAL_TASK_BUFFERED_ID_LIMIT
+    )
     if not has_non_time_filter and not requires_population_proof:
         # The historical contract caps an ID-ascending deterministic prefix.
         # The bounded reader is newest-first so it can prove a filtered UI

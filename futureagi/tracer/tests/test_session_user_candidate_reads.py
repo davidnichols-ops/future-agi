@@ -211,6 +211,32 @@ def test_attribute_bulk_filter_uses_bounded_seed_and_latest_candidate_classifier
 
 
 @pytest.mark.unit
+def test_session_eval_seed_allows_shared_512_rows_but_classifier_stays_at_200():
+    now = datetime(2026, 7, 31, 12, 0)
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[*_window(now)],
+        bounded_internal_scan=True,
+    )
+
+    _, seed_params = builder.build_filter_seed_page(
+        slice_start=now - timedelta(minutes=5),
+        slice_end=now,
+        limit=512,
+    )
+
+    assert seed_params["filter_seed_limit"] == 512
+    with pytest.raises(ValueError, match="between 1 and 512"):
+        builder.build_filter_seed_page(
+            slice_start=now - timedelta(minutes=5),
+            slice_end=now,
+            limit=513,
+        )
+    with pytest.raises(ValueError, match="exceeds bounded limit"):
+        builder.build_filter_match_query([str(uuid.uuid4()) for _ in range(201)])
+
+
+@pytest.mark.unit
 def test_negated_end_user_bulk_filter_is_candidate_session_scoped():
     session_id = str(uuid.uuid4())
     end_user_id = str(uuid.uuid4())
