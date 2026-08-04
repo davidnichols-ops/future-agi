@@ -183,7 +183,13 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         """Choose the most selective safe raw-row witness deterministically."""
 
         candidates = [
-            (getattr(plan, "raw_witness_rank", 100), index, plan)
+            (
+                getattr(plan, "raw_witness_rank", None)
+                if getattr(plan, "raw_witness_rank", None) is not None
+                else 100,
+                index,
+                plan,
+            )
             for index, plan in enumerate(plans)
             if getattr(plan, "raw_witness_predicate", None) is not None
         ]

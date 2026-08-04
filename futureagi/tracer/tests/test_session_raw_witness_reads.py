@@ -106,6 +106,48 @@ def test_session_seed_prefers_indexed_scalar_when_json_filter_comes_first() -> N
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("filter_type", "value", "raw_expression"),
+    [
+        (
+            "map",
+            {"country": "CO"},
+            "JSONExtractRaw(attributes_extra, %(latest_filter_key_0)s)",
+        ),
+        (
+            "array",
+            ["vip", 3, True],
+            "JSONExtractArrayRaw(attributes_extra, %(latest_filter_key_0)s)",
+        ),
+    ],
+)
+def test_positive_json_only_filter_uses_a_raw_candidate_witness(
+    filter_type: str,
+    value: object,
+    raw_expression: str,
+) -> None:
+    builder = _builder(
+        _attribute_filter(
+            "customer_context",
+            value,
+            filter_type=filter_type,
+            operation="contains",
+        )
+    )
+
+    sql, params = builder.build_filter_seed_page(
+        slice_start=END - timedelta(minutes=5),
+        slice_end=END,
+        limit=200,
+    )
+
+    assert "JSONHas(attributes_extra, %(latest_filter_key_0)s)" in sql
+    assert raw_expression in sql
+    assert sql.index(raw_expression) < sql.index("GROUP BY session_id")
+    assert params["latest_filter_key_0"] == "customer_context"
+
+
+@pytest.mark.unit
 def test_negative_only_session_filter_does_not_claim_a_raw_witness() -> None:
     builder = _builder(
         _attribute_filter(
