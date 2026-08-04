@@ -1759,6 +1759,162 @@ def test_dense_typed_value_sample_stops_before_json_lane():
     assert "attrs_string[%(attribute_key)s]" not in presence_call.sql
 
 
+def test_typed_value_presence_narrows_hydration_to_active_identities():
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            span_id,
+            trace_id=f"trace-{span_id}",
+            start_time=NOW - timedelta(hours=1, seconds=index),
+        )
+        for index, span_id in enumerate(
+            (
+                "active-string",
+                "active-number",
+                "active-boolean",
+                "cleared-one",
+                "cleared-two",
+                "tombstoned-one",
+                "tombstoned-two",
+                "cleared-three",
+                "truncation-sentinel",
+            )
+        )
+    ]
+    by_id = {str(row["id"]): row for row in candidates}
+    active_ids = {"active-string", "active-number", "active-boolean"}
+    tombstoned_ids = {"tombstoned-one", "tombstoned-two"}
+
+    def presence_row(span_id: str) -> dict[str, Any]:
+        candidate = by_id[span_id]
+        return {
+            "project_id": PROJECT_A,
+            "trace_id": candidate["trace_id"],
+            "id": span_id,
+            "start_time": candidate["start_time"],
+            "is_deleted": int(span_id in tombstoned_ids),
+            "string_present": span_id == "active-string",
+            "number_present": span_id == "active-number",
+            "boolean_present": span_id == "active-boolean",
+        }
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            return candidates
+        requested_ids = call.params["candidate_ids_0"]
+        if "attrs_string.keys" in call.sql:
+            # Match the real presence projection: never leak values into the
+            # mock response that could conceal a missing hydration query.
+            return [presence_row(span_id) for span_id in requested_ids]
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=by_id[span_id]["trace_id"],
+                start_time=by_id[span_id]["start_time"],
+                string="Rejected" if span_id == "active-string" else None,
+                number=42 if span_id == "active-number" else None,
+                boolean=True if span_id == "active-boolean" else None,
+            )
+            for span_id in requested_ids
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+    ).read_values(
+        [PROJECT_A],
+        "final_status",
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert {(row.value, row.type, row.count) for row in read.rows} == {
+        ("Rejected", "string", 1),
+        (42.0, "number", 1),
+        (True, "boolean", 1),
+    }
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
+    assert read.metadata.query_count == 3
+
+    presence_call = executor.calls[1]
+    hydration_call = executor.calls[2]
+    for family in ("string", "number", "bool"):
+        assert f"has(attrs_{family}.keys, %(attribute_key)s)" in presence_call.sql
+        assert f"attrs_{family}[%(attribute_key)s]" not in presence_call.sql
+        assert f"attrs_{family}[%(attribute_key)s]" in hydration_call.sql
+
+    expected_active_identities = {
+        (
+            by_id[span_id]["trace_id"],
+            span_id,
+            _unix_microseconds(by_id[span_id]["start_time"]),
+        )
+        for span_id in active_ids
+    }
+    assert (
+        set(hydration_call.params["candidate_physical_identities_0"])
+        == expected_active_identities
+    )
+    assert set(hydration_call.params["candidate_ids_0"]) == active_ids
+
+
+def test_typed_value_all_stale_candidates_skip_value_hydration():
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            span_id,
+            trace_id=f"trace-{span_id}",
+            start_time=NOW - timedelta(hours=1, seconds=index),
+        )
+        for index, span_id in enumerate(("cleared", "tombstoned"))
+    ]
+    by_id = {str(row["id"]): row for row in candidates}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            return candidates
+        return [
+            {
+                "project_id": PROJECT_A,
+                "trace_id": by_id[span_id]["trace_id"],
+                "id": span_id,
+                "start_time": by_id[span_id]["start_time"],
+                "is_deleted": int(span_id == "tombstoned"),
+                "string_present": False,
+                "number_present": False,
+                "boolean_present": False,
+            }
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+    ).read_values(
+        [PROJECT_A],
+        "final_status",
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert read.rows == ()
+    assert read.metadata.query_status == "complete"
+    assert read.metadata.query_count == 2
+    assert len(executor.calls) == 2
+    presence_call = executor.calls[1]
+    assert "attrs_string.keys" in presence_call.sql
+    assert all(
+        f"attrs_{family}[%(attribute_key)s]" not in presence_call.sql
+        for family in ("string", "number", "bool")
+    )
+
+
 def test_explicit_window_json_value_runs_after_empty_typed_probe():
     json_emitted = False
 

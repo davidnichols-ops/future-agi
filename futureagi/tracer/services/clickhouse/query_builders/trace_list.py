@@ -80,12 +80,6 @@ _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE = 20
 # selector still enforces its independent 256 MiB/512 MiB memory/read caps and
 # fails closed on either limit.
 _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE = 100
-# A single positive typed-Map witness already prunes the candidate population
-# through the existing key bloom.  Production A/B showed that combining two
-# 100-root identity-only classifier reads stays below the 512 MiB statement
-# cap while removing enough round trips to preserve the list wall deadline
-# under load. JSON, negative and multi-filter shapes retain the smaller batch.
-_NORMAL_LIST_WITNESS_CLASSIFY_BATCH_SIZE = 200
 
 # A long-window list gets a small, partitioned sparse-value proof before it
 # enters the ordered-root fallback. Sixty-four is one global exhaustiveness
@@ -521,11 +515,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # this recommendation isolated from graph/eval/task builders, which set
         # bounded_identity_only explicitly and must retain their old batches.
         if not self._bounded_identity_only and not self._bounded_internal_scan:
-            if (
-                request_end - request_start > timedelta(hours=1)
-                and self._candidate_witness_anchor_plan() is not None
-            ):
-                return _NORMAL_LIST_WITNESS_CLASSIFY_BATCH_SIZE
             return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
         return 50
 
