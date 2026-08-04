@@ -513,6 +513,115 @@ def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
     assert builder.recommended_filter_classify_batch_size() == 20
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
+    assert (
+        builder.supports_filter_candidate_witness_prefilter_without_hydration() is False
+    )
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
+
+
+def test_eval_trace_membership_only_classifier_can_prefilter_typed_map_candidates() -> (
+    None
+):
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(days=14), END),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+        ],
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+    )
+
+    assert builder.recommended_filter_classify_batch_size() == 100
+    assert (
+        builder.supports_filter_candidate_witness_prefilter_without_hydration() is True
+    )
+    assert builder.prefer_filter_candidate_witness_probe_first() is True
+    probe_sql, probe_params = builder.build_filter_candidate_witness_probe(
+        [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
+    )
+    assert "SELECT DISTINCT trace_id" in probe_sql
+    assert "trace_id IN %(filter_candidate_trace_ids)s" in probe_sql
+    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in probe_sql
+    assert "argMax(" not in probe_sql
+    assert probe_params["filter_candidate_trace_ids"] == ("trace-a", "trace-b")
+
+
+@pytest.mark.parametrize(
+    ("filters", "extra_kwargs"),
+    [
+        (
+            [
+                _time_filter(),
+                _attribute_filter("final_status", "Rejected", operation="not_equals"),
+            ],
+            {},
+        ),
+        (
+            [
+                _time_filter(),
+                _attribute_filter("payload", {"state": "Rejected"}, filter_type="map"),
+            ],
+            {},
+        ),
+        (
+            [
+                _time_filter(),
+                _attribute_filter("final_status", "Rejected"),
+                _attribute_filter("country", "ES"),
+            ],
+            {},
+        ),
+        ([_time_filter(), _system_filter("trace_name", "checkout")], {}),
+        ([_time_filter(), _annotation_filter("label-a", "Rejected")], {}),
+        (
+            [_time_filter(), _attribute_filter("final_status", "Rejected")],
+            {"search": "checkout"},
+        ),
+        (
+            [_time_filter(), _attribute_filter("final_status", "Rejected")],
+            {"bounded_include_filter_witnesses": True},
+        ),
+        (
+            [_time_filter(), _attribute_filter("final_status", "Rejected")],
+            {"bounded_population_proof": True},
+        ),
+    ],
+    ids=[
+        "negative",
+        "json",
+        "multifilter",
+        "root",
+        "residual",
+        "search",
+        "witness-carrying",
+        "population-proof",
+    ],
+)
+def test_eval_trace_candidate_prefilter_rejects_non_membership_only_shapes(
+    filters: list[dict[str, Any]],
+    extra_kwargs: dict[str, Any],
+) -> None:
+    builder_kwargs = {
+        "bounded_internal_scan": True,
+        "bounded_identity_only": True,
+        "bounded_bulk_scan": True,
+        "bounded_include_filter_witnesses": False,
+        **extra_kwargs,
+    }
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=filters,
+        **builder_kwargs,
+    )
+
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
+    assert builder.build_filter_candidate_witness_probe([{"trace_id": "trace-a"}]) == (
+        "",
+        {},
+    )
 
 
 def test_eval_trace_any_span_large_prefix_fails_closed_at_query_ceiling() -> None:
@@ -3516,6 +3625,23 @@ class _CandidateWitnessHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
         return "prefilter", {"candidate_ids": tuple(row["id"] for row in rows)}
 
 
+@dataclass
+class _CandidateWitnessUnhydratedFakeBuilder(_FakeBuilder):
+    """Model the membership-only eval selector's final identity projection."""
+
+    @staticmethod
+    def supports_filter_candidate_witness_prefilter_without_hydration():
+        return True
+
+    @staticmethod
+    def prefer_filter_candidate_witness_probe_first():
+        return True
+
+    @staticmethod
+    def build_filter_candidate_witness_probe(rows):
+        return "prefilter", {"candidate_ids": tuple(row["id"] for row in rows)}
+
+
 class _CandidateWitnessHydrationFakeExecutor(_IdentityHydrationFakeExecutor):
     def __init__(
         self,
@@ -6302,6 +6428,95 @@ def test_sparse_candidates_are_prefiltered_before_full_window_classification() -
         "prefilter",
         "classify",
     ]
+
+
+def test_unhydrated_membership_selector_returns_only_exact_prefilter_survivors() -> (
+    None
+):
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(6)
+    ]
+    exact_row = rows[2]
+    builder = _CandidateWitnessUnhydratedFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        # The raw probe also returns one stale witness. Only the exact latest-
+        # state classifier may publish a selector identity.
+        match_rows=[exact_row],
+        recommended_batch_size=2,
+        recommended_seed_batch_size=6,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        witness_ids={"trace-2", "trace-4"},
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.rows == [exact_row]
+    assert [query for query, _ in executor.calls] == ["seed", "prefilter", "match"]
+    assert executor.calls[-1][1]["candidate_ids"] == ("trace-2", "trace-4")
+    assert [attempt.kind for attempt in page.attempts] == [
+        "seed",
+        "prefilter",
+        "classify",
+    ]
+
+
+def test_unhydrated_membership_prefilter_failure_falls_back_to_exact_classifier() -> (
+    None
+):
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(4)
+    ]
+    builder = _CandidateWitnessUnhydratedFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=[rows[1]],
+        recommended_batch_size=4,
+        recommended_seed_batch_size=4,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        fail_prefilter=True,
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.rows == [rows[1]]
+    assert [query for query, _ in executor.calls] == ["seed", "prefilter", "match"]
+    assert executor.calls[-1][1]["candidate_ids"] == tuple(row["id"] for row in rows)
+    assert page.attempts[1].error_code == "read_budget_exceeded"
 
 
 def test_broad_candidate_witness_prefilter_falls_through_to_exact_classifier() -> None:

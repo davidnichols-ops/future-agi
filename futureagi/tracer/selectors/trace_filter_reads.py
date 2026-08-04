@@ -388,6 +388,11 @@ def read_bounded_filter_page(
         "prefer_filter_candidate_witness_probe_first",
         None,
     )
+    unhydrated_candidate_witness_capability = getattr(
+        builder,
+        "supports_filter_candidate_witness_prefilter_without_hydration",
+        None,
+    )
     hydration_identity_builder = getattr(
         builder, "bounded_filter_page_hydration_identity", None
     )
@@ -399,6 +404,15 @@ def read_bounded_filter_page(
         and not defer_classification
         and callable(identity_classification_capability)
         and bool(identity_classification_capability())
+    )
+    unhydrated_candidate_witness_prefilter = bool(
+        not include_incomplete_rows
+        and not defer_classification
+        and callable(unhydrated_candidate_witness_capability)
+        and unhydrated_candidate_witness_capability()
+    )
+    candidate_witness_prefilter_allowed = bool(
+        identity_only_classification or unhydrated_candidate_witness_prefilter
     )
     if identity_only_classification and not (
         callable(identity_match_builder)
@@ -633,7 +647,7 @@ def read_bounded_filter_page(
     )
     candidate_witness_probe_enabled = bool(
         probe_limits_enforced
-        and identity_only_classification
+        and candidate_witness_prefilter_allowed
         and callable(candidate_witness_probe_builder)
         and callable(candidate_witness_probe_preference)
         and candidate_witness_probe_preference()
@@ -849,6 +863,8 @@ def read_bounded_filter_page(
         if defer_classification:
             deferred_candidate_by_id.update(candidate_seed_rows)
             return False
+        if not candidate_identities:
+            return False
 
         probe_classified_tail: Hashable | None = None
         prefilter_query_reserve = (
@@ -868,7 +884,7 @@ def read_bounded_filter_page(
             candidate_witness_probe_enabled = False
             candidate_witness_probe_abandoned = True
         if (
-            identity_only_classification
+            candidate_witness_prefilter_allowed
             and candidate_witness_probe_enabled
             and callable(candidate_witness_probe_builder)
         ):

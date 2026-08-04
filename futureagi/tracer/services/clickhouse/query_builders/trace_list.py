@@ -770,9 +770,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def _candidate_witness_anchor_plan(self) -> LatestFilterPredicate | None:
         """Return the raw predicate that is a complete candidate superset."""
 
+        unsupported_internal_mode = (
+            self._bounded_identity_only or self._bounded_internal_scan
+        ) and not self.supports_filter_candidate_witness_prefilter_without_hydration()
         if (
-            self._bounded_identity_only
-            or self._bounded_internal_scan
+            unsupported_internal_mode
             or self._bounded_membership_filters is not None
             or self.search
         ):
@@ -811,6 +813,28 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         ):
             return None
         return anchor
+
+    def supports_filter_candidate_witness_prefilter_without_hydration(self) -> bool:
+        """Allow one membership-only historical trace selector optimization.
+
+        The raw witness probe is safe without page hydration only for the
+        exact internal bulk mode whose classifier already returns its final
+        identity/order projection. Witness-carrying and population proofs keep
+        their established one/two-phase protocols, and graph membership-window
+        scans retain their wider temporal contract.
+        """
+
+        return bool(
+            self._bounded_internal_scan
+            and self._bounded_identity_only
+            and self._bounded_bulk_scan
+            and not self._bounded_include_filter_witnesses
+            and not self._bounded_population_proof
+            and self._bounded_membership_filters is None
+            and self.project_id is not None
+            and self.project_ids is None
+            and not self.search
+        )
 
     def prefer_filter_candidate_witness_probe_first(self) -> bool:
         """Prefer the indexed witness superset before a long-window argMax scan."""
