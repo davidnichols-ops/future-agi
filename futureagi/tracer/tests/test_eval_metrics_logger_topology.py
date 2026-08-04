@@ -115,31 +115,34 @@ def _raw_builder(
     ],
 )
 @pytest.mark.parametrize(
-    ("logger_table", "live_predicate", "foreign_live_column"),
+    ("logger_table", "live_predicate", "foreign_live_columns"),
     [
         (
             "tracer_eval_logger",
             "raw_eval_logger._peerdb_is_deleted = 0 AND "
             "(raw_eval_logger.deleted = 0 OR raw_eval_logger.deleted IS NULL)",
-            "raw_eval_logger.is_deleted = 0",
+            ("raw_eval_logger.is_deleted = 0",),
         ),
         (
             "tracer_eval_logger_v2",
             "raw_eval_logger.is_deleted = 0",
-            "raw_eval_logger._peerdb_is_deleted",
+            (
+                "raw_eval_logger._peerdb_is_deleted",
+                "raw_eval_logger.deleted",
+            ),
         ),
     ],
 )
-def test_raw_terminal_graph_uses_configured_logger_without_project_column(
+def test_v2_raw_terminal_graph_uses_configured_authoritative_logger(
     settings,
     output_type,
     canonical_type,
     metric_expression,
     logger_table,
     live_predicate,
-    foreign_live_column,
+    foreign_live_columns,
 ):
-    """Reproduce the three production Code 47 terminal graph failures."""
+    """CH25 graphs preserve the selected eval logger's physical schema."""
 
     settings.CH25_EVAL_LOGGER_TABLE = logger_table
 
@@ -148,7 +151,8 @@ def test_raw_terminal_graph_uses_configured_logger_without_project_column(
 
     assert f"FROM {logger_table} AS raw_eval_logger FINAL" in normalized
     assert live_predicate in normalized
-    assert foreign_live_column not in normalized
+    for foreign_live_column in foreign_live_columns:
+        assert foreign_live_column not in normalized
     assert metric_expression in normalized
     assert normalize_eval_output_type(output_type) == canonical_type
     # Neither physical logger has project_id. The config UUID is the authorized
@@ -161,6 +165,41 @@ def test_raw_terminal_graph_uses_configured_logger_without_project_column(
     assert params["start_date"] == START
     assert params["end_date"] == END
     assert EVAL_CONFIG_ID not in query
+
+
+@pytest.mark.unit
+def test_v2_eval_graph_uses_raw_authoritative_table_even_when_rollup_requested(
+    settings,
+):
+    """The insertion-only eval rollup is not authoritative for this path."""
+
+    settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
+    builder = EvalMetricsQueryBuilderV2(
+        custom_eval_config_id=EVAL_CONFIG_ID,
+        project_id=PROJECT_ID,
+        start_date=START,
+        end_date=END,
+        interval="day",
+        eval_output_type="SCORE",
+        use_preaggregated=True,
+    )
+
+    query, _ = builder.build()
+
+    assert "FROM tracer_eval_logger AS raw_eval_logger FINAL" in query
+    assert "raw_eval_logger._peerdb_is_deleted = 0" in query
+    assert "eval_metrics_hourly" not in query
+
+
+@pytest.mark.unit
+def test_v2_eval_graph_defaults_to_legacy_authoritative_table(settings):
+    del settings.CH25_EVAL_LOGGER_TABLE
+
+    query, _ = _raw_builder("SCORE").build()
+
+    assert "FROM tracer_eval_logger AS raw_eval_logger FINAL" in query
+    assert "raw_eval_logger._peerdb_is_deleted = 0" in query
+    assert "raw_eval_logger.is_deleted = 0" not in query
 
 
 @pytest.mark.unit
@@ -182,8 +221,8 @@ def test_v1_legacy_raw_eval_graph_includes_cdc_tombstone_guard(settings):
 
 
 @pytest.mark.unit
-def test_filtered_raw_graph_keeps_project_scope_on_span_candidates(settings):
-    """Removing the nonexistent logger column must not remove tenant scope."""
+def test_filtered_raw_graph_fails_closed_to_bounded_dispatch(settings):
+    """A caller cannot reintroduce the removed full-window spans scan."""
 
     settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
     filters = [
@@ -198,19 +237,8 @@ def test_filtered_raw_graph_keeps_project_scope_on_span_candidates(settings):
         }
     ]
 
-    query, params = _raw_builder("SCORE", filters=filters).build()
-    normalized = " ".join(query.split())
-    logger_scope, candidate_scope = normalized.split(
-        "AND trace_id IN (SELECT DISTINCT trace_id FROM spans", 1
-    )
-
-    assert "project_id" not in logger_scope
-    assert "custom_eval_config_id = toUUID(%(eval_config_id)s)" in logger_scope
-    assert "WHERE project_id = %(project_id)s AND is_deleted = 0" in candidate_scope
-    assert "lowerUTF8(toString(status)) =" in candidate_scope
-    assert params["project_id"] == PROJECT_ID
-    assert params["eval_config_id"] == EVAL_CONFIG_ID
-    assert "ok" in params.values()
+    with pytest.raises(ValueError, match="bounded graph dispatcher"):
+        _raw_builder("SCORE", filters=filters).build()
 
 
 @pytest.mark.unit

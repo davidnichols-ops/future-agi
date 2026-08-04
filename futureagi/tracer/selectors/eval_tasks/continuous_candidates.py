@@ -19,9 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from tracer.models.eval_task import RowType
-from tracer.services.clickhouse.eval_logger_table import (
-    eval_logger_source,
-)
+from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.v2.id_remap_sql import (
     NIL_UUID,
     resolved_id_expr,
@@ -373,6 +371,9 @@ def _read_changed_eval_refs(
     ceiling: datetime,
     budget: _ReadBudget,
 ) -> list[tuple[str, str, str]]:
+    # Eval results are co-located with CH25 spans, but production may retain
+    # the legacy physical table name while writing there directly. Follow the
+    # authoritative storage selector rather than assuming the empty v2 table.
     table, _ = eval_logger_source()
     if table.endswith("_v2"):
         arrival_column = "_version"

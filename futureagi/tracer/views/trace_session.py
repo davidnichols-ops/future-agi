@@ -37,6 +37,7 @@ from django.http import FileResponse, Http404
 from django.utils import timezone
 from rest_framework import status as drf_status
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
@@ -67,6 +68,7 @@ from tracer.selectors.trace_filter_reads import (
 from tracer.serializers.eval_task import PaginationQuerySerializer
 from tracer.serializers.filters import (
     ObserveGraphDataErrorResponseSerializer,
+    ObserveGraphDataQuerySerializer,
     ObserveGraphDataResponseSerializer,
     PageDepthExceededErrorSerializer,
 )
@@ -86,20 +88,28 @@ from tracer.services.clickhouse.filter_value_reads import (
 from tracer.services.clickhouse.graph_dispatch import (
     degraded_graph_response,
     enforce_exact_graph_data_contract,
+    graph_payload_is_publishable,
 )
 from tracer.services.clickhouse.query_builders.base import NIL_UUID, BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.eval_status import (
     non_terminal_eval_marker,
 )
+from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.read_budget import (
     ReadDeadline,
     ReadDeadlineExceeded,
+    is_clickhouse_api_read_unavailable_error,
     is_clickhouse_query_error,
     is_read_budget_error,
 )
 from tracer.services.clickhouse.session_graph import (
     SESSION_SYSTEM_METRICS,
     fetch_session_graph_ch,
+)
+from tracer.services.clickhouse.v2.query_builders.session_list import (
+    SessionListQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.utils.filters import FilterEngine, apply_created_at_filters
@@ -131,6 +141,11 @@ SESSION_LIST_READ_SETTINGS = {
 }
 SESSION_LIST_RESULT_BYTES = 32 * 1024 * 1024
 SESSION_LIST_ATTRIBUTE_RESULT_ROWS = 50_000
+SESSION_GRAPH_RETRYABLE_ERROR_CODES = {
+    "deadline_exceeded",
+    "read_budget_exceeded",
+    "sample_limit",
+}
 
 
 def _session_read_settings(*, max_result_rows: int) -> dict[str, int | str]:
@@ -801,18 +816,31 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 }
             )
 
-        # Resolve eval-config IDs in CH (avoids a tracer_eval_logger PG
-        # scan that grows linearly with eval traffic), then fetch the
-        # PG metadata by primary key.
+        # The eval table has no project_id and customer trace IDs are not
+        # globally unique. Resolve the project's config IDs in Postgres first,
+        # then require both that candidate set and the page's trace IDs during
+        # CH discovery. A bare trace-id read could otherwise discover another
+        # project's eval when both projects use the same trace ID.
         trace_ids = [r["trace_id"] for r in traces_data]
         eval_configs: list = []
         if trace_ids:
+            candidate_config_ids = [
+                str(config_id)
+                for config_id in CustomEvalConfig.objects.filter(
+                    project_id=project_id,
+                    deleted=False,
+                ).values_list("id", flat=True)
+            ]
             # A CH read failure must surface (via retrieve()'s outer error
             # handler), not fail open to "this session has no eval scores".
-            pre_config_ids = analytics.get_eval_config_ids_for_traces_ch(trace_ids)
+            pre_config_ids = analytics.get_eval_config_ids_for_traces_ch(
+                trace_ids,
+                candidate_config_ids,
+            )
             if pre_config_ids:
                 eval_configs = list(
                     CustomEvalConfig.objects.filter(
+                        project_id=project_id,
                         id__in=pre_config_ids,
                         deleted=False,
                     ).select_related("eval_template")
@@ -1059,35 +1087,38 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         page_size=page_size,
                     )
                 except Exception as exc:
-                    if not (
-                        is_read_budget_error(exc) or is_clickhouse_query_error(exc)
-                    ):
+                    if not is_clickhouse_api_read_unavailable_error(exc):
                         raise
-                    error_code = (
-                        "read_budget_exceeded"
-                        if is_read_budget_error(exc)
-                        else "query_failed"
-                    )
                     session_logger.warning(
-                        "session_message_filter_values_degraded",
+                        "session_message_filter_values_unavailable",
                         column=column,
-                        error_code=error_code,
                         error_type=type(exc).__name__,
                     )
-                    return self._gm.success_response(
-                        {
-                            "values": [],
-                            "next": False,
-                            "query_complete": False,
-                            "query_status": "degraded",
-                            "query_error_code": error_code,
-                        }
+                    return self._gm.custom_error_response(
+                        drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Session filter values are temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
+                value_metadata = value_read.metadata()
+                if not value_read.query_complete and (
+                    value_read.query_error_code != "sample_limit"
+                    or not value_read.values
+                ):
+                    session_logger.warning(
+                        "session_message_filter_values_incomplete",
+                        column=column,
+                        error_code=value_read.query_error_code,
+                    )
+                    return self._gm.custom_error_response(
+                        drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Session filter values are temporarily unavailable. Please retry.",
+                        code="service_unavailable",
                     )
                 return self._gm.success_response(
                     {
                         "values": list(value_read.values),
                         "next": value_read.has_more,
-                        **value_read.metadata(),
+                        **value_metadata,
                     }
                 )
 
@@ -1134,7 +1165,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.success_response({"values": values})
 
         except Exception as exc:
-            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+            if is_clickhouse_api_read_unavailable_error(exc):
                 session_logger.warning(
                     "session_filter_values_query_unavailable",
                     error_type=type(exc).__name__,
@@ -1148,9 +1179,14 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 "session_filter_values_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Session filter values could not be loaded")
+            return self._gm.custom_error_response(
+                drf_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Session filter values could not be loaded",
+                code="server_error",
+            )
 
     @validated_request(
+        query_serializer=ObserveGraphDataQuerySerializer,
         request_serializer=TraceSessionGraphDataRequestSerializer,
         responses={
             200: ObserveGraphDataResponseSerializer,
@@ -1174,6 +1210,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         """
         try:
             body = request.validated_data
+            allow_sampled = request.validated_query_data["allow_sampled"]
             project_id = str(body["project_id"])
             project = _project_queryset_for_request(request).get(id=project_id)
             req_data_config = body["req_data_config"]
@@ -1214,30 +1251,42 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     req_data_config=req_data_config,
                 )
             except Exception as exc:
-                if (
-                    isinstance(exc, BoundedGraphReadError)
-                    or is_read_budget_error(exc)
-                    or is_clickhouse_query_error(exc)
-                ):
-                    session_logger.warning(
-                        "session_graph_query_degraded",
-                        project_id=project_id,
-                        metric_type=metric_type,
-                        metric_id=metric_id,
-                        error_type=type(exc).__name__,
-                    )
-                    graph = degraded_graph_response(metric_id, exc)
-                else:
+                if isinstance(exc, BoundedGraphReadError):
+                    if exc.error_code == "unsupported_filter_shape":
+                        raise UnsupportedFilterShapeError(
+                            "session graph filter configuration is invalid"
+                        ) from None
+                    if not (
+                        exc.error_code in SESSION_GRAPH_RETRYABLE_ERROR_CODES
+                        or exc.retryable
+                    ):
+                        raise
+                elif not is_clickhouse_api_read_unavailable_error(exc):
                     raise
+                session_logger.warning(
+                    "session_graph_query_degraded",
+                    project_id=project_id,
+                    metric_type=metric_type,
+                    metric_id=metric_id,
+                    error_type=type(exc).__name__,
+                )
+                graph = degraded_graph_response(metric_id, exc)
 
             graph = enforce_exact_graph_data_contract(graph)
 
-            # An incomplete/truncated/error graph is never an exact empty success.
-            # Keep the stable graph metadata in the error envelope so the frontend
-            # can show a retryable state without exposing ClickHouse diagnostics.
-            if graph.get("query_complete") is not True:
+            # A fully executed, explicitly labelled sample is a usable bounded
+            # graph response. Partial/failed reads remain a typed retryable error
+            # with no ClickHouse diagnostics exposed to the frontend.
+            if not graph_payload_is_publishable(
+                graph,
+                allow_sampled=allow_sampled,
+            ):
                 graph = {
                     **graph,
+                    "data": [],
+                    "query_complete": False,
+                    "query_status": "degraded",
+                    "query_sampled": False,
                     "message": (
                         "Session graph data is temporarily unavailable. Please retry."
                     ),
@@ -1250,12 +1299,13 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.success_response(graph)
         except Project.DoesNotExist:
             return self._gm.bad_request("Project not found")
+        except UnsupportedFilterShapeError:
+            return self._gm.bad_request("Graph filter configuration is invalid")
         except Exception as exc:
-            if (
-                isinstance(exc, BoundedGraphReadError)
-                or is_read_budget_error(exc)
-                or is_clickhouse_query_error(exc)
-            ):
+            bounded_retryable = isinstance(exc, BoundedGraphReadError) and (
+                exc.error_code in SESSION_GRAPH_RETRYABLE_ERROR_CODES or exc.retryable
+            )
+            if bounded_retryable or is_clickhouse_api_read_unavailable_error(exc):
                 session_logger.warning(
                     "session_graph_query_unavailable",
                     error_type=type(exc).__name__,
@@ -1269,7 +1319,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 "session_graph_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Session graph data could not be loaded")
+            return self._gm.custom_error_response(
+                drf_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Session graph data could not be loaded",
+                code="server_error",
+            )
 
     @validated_request(
         query_serializer=TraceSessionListQuerySerializer,
@@ -1372,12 +1426,10 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             ).empty:
                 return self._empty_session_list_response(project, export=export)
 
-            # ClickHouse dispatch
-            from tracer.services.clickhouse.query_service import (
-                AnalyticsQueryService,
-            )
-
-            analytics = AnalyticsQueryService()
+            # Sessions are direct-write CH25 telemetry. Bind the endpoint and
+            # its bookmark-remap read to the matching service explicitly; the
+            # legacy CDC builder/service is not a fallback or routing option.
+            analytics = V2AnalyticsQueryService()
             read_deadline = ReadDeadline.start(SESSION_LIST_WALL_DEADLINE_MS)
             bookmarked = validated_data.get("bookmarked")
 
@@ -1408,6 +1460,8 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     bookmark_filter=bookmark_filter,
                     read_deadline=read_deadline,
                 )
+            except UnsupportedFilterShapeError:
+                raise
             except Exception as e:
                 logger.exception(
                     "ClickHouse session-list failed",
@@ -1763,8 +1817,10 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
         except Project.DoesNotExist:
             return self._gm.bad_request("Project not found")
+        except UnsupportedFilterShapeError:
+            return self._gm.bad_request("Session filter configuration is invalid")
         except Exception as exc:
-            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+            if is_clickhouse_api_read_unavailable_error(exc):
                 session_logger.warning(
                     "session_list_query_unavailable",
                     error_type=type(exc).__name__,
@@ -1778,7 +1834,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 "session_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Session data could not be loaded")
+            return self._gm.custom_error_response(
+                drf_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Session data could not be loaded",
+                code="server_error",
+            )
 
     @staticmethod
     def _build_row(span, needs_first_last, end_user_map, session_name_map=None):
@@ -2266,14 +2326,6 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         ``TraceSessionOverlay``) that implements the three-state ``bookmarked``
         flag against the CH path (DESIGN §5.2). ``None`` ⇒ no bookmark filtering.
         """
-        # v1↔v2 dispatch — flips with CH25_QUERY_TYPES_V2_PRIMARY=SESSION_LIST
-        from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-        from tracer.services.clickhouse.v2.query_service import (
-            query_service_for_builder,
-        )
-
-        BuilderCls = get_query_builder_class("SESSION_LIST")  # noqa: N806
-        analytics = query_service_for_builder("SESSION_LIST", BuilderCls, analytics)
         if read_deadline is None:
             read_deadline = ReadDeadline.start(SESSION_LIST_WALL_DEADLINE_MS)
 
@@ -2413,7 +2465,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         if bookmark_filter is not None:
             filters.append(bookmark_filter)
 
-        builder = BuilderCls(
+        builder = SessionListQueryBuilderV2(
             project_id=None if org_scope else str(project_id),
             project_ids=[str(p) for p in org_project_ids] if org_scope else None,
             filters=filters,
@@ -2433,12 +2485,17 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         candidate_first = builder.supports_candidate_first_page()
         bounded_page = None
         if not candidate_first and not builder.supports_bounded_filter_scan():
+            degraded_error_code = builder.bounded_filter_degraded_error_code()
             logger.warning(
                 "bounded_session_list_shape_unsupported",
                 filter_count=len(filters),
                 sort_count=len(sort_params),
-                error_code=builder.bounded_filter_degraded_error_code(),
+                error_code=degraded_error_code,
             )
+            if degraded_error_code == "unsupported_filter_shape":
+                raise UnsupportedFilterShapeError(
+                    "session filter configuration is invalid"
+                )
             return self._gm.custom_error_response(
                 drf_status.HTTP_503_SERVICE_UNAVAILABLE,
                 "This session filter or sort is temporarily unavailable. Please retry shortly.",
@@ -2796,6 +2853,14 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     "query_error_code": bounded_page.error_code,
                 }
             )
+        if metadata.get("total_rows_is_lower_bound") and not validated_data.get(
+            "allow_sampled", False
+        ):
+            return self._gm.custom_error_response(
+                drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Session data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
 
         return self._gm.success_response(
             {
@@ -3021,7 +3086,9 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 "session_export_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Sessions could not be exported")
+            return self._gm.internal_server_error_response(
+                "Sessions could not be exported"
+            )
 
     @action(detail=True, methods=["get"])
     def eval_logs(self, request, *args, **kwargs):
@@ -3065,17 +3132,14 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             page = qp.validated_data["page"]
             page_size = qp.validated_data["page_size"]
 
-            # Query CH tracer_eval_logger_v2 for session-level eval logs.
+            # Query the authoritative eval table through the CH25 connection.
             from tracer.services.clickhouse.eval_logger_table import (
                 eval_logger_live_state_columns,
                 eval_logger_source,
                 eval_logger_version_column,
             )
-            from tracer.services.clickhouse.query_service import (
-                AnalyticsQueryService,
-            )
 
-            analytics = AnalyticsQueryService()
+            analytics = V2AnalyticsQueryService()
             el_table, _ = eval_logger_source()
             _, el_pred = eval_logger_source(
                 "latest_eval", include_cdc_tombstone_guard=True
@@ -3131,8 +3195,6 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         eval_explanation,
                         results_explanation,
                         target_type,
-                        status AS eval_status,
-                        skipped_reason,
                         created_at
                     FROM (
                         SELECT
@@ -3146,8 +3208,6 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                             eval_scan.eval_explanation,
                             eval_scan.results_explanation,
                             eval_scan.target_type,
-                            eval_scan.status,
-                            eval_scan.skipped_reason,
                             eval_scan.created_at,
                             {live_projection}
                         FROM {el_table} AS eval_scan
@@ -3190,24 +3250,10 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     output_bool = log.get("output_bool")
                     output_float = log.get("output_float")
                     output_str = log.get("output_str")
-                    # Real EvalLogger lifecycle status (pending/running/
-                    # completed/errored/skipped) — distinct from the derived
-                    # display ``status`` below.
-                    eval_status = (log.get("eval_status") or "").lower()
-
-                    if error or eval_status == "errored":
+                    if error:
                         result_label = "Error"
                         score_val = None
                         status = "error"
-                    elif eval_status in ("pending", "running", "skipped"):
-                        # Lifecycle status wins over the output columns: a
-                        # non-terminal row can still carry stale/coerced output
-                        # (the CH mirror stores 0 for a NULL bool), so deriving
-                        # from output here would mislabel a queued/running eval
-                        # as a real Pass/Fail. Reflect the lifecycle state.
-                        result_label = eval_status.capitalize()
-                        score_val = None
-                        status = eval_status
                     elif output_bool == 1:
                         result_label = "Passed"
                         score_val = 1.0
@@ -3231,14 +3277,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
                     config = config_map.get(log.get("custom_eval_config_id"))
                     reason = (
-                        log.get("eval_explanation")
-                        or log.get("error_message")
-                        or (
-                            log.get("skipped_reason")
-                            if eval_status == "skipped"
-                            else ""
-                        )
-                        or ""
+                        log.get("eval_explanation") or log.get("error_message") or ""
                     )
                     created = log.get("created_at")
 
@@ -3250,7 +3289,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                             "score": score_val,
                             "reason": reason,
                             "status": status,
-                            "eval_status": eval_status or None,
+                            "eval_status": None,
                             "source": "eval_task",
                             "created_at": (
                                 created.isoformat()
@@ -3289,11 +3328,25 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     "items": items,
                 }
             )
+        except ValidationError:
+            return self._gm.bad_request("Session evaluation log request is invalid")
         except Exception as exc:
+            if is_clickhouse_api_read_unavailable_error(exc):
+                logger.warning(
+                    "session_eval_logs_unavailable",
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Evaluation logs are temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
             logger.exception(
                 "session_eval_logs_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request(
-                "Evaluation logs could not be loaded. Please try again later."
+            return self._gm.custom_error_response(
+                drf_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Evaluation logs could not be loaded",
+                code="server_error",
             )

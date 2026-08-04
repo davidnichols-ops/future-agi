@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -30,7 +30,6 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_MAX_PROJECTS,
     ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT,
-    ATTRIBUTE_READ_VALUE_CANDIDATE_PAGE_LIMIT,
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
     AttributeCardinalityRead,
     AttributeDetailRead,
@@ -46,6 +45,7 @@ from tracer.services.clickhouse.attribute_reads import (
     V2AttributeQueryExecutor,
     _unix_microseconds,
     adaptive_attribute_windows,
+    merge_read_metadata,
     validate_attribute_key,
 )
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
@@ -79,15 +79,69 @@ class RecordingExecutor:
         return AttributeQueryPage(data=list(result), query_time_ms=1.0)
 
 
-def _metadata(*, complete: bool = True, error_code: str | None = None):
+def _metadata(
+    *,
+    complete: bool = True,
+    error_code: str | None = None,
+    sampled: bool = False,
+):
     return AttributeReadMetadata(
         query_complete=complete,
-        query_status="complete" if complete else "degraded",
+        query_status="complete" if complete else "sampled" if sampled else "degraded",
         query_error_code=error_code,
         query_window_start=NOW - timedelta(days=365),
         query_window_end=NOW,
         query_count=2,
     )
+
+
+def test_attribute_metadata_distinguishes_samples_from_incomplete_reads():
+    sampled = _metadata(
+        complete=False,
+        error_code="sample_limit",
+        sampled=True,
+    )
+    degraded = _metadata(
+        complete=False,
+        error_code="read_budget_exceeded",
+    )
+
+    assert sampled.public_payload()["query_status"] == "sampled"
+    assert degraded.public_payload()["query_status"] == "degraded"
+
+
+def test_merged_attribute_metadata_never_hides_a_degraded_phase():
+    exact = _metadata()
+    sampled = _metadata(
+        complete=False,
+        error_code="sample_limit",
+        sampled=True,
+    )
+    degraded = _metadata(
+        complete=False,
+        error_code="read_budget_exceeded",
+    )
+
+    sampled_merge = merge_read_metadata(exact, sampled)
+    degraded_merge = merge_read_metadata(sampled, degraded)
+
+    assert sampled_merge.query_status == "sampled"
+    assert sampled_merge.query_error_code == "sample_limit"
+    assert degraded_merge.query_status == "degraded"
+    assert degraded_merge.query_error_code == "read_budget_exceeded"
+
+
+def test_metadata_merge_never_infers_sampled_from_incomplete_complete_status():
+    inconsistent = replace(
+        _metadata(complete=False, error_code="query_failed"),
+        query_status="complete",
+    )
+
+    merged = merge_read_metadata(_metadata(), inconsistent)
+
+    assert merged.query_complete is False
+    assert merged.query_status == "degraded"
+    assert merged.query_error_code == "query_failed"
 
 
 def _target_row(
@@ -207,17 +261,58 @@ def test_adaptive_windows_are_adjacent_half_open_7d_14d_30d_6mo_1yr_bands():
     )
 
 
+@pytest.mark.parametrize(
+    ("horizon_days", "expected_band_count"),
+    [(7, 1), (14, 2), (180, 4), (365, 5)],
+)
+def test_exact_typed_first_probe_covers_each_requested_horizon_band(
+    horizon_days: int,
+    expected_band_count: int,
+) -> None:
+    executor = RecordingExecutor()
+
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+    ).discover_keys(
+        [PROJECT_A],
+        exact_key="final_status",
+        horizon_days=horizon_days,
+    )
+
+    expected_windows = adaptive_attribute_windows(NOW, horizon_days=horizon_days)
+    assert read.rows == ()
+    assert read.metadata.query_complete is True
+    assert len(expected_windows) == expected_band_count
+    assert [
+        (call.params["segment_start"], call.params["segment_end"])
+        for call in executor.calls
+    ] == list(expected_windows)
+
+
 def test_empty_key_inventory_walks_five_bounded_ch25_segments():
     executor = RecordingExecutor()
     read = AttributeReadSelector(executor, now=NOW).discover_keys([PROJECT_A])
 
     assert read.rows == ()
     assert read.metadata.query_complete is True
-    assert len(executor.calls) == 5
+    assert len(executor.calls) == 10
     assert [
         (call.params["segment_start"], call.params["segment_end"])
         for call in executor.calls
-    ] == list(adaptive_attribute_windows(NOW))
+    ] == [
+        segment
+        for segment in adaptive_attribute_windows(NOW)
+        for _lane in ("typed", "json")
+    ]
+    typed_calls = [
+        call for call in executor.calls if "length(attrs_string.keys)" in call.sql
+    ]
+    json_calls = [
+        call for call in executor.calls if "attributes_extra NOT IN" in call.sql
+    ]
+    assert len(typed_calls) == len(json_calls) == 5
     for call in executor.calls:
         upper_sql = call.sql.upper()
         assert "FROM SPANS" in upper_sql
@@ -228,27 +323,30 @@ def test_empty_key_inventory_walks_five_bounded_ch25_segments():
         assert call.params["scope_project_id"] == PROJECT_A
         assert "START_TIME >= %(SEGMENT_START)S" in upper_sql
         assert "START_TIME < %(SEGMENT_END)S" in upper_sql
-        assert "ATTRIBUTES_EXTRA" in upper_sql
         assert " FINAL " not in f" {upper_sql} "
         assert "ARRAY JOIN" not in upper_sql
         assert "SELECT DISTINCT" not in upper_sql
-        assert "LIMIT 1 BY PROJECT_ID, TRACE_ID, ID, START_TIME" in upper_sql
+        assert "LIMIT 1 BY PROJECT_ID, TRACE_ID, ID, START_TIME" not in upper_sql
         assert "GROUP BY" not in upper_sql
-        assert (
-            "ORDER BY START_TIME DESC, ID DESC, TRACE_ID DESC, PROJECT_ID DESC"
-            in upper_sql
-        )
+        assert "ATTRIBUTE_SOURCE.PROJECT_ID ASC" in upper_sql
+        assert "OBSERVATION_TYPE ASC" in upper_sql
+        assert "SERVICE_NAME ASC" in upper_sql
+        assert "TOSTARTOFHOUR(ATTRIBUTE_SOURCE.START_TIME) ASC" in upper_sql
         assert call.timeout_ms <= 1_500
         assert call.settings["max_threads"] == 1
         assert call.settings["optimize_use_projections"] == 0
         assert call.settings["allow_experimental_projection_optimization"] == 0
         assert call.settings["use_skip_indexes"] == 0
+        assert call.settings["optimize_read_in_order"] == 1
         assert call.settings["max_block_size"] == 8_192
         assert call.settings["max_memory_usage"] <= 512 * 1024 * 1024
         assert call.settings["max_bytes_to_read"] <= 512 * 1024 * 1024
         assert call.settings["max_rows_to_read"] == 500_000
         assert call.settings["max_result_rows"] == ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
         assert call.settings["timeout_overflow_mode"] == "throw"
+    assert all("attributes_extra" not in call.sql for call in typed_calls)
+    assert all("attrs_string" not in call.sql for call in json_calls)
+    assert all(call.timeout_ms <= 750 for call in json_calls)
 
 
 def test_streaming_candidate_avoids_datetime_bucket_type_coercion():
@@ -333,7 +431,7 @@ def test_general_exact_key_probe_finds_rare_key_in_later_band(
         ]
 
     executor = RecordingExecutor(respond)
-    read = AttributeReadSelector(executor, now=NOW).discover_keys(
+    read = AttributeReadSelector(executor, now=NOW, typed_only=True).discover_keys(
         [PROJECT_A], exact_key="final_status"
     )
 
@@ -353,12 +451,10 @@ def test_general_exact_key_probe_finds_rare_key_in_later_band(
     assert "mapContains(attrs_string, %(attribute_key)s)" in candidate_sql
     assert "length(attrs_string.keys)" not in candidate_sql
     assert "argMin(" not in candidate_sql
-    assert "LIMIT 1 BY project_id, trace_id, id, start_time" in candidate_sql
+    assert "LIMIT 1 BY project_id, trace_id, id, start_time" not in candidate_sql
     assert "GROUP BY" not in candidate_sql
-    assert (
-        "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC"
-        in candidate_sql
-    )
+    assert "attribute_source.project_id ASC" in candidate_sql
+    assert "toStartOfHour(attribute_source.start_time) ASC" in candidate_sql
 
 
 def test_exact_key_probe_keyset_pages_past_512_stale_latest_states() -> None:
@@ -409,24 +505,91 @@ def test_exact_key_probe_keyset_pages_past_512_stale_latest_states() -> None:
 
     assert read.rows == (AttributeKeyRow(key, "string", 1),)
     assert read.metadata.query_complete is True
-    assert read.metadata.query_count == 4
+    # One cheap storage-order probe is replayed first. Because it is entirely
+    # stale, continuation restarts at ordered page one, then advances from that
+    # ordered page's own cursor.
+    assert read.metadata.query_count == 6
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
     ]
-    assert len(candidate_calls) == 2
-    assert (
-        "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC"
-        in candidate_calls[0].sql
-    )
+    assert len(candidate_calls) == 3
+    assert "attribute_source.project_id ASC" in candidate_calls[0].sql
+    assert "LIMIT 1 BY" not in candidate_calls[0].sql
     assert "candidate_before_start_us" not in candidate_calls[0].params
-    cursor = candidate_calls[1].params
+    assert "toString(attribute_source.project_id) DESC" in candidate_calls[1].sql
+    assert "candidate_before_start_us" not in candidate_calls[1].params
+    cursor = candidate_calls[2].params
     assert cursor["candidate_before_id"] == first_page[-1]["id"]
     assert cursor["candidate_before_trace_id"] == first_page[-1]["trace_id"]
     assert cursor["candidate_before_project_id"] == PROJECT_A
     assert "candidate_before_start_us" in cursor
-    assert "NOT IN" not in candidate_calls[1].sql
+    assert (
+        "toString(attribute_source.project_id) "
+        "< %(candidate_before_project_id)s" in candidate_calls[2].sql
+    )
+    assert "project_id < toUUID(%(candidate_before_project_id)s)" not in (
+        candidate_calls[2].sql
+    )
+    assert "NOT IN" not in candidate_calls[2].sql
     assert all(key not in call.sql for call in executor.calls)
     assert all(call.params["attribute_key"] == key for call in executor.calls)
+
+
+def test_storage_order_sample_is_never_reused_as_descending_keyset_cursor() -> None:
+    """A differently ordered sample cannot skip a newer live fallback row."""
+
+    key = "final_status"
+    storage_sample = [
+        _candidate(
+            PROJECT_A,
+            f"storage-stale-{index:04d}",
+            trace_id=f"trace-storage-stale-{index:04d}",
+            start_time=NOW - timedelta(days=3, seconds=index + 1),
+        )
+        for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+    ]
+    live = _candidate(
+        PROJECT_A,
+        "newer-live",
+        trace_id="trace-newer-live",
+        start_time=NOW - timedelta(days=1),
+    )
+    by_id = {str(row["id"]): row for row in [*storage_sample, live]}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            if "LIMIT 1 BY" not in call.sql:
+                # Deliberately unlike the descending fallback order. Seeding a
+                # descending keyset from this sample's last row would skip live.
+                return storage_sample
+            return _keyset_candidate_page([*storage_sample, live], call)
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=by_id[span_id]["trace_id"],
+                start_time=by_id[span_id]["start_time"],
+                string="Rejected" if span_id == "newer-live" else None,
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+    ).discover_keys([PROJECT_A], exact_key=key, horizon_days=7)
+
+    assert read.rows == (AttributeKeyRow(key, "string", 1),)
+    assert read.metadata.query_error_code == "sample_limit"
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert len(candidate_calls) == 2
+    assert "LIMIT 1 BY" not in candidate_calls[0].sql
+    assert "LIMIT 1 BY" in candidate_calls[1].sql
+    assert "candidate_before_start_us" not in candidate_calls[1].params
 
 
 def test_exact_key_keyset_is_bounded_and_lossless_past_2560_tied_candidates():
@@ -482,15 +645,19 @@ def test_exact_key_keyset_is_bounded_and_lossless_past_2560_tied_candidates():
 
     assert read.rows == (AttributeKeyRow(key, "string", 1),)
     assert read.metadata.query_complete is True
-    assert read.metadata.query_count == 12
-    assert len(replayed) == physical_count
+    assert read.metadata.query_count == 14
+    # The storage-order sample is intentionally replayed before the ordered
+    # restart. Identity-keyed merging prevents duplicate counts.
+    assert len(replayed) == physical_count + ATTRIBUTE_READ_CANDIDATE_LIMIT
     assert len(set(replayed)) == physical_count
     assert set(replayed) == set(by_identity)
 
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
     ]
-    assert len(candidate_calls) == 6
+    assert len(candidate_calls) == 7
+    assert "LIMIT 1 BY" not in candidate_calls[0].sql
+    assert "candidate_before_start_us" not in candidate_calls[1].params
     assert all(
         "excluded_candidate_identities" not in call.params for call in candidate_calls
     )
@@ -499,7 +666,7 @@ def test_exact_key_keyset_is_bounded_and_lossless_past_2560_tied_candidates():
         max(len(call.sql) + len(repr(call.params)) for call in candidate_calls) < 8_192
     )
     continuation_sizes = [
-        len(call.sql) + len(repr(call.params)) for call in candidate_calls[1:]
+        len(call.sql) + len(repr(call.params)) for call in candidate_calls[2:]
     ]
     assert max(continuation_sizes) - min(continuation_sizes) < 64
 
@@ -543,9 +710,13 @@ def test_exact_key_continuation_stops_at_hard_page_cap_and_degrades() -> None:
 
     assert read.rows == ()
     assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "degraded"
     assert read.metadata.query_error_code == "sample_limit"
-    assert candidate_page == ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
-    assert read.metadata.query_count == 2 * ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
+    assert candidate_page == (
+        len(adaptive_attribute_windows(NOW))
+        + ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
+    )
+    assert read.metadata.query_count == 2 * candidate_page
     final_candidate_call = [
         call for call in executor.calls if "segment_start" in call.params
     ][-1]
@@ -568,21 +739,15 @@ def test_exact_key_page_cap_is_global_across_horizon_bands() -> None:
         if "segment_start" in call.params:
             page = candidate_page
             candidate_page += 1
-            if page >= 3:
-                return []
-            row_count = (
-                ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
-                if page < 2
-                else ATTRIBUTE_READ_CANDIDATE_LIMIT
-            )
+            segment_end = call.params["segment_end"]
             rows = [
                 _candidate(
                     PROJECT_A,
                     f"stale-{page:02d}-{index:04d}",
                     trace_id=f"trace-stale-{page:02d}-{index:04d}",
-                    start_time=NOW - timedelta(seconds=page * 1_000 + index + 1),
+                    start_time=segment_end - timedelta(seconds=index + 1),
                 )
-                for index in range(row_count)
+                for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
             ]
             starts_by_id.update((str(row["id"]), row["start_time"]) for row in rows)
             return rows
@@ -606,20 +771,30 @@ def test_exact_key_page_cap_is_global_across_horizon_bands() -> None:
     assert read.rows == ()
     assert read.metadata.query_complete is False
     assert read.metadata.query_error_code == "sample_limit"
-    assert candidate_page == ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
-    assert read.metadata.query_count == 9
+    assert candidate_page == (
+        len(adaptive_attribute_windows(NOW))
+        + ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
+    )
+    assert read.metadata.query_count == 2 * candidate_page
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
     ]
-    assert len({call.params["segment_start"] for call in candidate_calls}) == 4
-    assert adaptive_attribute_windows(NOW)[-1][0] not in {
+    # Every horizon gets its cheap first probe before the six-page ordered
+    # continuation budget is shared round-robin across them.
+    assert len({call.params["segment_start"] for call in candidate_calls}) == 5
+    assert adaptive_attribute_windows(NOW)[-1][0] in {
         call.params["segment_start"] for call in candidate_calls
     }
+    assert sum("LIMIT 1 BY" in call.sql for call in candidate_calls) == (
+        ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
+    )
 
 
-def test_browse_inventory_stops_after_513th_identity_and_marks_sampling_incomplete():
+def test_browse_inventory_samples_513_identities_but_still_probes_older_bands():
     def respond(call, _):
         if "segment_start" in call.params:
+            if call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]:
+                return []
             return [
                 _candidate(PROJECT_A, f"sampled-span-{index:04d}")
                 for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
@@ -642,24 +817,27 @@ def test_browse_inventory_stops_after_513th_identity_and_marks_sampling_incomple
         ]
 
     executor = RecordingExecutor(respond)
-    read = AttributeReadSelector(executor, now=NOW).discover_keys([PROJECT_A])
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+    ).discover_keys([PROJECT_A])
 
     assert read.rows == (
         AttributeKeyRow("final_status", "string", ATTRIBUTE_READ_CANDIDATE_LIMIT),
     )
     assert read.metadata.query_complete is False
-    assert read.metadata.query_status == "degraded"
+    assert read.metadata.query_status == "sampled"
     assert read.metadata.query_error_code == "sample_limit"
-    assert read.metadata.query_count == 2
+    assert read.metadata.query_count == 6
+    assert read.metadata.query_window_start == NOW - timedelta(days=365)
     candidate_call = next(
         call for call in executor.calls if "segment_start" in call.params
     )
-    assert "LIMIT 1 BY project_id, trace_id, id, start_time" in candidate_call.sql
+    assert "LIMIT 1 BY project_id, trace_id, id, start_time" not in candidate_call.sql
     assert "GROUP BY" not in candidate_call.sql
-    assert (
-        "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC"
-        in candidate_call.sql
-    )
+    assert "attribute_source.project_id ASC" in candidate_call.sql
+    assert candidate_call.settings["optimize_read_in_order"] == 1
     assert candidate_call.params["candidate_limit"] == (
         ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
     )
@@ -696,16 +874,53 @@ def test_latest_replay_uses_index_pruning_and_exact_physical_identities():
         _target_row(PROJECT_A, "cleared"),
         _target_row(PROJECT_A, "legacy-object", legacy_raw='{"x": 1}'),
     ]
-    emitted_candidates = False
+    typed_candidate_ids = {
+        "duplicate-id",
+        "string-second",
+        "number",
+        "boolean",
+        "cleared",
+    }
+    json_candidate_ids = {
+        "legacy-string",
+        "legacy-number",
+        "legacy-boolean",
+        "legacy-object",
+    }
 
     def respond(call, _):
-        nonlocal emitted_candidates
         if "segment_start" in call.params:
-            if not emitted_candidates:
-                emitted_candidates = True
-                return candidates
-            return []
-        return latest
+            if call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]:
+                return []
+            selected_ids = (
+                json_candidate_ids
+                if "JSONHas(attributes_extra" in call.sql
+                else typed_candidate_ids
+            )
+            return [row for row in candidates if row["id"] in selected_ids]
+
+        wanted: set[tuple[str, str, str, int]] = set()
+        index = 0
+        while f"candidate_project_{index}" in call.params:
+            project_id = call.params[f"candidate_project_{index}"]
+            wanted.update(
+                (project_id, trace_id, span_id, start_us)
+                for trace_id, span_id, start_us in call.params[
+                    f"candidate_physical_identities_{index}"
+                ]
+            )
+            index += 1
+        return [
+            row
+            for row in latest
+            if (
+                row["project_id"],
+                row["trace_id"],
+                row["id"],
+                _unix_microseconds(row["start_time"]),
+            )
+            in wanted
+        ]
 
     executor = RecordingExecutor(respond)
     read = AttributeReadSelector(executor, now=NOW).read_values(
@@ -754,7 +969,17 @@ def test_latest_replay_uses_index_pruning_and_exact_physical_identities():
     assert PROJECT_B not in replay.sql
     assert replay.settings["max_threads"] == 1
     assert replay.settings["max_bytes_to_read"] == 512 * 1024 * 1024
-    assert replay.settings["max_result_rows"] == len(candidates)
+    assert replay.settings["max_result_rows"] == 6
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert all(
+        not (
+            "mapContains(attrs_string" in call.sql
+            and "JSONHas(attributes_extra" in call.sql
+        )
+        for call in candidate_calls
+    )
 
 
 def test_reused_span_ids_keep_trace_and_start_time_scoped_tombstones():
@@ -897,14 +1122,10 @@ def test_detail_read_uses_latest_versions_and_does_not_resurrect_tombstones():
 
 
 def test_typed_map_key_browse_and_legacy_json_scalar_precedence():
-    emitted = False
-
     def respond(call, _):
-        nonlocal emitted
         if "segment_start" in call.params:
-            if emitted:
+            if call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]:
                 return []
-            emitted = True
             return [_candidate(PROJECT_A, "wide")]
         return [
             {
@@ -950,14 +1171,13 @@ def test_typed_map_key_browse_and_legacy_json_scalar_precedence():
 
 
 def test_exact_structured_json_key_is_not_reported_as_complete_empty():
-    emitted = False
-
     def respond(call, _):
-        nonlocal emitted
         if "segment_start" in call.params:
-            if emitted:
+            if (
+                call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]
+                or "JSONHas(attributes_extra" not in call.sql
+            ):
                 return []
-            emitted = True
             return [_candidate(PROJECT_A, "structured")]
         return [
             _target_row(
@@ -976,14 +1196,13 @@ def test_exact_structured_json_key_is_not_reported_as_complete_empty():
 
 
 def test_structured_json_value_picker_is_explicitly_degraded():
-    emitted = False
-
     def respond(call, _):
-        nonlocal emitted
         if "segment_start" in call.params:
-            if emitted:
+            if (
+                call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]
+                or "JSONHas(attributes_extra" not in call.sql
+            ):
                 return []
-            emitted = True
             return [_candidate(PROJECT_A, "structured")]
         return [
             _target_row(
@@ -1003,14 +1222,10 @@ def test_structured_json_value_picker_is_explicitly_degraded():
 
 
 def test_array_filter_picker_surfaces_json_array_and_preserves_typed_maps():
-    emitted = False
-
     def respond(call, _):
-        nonlocal emitted
         if "segment_start" in call.params:
-            if emitted:
+            if call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]:
                 return []
-            emitted = True
             return [_candidate(PROJECT_A, "array-and-map")]
         return [
             {
@@ -1049,18 +1264,28 @@ def test_array_filter_picker_surfaces_json_array_and_preserves_typed_maps():
         ("json_array", "array"),
     }
     assert read.metadata.query_complete is True
-    assert all("attributes_extra" in call.sql for call in executor.calls)
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert any("attributes_extra NOT IN" in call.sql for call in candidate_calls)
+    assert any("length(attrs_string.keys)" in call.sql for call in candidate_calls)
+    assert all(
+        not (
+            "attributes_extra NOT IN" in call.sql
+            and "length(attrs_string.keys)" in call.sql
+        )
+        for call in candidate_calls
+    )
 
 
 def test_array_filter_picker_does_not_advertise_json_object_as_filterable():
-    emitted = False
-
     def respond(call, _):
-        nonlocal emitted
         if "segment_start" in call.params:
-            if emitted:
+            if (
+                call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]
+                or "JSONHas(attributes_extra" not in call.sql
+            ):
                 return []
-            emitted = True
             return [_candidate(PROJECT_A, "object-only")]
         return [
             _target_row(
@@ -1082,14 +1307,10 @@ def test_array_filter_picker_does_not_advertise_json_object_as_filterable():
 
 
 def test_eval_mapping_inventory_includes_all_json_value_families():
-    emitted = False
-
     def respond(call, _):
-        nonlocal emitted
         if "segment_start" in call.params:
-            if emitted:
+            if call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]:
                 return []
-            emitted = True
             return [_candidate(PROJECT_A, "eval-json")]
         return [
             {
@@ -1132,14 +1353,13 @@ def test_eval_mapping_inventory_includes_all_json_value_families():
 
 
 def test_array_value_picker_flattens_supported_json_scalars_type_exactly():
-    emitted = False
-
     def respond(call, _):
-        nonlocal emitted
         if "segment_start" in call.params:
-            if emitted:
+            if (
+                call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]
+                or "JSONHas(attributes_extra" not in call.sql
+            ):
                 return []
-            emitted = True
             return [
                 _candidate(PROJECT_A, "array-one"),
                 _candidate(PROJECT_A, "array-two"),
@@ -1339,7 +1559,7 @@ def test_ascii_value_search_is_pushed_into_exact_candidates_and_finds_rare_value
         ]
 
     executor = RecordingExecutor(respond)
-    read = AttributeReadSelector(executor, now=NOW).read_values(
+    read = AttributeReadSelector(executor, now=NOW, typed_only=True).read_values(
         [PROJECT_A],
         "rare.search.key",
         search="needle%_\\path",
@@ -1356,7 +1576,7 @@ def test_ascii_value_search_is_pushed_into_exact_candidates_and_finds_rare_value
     assert all("needle%_\\path" not in call.sql for call in candidates)
 
 
-def test_value_read_pages_dense_recent_band_and_still_covers_older_band():
+def test_value_read_samples_dense_recent_band_and_still_covers_older_band():
     recent = [
         _candidate(
             PROJECT_A,
@@ -1405,21 +1625,19 @@ def test_value_read_pages_dense_recent_band_and_still_covers_older_band():
     ).read_values([PROJECT_A], "final_status")
 
     assert read.rows == (
-        AttributeValueRow("recent-value", "string", ATTRIBUTE_READ_CANDIDATE_LIMIT + 1),
+        AttributeValueRow("recent-value", "string", ATTRIBUTE_READ_CANDIDATE_LIMIT),
         AttributeValueRow("older-value", "string", 1),
     )
-    assert read.metadata.query_complete is True
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_error_code == "sample_limit"
     assert read.metadata.query_window_start == NOW - timedelta(days=365)
     recent_candidate_calls = [
         call
         for call in executor.calls
         if call.params.get("segment_start") == recent_start
     ]
-    assert len(recent_candidate_calls) == 2
-    assert (
-        recent_candidate_calls[1].params["candidate_before_id"]
-        == (recent[ATTRIBUTE_READ_CANDIDATE_LIMIT - 1]["id"])
-    )
+    assert len(recent_candidate_calls) == 1
+    assert "LIMIT 1 BY" not in recent_candidate_calls[0].sql
 
 
 def test_value_search_pages_past_512_stale_matches_to_live_value():
@@ -1509,6 +1727,85 @@ def test_global_replay_resource_failure_discards_partial_and_does_not_retry():
     assert selector.query_count == 2
 
 
+@pytest.mark.parametrize("code", [241, 307])
+def test_json_budget_failure_keeps_verified_typed_key_inventory_usable(code: int):
+    recent_start = adaptive_attribute_windows(NOW)[0][0]
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            if "attributes_extra NOT IN" in call.sql:
+                return ServerException("private JSON lane failure", code)
+            if call.params["segment_start"] == recent_start:
+                return [_candidate(PROJECT_A, "typed-final-status")]
+            return []
+        return [
+            {
+                "project_id": PROJECT_A,
+                "trace_id": f"trace-{PROJECT_A}-typed-final-status",
+                "id": "typed-final-status",
+                "start_time": NOW - timedelta(days=1),
+                "is_deleted": 0,
+                "string_keys": ["final_status"],
+                "number_keys": [],
+                "boolean_keys": [],
+            }
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).discover_keys([PROJECT_A])
+
+    assert read.rows == (AttributeKeyRow("final_status", "string", 1),)
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_error_code == "sample_limit"
+    json_call = next(
+        call for call in executor.calls if "attributes_extra NOT IN" in call.sql
+    )
+    assert json_call.timeout_ms <= 750
+    typed_call = next(
+        call for call in executor.calls if "length(attrs_string.keys)" in call.sql
+    )
+    assert "attributes_extra" not in typed_call.sql
+
+
+@pytest.mark.parametrize("code", [241, 307])
+def test_json_budget_failure_keeps_verified_typed_searched_value_usable(code: int):
+    recent_start = adaptive_attribute_windows(NOW)[0][0]
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            if "JSONHas(attributes_extra" in call.sql:
+                return ServerException("private JSON lane failure", code)
+            if call.params["segment_start"] == recent_start:
+                return [_candidate(PROJECT_A, "typed-rejected")]
+            return []
+        return [_target_row(PROJECT_A, "typed-rejected", string="Rejected")]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).read_values(
+        [PROJECT_A],
+        "final_status",
+        search="Rejected",
+    )
+
+    assert read.rows == (AttributeValueRow("Rejected", "string", 1),)
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_error_code == "sample_limit"
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert all(
+        not (
+            "mapContains(attrs_string" in call.sql
+            and "JSONHas(attributes_extra" in call.sql
+        )
+        for call in candidate_calls
+    )
+    json_call = next(
+        call for call in candidate_calls if "JSONHas(attributes_extra" in call.sql
+    )
+    assert json_call.timeout_ms <= 750
+
+
 def test_timeout_on_first_segment_has_no_retry():
     executor = RecordingExecutor(
         lambda *_: ReadDeadlineExceeded("private deadline detail")
@@ -1552,7 +1849,11 @@ def test_later_budget_timeout_keeps_replayed_inventory_and_marks_it_degraded(
         return ReadDeadlineExceeded("private deadline detail")
 
     executor = RecordingExecutor(respond)
-    read = AttributeReadSelector(executor, now=NOW).discover_keys([PROJECT_A])
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+    ).discover_keys([PROJECT_A])
 
     assert read.rows == (AttributeKeyRow("final_status", "string", 1),)
     assert read.metadata.query_complete is False
@@ -1576,7 +1877,12 @@ def test_each_public_operation_starts_fresh_wall_budget_at_call_boundary():
 
     clock = ManualClock()
     executor = RecordingExecutor()
-    selector = AttributeReadSelector(executor, now=NOW, clock=clock)
+    selector = AttributeReadSelector(
+        executor,
+        now=NOW,
+        clock=clock,
+        typed_only=True,
+    )
 
     # Object construction can precede request dispatch without consuming the
     # operation's four-second wall budget.
@@ -1627,17 +1933,21 @@ def test_candidate_sample_cap_is_explicitly_degraded_and_query_count_bounded():
         ]
 
     executor = RecordingExecutor(respond)
-    read = AttributeReadSelector(executor, now=NOW).read_values([PROJECT_A], "sampled")
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+    ).read_values([PROJECT_A], "sampled")
 
     assert read.rows == (
         AttributeValueRow(
             "same",
             "string",
-            ATTRIBUTE_READ_CANDIDATE_LIMIT * ATTRIBUTE_READ_VALUE_CANDIDATE_PAGE_LIMIT,
+            ATTRIBUTE_READ_CANDIDATE_LIMIT,
         ),
     )
     assert read.metadata.query_complete is False
-    assert read.metadata.query_status == "degraded"
+    assert read.metadata.query_status == "sampled"
     assert read.metadata.query_error_code == "sample_limit"
     assert read.metadata.query_count <= (
         2 * ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
@@ -1815,7 +2125,7 @@ def test_dashboard_json_array_value_picker_preserves_scalar_json_types(monkeypat
 
 
 @pytest.mark.parametrize("code", [159, 241, 307])
-def test_dashboard_budget_errors_are_sanitized_degraded_and_not_retried(
+def test_dashboard_budget_errors_return_sanitized_503_and_are_not_retried(
     code, monkeypatch
 ):
     from tracer.views.dashboard import DashboardViewSet
@@ -1845,13 +2155,10 @@ def test_dashboard_budget_errors_are_sanitized_degraded_and_not_retried(
     )
     response = DashboardViewSet.as_view({"get": "filter_values"})(request)
 
-    assert response.status_code == 200
-    payload = response.data["result"]
-    assert payload["values"] == []
-    assert payload["query_complete"] is False
-    assert payload["query_status"] == "degraded"
-    assert payload["query_error_code"] == "read_budget_exceeded"
+    assert response.status_code == 503
+    assert response.data["code"] == "service_unavailable"
     serialized = json.dumps(response.data)
+    assert "temporarily unavailable" in serialized
     assert "secret" not in serialized
     assert "SELECT" not in serialized
     assert calls == 1
@@ -1937,7 +2244,7 @@ def test_eval_picker_uses_selector_for_keys_and_cardinality_without_pg_fallback(
         ),
     ],
 )
-def test_observation_attribute_pickers_degrade_typed_ch_failures(
+def test_observation_attribute_pickers_return_sanitized_503_for_typed_ch_failures(
     monkeypatch, action_name, path
 ):
     from tracer.views.observation_span import ObservationSpanView
@@ -1958,11 +2265,8 @@ def test_observation_attribute_pickers_degrade_typed_ch_failures(
 
     response = ObservationSpanView.as_view({"get": action_name})(request)
 
-    assert response.status_code == 200
-    assert response.data["result"] == []
-    assert response.data["query_complete"] is False
-    assert response.data["query_status"] == "degraded"
-    assert response.data["query_error_code"] == "read_budget_exceeded"
+    assert response.status_code == 503
+    assert "temporarily unavailable" in json.dumps(response.data)
     assert "private ClickHouse" not in json.dumps(response.data)
 
 
@@ -1979,7 +2283,7 @@ def test_observation_attribute_pickers_degrade_typed_ch_failures(
         ),
     ],
 )
-def test_observation_attribute_pickers_preserve_sanitized_400_for_programming_defects(
+def test_observation_attribute_pickers_return_sanitized_500_for_programming_defects(
     monkeypatch, action_name, path
 ):
     from tracer.views.observation_span import ObservationSpanView
@@ -2000,10 +2304,111 @@ def test_observation_attribute_pickers_preserve_sanitized_400_for_programming_de
 
     response = ObservationSpanView.as_view({"get": action_name})(request)
 
-    assert response.status_code == 400
+    assert response.status_code == 500
     payload = json.dumps(response.data)
     assert "could not be loaded" in payload
     assert "compiler invariant" not in payload
+
+
+@pytest.mark.parametrize(
+    ("action_name", "path"),
+    [
+        (
+            "get_span_attributes_list",
+            "/tracer/observation-span/get_span_attributes_list/",
+        ),
+        (
+            "get_eval_attributes_list",
+            "/tracer/observation-span/get_eval_attributes_list/",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("error_code", "sampled", "expected_status"),
+    [
+        ("read_budget_exceeded", False, 503),
+        ("sample_limit", False, 503),
+        ("sample_limit", True, 200),
+    ],
+)
+def test_observation_attribute_pickers_only_publish_labelled_samples(
+    monkeypatch, action_name, path, error_code, sampled, expected_status
+):
+    from tracer.views.observation_span import ObservationSpanView
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "discover_keys",
+        lambda *_args, **_kwargs: AttributeKeyRead(
+            (AttributeKeyRow("final_status", "string", 1),),
+            _metadata(complete=False, error_code=error_code, sampled=sampled),
+        ),
+    )
+    monkeypatch.setattr(
+        ObservationSpanView,
+        "_attribute_project_for_request",
+        staticmethod(lambda _request, _project_id: True),
+    )
+    request = _authenticated_get(
+        path,
+        {"filters": json.dumps({"project_id": PROJECT_A})},
+    )
+
+    response = ObservationSpanView.as_view({"get": action_name})(request)
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.data["result"] == ["final_status"]
+        assert response.data["query_complete"] is False
+        assert response.data["query_status"] == "sampled"
+        assert response.data["query_error_code"] == "sample_limit"
+        assert "query_window_start" in response.data
+        assert "query_window_end" in response.data
+    else:
+        assert "temporarily unavailable" in json.dumps(response.data)
+
+
+@pytest.mark.parametrize(
+    ("action_name", "path"),
+    [
+        (
+            "get_span_attributes_list",
+            "/tracer/observation-span/get_span_attributes_list/",
+        ),
+        (
+            "get_eval_attributes_list",
+            "/tracer/observation-span/get_eval_attributes_list/",
+        ),
+    ],
+)
+def test_observation_attribute_pickers_reject_empty_sample_limit_results(
+    monkeypatch, action_name, path
+):
+    from tracer.views.observation_span import ObservationSpanView
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "discover_keys",
+        lambda *_args, **_kwargs: AttributeKeyRead(
+            (),
+            _metadata(complete=False, error_code="sample_limit"),
+        ),
+    )
+    monkeypatch.setattr(
+        ObservationSpanView,
+        "_attribute_project_for_request",
+        staticmethod(lambda _request, _project_id: True),
+    )
+    request = _authenticated_get(
+        path,
+        {"filters": json.dumps({"project_id": PROJECT_A})},
+    )
+
+    response = ObservationSpanView.as_view({"get": action_name})(request)
+
+    assert response.status_code == 503
+    assert "temporarily unavailable" in json.dumps(response.data)
+    assert "sample_limit" not in json.dumps(response.data)
 
 
 def test_span_attribute_ownership_gate_precedes_any_ch_read(monkeypatch):

@@ -8,6 +8,9 @@ import pytest
 from clickhouse_driver.errors import ServerException
 
 from tracer.models.dashboard import Dashboard, DashboardWidget
+from tracer.services.clickhouse.v2.query_builders.dashboard import (
+    DashboardQueryBuilderV2,
+)
 from tracer.views.dashboard import DashboardViewSet, DashboardWidgetViewSet
 
 
@@ -63,6 +66,127 @@ def _trace_query(project_id):
     }
 
 
+DIRECT_WRITE_ROUTING_CONFIGS = (
+    pytest.param({}, id="routing-missing"),
+    pytest.param(
+        {"QUERY_TYPES_DISABLED": "dashboard"},
+        id="routing-disabled",
+    ),
+    pytest.param(
+        {
+            "QUERY_TYPES_V2_ONLY": "trace_list",
+            "QUERY_TYPES_SHADOW": "dashboard",
+        },
+        id="routing-misconfigured-shadow",
+    ),
+)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("routing_config", DIRECT_WRITE_ROUTING_CONFIGS)
+def test_dashboard_query_uses_direct_write_backend_independent_of_routing(
+    routing_config,
+    settings,
+    auth_client,
+    observe_project,
+):
+    settings.CLICKHOUSE_V2 = routing_config
+    v2_client = MagicMock()
+    v2_client.execute_read.return_value = ([], [], 1.0)
+
+    with (
+        patch(
+            "tracer.services.clickhouse.v2.query_service.get_v2_query_client",
+            return_value=v2_client,
+        ),
+        patch(
+            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+            side_effect=AssertionError("dashboard dispatch must not be consulted"),
+        ) as dispatch,
+        patch(
+            "tracer.views.dashboard.AnalyticsQueryService",
+            side_effect=AssertionError("legacy analytics must not be constructed"),
+        ) as legacy_analytics,
+        patch(
+            "tracer.views.dashboard.DashboardQueryBuilderV2",
+            wraps=DashboardQueryBuilderV2,
+        ) as v2_builder,
+    ):
+        response = auth_client.post(
+            "/tracer/dashboard/query/",
+            _trace_query(observe_project.id),
+            format="json",
+        )
+
+    assert response.status_code == 200
+    assert v2_client.execute_read.called
+    assert v2_builder.called
+    dispatch.assert_not_called()
+    legacy_analytics.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("routing_config", DIRECT_WRITE_ROUTING_CONFIGS)
+@pytest.mark.parametrize("action", ("execute", "preview"))
+def test_widget_trace_queries_use_direct_write_backend_independent_of_routing(
+    action,
+    routing_config,
+    settings,
+    auth_client,
+    dashboard,
+    dashboard_widget,
+    observe_project,
+):
+    settings.CLICKHOUSE_V2 = routing_config
+    query_config = _trace_query(observe_project.id)
+    dashboard_widget.query_config = query_config
+    dashboard_widget.save(update_fields=["query_config"])
+
+    v2_client = MagicMock()
+    v2_client.execute_read.return_value = ([], [], 1.0)
+
+    with (
+        patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True),
+        patch(
+            "tracer.services.clickhouse.v2.query_service.get_v2_query_client",
+            return_value=v2_client,
+        ),
+        patch(
+            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+            side_effect=AssertionError("dashboard dispatch must not be consulted"),
+        ) as dispatch,
+        patch(
+            "tracer.views.dashboard.AnalyticsQueryService",
+            side_effect=AssertionError("legacy analytics must not be constructed"),
+        ) as legacy_analytics,
+        patch(
+            "tracer.views.dashboard.get_clickhouse_client",
+            side_effect=AssertionError("legacy client must not be constructed"),
+        ) as legacy_client,
+        patch(
+            "tracer.views.dashboard.DashboardQueryBuilderV2",
+            wraps=DashboardQueryBuilderV2,
+        ) as v2_builder,
+    ):
+        if action == "execute":
+            response = auth_client.post(
+                f"/tracer/dashboard/{dashboard.id}/widgets/{dashboard_widget.id}/query/"
+            )
+        else:
+            response = auth_client.post(
+                f"/tracer/dashboard/{dashboard.id}/widgets/preview/",
+                {"query_config": query_config},
+                format="json",
+            )
+
+    assert response.status_code == 200
+    assert v2_client.execute_read.called
+    assert v2_builder.called
+    dispatch.assert_not_called()
+    legacy_analytics.assert_not_called()
+    legacy_client.assert_not_called()
+
+
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     "failure",
@@ -73,7 +197,7 @@ def _trace_query(project_id):
 )
 @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
 @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-def test_system_filter_values_programming_defects_preserve_sanitized_400(
+def test_system_filter_values_programming_defects_preserve_sanitized_500(
     mock_analytics_cls,
     _mock_ch_enabled,
     failure,
@@ -88,7 +212,7 @@ def test_system_filter_values_programming_defects_preserve_sanitized_400(
         f"&project_ids={observe_project.id}&source=traces"
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 500
     payload = json.dumps(response.json())
     assert "private" not in payload
     assert "missing-column" not in payload
@@ -98,7 +222,7 @@ def test_system_filter_values_programming_defects_preserve_sanitized_400(
 @pytest.mark.django_db
 @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
 @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-def test_system_filter_values_read_budget_is_explicit_degraded_200(
+def test_system_filter_values_read_budget_is_sanitized_503(
     mock_analytics_cls,
     _mock_ch_enabled,
     auth_client,
@@ -114,15 +238,11 @@ def test_system_filter_values_read_budget_is_explicit_degraded_200(
         f"&project_ids={observe_project.id}&source=traces"
     )
 
-    assert response.status_code == 200
-    payload = response.json()["result"]
-    assert payload == {
-        "values": [],
-        "query_complete": False,
-        "query_status": "degraded",
-        "query_error_code": "read_budget_exceeded",
-    }
-    assert "private" not in json.dumps(response.json())
+    assert response.status_code == 503
+    payload = json.dumps(response.json())
+    assert "temporarily unavailable" in payload
+    assert "private" not in payload
+    assert "timeout query" not in payload
 
 
 @pytest.mark.django_db

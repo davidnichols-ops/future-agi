@@ -43,6 +43,7 @@ import {
   getQueryReadState,
 } from "src/utils/queryReadState";
 import { createListCursorPagination } from "./listCursorPagination";
+import { getListTotalState } from "./listTotalMetadata";
 
 const ROWS_LIMIT = 25;
 const EMPTY_EXTRA_FILTERS = [];
@@ -245,6 +246,7 @@ const TraceGrid = React.forwardRef(
                   // project_id as org-scoped (used by the cross-project user
                   // detail page).
                   ...(projectId ? { project_id: projectId } : {}),
+                  allow_sampled: true,
                   page_size: ROWS_LIMIT,
                   filters: JSON.stringify(
                     toBackendFilters([
@@ -337,9 +339,13 @@ const TraceGrid = React.forwardRef(
               const rows = res?.table || [];
               const metadata = res?.metadata || {};
               cursorPagination.current.recordResponse(pageNumber, metadata);
-              const totalRows = metadata.total_rows;
-              params.api.totalRowCount = totalRows;
-              useTraceGridStore.setState({ totalRowCount: totalRows || 0 });
+              const totalState = getListTotalState(metadata);
+              params.api.totalRowCount = totalState.totalRowCount;
+              params.api.totalRowCountLowerBound =
+                totalState.totalRowCountLowerBound;
+              params.api.totalRowCountIsLowerBound =
+                totalState.totalRowCountIsLowerBound;
+              useTraceGridStore.setState(totalState);
 
               // Infinite-scroll behavior: don't tell AG Grid the total upfront.
               // Use -1 (unknown) so it only extends the scrollbar as pages load.

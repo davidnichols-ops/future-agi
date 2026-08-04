@@ -67,7 +67,7 @@ class SpanAttributeKeySerializer(serializers.Serializer):
 class SpanAttributeKeysResponseSerializer(serializers.Serializer):
     result = SpanAttributeKeySerializer(many=True)
     query_complete = serializers.BooleanField()
-    query_status = serializers.ChoiceField(choices=["complete", "degraded"])
+    query_status = serializers.ChoiceField(choices=["complete", "sampled", "degraded"])
     query_error_code = serializers.ChoiceField(
         choices=["sample_limit", "read_budget_exceeded", "query_failed"],
         required=False,
@@ -85,7 +85,7 @@ class SpanAttributeValueSerializer(serializers.Serializer):
 class SpanAttributeValuesResponseSerializer(serializers.Serializer):
     result = SpanAttributeValueSerializer(many=True)
     query_complete = serializers.BooleanField()
-    query_status = serializers.ChoiceField(choices=["complete", "degraded"])
+    query_status = serializers.ChoiceField(choices=["complete", "sampled", "degraded"])
     query_error_code = serializers.ChoiceField(
         choices=["sample_limit", "read_budget_exceeded", "query_failed"],
         required=False,
@@ -112,7 +112,7 @@ class SpanAttributeDetailResponseSerializer(serializers.Serializer):
     p50 = serializers.FloatField(required=False, allow_null=True)
     p95 = serializers.FloatField(required=False, allow_null=True)
     query_complete = serializers.BooleanField()
-    query_status = serializers.ChoiceField(choices=["complete", "degraded"])
+    query_status = serializers.ChoiceField(choices=["complete", "sampled", "degraded"])
     query_error_code = serializers.ChoiceField(
         choices=["sample_limit", "read_budget_exceeded", "query_failed"],
         required=False,

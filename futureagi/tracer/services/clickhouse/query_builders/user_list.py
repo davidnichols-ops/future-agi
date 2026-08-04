@@ -22,6 +22,9 @@ class UserListQueryBuilder(BaseQueryBuilder):
     """
 
     TABLE = "spans"
+    # Preserve rollout-configured storage for the legacy builder while giving
+    # the V2 wrapper an explicit direct-write injection point.
+    _EVAL_LOGGER_SOURCE = staticmethod(eval_logger_source)
 
     OUTPUT_FILTER_MAP: dict[str, str] = {
         "user_id": "user_id",
@@ -907,7 +910,9 @@ class UserListQueryBuilder(BaseQueryBuilder):
         if not end_user_ids:
             return "", {}
         start_date, end_date = self.parse_time_range(self.filters)
-        eval_table, eval_nd = eval_logger_source("e")
+        eval_table, eval_nd = self._EVAL_LOGGER_SOURCE(
+            "eval_scan", include_cdc_tombstone_guard=True
+        )
         params: dict[str, Any] = {
             "eval_eu_ids": tuple(end_user_ids),
             "start_date": start_date,
@@ -972,13 +977,14 @@ class UserListQueryBuilder(BaseQueryBuilder):
         SELECT
             ut.end_user_id AS end_user_id,
             round(
-                100.0 * countIf(e.output_bool = 1)
-                / nullIf(countIf(isNotNull(e.output_bool)), 0),
+                100.0 * countIf(eval_scan.output_bool = 1)
+                / nullIf(countIf(isNotNull(eval_scan.output_bool)), 0),
                 2
             ) AS bool_eval_pass_rate,
-            round(avg(e.output_float), 2) AS avg_output_float
-        FROM {eval_table} AS e FINAL
-        INNER JOIN user_traces AS ut ON e.trace_id = toUUIDOrNull(ut.trace_id)
+            round(avg(eval_scan.output_float), 2) AS avg_output_float
+        FROM {eval_table} AS eval_scan FINAL
+        INNER JOIN user_traces AS ut
+            ON eval_scan.trace_id = toUUIDOrNull(ut.trace_id)
         WHERE {eval_nd}
         GROUP BY ut.end_user_id
         """

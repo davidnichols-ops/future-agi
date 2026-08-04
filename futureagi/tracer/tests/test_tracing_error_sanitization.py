@@ -35,7 +35,7 @@ def test_eval_name_picker_sanitizes_clickhouse_failure():
             return_value=project_scope,
         ),
         patch("tracer.views.trace.CustomEvalConfig.objects", config_manager),
-        patch("tracer.views.trace.AnalyticsQueryService", return_value=analytics),
+        patch("tracer.views.trace.V2AnalyticsQueryService", return_value=analytics),
     ):
         # Exercise the view boundary itself. ``validated_request`` requires a
         # real DRF request, which this focused unit test deliberately replaces
@@ -79,7 +79,7 @@ def test_evaluation_detail_sanitizes_clickhouse_failure():
             config_manager,
         ),
         patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+            "tracer.views.observation_span.V2AnalyticsQueryService",
             return_value=analytics,
         ),
     ):

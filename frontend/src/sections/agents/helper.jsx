@@ -857,7 +857,12 @@ export const useCallLogs = ({
     queryKey: queryKey,
     queryFn: () =>
       axios.get(getEndpoint(), {
-        params: { page, page_size: pageLimit, ...params },
+        params: {
+          page,
+          page_size: pageLimit,
+          ...(isProjectModule && { allow_sampled: true }),
+          ...params,
+        },
       }),
     enabled: condition && enabled,
     select: (data) => data?.data,
@@ -884,7 +889,12 @@ export const prefetchCallLogs = (
     queryKey,
     queryFn: () =>
       axios.get(endpoint, {
-        params: { page, page_size: pageLimit, ...params },
+        params: {
+          page,
+          page_size: pageLimit,
+          ...(isProjectModule && { allow_sampled: true }),
+          ...params,
+        },
       }),
   });
 };

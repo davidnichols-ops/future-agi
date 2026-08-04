@@ -169,6 +169,7 @@ import ObserveToolbar from "./ObserveToolbar";
 import { selectPanelGraphFilters } from "./GraphSection/graphFilterUtils";
 import { buildAddEvalsDraft } from "./buildAddEvalsDraft";
 import SelectAllBanner from "./SelectAllBanner";
+import { getSelectionCountState } from "./listTotalMetadata";
 import useProjectFilterField from "../UsersView/useProjectFilterField";
 import FilterChips from "./FilterChips";
 import { useDashboardFilterValues } from "src/hooks/useDashboards";
@@ -673,6 +674,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     currentPageSize: 0,
     totalPages: 1,
     pageLimit: 25,
+    totalMatchingIsLowerBound: false,
   });
   const [openAnnotateDrawer, setOpenAnnotateDrawer] = useState(false);
   const { mutate: addAnnotationValues } = useMutation({
@@ -838,23 +840,52 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       setViewMode: state.setViewMode,
     }),
   );
-  const { selectedTraces, allTracesSelected, totalTraces } =
-    useTraceGridStoreShallow((s) => {
-      return {
-        selectedTraces: s.toggledNodes,
-        allTracesSelected: s.selectAll,
-        totalTraces: s.totalRowCount,
-      };
-    });
+  const {
+    selectedTraces,
+    allTracesSelected,
+    totalTraces,
+    traceTotalLowerBound,
+    traceTotalIsLowerBound,
+  } = useTraceGridStoreShallow((s) => {
+    return {
+      selectedTraces: s.toggledNodes,
+      allTracesSelected: s.selectAll,
+      totalTraces: s.totalRowCount,
+      traceTotalLowerBound: s.totalRowCountLowerBound,
+      traceTotalIsLowerBound: s.totalRowCountIsLowerBound,
+    };
+  });
 
-  const { selectedSpans, allSpansSelected, totalSpans } =
-    useSpanGridStoreShallow((s) => {
-      return {
-        selectedSpans: s.toggledNodes,
-        allSpansSelected: s.selectAll,
-        totalSpans: s.totalRowCount,
-      };
-    });
+  const {
+    selectedSpans,
+    allSpansSelected,
+    totalSpans,
+    spanTotalLowerBound,
+    spanTotalIsLowerBound,
+  } = useSpanGridStoreShallow((s) => {
+    return {
+      selectedSpans: s.toggledNodes,
+      allSpansSelected: s.selectAll,
+      totalSpans: s.totalRowCount,
+      spanTotalLowerBound: s.totalRowCountLowerBound,
+      spanTotalIsLowerBound: s.totalRowCountIsLowerBound,
+    };
+  });
+
+  const traceSelectionCount = getSelectionCountState({
+    selectAll: allTracesSelected,
+    toggledNodes: selectedTraces,
+    totalRowCount: totalTraces,
+    totalRowCountLowerBound: traceTotalLowerBound,
+    totalRowCountIsLowerBound: traceTotalIsLowerBound,
+  });
+  const spanSelectionCount = getSelectionCountState({
+    selectAll: allSpansSelected,
+    toggledNodes: selectedSpans,
+    totalRowCount: totalSpans,
+    totalRowCountLowerBound: spanTotalLowerBound,
+    totalRowCountIsLowerBound: spanTotalIsLowerBound,
+  });
 
   const {
     openReplaySessionDrawer,
@@ -3799,18 +3830,16 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                       simCallMeta.totalPages * simCallMeta.pageLimit
                     : selectedCallIds?.length || 0
                   : selectedTab === "trace"
-                    ? allTracesSelected
-                      ? Math.max(
-                          (totalTraces || 0) - (selectedTraces?.length || 0),
-                          1,
-                        )
-                      : selectedTraces?.length || 0
-                    : allSpansSelected
-                      ? Math.max(
-                          (totalSpans || 0) - (selectedSpans?.length || 0),
-                          1,
-                        )
-                      : selectedSpans?.length || 0
+                    ? traceSelectionCount.count
+                    : spanSelectionCount.count
+              }
+              selectedCountIsLowerBound={
+                projectSource === PROJECT_SOURCE.SIMULATOR
+                  ? simCallFilterSelectionMode &&
+                    simCallMeta.totalMatchingIsLowerBound
+                  : selectedTab === "trace"
+                    ? traceSelectionCount.isLowerBound
+                    : spanSelectionCount.isLowerBound
               }
               allMatching={
                 (projectSource === PROJECT_SOURCE.SIMULATOR &&
@@ -4565,7 +4594,12 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                   primaryTraceGridRef.current?.api?.getDisplayedRowCount?.() ||
                   0
                 }
-                totalMatching={totalTraces || 0}
+                totalMatching={
+                  traceTotalIsLowerBound
+                    ? traceTotalLowerBound || 0
+                    : totalTraces || 0
+                }
+                totalMatchingIsLowerBound={traceTotalIsLowerBound}
                 noun="trace"
                 onSelectAll={() => setFilterSelectionMode(true)}
               />
@@ -4671,7 +4705,12 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     primarySpanGridRef.current?.api?.getDisplayedRowCount?.() ||
                     0
                   }
-                  totalMatching={totalSpans || 0}
+                  totalMatching={
+                    spanTotalIsLowerBound
+                      ? spanTotalLowerBound || 0
+                      : totalSpans || 0
+                  }
+                  totalMatchingIsLowerBound={spanTotalIsLowerBound}
                   noun="span"
                   onSelectAll={() => setSpanFilterSelectionMode(true)}
                 />
@@ -4781,6 +4820,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                 simCallMeta.totalPages * simCallMeta.pageLimit
               }
               noun="call"
+              totalMatchingIsLowerBound={simCallMeta.totalMatchingIsLowerBound}
               onSelectAll={() => setSimCallFilterSelectionMode(true)}
             />
             <Suspense fallback={<ComponentLoader />}>

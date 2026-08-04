@@ -493,6 +493,23 @@ _EVAL_LOGGER_INSERT_COLUMNS = [
     "_peerdb_version",
 ]
 
+_EVAL_LOGGER_V2_INSERT_COLUMNS = [
+    "id",
+    "trace_session_id",
+    "target_type",
+    "custom_eval_config_id",
+    "output_bool",
+    "output_float",
+    "output_str",
+    "error",
+    "error_message",
+    "eval_explanation",
+    "results_explanation",
+    "created_at",
+    "is_deleted",
+    "_version",
+]
+
 _ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 
 
@@ -576,10 +593,66 @@ def seed_ch_eval_loggers(
     return len(rows)
 
 
+def seed_ch_eval_loggers_v2(
+    eval_loggers: Iterable[Any],
+    *,
+    client: Any | None = None,
+) -> int:
+    """Bulk-insert direct-write-shaped eval rows for endpoint integration tests."""
+
+    legacy_rows = [_eval_logger_row_from_django(el) for el in eval_loggers]
+    rows = [
+        (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            row[6],
+            row[7],
+            row[8],
+            row[9],
+            row[10],
+            row[13],
+            row[14],
+            row[15],
+        )
+        for row in legacy_rows
+    ]
+    if not rows:
+        return 0
+
+    own_client = client is None
+    if own_client:
+        client = _get_ch_client()
+    try:
+        client.insert(
+            "tracer_eval_logger_v2",
+            rows,
+            column_names=list(_EVAL_LOGGER_V2_INSERT_COLUMNS),
+        )
+    finally:
+        if own_client:
+            client.close()
+
+    return len(rows)
+
+
 def truncate_ch_eval_logger() -> None:
     """Wipe the CH ``tracer_eval_logger`` table. Idempotent."""
     client = _get_ch_client()
     try:
         client.command("TRUNCATE TABLE IF EXISTS tracer_eval_logger")
+    finally:
+        client.close()
+
+
+def truncate_ch_eval_logger_v2() -> None:
+    """Wipe the direct-write eval test table. Idempotent."""
+
+    client = _get_ch_client()
+    try:
+        client.command("TRUNCATE TABLE IF EXISTS tracer_eval_logger_v2")
     finally:
         client.close()

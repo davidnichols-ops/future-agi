@@ -14,9 +14,11 @@ from tracer.models.project import Project
 from tracer.serializers.monitor import (
     FetchGraphSerializer,
 )
+from tracer.services.clickhouse.graph_dispatch import graph_payload_is_publishable
 from tracer.utils.graphs_optimized import (
     EvalGraphConfigurationError,
     EvalGraphReadError,
+    SystemMetricGraphReadError,
     get_all_system_metrics,
     get_eval_graph_data,
     get_system_metric_data,
@@ -96,6 +98,7 @@ class ChartsView(GenericViewSet):
             filters = validated_data.get("filters")
             property = validated_data.get("property")
             project_id = validated_data.get("project_id")
+            allow_sampled = validated_data["allow_sampled"]
 
             if not project_id:
                 return self._gm.bad_request("Project id is required")
@@ -155,6 +158,15 @@ class ChartsView(GenericViewSet):
 
             if not metric_data:
                 return self._gm.bad_request("Metric data is not valid")
+            if not graph_payload_is_publishable(
+                metric_data,
+                allow_sampled=allow_sampled,
+            ):
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Graph data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
 
             elapsed_time = time.time() - start_time
             logger.info(
@@ -166,15 +178,15 @@ class ChartsView(GenericViewSet):
 
         except EvalGraphConfigurationError as exc:
             return self._gm.bad_request(str(exc))
-        except EvalGraphReadError:
+        except (EvalGraphReadError, SystemMetricGraphReadError):
             elapsed_time = time.time() - start_time
             logger.exception(
-                "fetch_graph_eval_read_failed",
+                "fetch_graph_clickhouse_read_failed",
                 elapsed_seconds=round(elapsed_time, 3),
             )
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
-                "Evaluation graph data is temporarily unavailable. Please retry.",
+                "Graph data is temporarily unavailable. Please retry.",
                 code="service_unavailable",
             )
         except Exception as exc:

@@ -3,7 +3,7 @@
 Filtered Observe graphs must not materialize a tenant/window-wide ``IN
 (SELECT ...)`` set. This module reuses the list endpoint's selective-anchor /
 ordered-prefix protocol. Results within the finite graph ceiling remain exact;
-larger result sets use a deterministic full-window sample that is always marked
+larger result sets use a bounded time-stratified sample that is always marked
 incomplete. Budget or query failures never become an allegedly exact graph.
 """
 
@@ -20,6 +20,9 @@ import structlog
 
 from tracer.selectors.trace_filter_reads import read_bounded_filter_page
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
+from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.read_budget import (
     is_clickhouse_query_error,
     is_read_budget_error,
@@ -54,15 +57,14 @@ GRAPH_ANY_SPAN_ROWS_PER_STRATUM = 49
 # the ordered stratum reads begin. Common predicates deliberately switch to a
 # small representative ceiling: replaying 512 identities in each of eight
 # strata consumed the whole graph deadline in production before the first
-# stratum completed. Forty-nine identities still provide deterministic temporal
+# stratum completed. Forty-nine identities still provide representative temporal
 # coverage while keeping every latest-state classifier safely bounded.
 GRAPH_ANY_SPAN_DISTRIBUTED_AFTER = timedelta(hours=1)
-# Before distributing a long window, give a directly-indexable predicate one
-# bounded chance to prove that the entire result is sparse.  The 513th raw
-# identity is a sentinel; only an exhausted probe followed by latest-state
-# classification is accepted as exact.
-GRAPH_SPARSE_ANCHOR_LIMIT = 512
-GRAPH_SPARSE_ANCHOR_DEADLINE_MS = 1_800
+# Unindexed structured predicates are never evaluated over an entire long
+# stratum. Sample one fixed tail slice from each temporal stratum, then apply
+# JSON/call_type semantics only to the finite latest-state candidates. This is
+# intentionally incomplete and is always published as sampled metadata.
+GRAPH_UNINDEXED_SAMPLE_SLICE = timedelta(minutes=5)
 
 logger = structlog.get_logger(__name__)
 
@@ -70,8 +72,13 @@ logger = structlog.get_logger(__name__)
 class BoundedGraphReadError(RuntimeError):
     """A sanitized graph-read failure safe to map into an API error code."""
 
-    def __init__(self, error_code: str):
+    def __init__(self, error_code: str, *, retryable: bool = False):
         self.error_code = error_code
+        # ``query_failed`` is intentionally the stable public graph metadata for
+        # both an unavailable transport and a private reducer invariant.  Keep
+        # the transport provenance out-of-band so HTTP boundaries can retry the
+        # former (503) without misclassifying the latter (500).
+        self.retryable = retryable
         super().__init__(error_code)
 
 
@@ -123,17 +130,6 @@ def _active_filters(filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
         not in {"created_at", "start_time"}
         or BaseQueryBuilder.is_datetime_complement_filter(item)
     ]
-
-
-def _has_structured_filter(filters: list[dict[str, Any]]) -> bool:
-    """Return whether a full-window raw anchor is unsafe for this shape."""
-
-    return any(
-        (item.get("column_id") or item.get("columnId")) == "call_type"
-        or str((item.get("filter_config") or {}).get("filter_type") or "").lower()
-        in {"json", "map"}
-        for item in _active_filters(filters)
-    )
 
 
 def _identity_seed_filter(observe_type: str) -> dict[str, Any]:
@@ -219,13 +215,13 @@ def _read_time_distributed_candidates(
     deadline_ms: int,
     classify_batch_size: int,
     rows_per_stratum: int = GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
-    prior_page: Any | None = None,
+    synthetic_time_only_seed: bool = False,
 ) -> GraphCandidateSample:
     """Read arbitrary child-span filters across bounded full-window strata.
 
     Trace attributes may live on any child span.  A single newest-first scan
     can consume its budget in the latest dense slice and show no older shape.
-    Eight disjoint time strata keep the work finite and deterministic. A
+    Eight disjoint time strata keep the work finite and temporally distributed. A
     stratum is marked complete only when its seed was exhausted, so the
     combined graph can never advertise a sample as exact.
     """
@@ -241,11 +237,11 @@ def _read_time_distributed_candidates(
     key_field = "trace_id" if mode == "trace" else "id"
     rows_by_id: dict[Hashable, dict[str, Any]] = {}
     complete = True
-    elapsed_ms = float(getattr(prior_page, "elapsed_ms", 0.0) or 0.0)
-    query_count = int(getattr(prior_page, "query_count", 0) or 0)
-    rows_returned = int(getattr(prior_page, "rows_returned", 0) or 0)
-    result_payload_bytes = int(getattr(prior_page, "result_payload_bytes", 0) or 0)
-    total_rows_lower_bound = int(getattr(prior_page, "total_rows_lower_bound", 0) or 0)
+    elapsed_ms = 0.0
+    query_count = 0
+    rows_returned = 0
+    result_payload_bytes = 0
+    total_rows_lower_bound = 0
     sampling_strata_completed = 0
     sampling_error_code: str | None = None
     # Freeze the outer request window into an explicit positive time leaf.
@@ -260,6 +256,7 @@ def _read_time_distributed_candidates(
         window_start=window_start,
         window_end=window_end,
     )
+    force_temporal_sample = False
 
     for index in range(stratum_count):
         remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
@@ -290,7 +287,49 @@ def _read_time_distributed_candidates(
             # replay each finite trace across the original request window so a
             # root in one stratum can match children in another.
             stratum_builder_kwargs["bounded_membership_filters"] = membership_filters
+        else:
+            # Span anchor probes are an explicit graph opt-in.  Long-window
+            # strata use their finite sentinel instead of sorting every match
+            # in the stratum just to obtain the first 49 candidate identities.
+            stratum_builder_kwargs["bounded_anchor_probe"] = True
         stratum_builder = builder_class(**stratum_builder_kwargs)
+        anchor_support = getattr(stratum_builder, "supports_filter_anchor_probe", None)
+        use_stratum_anchor = (
+            not force_temporal_sample
+            and callable(anchor_support)
+            and bool(anchor_support())
+        )
+        unindexed_sample_support = getattr(
+            stratum_builder,
+            "requires_unindexed_graph_sample_slice",
+            None,
+        )
+        temporal_sample = (
+            not synthetic_time_only_seed
+            and (
+                force_temporal_sample
+                or (
+                    not use_stratum_anchor
+                    and callable(unindexed_sample_support)
+                    and bool(unindexed_sample_support())
+                )
+            )
+            and stratum_end - stratum_start > GRAPH_UNINDEXED_SAMPLE_SLICE
+        )
+        if temporal_sample:
+            # A full-stratum ORDER BY with a predicate ClickHouse cannot prune
+            # can still scan tens of hours before returning zero rows. Restrict
+            # the ordered seed to one fixed five-minute tail slice per stratum.
+            # The trace classifier retains the complete request membership
+            # window; the result remains explicitly sampled in every case.
+            sample_start = stratum_end - GRAPH_UNINDEXED_SAMPLE_SLICE
+            stratum_filters = _filters_for_window(
+                filters,
+                window_start=sample_start,
+                window_end=stratum_end,
+            )
+            stratum_builder_kwargs["filters"] = stratum_filters
+            stratum_builder = builder_class(**stratum_builder_kwargs)
         # One extra identity is the finite has-more sentinel. Keeping the whole
         # stratum working set at 50 avoids the 512-row classifier that exceeded
         # the production graph deadline.
@@ -306,11 +345,22 @@ def _read_time_distributed_candidates(
             candidate_limit + bounded_classify_batch_size - 1
         ) // bounded_classify_batch_size
         max_query_count = max_seed_attempts * (1 + classifiers_per_seed)
-        try:
-            page = read_bounded_filter_page(
-                builder=stratum_builder,
+
+        def read_page(
+            *,
+            active_builder,
+            active_filters,
+            use_anchor: bool,
+            active_remaining_ms: int,
+            seed_attempts: int,
+            query_limit: int,
+            candidate_count: int,
+            classify_size: int,
+        ):
+            return read_bounded_filter_page(
+                builder=active_builder,
                 analytics=analytics,
-                filters=stratum_filters,
+                filters=active_filters,
                 key_field=key_field,
                 page_number=0,
                 page_size=rows_per_stratum,
@@ -319,33 +369,142 @@ def _read_time_distributed_candidates(
                 # caps in the selector still bound a slow ClickHouse read, but
                 # a healthy classifier may use the otherwise-idle budget from
                 # adjacent strata.
-                deadline_ms=remaining_ms,
-                max_seed_attempts=max_seed_attempts,
-                max_query_count=max_query_count,
+                deadline_ms=active_remaining_ms,
+                max_seed_attempts=seed_attempts,
+                max_query_count=query_limit,
                 # The visible rows plus one has-more sentinel stay finite. A
                 # sparse/unattested path retains the 49-row representative
                 # ceiling.
-                max_candidates=candidate_limit,
-                classify_batch_size=bounded_classify_batch_size,
+                max_candidates=candidate_count,
+                classify_batch_size=classify_size,
                 include_incomplete_rows=True,
+                # An indexed graph stratum is one disjoint piece of the frozen
+                # request window.  Its 50th raw identity is therefore a local
+                # sample sentinel: classify that finite set and never enter the
+                # ORDER BY seed path for directly anchorable predicates.
+                anchor_probe_only=use_anchor,
+                anchor_probe_limit=(candidate_count if use_anchor else None),
+            )
+
+        page = None
+        anchor_failure: Exception | str | None = None
+        try:
+            page = read_page(
+                active_builder=stratum_builder,
+                active_filters=stratum_filters,
+                use_anchor=use_stratum_anchor,
+                active_remaining_ms=remaining_ms,
+                seed_attempts=max_seed_attempts,
+                query_limit=max_query_count,
+                candidate_count=candidate_limit,
+                classify_size=bounded_classify_batch_size,
             )
         except Exception as exc:
-            # Compiler/programming defects are not degradable. They must reach
-            # the API boundary, where the generic 500 contract hides private
-            # SQL details. Only typed resource and transport failures may be
-            # represented by stable graph error metadata here.
-            if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
-                raise
+            if use_stratum_anchor and is_read_budget_error(exc):
+                anchor_failure = exc
+            else:
+                # Compiler/programming defects are not degradable. They must reach
+                # the API boundary, where the generic 500 contract hides private
+                # SQL details. Only typed resource and transport failures may be
+                # represented by stable graph error metadata here.
+                if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+                    raise
+                logger.warning(
+                    "graph candidate stratum degraded",
+                    stratum_index=index,
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
+                public_code = (
+                    "read_budget_exceeded"
+                    if is_read_budget_error(exc)
+                    else "query_failed"
+                )
+                raise BoundedGraphReadError(public_code, retryable=True) from None
+
+        if (
+            page is not None
+            and use_stratum_anchor
+            and page.error_code == "read_budget_exceeded"
+            and any(
+                getattr(attempt, "kind", None) == "anchor"
+                and getattr(attempt, "error_code", None) == "read_budget_exceeded"
+                for attempt in page.attempts
+            )
+        ):
+            anchor_failure = "read_budget_exceeded"
+
+        if anchor_failure is not None:
+            # An index may be declared but not materialized on old parts, or a
+            # positive key can be common while its value is rare. A 159/241/307
+            # anchor failure therefore says nothing about graph membership.
+            # Preserve its accounting, then switch this and every remaining
+            # stratum to the fixed five-minute lane under the same wall deadline.
+            if page is not None:
+                elapsed_ms += page.elapsed_ms
+                query_count += page.query_count
+                rows_returned += page.rows_returned
+                result_payload_bytes += page.result_payload_bytes
+                total_rows_lower_bound += page.total_rows_lower_bound
             logger.warning(
-                "graph candidate stratum degraded",
+                "graph candidate anchor exceeded budget; using temporal sample",
                 stratum_index=index,
-                error_type=type(exc).__name__,
-                exc_info=True,
+                error_type=(
+                    type(anchor_failure).__name__
+                    if isinstance(anchor_failure, Exception)
+                    else str(anchor_failure)
+                ),
+                exc_info=isinstance(anchor_failure, Exception),
             )
-            public_code = (
-                "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+            force_temporal_sample = True
+            use_stratum_anchor = False
+            temporal_sample = stratum_end - stratum_start > GRAPH_UNINDEXED_SAMPLE_SLICE
+            sample_start = (
+                stratum_end - GRAPH_UNINDEXED_SAMPLE_SLICE
+                if temporal_sample
+                else stratum_start
             )
-            raise BoundedGraphReadError(public_code) from None
+            stratum_filters = _filters_for_window(
+                filters,
+                window_start=sample_start,
+                window_end=stratum_end,
+            )
+            stratum_builder_kwargs["filters"] = stratum_filters
+            stratum_builder = builder_class(**stratum_builder_kwargs)
+            remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
+            if remaining_ms < 25:
+                complete = False
+                sampling_error_code = "read_budget_exceeded"
+                break
+            try:
+                page = read_page(
+                    active_builder=stratum_builder,
+                    active_filters=stratum_filters,
+                    use_anchor=False,
+                    active_remaining_ms=remaining_ms,
+                    seed_attempts=max_seed_attempts,
+                    query_limit=max_query_count,
+                    candidate_count=candidate_limit,
+                    classify_size=bounded_classify_batch_size,
+                )
+            except Exception as exc:
+                if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+                    raise
+                logger.warning(
+                    "graph candidate temporal fallback degraded",
+                    stratum_index=index,
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
+                public_code = (
+                    "read_budget_exceeded"
+                    if is_read_budget_error(exc)
+                    else "query_failed"
+                )
+                raise BoundedGraphReadError(public_code, retryable=True) from None
+
+        if page is None:  # pragma: no cover - defensive exhaustiveness
+            raise BoundedGraphReadError("query_failed")
 
         elapsed_ms += page.elapsed_ms
         query_count += page.query_count
@@ -362,6 +521,11 @@ def _read_time_distributed_candidates(
             )
             if public_code != "sample_limit":
                 sampling_error_code = public_code
+        elif temporal_sample:
+            # Exhausting the bounded micro-slice proves only that slice, never
+            # the surrounding long stratum.
+            complete = False
+            public_code = "sample_limit"
         # A resource/transport failure is not temporal coverage. Only an
         # exhausted page or a bounded candidate/sample-limit response proves
         # that this stratum was actually classified. This prevents eight
@@ -422,10 +586,11 @@ def read_graph_candidates(
 ) -> GraphCandidateSample:
     """Return an exact finite set or an explicitly incomplete graph sample.
 
-    ``allow_time_only_seed`` is used by annotation graphs, whose score table
-    cannot prove tracer project ownership on its own.  A tautological finite
-    identity predicate sends those requests through the same bounded CH25
-    selector without introducing a broad membership subquery.
+    ``allow_time_only_seed`` lets chart callers prove project/window ownership
+    with a finite identity predicate when no user row filter exists.  Long
+    windows still read one capped page per temporal stratum, but the synthetic
+    ``is_not_null`` leaf must not be mistaken for an unindexed user predicate
+    and reduced to a five-minute micro-slice.
     """
 
     mode = str(observe_type or "").strip().lower()
@@ -435,10 +600,12 @@ def read_graph_candidates(
         raise ValueError("deadline_ms must be positive")
 
     effective_filters = list(filters or [])
+    synthetic_time_only_seed = False
     if not _active_filters(effective_filters):
         if not allow_time_only_seed:
             raise ValueError("a bounded graph candidate read needs a row filter")
         effective_filters.append(_identity_seed_filter(mode))
+        synthetic_time_only_seed = True
 
     builder_class = (
         TraceListQueryBuilderV2 if mode == "trace" else SpanListQueryBuilderV2
@@ -461,98 +628,15 @@ def read_graph_candidates(
     )
     if not builder.supports_bounded_filter_scan():
         error_code = builder.bounded_filter_degraded_error_code()
+        if error_code == "unsupported_filter_shape":
+            raise UnsupportedFilterShapeError(
+                "The filter cannot be evaluated by the bounded graph reader"
+            )
         raise BoundedGraphReadError(error_code or "unsupported_filter_shape")
 
     window_start, window_end = builder.parse_time_range(effective_filters)
     classify_batch_size = builder.recommended_filter_classify_batch_size()
     if window_end - window_start > GRAPH_ANY_SPAN_DISTRIBUTED_AFTER:
-        sparse_page = None
-        distributed_deadline_ms = deadline_ms
-        anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
-        if (
-            callable(anchor_support)
-            and bool(anchor_support())
-            and not _has_structured_filter(effective_filters)
-        ):
-            anchor_started = monotonic()
-            try:
-                sparse_page = read_bounded_filter_page(
-                    builder=builder,
-                    analytics=analytics,
-                    filters=effective_filters,
-                    key_field="trace_id" if mode == "trace" else "id",
-                    page_number=0,
-                    page_size=GRAPH_SPARSE_ANCHOR_LIMIT,
-                    deadline_ms=min(deadline_ms, GRAPH_SPARSE_ANCHOR_DEADLINE_MS),
-                    max_seed_attempts=2,
-                    max_query_count=5,
-                    max_candidates=GRAPH_SPARSE_ANCHOR_LIMIT,
-                    classify_batch_size=min(
-                        int(classify_batch_size or 50),
-                        GRAPH_SPARSE_ANCHOR_LIMIT,
-                    ),
-                    include_incomplete_rows=False,
-                    anchor_probe_only=True,
-                )
-            except Exception as exc:
-                if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
-                    raise
-                logger.warning(
-                    "graph sparse anchor degraded",
-                    error_type=type(exc).__name__,
-                    exc_info=True,
-                )
-                if not is_read_budget_error(exc):
-                    raise BoundedGraphReadError("query_failed") from None
-                # Code 307 / read-budget failures on a full-window anchor do
-                # not invalidate the smaller disjoint strata. Reuse no partial
-                # anchor rows and spend only the remaining request budget on
-                # deterministic latest-state samples.
-                distributed_deadline_ms = max(
-                    25,
-                    deadline_ms - int((monotonic() - anchor_started) * 1000),
-                )
-                if distributed_deadline_ms <= 25:
-                    raise BoundedGraphReadError("read_budget_exceeded") from None
-            # ``complete`` alone can mean a proven *page prefix*.  Exact graph
-            # membership requires the full sentinel probe to be exhausted,
-            # represented here by a complete page with no has-more row.
-            if (
-                sparse_page is not None
-                and sparse_page.complete
-                and not sparse_page.has_more
-            ):
-                return GraphCandidateSample(
-                    rows=tuple(sparse_page.rows),
-                    query_complete=True,
-                    query_status="complete",
-                    query_error_code=None,
-                    window_start=window_start,
-                    window_end=window_end,
-                    elapsed_ms=sparse_page.elapsed_ms,
-                    query_count=sparse_page.query_count,
-                    rows_returned=sparse_page.rows_returned,
-                    result_payload_bytes=sparse_page.result_payload_bytes,
-                    total_rows_lower_bound=max(
-                        len(sparse_page.rows),
-                        sparse_page.total_rows_lower_bound,
-                    ),
-                )
-            if sparse_page is not None:
-                if sparse_page.error_code not in {
-                    "sample_limit",
-                    "deadline_exceeded",
-                    "read_budget_exceeded",
-                }:
-                    raise BoundedGraphReadError(
-                        _incomplete_error_code(sparse_page.error_code)
-                    )
-                distributed_deadline_ms = max(
-                    25,
-                    deadline_ms - int(sparse_page.elapsed_ms),
-                )
-                if distributed_deadline_ms <= 25:
-                    raise BoundedGraphReadError("read_budget_exceeded")
         return _read_time_distributed_candidates(
             analytics=analytics,
             builder_class=builder_class,
@@ -561,10 +645,10 @@ def read_graph_candidates(
             mode=mode,
             window_start=window_start,
             window_end=window_end,
-            deadline_ms=distributed_deadline_ms,
+            deadline_ms=deadline_ms,
             classify_batch_size=int(classify_batch_size or 50),
             rows_per_stratum=GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
-            prior_page=sparse_page,
+            synthetic_time_only_seed=synthetic_time_only_seed,
         )
 
     candidate_limit = GRAPH_CANDIDATE_LIMIT
@@ -606,7 +690,7 @@ def read_graph_candidates(
         public_code = (
             "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
         )
-        raise BoundedGraphReadError(public_code) from None
+        raise BoundedGraphReadError(public_code, retryable=True) from None
     if not page.complete:
         error_code = _incomplete_error_code(page.error_code)
         if error_code != "sample_limit" or not page.rows:

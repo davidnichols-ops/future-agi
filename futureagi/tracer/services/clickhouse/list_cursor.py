@@ -106,7 +106,13 @@ def normalize_cursor_query(query: dict[str, Any]) -> dict[str, Any]:
 
     normalized: dict[str, Any] = {}
     for key, value in query.items():
-        if key in {"cursor", "cursor_mode", "page", "page_number"}:
+        if key in {
+            "allow_sampled",
+            "cursor",
+            "cursor_mode",
+            "page",
+            "page_number",
+        }:
             continue
         if key == "filters":
             filters = [_normalized_filter(item) for item in (value or [])]

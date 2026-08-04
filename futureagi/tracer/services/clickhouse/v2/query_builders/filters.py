@@ -70,25 +70,15 @@ _DICT_RENAME_RE = re.compile(
 )
 
 
-# Eval filters are polymorphic: even when the outer spans query targets CH25,
-# ``CH25_EVAL_LOGGER_TABLE`` may still select the legacy PeerDB table. The
-# whole-fragment v2 rewrite must continue to migrate spans references, but it
-# must not rename that table's physical version/tombstone columns. Protect only
-# the dedicated eval aliases emitted by the base filter compiler, rewrite the
-# rest of the fragment, then restore the legacy identifiers.
-_LEGACY_EVAL_COLUMN_MARKERS: dict[str, str] = {
-    "eval_scan._peerdb_version": "eval_scan.__eval_legacy_version__",
+_EVAL_LEGACY_COLUMN_MARKERS = {
+    "raw_eval_logger._peerdb_is_deleted": (
+        "raw_eval_logger.__eval_legacy_cdc_deleted__"
+    ),
+    "raw_eval_logger._peerdb_version": "raw_eval_logger.__eval_legacy_version__",
     "eval_scan._peerdb_is_deleted": "eval_scan.__eval_legacy_cdc_deleted__",
+    "eval_scan._peerdb_version": "eval_scan.__eval_legacy_version__",
     "latest_eval._peerdb_is_deleted": "latest_eval.__eval_legacy_cdc_deleted__",
-    "raw_eval_logger._peerdb_is_deleted": (
-        "raw_eval_logger.__eval_legacy_cdc_deleted__"
-    ),
-}
-
-_RAW_EVAL_LEGACY_COLUMN_MARKERS = {
-    "raw_eval_logger._peerdb_is_deleted": (
-        "raw_eval_logger.__eval_legacy_cdc_deleted__"
-    ),
+    "latest_eval._peerdb_version": "latest_eval.__eval_legacy_version__",
 }
 
 
@@ -134,6 +124,16 @@ _BARE_JSON_REWRITES = {
     "resource_attributes_raw": cols.RESOURCE_ATTRS,
 }
 _STRING_JSON_LEGACY_COLUMNS = frozenset({"span_attributes_raw"})
+
+# Latest-state content hydration wraps the legacy JSON string in a one-element
+# tuple so nullable values survive ``argMax``.  Treat that aggregate as one SQL
+# expression before the generic bare-column pass; otherwise the latter would
+# inject ``AS span_attributes_raw`` *inside* ``tuple(...)`` and emit invalid
+# CH25 SQL (``tuple(attributes_extra AS span_attributes_raw)``).
+_ARGMAX_TUPLE_SPAN_ATTRIBUTES_PATTERN = re.compile(
+    r"argMax\(\s*tuple\(\s*span_attributes_raw\s*\)\s*,\s*"
+    r"(?P<version>_peerdb_version)\s*\)\.1"
+)
 
 
 def _json_text_expression(legacy_col: str, v2_col: str) -> str:
@@ -248,12 +248,11 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
          Word-boundary substitution; runs last.
       6. Append v2-required settings (use_skip_indexes_if_final etc).
     """
-    # A legacy raw eval table can be selected while the surrounding spans SQL
-    # uses the v2 schema.  The dedicated alias is emitted only for that legacy
-    # physical table, so preserve its CDC tombstone column through the global
-    # token rewrite.  A v2 eval table emits ``raw_eval_logger.is_deleted`` and
-    # does not need a marker.
-    for source, marker in _RAW_EVAL_LEGACY_COLUMN_MARKERS.items():
+    # A legacy-named eval table can be authoritative while the surrounding
+    # span SQL uses CH25. Preserve eval aliases' version/tombstone columns
+    # through the global span-column rewrite. A v2 eval source never emits
+    # these tokens, so this is a no-op for that table shape.
+    for source, marker in _EVAL_LEGACY_COLUMN_MARKERS.items():
         sql = sql.replace(source, marker)
 
     # 1. String JSON access. Replace only the first argument so nested paths
@@ -262,6 +261,15 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
         lambda match: (
             f"{match.group('function')}{match.group('open')}"
             f"{cols.ATTRIBUTES_EXTRA}{match.group('comma')}"
+        ),
+        sql,
+    )
+
+    # 1b. Aggregate-level JSON projection. This must precede the bare-column
+    # alias rewrite; the version token is intentionally left for step 5.
+    sql = _ARGMAX_TUPLE_SPAN_ATTRIBUTES_PATTERN.sub(
+        lambda match: (
+            f"argMax(tuple({cols.ATTRIBUTES_EXTRA}), {match.group('version')}).1"
         ),
         sql,
     )
@@ -317,7 +325,7 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
     sql = _COL_RENAME_RE.sub(lambda m: _COL_RENAMES[m.group(1)], sql)
     # 5b. Legacy CDC dictionary names → v2 CH-native dictionary names.
     sql = _DICT_RENAME_RE.sub(lambda m: _DICT_RENAMES[m.group(1)], sql)
-    for source, marker in _RAW_EVAL_LEGACY_COLUMN_MARKERS.items():
+    for source, marker in _EVAL_LEGACY_COLUMN_MARKERS.items():
         sql = sql.replace(marker, source)
     # NOTE: this function does NOT append the v2 SETTINGS clause. The settings
     # are appended at the BUILDER boundary (v2 `build()`/`build_count_query()` etc)
@@ -354,20 +362,8 @@ class ClickHouseFilterBuilderV2(ClickHouseFilterBuilder):
 
     @staticmethod
     def _rewrite_filter_fragment(sql: str) -> str:
-        """Rewrite spans SQL without corrupting a legacy eval-table probe."""
-        from tracer.services.clickhouse.eval_logger_table import eval_logger_source
-
-        eval_table, _ = eval_logger_source()
-        if eval_table.endswith("_v2"):
-            return rewrite_v1_sql_to_v2(sql)
-
-        protected = sql
-        for source, marker in _LEGACY_EVAL_COLUMN_MARKERS.items():
-            protected = protected.replace(source, marker)
-        rewritten = rewrite_v1_sql_to_v2(protected)
-        for source, marker in _LEGACY_EVAL_COLUMN_MARKERS.items():
-            rewritten = rewritten.replace(marker, source)
-        return rewritten
+        """Rewrite a V2 spans/filter fragment at the schema boundary."""
+        return rewrite_v1_sql_to_v2(sql)
 
     def _span_attr_inner(
         self,

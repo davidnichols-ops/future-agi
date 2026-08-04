@@ -16,6 +16,16 @@ from typing import Any
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 
 
+def _unix_microseconds(value: datetime) -> int:
+    """Encode a UTC DateTime64(6) bound without driver precision loss."""
+
+    utc_value = (
+        value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    )
+    delta = utc_value - datetime(1970, 1, 1, tzinfo=UTC)
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+
+
 @dataclass(frozen=True)
 class BoundedDateTimeRange:
     """One finite base window plus conjunctive exclusions inside it."""
@@ -516,10 +526,14 @@ class BaseQueryBuilder(ABC):
         for index, (lower, upper) in enumerate(analyzed.exclusions):
             lower_param = f"{param_prefix}_{index}_start"
             upper_param = f"{param_prefix}_{index}_end"
-            params[lower_param] = lower
-            params[upper_param] = upper
+            # clickhouse-driver renders a bound ``datetime`` at whole-second
+            # precision.  Complements such as ``not_equals`` deliberately use
+            # one-microsecond ranges, so bind epoch microseconds explicitly.
+            params[lower_param] = _unix_microseconds(lower)
+            params[upper_param] = _unix_microseconds(upper)
             predicates.append(
-                f"({column} < %({lower_param})s OR {column} >= %({upper_param})s)"
+                f"({column} < fromUnixTimestamp64Micro(%({lower_param})s) OR "
+                f"{column} >= fromUnixTimestamp64Micro(%({upper_param})s))"
             )
         return " AND ".join(predicates), params
 

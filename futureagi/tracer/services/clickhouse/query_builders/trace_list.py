@@ -14,6 +14,7 @@ The two result sets are merged in Python.
 """
 
 import math
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -38,6 +39,28 @@ from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
 # start_time)) start_time prunes partitions and the PK; created_at prunes
 # nothing and scans the whole project.
 TIME_FILTER_COLUMN = "start_time"  # Options: "created_at" | "start_time"
+
+_INDEXED_TRACE_ANY_SPAN_ANCHOR_COLUMNS = frozenset(
+    {
+        "id",
+        "trace_id",
+        "parent_span_id",
+        "trace_session_id",
+        "end_user_id",
+        "custom_eval_config_id",
+        "model",
+        "provider",
+        "status",
+        "eval_status",
+        "latency_ms",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cost",
+        "input_length",
+        "output_length",
+    }
+)
 
 
 def _unix_microseconds(value: datetime) -> int:
@@ -65,6 +88,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
     TABLE = "spans"
     EVAL_TABLE = "tracer_eval_logger"
+    # Eval storage is selected independently from the spans generation. A
+    # CH25 span query can legitimately read the legacy-named authoritative
+    # eval table on the same connection.
+    _EVAL_LOGGER_SOURCE = staticmethod(eval_logger_source)
     # Filter compiler class; the v2 list builder overrides this to the v2
     # builder so it reads the v2 dimension tables (end_users, etc.).
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
@@ -316,14 +343,78 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return [
             plan
             for plan in plans
-            if plan.scope == "any" and "JSONExtract" not in plan.seed_predicate
+            if plan.scope == "any" and self._plan_uses_indexed_anchor(plan)
         ]
+
+    @staticmethod
+    def _plan_uses_indexed_anchor(plan: LatestFilterPredicate) -> bool:
+        """Return whether an any-span predicate has a safe broad sentinel."""
+
+        predicate = " ".join(str(plan.seed_predicate or "").split())
+        if not predicate or predicate.replace(" ", "") == "1=1":
+            return False
+        if "JSONExtract" in predicate:
+            return False
+        if "mapContains(span_attr_" in predicate:
+            if "NOT mapContains(span_attr_" in predicate:
+                return False
+            if any(
+                fragment in predicate
+                for fragment in (
+                    " != ",
+                    " NOT IN ",
+                    " NOT BETWEEN ",
+                    "positionUTF8(",
+                    "startsWith(",
+                    "endsWith(",
+                )
+            ) or re.search(r"\bIS\s+(?:NOT\s+)?NULL\b", predicate):
+                return False
+            if "lowerUTF8(" in predicate and not (
+                "has(arrayMap(x -> lower(x), mapValues(span_attr_str))" in predicate
+                or "hasAny(arrayMap(x -> lower(x), mapValues(span_attr_str))"
+                in predicate
+            ):
+                return False
+            return True
+        if any(
+            fragment in predicate
+            for fragment in (
+                "lowerUTF8(",
+                "positionUTF8(",
+                "startsWith(",
+                "endsWith(",
+            )
+        ):
+            return False
+        if any(
+            fragment in predicate for fragment in (" != ", " NOT IN ", " NOT BETWEEN ")
+        ) or re.search(r"\bIS\s+(?:NOT\s+)?NULL\b", predicate):
+            return False
+        return any(
+            re.search(rf"\b{re.escape(column)}\b", predicate)
+            for column in _INDEXED_TRACE_ANY_SPAN_ANCHOR_COLUMNS
+        )
 
     def _has_unindexed_any_span_filter(self) -> bool:
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
         return any(
             plan.scope == "any" and "JSONExtract" in plan.seed_predicate
             for plan in plans
+        )
+
+    def requires_unindexed_graph_sample_slice(self) -> bool:
+        """Use micro-slices when no positive index-usable superset exists.
+
+        This is expression-aware rather than column-name-aware. Text comparison
+        wrappers, root text fields, JSON extraction, and negative/null-only
+        shapes use fixed temporal micro-slices unless another positive predicate
+        has a deployed index companion ClickHouse can actually apply.
+        """
+
+        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        return bool(plans) and not any(
+            self._plan_uses_indexed_anchor(plan) for plan in plans
         )
 
     def recommended_filter_seed_batch_size(self) -> int:
@@ -351,7 +442,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
     def bounded_filter_seed_identity(
         self, row: dict[str, Any]
-    ) -> tuple[str, str, str, Any] | str:
+    ) -> tuple[str, str, str, Any] | tuple[str, str] | str:
         """Keyset selective seeds by physical span, public rows by trace."""
 
         if row.get("matched_span_id"):
@@ -361,19 +452,47 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 str(row.get("matched_span_id") or ""),
                 row.get("start_time"),
             )
+        if self.project_ids is not None:
+            return (
+                str(row.get("project_id") or ""),
+                str(row.get("trace_id") or ""),
+            )
         return str(row.get("trace_id") or "")
 
-    @staticmethod
     def bounded_filter_seed_order_token(
+        self,
         row: dict[str, Any],
-    ) -> tuple[str, str, str] | str:
+    ) -> tuple[str, str, str] | tuple[str, str] | str:
         if row.get("matched_span_id"):
             return (
                 str(row.get("matched_span_id") or ""),
                 str(row.get("trace_id") or ""),
                 str(row.get("project_id") or ""),
             )
+        if self.project_ids is not None:
+            return (
+                str(row.get("trace_id") or ""),
+                str(row.get("project_id") or ""),
+            )
         return str(row.get("trace_id") or "")
+
+    def bounded_filter_row_identity(self, row: dict[str, Any]) -> tuple[str, str] | str:
+        """Keep same-text trace IDs distinct across organization projects."""
+
+        trace_id = str(row.get("trace_id") or "")
+        if self.project_ids is not None:
+            return str(row.get("project_id") or ""), trace_id
+        return trace_id
+
+    def bounded_filter_row_order_token(
+        self, row: dict[str, Any]
+    ) -> tuple[str, str] | str:
+        """Match the result query's deterministic tenant-aware order."""
+
+        trace_id = str(row.get("trace_id") or "")
+        if self.project_ids is not None:
+            return trace_id, str(row.get("project_id") or "")
+        return trace_id
 
     def supports_filter_anchor_probe(self) -> bool:
         """Whether a direct any-span leaf can classify sparse vs common."""
@@ -409,6 +528,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             **anchor_params,
             "filter_anchor_start": request_start,
             "filter_anchor_end": request_end,
+            "filter_anchor_start_us": _unix_microseconds(request_start),
+            "filter_anchor_end_us": _unix_microseconds(request_end),
             "filter_anchor_limit": int(limit),
         }
         project_version_fragment = ""
@@ -425,13 +546,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
               ) < %(bounded_sampling_rate)s
             """
         query = f"""
-        SELECT DISTINCT trace_id
+        SELECT DISTINCT {"project_id, trace_id" if self.project_ids is not None else "trace_id"}
         FROM {self.TABLE}
         PREWHERE {self.project_filter_sql()}
           AND is_deleted = 0
           {project_version_fragment}
-          AND start_time >= %(filter_anchor_start)s
-          AND start_time < %(filter_anchor_end)s
+          AND start_time >= fromUnixTimestamp64Micro(%(filter_anchor_start_us)s)
+          AND start_time < fromUnixTimestamp64Micro(%(filter_anchor_end_us)s)
         WHERE {anchor.seed_predicate}
           {sampling_fragment}
         LIMIT %(filter_anchor_limit)s
@@ -468,6 +589,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             **self.params,
             "filter_slice_start": slice_start,
             "filter_slice_end": slice_end,
+            # clickhouse-driver formats bound ``datetime`` values at whole-
+            # second precision.  Keep the datetimes above for the bounded-read
+            # orchestration contract, but bind epoch microseconds in SQL so a
+            # row in the final fractional second is not lost at a slice edge.
+            "filter_slice_start_us": _unix_microseconds(slice_start),
+            "filter_slice_end_us": _unix_microseconds(slice_end),
             "filter_seed_limit": int(limit),
         }
         for plan in root_plans:
@@ -509,8 +636,35 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             if not slice_start <= before_start_time < slice_end:
                 raise ValueError("trace keyset must stay inside its slice")
             params["filter_before_start_us"] = _unix_microseconds(before_start_time)
-            params["filter_before_id"] = str(before_id)
-            keyset_fragment = """
+            if self.project_ids is not None:
+                if not (
+                    isinstance(before_id, tuple)
+                    and len(before_id) == 2
+                    and all(isinstance(value, str) for value in before_id)
+                ):
+                    raise ValueError(
+                        "org trace keyset must be a (trace_id, project_id) tuple"
+                    )
+                params["filter_before_id"] = before_id[0]
+                params["filter_before_project_id"] = before_id[1]
+                keyset_fragment = """
+              AND (
+                  toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
+                  OR (
+                      toUnixTimestamp64Micro(start_time) = %(filter_before_start_us)s
+                      AND (
+                          trace_id < %(filter_before_id)s
+                          OR (
+                              trace_id = %(filter_before_id)s
+                              AND project_id < toUUID(%(filter_before_project_id)s)
+                          )
+                      )
+                  )
+              )
+            """
+            else:
+                params["filter_before_id"] = str(before_id)
+                keyset_fragment = """
               AND (
                   toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
                   OR (
@@ -519,21 +673,32 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                   )
               )
             """
+        identity_select = (
+            "project_id, trace_id" if self.project_ids is not None else "trace_id"
+        )
+        identity_order = (
+            "trace_id DESC, project_id DESC"
+            if self.project_ids is not None
+            else "trace_id DESC"
+        )
+        identity_limit_by = (
+            "project_id, trace_id" if self.project_ids is not None else "trace_id"
+        )
         query = f"""
-        SELECT trace_id, id AS root_span_id, start_time
+        SELECT {identity_select}, id AS root_span_id, start_time
         FROM {self.TABLE}
         PREWHERE {self.project_filter_sql()}
           AND is_deleted = 0
           {project_version_fragment}
           AND (parent_span_id IS NULL OR parent_span_id = '')
-          AND start_time >= %(filter_slice_start)s
-          AND start_time < %(filter_slice_end)s
+          AND start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)
+          AND start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)
         WHERE 1 = 1
           {predicate_fragment}{datetime_fragment}
           {sampling_fragment}
           {keyset_fragment}
-        ORDER BY start_time DESC, trace_id DESC
-        LIMIT 1 BY trace_id
+        ORDER BY start_time DESC, {identity_order}
+        LIMIT 1 BY {identity_limit_by}
         LIMIT %(filter_seed_limit)s
         """
         return query, params
@@ -575,6 +740,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             **self.params,
             "filter_slice_start": slice_start,
             "filter_slice_end": slice_end,
+            # Preserve DateTime64(6) slice edges across clickhouse-driver's
+            # whole-second datetime interpolation.  The datetime parameters
+            # remain available to bounded-reader instrumentation and fakes.
+            "filter_slice_start_us": _unix_microseconds(slice_start),
+            "filter_slice_end_us": _unix_microseconds(slice_end),
             "filter_seed_limit": int(limit),
         }
         project_version_fragment = ""
@@ -659,8 +829,35 @@ class TraceListQueryBuilder(BaseQueryBuilder):
               )
             """
             else:
-                params["filter_before_id"] = str(before_id)
-                keyset_fragment = """
+                if self.project_ids is not None:
+                    if not (
+                        isinstance(before_id, tuple)
+                        and len(before_id) == 2
+                        and all(isinstance(value, str) for value in before_id)
+                    ):
+                        raise ValueError(
+                            "org trace keyset must be a (trace_id, project_id) tuple"
+                        )
+                    params["filter_before_id"] = before_id[0]
+                    params["filter_before_project_id"] = before_id[1]
+                    keyset_fragment = """
+              AND (
+                  toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
+                  OR (
+                      toUnixTimestamp64Micro(start_time) = %(filter_before_start_us)s
+                      AND (
+                          trace_id < %(filter_before_id)s
+                          OR (
+                              trace_id = %(filter_before_id)s
+                              AND project_id < toUUID(%(filter_before_project_id)s)
+                          )
+                      )
+                  )
+              )
+            """
+                else:
+                    params["filter_before_id"] = str(before_id)
+                    keyset_fragment = """
               AND (
                   toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
                   OR (
@@ -678,10 +875,22 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             )
             limit_by_fragment = "LIMIT 1 BY project_id, trace_id, id, start_time"
         else:
-            select_fragment = "trace_id, id AS root_span_id, start_time"
+            select_fragment = (
+                "project_id, trace_id, id AS root_span_id, start_time"
+                if self.project_ids is not None
+                else "trace_id, id AS root_span_id, start_time"
+            )
             root_fragment = "AND (parent_span_id IS NULL OR parent_span_id = '')"
-            order_fragment = "ORDER BY start_time DESC, trace_id DESC"
-            limit_by_fragment = "LIMIT 1 BY trace_id"
+            order_fragment = (
+                "ORDER BY start_time DESC, trace_id DESC, project_id DESC"
+                if self.project_ids is not None
+                else "ORDER BY start_time DESC, trace_id DESC"
+            )
+            limit_by_fragment = (
+                "LIMIT 1 BY project_id, trace_id"
+                if self.project_ids is not None
+                else "LIMIT 1 BY trace_id"
+            )
 
         query = f"""
         SELECT {select_fragment}
@@ -690,8 +899,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
           AND is_deleted = 0
           {project_version_fragment}
           {root_fragment}
-          AND start_time >= %(filter_slice_start)s
-          AND start_time < %(filter_slice_end)s
+          AND start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)
+          AND start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)
         WHERE 1 = 1
           {predicate_fragment}{datetime_fragment}
           {sampling_fragment}
@@ -707,6 +916,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         candidate_ids: list[str],
         *,
         candidate_full_state: bool = False,
+        candidate_trace_identities: list[tuple[str, str]] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Classify bounded trace IDs against their latest span versions.
 
@@ -723,7 +933,30 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if not trace_ids:
             return "", {}
         candidate_limit = 200 if self._bounded_bulk_scan else 512
-        if len(trace_ids) > candidate_limit:
+        org_scope = self.project_ids is not None
+        trace_identities: tuple[tuple[str, str], ...] = ()
+        if org_scope:
+            if candidate_trace_identities is None:
+                trace_identities = tuple(
+                    (str(project_id), trace_id)
+                    for project_id in self.project_ids or ()
+                    for trace_id in trace_ids
+                )
+            else:
+                trace_identities = tuple(
+                    dict.fromkeys(
+                        (str(project_id), str(trace_id))
+                        for project_id, trace_id in candidate_trace_identities
+                        if project_id and trace_id
+                    )
+                )
+            if not trace_identities:
+                return "", {}
+            trace_ids = tuple(
+                dict.fromkeys(trace_id for _, trace_id in trace_identities)
+            )
+        candidate_count = len(trace_identities) if org_scope else len(trace_ids)
+        if candidate_count > candidate_limit:
             raise ValueError("candidate trace batch exceeds bounded limit")
         if not self.supports_bounded_filter_scan():
             raise ValueError("unsupported bounded trace filter scan")
@@ -752,11 +985,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             **self.params,
             "candidate_trace_ids": trace_ids,
         }
+        if org_scope:
+            params["candidate_trace_identities"] = trace_identities
         if scope_to_request_window:
             params.update(
                 {
                     "candidate_start_date": request_start,
                     "candidate_end_date": request_end,
+                    "candidate_start_date_us": _unix_microseconds(request_start),
+                    "candidate_end_date_us": _unix_microseconds(request_end),
                 }
             )
         candidate_time_fragment = ""
@@ -766,10 +1003,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             # partition, so pruning outside partitions before argMax cannot
             # hide a newer version or change latest-state membership.
             candidate_time_fragment = """
-                  AND toDate(start_time) >= toDate(%(candidate_start_date)s)
-                  AND toDate(start_time) <= toDate(%(candidate_end_date)s)
-                  AND start_time >= %(candidate_start_date)s
-                  AND start_time < %(candidate_end_date)s
+                  AND toDate(start_time) >= toDate(fromUnixTimestamp64Micro(%(candidate_start_date_us)s))
+                  AND toDate(start_time) <= toDate(fromUnixTimestamp64Micro(%(candidate_end_date_us)s))
+                  AND start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)
+                  AND start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)
             """
         project_version_fragment = ""
         if self.project_version_id:
@@ -809,8 +1046,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         if scope_to_request_window:
             canonical_root_condition = f"""(
-                    latest_start_time >= %(candidate_start_date)s
-                    AND latest_start_time < %(candidate_end_date)s{datetime_root_fragment}
+                    latest_start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)
+                    AND latest_start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s){datetime_root_fragment}
                     AND (
                         latest_parent_span_id IS NULL
                         OR latest_parent_span_id = ''
@@ -844,8 +1081,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # requested half-open window satisfy the trace filter.
         if scope_to_request_window:
             any_span_window_condition = """(
-                    latest_start_time >= %(candidate_start_date)s
-                    AND latest_start_time < %(candidate_end_date)s
+                    latest_start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)
+                    AND latest_start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)
                 )"""
             any_span_having = " AND ".join(
                 (f"countIf({any_span_window_condition} AND ({plan.predicate})) > 0")
@@ -895,30 +1132,133 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         residual_predicate = "1 = 1"
         if residual_filters:
-            residual_builder = self._FILTER_BUILDER_CLS(
-                table=self.TABLE,
-                query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
-                annotation_label_ids=self.annotation_label_ids,
-                project_id=self.project_id,
-                project_ids=self.project_ids,
-                score_date_scope=scope_to_request_window,
-                span_date_scope=scope_to_request_window,
-                candidate_ids_param="candidate_trace_ids",
-            )
-            residual_predicate, residual_params = residual_builder.translate(
-                residual_filters
-            )
-            params.update(residual_params)
-            residual_predicate = residual_predicate or "1 = 1"
+            if org_scope:
+                # A trace id is tenant-local, not globally unique.  Compile the
+                # finite candidate batch into one project-scoped relational
+                # branch per tenant so an eval, annotation, or end-user match
+                # in project A cannot admit the same textual trace id from B.
+                # All branch placeholders are namespaced because each filter
+                # compiler starts its deterministic counter at one.
+                identities_by_project: dict[str, list[str]] = {}
+                for candidate_project_id, candidate_trace_id in trace_identities:
+                    identities_by_project.setdefault(candidate_project_id, []).append(
+                        candidate_trace_id
+                    )
+
+                residual_branches: list[str] = []
+                for branch_index, (
+                    candidate_project_id,
+                    project_trace_ids,
+                ) in enumerate(identities_by_project.items()):
+                    residual_builder = self._FILTER_BUILDER_CLS(
+                        table=self.TABLE,
+                        query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
+                        annotation_label_ids=self.annotation_label_ids,
+                        project_id=candidate_project_id,
+                        score_date_scope=scope_to_request_window,
+                        span_date_scope=scope_to_request_window,
+                        candidate_ids_param="candidate_trace_ids",
+                        strict_trace_project_correlation=True,
+                    )
+                    branch_predicate, branch_filter_params = residual_builder.translate(
+                        residual_filters
+                    )
+                    branch_predicate = branch_predicate or "1 = 1"
+                    branch_sources = {
+                        **params,
+                        **branch_filter_params,
+                        "project_id": candidate_project_id,
+                        "candidate_trace_ids": tuple(dict.fromkeys(project_trace_ids)),
+                    }
+                    placeholder_names = set(
+                        re.findall(r"%\(([A-Za-z_][A-Za-z0-9_]*)\)s", branch_predicate)
+                    )
+                    for placeholder_name in sorted(placeholder_names):
+                        if placeholder_name not in branch_sources:
+                            raise AssertionError(
+                                "unbound organization residual parameter "
+                                f"{placeholder_name!r}"
+                            )
+                        namespaced_name = (
+                            f"org_residual_{branch_index}_{placeholder_name}"
+                        )
+                        branch_predicate = branch_predicate.replace(
+                            f"%({placeholder_name})s",
+                            f"%({namespaced_name})s",
+                        )
+                        params[namespaced_name] = branch_sources[placeholder_name]
+                    branch_project_param = (
+                        f"org_residual_{branch_index}_outer_project_id"
+                    )
+                    params[branch_project_param] = candidate_project_id
+                    residual_branches.append(
+                        "(project_id = "
+                        f"toUUID(%({branch_project_param})s) "
+                        f"AND ({branch_predicate}))"
+                    )
+                residual_predicate = " OR ".join(residual_branches) or "0 = 1"
+            else:
+                residual_builder = self._FILTER_BUILDER_CLS(
+                    table=self.TABLE,
+                    query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
+                    annotation_label_ids=self.annotation_label_ids,
+                    project_id=self.project_id,
+                    project_ids=self.project_ids,
+                    score_date_scope=scope_to_request_window,
+                    span_date_scope=scope_to_request_window,
+                    candidate_ids_param="candidate_trace_ids",
+                )
+                residual_predicate, residual_params = residual_builder.translate(
+                    residual_filters
+                )
+                params.update(residual_params)
+                residual_predicate = residual_predicate or "1 = 1"
+
+        candidate_identity_scan_fragment = (
+            "AND (project_id, trace_id) IN %(candidate_trace_identities)s"
+            if org_scope
+            else ""
+        )
+        candidate_identity_result_fragment = (
+            "AND (grouped_project_id, grouped_trace_id) "
+            "IN %(candidate_trace_identities)s"
+            if org_scope
+            else ""
+        )
+        grouped_project_select_fragment = (
+            "project_id AS grouped_project_id," if org_scope else ""
+        )
+        physical_group_by = (
+            "project_id, trace_id, id, start_time"
+            if org_scope
+            else "trace_id, id, start_time"
+        )
+        trace_group_by = (
+            "grouped_project_id, grouped_trace_id" if org_scope else "grouped_trace_id"
+        )
+        result_order = (
+            "start_time DESC, trace_id DESC, project_id DESC"
+            if org_scope
+            else "start_time DESC, trace_id DESC"
+        )
 
         if self._bounded_identity_only:
-            per_trace_select_fragment = f"""grouped_trace_id AS trace_id,
+            identity_project_select = (
+                "grouped_project_id AS project_id,\n                "
+                if org_scope
+                else ""
+            )
+            per_trace_select_fragment = f"""{identity_project_select}grouped_trace_id AS trace_id,
                 argMaxIf(
                     latest_start_time,
                     {canonical_root_order},
                     {canonical_root_condition}
                 ) AS start_time{witness_select_fragment}"""
-            public_select_fragment = f"trace_id, start_time{witness_public_fragment}"
+            public_select_fragment = (
+                f"project_id, trace_id, start_time{witness_public_fragment}"
+                if org_scope
+                else f"trace_id, start_time{witness_public_fragment}"
+            )
             hydrate_root_aggregate_fragment = ""
         else:
             root_fields = (
@@ -983,6 +1323,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 {canonical_root_aggregate_fragment}
             FROM (
                 SELECT
+                    {grouped_project_select_fragment}
                     id AS grouped_id,
                     trace_id AS grouped_trace_id,
                     argMax(tuple(parent_span_id), _peerdb_version).1
@@ -995,19 +1336,21 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 PREWHERE {self.project_filter_sql()}
                   {project_version_fragment}
                   AND trace_id IN %(candidate_trace_ids)s
+                  {candidate_identity_scan_fragment}
                   {candidate_time_fragment}
-                GROUP BY trace_id, id, start_time
+                GROUP BY {physical_group_by}
             )
             WHERE latest_is_deleted = 0
               AND grouped_trace_id IN %(candidate_trace_ids)s
-            GROUP BY grouped_trace_id
+              {candidate_identity_result_fragment}
+            GROUP BY {trace_group_by}
             HAVING countIf({canonical_root_condition}) > 0
               AND {root_predicate}
               {any_span_having_fragment}
         ) AS latest_candidates
         WHERE {residual_predicate}
-        ORDER BY start_time DESC, trace_id DESC
-        LIMIT {len(trace_ids)}
+        ORDER BY {result_order}
+        LIMIT {candidate_count}
         """
         return query, params
 
@@ -1023,7 +1366,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """
 
         trace_ids = [str(row.get("trace_id") or "") for row in candidate_rows]
-        return self.build_filter_match_query(trace_ids)
+        if self.project_ids is None:
+            return self.build_filter_match_query(trace_ids)
+        trace_identities = [
+            (str(row.get("project_id") or ""), str(row.get("trace_id") or ""))
+            for row in candidate_rows
+            if row.get("project_id") and row.get("trace_id")
+        ]
+        return self.build_filter_match_query(
+            trace_ids,
+            candidate_trace_identities=trace_identities,
+        )
 
     def _span_time_window(
         self, params: dict[str, Any], column: str = "start_time"
@@ -1093,7 +1446,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             self.sort_params, field_map=self.SORT_FIELD_MAP
         )
         if not order_clause:
-            order_clause = "ORDER BY start_time DESC"
+            order_clause = (
+                "ORDER BY start_time DESC, trace_id DESC, project_id DESC"
+                if self.project_ids is not None
+                else "ORDER BY start_time DESC"
+            )
+        elif self.project_ids is not None:
+            order_clause = f"{order_clause}, trace_id DESC, project_id DESC"
 
         # Prefix-fetch pagination: read the sorted prefix [0, offset +
         # 2*page_size) in ONE bounded top-K pass and let the view dedup by
@@ -1129,6 +1488,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             valid = [c for c in self.columns if c in self.AVAILABLE_COLUMNS]
             if "trace_id" not in valid:
                 valid.insert(0, "trace_id")
+            if self.project_ids is not None and "project_id" not in valid:
+                valid.insert(0, "project_id")
             # Alias 'name' to 'span_name' for backward compatibility
             select_cols = []
             for c in valid:
@@ -1334,6 +1695,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         span_window = self._span_time_window(params)
         query = f"""
         SELECT
+            toString(project_id) AS project_id,
             trace_id,
             latest_input AS input,
             latest_output AS output,
@@ -1408,6 +1770,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         span_window = self._span_time_window(params)
         query = f"""
         SELECT
+            toString(project_id) AS project_id,
             trace_id,
             attributes_extra
         FROM {self.TABLE}
@@ -1476,8 +1839,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             search_fragment = "AND trace_name ILIKE %(search)s"
             params["search"] = f"%{self.search}%"
 
+        count_identity = (
+            "uniq(project_id, trace_id)"
+            if self.project_ids is not None
+            else "uniq(trace_id)"
+        )
         query = f"""
-        SELECT uniq(trace_id) AS total
+        SELECT {count_identity} AS total
         FROM {self.TABLE}
         {self.project_where()}
           AND (parent_span_id IS NULL OR parent_span_id = '')
@@ -1576,8 +1944,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             params["start_date"] = self.start_date
             created_at_fragment = "AND created_at >= %(start_date)s - INTERVAL 1 DAY"
 
-        eval_table, _ = eval_logger_source(include_cdc_tombstone_guard=True)
+        eval_table, _ = self._EVAL_LOGGER_SOURCE(include_cdc_tombstone_guard=True)
         eval_version = eval_logger_version_column(eval_table)
+        if eval_table.endswith("_v2"):
+            status_projection = "'completed' AS status"
+            skipped_reason_projection = (
+                "CAST(NULL AS Nullable(String)) AS skipped_reason"
+            )
+        else:
+            status_projection = "status"
+            skipped_reason_projection = "skipped_reason"
         live_columns = eval_logger_live_state_columns(eval_table)
         live_projection = ",\n                ".join(
             f"{column} AS latest_state_{index}"
@@ -1650,8 +2026,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 output_str,
                 output_str_list,
                 error,
-                status,
-                skipped_reason,
+                {status_projection},
+                {skipped_reason_projection},
                 {live_projection}
             FROM {eval_table}
             WHERE trace_id IN %(trace_ids)s

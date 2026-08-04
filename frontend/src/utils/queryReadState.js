@@ -7,13 +7,22 @@ export const QUERY_READ_SAMPLED_MESSAGE =
 export const QUERY_FAILED_RETRY_MESSAGE =
   "We couldn't load this data. Please retry in a moment.";
 
-const payloadCandidates = (payload) =>
-  [
+const payloadCandidates = (payload) => {
+  const candidates = [
     payload,
     payload?.result,
     payload?.metadata,
     payload?.result?.metadata,
-  ].filter(Boolean);
+  ]
+    .flatMap((candidate) =>
+      Array.isArray(candidate) ? candidate : [candidate],
+    )
+    .filter(Boolean);
+
+  return candidates.flatMap((candidate) =>
+    candidate?.metadata ? [candidate, candidate.metadata] : [candidate],
+  );
+};
 
 const hasCompleteSamplingCoverage = (candidate) => {
   const planned = candidate?.query_sampling_strata;

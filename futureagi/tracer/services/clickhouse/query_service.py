@@ -55,6 +55,14 @@ def _eval_live_projection(table: str, alias: str = "eval_scan") -> str:
     )
 
 
+def _eval_lifecycle_projection(table: str, alias: str = "eval_scan") -> str:
+    """Project lifecycle fields without assuming optional v2 columns exist."""
+
+    if table.endswith("_v2"):
+        return "'completed' AS status, CAST(NULL, 'Nullable(String)') AS skipped_reason"
+    return f"{alias}.status, {alias}.skipped_reason"
+
+
 class QueryType(StrEnum):
     """Supported query types with per-type routing."""
 
@@ -222,7 +230,12 @@ class AnalyticsQueryService:
         )
 
     @staticmethod
-    def _eval_config_ids_query(scope_sql: str, extra_where: str = "") -> str:
+    def _eval_config_ids_query(
+        scope_sql: str,
+        extra_where: str = "",
+        *,
+        eval_logger_table: str | None = None,
+    ) -> str:
         """Build the shared "distinct eval-config IDs that have data" query.
 
         One body for every eval-config discovery read: the table and its
@@ -238,7 +251,7 @@ class AnalyticsQueryService:
         FINAL, by contrast, forced a full-table merge before the scope filter
         and was a primary OOM/crash source on the span-list hot path.
         """
-        eval_table, eval_nd = eval_logger_source()
+        eval_table, eval_nd = eval_logger_source(table=eval_logger_table)
         return (
             "SELECT DISTINCT toString(custom_eval_config_id) AS config_id "
             f"FROM {eval_table} "
@@ -253,6 +266,8 @@ class AnalyticsQueryService:
         timeout_ms: int = 5000,
         window_days: int | None = 30,
         candidate_config_ids: list[str] | None = None,
+        *,
+        eval_logger_table: str | None = None,
     ) -> list[str]:
         """Distinct eval config IDs that have data for a project.
 
@@ -276,7 +291,7 @@ class AnalyticsQueryService:
           ``FINAL`` — the primary OOM source. Pass ``window_days=None`` to
           restore the unbounded window.
         """
-        eval_table, eval_nd = eval_logger_source()
+        eval_table, eval_nd = eval_logger_source(table=eval_logger_table)
         params: dict[str, Any] = {}
         window_sql = ""
         if window_days is not None:
@@ -284,17 +299,13 @@ class AnalyticsQueryService:
             window_sql = "AND created_at >= now() - toIntervalDay(%(window_days)s)"
 
         if candidate_config_ids is not None:
-            if not candidate_config_ids:
-                return []
-            params["config_ids"] = tuple(candidate_config_ids)
-            query = (
-                "SELECT DISTINCT toString(custom_eval_config_id) AS config_id "
-                f"FROM {eval_table} "
-                f"WHERE {eval_nd} {window_sql} "
-                "AND custom_eval_config_id IN %(config_ids)s"
+            return AnalyticsQueryService.get_eval_config_ids_for_candidates_ch(
+                self,
+                candidate_config_ids,
+                timeout_ms=timeout_ms,
+                window_days=window_days,
+                eval_logger_table=eval_logger_table,
             )
-            result = self.execute_ch_query(query, params, timeout_ms=timeout_ms)
-            return [row["config_id"] for row in result.data]
 
         params["project_id"] = project_id
         span_window = (
@@ -309,6 +320,7 @@ class AnalyticsQueryService:
             "GROUP BY trace_id"
             ")",
             extra_where=window_sql,
+            eval_logger_table=eval_logger_table,
         )
         result = self.execute_ch_query(
             query,
@@ -318,15 +330,69 @@ class AnalyticsQueryService:
         )
         return [row["config_id"] for row in result.data]
 
-    def get_eval_config_ids_for_traces_ch(
-        self, trace_ids: list[str], timeout_ms: int = 3000
+    def get_eval_config_ids_for_candidates_ch(
+        self,
+        candidate_config_ids: list[str],
+        timeout_ms: int = 5000,
+        window_days: int | None = 30,
+        *,
+        eval_logger_table: str | None = None,
     ) -> list[str]:
-        """Distinct eval config IDs recorded for an explicit set of trace IDs."""
-        if not trace_ids:
+        """Return candidate config ids that have direct eval rows.
+
+        Candidate config ids are globally unique and already carry project
+        scope from ``CustomEvalConfig``.  Keeping this operation explicitly
+        project-free allows one leading-key lookup for a multi-project metrics
+        catalog instead of serial scans or an incorrect first-project scope.
+        """
+
+        if not candidate_config_ids:
             return []
-        query = self._eval_config_ids_query("trace_id IN %(trace_ids)s")
+        eval_table, eval_nd = eval_logger_source(table=eval_logger_table)
+        params: dict[str, Any] = {"config_ids": tuple(candidate_config_ids)}
+        window_sql = ""
+        if window_days is not None:
+            params["window_days"] = int(window_days)
+            window_sql = "AND created_at >= now() - toIntervalDay(%(window_days)s)"
+        query = (
+            "SELECT DISTINCT toString(custom_eval_config_id) AS config_id "
+            f"FROM {eval_table} "
+            f"WHERE {eval_nd} {window_sql} "
+            "AND custom_eval_config_id IN %(config_ids)s"
+        )
+        result = self.execute_ch_query(query, params, timeout_ms=timeout_ms)
+        return [row["config_id"] for row in result.data]
+
+    def get_eval_config_ids_for_traces_ch(
+        self,
+        trace_ids: list[str],
+        candidate_config_ids: list[str],
+        timeout_ms: int = 3000,
+        *,
+        eval_logger_table: str | None = None,
+    ) -> list[str]:
+        """Project-owned eval configs recorded for an explicit trace set.
+
+        ``tracer_eval_logger`` has no project column and trace IDs are supplied
+        by customers, so a bare trace-id predicate is not a tenant boundary.
+        Callers must first resolve the requesting project's config IDs from
+        Postgres; the globally unique config IDs then provide the project scope
+        for this ClickHouse discovery read.
+        """
+        if not (trace_ids and candidate_config_ids):
+            return []
+        query = self._eval_config_ids_query(
+            "trace_id IN %(trace_ids)s "
+            "AND custom_eval_config_id IN %(candidate_config_ids)s",
+            eval_logger_table=eval_logger_table,
+        )
         result = self.execute_ch_query(
-            query, {"trace_ids": trace_ids}, timeout_ms=timeout_ms
+            query,
+            {
+                "trace_ids": trace_ids,
+                "candidate_config_ids": tuple(candidate_config_ids),
+            },
+            timeout_ms=timeout_ms,
         )
         return [row["config_id"] for row in result.data]
 
@@ -370,15 +436,24 @@ class AnalyticsQueryService:
         return {r["span_id"]: r["trace_id"] for r in result.data}
 
     def get_children_eval_metrics_ch(
-        self, span_ids: list[str], timeout_ms: int = 5000
+        self,
+        span_ids: list[str],
+        timeout_ms: int = 5000,
+        *,
+        eval_logger_table: str | None = None,
     ) -> list[dict]:
         """Per-span eval rows for a set of child observation spans."""
         if not span_ids:
             return []
-        eval_table, _ = eval_logger_source()
-        _, eval_nd = eval_logger_source("latest_eval", include_cdc_tombstone_guard=True)
+        eval_table, _ = eval_logger_source(table=eval_logger_table)
+        _, eval_nd = eval_logger_source(
+            "latest_eval",
+            include_cdc_tombstone_guard=True,
+            table=eval_logger_table,
+        )
         eval_version = eval_logger_version_column(eval_table)
         live_projection = _eval_live_projection(eval_table)
+        lifecycle_projection = _eval_lifecycle_projection(eval_table)
         query = f"""
             SELECT
                 toString(observation_span_id) AS span_id,
@@ -404,8 +479,7 @@ class AnalyticsQueryService:
                     eval_scan.error,
                     eval_scan.error_message,
                     eval_scan.output_str,
-                    eval_scan.status,
-                    eval_scan.skipped_reason,
+                    {lifecycle_projection},
                     {live_projection}
                 FROM {eval_table} AS eval_scan
                 WHERE eval_scan.observation_span_id IN %(span_ids)s
@@ -429,6 +503,7 @@ class AnalyticsQueryService:
         *,
         project_id: str,
         timeout_ms: int = 5000,
+        eval_logger_table: str | None = None,
     ) -> dict | None:
         """Return one tenant-anchored span/trace eval detail row.
 
@@ -474,8 +549,12 @@ class AnalyticsQueryService:
             return None
         trace_id = str(span_anchor.data[0]["trace_id"])
 
-        eval_table, _ = eval_logger_source()
-        _, eval_nd = eval_logger_source("latest_eval", include_cdc_tombstone_guard=True)
+        eval_table, _ = eval_logger_source(table=eval_logger_table)
+        _, eval_nd = eval_logger_source(
+            "latest_eval",
+            include_cdc_tombstone_guard=True,
+            table=eval_logger_table,
+        )
         eval_version = eval_logger_version_column(eval_table)
         live_projection = _eval_live_projection(eval_table)
         query = f"""
@@ -535,15 +614,25 @@ class AnalyticsQueryService:
         return result.data[0] if result.data else None
 
     def get_trace_eval_scores_ch(
-        self, trace_ids: list[str], config_ids: list[str], timeout_ms: int = 5000
+        self,
+        trace_ids: list[str],
+        config_ids: list[str],
+        timeout_ms: int = 5000,
+        *,
+        eval_logger_table: str | None = None,
     ) -> list[dict]:
         """Per-(trace, config) aggregated eval scores for a session's traces."""
         if not (trace_ids and config_ids):
             return []
-        eval_table, _ = eval_logger_source()
-        _, eval_nd = eval_logger_source("latest_eval", include_cdc_tombstone_guard=True)
+        eval_table, _ = eval_logger_source(table=eval_logger_table)
+        _, eval_nd = eval_logger_source(
+            "latest_eval",
+            include_cdc_tombstone_guard=True,
+            table=eval_logger_table,
+        )
         eval_version = eval_logger_version_column(eval_table)
         live_projection = _eval_live_projection(eval_table)
+        lifecycle_projection = _eval_lifecycle_projection(eval_table)
         query = f"""
             SELECT
                 toString(trace_id) AS trace_id,
@@ -579,8 +668,7 @@ class AnalyticsQueryService:
                     eval_scan.output_bool,
                     eval_scan.output_str,
                     eval_scan.error,
-                    eval_scan.status,
-                    eval_scan.skipped_reason,
+                    {lifecycle_projection},
                     {live_projection}
                 FROM {eval_table} AS eval_scan
                 WHERE eval_scan.trace_id IN %(trace_ids)s

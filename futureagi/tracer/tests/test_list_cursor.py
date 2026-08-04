@@ -156,6 +156,28 @@ def test_cursor_rejects_tenant_auth_and_project_replay():
     assert exc_info.value.code == "cursor_mismatch"
 
 
+def test_org_cursor_cannot_be_replayed_in_single_project_scope():
+    request = _request()
+    org_scope = cursor_scope_for_request(request, project_ids=["p1", "p2"])
+    token, values = _token(
+        request=request,
+        scope=org_scope,
+        order=(datetime(2026, 7, 1, tzinfo=UTC), "trace-2", "p2"),
+    )
+    single_project_scope = cursor_scope_for_request(request, project_ids=["p1"])
+
+    with pytest.raises(ListCursorError) as exc_info:
+        decode_list_cursor(
+            token,
+            resource=values["resource"],
+            scope=single_project_scope,
+            query=values["query"],
+            page_size=values["page_size"],
+        )
+
+    assert exc_info.value.code == "cursor_mismatch"
+
+
 def test_cursor_rejects_tampering_without_exposing_signing_details():
     token, values = _token()
     with pytest.raises(ListCursorError) as exc_info:
@@ -176,6 +198,33 @@ def test_cursor_rejects_expired_token(monkeypatch):
 
     monkeypatch.setattr(signing.time, "time", lambda: 1_000.0)
     token, values = _token()
+    monkeypatch.setattr(signing.time, "time", lambda: 1_010.0)
+    with pytest.raises(ListCursorError) as exc_info:
+        decode_list_cursor(
+            token,
+            resource=values["resource"],
+            scope=values["scope"],
+            query=values["query"],
+            page_size=values["page_size"],
+        )
+    assert exc_info.value.code == "cursor_expired"
+
+
+@override_settings(TRACER_LIST_CURSOR_MAX_AGE_SECONDS=1)
+def test_org_composite_cursor_keeps_the_same_ttl(monkeypatch):
+    from django.core import signing
+
+    monkeypatch.setattr(signing.time, "time", lambda: 1_000.0)
+    token, values = _token(order=(datetime(2026, 7, 1, tzinfo=UTC), "trace-2", "p2"))
+    cursor = decode_list_cursor(
+        token,
+        resource=values["resource"],
+        scope=values["scope"],
+        query=values["query"],
+        page_size=values["page_size"],
+    )
+    assert cursor.order == values["order"]
+
     monkeypatch.setattr(signing.time, "time", lambda: 1_010.0)
     with pytest.raises(ListCursorError) as exc_info:
         decode_list_cursor(

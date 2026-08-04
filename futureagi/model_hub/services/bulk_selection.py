@@ -56,6 +56,10 @@ from simulate.utils.persona_filtering import (
     is_persona_filter_column,
 )
 from tracer.models.project import Project, ProjectSourceChoices
+from tracer.services.clickhouse.eval_logger_table import eval_logger_source
+from tracer.services.clickhouse.v2.query_builders.filters import (
+    ClickHouseFilterBuilderV2,
+)
 from tracer.utils.filters import (
     apply_created_at_filters,
     normalize_filter_item,
@@ -63,6 +67,28 @@ from tracer.utils.filters import (
 from tracer.utils.helper import get_annotation_labels_for_project
 
 logger = structlog.get_logger(__name__)
+
+
+class _ConfiguredEvalFilterBuilderV2(ClickHouseFilterBuilderV2):
+    """Compile CH25 span filters against the configured authoritative eval table."""
+
+    _eval_logger_source = staticmethod(eval_logger_source)
+
+
+def _use_authoritative_eval_source(builder):
+    """Pair V2 span SQL with the configured eval table on the CH25 connection.
+
+    Production currently writes eval rows to the legacy-named
+    ``tracer_eval_logger`` table on the direct CH25 cluster. ``eval_logger_source``
+    owns the table-specific version and liveness predicates, while the explicit
+    V2 service at each caller owns the connection. Keeping those two decisions
+    separate prevents an eval-table name from routing span reads to legacy CH.
+    """
+
+    builder._FILTER_BUILDER_CLS = _ConfiguredEvalFilterBuilderV2
+    if hasattr(builder, "_EVAL_LOGGER_SOURCE"):
+        builder._EVAL_LOGGER_SOURCE = eval_logger_source
+    return builder
 
 
 @dataclass
@@ -123,6 +149,36 @@ def _bounded_bulk_worst_case_query_count(raw_page_size: int) -> int:
     return query_count
 
 
+def _bounded_bulk_classify_batch_size(
+    *, cap: int, exclude_count: int, preferred: int
+) -> int:
+    """Keep a preferred classifier batch while fitting the finite query budget.
+
+    Voice simulator classification intentionally prefers 50 candidates because
+    it parses ``raw_log`` JSON. A 10,000-item queue selection cannot be proven
+    in 128 queries with a fixed batch of 50, however: the bounded reader would
+    reject it before touching ClickHouse even when the project had no calls.
+    Increase the batch only as much as the requested prefix requires, capped by
+    the existing 200-candidate working-set ceiling.
+    """
+
+    raw_page_size = cap + 1 + exclude_count
+    prefix_needed = raw_page_size + 1
+    seed_queries = (
+        prefix_needed + _BULK_BOUNDED_MAX_CANDIDATES - 1
+    ) // _BULK_BOUNDED_MAX_CANDIDATES
+    remaining_classifier_queries = _BULK_BOUNDED_MAX_QUERY_COUNT - seed_queries
+    if remaining_classifier_queries <= 0:
+        return _BULK_BOUNDED_MAX_CANDIDATES
+    minimum_batch = (
+        prefix_needed + remaining_classifier_queries - 1
+    ) // remaining_classifier_queries
+    return min(
+        _BULK_BOUNDED_MAX_CANDIDATES,
+        max(int(preferred), minimum_batch),
+    )
+
+
 def _supports_bounded_bulk_prefix(*, cap: int, exclude_count: int) -> bool:
     """Return whether cap+1 non-excluded IDs fit the finite proof budget."""
 
@@ -137,7 +193,14 @@ def _supports_bounded_bulk_prefix(*, cap: int, exclude_count: int) -> bool:
 
 
 def _read_bounded_bulk_page(
-    *, builder, analytics, filters, key_field, cap, exclude_count=0
+    *,
+    builder,
+    analytics,
+    filters,
+    key_field,
+    cap,
+    exclude_count=0,
+    classify_batch_size=200,
 ):
     """Resolve enough raw IDs to prove a cap+1 non-excluded prefix."""
 
@@ -166,7 +229,7 @@ def _read_bounded_bulk_page(
         max_seed_attempts=_BULK_BOUNDED_MAX_SEED_ATTEMPTS,
         max_candidates=_BULK_BOUNDED_MAX_CANDIDATES,
         max_query_count=_BULK_BOUNDED_MAX_QUERY_COUNT,
-        classify_batch_size=_BULK_BOUNDED_CLASSIFY_BATCH_SIZE,
+        classify_batch_size=classify_batch_size,
         retry_wide_read_budget=True,
     )
     if not page.complete:
@@ -260,27 +323,56 @@ def _resolve_voice_call_ids_clickhouse(
     are being dropped), so a ClickHouse failure propagates rather than silently
     resolving to a partial/empty set.
     """
-    from tracer.services.clickhouse.query_builders import VoiceCallListQueryBuilder
-    from tracer.services.clickhouse.query_service import AnalyticsQueryService
-
-    analytics = AnalyticsQueryService()
-    builder = VoiceCallListQueryBuilder(
-        project_id=str(project_id),
-        page_number=0,
-        page_size=cap,
-        filters=filters or [],
-        annotation_label_ids=annotation_label_ids,
-        remove_simulation_calls=remove_simulation_calls,
+    from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+        VoiceCallListQueryBuilderV2,
     )
-    # Skip the separate `uniqExact(trace_id)` count query — on large filter
-    # results it was the dominant /preview timeout. ``build()`` already adds
-    # ``LIMIT cap + 1`` (voice_call_list.py:97), so the cap+1 sentinel gives
-    # us "≥ cap" without a second scan.
-    try:
-        ids_query, ids_params = builder.build()
-        ids_result = analytics.execute_ch_query(
-            ids_query, ids_params, timeout_ms=15_000
+    from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
+
+    analytics = V2AnalyticsQueryService()
+    builder = _use_authoritative_eval_source(
+        VoiceCallListQueryBuilderV2(
+            project_id=str(project_id),
+            page_number=0,
+            page_size=cap + 1,
+            filters=filters or [],
+            annotation_label_ids=annotation_label_ids,
+            remove_simulation_calls=remove_simulation_calls,
         )
+    )
+    if not builder.supports_bounded_filter_scan():
+        raise BulkSelectionReadIncomplete(
+            builder.bounded_filter_degraded_error_code() or "unsupported_bounded_filter"
+        )
+
+    # Voice selection uses the same finite latest-state reader as the public
+    # voice grid. In particular, simulator exclusion is compiled into the
+    # candidate-scoped V2 classifier, where ``span_attributes_raw`` /
+    # ``span_attr_str`` are rewritten to ``attributes_extra`` / ``attrs_string``
+    # before the statement reaches CH25. The legacy broad build + raw post-read
+    # both targeted columns that do not exist in a direct-write-only cluster.
+    try:
+        bounded_page = _read_bounded_bulk_page(
+            builder=builder,
+            analytics=analytics,
+            filters=filters or [],
+            key_field="trace_id",
+            cap=cap,
+            exclude_count=len(exclude_ids or set()),
+            # Prefer fifty fat voice roots per simulator classifier. For large
+            # selections, grow only enough to keep cap+1 proof within the
+            # selector's fixed 128-query ceiling; 200 remains the hard maximum.
+            classify_batch_size=(
+                _bounded_bulk_classify_batch_size(
+                    cap=cap,
+                    exclude_count=len(exclude_ids or set()),
+                    preferred=builder.recommended_filter_classify_batch_size(),
+                )
+                if remove_simulation_calls
+                else _BULK_BOUNDED_CLASSIFY_BATCH_SIZE
+            ),
+        )
+        rows = bounded_page.rows
+        bounded_has_more = bounded_page.has_more
     except Exception as exc:
         # CH is the sole voice backend (PG tracer tables dropped); fail closed.
         # Breadcrumb for log-based alerting; the re-raise carries the Sentry
@@ -292,24 +384,18 @@ def _resolve_voice_call_ids_clickhouse(
             error_type=type(exc).__name__,
         )
         raise
-    ids = [str(r.get("trace_id", "")) for r in ids_result.data if r.get("trace_id")]
-    raw_truncated = len(ids) > cap
-
-    # VoiceCallListQueryBuilder's SQL simulation filter is a no-op (the
-    # phone numbers live in the heavy span_attributes_raw blob). The list
-    # view filters in Python after Phase 1b; we do the same here when the
-    # toggle is on.
-    if remove_simulation_calls and ids:
-        ids = _filter_out_simulator_calls_ch(ids, project_id, analytics)
+    ids = [str(row.get("trace_id", "")) for row in rows if row.get("trace_id")]
 
     if exclude_ids:
         excl = {str(i) for i in exclude_ids}
         ids = [i for i in ids if i not in excl]
 
-    # Preserve the cap+1 sentinel from before exclusion. If an excluded row
-    # occupied the sentinel slot there may still be more non-excluded rows
-    # just beyond the fetched window, so do not under-report truncation.
-    truncated = raw_truncated or len(ids) > cap
+    # The bounded read overscans by the complete exclusion set. Its sentinel
+    # therefore describes the post-exclusion set; never publish an unproven
+    # prefix if a future builder violates that contract.
+    if bounded_has_more and len(ids) <= cap:
+        raise BulkSelectionReadIncomplete("excluded_prefix_unproven")
+    truncated = len(ids) > cap
     ids = ids[:cap]
     total_matching = len(ids) + (1 if truncated else 0)
 
@@ -324,48 +410,6 @@ def _resolve_voice_call_ids_clickhouse(
     )
 
     return ResolveResult(ids=ids, total_matching=total_matching, truncated=truncated)
-
-
-def _filter_out_simulator_calls_ch(trace_ids, project_id, analytics):
-    """Post-filter the given trace_ids to drop VAPI simulator calls.
-
-    Mirrors ``_list_voice_calls_clickhouse``'s Python-side simulation
-    filter: fetch span_attributes_raw + provider for the root conversation
-    span of each trace, then apply ``is_simulator_call``.
-    """
-    from tracer.services.clickhouse.query_builders import VoiceCallListQueryBuilder
-
-    if not trace_ids:
-        return trace_ids
-
-    import json as _json
-
-    # Get root conversation span IDs and attributes in CH.
-    query = """
-    SELECT trace_id, id AS span_id, provider, span_attributes_raw
-    FROM spans
-    WHERE project_id = %(project_id)s AND _peerdb_is_deleted = 0
-      AND (parent_span_id IS NULL OR parent_span_id = '')
-      AND observation_type = 'conversation'
-      AND trace_id IN %(trace_ids)s
-    """
-    params = {
-        "project_id": str(project_id),
-        "trace_ids": tuple(str(t) for t in trace_ids),
-    }
-    result = analytics.execute_ch_query(query, params, timeout_ms=15_000)
-    sim_trace_ids = set()
-    for row in result.data:
-        raw = row.get("span_attributes_raw") or "{}"
-        try:
-            attrs = _json.loads(raw) if isinstance(raw, str) else (raw or {})
-        except (_json.JSONDecodeError, TypeError):
-            attrs = {}
-        if VoiceCallListQueryBuilder.is_simulator_call(
-            attrs, row.get("provider") or ""
-        ):
-            sim_trace_ids.add(str(row.get("trace_id", "")))
-    return [t for t in trace_ids if t not in sim_trace_ids]
 
 
 def _resolve_trace_ids_clickhouse(
@@ -386,11 +430,12 @@ def _resolve_trace_ids_clickhouse(
     being dropped), so a ClickHouse failure propagates rather than silently
     resolving to a partial/empty set.
     """
-    from tracer.services.clickhouse.query_service import AnalyticsQueryService
-    from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-    from tracer.services.clickhouse.v2.query_service import query_service_for_builder
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
+    from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 
-    analytics = AnalyticsQueryService()
+    analytics = V2AnalyticsQueryService()
     excl = {str(value) for value in (exclude_ids or set())}
     if not _supports_bounded_bulk_prefix(cap=cap, exclude_count=len(excl)):
         # A synchronous resolver returning one in-memory list cannot represent
@@ -398,26 +443,26 @@ def _resolve_trace_ids_clickhouse(
         # Fail closed with a stable code; never re-enter the broad list query
         # that caused the production task-preview timeout.
         raise BulkSelectionReadIncomplete("selection_prefix_too_large")
-    BuilderCls = get_query_builder_class("TRACE_LIST")  # noqa: N806
-    analytics = query_service_for_builder("TRACE_LIST", BuilderCls, analytics)
-    builder = BuilderCls(
-        project_id=str(project_id),
-        page_number=0,
-        # Fetch cap+1 as the page size so a >cap result trips the truncation
-        # sentinel below. Unlike the voice builder, the trace ``build()`` LIMIT
-        # is exactly page_size (no internal +1), so request the extra row here.
-        page_size=cap + 1,
-        filters=filters or [],
-        annotation_label_ids=annotation_label_ids,
-        # Phase 1 light columns are all we need — we only want trace_id.
-        columns=["trace_id"],
-        # Identity-only is a projection choice. Empty/time-only requests enable
-        # the internal-scan contract so they also use finite seed/replay reads;
-        # filtered requests keep it off so candidate-scoped residual compilers
-        # continue to handle eval/annotation/end-user predicates exactly.
-        bounded_internal_scan=_needs_bounded_internal_scan(filters),
-        bounded_identity_only=True,
-        bounded_bulk_scan=True,
+    builder = _use_authoritative_eval_source(
+        TraceListQueryBuilderV2(
+            project_id=str(project_id),
+            page_number=0,
+            # Fetch cap+1 as the page size so a >cap result trips the truncation
+            # sentinel below. Unlike the voice builder, the trace ``build()`` LIMIT
+            # is exactly page_size (no internal +1), so request the extra row here.
+            page_size=cap + 1,
+            filters=filters or [],
+            annotation_label_ids=annotation_label_ids,
+            # Phase 1 light columns are all we need — we only want trace_id.
+            columns=["trace_id"],
+            # Identity-only is a projection choice. Empty/time-only requests enable
+            # the internal-scan contract so they also use finite seed/replay reads;
+            # filtered requests keep it off so candidate-scoped residual compilers
+            # continue to handle eval/annotation/end-user predicates exactly.
+            bounded_internal_scan=_needs_bounded_internal_scan(filters),
+            bounded_identity_only=True,
+            bounded_bulk_scan=True,
+        )
     )
     if not builder.supports_bounded_filter_scan():
         raise BulkSelectionReadIncomplete(
@@ -616,27 +661,27 @@ def _resolve_span_ids_clickhouse(
     dropped), so a ClickHouse failure propagates rather than silently resolving
     to a partial/empty set.
     """
-    from tracer.services.clickhouse.query_service import AnalyticsQueryService
-    from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-    from tracer.services.clickhouse.v2.query_service import query_service_for_builder
+    from tracer.services.clickhouse.v2.query_builders.span_list import (
+        SpanListQueryBuilderV2,
+    )
+    from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 
     ch_filters = list(filters or [])
     if not _has_explicit_time_filter(ch_filters):
         ch_filters.append(_all_history_time_filter())
 
-    BuilderCls = get_query_builder_class("SPAN_LIST")  # noqa: N806
-    analytics = query_service_for_builder(
-        "SPAN_LIST", BuilderCls, AnalyticsQueryService()
-    )
+    analytics = V2AnalyticsQueryService()
     excl = {str(value) for value in (exclude_ids or set())}
     if not _supports_bounded_bulk_prefix(cap=cap, exclude_count=len(excl)):
         raise BulkSelectionReadIncomplete("selection_prefix_too_large")
-    builder = BuilderCls(
-        project_id=str(project_id),
-        filters=ch_filters,
-        annotation_label_ids=annotation_label_ids,
-        bounded_internal_scan=_needs_bounded_internal_scan(ch_filters),
-        bounded_identity_only=True,
+    builder = _use_authoritative_eval_source(
+        SpanListQueryBuilderV2(
+            project_id=str(project_id),
+            filters=ch_filters,
+            annotation_label_ids=annotation_label_ids,
+            bounded_internal_scan=_needs_bounded_internal_scan(ch_filters),
+            bounded_identity_only=True,
+        )
     )
     if not builder.supports_bounded_filter_scan():
         raise BulkSelectionReadIncomplete(
@@ -941,11 +986,11 @@ def _resolve_session_ids_clickhouse(
     being dropped), so a ClickHouse failure propagates rather than silently
     resolving to a partial/empty set.
     """
-    from tracer.services.clickhouse.query_service import AnalyticsQueryService
-    from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-    from tracer.services.clickhouse.v2.query_service import query_service_for_builder
+    from tracer.services.clickhouse.v2.query_builders.session_list import (
+        SessionListQueryBuilderV2,
+    )
+    from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 
-    BuilderCls = get_query_builder_class("SESSION_LIST")  # noqa: N806
     ch_filters = _prepare_session_ch_filters(
         non_score_filters, project_id=project_id, organization=organization
     )
@@ -957,19 +1002,19 @@ def _resolve_session_ids_clickhouse(
     if not _has_explicit_time_filter(non_score_filters):
         ch_filters.append(_all_history_time_filter())
 
-    analytics = query_service_for_builder(
-        "SESSION_LIST", BuilderCls, AnalyticsQueryService()
-    )
+    analytics = V2AnalyticsQueryService()
     excl = {str(value) for value in (exclude_ids or set())}
     if not _supports_bounded_bulk_prefix(cap=cap, exclude_count=len(excl)):
         raise BulkSelectionReadIncomplete("selection_prefix_too_large")
-    builder = BuilderCls(
-        project_id=str(project_id),
-        page_number=0,
-        page_size=cap + 1,
-        filters=ch_filters,
-        sort_params=[],
-        bounded_internal_scan=True,
+    builder = _use_authoritative_eval_source(
+        SessionListQueryBuilderV2(
+            project_id=str(project_id),
+            page_number=0,
+            page_size=cap + 1,
+            filters=ch_filters,
+            sort_params=[],
+            bounded_internal_scan=True,
+        )
     )
     if not builder.supports_bounded_filter_scan():
         raise BulkSelectionReadIncomplete(

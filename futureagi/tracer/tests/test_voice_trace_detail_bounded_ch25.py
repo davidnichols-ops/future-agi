@@ -14,6 +14,9 @@ from django.test import override_settings
 from tracer.selectors.trace_filter_reads import read_bounded_filter_page
 from tracer.services.clickhouse import eval_logger_table as eval_logger_table_config
 from tracer.services.clickhouse.query_builders.voice_call_list import VAPI_PHONE_NUMBERS
+from tracer.services.clickhouse.v2 import (
+    trace_detail_reads as trace_detail_reads_module,
+)
 from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
     VoiceCallListQueryBuilderV2,
 )
@@ -45,6 +48,22 @@ def detail_tables(ch_client, monkeypatch):
     spans = f"_test_voice_detail_spans_{suffix}"
     evals = f"_test_voice_detail_evals_{suffix}_v2"
     scores = f"_test_voice_detail_scores_{suffix}"
+    monkeypatch.setattr(
+        trace_detail_reads_module,
+        "eval_logger_source",
+        lambda *args, **kwargs: (evals, "is_deleted = 0"),
+    )
+
+    def test_eval_source(alias="", include_cdc_tombstone_guard=False):
+        del include_cdc_tombstone_guard
+        prefix = f"{alias}." if alias else ""
+        return evals, f"{prefix}is_deleted = 0"
+
+    monkeypatch.setattr(
+        VoiceCallListQueryBuilderV2,
+        "_EVAL_LOGGER_SOURCE",
+        staticmethod(test_eval_source),
+    )
     monkeypatch.setattr(
         eval_logger_table_config,
         "SUPPORTED_EVAL_LOGGER_TABLES",
@@ -106,6 +125,7 @@ def detail_tables(ch_client, monkeypatch):
             output_str_list String DEFAULT '[]',
             eval_explanation Nullable(String),
             error UInt8,
+            error_message Nullable(String),
             is_deleted UInt8,
             _version UInt64
         ) ENGINE = MergeTree ORDER BY (id, _version)
@@ -502,14 +522,13 @@ def test_trace_detail_replays_versions_tombstones_evals_and_annotations(
         ],
     )
 
-    with override_settings(CH25_EVAL_LOGGER_TABLE=detail_tables.evals):
-        read = read_trace_detail(
-            analytics=_Analytics(ch_client),
-            project_ids=[project],
-            trace_id=trace,
-            eval_config_ids_resolver=lambda selected_project: [config_id],
-            deadline_ms=5000,
-        )
+    read = read_trace_detail(
+        analytics=_Analytics(ch_client),
+        project_ids=[project],
+        trace_id=trace,
+        eval_config_ids_resolver=lambda selected_project: [config_id],
+        deadline_ms=5000,
+    )
     assert [row["id"] for row in read.spans] == ["root", "child", "recycled"]
     assert read.spans[0]["input"] == "latest"
     assert str(read.spans[0]["project_version_id"]) == project_version
@@ -582,14 +601,13 @@ def test_trace_detail_eval_rows_are_scoped_by_selected_project_configs(
         resolved_projects.append(selected_project)
         return [own_config]
 
-    with override_settings(CH25_EVAL_LOGGER_TABLE=detail_tables.evals):
-        read = read_trace_detail(
-            analytics=_Analytics(ch_client),
-            project_ids=[project],
-            trace_id=trace,
-            eval_config_ids_resolver=resolve_project_configs,
-            deadline_ms=5000,
-        )
+    read = read_trace_detail(
+        analytics=_Analytics(ch_client),
+        project_ids=[project],
+        trace_id=trace,
+        eval_config_ids_resolver=resolve_project_configs,
+        deadline_ms=5000,
+    )
 
     assert resolved_projects == [project]
     assert read.eval_config_ids == (own_config,)
@@ -615,14 +633,13 @@ def test_trace_detail_without_authorized_configs_skips_eval_read(
         ],
     )
 
-    with override_settings(CH25_EVAL_LOGGER_TABLE=detail_tables.evals):
-        read = read_trace_detail(
-            analytics=_Analytics(ch_client),
-            project_ids=[project],
-            trace_id=trace,
-            eval_config_ids_resolver=lambda selected_project: [],
-            deadline_ms=5000,
-        )
+    read = read_trace_detail(
+        analytics=_Analytics(ch_client),
+        project_ids=[project],
+        trace_id=trace,
+        eval_config_ids_resolver=lambda selected_project: [],
+        deadline_ms=5000,
+    )
 
     assert read.eval_config_ids == ()
     assert read.evals == ()

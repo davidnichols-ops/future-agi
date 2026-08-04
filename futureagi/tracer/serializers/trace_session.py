@@ -100,6 +100,14 @@ class TraceSessionListQuerySerializer(StrictInputSerializer):
         required=False, default=30, min_value=1, max_value=500
     )
     interval = serializers.CharField(required=False, allow_blank=True)
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Explicitly opt in to lower-bound list totals. Clients that set "
+            "this must not present the count as an exact total."
+        ),
+    )
 
 
 class TraceSessionExportQuerySerializer(TraceSessionListQuerySerializer):

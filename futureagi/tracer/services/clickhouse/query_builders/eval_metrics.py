@@ -19,7 +19,7 @@ Supports three eval output types:
 """
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
@@ -88,19 +88,21 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
     """
 
     AGG_TABLE = "eval_metrics_hourly"
+    _EVAL_LOGGER_SOURCE = staticmethod(eval_logger_source)
+    _EVAL_TRACE_ID_EXPR = "trace_id"
 
     def __init__(
         self,
         custom_eval_config_id: str,
         project_id: str,
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         interval: str = "hour",
         eval_output_type: str = SCORE,
         eval_name: str = "",
-        choices: Optional[List[str]] = None,
+        choices: list[str] | None = None,
         use_preaggregated: bool = True,
-        filters: Optional[List[dict]] = None,
+        filters: list[dict] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id, **kwargs)
@@ -155,9 +157,11 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         if extra_where:
             self.params.update(extra_params)
             return (
-                f"AND trace_id IN ("
+                f"AND {self._EVAL_TRACE_ID_EXPR} IN ("
                 f"SELECT DISTINCT trace_id FROM spans "
                 f"WHERE project_id = %(project_id)s AND is_deleted = 0 "
+                f"AND start_time >= %(start_date)s "
+                f"AND start_time < %(end_date)s "
                 f"AND {extra_where})"
             )
         return ""
@@ -166,7 +170,7 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
     # Public API
     # ------------------------------------------------------------------
 
-    def build(self) -> Tuple[str, Dict[str, Any]]:
+    def build(self) -> tuple[str, dict[str, Any]]:
         """Build the eval metrics query.
 
         Dispatches to the appropriate builder based on eval output type and
@@ -187,9 +191,9 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
 
     def format_result(
         self,
-        rows: List[Tuple],
-        columns: List[str],
-    ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        rows: list[tuple],
+        columns: list[str],
+    ) -> dict[str, Any] | list[dict[str, Any]]:
         """Format the query results into the standard eval graph response.
 
         Args:
@@ -209,13 +213,13 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
     # Score (float) queries
     # ------------------------------------------------------------------
 
-    def _build_score_query(self) -> Tuple[str, Dict[str, Any]]:
+    def _build_score_query(self) -> tuple[str, dict[str, Any]]:
         """Build query for SCORE eval type: ``avg(output_float) * 100``."""
         if self.use_preaggregated:
             return self._build_score_agg()
         return self._build_score_raw()
 
-    def _build_score_agg(self) -> Tuple[str, Dict[str, Any]]:
+    def _build_score_agg(self) -> tuple[str, dict[str, Any]]:
         """Score query against the pre-aggregated table."""
         bucket_fn = self.time_bucket_expr(self.interval)
         query = f"""
@@ -233,7 +237,7 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         """
         return query, self.params
 
-    def _build_score_raw(self) -> Tuple[str, Dict[str, Any]]:
+    def _build_score_raw(self) -> tuple[str, dict[str, Any]]:
         """Score query against the configured raw eval-logger table."""
         bucket_fn = self.time_bucket_expr(self.interval)
         filter_frag = self._filter_fragment()
@@ -243,7 +247,7 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         # project's matching trace set in ``_filter_fragment``. Keep the raw scan
         # config/time scoped and let the topology resolver select the matching
         # legacy ``deleted`` or direct-write ``is_deleted`` predicate.
-        raw_table, live_predicate = eval_logger_source(
+        raw_table, live_predicate = self._EVAL_LOGGER_SOURCE(
             "raw_eval_logger", include_cdc_tombstone_guard=True
         )
         query = f"""
@@ -265,13 +269,13 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
     # Pass/Fail (bool) queries
     # ------------------------------------------------------------------
 
-    def _build_pass_fail_query(self) -> Tuple[str, Dict[str, Any]]:
+    def _build_pass_fail_query(self) -> tuple[str, dict[str, Any]]:
         """Build query for PASS_FAIL eval type: pass rate as percentage."""
         if self.use_preaggregated:
             return self._build_pass_fail_agg()
         return self._build_pass_fail_raw()
 
-    def _build_pass_fail_agg(self) -> Tuple[str, Dict[str, Any]]:
+    def _build_pass_fail_agg(self) -> tuple[str, dict[str, Any]]:
         """Pass/Fail query against the pre-aggregated table."""
         bucket_fn = self.time_bucket_expr(self.interval)
         query = f"""
@@ -289,11 +293,11 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         """
         return query, self.params
 
-    def _build_pass_fail_raw(self) -> Tuple[str, Dict[str, Any]]:
+    def _build_pass_fail_raw(self) -> tuple[str, dict[str, Any]]:
         """Pass/Fail query against the configured raw eval-logger table."""
         bucket_fn = self.time_bucket_expr(self.interval)
         filter_frag = self._filter_fragment()
-        raw_table, live_predicate = eval_logger_source(
+        raw_table, live_predicate = self._EVAL_LOGGER_SOURCE(
             "raw_eval_logger", include_cdc_tombstone_guard=True
         )
         query = f"""
@@ -316,7 +320,7 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
     # Choices (str_list) queries
     # ------------------------------------------------------------------
 
-    def _build_choices_query(self) -> Tuple[str, Dict[str, Any]]:
+    def _build_choices_query(self) -> tuple[str, dict[str, Any]]:
         """Build query for CHOICES eval type.
 
         Generates per-choice percentage columns using ClickHouse's
@@ -331,7 +335,7 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         # Build per-choice columns. ClickHouse stores output_str_list as a JSON
         # string, so parse it before calling has(); output_str is kept as the
         # single-choice fallback for older rows/imports.
-        choice_cols: List[str] = []
+        choice_cols: list[str] = []
         choice_array_expr = "JSONExtract(output_str_list, 'Array(String)')"
         for i, choice in enumerate(self.choices):
             param_name = f"choice_{i}"
@@ -345,7 +349,7 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         choice_select = ",\n            ".join(choice_cols)
 
         filter_frag = self._filter_fragment()
-        raw_table, live_predicate = eval_logger_source(
+        raw_table, live_predicate = self._EVAL_LOGGER_SOURCE(
             "raw_eval_logger", include_cdc_tombstone_guard=True
         )
         query = f"""
@@ -370,9 +374,9 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
 
     def _format_single_series(
         self,
-        rows: List[Tuple],
-        columns: List[str],
-    ) -> Dict[str, Any]:
+        rows: list[tuple],
+        columns: list[str],
+    ) -> dict[str, Any]:
         """Format rows into a single-series eval result dict."""
         data_points = self.format_time_series(
             rows=rows,
@@ -391,15 +395,15 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
 
     def _format_choices_result(
         self,
-        rows: List[Tuple],
-        columns: List[str],
-    ) -> List[Dict[str, Any]]:
+        rows: list[tuple],
+        columns: list[str],
+    ) -> list[dict[str, Any]]:
         """Format choices query rows into multi-series result.
 
         Returns one series per choice option, each with the standard
         ``{name, data, id}`` shape.
         """
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
 
         for i, choice in enumerate(self.choices):
             col_name = f"choice_{i}"

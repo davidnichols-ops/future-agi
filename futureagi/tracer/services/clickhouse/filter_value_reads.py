@@ -48,6 +48,8 @@ _SYSTEM_VALUE_SOURCE_COLUMNS = {
     "name": "name",
     "span_name": "name",
     "session": "trace_session_id",
+    "user": "end_user_id",
+    "user_id": "end_user_id",
     "tag": "tags",
     "prompt_name": "prompt_version_id",
     "prompt_version": "prompt_version_id",
@@ -58,7 +60,7 @@ SYSTEM_FILTER_VALUE_METRICS = frozenset(_SYSTEM_VALUE_SOURCE_COLUMNS)
 
 class FilterValueMetadata(TypedDict):
     query_complete: bool
-    query_status: Literal["complete", "degraded"]
+    query_status: Literal["complete", "sampled", "degraded"]
     query_window_start: str
     query_window_end: str
     query_error_code: NotRequired[str]
@@ -73,10 +75,18 @@ class FilterValueRead:
     query_window_end: datetime
     has_more: bool = False
 
+    @property
+    def query_status(self) -> Literal["complete", "sampled", "degraded"]:
+        if self.query_complete:
+            return "complete"
+        if self.query_error_code == "sample_limit" and self.values:
+            return "sampled"
+        return "degraded"
+
     def metadata(self) -> FilterValueMetadata:
         payload: FilterValueMetadata = {
             "query_complete": self.query_complete,
-            "query_status": "complete" if self.query_complete else "degraded",
+            "query_status": self.query_status,
             "query_window_start": self.query_window_start.isoformat(),
             "query_window_end": self.query_window_end.isoformat(),
         }

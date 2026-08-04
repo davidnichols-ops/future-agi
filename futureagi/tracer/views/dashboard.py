@@ -33,6 +33,7 @@ from tracer.serializers.dashboard import (
     DashboardSerializer,
     DashboardWidgetSerializer,
 )
+from tracer.services.annotation_label_source import AnnotationScoreReadUnavailable
 from tracer.services.clickhouse.attribute_reads import (
     AttributeReadSelector,
     InvalidAttributeKey,
@@ -47,7 +48,6 @@ from tracer.services.clickhouse.filter_value_reads import (
 )
 from tracer.services.clickhouse.query_builders.dashboard import (
     METRIC_UNITS,
-    DashboardQueryBuilder,
     InvalidMetricCombinationError,
 )
 from tracer.services.clickhouse.query_builders.dataset_dashboard import (
@@ -63,8 +63,12 @@ from tracer.services.clickhouse.query_builders.simulation_dashboard import (
 )
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
 from tracer.services.clickhouse.read_budget import (
+    is_clickhouse_api_read_unavailable_error,
     is_clickhouse_query_error,
     is_read_budget_error,
+)
+from tracer.services.clickhouse.v2.query_builders.dashboard import (
+    DashboardQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.services.dashboard_metrics_catalog import get_cached_metrics_catalog
@@ -400,9 +404,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         ]
 
         try:
-            # Filter values read the direct-write CH25 tables only. Keep this
-            # separate from dashboard-widget query routing, which still uses
-            # the legacy-named service facade elsewhere in this module.
+            # Observability metrics are direct-write CH25 data. Keep the V2
+            # service explicit so routing configuration cannot select the
+            # legacy cluster.
             analytics = V2AnalyticsQueryService()
             all_metric_results = []
             project_name_map = {}
@@ -458,19 +462,8 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 trace_config["organization_id"] = str(request.workspace.organization_id)
                 trace_config["workspace_id"] = str(request.workspace.id)
 
-                # v1↔v2 dispatch — flips with CH25_QUERY_TYPES_V2_PRIMARY=DASHBOARD
-                from tracer.services.clickhouse.v2.dispatch import (
-                    get_query_builder_class,
-                )
-                from tracer.services.clickhouse.v2.query_service import (
-                    query_service_for_builder,
-                )
-
-                _DashCls = get_query_builder_class("DASHBOARD")
-                trace_analytics = query_service_for_builder(
-                    "DASHBOARD", _DashCls, analytics
-                )
-                builder = _DashCls(trace_config)
+                trace_analytics = analytics
+                builder = DashboardQueryBuilderV2(trace_config)
                 query_timeout = self._get_trace_query_timeout_ms(trace_config)
                 all_metric_results.extend(
                     self._run_metric_queries(
@@ -1000,6 +993,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
             200: DashboardFilterValuesResponseSerializer,
             400: ApiErrorResponseSerializer,
             500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
         },
     )
     @action(detail=False, methods=["get"])
@@ -1044,11 +1038,17 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
             if metric_type == "annotation_metric" and metric_name == "annotator":
                 from accounts.models.user import User
                 from tracer.services.annotation_label_source import (
-                    AnnotationLabelScoresCH,
+                    AnnotationLabelScoresProjectPG,
                 )
 
-                annotator_ids = AnnotationLabelScoresCH().annotator_ids_for_projects(
-                    project_ids
+                # Annotation Scores remain authoritative in PostgreSQL.  Pin
+                # this read to their denormalized tracer project key: the
+                # legacy CDC score table and direct-write CH25 spans are not
+                # co-located and cannot be joined safely after cutover.
+                annotator_ids = (
+                    AnnotationLabelScoresProjectPG().annotator_ids_for_projects(
+                        project_ids
+                    )
                 )
                 users = (
                     User.objects.filter(id__in=annotator_ids)
@@ -1070,13 +1070,6 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         option["description"] = email
                     values.append(option)
                 return self._gm.success_response({"values": values})
-
-            if not is_clickhouse_enabled() and metric_type not in (
-                "annotation_metric",
-                "eval_metric",
-                "custom_attribute",
-            ):
-                return self._gm.success_response({"values": []})
 
             # Filter-value reads are backed exclusively by the direct-write
             # CH25 tables.  Using the legacy service here silently targets the
@@ -1111,34 +1104,26 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             for row in result.data
                         ]
                     except Exception as exc:
-                        if not (
-                            is_read_budget_error(exc) or is_clickhouse_query_error(exc)
-                        ):
-                            logger.exception(
-                                "filter_values_programming_error",
+                        if is_clickhouse_api_read_unavailable_error(exc):
+                            logger.warning(
+                                "filter_values_ch_query_unavailable",
                                 metric_name=metric_name,
                                 error_type=type(exc).__name__,
                             )
-                            return self._gm.bad_request(
-                                "Filter values could not be loaded"
+                            return self._gm.custom_error_response(
+                                status.HTTP_503_SERVICE_UNAVAILABLE,
+                                "Filter values are temporarily unavailable. Please retry.",
+                                code="service_unavailable",
                             )
-                        logger.warning(
-                            "filter_values_ch_query_failed",
+                        logger.exception(
+                            "filter_values_programming_error",
                             metric_name=metric_name,
                             error_type=type(exc).__name__,
                         )
-                        error_code = (
-                            "read_budget_exceeded"
-                            if is_read_budget_error(exc)
-                            else "query_failed"
-                        )
-                        return self._gm.success_response(
-                            {
-                                "values": [],
-                                "query_complete": False,
-                                "query_status": "degraded",
-                                "query_error_code": error_code,
-                            }
+                        return self._gm.custom_error_response(
+                            status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            "Filter values could not be loaded",
+                            code="server_error",
                         )
                     return self._gm.success_response({"values": values})
 
@@ -1162,32 +1147,26 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     )
                     values = list(value_read.values)
                 except Exception as exc:
-                    if not (
-                        is_read_budget_error(exc) or is_clickhouse_query_error(exc)
-                    ):
-                        logger.exception(
-                            "filter_values_programming_error",
+                    if is_clickhouse_api_read_unavailable_error(exc):
+                        logger.warning(
+                            "filter_values_ch_query_unavailable",
                             metric_name=metric_name,
                             error_type=type(exc).__name__,
                         )
-                        return self._gm.bad_request("Filter values could not be loaded")
-                    logger.warning(
-                        "filter_values_ch_query_failed",
+                        return self._gm.custom_error_response(
+                            status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Filter values are temporarily unavailable. Please retry.",
+                            code="service_unavailable",
+                        )
+                    logger.exception(
+                        "filter_values_programming_error",
                         metric_name=metric_name,
                         error_type=type(exc).__name__,
                     )
-                    error_code = (
-                        "read_budget_exceeded"
-                        if is_read_budget_error(exc)
-                        else "query_failed"
-                    )
-                    return self._gm.success_response(
-                        {
-                            "values": [],
-                            "query_complete": False,
-                            "query_status": "degraded",
-                            "query_error_code": error_code,
-                        }
+                    return self._gm.custom_error_response(
+                        status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        "Filter values could not be loaded",
+                        code="server_error",
                     )
 
                 if metric_name == "session" and source == "sessions":
@@ -1274,22 +1253,24 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         else:
                             add_value_option(values, seen_values, opt)
 
-                    # CH-backed stored categorical choices (Score.value), scoped via spans.
+                    # Stored categorical choices are read from authoritative
+                    # Score rows via tracer_project_id.  This avoids a cross-
+                    # cluster legacy-score/direct-span subquery.
                     import json
 
                     from tracer.services.annotation_label_source import (
-                        AnnotationLabelScoresCH,
+                        AnnotationLabelScoresProjectPG,
                     )
 
                     for (
-                        payload_str
-                    ) in AnnotationLabelScoresCH().categorical_values_for_label(
+                        payload_value
+                    ) in AnnotationLabelScoresProjectPG().categorical_values_for_label(
                         label.id, project_ids
                     ):
                         try:
-                            payload = json.loads(payload_str)
+                            payload = json.loads(payload_value)
                         except (TypeError, ValueError):
-                            payload = payload_str
+                            payload = payload_value
                         raw_values = []
                         if isinstance(payload, dict):
                             selected = payload.get("selected")
@@ -1350,50 +1331,87 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         }
                         for row in read.rows
                     ]
+                    metadata = read.metadata.public_payload()
+                    if not read.metadata.query_complete:
+                        if read.metadata.query_error_code == "sample_limit" and values:
+                            # The bounded selector completed its finite sample
+                            # and proved usable values, but hit the public value
+                            # cap.  Publish that result as an explicit sample;
+                            # every resource/timeout/partial replay remains a
+                            # retryable error instead of an empty 200 response.
+                            metadata["query_status"] = "sampled"
+                        else:
+                            logger.warning(
+                                "filter_values_custom_attribute_incomplete",
+                                metric_name=metric_name,
+                                error_code=read.metadata.query_error_code,
+                            )
+                            return self._gm.custom_error_response(
+                                status.HTTP_503_SERVICE_UNAVAILABLE,
+                                "Filter values are temporarily unavailable. Please retry.",
+                                code="service_unavailable",
+                            )
                     return self._gm.success_response(
                         {
                             "values": values,
-                            **read.metadata.public_payload(),
+                            **metadata,
                         }
                     )
                 except InvalidAttributeKey:
                     return self._gm.bad_request("Invalid attribute key")
                 except Exception as exc:
-                    if not (
-                        is_read_budget_error(exc) or is_clickhouse_query_error(exc)
-                    ):
-                        logger.exception(
-                            "filter_values_programming_error",
+                    if is_clickhouse_api_read_unavailable_error(exc):
+                        logger.warning(
+                            "filter_values_ch_query_unavailable",
                             metric_name=metric_name,
                             error_type=type(exc).__name__,
                         )
-                        return self._gm.bad_request("Filter values could not be loaded")
-                    logger.warning(
-                        "filter_values_ch_query_failed",
+                        return self._gm.custom_error_response(
+                            status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Filter values are temporarily unavailable. Please retry.",
+                            code="service_unavailable",
+                        )
+                    logger.exception(
+                        "filter_values_programming_error",
                         metric_name=metric_name,
                         error_type=type(exc).__name__,
                     )
-                    error_code = (
-                        "read_budget_exceeded"
-                        if is_read_budget_error(exc)
-                        else "query_failed"
-                    )
-                    return self._gm.success_response(
-                        {
-                            "values": [],
-                            **selector.degraded_metadata(error_code).public_payload(),
-                        }
+                    return self._gm.custom_error_response(
+                        status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        "Filter values could not be loaded",
+                        code="server_error",
                     )
             else:
                 values = []
 
             return self._gm.success_response({"values": values})
+        except AnnotationScoreReadUnavailable:
+            logger.warning("fetch_annotation_filter_values_unavailable")
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Filter values are temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         except Exception as exc:
+            if is_clickhouse_api_read_unavailable_error(exc):
+                logger.warning(
+                    "fetch_filter_values_unavailable",
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Filter values are temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
             logger.exception(
                 "fetch_filter_values_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Filter values could not be loaded")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Filter values could not be loaded",
+                code="server_error",
+            )
 
     def _filter_values_dataset(self, request, metric_name, metric_type):
         """Return distinct filter values for dataset source."""
@@ -1843,7 +1861,10 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             m for m in query_config["metrics"] if m.get("source") == "simulation"
         ]
 
-        ch_client = get_clickhouse_client()
+        # The legacy ClickHouse client is only valid for the still-unmigrated
+        # dataset/simulation sources. Do not construct it for a trace-only
+        # observability request.
+        ch_client = None
         metric_results = []
 
         if trace_metrics:
@@ -1868,19 +1889,8 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     )
             trace_config["organization_id"] = str(workspace.organization_id)
             trace_config["workspace_id"] = str(workspace.id)
-            # v1↔v2 dispatch — flips with CH25_QUERY_TYPES_V2_PRIMARY=DASHBOARD
-            from tracer.services.clickhouse.v2.dispatch import (
-                get_query_builder_class,
-            )
-            from tracer.services.clickhouse.v2.query_service import (
-                query_service_for_builder,
-            )
-
-            _DashCls = get_query_builder_class("DASHBOARD")
-            trace_analytics = query_service_for_builder(
-                "DASHBOARD", _DashCls, AnalyticsQueryService()
-            )
-            builder = _DashCls(trace_config)
+            trace_analytics = V2AnalyticsQueryService()
+            builder = DashboardQueryBuilderV2(trace_config)
             query_timeout = self._get_trace_query_timeout_ms(trace_config)
 
             def _fetch_trace_rows(sql, params):
@@ -1895,6 +1905,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             )
 
         if dataset_metrics:
+            ch_client = get_clickhouse_client()
             ds_config = {**query_config, "metrics": dataset_metrics}
             ds_config["workspace_id"] = str(workspace.id)
             builder = DatasetQueryBuilder(ds_config)
@@ -1911,6 +1922,8 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             )
 
         if simulation_metrics:
+            if ch_client is None:
+                ch_client = get_clickhouse_client()
             sim_config = {**query_config, "metrics": simulation_metrics}
             sim_config["workspace_id"] = str(workspace.id)
             metric_results.extend(
@@ -1929,7 +1942,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 ).values_list("id", "name")
             )
             project_name_map = {str(k): v for k, v in project_name_map.items()}
-            formatted = DashboardQueryBuilder(query_config).format_results(
+            formatted = DashboardQueryBuilderV2(query_config).format_results(
                 metric_results, project_name_map=project_name_map
             )
         else:

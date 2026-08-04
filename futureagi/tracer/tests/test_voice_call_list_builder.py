@@ -300,6 +300,21 @@ def test_content_query_empty_span_ids_returns_empty():
     assert params == {}
 
 
+@pytest.mark.unit
+def test_v2_content_query_uses_valid_latest_json_aggregate():
+    from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+        VoiceCallListQueryBuilderV2,
+    )
+
+    sql, _ = VoiceCallListQueryBuilderV2(project_id=PROJECT_ID).build_content_query(
+        ["s1"]
+    )
+
+    assert "argMax(tuple(attributes_extra), _version).1" in sql
+    assert "attributes_extra AS span_attributes_raw" not in sql
+    assert "tuple(attributes_extra AS" not in sql
+
+
 # ---------------------------------------------------------------------------
 # build_eval_query — Phase 2 eval scores (NOT rewritten by v2)
 # ---------------------------------------------------------------------------

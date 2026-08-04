@@ -2803,10 +2803,8 @@ class TestTraceListQueryBuilder:
         assert query == ""
         assert params == {}
 
-    def test_v2_build_user_id_query_uses_v2_dict_and_column(self):
-        """TraceListQueryBuilderV2 must rewrite the inherited user-id query to the
-        v2 `end_users_dict` / `is_deleted` (and append the v2 SETTINGS) — the v1
-        `enduser_dict` / `_peerdb_is_deleted` artifacts must be gone."""
+    def test_v2_build_user_id_query_uses_live_dimension_without_dictionary(self):
+        """The V2 page enrichment must work under the table-only readonly role."""
         from tracer.services.clickhouse.v2.query_builders.trace_list import (
             TraceListQueryBuilderV2,
         )
@@ -2814,8 +2812,18 @@ class TestTraceListQueryBuilder:
         builder = TraceListQueryBuilderV2(project_id="test-proj-123")
         query, params = builder.build_user_id_query(["trace-1", "trace-2"])
 
-        assert "end_users_dict" in query
-        assert "is_deleted" in query
+        assert "remap_lookup AS (" in query
+        assert query.count("FROM end_user_id_remap FINAL") == 1
+        assert "ARRAY JOIN all_physical_end_user_ids AS any_id" in query
+        assert "GROUP BY any_id" in query
+        assert "LEFT ANY JOIN remap_lookup AS remap" in query
+        assert "end_users" not in query
+        assert "argMax(tuple(sp.end_user_id), sp._version)" in query
+        assert "argMax(sp.is_deleted, sp._version)" in query
+        assert "sp.project_id = %(project_id)s" in query
+        assert "sp.trace_id IN %(user_trace_ids)s" in query
+        assert "end_users_dict" not in query
+        assert "dictGet" not in query
         # General builders must retain exact FINAL semantics. Only stable-key
         # point reads opt in to skip indexes under FINAL.
         assert "use_skip_indexes_if_final = 0" in query
@@ -8345,7 +8353,10 @@ class TestMonitorMetricsQueryBuilder:
         )
         assert "avg(output_float)" in query
         assert "tracer_eval_logger" in query
-        assert "FINAL" in query
+        assert "ORDER BY eval_scan._peerdb_version DESC" in query
+        assert "LIMIT 1 BY eval_scan.id" in query
+        assert "latest_eval._peerdb_is_deleted = 0" in query
+        assert "FINAL" not in query
         assert params["eval_config_id"] == "eval-cfg-123"
 
     def test_evaluation_metrics_pass_fail_query(self):

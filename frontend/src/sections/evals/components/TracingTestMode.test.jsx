@@ -24,6 +24,7 @@ describe("buildTracingPreviewListParams", () => {
 
     expect(params).toEqual({
       project_id: "project-1",
+      allow_sampled: true,
       page_number: 0,
       page_size: 50,
       filters: JSON.stringify([

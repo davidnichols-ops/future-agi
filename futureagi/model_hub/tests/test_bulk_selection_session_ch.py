@@ -45,11 +45,11 @@ def _install_fake_session_builder(monkeypatch, *, rows, capture):
             return _FakeResult(rows)
 
     monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-        lambda name: _FakeBuilder,
+        "tracer.services.clickhouse.v2.query_builders.session_list.SessionListQueryBuilderV2",
+        _FakeBuilder,
     )
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
         _FakeAnalytics,
     )
     monkeypatch.setattr(
@@ -141,8 +141,12 @@ def test_ch_failure_propagates(monkeypatch):
             return None
 
     monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-        lambda name: _Boom,
+        "tracer.services.clickhouse.v2.query_builders.session_list.SessionListQueryBuilderV2",
+        _Boom,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        lambda: object(),
     )
     monkeypatch.setattr(
         "model_hub.services.bulk_selection._read_bounded_bulk_page",

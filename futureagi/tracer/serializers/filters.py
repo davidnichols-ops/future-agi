@@ -697,6 +697,17 @@ class ObserveGraphDataRequestSerializer(StrictInputSerializer):
     req_data_config = ObserveGraphMetricConfigField()
 
 
+class ObserveGraphDataQuerySerializer(StrictInputSerializer):
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Explicitly opt in to bounded sample points. Clients that set this "
+            "must label sampled values as estimates rather than exact totals."
+        ),
+    )
+
+
 class ObserveGraphDataPointSerializer(serializers.Serializer):
     """One exact or explicitly sampled graph point."""
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -33,6 +34,9 @@ from tracer.services.clickhouse.v2.query_builders.span_list import (
 )
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
+)
+from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+    VoiceCallListQueryBuilderV2,
 )
 
 PROJECT_ID = "00000000-0000-4000-8000-000000000001"
@@ -123,6 +127,77 @@ def _eval_filter(
     }
 
 
+def _end_user_filter(
+    value: object,
+    *,
+    operation: str = "equals",
+) -> dict[str, Any]:
+    return {
+        "column_id": "user_id",
+        "filter_config": {
+            "col_type": "TRACE_END_USER",
+            "filter_type": "text",
+            "filter_op": operation,
+            "filter_value": value,
+        },
+    }
+
+
+class _ProjectConfigValues(list):
+    def first(self):
+        return self[0] if self else None
+
+
+class _ProjectConfigQuery:
+    def __init__(
+        self,
+        configs_by_project: dict[str, tuple[str, ...]],
+        *,
+        selected_projects: tuple[str, ...] | None = None,
+    ) -> None:
+        self._configs_by_project = configs_by_project
+        self._selected_projects = selected_projects
+
+    def filter(self, **kwargs):
+        projects = kwargs.get("project_id__in")
+        if projects is None:
+            return self
+        return _ProjectConfigQuery(
+            self._configs_by_project,
+            selected_projects=tuple(str(project_id) for project_id in projects),
+        )
+
+    def exists(self):
+        return any(self._configs_by_project.values())
+
+    def values_list(self, field, **_kwargs):
+        projects = self._selected_projects or tuple(self._configs_by_project)
+        config_ids = [
+            config_id
+            for project_id in projects
+            for config_id in self._configs_by_project.get(project_id, ())
+        ]
+        if field == "eval_template_id":
+            return _ProjectConfigValues(["org-template"] if config_ids else [])
+        return _ProjectConfigValues(config_ids)
+
+
+class _ProjectConfigManager:
+    def __init__(self, configs_by_project: dict[str, tuple[str, ...]]) -> None:
+        self._configs_by_project = configs_by_project
+
+    def filter(self, **kwargs):
+        return _ProjectConfigQuery(self._configs_by_project).filter(**kwargs)
+
+
+class _ScoreTemplateQuery:
+    def values(self, *_args):
+        return self
+
+    def first(self):
+        return {"config": {"output": "SCORE"}}
+
+
 @override_settings(
     CLICKHOUSE={
         "CH_HOST": "legacy.invalid",
@@ -184,8 +259,10 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     )
     match_sql, match_params = builder.build_filter_match_query(["trace-a"])
 
-    assert "start_time >= %(filter_slice_start)s" in seed_sql
-    assert "start_time < %(filter_slice_end)s" in seed_sql
+    assert (
+        "start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)" in seed_sql
+    )
+    assert "start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)" in seed_sql
     assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in seed_sql
     assert "arrayMap(x -> lower(x), mapValues(span_attr_str))" in seed_sql
     assert seed_params["latest_filter_key_0"] == "final_status"
@@ -266,12 +343,19 @@ def test_trace_candidate_classifier_prunes_to_request_partitions() -> None:
     sql, params = builder.build_filter_match_query(["trace-a"])
 
     prewhere = sql.split("GROUP BY trace_id, id, start_time", 1)[0]
-    assert "toDate(start_time) >= toDate(%(candidate_start_date)s)" in prewhere
-    assert "toDate(start_time) <= toDate(%(candidate_end_date)s)" in prewhere
-    assert "start_time >= %(candidate_start_date)s" in prewhere
-    assert "start_time < %(candidate_end_date)s" in prewhere
+    assert "toDate(fromUnixTimestamp64Micro(%(candidate_start_date_us)s))" in prewhere
+    assert "toDate(fromUnixTimestamp64Micro(%(candidate_end_date_us)s))" in prewhere
+    assert (
+        "start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)"
+        in prewhere
+    )
+    assert (
+        "start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)" in prewhere
+    )
     assert params["candidate_start_date"] == START
     assert params["candidate_end_date"] == END
+    assert params["candidate_start_date_us"] == 1_735_689_600_000_000
+    assert params["candidate_end_date_us"] == 1_767_225_600_000_000
 
 
 def test_root_seed_replay_does_not_trust_one_raw_physical_root_id() -> None:
@@ -297,6 +381,87 @@ def test_root_seed_replay_does_not_trust_one_raw_physical_root_id() -> None:
     assert "argMaxIf(tuple(grouped_id)" in sql
     assert "SELECT id\n" not in sql
     assert sql.count("FROM spans") == 1
+
+
+def test_org_trace_builder_keeps_project_in_seed_classifier_and_page_keys() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    filters = [_time_filter(), _attribute_filter("final_status", "Rejected")]
+    builder = TraceListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        filters=filters,
+    )
+    started = END - timedelta(minutes=1)
+    seed_rows = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": "shared-trace",
+            "root_span_id": "root-a",
+            "start_time": started,
+        },
+        {
+            "project_id": project_b,
+            "trace_id": "shared-trace",
+            "root_span_id": "root-b",
+            "start_time": started,
+        },
+    ]
+
+    anchor_sql, _ = builder.build_filter_anchor_probe(limit=513)
+    ordered_sql, ordered_params = builder.build_filter_ordered_seed_page(
+        slice_start=END - timedelta(minutes=5),
+        slice_end=END,
+        limit=50,
+        before_start_time=started,
+        before_id=("shared-trace", project_b),
+    )
+    match_sql, match_params = builder.build_filter_match_query_from_seed_rows(seed_rows)
+    unfiltered = TraceListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[_time_filter()],
+    )
+    list_sql, _ = unfiltered.build()
+    count_sql, _ = unfiltered.build_count_query()
+    attributes_sql, _ = unfiltered.build_span_attributes_query(["shared-trace"])
+
+    assert "SELECT DISTINCT project_id, trace_id" in anchor_sql
+    assert "SELECT project_id, trace_id, id AS root_span_id" in ordered_sql
+    assert "ORDER BY start_time DESC, trace_id DESC, project_id DESC" in ordered_sql
+    assert "LIMIT 1 BY project_id, trace_id" in ordered_sql
+    assert "project_id < toUUID(%(filter_before_project_id)s)" in ordered_sql
+    assert ordered_params["filter_before_id"] == "shared-trace"
+    assert ordered_params["filter_before_project_id"] == project_b
+    assert match_params["candidate_trace_identities"] == (
+        (PROJECT_ID, "shared-trace"),
+        (project_b, "shared-trace"),
+    )
+    assert (
+        match_sql.count("(project_id, trace_id) IN %(candidate_trace_identities)s") == 1
+    )
+    assert (
+        "(grouped_project_id, grouped_trace_id) "
+        "IN %(candidate_trace_identities)s" in match_sql
+    )
+    assert "GROUP BY project_id, trace_id, id, start_time" in match_sql
+    assert "GROUP BY grouped_project_id, grouped_trace_id" in match_sql
+    assert "ORDER BY start_time DESC, trace_id DESC, project_id DESC" in match_sql
+    assert "LIMIT 2" in match_sql
+    assert builder.bounded_filter_row_identity(seed_rows[0]) == (
+        PROJECT_ID,
+        "shared-trace",
+    )
+    assert builder.bounded_filter_row_order_token(seed_rows[0]) == (
+        "shared-trace",
+        PROJECT_ID,
+    )
+    assert "ORDER BY start_time DESC, trace_id DESC, project_id DESC" in list_sql
+    assert "uniq(project_id, trace_id) AS total" in count_sql
+    assert "toString(project_id) AS project_id" in attributes_sql
+
+    single_project = TraceListQueryBuilder(project_id=PROJECT_ID, filters=filters)
+    assert single_project.bounded_filter_row_identity(seed_rows[0]) == "shared-trace"
+    assert single_project.bounded_filter_row_order_token(seed_rows[0]) == (
+        "shared-trace"
+    )
 
 
 def test_span_match_compiles_typed_map_json_and_multi_filter_at_latest_state() -> None:
@@ -394,6 +559,83 @@ def test_span_seed_replay_uses_trace_scoped_otel_identity() -> None:
     assert "project_version_id = %(project_version_id)s" in match_sql
     assert params["project_version_id"] == project_version_id
     assert "GROUP BY project_id, trace_id, id, start_time" in match_sql
+
+
+def test_trace_and_span_seed_slice_bounds_preserve_microseconds() -> None:
+    slice_start = START + timedelta(microseconds=123_456)
+    slice_end = START + timedelta(seconds=1, microseconds=654_321)
+    filters = [
+        _time_filter(slice_start, slice_end),
+        _attribute_filter("final_status", "Rejected"),
+    ]
+
+    trace_builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=filters,
+    )
+    trace_sql, trace_params = trace_builder.build_filter_seed_page(
+        slice_start=slice_start,
+        slice_end=slice_end,
+        limit=1,
+    )
+    span_builder = SpanListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=filters,
+        bounded_anchor_probe=True,
+    )
+    span_sql, span_params = span_builder.build_filter_seed_page(
+        slice_start=slice_start,
+        slice_end=slice_end,
+        limit=1,
+    )
+
+    for sql, params in ((trace_sql, trace_params), (span_sql, span_params)):
+        assert (
+            "start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)" in sql
+        )
+        assert "start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)" in sql
+        assert params["filter_slice_start"] == slice_start
+        assert params["filter_slice_end"] == slice_end
+        assert params["filter_slice_start_us"] == 1_735_689_600_123_456
+        assert params["filter_slice_end_us"] == 1_735_689_601_654_321
+
+    trace_anchor_sql, trace_anchor_params = trace_builder.build_filter_anchor_probe(
+        limit=2
+    )
+    span_anchor_sql, span_anchor_params = span_builder.build_filter_anchor_probe(
+        limit=2
+    )
+    for sql, params in (
+        (trace_anchor_sql, trace_anchor_params),
+        (span_anchor_sql, span_anchor_params),
+    ):
+        assert (
+            "start_time >= fromUnixTimestamp64Micro(%(filter_anchor_start_us)s)" in sql
+        )
+        assert "start_time < fromUnixTimestamp64Micro(%(filter_anchor_end_us)s)" in sql
+        assert params["filter_anchor_start_us"] == 1_735_689_600_123_456
+        assert params["filter_anchor_end_us"] == 1_735_689_601_654_321
+
+    trace_match_sql, trace_match_params = trace_builder.build_filter_match_query(
+        ["trace-a"]
+    )
+    span_match_sql, span_match_params = span_builder.build_filter_match_query(
+        ["span-a"]
+    )
+    for sql, params in (
+        (trace_match_sql, trace_match_params),
+        (span_match_sql, span_match_params),
+    ):
+        assert (
+            "latest_start_time >= "
+            "fromUnixTimestamp64Micro(%(candidate_start_date_us)s)" in sql
+        )
+        assert (
+            "latest_start_time < "
+            "fromUnixTimestamp64Micro(%(candidate_end_date_us)s)" in sql
+        )
+        assert params["candidate_start_date_us"] == 1_735_689_600_123_456
+        assert params["candidate_end_date_us"] == 1_735_689_601_654_321
 
 
 def test_v2_span_seed_uses_deployed_string_value_bloom_companion() -> None:
@@ -590,6 +832,7 @@ def test_mixed_attribute_and_annotation_stays_in_one_bounded_trace_classifier() 
     assert "model_hub_score" not in seed_sql
     assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in seed_sql
     assert "model_hub_score AS s FINAL" in match_sql
+    assert "tracer_project_id" not in match_sql
     assert "latest_attr_exists_0" in match_sql
     assert "%(candidate_trace_ids)s" in match_sql
     assert "toString(if(" in match_sql
@@ -651,6 +894,173 @@ def test_eval_residual_is_candidate_scoped_inside_same_trace_match_query() -> No
     assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in sql
     assert params["candidate_trace_ids"] == ("trace-a", "trace-b")
     assert params["eval_cfg_1"] == (eval_id,)
+
+
+def _org_collision_seed_rows(project_b: str) -> list[dict[str, Any]]:
+    started = END - timedelta(minutes=1)
+    return [
+        {
+            "project_id": project_id,
+            "trace_id": "shared-trace",
+            "root_span_id": root_span_id,
+            "start_time": started,
+        }
+        for project_id, root_span_id in (
+            (PROJECT_ID, "root-a"),
+            (project_b, "root-b"),
+        )
+    ]
+
+
+def test_org_annotation_residual_correlates_shared_trace_by_project() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    label_id = "00000000-0000-4000-8000-000000000099"
+    builder = TraceListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[_time_filter(), _annotation_filter(label_id, "approved")],
+    )
+
+    sql, params = builder.build_filter_match_query_from_seed_rows(
+        _org_collision_seed_rows(project_b)
+    )
+
+    assert sql.count("tracer_project_id = toUUID(") >= 2
+    assert sql.count("outer_project_id)s) AND") == 2
+    assert params["org_residual_0_candidate_trace_ids"] == ("shared-trace",)
+    assert params["org_residual_1_candidate_trace_ids"] == ("shared-trace",)
+    assert params["org_residual_0_project_id"] == PROJECT_ID
+    assert params["org_residual_1_project_id"] == project_b
+    assert params["org_residual_0_outer_project_id"] == PROJECT_ID
+    assert params["org_residual_1_outer_project_id"] == project_b
+
+
+def test_org_eval_residual_does_not_admit_same_trace_from_other_project() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    eval_id = "00000000-0000-4000-8000-000000000088"
+    config_manager = _ProjectConfigManager({PROJECT_ID: (eval_id,), project_b: ()})
+    builder = TraceListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[_time_filter(), _eval_filter(eval_id, 75)],
+    )
+
+    with (
+        mock.patch(
+            "tracer.models.custom_eval_config.CustomEvalConfig.objects",
+            config_manager,
+        ),
+        mock.patch(
+            "model_hub.models.evals_metric.EvalTemplate.no_workspace_objects.filter",
+            return_value=_ScoreTemplateQuery(),
+        ),
+    ):
+        sql, params = builder.build_filter_match_query_from_seed_rows(
+            _org_collision_seed_rows(project_b)
+        )
+
+    assert sql.count("outer_project_id)s) AND") == 2
+    assert "org_residual_0_eval_cfg_1" in params
+    assert params["org_residual_0_eval_cfg_1"] == (eval_id,)
+    assert "org_residual_1_eval_cfg_1" not in params
+    assert "SELECT toUUID('00000000-0000-0000-0000-000000000000')" in sql
+    assert params["org_residual_0_outer_project_id"] == PROJECT_ID
+    assert params["org_residual_1_outer_project_id"] == project_b
+
+
+def test_org_has_eval_residual_uses_project_owned_configs_for_shared_trace() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    config_id = "00000000-0000-4000-8000-000000000088"
+    config_manager = _ProjectConfigManager({PROJECT_ID: (config_id,), project_b: ()})
+    builder = TraceListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[
+            _time_filter(),
+            {
+                "column_id": "has_eval",
+                "filter_config": {
+                    "filter_type": "boolean",
+                    "filter_op": "equals",
+                    "filter_value": True,
+                },
+            },
+        ],
+    )
+
+    with mock.patch(
+        "tracer.models.custom_eval_config.CustomEvalConfig.objects",
+        config_manager,
+    ):
+        sql, params = builder.build_filter_match_query_from_seed_rows(
+            _org_collision_seed_rows(project_b)
+        )
+
+    assert params["org_residual_0_project_eval_cfg_1"] == (config_id,)
+    assert "org_residual_1_project_eval_cfg_1" not in params
+    assert "eval_scan.custom_eval_config_id" in sql
+    assert sql.count("outer_project_id)s) AND") == 2
+
+
+def test_org_end_user_negative_residual_is_project_scoped_for_shared_trace() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    builder = TraceListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[
+            _time_filter(),
+            _end_user_filter("customer@example.com", operation="not_equals"),
+        ],
+    )
+
+    sql, params = builder.build_filter_match_query_from_seed_rows(
+        _org_collision_seed_rows(project_b)
+    )
+
+    assert sql.count("trace_id NOT IN") == 2
+    assert sql.count("outer_project_id)s) AND") == 2
+    assert params["org_residual_0_project_id"] == PROJECT_ID
+    assert params["org_residual_1_project_id"] == project_b
+    assert params["org_residual_0_candidate_trace_ids"] == ("shared-trace",)
+    assert params["org_residual_1_candidate_trace_ids"] == ("shared-trace",)
+
+
+def test_org_combined_residuals_keep_each_shared_trace_branch_project_local() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    label_id = "00000000-0000-4000-8000-000000000099"
+    eval_id = "00000000-0000-4000-8000-000000000088"
+    config_manager = _ProjectConfigManager(
+        {PROJECT_ID: (eval_id,), project_b: (eval_id,)}
+    )
+    builder = TraceListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[
+            _time_filter(),
+            _annotation_filter(label_id, "approved"),
+            _eval_filter(eval_id, 75),
+            _end_user_filter("customer@example.com"),
+        ],
+    )
+
+    with (
+        mock.patch(
+            "tracer.models.custom_eval_config.CustomEvalConfig.objects",
+            config_manager,
+        ),
+        mock.patch(
+            "model_hub.models.evals_metric.EvalTemplate.no_workspace_objects.filter",
+            return_value=_ScoreTemplateQuery(),
+        ),
+    ):
+        sql, params = builder.build_filter_match_query_from_seed_rows(
+            _org_collision_seed_rows(project_b)
+        )
+
+    assert sql.count("model_hub_score AS s FINAL") >= 2
+    assert sql.count(" AS eval_scan") >= 2
+    assert sql.count("tracer_enduser FINAL") == 2
+    assert sql.count("outer_project_id)s) AND") == 2
+    assert params["org_residual_0_project_id"] == PROJECT_ID
+    assert params["org_residual_1_project_id"] == project_b
+    assert params["org_residual_0_candidate_trace_ids"] == ("shared-trace",)
+    assert params["org_residual_1_candidate_trace_ids"] == ("shared-trace",)
+    assert not re.search(r"%\(project_id\)s", sql)
 
 
 def test_span_annotation_classifier_scopes_score_and_span_sides_to_candidates() -> None:
@@ -809,11 +1219,15 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
     expected_window_gate_uses = 2 + (2 * any_span_leaf_count)
     assert match_sql.count("argMinIf(") == any_span_leaf_count
     assert (
-        match_sql.count("latest_start_time >= %(candidate_start_date)s")
+        match_sql.count(
+            "latest_start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)"
+        )
         == expected_window_gate_uses
     )
     assert (
-        match_sql.count("latest_start_time < %(candidate_end_date)s")
+        match_sql.count(
+            "latest_start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)"
+        )
         == expected_window_gate_uses
     )
     assert first_filter in match_sql and second_filter in match_sql
@@ -996,7 +1410,10 @@ def test_v2_bounded_builders_emit_only_ch25_columns() -> None:
     )
     span_match_sql, _ = span_builder.build_filter_match_query(["span-a"])
 
-    assert "start_time >= %(filter_slice_start)s" in trace_seed_sql
+    assert (
+        "start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)"
+        in trace_seed_sql
+    )
     assert "attrs_string" in trace_match_sql
     assert "attrs_string" in span_match_sql
     assert "attrs_number" in span_match_sql
@@ -1220,10 +1637,8 @@ def test_span_unfiltered_end_user_uses_remap_aware_legacy_path() -> None:
     assert count_params["end_user_id"] == end_user_id
 
 
-@override_settings(
-    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
-)
-def test_trace_list_view_selects_bounded_path_under_v2_only() -> None:
+@override_settings(CLICKHOUSE_V2={"QUERY_TYPES_DISABLED": "TRACE_LIST"})
+def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
     from tracer.views.trace import TraceView
 
     view = TraceView.__new__(TraceView)
@@ -1265,7 +1680,7 @@ def test_trace_list_view_selects_bounded_path_under_v2_only() -> None:
         ) as bounded_read,
     ):
         eval_config.objects.filter.return_value.select_related.return_value = []
-        status, payload = view._list_traces_of_session_clickhouse(
+        legacy_response = view._list_traces_of_session_clickhouse(
             request,
             project_id=PROJECT_ID,
             validated_data={
@@ -1280,7 +1695,25 @@ def test_trace_list_view_selects_bounded_path_under_v2_only() -> None:
             org_project_ids=None,
             org=organization,
         )
+        status, payload = view._list_traces_of_session_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "allow_sampled": True,
+            },
+            analytics=analytics,
+            org_project_ids=None,
+            org=organization,
+        )
 
+    assert legacy_response[0] == "error"
+    assert legacy_response[1][0] == 503
     assert status == "ok"
     assert isinstance(bounded_read.call_args.kwargs["builder"], TraceListQueryBuilderV2)
     assert payload["metadata"]["query_complete"] is True
@@ -1385,6 +1818,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
                 ],
                 "page_number": 0,
                 "page_size": 25,
+                "allow_sampled": True,
             },
             analytics=analytics,
             org_project_ids=None,
@@ -1400,6 +1834,234 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
     assert all(0 < timeout_ms <= 900 for _, timeout_ms, _ in analytics.calls)
     assert all(
         settings == TRACE_LIST_READ_SETTINGS for _, _, settings in analytics.calls
+    )
+
+
+@override_settings(
+    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
+)
+def test_trace_cursor_order_is_backward_compatible_only_in_single_project() -> None:
+    from tracer.services.clickhouse.list_cursor import ListCursorError
+    from tracer.views.trace import (
+        _decode_trace_list_cursor_order,
+        _trace_list_cursor_order_for_row,
+    )
+
+    started = END - timedelta(minutes=1)
+    row = {
+        "project_id": PROJECT_ID,
+        "trace_id": "shared-trace",
+        "start_time": started,
+    }
+
+    assert _trace_list_cursor_order_for_row(row, org_scope=False) == (
+        started,
+        "shared-trace",
+    )
+    assert (
+        _decode_trace_list_cursor_order((started, "shared-trace"), org_scope=False)
+        == "shared-trace"
+    )
+    assert _trace_list_cursor_order_for_row(row, org_scope=True) == (
+        started,
+        "shared-trace",
+        PROJECT_ID,
+    )
+    assert _decode_trace_list_cursor_order(
+        (started, "shared-trace", PROJECT_ID), org_scope=True
+    ) == ("shared-trace", PROJECT_ID)
+
+    with pytest.raises(ListCursorError) as legacy_org:
+        _decode_trace_list_cursor_order((started, "shared-trace"), org_scope=True)
+    assert legacy_org.value.code == "invalid_cursor"
+    assert str(legacy_org.value) == "The continuation cursor is invalid."
+
+    with pytest.raises(ListCursorError) as org_replayed_as_single:
+        _decode_trace_list_cursor_order(
+            (started, "shared-trace", PROJECT_ID), org_scope=False
+        )
+    assert org_replayed_as_single.value.code == "invalid_cursor"
+
+
+@override_settings(
+    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
+)
+def test_org_trace_content_same_trace_id_is_merged_by_project_identity() -> None:
+    from tracer.views.trace import TraceView
+
+    project_b = "00000000-0000-4000-8000-000000000002"
+    config_a = SimpleNamespace(
+        id="config-a",
+        project_id=PROJECT_ID,
+        name="quality-a",
+        eval_template=SimpleNamespace(
+            id="template-a", config={"output": "score"}, choices=None
+        ),
+    )
+    config_b = SimpleNamespace(
+        id="config-b",
+        project_id=project_b,
+        name="quality-b",
+        eval_template=SimpleNamespace(
+            id="template-b", config={"output": "score"}, choices=None
+        ),
+    )
+    started = END - timedelta(minutes=1)
+    bounded = BoundedFilterPage(
+        rows=[
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "shared-trace",
+                "root_span_id": "root-a",
+                "start_time": started,
+            },
+            {
+                "project_id": project_b,
+                "trace_id": "shared-trace",
+                "root_span_id": "root-b",
+                "start_time": started,
+            },
+        ],
+        has_more=True,
+        complete=True,
+        status="complete",
+        error_code=None,
+        total_rows_lower_bound=2,
+        elapsed_ms=2.0,
+        query_count=1,
+        rows_returned=2,
+        result_payload_bytes=20,
+        attempts=(),
+    )
+
+    class OrgAnalytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            if "content_trace_ids" in params:
+                rows = [
+                    {
+                        "project_id": PROJECT_ID,
+                        "trace_id": "shared-trace",
+                        "input": "tenant-a-input",
+                    },
+                    {
+                        "project_id": project_b,
+                        "trace_id": "shared-trace",
+                        "input": "tenant-b-input",
+                    },
+                ]
+            elif "eval_config_ids" in params:
+                rows = [
+                    {
+                        "trace_id": "shared-trace",
+                        "eval_config_id": "config-a",
+                        "avg_score": 0.1,
+                        "pass_rate": None,
+                        "success_count": 1,
+                        "error_count": 0,
+                        "eval_count": 1,
+                        "str_lists": [],
+                    },
+                    {
+                        "trace_id": "shared-trace",
+                        "eval_config_id": "config-b",
+                        "avg_score": 0.9,
+                        "pass_rate": None,
+                        "success_count": 1,
+                        "error_count": 0,
+                        "eval_count": 1,
+                        "str_lists": [],
+                    },
+                ]
+            elif "attr_trace_ids" in params:
+                rows = [
+                    {
+                        "project_id": PROJECT_ID,
+                        "trace_id": "shared-trace",
+                        "attributes_extra": '{"tenant_marker":"tenant-a"}',
+                    },
+                    {
+                        "project_id": project_b,
+                        "trace_id": "shared-trace",
+                        "attributes_extra": '{"tenant_marker":"tenant-b"}',
+                    },
+                ]
+            else:
+                rows = []
+            return QueryResult(rows, len(rows), "clickhouse", 0.0)
+
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    organization = SimpleNamespace(id="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+    )
+    validated_data = {
+        "filters": [_time_filter()],
+        "page_number": 0,
+        "page_size": 25,
+        "cursor_mode": True,
+        "allow_sampled": True,
+    }
+
+    with (
+        mock.patch("tracer.views.trace.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded,
+        ),
+        mock.patch(
+            "tracer.views.trace.capture_snapshot_version_ceiling", return_value=42
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = [
+            config_a,
+            config_b,
+        ]
+        status_name, payload = view._list_traces_of_session_clickhouse(
+            request,
+            project_id=None,
+            validated_data=validated_data,
+            analytics=OrgAnalytics(),
+            org_project_ids=[PROJECT_ID, project_b],
+            org=organization,
+        )
+
+    assert status_name == "ok"
+    rows_by_project = {row["project_id"]: row for row in payload["table"]}
+    assert rows_by_project[PROJECT_ID]["input"] == "tenant-a-input"
+    assert rows_by_project[PROJECT_ID]["tenant_marker"] == "tenant-a"
+    assert rows_by_project[PROJECT_ID]["config-a"] == 10.0
+    assert "config-b" not in rows_by_project[PROJECT_ID]
+    assert rows_by_project[project_b]["input"] == "tenant-b-input"
+    assert rows_by_project[project_b]["tenant_marker"] == "tenant-b"
+    assert rows_by_project[project_b]["config-b"] == 90.0
+    assert "config-a" not in rows_by_project[project_b]
+    from tracer.services.clickhouse.list_cursor import (
+        cursor_scope_for_request,
+        decode_list_cursor,
+    )
+
+    cursor = decode_list_cursor(
+        payload["metadata"]["next_cursor"],
+        resource="observe_traces",
+        scope=cursor_scope_for_request(request, project_ids=[PROJECT_ID, project_b]),
+        query=validated_data,
+        page_size=25,
+    )
+    assert cursor.order == (
+        started.replace(tzinfo=UTC),
+        "shared-trace",
+        project_b,
     )
 
 
@@ -1482,17 +2144,18 @@ def test_trace_list_enrichment_timeout_is_sanitized_503_not_empty_200() -> None:
     assert "private ClickHouse" not in str(response)
 
 
-@override_settings(
-    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
-)
-def test_eval_task_trace_list_project_version_selects_bounded_path() -> None:
+@override_settings(CLICKHOUSE_V2={})
+def test_non_observe_trace_list_uses_v2_builder_without_routing_config() -> None:
     """Prototype/eval trace filtering must not call the blocked broad query."""
 
     from tracer.views.trace import TRACE_LIST_CANDIDATE_DEADLINE_MS, TraceView
 
     project_version_id = "00000000-0000-4000-8000-000000000099"
     view = TraceView.__new__(TraceView)
-    view._gm = SimpleNamespace(success_response=lambda payload: ("ok", payload))
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
     organization = SimpleNamespace(id="org-a")
     request = SimpleNamespace(
         organization=organization,
@@ -1532,7 +2195,7 @@ def test_eval_task_trace_list_project_version_selects_bounded_path() -> None:
             project_id=PROJECT_ID
         )
         eval_config.objects.filter.return_value.select_related.return_value = []
-        status, payload = view._list_traces_clickhouse(
+        legacy_response = view._list_traces_clickhouse(
             request,
             project_version_id,
             analytics,
@@ -1546,7 +2209,24 @@ def test_eval_task_trace_list_project_version_selects_bounded_path() -> None:
                 "page_size": 25,
             },
         )
+        status, payload = view._list_traces_clickhouse(
+            request,
+            project_version_id,
+            analytics,
+            {
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "sort_params": [],
+                "page_number": 3,
+                "page_size": 25,
+                "allow_sampled": True,
+            },
+        )
 
+    assert legacy_response[0] == "error"
+    assert legacy_response[1][0] == 503
     assert status == "ok"
     bounded_kwargs = bounded_read.call_args.kwargs
     assert isinstance(bounded_kwargs["builder"], TraceListQueryBuilderV2)
@@ -1616,8 +2296,25 @@ def test_eval_task_project_version_enrichments_share_deadline_and_caps() -> None
                     "settings": settings,
                 }
             )
-            if " AS user_id" in query:
-                rows = [{"trace_id": "trace-a", "user_id": "user-a"}]
+            if "user_trace_identities" in params:
+                end_user_id = "00000000-0000-0000-0000-000000000010"
+                rows = [
+                    {
+                        "project_id": PROJECT_ID,
+                        "trace_id": "trace-a",
+                        "resolved_end_user_id": end_user_id,
+                        "physical_end_user_ids": [end_user_id],
+                    }
+                ]
+            elif "user_physical_identities" in params:
+                rows = [
+                    {
+                        "project_id": PROJECT_ID,
+                        "end_user_id": "00000000-0000-0000-0000-000000000010",
+                        "user_id": "user-a",
+                        "version": END,
+                    }
+                ]
             else:
                 rows = [
                     {
@@ -1669,11 +2366,12 @@ def test_eval_task_project_version_enrichments_share_deadline_and_caps() -> None
                 "sort_params": [],
                 "page_number": 0,
                 "page_size": 25,
+                "allow_sampled": True,
             },
         )
 
     assert status_name == "ok"
-    assert len(analytics.calls) == 2
+    assert len(analytics.calls) == 3
     assert all(
         0 < call["timeout_ms"] <= TRACE_LIST_ENRICHMENT_TIMEOUT_MS
         for call in analytics.calls
@@ -1758,14 +2456,16 @@ def test_eval_task_trace_list_incomplete_page_fails_closed_before_enrichment() -
 
 
 @override_settings(
-    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "SPAN_LIST"},
+    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "", "QUERY_TYPES_V2_PRIMARY": ""},
 )
 def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> None:
-    from tracer.services.clickhouse.query_service import AnalyticsQueryService
     from tracer.views.observation_span import ObservationSpanView
 
     view = ObservationSpanView.__new__(ObservationSpanView)
-    view._gm = SimpleNamespace(success_response=lambda payload: ("ok", payload))
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
     organization = SimpleNamespace(id="org-a")
     request = SimpleNamespace(
         organization=organization,
@@ -1784,7 +2484,6 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
         result_payload_bytes=0,
         attempts=(),
     )
-    legacy_analytics = AnalyticsQueryService()
     v2_analytics = mock.MagicMock()
 
     with (
@@ -1798,15 +2497,16 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
             return_value=bounded,
         ) as bounded_read,
         mock.patch(
-            "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
-            return_value=v2_analytics,
-        ),
+            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+            side_effect=AssertionError("SPAN_LIST dispatch must not be consulted"),
+        ) as dispatch,
         mock.patch(
-            "tracer.services.clickhouse.query_service.get_clickhouse_client"
-        ) as legacy_client,
+            "tracer.services.clickhouse.v2.query_service.query_service_for_builder",
+            side_effect=AssertionError("SPAN_LIST service remap must not be consulted"),
+        ) as service_remap,
     ):
         eval_config.objects.filter.return_value.select_related.return_value = []
-        status, payload = view._list_spans_clickhouse(
+        legacy_response = view._list_spans_clickhouse(
             request,
             project_id=PROJECT_ID,
             validated_data={
@@ -1817,11 +2517,29 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
                 "page_number": 0,
                 "page_size": 50,
             },
-            analytics=legacy_analytics,
+            analytics=v2_analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+        status, payload = view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("prompt_slug", "agent_2_identity_disclosure"),
+                ],
+                "page_number": 0,
+                "page_size": 50,
+                "allow_sampled": True,
+            },
+            analytics=v2_analytics,
             org_project_ids=None,
             org=organization,
         )
 
+    assert legacy_response[0] == "error"
+    assert legacy_response[1][0] == 503
     assert status == "ok"
     bounded_kwargs = bounded_read.call_args.kwargs
     assert isinstance(bounded_kwargs["builder"], SpanListQueryBuilderV2)
@@ -1838,7 +2556,89 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
     assert payload["metadata"]["query_result_payload_bytes"] == 0
     assert payload["metadata"]["total_rows_is_lower_bound"] is True
     v2_analytics.execute_ch_query.assert_not_called()
-    legacy_client.assert_not_called()
+    dispatch.assert_not_called()
+    service_remap.assert_not_called()
+
+
+@override_settings(
+    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "", "QUERY_TYPES_V2_PRIMARY": ""},
+)
+def test_non_observe_span_list_uses_direct_v2_builder_without_dispatch() -> None:
+    from tracer.views.observation_span import ObservationSpanView
+
+    view = ObservationSpanView.__new__(ObservationSpanView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    analytics = mock.MagicMock()
+    bounded = BoundedFilterPage(
+        rows=[],
+        has_more=False,
+        complete=True,
+        status="complete",
+        error_code=None,
+        total_rows_lower_bound=0,
+        elapsed_ms=1.0,
+        query_count=1,
+        rows_returned=0,
+        result_payload_bytes=0,
+        attempts=(),
+    )
+
+    with (
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded,
+        ) as bounded_read,
+        mock.patch(
+            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+            side_effect=AssertionError("SPAN_LIST dispatch must not be consulted"),
+        ) as dispatch,
+        mock.patch(
+            "tracer.services.clickhouse.v2.query_service.query_service_for_builder",
+            side_effect=AssertionError("SPAN_LIST service remap must not be consulted"),
+        ) as service_remap,
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        legacy_response = view._list_spans_non_observe_clickhouse(
+            SimpleNamespace(),
+            "00000000-0000-4000-8000-000000000099",
+            SimpleNamespace(project_id=PROJECT_ID),
+            analytics,
+            {
+                "filters": [_time_filter()],
+                "page_number": 0,
+                "page_size": 25,
+            },
+        )
+        status_name, payload = view._list_spans_non_observe_clickhouse(
+            SimpleNamespace(),
+            "00000000-0000-4000-8000-000000000099",
+            SimpleNamespace(project_id=PROJECT_ID),
+            analytics,
+            {
+                "filters": [_time_filter()],
+                "page_number": 0,
+                "page_size": 25,
+                "allow_sampled": True,
+            },
+        )
+
+    assert legacy_response[0] == "error"
+    assert legacy_response[1][0] == 503
+    assert status_name == "ok"
+    assert payload["metadata"]["total_rows"] == 0
+    assert payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert isinstance(bounded_read.call_args.kwargs["builder"], SpanListQueryBuilderV2)
+    assert bounded_read.call_args.kwargs["analytics"] is analytics
+    dispatch.assert_not_called()
+    service_remap.assert_not_called()
 
 
 @override_settings(
@@ -1932,6 +2732,7 @@ def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
                 ],
                 "page_number": 0,
                 "page_size": 25,
+                "allow_sampled": True,
             },
             analytics=analytics,
             org_project_ids=None,
@@ -1977,8 +2778,9 @@ def test_trace_route_returns_sanitized_degraded_page_for_filtered_sort() -> None
             "tracer.views.trace._build_annotation_map_from_scores", return_value={}
         ),
         mock.patch(
-            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-            return_value=SortedTraceBuilder,
+            "tracer.services.clickhouse.v2.query_builders.trace_list."
+            "TraceListQueryBuilderV2",
+            SortedTraceBuilder,
         ),
         mock.patch(
             "tracer.selectors.trace_filter_reads.read_bounded_filter_page"
@@ -2035,8 +2837,8 @@ def test_span_route_returns_sanitized_degraded_page_for_filtered_end_user() -> N
             return_value=[],
         ),
         mock.patch(
-            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-            return_value=EndUserSpanBuilder,
+            "tracer.views.observation_span.SpanListQueryBuilderV2",
+            EndUserSpanBuilder,
         ),
         mock.patch(
             "tracer.selectors.trace_filter_reads.read_bounded_filter_page"
@@ -2177,6 +2979,54 @@ class _UnindexedAnySpanFakeBuilder(_FakeBuilder):
         return "ordered_seed", params
 
 
+class _AnchorFakeBuilder(_FakeBuilder):
+    def supports_filter_anchor_probe(self) -> bool:
+        return True
+
+    @staticmethod
+    def build_filter_anchor_probe(*, limit: int) -> tuple[str, dict[str, Any]]:
+        return "anchor", {"limit": limit}
+
+    def build_filter_ordered_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        before_start_time: datetime | None = None,
+        before_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        _, params = self.build_filter_seed_page(
+            slice_start=slice_start,
+            slice_end=slice_end,
+            limit=limit,
+            before_start_time=before_start_time,
+            before_id=before_id,
+        )
+        return "ordered_seed", params
+
+
+class _AnchorFakeExecutor(_FakeExecutor):
+    def execute_ch_query(
+        self,
+        query: str,
+        params: dict[str, Any],
+        *,
+        timeout_ms: int,
+        settings: dict[str, Any],
+    ) -> QueryResult:
+        if query != "anchor":
+            return super().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+        self.calls.append((query, params))
+        rows = self.builder.rows[: params["limit"]]
+        return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+
 class _VersionedFakeExecutor(_FakeExecutor):
     """Apply the same raw-version table filter used by CH cursor reads."""
 
@@ -2274,6 +3124,61 @@ class _PhysicalCursorFakeExecutor(_FakeExecutor):
                     params["before_start_time"],
                     params["before_id"],
                 )
+                rows = [row for row in rows if order(row) < boundary]
+            rows = rows[: params["limit"]]
+        return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+
+class _OrgTraceCursorFakeBuilder(_FakeBuilder):
+    """Model organization trace identity and its signed result order."""
+
+    @staticmethod
+    def bounded_filter_row_identity(row: dict[str, Any]) -> tuple[str, str]:
+        return str(row["project_id"]), str(row["trace_id"])
+
+    @staticmethod
+    def bounded_filter_row_order_token(row: dict[str, Any]) -> tuple[str, str]:
+        return str(row["trace_id"]), str(row["project_id"])
+
+    bounded_filter_seed_identity = bounded_filter_row_identity
+    bounded_filter_seed_order_token = bounded_filter_row_order_token
+
+    def build_filter_match_query_from_seed_rows(
+        self, rows: list[dict[str, Any]]
+    ) -> tuple[str, dict[str, Any]]:
+        identities = tuple(self.bounded_filter_row_identity(row) for row in rows)
+        return "match_org_traces", {"candidate_identities": identities}
+
+
+class _OrgTraceCursorFakeExecutor(_FakeExecutor):
+    def execute_ch_query(
+        self,
+        query: str,
+        params: dict[str, Any],
+        *,
+        timeout_ms: int,
+        settings: dict[str, Any],
+    ) -> QueryResult:
+        del timeout_ms, settings
+        self.calls.append((query, params))
+        identity = self.builder.bounded_filter_row_identity
+        order_token = self.builder.bounded_filter_row_order_token
+
+        def order(row: dict[str, Any]) -> tuple[Any, ...]:
+            return row["start_time"], order_token(row)
+
+        if query == "match_org_traces":
+            wanted = set(params["candidate_identities"])
+            rows = [row for row in self.builder.rows if identity(row) in wanted]
+        else:
+            rows = [
+                row
+                for row in self.builder.rows
+                if params["slice_start"] <= row["start_time"] < params["slice_end"]
+            ]
+            rows.sort(key=order, reverse=True)
+            if params["before_start_time"] is not None:
+                boundary = params["before_start_time"], params["before_id"]
                 rows = [row for row in rows if order(row) < boundary]
             rows = rows[: params["limit"]]
         return QueryResult(rows, len(rows), "clickhouse", 1.0)
@@ -2495,7 +3400,8 @@ def _complete_empty_page() -> BoundedFilterPage:
     )
 
 
-def test_voice_last_supported_numbered_page_reaches_bounded_reader() -> None:
+@override_settings(CLICKHOUSE_V2={"QUERY_TYPES_DISABLED": "VOICE_CALL_LIST"})
+def test_voice_list_uses_v2_builder_when_routing_is_disabled() -> None:
     from tracer.serializers.trace import TraceVoiceCallListResponseSerializer
     from tracer.views.trace import TraceView
 
@@ -2503,14 +3409,6 @@ def test_voice_last_supported_numbered_page_reaches_bounded_reader() -> None:
     analytics = mock.MagicMock()
 
     with (
-        mock.patch(
-            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-            return_value=VoiceCallListQueryBuilder,
-        ),
-        mock.patch(
-            "tracer.services.clickhouse.v2.query_service.query_service_for_builder",
-            return_value=analytics,
-        ) as query_service,
         mock.patch(
             "tracer.views.trace.get_project_eval_configs", return_value=([], [])
         ),
@@ -2525,7 +3423,7 @@ def test_voice_last_supported_numbered_page_reaches_bounded_reader() -> None:
             return_value=_complete_empty_page(),
         ) as bounded_reader,
     ):
-        response = view._list_voice_calls_clickhouse(
+        legacy_response = view._list_voice_calls_clickhouse(
             SimpleNamespace(),
             project_id=PROJECT_ID,
             validated_data={
@@ -2536,14 +3434,28 @@ def test_voice_last_supported_numbered_page_reaches_bounded_reader() -> None:
             remove_simulation_calls=False,
             analytics=analytics,
         )
+        response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [_time_filter()],
+                "page": 71,
+                "page_size": 30,
+                "allow_sampled": True,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
 
+    assert legacy_response.status_code == 503
     assert response.status_code == 200
     assert response.data["current_page"] == 71
     response_serializer = TraceVoiceCallListResponseSerializer(data=response.data)
     assert response_serializer.is_valid(), response_serializer.errors
-    query_service.assert_called_once_with(
-        "VOICE_CALL_LIST", VoiceCallListQueryBuilder, analytics
+    assert isinstance(
+        bounded_reader.call_args.kwargs["builder"], VoiceCallListQueryBuilderV2
     )
+    assert bounded_reader.call_args.kwargs["analytics"] is analytics
     assert bounded_reader.call_args.kwargs["page_number"] == 70
     assert bounded_reader.call_args.kwargs["page_size"] == 30
 
@@ -2558,13 +3470,6 @@ def test_voice_first_unsupported_numbered_page_is_typed_422_before_ch() -> None:
     analytics = mock.MagicMock()
 
     with (
-        mock.patch(
-            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-            return_value=VoiceCallListQueryBuilder,
-        ),
-        mock.patch(
-            "tracer.services.clickhouse.v2.query_service.query_service_for_builder"
-        ) as query_service,
         mock.patch("tracer.views.trace.get_project_eval_configs") as eval_configs,
         mock.patch(
             "tracer.views.trace.get_annotation_labels_for_project"
@@ -2591,7 +3496,6 @@ def test_voice_first_unsupported_numbered_page_is_typed_422_before_ch() -> None:
         PAGE_DEPTH_EXCEEDED_MESSAGE,
         code="page_depth_exceeded",
     )
-    query_service.assert_not_called()
     eval_configs.assert_not_called()
     annotation_labels.assert_not_called()
     bounded_reader.assert_not_called()
@@ -2993,6 +3897,67 @@ def test_graph_only_incomplete_rows_do_not_change_exact_list_default() -> None:
         )
 
 
+def test_graph_stratum_anchor_classifies_one_finite_sentinel_without_ordered_seed():
+    rows = _rows(1, 2, 3)
+    builder = _AnchorFakeBuilder(rows, seed_proves_order=False)
+    executor = _AnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        max_seed_attempts=1,
+        max_candidates=3,
+        max_query_count=2,
+        classify_batch_size=3,
+        include_incomplete_rows=True,
+        anchor_probe_only=True,
+        anchor_probe_limit=3,
+    )
+
+    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert page.complete is False
+    assert page.has_more is True
+    assert page.error_code == "sample_limit"
+    assert [query for query, _ in executor.calls] == ["anchor", "match"]
+    assert executor.calls[0][1]["limit"] == 3
+
+
+def test_lower_anchor_limit_is_opt_in_and_keeps_list_sentinel_unchanged() -> None:
+    rows = _rows(1, 2)
+    builder = _AnchorFakeBuilder(rows, seed_proves_order=False)
+    executor = _AnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert executor.calls[0] == ("anchor", {"limit": 513})
+
+    with pytest.raises(ValueError, match="requires anchor_probe_only"):
+        read_bounded_filter_page(
+            builder=builder,
+            analytics=_AnchorFakeExecutor(builder),
+            filters=[_time_filter()],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            anchor_probe_limit=3,
+        )
+
+
 def test_bounded_reader_keeps_page_zero_and_page_n_disjoint() -> None:
     rows = _rows(1, 2, 3, 4, 5, 6, 7)
     builder = _FakeBuilder(rows)
@@ -3058,6 +4023,90 @@ def test_cursor_keyset_handles_equal_timestamps_without_duplicates_or_skips() ->
         row["id"] for row in second.rows
     )
     assert second.has_more is False
+
+
+def test_org_trace_page_keeps_same_trace_id_from_both_projects() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    timestamp = END - timedelta(minutes=1)
+    rows = [
+        {
+            "project_id": project_id,
+            "trace_id": trace_id,
+            "id": root_id,
+            "start_time": timestamp,
+        }
+        for project_id, trace_id, root_id in (
+            (project_b, "shared-trace", "root-b"),
+            (PROJECT_ID, "shared-trace", "root-a"),
+            (PROJECT_ID, "earlier-trace", "root-c"),
+        )
+    ]
+    builder = _OrgTraceCursorFakeBuilder(rows, key_field="trace_id")
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=_OrgTraceCursorFakeExecutor(builder),
+        filters=[_time_filter()],
+        key_field="trace_id",
+        page_number=0,
+        page_size=2,
+    )
+
+    assert [(row["project_id"], row["trace_id"]) for row in page.rows] == [
+        (project_b, "shared-trace"),
+        (PROJECT_ID, "shared-trace"),
+    ]
+    assert page.has_more is True
+
+
+def test_org_trace_cursor_continues_across_project_collision_without_skip() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    timestamp = END - timedelta(minutes=1)
+    rows = [
+        {
+            "project_id": project_id,
+            "trace_id": trace_id,
+            "id": root_id,
+            "start_time": timestamp,
+        }
+        for project_id, trace_id, root_id in (
+            (project_b, "shared-trace", "root-b"),
+            (PROJECT_ID, "shared-trace", "root-a"),
+            (PROJECT_ID, "earlier-trace", "root-c"),
+        )
+    ]
+    builder = _OrgTraceCursorFakeBuilder(rows, key_field="trace_id")
+
+    pages = []
+    cursor_order_token = None
+    for _ in range(3):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=_OrgTraceCursorFakeExecutor(builder),
+            filters=[_time_filter()],
+            key_field="trace_id",
+            page_number=0,
+            page_size=1,
+            cursor_start_time=(timestamp if cursor_order_token is not None else None),
+            cursor_order_token=cursor_order_token,
+        )
+        pages.append(page)
+        last_row = page.rows[-1]
+        cursor_order_token = (
+            str(last_row["trace_id"]),
+            str(last_row["project_id"]),
+        )
+
+    identities = [
+        (page.rows[0]["project_id"], page.rows[0]["trace_id"]) for page in pages
+    ]
+    assert identities == [
+        (project_b, "shared-trace"),
+        (PROJECT_ID, "shared-trace"),
+        (PROJECT_ID, "earlier-trace"),
+    ]
+    assert len(set(identities)) == 3
+    assert [page.has_more for page in pages] == [True, True, False]
 
 
 def test_cursor_keyset_preserves_same_identity_rows_one_microsecond_apart() -> None:

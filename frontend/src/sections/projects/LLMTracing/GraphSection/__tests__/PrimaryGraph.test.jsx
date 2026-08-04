@@ -87,6 +87,7 @@ describe("PrimaryGraph", () => {
       expect.objectContaining({
         project_id: "project-override",
       }),
+      { params: { allow_sampled: true } },
     );
   });
 
@@ -105,6 +106,7 @@ describe("PrimaryGraph", () => {
       expect.objectContaining({
         project_id: "project-override",
       }),
+      { params: { allow_sampled: true } },
     );
   });
 

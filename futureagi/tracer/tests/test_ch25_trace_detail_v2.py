@@ -32,6 +32,7 @@ from tracer.services.clickhouse.v2.query_builders.trace_detail import (
 from tracer.services.clickhouse.v2.trace_detail_reads import (
     TraceDetailNotFound,
     TraceDetailRead,
+    TraceDetailReadBuilder,
     TraceDetailReadUnavailable,
     read_span_detail,
     read_trace_detail,
@@ -49,6 +50,24 @@ except Exception:  # pragma: no cover - import shape guard
 class _FakeResult:
     def __init__(self, data):
         self.data = data
+
+
+@pytest.mark.unit
+@override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger")
+def test_trace_detail_eval_query_uses_authoritative_legacy_named_table():
+    builder = TraceDetailReadBuilder(project_ids=["P1"], trace_id="T1")
+
+    query, _params = builder.build_eval_query(
+        project_id="P1",
+        span_ids=["S1"],
+        eval_config_ids=["11111111-1111-4111-8111-111111111111"],
+    )
+
+    assert "FROM tracer_eval_logger" in query
+    assert "FROM tracer_eval_logger_v2" not in query
+    assert "argMax(status, _peerdb_version)" in query
+    assert "argMax(tuple(skipped_reason), _peerdb_version)" in query
+    assert "argMax(_peerdb_is_deleted, _peerdb_version)" in query
 
 
 class _FakeAnalytics:
@@ -196,8 +215,8 @@ def _patch_v2_pg(
     )
     stack.enter_context(
         patch(
-            "tracer.services.clickhouse.eval_logger_table.eval_logger_source",
-            lambda: ("tracer_eval_logger_v2", "is_deleted = 0"),
+            "tracer.services.clickhouse.v2.trace_detail_reads.eval_logger_source",
+            lambda *args, **kwargs: ("tracer_eval_logger_v2", "is_deleted = 0"),
         )
     )
     return config_mgr

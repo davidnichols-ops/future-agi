@@ -265,7 +265,7 @@ class TestEvalLoggerReaderAudit:
         )
 
         with patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+            "tracer.views.observation_span.V2AnalyticsQueryService"
         ) as analytics_cls:
             analytics_cls.return_value.get_eval_detail_ch.return_value = None
             response = auth_client.get(

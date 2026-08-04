@@ -64,7 +64,10 @@ def eval_logger_live_state_columns(table: str | None = None) -> tuple[str, ...]:
 
 
 def eval_logger_source(
-    alias: str = "", include_cdc_tombstone_guard: bool = False
+    alias: str = "",
+    include_cdc_tombstone_guard: bool = False,
+    *,
+    table: str | None = None,
 ) -> tuple[str, str]:
     """Return ``(table_name, not_deleted_predicate)`` for the configured table.
 
@@ -81,7 +84,7 @@ def eval_logger_source(
     need this guard to match the display queries. No-op on the v2 table (no CDC
     columns).
     """
-    table = _resolve_eval_logger_table()
+    table = _resolve_eval_logger_table(table)
     p = f"{alias}." if alias else ""
     if table.endswith("_v2"):
         # v2: single is_deleted marker, no peerdb CDC columns.

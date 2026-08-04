@@ -218,6 +218,7 @@ def read_bounded_filter_page(
     cursor_order_token: Any = None,
     read_settings: dict[str, Any] | None = None,
     anchor_probe_only: bool = False,
+    anchor_probe_limit: int | None = None,
 ) -> BoundedFilterPage:
     """Return one exact numbered page or an explicit sanitized degradation.
 
@@ -230,6 +231,11 @@ def read_bounded_filter_page(
     ``anchor_probe_only`` stops after a selective-anchor sentinel instead of
     entering the ordered seed loop; it is reserved for callers that provide a
     separate bounded fallback for non-sparse values.
+    ``anchor_probe_limit`` lowers that sentinel for a caller whose surrounding
+    protocol already partitions the complete request window.  It is graph-only
+    in practice: numbered pages retain the 513-row sparse/common proof, while a
+    graph stratum can classify its visible rows plus one finite sentinel without
+    sorting the stratum's full match set.
     """
 
     if page_number < 0 or page_size <= 0 or deadline_ms <= 0:
@@ -244,6 +250,13 @@ def read_bounded_filter_page(
         raise ValueError("max_seed_attempts exceeds the bounded read contract")
     if not 1 <= max_candidates <= _ABSOLUTE_MAX_CANDIDATES:
         raise ValueError("max_candidates exceeds the bounded read contract")
+    if anchor_probe_limit is not None:
+        if not anchor_probe_only:
+            raise ValueError("anchor_probe_limit requires anchor_probe_only")
+        if not 2 <= anchor_probe_limit <= max_candidates:
+            raise ValueError("anchor_probe_limit exceeds max_candidates")
+        if page_size >= anchor_probe_limit:
+            raise ValueError("anchor_probe_limit must include a page sentinel")
     if max_query_count is None:
         max_query_count = min(max_seed_attempts * 2, _ABSOLUTE_MAX_QUERIES)
     if not 1 <= max_query_count <= _ABSOLUTE_MAX_QUERIES:
@@ -540,7 +553,10 @@ def read_bounded_filter_page(
         ordered_seed_builder = getattr(builder, "build_filter_ordered_seed_page", None)
         use_seed_loop = True
         seed_page_builder = builder.build_filter_seed_page
-        anchor_limit = min(_SELECTIVE_ANCHOR_SENTINEL, max_candidates + 1)
+        anchor_limit = anchor_probe_limit or min(
+            _SELECTIVE_ANCHOR_SENTINEL,
+            max_candidates + 1,
+        )
         if cursor_key is not None:
             # Continuations must start from the signed *result* tuple. Trace
             # any-span seeds are ordered by the matching physical child, not
@@ -550,7 +566,10 @@ def read_bounded_filter_page(
                 seed_page_builder = ordered_seed_builder
                 seed_proves_result_order = True
         elif (
-            anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
+            (
+                anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
+                or anchor_probe_limit is not None
+            )
             and callable(anchor_builder)
             and callable(anchor_support)
             and bool(anchor_support())
@@ -577,9 +596,17 @@ def read_bounded_filter_page(
                     use_seed_loop = False
                 elif anchor_probe_only:
                     # The sentinel proves only that this value is not sparse.
-                    # Do not spend the graph's remaining wall budget on an
-                    # ordered prefix here; its full-window distributed fallback
-                    # is responsible for deterministic incomplete coverage.
+                    # A partitioned graph probe classifies only this finite
+                    # sentinel set and exposes at most the requested page.  It
+                    # never falls into the ORDER BY seed loop; the surrounding
+                    # stratum protocol supplies bounded temporal coverage and
+                    # retains explicit sampled metadata.
+                    if anchor_probe_limit is not None:
+                        classify_seed_rows(
+                            anchor_rows,
+                            active_start=request_start,
+                            active_end=request_end,
+                        )
                     degraded_error_code = "sample_limit"
                     use_seed_loop = False
                 else:

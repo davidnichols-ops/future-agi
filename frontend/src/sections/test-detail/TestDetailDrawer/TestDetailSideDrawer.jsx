@@ -251,6 +251,7 @@ const TestDetailSideDrawerChild = ({
         axios.get(endpoint, {
           params: {
             page: pageNum,
+            ...(urlModule === "project" && { allow_sampled: true }),
             // simulate endpoints use "limit", observe/agent use "page_size"
             ...(urlModule === "simulate" && urlOrigin !== "agent-definition"
               ? { limit: standardPageLimit || 30 }
@@ -484,9 +485,7 @@ const TestDetailSideDrawerChild = ({
           we don't render two drawers. */}
       <ShowComponent
         condition={
-          isFetching !== "initial" &&
-          urlModule === "simulate" &&
-          isChatSim
+          isFetching !== "initial" && urlModule === "simulate" && isChatSim
         }
       >
         <ChatDetailDrawerV2

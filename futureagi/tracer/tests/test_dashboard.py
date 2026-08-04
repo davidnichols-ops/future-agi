@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 from urllib.parse import urlencode
 
 import pytest
-from clickhouse_driver.errors import ServerException
+from clickhouse_driver.errors import NetworkError, ServerException
 
 from accounts.models.workspace import Workspace
 from model_hub.models.ai_model import AIModel
@@ -102,14 +102,14 @@ def _get_metrics_with_annotation_labels(auth_client, project_id, label_ids):
         ),
         patch("tracer.services.dashboard_metrics_catalog.cache.set"),
         patch(
-            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-            return_value=source_class,
-        ) as get_builder_class,
+            "tracer.services.dashboard_metrics_catalog.AnnotationLabelScoresProjectPG",
+            source_class,
+        ) as direct_source_class,
     ):
         response = auth_client.get(
             f"/tracer/dashboard/metrics/?project_ids={project_id}"
         )
-    get_builder_class.assert_called_once_with("ANNOTATION_LABELS")
+    direct_source_class.assert_called_once_with()
     source.label_ids_for_project.assert_called_once_with(str(project_id))
     return response
 
@@ -648,6 +648,41 @@ class TestMetricsEndpoint:
         assert "latency_ms" not in metric_names
 
     @pytest.mark.django_db
+    def test_metrics_keeps_configured_evals_when_direct_usage_read_times_out(
+        self,
+        auth_client,
+        observe_project,
+        custom_eval_config,
+    ):
+        custom_eval_config.project = observe_project
+        custom_eval_config.save(update_fields=["project"])
+        analytics = MagicMock()
+        analytics.get_span_attribute_keys_ch_for_projects.return_value = []
+        analytics.get_eval_config_ids_for_candidates_ch.side_effect = RuntimeError(
+            "private ClickHouse timeout detail"
+        )
+
+        with (
+            patch(
+                "tracer.services.dashboard_metrics_catalog.cache.get",
+                return_value=None,
+            ),
+            patch("tracer.services.dashboard_metrics_catalog.cache.set"),
+            patch(
+                "tracer.services.dashboard_metrics_catalog.V2AnalyticsQueryService",
+                return_value=analytics,
+            ),
+        ):
+            response = auth_client.get(
+                f"/tracer/dashboard/metrics/?project_ids={observe_project.id}"
+            )
+
+        assert response.status_code == 200
+        metric_names = {item["name"] for item in response.json()["result"]["metrics"]}
+        assert str(custom_eval_config.eval_template_id) in metric_names
+        assert "private ClickHouse timeout detail" not in str(response.json())
+
+    @pytest.mark.django_db
     def test_metrics_returns_agent_scoped_simulation_eval_metrics(
         self, auth_client, organization, workspace
     ):
@@ -742,15 +777,10 @@ class TestMetricsEndpoint:
         assert str(label.id) in metric_names
 
     @pytest.mark.django_db
-    @patch(
-        "tracer.services.dashboard_metrics_catalog.is_clickhouse_enabled",
-        return_value=False,
-    )
-    @patch("tracer.services.dashboard_metrics_catalog.AnalyticsQueryService")
+    @patch("tracer.services.dashboard_metrics_catalog.V2AnalyticsQueryService")
     def test_metrics_suppresses_customer_attribute_aliases_when_canonical_metric_exists(
         self,
         mock_analytics_cls,
-        _mock_clickhouse_enabled,
         auth_client,
         observe_project,
     ):
@@ -774,15 +804,10 @@ class TestMetricsEndpoint:
         assert "freeform.attr" in metric_names
 
     @pytest.mark.django_db
-    @patch(
-        "tracer.services.dashboard_metrics_catalog.is_clickhouse_enabled",
-        return_value=False,
-    )
-    @patch("tracer.services.dashboard_metrics_catalog.AnalyticsQueryService")
+    @patch("tracer.services.dashboard_metrics_catalog.V2AnalyticsQueryService")
     def test_metrics_exposes_agent_talk_percentage_for_simulator_project(
         self,
         mock_analytics_cls,
-        _mock_clickhouse_enabled,
         auth_client,
         organization,
         workspace,
@@ -822,15 +847,10 @@ class TestMetricsEndpoint:
         assert entry["type"] == "number"
 
     @pytest.mark.django_db
-    @patch(
-        "tracer.services.dashboard_metrics_catalog.is_clickhouse_enabled",
-        return_value=False,
-    )
-    @patch("tracer.services.dashboard_metrics_catalog.AnalyticsQueryService")
+    @patch("tracer.services.dashboard_metrics_catalog.V2AnalyticsQueryService")
     def test_metrics_hides_agent_talk_percentage_for_non_simulator_project(
         self,
         mock_analytics_cls,
-        _mock_clickhouse_enabled,
         auth_client,
         observe_project,
     ):
@@ -848,15 +868,10 @@ class TestMetricsEndpoint:
         assert "agent_talk_percentage" not in metric_names
 
     @pytest.mark.django_db
-    @patch(
-        "tracer.services.dashboard_metrics_catalog.is_clickhouse_enabled",
-        return_value=False,
-    )
-    @patch("tracer.services.dashboard_metrics_catalog.AnalyticsQueryService")
+    @patch("tracer.services.dashboard_metrics_catalog.V2AnalyticsQueryService")
     def test_metrics_hides_agent_talk_percentage_when_mixed_sources(
         self,
         mock_analytics_cls,
-        _mock_clickhouse_enabled,
         auth_client,
         organization,
         workspace,
@@ -1383,17 +1398,84 @@ class TestMetricsEndpoint:
         assert response.json()["result"]["values"] == []
         mock_selector_cls.return_value.read_values.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("values", "error_code"),
+        [
+            ((), "read_budget_exceeded"),
+            (("partial-value",), "read_budget_exceeded"),
+            ((), "sample_limit"),
+        ],
+        ids=["empty-budget", "partial-budget", "empty-sample"],
+    )
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_custom_attribute_incomplete_read_is_sanitized_503(
+        self,
+        mock_selector_cls,
+        values,
+        error_code,
+        auth_client,
+        observe_project,
+    ):
+        mock_selector_cls.return_value.read_values.return_value = _attribute_value_read(
+            values,
+            complete=False,
+            error_code=error_code,
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=prompt_slug&metric_type=custom_attribute"
+            f"&project_ids={observe_project.id}&source=traces"
+        )
+
+        assert response.status_code == 503
+        payload = json.dumps(response.json())
+        assert "temporarily unavailable" in payload
+        assert response.json()["code"] == "service_unavailable"
+        assert "partial-value" not in payload
+        assert error_code not in payload
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_custom_attribute_nonempty_cap_is_labelled_sample(
+        self,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        mock_selector_cls.return_value.read_values.return_value = _attribute_value_read(
+            ("verified-value",),
+            complete=False,
+            error_code="sample_limit",
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=prompt_slug&metric_type=custom_attribute"
+            f"&project_ids={observe_project.id}&source=traces"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()["result"]
+        assert payload["values"] == [
+            {"value": "verified-value", "label": "verified-value"}
+        ]
+        assert payload["query_complete"] is False
+        assert payload["query_status"] == "sampled"
+        assert payload["query_error_code"] == "sample_limit"
+
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
     @patch("tracer.views.dashboard.AttributeReadSelector")
-    def test_filter_values_custom_attribute_query_defect_preserves_sanitized_400(
+    def test_filter_values_custom_attribute_query_defect_returns_sanitized_500(
         self,
         mock_selector_cls,
         _mock_ch_enabled,
         auth_client,
         observe_project,
     ):
-        """Query defects preserve sanitized 400, never an empty picker."""
+        """Query defects are server failures, never an empty picker or raw SQL."""
         mock_selector_cls.return_value.read_values.side_effect = ServerException(
             "private ClickHouse query detail", code=47
         )
@@ -1404,22 +1486,23 @@ class TestMetricsEndpoint:
             f"&project_ids={observe_project.id}&source=traces"
         )
 
-        assert response.status_code == 400
+        assert response.status_code == 500
         payload = json.dumps(response.json())
         assert "could not be loaded" in payload
+        assert response.json()["code"] == "server_error"
         assert "private ClickHouse" not in payload
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
     @patch("tracer.views.dashboard.AttributeReadSelector")
-    def test_filter_values_custom_attribute_programming_error_preserves_sanitized_400(
+    def test_filter_values_custom_attribute_programming_error_returns_sanitized_500(
         self,
         mock_selector_cls,
         _mock_ch_enabled,
         auth_client,
         observe_project,
     ):
-        """Programming defects preserve sanitized 400, never an empty picker."""
+        """Programming defects are sanitized server errors, not bad requests."""
         mock_selector_cls.return_value.read_values.side_effect = RuntimeError(
             "private attribute compiler invariant"
         )
@@ -1430,10 +1513,64 @@ class TestMetricsEndpoint:
             f"&project_ids={observe_project.id}&source=traces"
         )
 
-        assert response.status_code == 400
+        assert response.status_code == 500
         payload = json.dumps(response.json())
         assert "could not be loaded" in payload
+        assert response.json()["code"] == "server_error"
         assert "compiler invariant" not in payload
+
+    @pytest.mark.parametrize("code", [241, 386], ids=["memory", "heterogeneous"])
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_custom_attribute_resource_failure_is_sanitized_503(
+        self,
+        mock_selector_cls,
+        _mock_ch_enabled,
+        code,
+        auth_client,
+        observe_project,
+    ):
+        mock_selector_cls.return_value.read_values.side_effect = ServerException(
+            "private attribute memory failure and SQL",
+            code=code,
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=prompt_slug&metric_type=custom_attribute"
+            f"&project_ids={observe_project.id}&source=traces"
+        )
+
+        assert response.status_code == 503
+        payload = json.dumps(response.json())
+        assert "temporarily unavailable" in payload
+        assert response.json()["code"] == "service_unavailable"
+        assert "private attribute" not in payload
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_serializer_validation_remains_sanitized_400(
+        self,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {
+                "metric_name": "prompt_slug",
+                "metric_type": "custom_attribute",
+                "project_ids": str(observe_project.id),
+                "source": "traces",
+                "search": "x" * 513,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "search" in json.dumps(response.json()).lower()
+        assert "traceback" not in json.dumps(response.json()).lower()
+        mock_selector_cls.assert_not_called()
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
@@ -1493,17 +1630,17 @@ class TestMetricsEndpoint:
         assert call.kwargs["settings"]["read_overflow_mode"] == "throw"
 
     @pytest.mark.django_db
-    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
+    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=False)
     @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-    def test_filter_values_system_metric_budget_is_explicit_degraded_not_empty_exact(
+    def test_filter_values_uses_direct_write_service_when_legacy_client_is_disabled(
         self,
         mock_analytics_cls,
-        _mock_ch_enabled,
+        mock_legacy_enabled,
         auth_client,
         observe_project,
     ):
-        mock_analytics_cls.return_value.execute_ch_query.side_effect = ServerException(
-            "DB::Exception private query and stack", 159
+        mock_analytics_cls.return_value.execute_ch_query.return_value = MagicMock(
+            data=[{"val": "gpt-4o"}]
         )
 
         response = auth_client.get(
@@ -1513,14 +1650,73 @@ class TestMetricsEndpoint:
         )
 
         assert response.status_code == 200
-        payload = response.json()["result"]
-        assert payload == {
-            "values": [],
-            "query_complete": False,
-            "query_status": "degraded",
-            "query_error_code": "read_budget_exceeded",
-        }
-        assert "private query" not in json.dumps(response.json())
+        assert response.json()["result"]["values"] == [
+            {"value": "gpt-4o", "label": "gpt-4o"}
+        ]
+        mock_analytics_cls.assert_called_once_with()
+        mock_legacy_enabled.assert_not_called()
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
+    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
+    def test_filter_values_end_user_dimension_failure_is_sanitized_503(
+        self,
+        mock_analytics_cls,
+        _mock_ch_enabled,
+        auth_client,
+        observe_project,
+    ):
+        mock_analytics_cls.return_value.execute_ch_query.side_effect = NetworkError(
+            "private end-users ClickHouse host"
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=user_id&metric_type=system_metric"
+            f"&project_ids={observe_project.id}&source=traces"
+        )
+
+        assert response.status_code == 503
+        payload = json.dumps(response.json())
+        assert "temporarily unavailable" in payload
+        assert response.json()["code"] == "service_unavailable"
+        assert "private end-users" not in payload
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ServerException("private timeout query and stack", code=159),
+            ServerException("private memory query and stack", code=241),
+            ServerException("private byte-limit query and stack", code=307),
+            ServerException("private heterogeneous query and stack", code=386),
+            NetworkError("private dashboard ClickHouse host"),
+        ],
+        ids=["code-159", "code-241", "code-307", "code-386", "network"],
+    )
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
+    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
+    def test_filter_values_system_metric_unavailable_is_sanitized_503(
+        self,
+        mock_analytics_cls,
+        _mock_ch_enabled,
+        exc,
+        auth_client,
+        observe_project,
+    ):
+        mock_analytics_cls.return_value.execute_ch_query.side_effect = exc
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=model&metric_type=system_metric"
+            f"&project_ids={observe_project.id}&source=traces"
+        )
+
+        assert response.status_code == 503
+        payload = json.dumps(response.json())
+        assert "temporarily unavailable" in payload
+        assert response.json()["code"] == "service_unavailable"
+        assert "private" not in payload
         settings = mock_analytics_cls.return_value.execute_ch_query.call_args.kwargs[
             "settings"
         ]
@@ -1551,7 +1747,7 @@ class TestMetricsEndpoint:
         payload = response.json()["result"]
         assert len(payload["values"]) == 500
         assert payload["query_complete"] is False
-        assert payload["query_status"] == "degraded"
+        assert payload["query_status"] == "sampled"
         assert payload["query_error_code"] == "sample_limit"
 
     @pytest.mark.django_db
@@ -1635,7 +1831,7 @@ class TestChartsView:
             assert "fetch_graph" in response.json()["detail"]
 
     @pytest.mark.django_db
-    @patch("tracer.services.clickhouse.query_service.AnalyticsQueryService")
+    @patch("tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService")
     def test_fetch_eval_graph_rejects_config_from_another_project_before_ch(
         self,
         mock_analytics_cls,
@@ -1670,7 +1866,7 @@ class TestChartsView:
         mock_analytics_cls.assert_not_called()
 
     @pytest.mark.django_db
-    @patch("tracer.services.clickhouse.query_service.AnalyticsQueryService")
+    @patch("tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService")
     def test_fetch_eval_graph_does_not_fall_back_or_expose_ch_error(
         self,
         mock_analytics_cls,
@@ -1698,7 +1894,7 @@ class TestChartsView:
         )
 
         with patch(
-            "tracer.utils.graphs_optimized.EvalLogger.objects.filter"
+            "tracer.utils.graphs_optimized.ObservationSpan.objects.filter"
         ) as pg_filter:
             response = auth_client.get(f"/tracer/charts/fetch_graph/?{query}")
 
@@ -1737,6 +1933,39 @@ class TestChartsView:
         assert mock_system_metric_data.call_args.kwargs["system_metric_filters"] == {
             "project_id": str(observe_project.id)
         }
+
+    @pytest.mark.django_db
+    @patch("tracer.views.charts.get_system_metric_data")
+    def test_fetch_graph_requires_sample_opt_in(
+        self, mock_system_metric_data, auth_client, observe_project
+    ):
+        mock_system_metric_data.return_value = {
+            "metric_name": "latency",
+            "data": [{"timestamp": "2026-08-03T00:00:00Z", "value": 12}],
+            "query_complete": False,
+            "query_status": "sampled",
+            "query_error_code": "sample_limit",
+            "query_sampling_strategy": "time_stratified_latest_state",
+            "query_sampling_strata": 8,
+            "query_sampling_strata_completed": 8,
+        }
+        params = {
+            "project_id": str(observe_project.id),
+            "interval": "day",
+            "property": "average",
+            "req_data_config": json.dumps({"id": "latency", "type": "SYSTEM_METRIC"}),
+        }
+
+        legacy_response = auth_client.get(
+            f"/tracer/charts/fetch_graph/?{urlencode(params)}"
+        )
+        opted_in_response = auth_client.get(
+            f"/tracer/charts/fetch_graph/?{urlencode({**params, 'allow_sampled': 'true'})}"
+        )
+
+        assert legacy_response.status_code == 503
+        assert opted_in_response.status_code == 200
+        assert opted_in_response.json()["result"]["query_status"] == "sampled"
 
     @pytest.mark.django_db
     @pytest.mark.django_db
@@ -3219,7 +3448,7 @@ class TestSerializerValidation:
 
 class TestDashboardQueryExecution:
     @pytest.mark.django_db
-    @patch("tracer.views.dashboard.AnalyticsQueryService")
+    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
     def test_query_action(self, mock_analytics_cls, auth_client, observe_project):
         mock_service = MagicMock()
         mock_result = MagicMock()
@@ -3247,7 +3476,7 @@ class TestDashboardQueryExecution:
         assert response.status_code == 200
 
     @pytest.mark.django_db
-    @patch("tracer.views.dashboard.AnalyticsQueryService")
+    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
     def test_query_action_missing_project_ids_still_works(
         self, mock_analytics_cls, auth_client, observe_project
     ):
@@ -3775,12 +4004,22 @@ class TestDashboardQueryExecution:
     def test_filter_values_annotation_annotator_returns_project_annotators(
         self, auth_client, project, user, organization, workspace
     ):
-        from tracer.services.annotation_label_source import AnnotationLabelScoresCH
-
-        with patch.object(
+        from tracer.services.annotation_label_source import (
             AnnotationLabelScoresCH,
-            "annotator_ids_for_projects",
-            return_value=[str(user.id)],
+            AnnotationLabelScoresProjectPG,
+        )
+
+        with (
+            patch.object(
+                AnnotationLabelScoresProjectPG,
+                "annotator_ids_for_projects",
+                return_value=[str(user.id)],
+            ),
+            patch.object(
+                AnnotationLabelScoresCH,
+                "annotator_ids_for_projects",
+                side_effect=AssertionError("legacy ClickHouse score source used"),
+            ),
         ):
             response = auth_client.get(
                 "/tracer/dashboard/filter_values/",
@@ -3812,7 +4051,10 @@ class TestDashboardQueryExecution:
 
         from model_hub.models.choices import AnnotationTypeChoices
         from model_hub.models.develop_annotations import AnnotationsLabels
-        from tracer.services.annotation_label_source import AnnotationLabelScoresCH
+        from tracer.services.annotation_label_source import (
+            AnnotationLabelScoresCH,
+            AnnotationLabelScoresProjectPG,
+        )
 
         label = AnnotationsLabels.objects.create(
             name="Matrix",
@@ -3829,10 +4071,17 @@ class TestDashboardQueryExecution:
             },
         )
 
-        with patch.object(
-            AnnotationLabelScoresCH,
-            "categorical_values_for_label",
-            return_value=[json.dumps({"selected": ["matrix"]})],
+        with (
+            patch.object(
+                AnnotationLabelScoresProjectPG,
+                "categorical_values_for_label",
+                return_value=[json.dumps({"selected": ["matrix"]})],
+            ),
+            patch.object(
+                AnnotationLabelScoresCH,
+                "categorical_values_for_label",
+                side_effect=AssertionError("legacy ClickHouse score source used"),
+            ),
         ):
             response = auth_client.get(
                 "/tracer/dashboard/filter_values/",
@@ -3851,6 +4100,34 @@ class TestDashboardQueryExecution:
             {"value": "coverage", "label": "coverage"},
             {"value": "matrix", "label": "matrix"},
         ]
+
+    @pytest.mark.django_db
+    def test_filter_values_annotation_database_error_is_sanitized_503(
+        self, auth_client, project, organization, workspace
+    ):
+        from tracer.services.annotation_label_source import (
+            AnnotationLabelScoresProjectPG,
+            AnnotationScoreReadUnavailable,
+        )
+
+        raw = "private database host and query diagnostics"
+        with patch.object(
+            AnnotationLabelScoresProjectPG,
+            "annotator_ids_for_projects",
+            side_effect=AnnotationScoreReadUnavailable(raw),
+        ):
+            response = auth_client.get(
+                "/tracer/dashboard/filter_values/",
+                {
+                    "source": "traces",
+                    "metric_name": "annotator",
+                    "metric_type": "annotation_metric",
+                    "project_ids": str(project.id),
+                },
+            )
+
+        assert response.status_code == 503
+        assert raw not in str(response.json())
 
 
 class TestAnnotationLabelScoresCH:

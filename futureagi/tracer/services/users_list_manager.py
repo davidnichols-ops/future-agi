@@ -16,7 +16,6 @@ from typing import Any
 
 import structlog
 
-from tracer.services.clickhouse.query_service import AnalyticsQueryService
 from tracer.services.clickhouse.read_budget import (
     ReadDeadline,
     ReadDeadlineExceeded,
@@ -26,6 +25,7 @@ from tracer.services.clickhouse.read_budget import (
 from tracer.services.clickhouse.v2.query_builders.user_list import (
     UserListQueryBuilderV2,
 )
+from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 
 logger = structlog.get_logger(__name__)
 
@@ -243,7 +243,7 @@ class UsersListManager:
         deadline: ReadDeadline,
         max_rows: int | None = None,
     ) -> tuple[list[dict], int, UserListQueryBuilderV2]:
-        analytics = AnalyticsQueryService()
+        analytics = V2AnalyticsQueryService()
         builder = UserListQueryBuilderV2(
             organization_id=self.organization_id,
             project_ids=self.scoped_project_ids,
@@ -293,7 +293,7 @@ class UsersListManager:
         query, params = builder.build_page_metrics_query(
             [str(value) for value in end_user_ids]
         )
-        analytics = AnalyticsQueryService()
+        analytics = V2AnalyticsQueryService()
         result = analytics.execute_ch_query(
             query,
             params,
@@ -328,7 +328,7 @@ class UsersListManager:
         end_user_ids = [r.get("end_user_id") for r in rows if r.get("end_user_id")]
         if not end_user_ids:
             return {}
-        analytics = AnalyticsQueryService()
+        analytics = V2AnalyticsQueryService()
         attr_query, attr_params = _users_attr_enrichment_query(
             project_id=self.project_id,
             project_ids=self.scoped_project_ids,
@@ -413,7 +413,7 @@ class UsersListManager:
         )
         if not eval_query:
             return {}
-        analytics = AnalyticsQueryService()
+        analytics = V2AnalyticsQueryService()
         eval_result = analytics.execute_ch_query(
             eval_query,
             eval_params,

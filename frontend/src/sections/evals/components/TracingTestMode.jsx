@@ -221,6 +221,7 @@ export const buildTracingPreviewListParams = ({
   effectiveFilters,
 }) => ({
   project_id: selectedProjectId,
+  allow_sampled: true,
   page_number: 0,
   page_size: 50,
   filters: JSON.stringify(effectiveFilters || []),
@@ -489,6 +490,7 @@ const TracingTestMode = React.forwardRef(
             const { data } = await axios.get(endpoints.project.getCallLogs, {
               params: {
                 project_id: selectedProjectId,
+                allow_sampled: true,
                 page: 1,
                 page_size: 50,
                 filters: JSON.stringify(effectiveFilters || []),

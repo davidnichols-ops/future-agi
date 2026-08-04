@@ -171,8 +171,8 @@ def test_mutable_map_and_json_filter_statements_keep_final_skip_indexes_off():
 
 # ---------------------------------------------------------------------------
 # Eval-logger table routing: the Phase-2 score query (build_eval_query) is
-# excluded from the v2 rewrite, so it must follow CH25_EVAL_LOGGER_TABLE on its
-# own — else a v2 deployment 500s on the dropped legacy tracer_eval_logger.
+# excluded from the span-column rewrite, so it follows the independently
+# configured eval table while the main span query remains on CH25.
 # (Discovery-query routing is covered in test_eval_config_ids_resolution.py.)
 # ---------------------------------------------------------------------------
 
@@ -194,18 +194,20 @@ def test_build_eval_query_routes_to_v2_table():
 
 
 @override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger")
-def test_build_eval_query_keeps_legacy_table_and_predicate():
+def test_build_eval_query_uses_authoritative_legacy_named_table():
     sql, _ = _make_builder(eval_config_ids=[EVAL_CONFIG_ID]).build_eval_query(
         span_ids=["sp1", "sp2"]
     )
-    assert "tracer_eval_logger" in sql
+    assert "FROM tracer_eval_logger\n" in sql
     assert "tracer_eval_logger FINAL" not in sql
     assert "LIMIT 1 BY id" in sql
-    assert "tracer_eval_logger_v2" not in sql
+    assert "ORDER BY _peerdb_version DESC" in sql
     assert "_peerdb_is_deleted AS latest_state_0" in sql
     assert "deleted AS latest_state_1" in sql
     assert "latest_state_0 = 0" in sql
-    assert "latest_state_1 = 0 OR latest_state_1 IS NULL" in sql
+    assert "(latest_state_1 = 0 OR latest_state_1 IS NULL)" in sql
+    assert "status," in sql
+    assert "skipped_reason," in sql
 
 
 # ── perf-fix shapes: tiebreak, progressive slices, created_at bounds ─────────

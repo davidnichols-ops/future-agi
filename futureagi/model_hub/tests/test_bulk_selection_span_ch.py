@@ -39,7 +39,7 @@ def _install_fake_builder(
     error_code=None,
     supports=True,
 ):
-    """Patch SPAN_LIST dispatch + AnalyticsQueryService so
+    """Patch the explicit V2 span builder/service so
     ``_resolve_span_ids_clickhouse`` runs against a fake CH returning ``rows``.
     ``capture`` records the filters / limit the builder saw."""
 
@@ -72,15 +72,15 @@ def _install_fake_builder(
         )
 
     monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-        lambda name: _FakeBuilder,
+        "tracer.services.clickhouse.v2.query_builders.span_list.SpanListQueryBuilderV2",
+        _FakeBuilder,
     )
     monkeypatch.setattr(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
         _fake_bounded_read,
     )
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
         _FakeAnalytics,
     )
 
@@ -294,8 +294,12 @@ def test_ch_query_failure_propagates(monkeypatch):
             return None
 
     monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-        lambda name: _Builder,
+        "tracer.services.clickhouse.v2.query_builders.span_list.SpanListQueryBuilderV2",
+        _Builder,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        lambda: object(),
     )
     monkeypatch.setattr(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page",

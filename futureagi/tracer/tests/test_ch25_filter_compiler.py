@@ -197,6 +197,18 @@ class TestRewriteV1SqlToV2:
         v2 = "SELECT attributes_extra AS span_attributes_raw FROM spans"
         assert rewrite_v1_sql_to_v2(v1) == v2
 
+    def test_argmax_tuple_json_projection_keeps_alias_outside_aggregate(self):
+        v1 = (
+            "argMax(tuple(span_attributes_raw), _peerdb_version).1 "
+            "AS latest_span_attributes_raw"
+        )
+        v2 = rewrite_v1_sql_to_v2(v1)
+
+        assert v2 == (
+            "argMax(tuple(attributes_extra), _version).1 AS latest_span_attributes_raw"
+        )
+        assert "attributes_extra AS span_attributes_raw" not in v2
+
     def test_bare_select_list_rewrite_is_not_idempotent(self):
         # Re-running re-wraps the alias. This is WHY the v2 filter builder may
         # only double-rewrite WHERE/ORDER fragments (which never carry a bare

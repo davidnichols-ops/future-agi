@@ -165,6 +165,14 @@ class TraceListQuerySerializer(StrictInputSerializer):
     page_size = serializers.IntegerField(
         required=False, default=30, min_value=1, max_value=500
     )
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Explicitly opt in to lower-bound list totals. Clients that set "
+            "this must not present the count as an exact total."
+        ),
+    )
 
 
 class TraceObserveListQuerySerializer(StrictInputSerializer):
@@ -185,6 +193,14 @@ class TraceObserveListQuerySerializer(StrictInputSerializer):
         required=False, allow_blank=False, max_length=4096, help_text=CURSOR_HELP_TEXT
     )
     cursor_mode = serializers.BooleanField(required=False, default=False)
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Explicitly opt in to lower-bound list totals. Clients that set "
+            "this must not present the count as an exact total."
+        ),
+    )
     interval = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):
@@ -268,6 +284,14 @@ class TraceVoiceCallListQuerySerializer(TraceExportQuerySerializer):
         required=False, default=30, min_value=1, max_value=500
     )
     remove_simulation_calls = serializers.BooleanField(required=False, default=False)
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Explicitly opt in to lower-bound list totals. Clients that set "
+            "this must not present the count as an exact total."
+        ),
+    )
 
 
 class TraceVoiceCallListResponseSerializer(serializers.Serializer):

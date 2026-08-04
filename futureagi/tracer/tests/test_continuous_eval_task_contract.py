@@ -445,8 +445,15 @@ def test_full_state_classifier_still_honors_explicit_task_time_filter() -> None:
 
     assert "candidate_start_date" in params
     assert "candidate_end_date" in params
-    assert "latest_start_time >= %(candidate_start_date)s" in sql
-    assert "latest_start_time < %(candidate_end_date)s" in sql
+    assert "candidate_start_date_us" in params
+    assert "candidate_end_date_us" in params
+    assert (
+        "latest_start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)"
+        in sql
+    )
+    assert (
+        "latest_start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)" in sql
+    )
 
 
 @pytest.mark.unit
@@ -588,6 +595,52 @@ def test_eval_trigger_pages_unrelated_tenants_without_global_future_sets() -> No
     span_queries = [sql for sql in observed_sql if "FROM spans" in sql]
     assert span_queries
     assert all("project_id = toUUID(%(project_id)s)" in sql for sql in span_queries)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("configured_table", ["legacy", "unset"])
+def test_changed_eval_refs_follow_authoritative_legacy_table(
+    settings, configured_table
+) -> None:
+    if configured_table == "legacy":
+        settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
+    else:
+        del settings.CH25_EVAL_LOGGER_TABLE
+
+    observed: dict[str, object] = {}
+
+    class Analytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            observed["query"] = query
+            observed["params"] = params
+            return _FakeQueryResult([])
+
+    floor = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+    ceiling = floor + timedelta(minutes=5)
+    budget = continuous_candidates._ReadBudget(
+        continuous_candidates.time.monotonic() + 5
+    )
+
+    affected = continuous_candidates._read_changed_eval_refs(
+        Analytics(),
+        project_id=str(uuid.uuid4()),
+        floor=floor,
+        ceiling=ceiling,
+        budget=budget,
+    )
+
+    assert affected == []
+    query = str(observed["query"])
+    assert "FROM tracer_eval_logger\n" in query
+    assert "FROM tracer_eval_logger_v2" not in query
+    assert "status" not in query
+    assert "skipped_reason" not in query
+    assert "config_hash" not in query
+    assert "attempts" not in query
+    assert "_peerdb_synced_at >= %(arrival_floor)s" in query
+    assert "_peerdb_synced_at < %(arrival_ceiling)s" in query
+    assert observed["params"]["arrival_floor"] == floor
+    assert observed["params"]["arrival_ceiling"] == ceiling
 
 
 @pytest.mark.unit

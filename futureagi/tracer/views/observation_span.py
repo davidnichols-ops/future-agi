@@ -72,6 +72,7 @@ from tracer.selectors.trace_filter_reads import (
     numbered_page_depth_exceeded,
 )
 from tracer.serializers.filters import (
+    ObserveGraphDataQuerySerializer,
     ObserveGraphDataRequestSerializer,
     ObserveGraphDataResponseSerializer,
     PageDepthExceededErrorSerializer,
@@ -94,15 +95,18 @@ from tracer.serializers.trace import TraceObserveListResponseSerializer, TraceSe
 from tracer.services.clickhouse.attribute_reads import (
     AttributeReadMetadata,
     AttributeReadSelector,
+    IncompleteLatestStateReplay,
+    InvalidAttributeKey,
+    InvalidAttributeSearch,
     merge_read_metadata,
 )
 from tracer.services.clickhouse.bounded_graph_reads import BoundedGraphReadError
 from tracer.services.clickhouse.graph_dispatch import (
-    degraded_graph_response,
     enforce_exact_graph_data_contract,
     fetch_annotation_graph_ch,
     fetch_eval_graph_ch,
     fetch_system_metric_graph_ch,
+    graph_payload_is_publishable,
 )
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
@@ -116,12 +120,19 @@ from tracer.services.clickhouse.list_cursor import (
     snapshot_read_settings,
 )
 from tracer.services.clickhouse.page_dedup import paginate_deduped
+from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
 from tracer.services.clickhouse.read_budget import (
     ReadDeadline,
     ReadDeadlineExceeded,
+    is_clickhouse_api_read_unavailable_error,
     is_clickhouse_query_error,
     is_read_budget_error,
+)
+from tracer.services.clickhouse.v2.query_builders.span_list import (
+    SpanListQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.services.clickhouse.v2.span_selectors import (
@@ -1275,18 +1286,13 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 project__organization=_get_request_organization(request),
             )
 
-            # ClickHouse dispatch
-            from tracer.services.clickhouse.query_service import (
-                AnalyticsQueryService,
-            )
-
-            # CH-only path post-migration. D-027: the previous PG fallback
+            # Direct-write CH25-only path post-migration. D-027: the previous PG fallback
             # (huge ObservationSpan.objects.filter + per-config metric
             # annotations + Score subqueries + Python pivot, ~270 LOC)
             # was deleted. CH is the authoritative span + eval store; the
             # eval/annotation pivots live in `_list_spans_non_observe_clickhouse`
-            # via SpanListQueryBuilder.
-            analytics = AnalyticsQueryService()
+            # via SpanListQueryBuilderV2. Legacy routing is not a fallback.
+            analytics = V2AnalyticsQueryService()
             return self._list_spans_non_observe_clickhouse(
                 request,
                 project_version_id,
@@ -1297,6 +1303,8 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         except ProjectVersion.DoesNotExist:
             return self._gm.bad_request("Project version not found")
+        except UnsupportedFilterShapeError:
+            return self._gm.bad_request("Span filter configuration is invalid")
         except Exception as exc:
             if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
                 logger.warning(
@@ -1587,20 +1595,15 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         }
                     )
 
-            # ClickHouse dispatch
-            from tracer.services.clickhouse.query_service import (
-                AnalyticsQueryService,
-            )
-
-            # CH-only path post-migration. D-027: the previous PG fallback
+            # Direct-write CH25-only path post-migration. D-027: the previous PG fallback
             # body (ObservationSpan.objects.filter + per-config metric
             # annotations + Score subqueries + Python pivot, ~350 LOC) was
             # deleted. CH is the authoritative span + eval store and the
             # pivot now lives in `_list_spans_clickhouse` via
-            # SpanListQueryBuilder. A CH read failure surfaces via the outer
+            # SpanListQueryBuilderV2. A CH read failure surfaces via the outer
             # handler instead of silently degrading to the empty post-migration
             # Postgres path, which masked CH failures as "0 rows".
-            analytics = AnalyticsQueryService()
+            analytics = V2AnalyticsQueryService()
             return self._list_spans_clickhouse(
                 request,
                 project_id,
@@ -1614,8 +1617,10 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.custom_error_response(
                 status.HTTP_400_BAD_REQUEST, str(exc), code=exc.code
             )
+        except UnsupportedFilterShapeError:
+            return self._gm.bad_request("Span filter configuration is invalid")
         except Exception as exc:
-            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+            if is_clickhouse_api_read_unavailable_error(exc):
                 logger.warning(
                     "observe_span_list_query_unavailable",
                     project_id=str(
@@ -1634,7 +1639,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "observe_span_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Span data could not be loaded")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Span data could not be loaded",
+                code="server_error",
+            )
 
     def _list_spans_clickhouse(
         self,
@@ -1645,29 +1654,16 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         org_project_ids=None,
         org=None,
     ):
-        """List spans using ClickHouse backend.
-
-        Builder class is resolved via the v1↔v2 dispatch — set
-        CH25_QUERY_TYPES_V2_PRIMARY=SPAN_LIST (or V2_ONLY) to flip this
-        endpoint to the CH 25.3 schema. Defaults to v1 (CH 24.10) until
-        flipped. See tracer/services/clickhouse/v2/dispatch.py.
-        """
+        """List spans from the direct-write ClickHouse 25 schema."""
         from tracer.services.clickhouse.query_builders import SpanListQueryBuilder
-        from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-        from tracer.services.clickhouse.v2.query_service import (
-            query_service_for_builder,
-        )
 
-        BuilderCls = get_query_builder_class("SPAN_LIST")  # noqa: N806
-        analytics = query_service_for_builder("SPAN_LIST", BuilderCls, analytics)
         read_deadline = ReadDeadline.start(SPAN_LIST_WALL_DEADLINE_MS)
 
         org_scope = bool(org_project_ids)
         if org is None:
             org = _get_request_organization(request)
-        # The v2 builder is a subclass of the v1 builder, so the pivot
-        # helpers below (called as classmethods on the v1 name) work for
-        # both — keep the v1 import for those static calls.
+        # Keep the v1 class import only for its schema-agnostic static pivot
+        # helpers below. Query construction is always SpanListQueryBuilderV2.
 
         filters = list(validated_data.get("filters", []) or [])
         page_number = validated_data["page_number"]
@@ -1799,7 +1795,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 else None
             )
         )
-        builder = BuilderCls(
+        builder = SpanListQueryBuilderV2(
             project_id=None if org_scope else str(project_id),
             project_ids=[str(p) for p in org_project_ids] if org_scope else None,
             filters=filters,
@@ -1822,6 +1818,10 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         # Phase 1: Paginated spans (light columns — no input/output).
         bounded_page = None
         bounded_error_code = builder.bounded_filter_degraded_error_code()
+        if bounded_error_code == "unsupported_filter_shape":
+            raise UnsupportedFilterShapeError(
+                "Span filter cannot be evaluated by the bounded list reader"
+            )
         try:
             candidate_deadline_ms = read_deadline.remaining_ms(
                 SPAN_LIST_CANDIDATE_DEADLINE_MS
@@ -2420,6 +2420,14 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 next_cursor=next_cursor,
             )
         )
+        if metadata.get("total_rows_is_lower_bound") and not validated_data.get(
+            "allow_sampled", False
+        ):
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Span data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         response = {
             "metadata": metadata,
             "table": table_data,
@@ -2431,19 +2439,8 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
     def _list_spans_non_observe_clickhouse(
         self, request, project_version_id, project_version, analytics, validated_data
     ):
-        """List spans (non-observe, prompt version/eval task views) using ClickHouse backend.
-
-        Same v1↔v2 dispatch as `_list_spans_clickhouse` — flips together via
-        CH25_QUERY_TYPES_V2_PRIMARY=SPAN_LIST.
-        """
+        """List prompt-version/eval-task spans from direct-write ClickHouse 25."""
         from tracer.services.clickhouse.query_builders import SpanListQueryBuilder
-        from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-        from tracer.services.clickhouse.v2.query_service import (
-            query_service_for_builder,
-        )
-
-        BuilderCls = get_query_builder_class("SPAN_LIST")  # noqa: N806
-        analytics = query_service_for_builder("SPAN_LIST", BuilderCls, analytics)
 
         filters = validated_data.get("filters", [])
         page_number = validated_data.get("page_number", 0)
@@ -2476,7 +2473,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         candidate_ids = [str(config.id) for config in project_configs]
         ids_with_data: set[str] = set()
         if candidate_ids:
-            window_days = SpanListQueryBuilder.window_days_covering(filters)
+            window_days = SpanListQueryBuilderV2.window_days_covering(filters)
             cache_key = (
                 "span_list_non_observe_eval_cfgs:"
                 + hashlib.sha256(
@@ -2513,7 +2510,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         annotation_label_ids = [str(lbl.id) for lbl in annotation_labels]
         label_types = {str(lbl.id): lbl.type for lbl in annotation_labels}
 
-        builder = BuilderCls(
+        builder = SpanListQueryBuilderV2(
             project_id=project_id,
             filters=filters,
             page_number=page_number,
@@ -2528,6 +2525,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         # Observe. The project-version predicate is compiled into both the seed
         # and exact classifier, so this path never widens to the whole project.
         bounded_page = None
+        bounded_error_code = builder.bounded_filter_degraded_error_code()
+        if bounded_error_code == "unsupported_filter_shape":
+            raise UnsupportedFilterShapeError(
+                "Span filter cannot be evaluated by the bounded list reader"
+            )
         if builder.supports_bounded_filter_scan():
             from tracer.selectors.trace_filter_reads import read_bounded_filter_page
             from tracer.services.clickhouse.query_service import QueryResult
@@ -2572,9 +2574,15 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 backend_used="clickhouse",
                 query_time_ms=bounded_page.elapsed_ms,
             )
-        else:
+        elif not bounded_error_code:
             query, params = builder.build()
             result = analytics.execute_ch_query(query, params, timeout_ms=10000)
+        else:
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Filtered span data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
 
             # Prefix-dedup pagination: Phase 1 dropped `LIMIT 1 BY id` (its
             # O(window) full sort OOM-crashed CH — see SpanListQueryBuilder.build)
@@ -2727,20 +2735,46 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
             table_data.append(entry)
 
+        metadata = {"total_rows": total_count}
+        if bounded_page is not None:
+            metadata.update(
+                {
+                    "total_rows_is_lower_bound": True,
+                    "has_more": bounded_page.has_more,
+                    "query_complete": bounded_page.complete,
+                    "query_status": bounded_page.status,
+                    "query_error_code": bounded_page.error_code,
+                    "query_elapsed_ms": round(bounded_page.elapsed_ms, 3),
+                    "query_count": bounded_page.query_count,
+                    "query_rows_returned": bounded_page.rows_returned,
+                    "query_result_payload_bytes": bounded_page.result_payload_bytes,
+                }
+            )
+        if metadata.get("total_rows_is_lower_bound") and not validated_data.get(
+            "allow_sampled", False
+        ):
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Span data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
+
         response = {
             "column_config": column_config,
-            "metadata": {"total_rows": total_count},
+            "metadata": metadata,
             "table": table_data,
         }
 
         return self._gm.success_response(response)
 
     @validated_request(
+        query_serializer=ObserveGraphDataQuerySerializer,
         request_serializer=ObserveGraphDataRequestSerializer,
         responses={
             200: ObserveGraphDataResponseSerializer,
             400: ApiErrorResponseSerializer,
             500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
         },
     )
     @action(detail=False, methods=["post"])
@@ -2750,6 +2784,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         """
         try:
             body = request.validated_data
+            allow_sampled = request.validated_query_data["allow_sampled"]
             project_id = str(body["project_id"])
 
             try:
@@ -2793,7 +2828,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             # (fetch_system_metric_graph_ch / fetch_eval_graph_ch /
             # fetch_annotation_graph_ch).
             # Spans/traces are direct-write CH25 only. Use the process-wide V2
-            # pool and return an explicit degraded graph on bounded read
+            # pool and return a typed unavailable response on bounded read
             # failure; never rebuild telemetry from stale PostgreSQL rows.
             analytics = V2AnalyticsQueryService()
             try:
@@ -2824,36 +2859,51 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         req_data_config=req_data_config,
                         observe_type="span",
                     )
-                return self._gm.success_response(
-                    enforce_exact_graph_data_contract(graph)
-                )
+                graph = enforce_exact_graph_data_contract(graph)
+                if not graph_payload_is_publishable(
+                    graph,
+                    allow_sampled=allow_sampled,
+                ):
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Graph data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
+                return self._gm.success_response(graph)
             except Exception as exc:
                 if not (
                     isinstance(exc, BoundedGraphReadError)
-                    or is_read_budget_error(exc)
-                    or is_clickhouse_query_error(exc)
+                    or is_clickhouse_api_read_unavailable_error(exc)
                 ):
                     # A programming defect is not a successful degraded graph.
                     # Re-raise into the outer sanitized handler, which records
                     # the traceback without exposing it in the API response.
                     raise
                 logger.warning(
-                    "span graph query degraded",
+                    "span_graph_query_unavailable",
                     project_id=project_id,
                     metric_type=metric_type,
                     metric_id=metric_id,
                     error_type=type(exc).__name__,
                 )
-                return self._gm.success_response(
-                    degraded_graph_response(str(metric_id or ""), exc)
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Graph data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
                 )
 
+        except UnsupportedFilterShapeError:
+            return self._gm.bad_request("Graph filter configuration is invalid")
         except Exception as exc:
             logger.exception(
-                "span graph request failed",
+                "span_graph_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Graph data could not be loaded")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Graph data could not be loaded",
+                code="server_error",
+            )
 
     @validated_request(
         query_serializer=ObservationAttributeListQuerySerializer,
@@ -2862,6 +2912,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             400: ApiErrorResponseSerializer,
             404: ApiErrorResponseSerializer,
             500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
         },
     )
     @action(detail=False, methods=["get"])
@@ -2889,23 +2940,32 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 selector=selector,
                 exact_key=exact_key,
             )
+            if not self._attribute_metadata_allows_success(
+                metadata, has_verified_results=bool(keys)
+            ):
+                return self._attribute_read_unavailable_response()
             return self._attribute_list_response(keys, metadata)
+        except (InvalidAttributeKey, InvalidAttributeSearch):
+            return self._gm.bad_request("Attribute filter configuration is invalid")
         except Exception as exc:
-            if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
-                logger.exception(
-                    "span attribute discovery programming error",
+            if isinstance(exc, IncompleteLatestStateReplay) or (
+                is_clickhouse_api_read_unavailable_error(exc)
+            ):
+                logger.warning(
+                    "span_attribute_discovery_unavailable",
                     project_id=str(project_id),
                     error_type=type(exc).__name__,
                 )
-                return self._gm.bad_request("Span attributes could not be loaded")
-            logger.warning(
-                "span attribute discovery failed",
+                return self._attribute_read_unavailable_response()
+            logger.exception(
+                "span_attribute_discovery_failed",
                 project_id=str(project_id),
                 error_type=type(exc).__name__,
             )
-            return self._attribute_list_response(
-                [],
-                selector.degraded_metadata(self._attribute_error_code(exc)),
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Span attributes could not be loaded",
+                code="server_error",
             )
 
     @validated_request(
@@ -2915,6 +2975,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             400: ApiErrorResponseSerializer,
             404: ApiErrorResponseSerializer,
             500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
         },
     )
     @action(detail=False, methods=["get"])
@@ -2957,12 +3018,25 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     exact_key=exact_key,
                 )
             )
+            if not self._attribute_metadata_allows_success(
+                discovery_metadata,
+                has_verified_results=bool(span_attribute_keys),
+            ):
+                return self._attribute_read_unavailable_response()
             if row_type in ("spans", "voiceCalls"):
                 return self._attribute_list_response(
                     span_attribute_keys, discovery_metadata
                 )
 
             cardinality = selector.sample_cardinality([project_id])
+            cardinality_has_verified_results = cardinality.max_spans_per_trace > 0 and (
+                row_type != "sessions" or cardinality.max_traces_per_session > 0
+            )
+            if not self._attribute_metadata_allows_success(
+                cardinality.metadata,
+                has_verified_results=cardinality_has_verified_results,
+            ):
+                return self._attribute_read_unavailable_response()
             metadata = merge_read_metadata(discovery_metadata, cardinality.metadata)
             if row_type == "traces":
                 paths = self._build_trace_attribute_paths(
@@ -2982,31 +3056,29 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 return self._attribute_list_response(paths, metadata)
 
             return self._gm.bad_request("Unknown row type")
+        except (InvalidAttributeKey, InvalidAttributeSearch):
+            return self._gm.bad_request("Attribute filter configuration is invalid")
         except Exception as exc:
-            if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
-                logger.exception(
-                    "evaluation attribute discovery programming error",
+            if isinstance(exc, IncompleteLatestStateReplay) or (
+                is_clickhouse_api_read_unavailable_error(exc)
+            ):
+                logger.warning(
+                    "evaluation_attribute_discovery_unavailable",
                     project_id=str(project_id),
                     row_type=row_type,
                     error_type=type(exc).__name__,
                 )
-                return self._gm.bad_request("Evaluation attributes could not be loaded")
-            logger.warning(
-                "evaluation attribute discovery failed",
+                return self._attribute_read_unavailable_response()
+            logger.exception(
+                "evaluation_attribute_discovery_failed",
                 project_id=str(project_id),
                 row_type=row_type,
                 error_type=type(exc).__name__,
             )
-            base_paths = (
-                list(self._TRACE_PUBLIC_FIELDS)
-                if row_type == "traces"
-                else list(self._SESSION_PUBLIC_FIELDS)
-                if row_type == "sessions"
-                else []
-            )
-            return self._attribute_list_response(
-                base_paths,
-                selector.degraded_metadata(self._attribute_error_code(exc)),
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Evaluation attributes could not be loaded",
+                code="server_error",
             )
 
     # Trace + session model fields the resolver allow-lists; mirrors the
@@ -3029,8 +3101,26 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
     _OBSERVED_MAX_SAMPLE_SIZE = 100
 
     @staticmethod
-    def _attribute_error_code(exc: Exception) -> str:
-        return "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+    def _attribute_metadata_allows_success(
+        metadata: AttributeReadMetadata,
+        *,
+        has_verified_results: bool,
+    ) -> bool:
+        """Accept exact reads or an explicitly labelled finite-cap sample only."""
+
+        return metadata.query_complete or (
+            has_verified_results
+            and metadata.query_status == "sampled"
+            and metadata.query_error_code == "sample_limit"
+        )
+
+    @staticmethod
+    def _attribute_read_unavailable_response():
+        return GeneralMethods().custom_error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Attribute values are temporarily unavailable. Please retry.",
+            code="service_unavailable",
+        )
 
     @staticmethod
     def _attribute_list_response(paths: list[str], metadata: AttributeReadMetadata):
@@ -3314,16 +3404,10 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 )
             project_id = str(config_scope["project_id"])
 
-            # ClickHouse dispatch
-            from tracer.services.clickhouse.query_service import (
-                AnalyticsQueryService,
-            )
-
-            analytics = AnalyticsQueryService()
-            # CH-only path post-migration. EvalLogger reads previously
-            # served as a PG fallback; the CH variant reads from
-            # `tracer_eval_logger` via the CDC pipeline and is now the
-            # only routed path.
+            # CH25-only path. V2AnalyticsQueryService keeps the direct CH25
+            # connection while honoring the independently configured eval
+            # table name.
+            analytics = V2AnalyticsQueryService()
             return self._get_evaluation_details_clickhouse(
                 observation_span_id,
                 custom_eval_config_id,
@@ -3332,7 +3416,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
 
         except Exception as exc:
-            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+            if is_clickhouse_api_read_unavailable_error(exc):
                 logger.warning(
                     "evaluation_detail_query_unavailable",
                     span_id=str(observation_span_id or ""),
@@ -3347,7 +3431,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "evaluation_detail_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Evaluation details could not be loaded")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Evaluation details could not be loaded",
+                code="server_error",
+            )
 
     @action(detail=False, methods=["get"])
     def get_spans_export_data(self, request, *args, **kwargs):

@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import math
+import re
 import traceback
 from datetime import datetime
 from typing import Any
@@ -60,6 +61,7 @@ from tracer.selectors.trace_filter_reads import (
     numbered_page_depth_exceeded,
 )
 from tracer.serializers.filters import (
+    ObserveGraphDataQuerySerializer,
     ObserveGraphDataRequestSerializer,
     ObserveGraphDataResponseSerializer,
     PageDepthExceededErrorSerializer,
@@ -82,11 +84,11 @@ from tracer.serializers.trace import (
 )
 from tracer.services.clickhouse.bounded_graph_reads import BoundedGraphReadError
 from tracer.services.clickhouse.graph_dispatch import (
-    degraded_graph_response,
     enforce_exact_graph_data_contract,
     fetch_annotation_graph_ch,
     fetch_eval_graph_ch,
     fetch_system_metric_graph_ch,
+    graph_payload_is_publishable,
 )
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
@@ -100,16 +102,20 @@ from tracer.services.clickhouse.list_cursor import (
     snapshot_read_settings,
 )
 from tracer.services.clickhouse.page_dedup import paginate_deduped
-from tracer.services.clickhouse.query_builders import (
-    AgentGraphQueryBuilder,
-)
 from tracer.services.clickhouse.query_builders.base import NIL_UUID
+from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
 from tracer.services.clickhouse.read_budget import (
     ReadDeadline,
     ReadDeadlineExceeded,
+    is_clickhouse_api_read_unavailable_error,
     is_clickhouse_query_error,
     is_read_budget_error,
+)
+from tracer.services.clickhouse.v2.query_builders.agent_graph import (
+    AgentGraphQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.services.clickhouse.v2.span_selectors import (
@@ -161,6 +167,118 @@ TRACE_LIST_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
 }
 TRACE_NAVIGATION_CANDIDATE_LIMIT = 4_095
+_CLICKHOUSE_ERROR_CODE_RE = re.compile(r"\bcode:\s*(\d+)\b", re.IGNORECASE)
+_OPTIONAL_USER_ENRICHMENT_ERROR_CODES = frozenset({497})
+
+
+def _clickhouse_error_code(exc: Exception) -> int | None:
+    """Extract only the numeric CH code; never expose the server message."""
+
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    match = _CLICKHOUSE_ERROR_CODE_RE.search(str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _is_optional_user_enrichment_failure(exc: Exception) -> bool:
+    """Failures that may omit a label without invalidating the trace page.
+
+    Query compiler/programming errors deliberately do not qualify.  Code 497
+    covers the historical read-only privilege failure that affected this
+    optional presentation field; bounded-resource and transport failures use
+    the shared narrow classifiers.
+    """
+
+    return (
+        is_read_budget_error(exc)
+        or is_clickhouse_query_error(exc)
+        or _clickhouse_error_code(exc) in _OPTIONAL_USER_ENRICHMENT_ERROR_CODES
+    )
+
+
+def _collect_trace_enrichment_futures(
+    future_names: dict[concurrent.futures.Future, str],
+    *,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], tuple[str, int | None] | None]:
+    """Collect required enrichments while allowing only ``users`` to degrade.
+
+    A socket-stalled optional user lookup may remain unfinished after the wall
+    wait.  It is cancelled and omitted only when every required future is done.
+    Any unfinished required phase, required exception, or user programming
+    error still propagates to the endpoint's existing 503/error handling.
+    """
+
+    results: dict[str, Any] = {}
+    user_degradation: tuple[str, int | None] | None = None
+
+    def consume(future: concurrent.futures.Future) -> None:
+        nonlocal user_degradation
+        future_name = future_names[future]
+        try:
+            results[future_name] = future.result()
+        except Exception as exc:
+            if future_name != "users" or not _is_optional_user_enrichment_failure(exc):
+                raise
+            results[future_name] = None
+            user_degradation = (type(exc).__name__, _clickhouse_error_code(exc))
+
+    try:
+        for future in concurrent.futures.as_completed(
+            future_names, timeout=timeout_seconds
+        ):
+            consume(future)
+    except concurrent.futures.TimeoutError:
+        # Consume every completed future first so a required exception can never
+        # be hidden merely because the optional users future also stalled.
+        for future in future_names:
+            if future.done() and future_names[future] not in results:
+                consume(future)
+        pending = [future for future in future_names if not future.done()]
+        if any(future_names[future] != "users" for future in pending):
+            raise
+        for future in pending:
+            future.cancel()
+        if pending:
+            results["users"] = None
+            user_degradation = ("TimeoutError", None)
+
+    return results, user_degradation
+
+
+def _decode_trace_list_cursor_order(
+    order: tuple[Any, ...], *, org_scope: bool
+) -> str | tuple[str, str]:
+    """Validate the opaque trace order and return its reader tiebreak token."""
+
+    valid_single_project_order = (
+        not org_scope
+        and len(order) == 2
+        and isinstance(order[0], datetime)
+        and isinstance(order[1], str)
+    )
+    valid_org_order = (
+        org_scope
+        and len(order) == 3
+        and isinstance(order[0], datetime)
+        and isinstance(order[1], str)
+        and isinstance(order[2], str)
+    )
+    if not (valid_single_project_order or valid_org_order):
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    return (order[1], order[2]) if org_scope else order[1]
+
+
+def _trace_list_cursor_order_for_row(
+    row: dict[str, Any], *, org_scope: bool
+) -> tuple[Any, ...]:
+    """Freeze the exact public result order without exposing cursor internals."""
+
+    base_order = (row.get("start_time"), str(row.get("trace_id", "")))
+    if org_scope:
+        return (*base_order, str(row.get("project_id", "")))
+    return base_order
 
 
 class TraceNavigationReadUnavailable(RuntimeError):
@@ -427,7 +545,7 @@ def _build_agent_graph_pg(project_id, filters, builder):
     all_span_by_id = {str(row["id"]): row for row in span_rows}
 
     def node_id(name, node_type):
-        return AgentGraphQueryBuilder._make_node_id(
+        return AgentGraphQueryBuilderV2._make_node_id(
             str(name or ""),
             str(node_type or "unknown"),
         )
@@ -736,6 +854,7 @@ def _build_annotation_map_from_scores(
     annotation_label_ids,
     label_types,
     span_trace_map=None,
+    analytics=None,
     project_id=None,
     start_date=None,
     end_date=None,
@@ -748,6 +867,8 @@ def _build_annotation_map_from_scores(
 
     ``project_id``/``start_date``/``end_date`` scope the span->trace CH
     lookup when this builds the map itself (span_trace_map not supplied).
+    Direct-write callers supply their V2 analytics service; the fallback is
+    also explicitly V2 so routing flags can never select the legacy cluster.
 
     Returns:
         Dict mapping trace_id -> label_id -> structured annotation data
@@ -756,9 +877,8 @@ def _build_annotation_map_from_scores(
     if not trace_ids or not annotation_label_ids:
         return {}
     if span_trace_map is None:
-        from tracer.services.clickhouse.query_service import AnalyticsQueryService
-
-        span_trace_map = AnalyticsQueryService().get_span_trace_map(
+        analytics = analytics or V2AnalyticsQueryService()
+        span_trace_map = analytics.get_span_trace_map(
             trace_ids,
             project_id=project_id,
             start_date=start_date,
@@ -774,7 +894,6 @@ def _build_annotation_map_from_scores_ch(trace_ids, annotation_label_ids, label_
     import json
 
     from accounts.models.user import User
-    from tracer.services.clickhouse.query_service import AnalyticsQueryService
 
     analytics = AnalyticsQueryService()
 
@@ -1254,24 +1373,15 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         try:
             trace_id = kwargs.get("pk")
-            from tracer.services.clickhouse.v2.dispatch import (
-                get_query_builder_class,
-            )
-            from tracer.services.clickhouse.v2.query_service import (
-                query_service_for_builder,
+            from tracer.services.clickhouse.v2.query_builders.trace_detail import (
+                TraceDetailHandlerV2,
             )
 
-            HandlerCls = get_query_builder_class("TRACE_DETAIL")
-            analytics = query_service_for_builder(
-                "TRACE_DETAIL",
-                HandlerCls,
-                AnalyticsQueryService(),
-            )
-            handler = HandlerCls(
+            handler = TraceDetailHandlerV2(
                 view=self,
                 request=request,
                 pk=trace_id,
-                analytics=analytics,
+                analytics=V2AnalyticsQueryService(),
             )
             return self._gm.success_response(handler.fetch())
         except Trace.DoesNotExist:
@@ -1811,7 +1921,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             name = self.request.query_params.get("name", None)
 
             # ClickHouse dispatch: resolve which eval config IDs have data
-            analytics = AnalyticsQueryService()
+            # Eval results live on CH25, while their physical table name is an
+            # independent rollout choice. The V2 service keeps the CH25
+            # connection and resolves the authoritative configured eval table.
+            analytics = V2AnalyticsQueryService()
             # CH-only path. Legacy PG fallback removed: EvalLogger lives in
             # CH now and the PG `tracer_evallogger` table is destined for
             # deletion. If CH errors, propagate so the operator sees it.
@@ -1862,7 +1975,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.success_response(configs)
 
         except Exception as exc:
-            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+            if is_clickhouse_api_read_unavailable_error(exc):
                 logger.warning(
                     "evaluation_name_picker_query_unavailable",
                     project_id=str(project_id or ""),
@@ -1877,7 +1990,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "evaluation_name_picker_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Evaluation names could not be loaded")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Evaluation names could not be loaded",
+                code="server_error",
+            )
 
     @validated_request(
         query_serializer=TraceListQuerySerializer,
@@ -1911,14 +2028,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # start_time / status + per-config EvalLogger metric pivot +
             # build_annotation_subqueries + 4-stage filter combinator +
             # Python pivot) was deleted. CH path lives in
-            # _list_traces_clickhouse via TraceListQueryBuilder. If
-            # TRACE_LIST isn't routed to CH that's a config error —
-            # surface it as 400.
-            analytics = AnalyticsQueryService()
+            # _list_traces_clickhouse via the direct-write CH25 builder. Bind
+            # the matching V2 service explicitly: routing configuration must
+            # never send authoritative telemetry reads to the legacy cluster.
+            analytics = V2AnalyticsQueryService()
             return self._list_traces_clickhouse(
                 request, project_version_id, analytics, query_params
             )
 
+        except UnsupportedFilterShapeError:
+            return self._gm.bad_request("Trace filter configuration is invalid")
         except Exception as exc:
             if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
                 logger.warning(
@@ -1942,11 +2061,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.bad_request("Trace data could not be loaded")
 
     @validated_request(
+        query_serializer=ObserveGraphDataQuerySerializer,
         request_serializer=ObserveGraphDataRequestSerializer,
         responses={
             200: ObserveGraphDataResponseSerializer,
             400: ApiErrorResponseSerializer,
             500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
         },
     )
     @action(detail=False, methods=["post"])
@@ -1956,6 +2077,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         """
         try:
             body = request.validated_data
+            allow_sampled = request.validated_query_data["allow_sampled"]
             project_id = str(body["project_id"])
             project = (
                 _project_queryset_for_request(self.request)
@@ -2033,36 +2155,51 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         req_data_config=req_data_config,
                         observe_type="trace",
                     )
-                return self._gm.success_response(
-                    enforce_exact_graph_data_contract(graph)
-                )
+                graph = enforce_exact_graph_data_contract(graph)
+                if not graph_payload_is_publishable(
+                    graph,
+                    allow_sampled=allow_sampled,
+                ):
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Graph data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
+                return self._gm.success_response(graph)
             except Exception as exc:
                 if not (
                     isinstance(exc, BoundedGraphReadError)
-                    or is_read_budget_error(exc)
-                    or is_clickhouse_query_error(exc)
+                    or is_clickhouse_api_read_unavailable_error(exc)
                 ):
                     # A programming defect is not a successful degraded graph.
                     # Re-raise into the outer sanitized handler, which records
                     # the traceback without exposing it in the API response.
                     raise
                 logger.warning(
-                    "trace graph query degraded",
+                    "trace_graph_query_unavailable",
                     project_id=project_id,
                     metric_type=metric_type,
                     metric_id=metric_id,
                     error_type=type(exc).__name__,
                 )
-                return self._gm.success_response(
-                    degraded_graph_response(str(metric_id or ""), exc)
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Graph data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
                 )
 
+        except UnsupportedFilterShapeError:
+            return self._gm.bad_request("Graph filter configuration is invalid")
         except Exception as exc:
             logger.exception(
-                "trace graph request failed",
+                "trace_graph_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Graph data could not be loaded")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Graph data could not be loaded",
+                code="server_error",
+            )
 
     @action(detail=False, methods=["post"])
     def bulk_create(self, request, *args, **kwargs):
@@ -2737,14 +2874,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # _end_user_span_qs Subquery annotations + per-config EvalLogger
             # metric pivot + build_annotation_subqueries + 4-stage filter
             # combinator + Python pivot) was deleted. CH path lives in
-            # _list_traces_of_session_clickhouse via TraceListQueryBuilder.
-            # If TRACE_OF_SESSION_LIST isn't routed to CH that's a config
-            # error — surface as 400. (NOTE: the legacy PG path supported
+            # _list_traces_of_session_clickhouse via the direct-write CH25
+            # builder. Routing flags are intentionally not consulted for this
+            # authoritative telemetry path. (NOTE: the legacy PG path supported
             # export=True by skipping pagination; the CH path always
             # paginates. Export of traces-of-session beyond the first page
             # is unsupported post-migration — feature parity tracked as a
             # follow-up if needed.)
-            analytics = AnalyticsQueryService()
+            analytics = V2AnalyticsQueryService()
             return self._list_traces_of_session_clickhouse(
                 request,
                 project_id,
@@ -2758,8 +2895,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.custom_error_response(
                 status.HTTP_400_BAD_REQUEST, str(exc), code=exc.code
             )
+        except UnsupportedFilterShapeError:
+            return self._gm.bad_request("Trace filter configuration is invalid")
         except Exception as exc:
-            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+            if is_clickhouse_api_read_unavailable_error(exc):
                 logger.warning(
                     "observe_trace_list_query_unavailable",
                     project_id=str(
@@ -2778,7 +2917,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "observe_trace_list_request_failed",
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Trace data could not be loaded")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Trace data could not be loaded",
+                code="server_error",
+            )
 
     @validated_request(
         query_serializer=TraceVoiceCallListQuerySerializer,
@@ -2837,7 +2980,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # _list_voice_calls_clickhouse via VoiceCallListQueryBuilder.
             # Per-query routing gate was removed in the CH25 close-out — CH
             # is the single source of truth; CH failures propagate.
-            analytics = AnalyticsQueryService()
+            analytics = V2AnalyticsQueryService()
             return self._list_voice_calls_clickhouse(
                 request,
                 project_id,
@@ -3688,16 +3831,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         view falls back to a PG-side EvalLogger lookup scoped to those
         projects (the CH dict-lookup path requires a single project_id).
 
-        Builder class resolved via v1↔v2 dispatch — set
-        CH25_QUERY_TYPES_V2_PRIMARY=TRACE_LIST to flip to CH 25.3.
+        Telemetry is direct-write-only, so this path always uses the CH25
+        builder paired with the V2 query service supplied by its endpoint.
         """
-        from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-        from tracer.services.clickhouse.v2.query_service import (
-            query_service_for_builder,
+        from tracer.services.clickhouse.v2.query_builders.trace_list import (
+            TraceListQueryBuilderV2,
         )
 
-        BuilderCls = get_query_builder_class("TRACE_LIST")  # noqa: N806
-        analytics = query_service_for_builder("TRACE_LIST", BuilderCls, analytics)
         read_deadline = ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
 
         org_scope = bool(org_project_ids)
@@ -3713,6 +3853,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         cursor_scope = cursor_scope_for_request(request, project_ids=scope_project_ids)
         cursor_query = dict(validated_data)
         cursor_state = None
+        cursor_order_token = None
         if cursor_token:
             cursor_state = decode_list_cursor(
                 cursor_token,
@@ -3721,14 +3862,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 query=cursor_query,
                 page_size=page_size,
             )
-            if (
-                len(cursor_state.order) != 2
-                or not isinstance(cursor_state.order[0], datetime)
-                or not isinstance(cursor_state.order[1], str)
-            ):
-                raise ListCursorError(
-                    "invalid_cursor", "The continuation cursor is invalid."
-                )
+            cursor_order_token = _decode_trace_list_cursor_order(
+                cursor_state.order,
+                org_scope=org_scope,
+            )
             filters.append(frozen_window_filter(cursor_state))
             page_number = 0
         if not cursor_token and numbered_page_depth_exceeded(
@@ -3817,7 +3954,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 else None
             )
         )
-        builder = BuilderCls(
+        builder = TraceListQueryBuilderV2(
             project_id=None if org_scope else str(project_id),
             project_ids=[str(p) for p in org_project_ids] if org_scope else None,
             filters=filters,
@@ -3839,6 +3976,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # Phase 1: Paginated traces (light columns only — no input/output)
         bounded_page = None
         bounded_error_code = builder.bounded_filter_degraded_error_code()
+        if bounded_error_code == "unsupported_filter_shape":
+            raise UnsupportedFilterShapeError(
+                "Trace filter cannot be evaluated by the bounded list reader"
+            )
         try:
             candidate_deadline_ms = read_deadline.remaining_ms(
                 TRACE_LIST_CANDIDATE_DEADLINE_MS
@@ -3865,7 +4006,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_state.order[0] if cursor_state is not None else None
                 ),
                 cursor_order_token=(
-                    cursor_state.order[1] if cursor_state is not None else None
+                    cursor_order_token if cursor_state is not None else None
                 ),
                 read_settings=page_read_settings,
             )
@@ -3928,7 +4069,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             # De-duplicate the common sorted prefix before slicing page N.
             result.data, _has_more = paginate_deduped(
-                result.data, "trace_id", page_number, page_size
+                result.data,
+                ("project_id", "trace_id") if org_scope else "trace_id",
+                page_number,
+                page_size,
             )
 
             count_query, count_params = builder.build_count_query()
@@ -3966,6 +4110,19 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # them concurrently: endpoint latency is selector + max(enrichment),
         # never selector + the serial sum of five independent queries.
         trace_ids = [str(row.get("trace_id", "")) for row in result.data]
+        trace_user_identities = tuple(
+            dict.fromkeys(
+                (
+                    str(row.get("project_id") or project_id or ""),
+                    str(row.get("trace_id") or ""),
+                )
+                for row in result.data
+                if (row.get("project_id") or project_id) and row.get("trace_id")
+            )
+        )
+        bounded_user_resolver = getattr(
+            builder, "resolve_user_ids_for_trace_identities", None
+        )
         root_identities = [
             (
                 str(row.get("project_id") or project_id or ""),
@@ -3985,7 +4142,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 root_identities if len(root_identities) == len(result.data) else None
             ),
         )
-        user_query, user_params = builder.build_user_id_query(trace_ids)
+        if callable(bounded_user_resolver):
+            user_query, user_params = "", {}
+        else:
+            user_query, user_params = builder.build_user_id_query(trace_ids)
         eval_query, eval_params = builder.build_eval_query(trace_ids)
         attr_query, attr_params = builder.build_span_attributes_query(trace_ids)
 
@@ -4024,16 +4184,36 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             for task_name, (task_query, task_params) in tasks.items():
                 future = pool.submit(_execute_enrichment, task_query, task_params)
                 future_names[future] = task_name
+            if callable(bounded_user_resolver) and trace_user_identities:
+                user_future = pool.submit(
+                    bounded_user_resolver,
+                    trace_user_identities,
+                    analytics,
+                    settings=page_read_settings,
+                    timeout_ms_provider=lambda: read_deadline.remaining_ms(
+                        TRACE_LIST_ENRICHMENT_TIMEOUT_MS
+                    ),
+                )
+                future_names[user_future] = "users"
             if trace_ids and annotation_label_ids:
                 span_map_future = pool.submit(_fetch_span_trace_map)
                 future_names[span_map_future] = "span_trace_map"
 
             wait_seconds = read_deadline.remaining_ms() / 1000
-            for future in concurrent.futures.as_completed(
-                future_names, timeout=wait_seconds
-            ):
-                enrichment_results[future_names[future]] = future.result()
-            read_deadline.remaining_ms()
+            enrichment_results, user_degradation = _collect_trace_enrichment_futures(
+                future_names,
+                timeout_seconds=wait_seconds,
+            )
+            if user_degradation is not None:
+                logger.warning(
+                    "trace_list_user_enrichment_degraded",
+                    error_type=user_degradation[0],
+                    clickhouse_error_code=user_degradation[1],
+                    project_id=str(project_id) if project_id else None,
+                    page_number=page_number,
+                )
+            if user_degradation != ("TimeoutError", None):
+                read_deadline.remaining_ms()
         except (concurrent.futures.TimeoutError, ReadDeadlineExceeded) as exc:
             logger.warning(
                 "trace_list_enrichment_deadline_exceeded",
@@ -4078,6 +4258,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             raise AssertionError("trace enrichment futures did not all complete")
 
         query_count += len(future_names)
+        resolved_users = enrichment_results.get("users")
+        query_count += max(0, getattr(resolved_users, "query_count", 1) - 1)
         for task_result in enrichment_results.values():
             task_rows = (
                 task_result.data if hasattr(task_result, "data") else task_result
@@ -4097,6 +4279,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         content_result = enrichment_results.get("content")
         content_rows = content_result.data if content_result is not None else []
+        if not org_scope:
+            for content_row in content_rows:
+                content_row.setdefault("project_id", str(project_id or ""))
         if content_query and len(content_rows) < len(trace_ids):
             logger.warning(
                 "trace_list_content_replay_incomplete",
@@ -4112,7 +4297,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         content_map = merge_content_rows(
             result.data,
             content_rows,
-            id_key="trace_id",
+            id_key=("project_id", "trace_id"),
             keys=(
                 "input",
                 "output",
@@ -4126,7 +4311,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         # metadata needs JSON-parsing from the raw CH column
         for row in result.data:
-            content = content_map.get(str(row.get("trace_id", "")), {})
+            content = content_map.get(
+                (
+                    str(row.get("project_id") or project_id or ""),
+                    str(row.get("trace_id", "")),
+                ),
+                {},
+            )
             raw_meta = content.get("metadata", "{}")
             if isinstance(raw_meta, str):
                 try:
@@ -4137,11 +4328,18 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 row["metadata"] = raw_meta or {}
 
         user_result = enrichment_results.get("users")
-        user_id_map = {
-            str(row.get("trace_id", "")): row.get("user_id")
-            for row in (user_result.data if user_result is not None else [])
-            if row.get("user_id")
-        }
+        user_id_map: dict[tuple[str, str], str] = {}
+        for user_row in user_result.data if user_result is not None else []:
+            row_project_id = user_row.get("project_id")
+            # A trace id is not globally unique.  Legacy single-project rows do
+            # not carry project_id, so add the known request scope only when it
+            # is unambiguous; organization-scoped unqualified labels fail closed.
+            if not row_project_id and not org_scope:
+                row_project_id = project_id
+            if row_project_id and user_row.get("trace_id") and user_row.get("user_id"):
+                user_id_map[(str(row_project_id), str(user_row["trace_id"]))] = str(
+                    user_row["user_id"]
+                )
 
         # Phase 2: page-scoped eval scores.
         eval_map = {}
@@ -4158,7 +4356,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # projects' spans).
         span_trace_map = enrichment_results.get("span_trace_map", {})
         annotation_map = _build_annotation_map_from_scores(
-            trace_ids, annotation_label_ids, label_types, span_trace_map
+            trace_ids,
+            annotation_label_ids,
+            label_types,
+            span_trace_map,
+            analytics=analytics,
         )
         try:
             read_deadline.remaining_ms()
@@ -4183,10 +4385,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             "input.value",
             "output.value",
         )
-        aggregated_attrs = {}  # trace_id -> {attr_key -> [unique_values]}
+        aggregated_attrs = {}  # (project_id, trace_id) -> {attr_key -> values}
         attr_result = enrichment_results.get("attributes")
         for attr_row in attr_result.data if attr_result is not None else []:
             tid = str(attr_row.get("trace_id", ""))
+            attr_project_id = str(
+                attr_row.get("project_id") or (project_id if not org_scope else "")
+            )
+            if not tid or not attr_project_id:
+                continue
+            attr_identity = (attr_project_id, tid)
             raw = attr_row.get("attributes_extra", "{}")
             try:
                 attrs = json.loads(raw) if isinstance(raw, str) else (raw or {})
@@ -4202,18 +4410,18 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     for key, value in num_map.items():
                         if key not in attrs:
                             attrs[key] = value
-            aggregated_attrs.setdefault(tid, {})
+            aggregated_attrs.setdefault(attr_identity, {})
             for key, value in attrs.items():
                 if key.startswith(_SKIP_ATTR_PREFIXES):
                     continue
                 if isinstance(value, str) and len(value) > 500:
                     continue
-                if key not in aggregated_attrs[tid]:
-                    aggregated_attrs[tid][key] = (
+                if key not in aggregated_attrs[attr_identity]:
+                    aggregated_attrs[attr_identity][key] = (
                         set() if isinstance(value, (str, int, float, bool)) else []
                     )
                 if isinstance(value, (str, int, float, bool)):
-                    aggregated_attrs[tid][key].add(
+                    aggregated_attrs[attr_identity][key].add(
                         value if not isinstance(value, bool) else str(value).lower()
                     )
 
@@ -4262,12 +4470,18 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "model": row.get("model"),
                 "provider": row.get("provider"),
                 "tags": row.get("trace_tags") or [],
-                "user_id": user_id_map.get(trace_id),
+                "user_id": user_id_map.get(
+                    (str(row.get("project_id") or project_id or ""), trace_id)
+                ),
             }
 
             # Add eval metrics
             trace_evals = eval_map.get(trace_id, {})
             for config in eval_configs:
+                if org_scope and str(getattr(config, "project_id", "")) != str(
+                    row.get("project_id") or ""
+                ):
+                    continue
                 config_id = str(config.id)
                 if config_id not in trace_evals:
                     continue
@@ -4299,7 +4513,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                             entry[key] = value
 
             # Include aggregated span attributes — single value or array of unique values
-            trace_attrs = aggregated_attrs.get(trace_id, {})
+            trace_attrs = aggregated_attrs.get(
+                (str(row.get("project_id") or project_id or ""), trace_id), {}
+            )
             for key, values in trace_attrs.items():
                 if key not in entry:
                     if isinstance(values, set):
@@ -4339,6 +4555,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         ):
             last_row = result.data[-1]
             window_start, window_end = builder.parse_time_range(filters)
+            cursor_order = _trace_list_cursor_order_for_row(
+                last_row,
+                org_scope=org_scope,
+            )
             next_cursor = encode_list_cursor(
                 resource="observe_traces",
                 scope=cursor_scope,
@@ -4346,7 +4566,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 page_size=page_size,
                 window_start=window_start,
                 window_end=window_end,
-                order=(last_row.get("start_time"), str(last_row.get("trace_id", ""))),
+                order=cursor_order,
                 version_ceiling=version_ceiling,
                 seen_rows=cursor_seen_rows,
             )
@@ -4374,6 +4594,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 next_cursor=next_cursor,
             )
         )
+        if metadata.get("total_rows_is_lower_bound") and not validated_data.get(
+            "allow_sampled", False
+        ):
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         response = {
             "metadata": metadata,
             "table": _sanitize_nonfinite_floats(table_data),
@@ -4387,26 +4615,23 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     ):
         """List voice calls using ClickHouse backend.
 
-        Builder classes resolved via v1↔v2 dispatch — flip with
-        CH25_QUERY_TYPES_V2_PRIMARY=VOICE_CALL_LIST,TRACE_LIST.
+        Telemetry is direct-write-only, so this path always uses CH25 query
+        builders paired with the V2 query service supplied by its endpoint.
         """
-        from tracer.services.clickhouse.query_builders import VoiceCallListQueryBuilder
-        from tracer.services.clickhouse.query_builders.trace_list import (
-            TraceListQueryBuilder,
-        )
         from tracer.services.clickhouse.read_budget import is_read_budget_error
-        from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-        from tracer.services.clickhouse.v2.query_service import (
-            query_service_for_builder,
+        from tracer.services.clickhouse.v2.query_builders.trace_list import (
+            TraceListQueryBuilderV2,
+        )
+        from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+            VoiceCallListQueryBuilderV2,
         )
 
-        VoiceBuilderCls = get_query_builder_class("VOICE_CALL_LIST")  # noqa: N806
         filters = validated_data.get("filters", [])
         page = validated_data.get("page", 1)
         page_size = validated_data.get("page_size", 30)
         page_number = page - 1  # Convert 1-based to 0-based
         classify_batch_size = int(
-            VoiceBuilderCls.recommended_filter_classify_batch_size()
+            VoiceCallListQueryBuilderV2.recommended_filter_classify_batch_size()
         )
         if bounded_numbered_page_depth_exceeded(
             page_number=page_number,
@@ -4426,10 +4651,6 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 code=PAGE_DEPTH_EXCEEDED_CODE,
             )
 
-        analytics = query_service_for_builder(
-            "VOICE_CALL_LIST", VoiceBuilderCls, analytics
-        )
-
         # Eval configs for the project, from PG (indexed) — replaces the
         # unbounded CH dictGet discovery scan.
         eval_configs, eval_config_ids = get_project_eval_configs(project_id)
@@ -4443,7 +4664,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             remove_simulation_calls
         ).lower() not in ("false", "0", "")
 
-        builder = VoiceBuilderCls(
+        builder = VoiceCallListQueryBuilderV2(
             project_id=str(project_id),
             filters=filters,
             page_number=page_number,
@@ -4641,7 +4862,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         "Voice call data is temporarily unavailable. Please retry.",
                         code="service_unavailable",
                     )
-                eval_map = TraceListQueryBuilder.pivot_eval_results(
+                eval_map = TraceListQueryBuilderV2.pivot_eval_results(
                     [(list(row.values())) for row in eval_result.data],
                     list(eval_result.data[0].keys()) if eval_result.data else [],
                 )
@@ -4651,6 +4872,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             trace_ids,
             annotation_label_ids,
             label_types,
+            analytics=analytics,
             project_id=str(project_id),
             start_date=builder.params.get("start_date"),
             end_date=builder.params.get("end_date"),
@@ -4685,7 +4907,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             provider = attr_row.get("provider") or provider
 
             # Post-filter simulator calls in Python (can't do in CH without OOM)
-            if sim_flag and VoiceCallListQueryBuilder.is_simulator_call(
+            if sim_flag and VoiceCallListQueryBuilderV2.is_simulator_call(
                 span_attrs, provider
             ):
                 continue
@@ -4901,6 +5123,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             "has_more": bounded_page.has_more,
             "query_complete": bounded_page.complete,
         }
+        if response_data["count_is_lower_bound"] and not validated_data.get(
+            "allow_sampled", False
+        ):
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Voice call data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         if bounded_page.has_more:
             response_data["next"] = page + 1
         if page > 1:
@@ -4915,15 +5145,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     ):
         """List traces using ClickHouse backend.
 
-        v1↔v2 dispatch — flips with CH25_QUERY_TYPES_V2_PRIMARY=TRACE_LIST.
+        Telemetry is direct-write-only, so this path always uses the CH25
+        builder paired with the V2 query service supplied by its endpoint.
         """
-        from tracer.services.clickhouse.v2.dispatch import get_query_builder_class
-        from tracer.services.clickhouse.v2.query_service import (
-            query_service_for_builder,
+        from tracer.services.clickhouse.v2.query_builders.trace_list import (
+            TraceListQueryBuilderV2,
         )
 
-        BuilderCls = get_query_builder_class("TRACE_LIST")  # noqa: N806
-        analytics = query_service_for_builder("TRACE_LIST", BuilderCls, analytics)
         read_deadline = ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
 
         filters = query_params["filters"]
@@ -4976,7 +5204,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         annotation_label_ids = [str(label.id) for label in annotation_labels]
         label_types = {str(label.id): label.type for label in annotation_labels}
 
-        builder = BuilderCls(
+        builder = TraceListQueryBuilderV2(
             project_id=project_id,
             filters=filters,
             page_number=page_number,
@@ -4992,6 +5220,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # project_version_id is pushed into both seed and classifier reads.
         bounded_page = None
         bounded_error_code = builder.bounded_filter_degraded_error_code()
+        if bounded_error_code == "unsupported_filter_shape":
+            raise UnsupportedFilterShapeError(
+                "Trace filter cannot be evaluated by the bounded list reader"
+            )
         try:
             candidate_deadline_ms = read_deadline.remaining_ms(
                 TRACE_LIST_CANDIDATE_DEADLINE_MS
@@ -5092,6 +5324,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # independent after page selection, so run them concurrently instead of
         # stacking the former 10s + 30s + 10s per-query timeouts.
         trace_ids = [str(row.get("trace_id", "")) for row in result.data]
+        trace_user_identities = tuple(
+            dict.fromkeys(
+                (str(row.get("project_id") or project_id), str(row.get("trace_id")))
+                for row in result.data
+                if row.get("trace_id")
+            )
+        )
+        bounded_user_resolver = getattr(
+            builder, "resolve_user_ids_for_trace_identities", None
+        )
         root_identities = [
             (
                 str(row.get("project_id") or project_id or ""),
@@ -5112,7 +5354,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             ),
         )
         eval_query, eval_params = builder.build_eval_query(trace_ids)
-        user_query, user_params = builder.build_user_id_query(trace_ids)
+        if callable(bounded_user_resolver):
+            user_query, user_params = "", {}
+        else:
+            user_query, user_params = builder.build_user_id_query(trace_ids)
 
         def _execute_project_version_enrichment(query, params):
             return analytics.execute_ch_query(
@@ -5131,19 +5376,45 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             tasks["users"] = (user_query, user_params)
 
         enrichment_results: dict[str, Any] = {}
-        if tasks:
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks))
+        if tasks or (callable(bounded_user_resolver) and trace_user_identities):
+            pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(tasks) + int(callable(bounded_user_resolver))
+            )
             future_names = {
                 pool.submit(_execute_project_version_enrichment, query, params): name
                 for name, (query, params) in tasks.items()
             }
+            if callable(bounded_user_resolver) and trace_user_identities:
+                user_future = pool.submit(
+                    bounded_user_resolver,
+                    trace_user_identities,
+                    analytics,
+                    settings=TRACE_LIST_READ_SETTINGS,
+                    timeout_ms_provider=lambda: read_deadline.remaining_ms(
+                        TRACE_LIST_ENRICHMENT_TIMEOUT_MS
+                    ),
+                )
+                future_names[user_future] = "users"
             try:
                 wait_seconds = read_deadline.remaining_ms() / 1000
-                for future in concurrent.futures.as_completed(
-                    future_names, timeout=wait_seconds
-                ):
-                    enrichment_results[future_names[future]] = future.result()
-                read_deadline.remaining_ms()
+                (
+                    enrichment_results,
+                    user_degradation,
+                ) = _collect_trace_enrichment_futures(
+                    future_names,
+                    timeout_seconds=wait_seconds,
+                )
+                if user_degradation is not None:
+                    logger.warning(
+                        "non_observe_trace_list_user_enrichment_degraded",
+                        error_type=user_degradation[0],
+                        clickhouse_error_code=user_degradation[1],
+                        project_id=project_id,
+                        project_version_id=str(project_version_id),
+                        page_number=page_number,
+                    )
+                if user_degradation != ("TimeoutError", None):
+                    read_deadline.remaining_ms()
             except (concurrent.futures.TimeoutError, ReadDeadlineExceeded) as exc:
                 logger.warning(
                     "non_observe_trace_list_enrichment_deadline_exceeded",
@@ -5178,10 +5449,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 pool.shutdown(wait=False, cancel_futures=True)
 
         content_result = enrichment_results.get("content")
+        content_rows = content_result.data if content_result is not None else []
+        for content_row in content_rows:
+            content_row.setdefault("project_id", str(project_id))
         merge_content_rows(
             result.data,
-            content_result.data if content_result is not None else [],
-            id_key="trace_id",
+            content_rows,
+            id_key=("project_id", "trace_id"),
             keys=(
                 "input",
                 "output",
@@ -5203,9 +5477,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         user_result = enrichment_results.get("users")
         user_id_map = {
-            str(row.get("trace_id", "")): row.get("user_id")
+            (
+                str(row.get("project_id") or project_id),
+                str(row.get("trace_id", "")),
+            ): str(row["user_id"])
             for row in (user_result.data if user_result is not None else [])
-            if row.get("user_id")
+            if row.get("trace_id") and row.get("user_id")
         }
 
         # Phase 3: Annotations — fetch from PG Score (unified annotation system)
@@ -5213,6 +5490,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             trace_ids,
             annotation_label_ids,
             label_types,
+            analytics=analytics,
             project_id=str(project_id),
             start_date=builder.params.get("start_date"),
             end_date=builder.params.get("end_date"),
@@ -5260,7 +5538,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     else row.get("trace_session_id")
                 ),
                 "tags": row.get("trace_tags") or [],
-                "user_id": user_id_map.get(trace_id),
+                "user_id": user_id_map.get(
+                    (str(row.get("project_id") or project_id), trace_id)
+                ),
             }
 
             # Add eval metrics matching PG format
@@ -5303,6 +5583,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     "query_result_payload_bytes": bounded_page.result_payload_bytes,
                 }
             )
+        if metadata.get("total_rows_is_lower_bound") and not query_params.get(
+            "allow_sampled", False
+        ):
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         response = {
             "column_config": column_config,
             "metadata": metadata,
@@ -5344,23 +5632,28 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if not project:
                 return self._gm.bad_request("Project not found")
 
-            builder = AgentGraphQueryBuilder(
+            builder = AgentGraphQueryBuilderV2(
                 project_id=project_id,
                 filters=filters,
             )
 
-            analytics = AnalyticsQueryService()
+            analytics = V2AnalyticsQueryService()
+            deadline = ReadDeadline.start(15000)
 
             # Edge query
             edge_query, edge_params = builder.build()
             edge_result = analytics.execute_ch_query(
-                edge_query, edge_params, timeout_ms=15000
+                edge_query,
+                edge_params,
+                timeout_ms=deadline.remaining_ms(),
             )
 
             # Node metrics query
             node_query, node_params = builder.build_node_metrics()
             node_result = analytics.execute_ch_query(
-                node_query, node_params, timeout_ms=15000
+                node_query,
+                node_params,
+                timeout_ms=deadline.remaining_ms(),
             )
 
             # CH-only path. The "agent graph returned no nodes → fall back
@@ -5377,8 +5670,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
             return self._gm.success_response(result)
 
+        except UnsupportedFilterShapeError:
+            return self._gm.bad_request("Agent graph filter configuration is invalid")
         except Exception as exc:
-            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+            if is_clickhouse_api_read_unavailable_error(exc):
                 logger.warning(
                     "agent_graph_query_unavailable",
                     project_id=str(project_id or ""),
@@ -5394,7 +5689,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 project_id=str(project_id or ""),
                 error_type=type(exc).__name__,
             )
-            return self._gm.bad_request("Agent graph data could not be loaded")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Agent graph data could not be loaded",
+                code="server_error",
+            )
 
 
 class UsersView(APIView):

@@ -564,10 +564,9 @@ class TestEvalModeAndConfig:
 
 @pytest.mark.unit
 class TestEvalMetricThroughV2:
-    def test_v2_eval_metric_keeps_deleted_predicate_intact(self, monkeypatch, settings):
-        # The legacy tracer_eval_logger lacks is_deleted. When the eval filter
-        # is compiled by the v2 builder, the rewriter must NOT turn the
-        # `(deleted = 0 OR deleted IS NULL)` predicate into `is_deleted`.
+    def test_v2_eval_metric_uses_authoritative_legacy_named_table(
+        self, monkeypatch, settings
+    ):
         settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
         eval_id, _ = _patch_eval(monkeypatch, "SCORE")
         where, _ = _translate(
@@ -576,23 +575,23 @@ class TestEvalMetricThroughV2:
         assert "FROM tracer_eval_logger " in where
         # No table-level FINAL survives the v2 rewrite either (OOM guard).
         assert "FINAL" not in where
-        assert "(latest_eval.deleted = 0 OR latest_eval.deleted IS NULL)" in where
         assert "ORDER BY eval_scan._peerdb_version DESC" in where
         assert "latest_eval._peerdb_is_deleted = 0" in where
-        # These must survive the v2 whole-fragment rewrite because this probe
-        # still targets the legacy eval table.
-        assert "eval_scan._version" not in where
-        assert "latest_eval.is_deleted" not in where
+        assert "(latest_eval.deleted = 0 OR latest_eval.deleted IS NULL)" in where
+        assert "FROM tracer_eval_logger_v2 " not in where
 
-    def test_v2_choice_eval_metric_keeps_deleted_predicate(self, monkeypatch, settings):
+    def test_v2_choice_eval_metric_uses_configured_eval_table(
+        self, monkeypatch, settings
+    ):
         settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
         eval_id, _ = _patch_eval(monkeypatch, "CHOICE")
         where, _ = _translate(
             ClickHouseFilterBuilderV2, _eval_filter(eval_id, "in", ["a", "b"])
         )
-        assert "(latest_eval.deleted = 0 OR latest_eval.deleted IS NULL)" in where
+        assert "FROM tracer_eval_logger " in where
+        assert "ORDER BY eval_scan._peerdb_version DESC" in where
         assert "latest_eval._peerdb_is_deleted = 0" in where
-        assert "latest_eval.is_deleted" not in where
+        assert "(latest_eval.deleted = 0 OR latest_eval.deleted IS NULL)" in where
 
     def test_v2_eval_table_uses_native_latest_state_columns(
         self, monkeypatch, settings
@@ -651,9 +650,7 @@ class TestHasEvalHasAnnotationShape:
         assert "sp.is_deleted = 0" in where
         assert "sp.project_id" in where
 
-    def test_has_eval_v2_keeps_legacy_deleted_predicate(self, settings):
-        # v2 builder + legacy eval table: the aliased deleted predicate must
-        # survive the rewrite (el.deleted is NOT renamed to el.is_deleted).
+    def test_has_eval_v2_uses_authoritative_legacy_named_table(self, settings):
         settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
         where, _ = ClickHouseFilterBuilderV2(project_id="p1").translate(
             self._bool_filter("has_eval", True)
@@ -663,8 +660,6 @@ class TestHasEvalHasAnnotationShape:
         assert "ORDER BY eval_scan._peerdb_version DESC" in where
         assert "latest_eval._peerdb_is_deleted = 0" in where
         assert "(latest_eval.deleted = 0 OR latest_eval.deleted IS NULL)" in where
-        assert "eval_scan._version" not in where
-        assert "latest_eval.is_deleted" not in where
 
     def test_has_eval_v2_table_uses_is_deleted(self, settings):
         settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger_v2"

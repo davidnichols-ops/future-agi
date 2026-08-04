@@ -82,6 +82,14 @@ class ProjectGraphDataQuerySerializer(StrictInputSerializer):
     project_id = serializers.UUIDField()
     interval = serializers.CharField(required=False, default="hour", allow_blank=False)
     filters = filter_list_query_param_field(required=False, default=list)
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Explicitly opt in to bounded sample points. Clients that set this "
+            "must label sampled values as estimates rather than exact totals."
+        ),
+    )
 
 
 class ProjectUserMetricsRequestSerializer(StrictInputSerializer):

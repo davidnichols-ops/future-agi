@@ -23,8 +23,12 @@ import {
   normalizeConfigKeys,
   toBackendFilters,
 } from "src/sections/projects/LLMTracing/common";
-import { useSessionsGridStoreShallow } from "./ReplaySessions/store";
+import {
+  useSessionsGridStore,
+  useSessionsGridStoreShallow,
+} from "./ReplaySessions/store";
 import { APP_CONSTANTS } from "src/utils/constants";
+import { getListTotalState } from "src/sections/projects/LLMTracing/listTotalMetadata";
 
 const getSessionGridThemeParams = (theme) => ({
   columnBorder: false,
@@ -224,6 +228,7 @@ const SessionGrid = React.forwardRef(
                 // project_id as org-scoped (used by the cross-project
                 // user detail page).
                 ...(projectId ? { project_id: projectId } : {}),
+                allow_sampled: true,
                 page_number: page,
                 page_size: DATASET_ROWS_LIMIT,
                 sort_params: JSON.stringify(
@@ -327,8 +332,13 @@ const SessionGrid = React.forwardRef(
 
               setFilteredColumnDefs(filteredColumns);
               const rows = res?.table || [];
-              const totalRows = res?.metadata?.total_rows;
-              params.api.totalRowCount = totalRows;
+              const totalState = getListTotalState(res?.metadata || {});
+              params.api.totalRowCount = totalState.totalRowCount;
+              params.api.totalRowCountLowerBound =
+                totalState.totalRowCountLowerBound;
+              params.api.totalRowCountIsLowerBound =
+                totalState.totalRowCountIsLowerBound;
+              useSessionsGridStore.setState(totalState);
 
               const isLastPage = rows.length < DATASET_ROWS_LIMIT;
               const lastRow = isLastPage ? request.startRow + rows.length : -1;

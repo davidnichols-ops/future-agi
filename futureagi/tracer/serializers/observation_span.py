@@ -75,7 +75,7 @@ class ObservationAttributeListResponseSerializer(serializers.Serializer):
     result = serializers.ListField(child=serializers.CharField())
     query_complete = serializers.BooleanField(required=False)
     query_status = serializers.ChoiceField(
-        choices=["complete", "degraded"], required=False
+        choices=["complete", "sampled", "degraded"], required=False
     )
     query_error_code = serializers.ChoiceField(
         choices=["sample_limit", "read_budget_exceeded", "query_failed"],
@@ -263,6 +263,14 @@ class SpanListQuerySerializer(StrictInputSerializer):
     page_size = serializers.IntegerField(
         required=False, default=30, min_value=1, max_value=500
     )
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Explicitly opt in to lower-bound list totals. Clients that set "
+            "this must not present the count as an exact total."
+        ),
+    )
 
 
 class SpanObserveListQuerySerializer(StrictInputSerializer):
@@ -282,6 +290,14 @@ class SpanObserveListQuerySerializer(StrictInputSerializer):
         required=False, allow_blank=False, max_length=4096, help_text=CURSOR_HELP_TEXT
     )
     cursor_mode = serializers.BooleanField(required=False, default=False)
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Explicitly opt in to lower-bound list totals. Clients that set "
+            "this must not present the count as an exact total."
+        ),
+    )
 
     def validate(self, attrs):
         attrs = super().validate(attrs)

@@ -192,15 +192,22 @@ def _aggregate_session_candidates(
     extra_query_count: int,
     extra_rows_returned: int,
 ) -> dict[str, Any]:
+    def response_metadata() -> dict[str, Any]:
+        metadata = sample.metadata()
+        metadata.update(
+            {
+                "query_count": sample.query_count + extra_query_count,
+                "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
+                "query_rows_returned": sample.rows_returned + extra_rows_returned,
+            }
+        )
+        return metadata
+
     if sample.window_start >= sample.window_end:
         return {
             "metric_name": metric_id,
             "data": [],
-            "query_complete": True,
-            "query_status": "complete",
-            "query_count": sample.query_count + extra_query_count,
-            "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
-            "query_rows_returned": sample.rows_returned + extra_rows_returned,
+            **response_metadata(),
         }
     sessions: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -289,11 +296,7 @@ def _aggregate_session_candidates(
     return {
         "metric_name": metric_id,
         "data": points,
-        "query_complete": True,
-        "query_status": "complete",
-        "query_count": sample.query_count + extra_query_count,
-        "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
-        "query_rows_returned": sample.rows_returned + extra_rows_returned,
+        **response_metadata(),
     }
 
 
@@ -306,7 +309,7 @@ def _fetch_system_metric_graph(
     metric_id: str,
     started: float,
 ) -> dict[str, Any]:
-    """Aggregate only latest trace rows from a proven-complete finite sample."""
+    """Aggregate latest trace rows from an exact or fully executed sample."""
 
     if any(
         (item.get("column_id") or item.get("columnId"))
@@ -331,12 +334,18 @@ def _fetch_system_metric_graph(
         observe_type="trace",
         deadline_ms=GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
     )
-    # A session graph folds every matching trace into a per-session aggregate.
-    # Unlike trace/span graphs, rendering a distributed candidate sample would
-    # change both session membership and every average/count derived from it.
-    # Never overwrite the selector's incomplete contract with the unconditional
-    # ``query_complete=True`` emitted by the exact in-process reducer below.
-    if not sample.query_complete:
+    # A session graph folds every selected trace into per-session aggregates.
+    # A distributed sample changes membership and values, so it is renderable
+    # only when all declared strata executed and the response retains the
+    # selector's explicit sampled metadata. Failed/partial reads still fail
+    # closed and never reach the reducer.
+    if not sample.query_complete and not (
+        sample.query_status == "sampled"
+        and sample.query_error_code == "sample_limit"
+        and sample.sampling_strategy
+        and sample.sampling_strata > 0
+        and sample.sampling_strata_completed == sample.sampling_strata
+    ):
         raise BoundedGraphReadError(sample.query_error_code or "sample_limit")
     rows = tuple(sample.rows)
     raw_session_ids = tuple(

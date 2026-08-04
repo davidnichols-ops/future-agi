@@ -106,6 +106,7 @@ def bounded_span_table(ch_client):
             trace_session_id Nullable(String),
             project_version_id Nullable(UUID),
             name String,
+            service_name String DEFAULT '',
             observation_type String,
             status Nullable(String),
             start_time DateTime64(6, 'UTC'),
@@ -127,7 +128,14 @@ def bounded_span_table(ch_client):
             attributes_extra String
         )
         ENGINE = MergeTree
-        ORDER BY (project_id, start_time, id, _version)
+        ORDER BY (
+            project_id,
+            observation_type,
+            service_name,
+            toStartOfHour(start_time),
+            trace_id,
+            id
+        )
         """
     )
     try:
@@ -383,6 +391,22 @@ def test_eval_filters_resolve_latest_value_error_and_tombstone_on_ch25(
         }
     ]
     p1, p2 = _patched_eval_config_resolution(config_id)
+    filter_builder_cls = ClickHouseFilterBuilder
+    if table_kind == "v2":
+        from tracer.services.clickhouse.eval_logger_table import eval_logger_source
+
+        def test_eval_source(alias="", include_cdc_tombstone_guard=False):
+            return eval_logger_source(
+                alias,
+                include_cdc_tombstone_guard,
+                table=eval_table,
+            )
+
+        class EphemeralEvalFilterBuilderV2(ClickHouseFilterBuilderV2):
+            _eval_logger_source = staticmethod(test_eval_source)
+
+        filter_builder_cls = EphemeralEvalFilterBuilderV2
+
     # Production config remains restricted to canonical identifiers. This
     # ephemeral local-CH table is admitted only inside this test context.
     with (
@@ -394,10 +418,10 @@ def test_eval_filters_resolve_latest_value_error_and_tombstone_on_ch25(
         p1,
         p2,
     ):
-        value_where, value_params = ClickHouseFilterBuilderV2(
-            **builder_kwargs
-        ).translate(eval_filter)
-        has_eval_where, has_eval_params = ClickHouseFilterBuilderV2(
+        value_where, value_params = filter_builder_cls(**builder_kwargs).translate(
+            eval_filter
+        )
+        has_eval_where, has_eval_params = filter_builder_cls(
             **builder_kwargs
         ).translate(has_eval_filter)
 
@@ -710,11 +734,12 @@ def test_graph_trace_span_replay_isolates_reused_ids_and_tenants_on_ch25(
     assert rows[0]["total_tokens"] == 33
 
 
-def test_production_score_schema_executes_project_scoped_annotation_graph_on_ch25(
+def test_annotation_graph_does_not_read_legacy_score_table_on_ch25(
     ch_client,
     production_score_table,
+    monkeypatch,
 ) -> None:
-    """The deployed Score shape must satisfy the live graph projection."""
+    """Direct-write graph decoration must not query the legacy CDC score table."""
 
     project_id = "00000000-0000-4000-8000-000000000021"
     trace_id = "00000000-0000-4000-8000-000000000022"
@@ -765,27 +790,24 @@ def test_production_score_schema_executes_project_scoped_annotation_graph_on_ch2
         total_rows_lower_bound=1,
     )
 
-    class LocalAnalytics:
+    score_read = {}
+
+    class ProjectScoreSource:
+        def annotation_rows_for_candidates(self, **kwargs):
+            score_read.update(kwargs)
+            return [{"created_at": created_at, "value": {"rating": 4.5}}]
+
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.graph_dispatch.AnnotationLabelScoresProjectPG",
+        ProjectScoreSource,
+    )
+
+    class NoLegacyScoreAnalytics:
         def execute_ch_query(self, query, params, *, timeout_ms, settings):
-            rewritten = query.replace(
-                "FROM model_hub_score",
-                f"FROM {production_score_table}",
-            )
-            rows, columns = ch_client.execute(
-                rewritten,
-                params,
-                settings={
-                    **settings,
-                    "max_execution_time": max(timeout_ms / 1000, 5.0),
-                },
-                with_column_types=True,
-            )
-            names = [name for name, _type in columns]
-            mapped = [dict(zip(names, row, strict=True)) for row in rows]
-            return QueryResult(mapped, len(mapped), "clickhouse", 0.0, names)
+            raise AssertionError(f"unexpected ClickHouse score read: {query}")
 
     rows, truncated, query_count, raw_count = _finite_annotation_rows(
-        analytics=LocalAnalytics(),
+        analytics=NoLegacyScoreAnalytics(),
         sample=sample,
         project_id=project_id,
         observe_type="span",
@@ -796,13 +818,15 @@ def test_production_score_schema_executes_project_scoped_annotation_graph_on_ch2
 
     assert rows == [
         {
-            "created_at": created_at.replace(tzinfo=None),
-            "value": '{"rating":4.5}',
+            "created_at": created_at,
+            "value": {"rating": 4.5},
         }
     ]
     assert truncated is False
     assert query_count == 1
     assert raw_count == 1
+    assert score_read["project_id"] == project_id
+    assert score_read["span_entities"] == ((trace_id, span_id),)
 
 
 def test_attribute_detail_executes_latest_state_and_tombstones_on_ch25(
@@ -920,7 +944,7 @@ def test_attribute_detail_executes_latest_state_and_tombstones_on_ch25(
 def test_exact_attribute_discovery_exclusion_pages_past_stale_sample_on_ch25(
     ch_client, bounded_span_table
 ) -> None:
-    """A live rare key survives 513 stale identities in the newer band."""
+    """A live rare key survives 513 stale identities in the same dense band."""
 
     project_id = "00000000-0000-4000-8000-000000000024"
     window_end = datetime(2025, 1, 8, 10, 0, tzinfo=UTC)
@@ -957,12 +981,15 @@ def test_exact_attribute_discovery_exclusion_pages_past_stale_sample_on_ch25(
                 ),
             ]
         )
-    live_started_at = window_end - timedelta(days=8)
+    # Keep the live row in the same hour but lexically after the storage-order
+    # sample. The ordered fallback then reaches it only after its first 512
+    # newest physical identities, exercising a real keyset continuation.
+    live_started_at = window_end - timedelta(minutes=30)
     physical_rows.append(
         (
-            "rare-live",
+            "zz-rare-live",
             project_id,
-            "trace-rare-live",
+            "zz-trace-rare-live",
             live_started_at,
             live_started_at,
             0,
@@ -1014,7 +1041,7 @@ def test_exact_attribute_discovery_exclusion_pages_past_stale_sample_on_ch25(
         now=window_end,
         wall_timeout_ms=10_000,
         typed_only=True,
-    ).discover_keys([project_id], exact_key=key, horizon_days=14)
+    ).discover_keys([project_id], exact_key=key, horizon_days=7)
     assert exact.rows == (AttributeKeyRow(key, "string", 1),)
     assert exact.metadata.query_complete is True
     assert exact.metadata.query_count == 6
@@ -3098,3 +3125,90 @@ def test_candidate_scoped_annotation_residual_executes_on_ch25(
     assert rows[0][1] == "annotated-span"
     assert params["candidate_span_ids"] == ("annotated-span",)
     assert params["candidate_span_entities"] == ((trace_id, "annotated-span"),)
+
+
+def test_org_trace_candidate_identity_tuple_executes_on_ch25(
+    ch_client, bounded_span_table
+) -> None:
+    """String-bound candidate tuples must compare safely with UUID projects."""
+
+    project_a = "00000000-0000-4000-8000-000000000405"
+    project_b = "00000000-0000-4000-8000-000000000406"
+    trace_id = "shared-trace"
+    started_at = datetime(2025, 1, 1, 11, 0, tzinfo=UTC)
+    ch_client.execute(
+        f"""
+        INSERT INTO {bounded_span_table}
+            (id, project_id, trace_id, parent_span_id, start_time, created_at,
+             is_deleted, _version, attrs_string)
+        VALUES
+        """,
+        [
+            (
+                root_id,
+                project_id,
+                trace_id,
+                None,
+                started_at,
+                started_at,
+                0,
+                1,
+                {"final_status": "Rejected"},
+            )
+            for project_id, root_id in (
+                (project_a, "org-root-a"),
+                (project_b, "org-root-b"),
+            )
+        ],
+    )
+    filters = [
+        {
+            "column_id": "created_at",
+            "filter_config": {
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [
+                    (started_at - timedelta(minutes=1)).isoformat(),
+                    (started_at + timedelta(minutes=1)).isoformat(),
+                ],
+            },
+        },
+        {
+            "column_id": "final_status",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "Rejected",
+            },
+        },
+    ]
+
+    class LocalTraceBuilder(TraceListQueryBuilderV2):
+        TABLE = bounded_span_table
+
+    query, params = LocalTraceBuilder(
+        project_ids=[project_a, project_b],
+        filters=filters,
+        bounded_identity_only=True,
+    ).build_filter_match_query_from_seed_rows(
+        [
+            {
+                "project_id": project_id,
+                "trace_id": trace_id,
+                "root_span_id": root_id,
+                "start_time": started_at,
+            }
+            for project_id, root_id in (
+                (project_a, "org-root-a"),
+                (project_b, "org-root-b"),
+            )
+        ]
+    )
+
+    rows = ch_client.execute(query, params)
+
+    assert {(str(row[0]), row[1]) for row in rows} == {
+        (project_a, trace_id),
+        (project_b, trace_id),
+    }

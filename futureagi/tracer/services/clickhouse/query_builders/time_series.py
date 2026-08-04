@@ -108,8 +108,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
 
         if extra_where:
             return self._build_raw_query(extra_where)
-        else:
-            return self._build_agg_query()
+        return self._build_agg_query()
 
     def format_result(
         self,

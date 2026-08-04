@@ -7,6 +7,8 @@ Tests for /tracer/project/ endpoints.
 import json
 import uuid
 from datetime import UTC, timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from django.utils import timezone
@@ -18,6 +20,7 @@ from tracer.models.observation_span import ObservationSpan
 from tracer.models.project import Project
 from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession
+from tracer.tests._ch_seed import seed_ch_spans
 
 AUTH_REQUIRED_STATUS_CODES = (
     status.HTTP_401_UNAUTHORIZED,
@@ -203,6 +206,39 @@ class TestObserveProjectListAPI:
         assert data["metadata"]["total_rows"] == 1
         assert data["table"][0]["id"] == str(observe_project.id)
         assert data["table"][0]["issues"] == 0
+
+    def test_list_projects_reads_latest_activity_from_direct_ch25(
+        self, auth_client, observe_project
+    ):
+        last_active = timezone.now()
+        day = last_active.strftime("%Y-%m-%d")
+        service = object()
+        with patch("tracer.views.project.V2AnalyticsQueryService") as service_class:
+            service = service_class.return_value
+            service.execute_ch_query.return_value = SimpleNamespace(
+                data=[
+                    {
+                        "project_id": str(observe_project.id),
+                        "volume": 3,
+                        "last_active": last_active,
+                        "daily_volume": [(day, 3)],
+                    }
+                ]
+            )
+            response = auth_client.get("/tracer/project/list_projects/")
+
+        assert response.status_code == status.HTTP_200_OK
+        row = get_result(response)["table"][0]
+        assert row["last_30_days_vol"] == 3
+        assert row["last_active"] == last_active.isoformat()
+        assert row["daily_volume"][-1] == 3
+
+        query, params = service.execute_ch_query.call_args.args[:2]
+        assert "argMax(is_deleted, _version)" in query
+        assert "latest_is_deleted = 0" in query
+        assert "FROM spans" in query
+        assert params["pids"] == [str(observe_project.id)]
+        service.execute_ch_query.assert_called_once()
 
 
 @pytest.mark.integration
@@ -682,6 +718,88 @@ class TestProjectGraphDataAPI:
         assert "system_metrics" in data
         assert "evaluations" in data
 
+    @patch("tracer.views.project.get_all_system_metrics")
+    def test_get_graph_data_requires_sample_opt_in(
+        self,
+        get_metrics,
+        auth_client,
+        observe_project,
+    ):
+        get_metrics.return_value = {
+            "latency": [{"timestamp": "2026-08-03T00:00:00Z", "latency": 12}],
+            "tokens": [],
+            "cost": [],
+            "traffic": [],
+            "query_complete": False,
+            "query_status": "sampled",
+            "query_error_code": "sample_limit",
+            "query_sampling_strategy": "time_stratified_latest_state",
+            "query_sampling_strata": 8,
+            "query_sampling_strata_completed": 8,
+        }
+        params = {"project_id": str(observe_project.id), "interval": "day"}
+
+        legacy_response = auth_client.get(
+            "/tracer/project/get_graph_data/",
+            params,
+        )
+        opted_in_response = auth_client.get(
+            "/tracer/project/get_graph_data/",
+            {**params, "allow_sampled": "true"},
+        )
+
+        assert legacy_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert opted_in_response.status_code == status.HTTP_200_OK
+        assert get_result(opted_in_response)["system_metrics"]["query_status"] == (
+            "sampled"
+        )
+
+    @patch("tracer.views.project.fetch_annotation_graph_ch")
+    @patch("tracer.views.project.V2AnalyticsQueryService")
+    def test_users_aggregate_graph_requires_sample_opt_in(
+        self,
+        _analytics,
+        fetch_annotation,
+        auth_client,
+        observe_project,
+    ):
+        fetch_annotation.return_value = {
+            "metric_name": "annotation-id",
+            "data": [{"timestamp": "2026-08-03T00:00:00Z", "value": 50}],
+            "query_complete": False,
+            "query_status": "sampled",
+            "query_error_code": "sample_limit",
+            "query_sampling_strategy": "time_stratified_latest_state",
+            "query_sampling_strata": 8,
+            "query_sampling_strata_completed": 8,
+        }
+        request_body = {
+            "project_id": str(observe_project.id),
+            "interval": "day",
+            "filters": [],
+            "property": "average",
+            "req_data_config": {
+                "id": "annotation-id",
+                "type": "ANNOTATION",
+                "output_type": "SCORE",
+            },
+        }
+
+        legacy_response = auth_client.post(
+            "/tracer/project/get_users_aggregate_graph_data/",
+            request_body,
+            format="json",
+        )
+        opted_in_response = auth_client.post(
+            ("/tracer/project/get_users_aggregate_graph_data/?allow_sampled=true"),
+            request_body,
+            format="json",
+        )
+
+        assert legacy_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert opted_in_response.status_code == status.HTTP_200_OK
+        assert get_result(opted_in_response)["query_status"] == "sampled"
+
     def test_get_graph_data_applies_observe_chart_filters(
         self, auth_client, observe_project
     ):
@@ -719,7 +837,7 @@ class TestProjectGraphDataAPI:
             status="OK",
             span_attributes={"api_journey_marker": f"target-{suffix}"},
         )
-        ObservationSpan.objects.create(
+        span_a_child = ObservationSpan.objects.create(
             id=f"chart_filter_a_child_{suffix}",
             project=observe_project,
             trace=trace_a,
@@ -752,6 +870,7 @@ class TestProjectGraphDataAPI:
             status="OK",
             span_attributes={"api_journey_marker": f"other-{suffix}"},
         )
+        seed_ch_spans([span_a, span_a_child, span_b])
 
         date_filter = _chart_filter(
             "created_at",
@@ -767,6 +886,7 @@ class TestProjectGraphDataAPI:
                     "project_id": str(observe_project.id),
                     "interval": "day",
                     "filters": json.dumps(filters),
+                    "allow_sampled": "true",
                 },
             )
             assert response.status_code == status.HTTP_200_OK

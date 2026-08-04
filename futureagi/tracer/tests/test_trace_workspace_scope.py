@@ -218,7 +218,7 @@ class TestTraceWorkspaceScopeAPI:
         assert "Average" in response.data["result"]
         assert "P95" in response.data["result"]
 
-    def test_agent_graph_preserves_sanitized_400_without_pg_fallback(
+    def test_agent_graph_preserves_sanitized_500_without_pg_fallback(
         self, auth_client, project, monkeypatch
     ):
         # Post-migration contract (DECISIONS #027): agent_graph is CH-only.
@@ -228,7 +228,8 @@ class TestTraceWorkspaceScopeAPI:
         # failures now preserve the sanitized 400 boundary instead of silently
         # degrading or exposing private query details.
         monkeypatch.setattr(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService.execute_ch_query",
+            "tracer.services.clickhouse.v2.query_service."
+            "V2AnalyticsQueryService.execute_ch_query",
             lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ch down")),
         )
 
@@ -273,8 +274,8 @@ class TestTraceWorkspaceScopeAPI:
             {"project_id": str(project.id)},
         )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST, (
-            f"expected 400 when CH fails (no PG fallback); got {response.status_code}: "
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR, (
+            f"expected 500 when CH fails (no PG fallback); got {response.status_code}: "
             f"{getattr(response, 'data', None)!r}"
         )
         # Diagnostic must mention agent_graph so operators can route the alert.
@@ -294,15 +295,15 @@ class TestTraceWorkspaceScopeAPI:
             ),
             (
                 ServerException("secret unknown identifier", 47),
-                status.HTTP_400_BAD_REQUEST,
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
             ),
             (
                 ServerException("secret unknown table", 60),
-                status.HTTP_400_BAD_REQUEST,
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
             ),
             (
                 ServerException("secret syntax error", 62),
-                status.HTTP_400_BAD_REQUEST,
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
             ),
         ],
     )
@@ -315,8 +316,8 @@ class TestTraceWorkspaceScopeAPI:
         expected_status,
     ):
         monkeypatch.setattr(
-            "tracer.services.clickhouse.query_service."
-            "AnalyticsQueryService.execute_ch_query",
+            "tracer.services.clickhouse.v2.query_service."
+            "V2AnalyticsQueryService.execute_ch_query",
             lambda *args, **kwargs: (_ for _ in ()).throw(failure),
         )
 

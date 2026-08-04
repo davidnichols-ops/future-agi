@@ -32,6 +32,7 @@ import FilterChips from "../LLMTracing/FilterChips";
 import { useLLMTracingFilters } from "../LLMTracing/useLLMTracingFilters";
 import { buildAddEvalsDraft } from "../LLMTracing/buildAddEvalsDraft";
 import SelectAllBanner from "../LLMTracing/SelectAllBanner";
+import { getSelectionCountState } from "../LLMTracing/listTotalMetadata";
 
 // Lazy-load graph
 const PrimaryGraph = lazy(
@@ -726,12 +727,19 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
     setCreatedReplay: s.setCreatedReplay,
   }));
 
-  const { totalRowCount, toggledNodes, selectAll } =
-    useSessionsGridStoreShallow((s) => ({
-      totalRowCount: s.totalRowCount,
-      toggledNodes: s.toggledNodes,
-      selectAll: s.selectAll,
-    }));
+  const {
+    totalRowCount,
+    totalRowCountLowerBound,
+    totalRowCountIsLowerBound,
+    toggledNodes,
+    selectAll,
+  } = useSessionsGridStoreShallow((s) => ({
+    totalRowCount: s.totalRowCount,
+    totalRowCountLowerBound: s.totalRowCountLowerBound,
+    totalRowCountIsLowerBound: s.totalRowCountIsLowerBound,
+    toggledNodes: s.toggledNodes,
+    selectAll: s.selectAll,
+  }));
 
   const { mutate: createReplaySessions } = useCreateReplaySessions();
 
@@ -752,12 +760,19 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
       toggledNodes: toggled,
       selectAll: !!ssState.selectAll,
       totalRowCount: params.api.totalRowCount,
+      totalRowCountLowerBound: params.api.totalRowCountLowerBound,
+      totalRowCountIsLowerBound: params.api.totalRowCountIsLowerBound,
     });
   }, []);
 
-  const selectedCount = selectAll
-    ? totalRowCount - toggledNodes.length
-    : toggledNodes.length;
+  const selectedCountState = getSelectionCountState({
+    selectAll,
+    toggledNodes,
+    totalRowCount,
+    totalRowCountLowerBound,
+    totalRowCountIsLowerBound,
+  });
+  const selectedCount = selectedCountState.count;
 
   const [queueAnchorEl, setQueueAnchorEl] = useState(null);
   // Opt-in for filter-mode bulk add — set when the SelectAllBanner is
@@ -1048,6 +1063,7 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
         }}
         // Bulk actions
         selectedCount={selectedCount}
+        selectedCountIsLowerBound={selectedCountState.isLowerBound}
         allMatching={sessionFilterSelectionMode}
         onClearSelection={() => {
           sessionGridApiRef.current?.api?.deselectAll();
@@ -1138,7 +1154,12 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
         visibleCount={
           sessionGridApiRef.current?.api?.getDisplayedRowCount?.() || 0
         }
-        totalMatching={totalRowCount || 0}
+        totalMatching={
+          totalRowCountIsLowerBound
+            ? totalRowCountLowerBound || 0
+            : totalRowCount || 0
+        }
+        totalMatchingIsLowerBound={totalRowCountIsLowerBound}
         noun="session"
         onSelectAll={() => setSessionFilterSelectionMode(true)}
       />

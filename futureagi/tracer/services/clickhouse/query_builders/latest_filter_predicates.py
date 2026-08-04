@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import unicodedata
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -271,6 +272,44 @@ def _comparison(
     if exists_alias:
         predicate = f"{exists_alias} AND {predicate}"
     return predicate, params
+
+
+def _raw_uuid_seed_predicate(
+    *,
+    column: str,
+    config: dict[str, Any],
+    params: dict[str, Any],
+    index: int,
+) -> str | None:
+    """Return an index-usable UUID equality seed without changing semantics.
+
+    UUID identity columns are exposed to the frontend as text, so their
+    latest-state classifier remains the ordinary case-insensitive text
+    comparison.  For canonical UUID equality/IN values, however, the raw
+    ``Nullable(UUID)`` column is an exact candidate superset and lets
+    ClickHouse apply its bloom-filter index.  Invalid/non-canonical values and
+    every negative or substring operation deliberately keep the generic text
+    predicate.
+    """
+
+    operation = normalize_filter_op(
+        str(config.get("filter_op") or config.get("filterOp") or "")
+    )
+    if operation not in {"equals", "in"}:
+        return None
+    param = f"latest_filter_param_{index}"
+    value = params.get(param)
+    values = value if isinstance(value, tuple) else (value,)
+    if not values:
+        return None
+    try:
+        canonical = tuple(str(uuid.UUID(str(item))) for item in values)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if canonical != tuple(str(item) for item in values):
+        return None
+    operator = "=" if operation == "equals" else "IN"
+    return f"{column} {operator} %({param})s"
 
 
 def _attribute_plan(
@@ -762,6 +801,16 @@ def _column_plan(
         value_type=value_type,
         index=index,
     )
+    if column == "trace_session_id":
+        seed_predicate = (
+            _raw_uuid_seed_predicate(
+                column=column,
+                config=config,
+                params=seed_params,
+                index=index,
+            )
+            or seed_predicate
+        )
     if seed_params != params:
         raise AssertionError("latest and seed predicates must share bound values")
     return LatestFilterPredicate(

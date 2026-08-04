@@ -6,11 +6,16 @@ from pathlib import Path
 import pytest
 
 from tfc.utils.serializer_fields import JsonValueField
+from tracer.serializers.observation_span import (
+    ObservationAttributeListResponseSerializer,
+)
 from tracer.serializers.span_attributes import (
     SpanAttributeDetailResponseSerializer,
     SpanAttributeKeySerializer,
+    SpanAttributeKeysResponseSerializer,
     SpanAttributeTopValueSerializer,
     SpanAttributeValueSerializer,
+    SpanAttributeValuesResponseSerializer,
 )
 
 
@@ -31,6 +36,13 @@ TYPE_FIELDS = (
     (SpanAttributeDetailResponseSerializer, "SpanAttributeDetailResponse"),
 )
 
+QUERY_STATUS_SERIALIZERS = (
+    SpanAttributeKeysResponseSerializer,
+    SpanAttributeValuesResponseSerializer,
+    SpanAttributeDetailResponseSerializer,
+    ObservationAttributeListResponseSerializer,
+)
+
 
 @pytest.mark.parametrize(("serializer_cls", "definition_name"), TYPE_FIELDS)
 def test_span_attribute_type_enum_matches_generated_openapi(
@@ -43,6 +55,13 @@ def test_span_attribute_type_enum_matches_generated_openapi(
 
     assert runtime_choices == ["string", "number", "boolean", "array"]
     assert openapi_choices == runtime_choices
+
+
+@pytest.mark.parametrize("serializer_cls", QUERY_STATUS_SERIALIZERS)
+def test_attribute_query_status_enum_is_declared_for_openapi(serializer_cls):
+    runtime_choices = list(serializer_cls().fields["query_status"].choices)
+
+    assert runtime_choices == ["complete", "sampled", "degraded"]
 
 
 @pytest.mark.parametrize(

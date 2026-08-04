@@ -34,6 +34,10 @@ import Iconify from "src/components/iconify";
 import TraceFilterPanel from "../LLMTracing/TraceFilterPanel";
 import FilterChips from "../LLMTracing/FilterChips";
 import { buildApiFilterFromPanelRow } from "src/api/contracts/filter-contract";
+import {
+  getQueryReadMessage,
+  getQueryReadState,
+} from "src/utils/queryReadState";
 
 const DateRangeButtonOptions = [
   { title: "Hour", value: "hour" },
@@ -278,6 +282,7 @@ const ChartsView = () => {
   const {
     data: graphData,
     isLoading,
+    isError: graphError,
     refetch: refetchSystemMetrics,
     isRefetching: isRefetchingSystemMetrics,
   } = useQuery({
@@ -288,6 +293,7 @@ const ChartsView = () => {
           project_id: observeId,
           filters: JSON.stringify(filters),
           interval: selectedInterval?.toLowerCase(),
+          allow_sampled: true,
         },
       });
       return response.data;
@@ -295,12 +301,20 @@ const ChartsView = () => {
     enabled: Boolean(observeId) && filters?.length > 0,
   });
 
+  const systemMetrics = graphData?.result?.system_metrics;
+  const graphReadState = getQueryReadState(systemMetrics, {
+    isError: graphError,
+  });
+  const graphReadMessage = getQueryReadMessage(graphReadState);
+
   const chartCategories = useMemo(() => {
     if (
-      graphData?.result?.system_metrics &&
-      Object.keys(graphData?.result?.system_metrics)?.length > 0
+      (graphReadState === "complete" || graphReadState === "sampled") &&
+      systemMetrics &&
+      Object.keys(systemMetrics)?.length > 0
     ) {
       setIsData(true);
+      const samplePrefix = graphReadState === "sampled" ? "Sampled " : "";
       return [
         {
           label: "System Metrics",
@@ -313,9 +327,9 @@ const ChartsView = () => {
               isEvaluationChart: false,
               series: [
                 {
-                  name: "Latency",
+                  name: `${samplePrefix}Latency`,
                   data:
-                    graphData?.result?.system_metrics?.latency?.map((item) => ({
+                    systemMetrics?.latency?.map((item) => ({
                       x: normalizeTimestamp(item?.timestamp),
                       y: item?.latency,
                     })) || [],
@@ -330,9 +344,9 @@ const ChartsView = () => {
               isEvaluationChart: false,
               series: [
                 {
-                  name: "Tokens",
+                  name: `${samplePrefix}Tokens`,
                   data:
-                    graphData?.result?.system_metrics?.tokens?.map((item) => ({
+                    systemMetrics?.tokens?.map((item) => ({
                       x: normalizeTimestamp(item?.timestamp),
                       y: item?.tokens,
                     })) || [],
@@ -347,9 +361,9 @@ const ChartsView = () => {
               isEvaluationChart: false,
               series: [
                 {
-                  name: "Traffic",
+                  name: `${samplePrefix}Traffic`,
                   data:
-                    graphData?.result?.system_metrics?.traffic?.map((item) => ({
+                    systemMetrics?.traffic?.map((item) => ({
                       x: normalizeTimestamp(item?.timestamp),
                       y: item?.traffic,
                     })) || [],
@@ -364,9 +378,9 @@ const ChartsView = () => {
               isEvaluationChart: false,
               series: [
                 {
-                  name: "Cost",
+                  name: `${samplePrefix}Cost`,
                   data:
-                    graphData?.result?.system_metrics?.cost?.map((item) => ({
+                    systemMetrics?.cost?.map((item) => ({
                       x: normalizeTimestamp(item?.timestamp),
                       y: item?.cost,
                     })) || [],
@@ -379,7 +393,7 @@ const ChartsView = () => {
     }
 
     return [];
-  }, [graphData]);
+  }, [graphReadState, systemMetrics]);
 
   const refreshGrid = useCallback(() => {
     queryClient.invalidateQueries({
@@ -564,6 +578,16 @@ const ChartsView = () => {
 
       {/* Chart Categories and Charts */}
       <Box sx={{ paddingTop: theme.spacing(3) }}>
+        {graphReadMessage && (
+          <Typography
+            role="status"
+            variant="caption"
+            color={graphReadState === "sampled" ? "warning.main" : "error.main"}
+            sx={{ display: "block", mb: 1 }}
+          >
+            {graphReadMessage}
+          </Typography>
+        )}
         {isLoading ? (
           <>
             <Skeleton

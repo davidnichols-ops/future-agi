@@ -7,6 +7,7 @@ from clickhouse_driver.errors import NetworkError, ServerException, SocketTimeou
 
 from tracer.services.clickhouse.read_budget import (
     ReadDeadlineExceeded,
+    is_clickhouse_api_read_unavailable_error,
     is_clickhouse_query_error,
     is_read_budget_error,
 )
@@ -111,4 +112,26 @@ def test_clickhouse_query_error_classifier_rejects_untyped_or_config_errors() ->
     assert not is_clickhouse_query_error(RuntimeError("Code: 60 missing table"))
     assert not is_clickhouse_query_error(
         OperationalError("Unsupported compression type: private")
+    )
+
+
+@pytest.mark.parametrize("code", [159, 241, 307, 386])
+def test_api_read_unavailable_classifier_accepts_customer_failure_codes(
+    code: int,
+) -> None:
+    native = ServerException("private server SQL and stack", code=code)
+    http = ClickHouseConnectDatabaseError(
+        f"Received ClickHouse exception, code: {code}, server response: private"
+    )
+
+    assert is_clickhouse_api_read_unavailable_error(native)
+    assert is_clickhouse_api_read_unavailable_error(http)
+
+
+def test_api_read_unavailable_classifier_keeps_query_defects_and_text_fail_closed():
+    assert not is_clickhouse_api_read_unavailable_error(
+        ServerException("private unknown column", code=47)
+    )
+    assert not is_clickhouse_api_read_unavailable_error(
+        RuntimeError("Received ClickHouse exception, code: 386, private")
     )

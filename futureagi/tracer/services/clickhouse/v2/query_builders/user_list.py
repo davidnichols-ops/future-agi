@@ -25,7 +25,5 @@ from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 class UserListQueryBuilderV2(V2RewriteMixin, UserListQueryBuilder):
     """Drop-in v2 UserList builder — adds SETTINGS for projection routing."""
 
-    pass
-
 
 __all__ = ["UserListQueryBuilderV2"]

@@ -46,6 +46,12 @@ LOWER = datetime(2026, 1, 1, 0, 0, 0, 123456)
 VALUE = datetime(2026, 2, 2, 3, 4, 5, 654321)
 UPPER = datetime(2026, 3, 3, 6, 7, 8, 987654)
 ONE_MICROSECOND = timedelta(microseconds=1)
+EPOCH = datetime(1970, 1, 1)
+
+
+def _micros(value: datetime) -> int:
+    delta = value - EPOCH
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
 
 def _datetime_filter(
@@ -157,11 +163,17 @@ def test_strict_time_range_preserves_complements_inside_finite_base(
     assert (analyzed.start, analyzed.end) == (LOWER, UPPER)
     assert analyzed.exclusions == expected_exclusions
     assert analyzed.empty is False
-    assert "start_time < %(bounded_datetime_0_start)s" in predicate
-    assert "start_time >= %(bounded_datetime_0_end)s" in predicate
+    assert (
+        "start_time < fromUnixTimestamp64Micro(%(bounded_datetime_0_start)s)"
+        in predicate
+    )
+    assert (
+        "start_time >= fromUnixTimestamp64Micro(%(bounded_datetime_0_end)s)"
+        in predicate
+    )
     assert params == {
-        "bounded_datetime_0_start": expected_exclusions[0][0],
-        "bounded_datetime_0_end": expected_exclusions[0][1],
+        "bounded_datetime_0_start": _micros(expected_exclusions[0][0]),
+        "bounded_datetime_0_end": _micros(expected_exclusions[0][1]),
     }
 
 
@@ -684,10 +696,10 @@ def test_direct_list_builders_compile_not_equals_as_microsecond_exclusion(
 
     query, params = builder.build()
 
-    assert "start_time < %(" in query
-    assert "start_time >= %(" in query
-    assert VALUE in params.values()
-    assert VALUE + ONE_MICROSECOND in params.values()
+    assert "start_time < fromUnixTimestamp64Micro(%(" in query
+    assert "start_time >= fromUnixTimestamp64Micro(%(" in query
+    assert _micros(VALUE) in params.values()
+    assert _micros(VALUE + ONE_MICROSECOND) in params.values()
 
 
 @pytest.mark.parametrize(
@@ -929,8 +941,16 @@ def test_trace_multifilter_classifier_keeps_attribute_and_datetime_complement():
 
     query, params = builder.build_filter_match_query(["trace-1"])
 
-    assert "latest_start_time < %(trace_match_time_exclusion_0_start)s" in query
-    assert "latest_start_time >= %(trace_match_time_exclusion_0_end)s" in query
+    assert (
+        "latest_start_time < "
+        "fromUnixTimestamp64Micro(%(trace_match_time_exclusion_0_start)s)" in query
+    )
+    assert (
+        "latest_start_time >= "
+        "fromUnixTimestamp64Micro(%(trace_match_time_exclusion_0_end)s)" in query
+    )
     assert "latest_attr_value_0" in query
-    assert params["trace_match_time_exclusion_0_start"] == VALUE
-    assert params["trace_match_time_exclusion_0_end"] == VALUE + ONE_MICROSECOND
+    assert params["trace_match_time_exclusion_0_start"] == _micros(VALUE)
+    assert params["trace_match_time_exclusion_0_end"] == _micros(
+        VALUE + ONE_MICROSECOND
+    )

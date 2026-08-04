@@ -485,10 +485,8 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
                     onSelectionChanged(traceIds);
                     if (onSelectionMeta) {
                       const currentPageSize = rows?.length || 0;
-                      // `data.count` is the exact matching-row count from
-                      // the backend (CH or PG), not `totalPages * pageLimit`
-                      // which rounds up to a page multiple and overstates
-                      // the banner by up to `pageLimit - 1` rows.
+                      // Keep the backend's explicit lower-bound marker with
+                      // the count; callers must not present it as exact.
                       const totalMatching =
                         typeof data?.count === "number" ? data.count : null;
                       const unavailableSelectedCount = selectedRows.filter(
@@ -506,6 +504,8 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
                         totalPages,
                         pageLimit,
                         totalMatching,
+                        totalMatchingIsLowerBound:
+                          data?.count_is_lower_bound === true,
                       });
                     }
                   }

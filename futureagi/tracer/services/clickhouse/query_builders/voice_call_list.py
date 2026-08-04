@@ -86,6 +86,9 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
     EVAL_TABLE = "tracer_eval_logger"
     ANNOTATION_TABLE = "model_hub_score"
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
+    # Legacy/default behavior follows the rollout setting. The V2 subclass
+    # injects the direct-write helper explicitly.
+    _EVAL_LOGGER_SOURCE = staticmethod(eval_logger_source)
 
     def __init__(
         self,
@@ -228,11 +231,10 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         simulator_phone = """
             coalesce(
                 nullIf(JSONExtractString(
-                    latest_span_attributes_raw, 'raw_log', 'customer', 'number'
+                    latest_raw_log_json, 'customer', 'number'
                 ), ''),
                 nullIf(JSONExtractString(
-                    JSONExtractString(latest_span_attributes_raw, 'raw_log'),
-                    'customer', 'number'
+                    latest_raw_log_text, 'customer', 'number'
                 ), ''),
                 nullIf(JSONExtractString(
                     latest_span_attr_str['raw_log'], 'customer', 'number'
@@ -242,11 +244,10 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         retell_phone = """
             coalesce(
                 nullIf(JSONExtractString(
-                    latest_span_attributes_raw, 'raw_log', 'from_number'
+                    latest_raw_log_json, 'from_number'
                 ), ''),
                 nullIf(JSONExtractString(
-                    JSONExtractString(latest_span_attributes_raw, 'raw_log'),
-                    'from_number'
+                    latest_raw_log_text, 'from_number'
                 ), ''),
                 nullIf(JSONExtractString(
                     latest_span_attr_str['raw_log'], 'from_number'
@@ -276,8 +277,12 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
                     argMax(observation_type, _peerdb_version)
                         AS latest_observation_type,
                     argMax(provider, _peerdb_version) AS latest_provider,
-                    argMax(tuple(span_attributes_raw), _peerdb_version).1
-                        AS latest_span_attributes_raw,
+                    argMax(tuple(JSONExtractRaw(
+                        span_attributes_raw, 'raw_log'
+                    )), _peerdb_version).1 AS latest_raw_log_json,
+                    argMax(tuple(JSONExtractString(
+                        span_attributes_raw, 'raw_log'
+                    )), _peerdb_version).1 AS latest_raw_log_text,
                     argMax(span_attr_str, _peerdb_version)
                         AS latest_span_attr_str,
                     argMax(_peerdb_is_deleted, _peerdb_version)
@@ -606,7 +611,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
             "eval_config_ids": tuple(self.eval_config_ids),
         }
 
-        table, _ = eval_logger_source()
+        table, _ = self._EVAL_LOGGER_SOURCE()
         is_v2 = table.endswith("_v2")
         version = "_version" if is_v2 else "_peerdb_version"
         status_aggregate = "'completed'" if is_v2 else f"argMax(status, {version})"

@@ -440,11 +440,13 @@ async function fetchAllTraceIds(
         page_number: page,
         page_size: TRACE_ROWS_LIMIT,
         filters: serializedFilters,
+        allow_sampled: true,
       },
     });
     const res = resp?.data?.result;
     const rows = res?.table ?? [];
-    const totalRows = res?.metadata?.totalRows ?? 0;
+    const metadata = res?.metadata ?? {};
+    const totalRows = metadata.totalRows ?? metadata.total_rows ?? 0;
 
     rows.forEach((row) => {
       const id = row.rowId || row.trace_id || row.id;
@@ -452,7 +454,10 @@ async function fetchAllTraceIds(
     });
 
     page += 1;
-    hasMore = page * TRACE_ROWS_LIMIT < totalRows;
+    hasMore =
+      metadata.has_more ??
+      metadata.hasMore ??
+      page * TRACE_ROWS_LIMIT < totalRows;
   }
 
   return allIds;
@@ -478,11 +483,13 @@ async function fetchAllSpanIds(
         page_number: page,
         page_size: SPAN_ROWS_LIMIT,
         filters: serializedFilters,
+        allow_sampled: true,
       },
     });
     const res = resp?.data?.result;
     const rows = res?.table ?? [];
-    const totalRows = res?.metadata?.totalRows ?? 0;
+    const metadata = res?.metadata ?? {};
+    const totalRows = metadata.totalRows ?? metadata.total_rows ?? 0;
 
     rows.forEach((row) => {
       const id = row.rowId || row.span_id || row.id;
@@ -490,7 +497,10 @@ async function fetchAllSpanIds(
     });
 
     page += 1;
-    hasMore = page * SPAN_ROWS_LIMIT < totalRows;
+    hasMore =
+      metadata.has_more ??
+      metadata.hasMore ??
+      page * SPAN_ROWS_LIMIT < totalRows;
   }
 
   return allIds;
@@ -1944,6 +1954,7 @@ function TraceSelector({
 
           const apiParams = {
             project_id: projectId,
+            allow_sampled: true,
             page_number: pageNumber,
             page_size: TRACE_ROWS_LIMIT,
             filters: JSON.stringify(
@@ -2615,6 +2626,7 @@ function SpanSelector({ onSetSelection, onSelectAll }) {
 
           const apiParams = {
             project_id: projectId,
+            allow_sampled: true,
             page_number: pageNumber,
             page_size: SPAN_ROWS_LIMIT,
             filters: JSON.stringify(
@@ -3190,6 +3202,7 @@ function SessionSelector({ onSetSelection, onSelectAll }) {
             {
               params: {
                 project_id: projectId,
+                allow_sampled: true,
                 ...(versionId ? { project_version_id: versionId } : {}),
                 page_number: pageNumber,
                 page_size: SESSION_ROWS_LIMIT,

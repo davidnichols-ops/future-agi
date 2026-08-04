@@ -10,6 +10,10 @@ from uuid import UUID
 
 from model_hub.models.choices import AnnotationTypeChoices
 from model_hub.models.develop_annotations import AnnotationsLabels
+from tracer.services.annotation_label_source import (
+    AnnotationLabelScoresProjectPG,
+    AnnotationScoreReadUnavailable,
+)
 from tracer.services.clickhouse.bounded_graph_reads import (
     GRAPH_CANDIDATE_LIMIT,
     GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
@@ -192,10 +196,11 @@ def _require_renderable_sample(sample: GraphCandidateSample) -> None:
     """Accept only exact rows or an intentional bounded sample marker.
 
     A ``sample_limit`` candidate set contains proven matches selected by the
-    deterministic full-window graph sampler. It is safe to return its bounded
-    diagnostics and graph points when its metadata remains explicitly sampled.
-    Partial rows from an unclassified or failed query remain a typed degraded
-    error.
+    bounded temporal graph sampler. It is safe to return its diagnostics and
+    graph points when metadata proves every declared sampling stratum ran.
+    An empty fully-executed sample is also intentional; it does not claim global
+    absence. Partial rows from an unclassified or failed query remain a typed
+    degraded error.
     """
 
     if sample.query_complete:
@@ -203,7 +208,6 @@ def _require_renderable_sample(sample: GraphCandidateSample) -> None:
     if (
         sample.query_status == "sampled"
         and sample.sampling_strategy
-        and sample.rows
         and sample.sampling_strata > 0
         and sample.sampling_strata_completed == sample.sampling_strata
     ):
@@ -248,6 +252,46 @@ def enforce_exact_graph_data_contract(
     ):
         return {**response, "data": []}
     return response
+
+
+def graph_payload_is_publishable(
+    payload: dict[str, Any] | list[dict[str, Any]],
+    *,
+    allow_sampled: bool,
+) -> bool:
+    """Fail closed unless every incomplete graph series was explicitly accepted.
+
+    Additive response metadata cannot protect older clients that ignore it and
+    chart ordinary numeric points as exact totals. Public views therefore call
+    this boundary before returning data. Exact responses (including legacy
+    responses without coverage metadata) remain publishable; sampled responses
+    require both a client opt-in and complete declared sampling-strata coverage.
+    """
+
+    series = payload if isinstance(payload, list) else [payload]
+    for item in series:
+        if not isinstance(item, dict):
+            return False
+        status = item.get("query_status")
+        complete = item.get("query_complete")
+        if status == "degraded":
+            return False
+        if status == "sampled":
+            planned = item.get("query_sampling_strata")
+            if (
+                not allow_sampled
+                or complete is not False
+                or not item.get("query_sampling_strategy")
+                or not isinstance(planned, int)
+                or isinstance(planned, bool)
+                or planned < 1
+                or item.get("query_sampling_strata_completed") != planned
+            ):
+                return False
+            continue
+        if complete is False:
+            return False
+    return True
 
 
 def _span_identity(row: dict[str, Any]) -> SpanIdentity | None:
@@ -437,17 +481,16 @@ def _trace_system_metric_query(
     }
 
 
-def _fetch_trace_system_metric_graph(
+def _fetch_trace_system_metrics(
     *,
     analytics: Any,
     sample: GraphCandidateSample,
     project_id: str,
     interval: str,
-    metric_id: str,
     started: float,
     timeout_ms: int,
-) -> dict[str, Any]:
-    """Preserve trace-graph semantics by aggregating all child spans."""
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Aggregate all metrics for a finite set of trace candidates once."""
 
     _ensure_point_budget(
         start_date=sample.window_start,
@@ -495,9 +538,7 @@ def _fetch_trace_system_metric_graph(
     )
     formatter.start_date = sample.window_start
     formatter.end_date = sample.window_end
-    response = format_system_metric_graph(
-        formatter.format_result(rows, columns), metric_id
-    )
+    metrics = formatter.format_result(rows, columns)
     metadata = _decoration_metadata(
         sample=sample,
         truncated=span_ids_truncated,
@@ -505,6 +546,32 @@ def _fetch_trace_system_metric_graph(
         query_count=sample.query_count + identity_query_count + metric_query_count,
         rows_returned=(sample.rows_returned + identity_rows_returned + len(rows)),
     )
+    if metadata.get("query_status") == "degraded":
+        metrics = {key: [] for key in metrics}
+    return metrics, metadata
+
+
+def _fetch_trace_system_metric_graph(
+    *,
+    analytics: Any,
+    sample: GraphCandidateSample,
+    project_id: str,
+    interval: str,
+    metric_id: str,
+    started: float,
+    timeout_ms: int,
+) -> dict[str, Any]:
+    """Preserve trace-graph semantics by aggregating all child spans."""
+
+    metrics, metadata = _fetch_trace_system_metrics(
+        analytics=analytics,
+        sample=sample,
+        project_id=project_id,
+        interval=interval,
+        started=started,
+        timeout_ms=timeout_ms,
+    )
+    response = format_system_metric_graph(metrics, metric_id)
     response.update(metadata)
     return enforce_exact_graph_data_contract(response)
 
@@ -519,7 +586,7 @@ def fetch_system_metric_graph_ch(
     observe_type: str = "trace",
     timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
 ) -> dict[str, Any]:
-    """Read an exact graph or an explicitly incomplete cardinality sample."""
+    """Read an exact graph or an explicitly bounded latest-state sample."""
 
     started = monotonic()
     project_id = _validated_project_id(project_id)
@@ -534,63 +601,134 @@ def fetch_system_metric_graph_ch(
             "data": [],
             **_complete_metadata(started=started, query_count=0, rows_returned=0),
         }
-    if _active_filters(filters):
-        sample = read_graph_candidates(
+    # The insertion-only hourly rollup cannot retract corrected or deleted
+    # spans, while an exact full-window ReplacingMergeTree collapse is not a
+    # finite production read.  Use the same bounded latest-state candidate lane
+    # for time-only and filtered graphs.  Long windows are intentionally marked
+    # sampled; short exhausted candidate sets remain exact.
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=project_id,
+        filters=filters,
+        observe_type=observe_type,
+        allow_time_only_seed=not _active_filters(filters),
+    )
+    _require_renderable_sample(sample)
+    if str(observe_type or "").strip().lower() == "trace":
+        return _fetch_trace_system_metric_graph(
             analytics=analytics,
+            sample=sample,
+            project_id=project_id,
+            interval=interval,
+            metric_id=metric_id,
+            started=started,
+            timeout_ms=timeout_ms,
+        )
+    response = aggregate_system_candidate_graph(
+        sample,
+        metric_id=metric_id,
+        interval=interval,
+    )
+    response["query_elapsed_ms"] = round((monotonic() - started) * 1000, 3)
+    return enforce_exact_graph_data_contract(response)
+
+
+def fetch_all_system_metrics_ch(
+    *,
+    analytics: Any,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    interval: str,
+    timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
+) -> dict[str, Any]:
+    """Read all public project-chart metrics through one finite span replay.
+
+    The project chart historically applies every filter to ``ObservationSpan``
+    rows before aggregation.  A trace candidate followed by decorating all of
+    its children changes that contract: one matching child attribute would make
+    unrelated siblings contribute to traffic, tokens, cost, and latency.  Read
+    the bounded *span* candidates instead and aggregate their hydrated latest
+    state in process.  This also removes the two decoration queries while
+    keeping coverage metadata authoritative.
+    """
+
+    started = monotonic()
+    project_id = _validated_project_id(project_id)
+    filters = list(filters or [])
+    analyzed_window = BaseQueryBuilder.analyze_bounded_datetime_filters(
+        filters,
+        strict=True,
+    )
+    if analyzed_window.empty:
+        empty = TimeSeriesQueryBuilder(
             project_id=project_id,
             filters=filters,
-            observe_type=observe_type,
+            interval=interval,
         )
-        _require_renderable_sample(sample)
-        if str(observe_type or "").strip().lower() == "trace":
-            return _fetch_trace_system_metric_graph(
-                analytics=analytics,
-                sample=sample,
-                project_id=project_id,
-                interval=interval,
-                metric_id=metric_id,
-                started=started,
-                timeout_ms=timeout_ms,
-            )
-        response = aggregate_system_candidate_graph(
+        empty.start_date = analyzed_window.start
+        empty.end_date = analyzed_window.end
+        return {
+            **empty.format_result([], []),
+            **_complete_metadata(started=started, query_count=0, rows_returned=0),
+        }
+
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=project_id,
+        filters=filters,
+        observe_type="span",
+        allow_time_only_seed=not _active_filters(filters),
+    )
+    _require_renderable_sample(sample)
+    metric_ids = (
+        "latency",
+        "tokens",
+        "cost",
+        "traffic",
+        "prompt_tokens",
+        "completion_tokens",
+        "error_rate",
+    )
+    reduced = {
+        metric_id: aggregate_system_candidate_graph(
             sample,
             metric_id=metric_id,
             interval=interval,
-        )
-        response["query_elapsed_ms"] = round((monotonic() - started) * 1000, 3)
-        return enforce_exact_graph_data_contract(response)
+        )["data"]
+        for metric_id in metric_ids
+    }
 
-    builder = TimeSeriesQueryBuilder(
-        project_id=project_id,
-        filters=filters,
-        interval=interval,
-    )
-    query, params = builder.build()
-    assert builder.start_date is not None and builder.end_date is not None
-    _ensure_point_budget(
-        start_date=builder.start_date,
-        end_date=builder.end_date,
-        interval=interval,
-    )
-    result = analytics.execute_ch_query(
-        query,
-        params,
-        timeout_ms=min(timeout_ms, _remaining_timeout_ms(started, timeout_ms)),
-        settings=GRAPH_READ_SETTINGS,
-    )
-    if len(result.data or []) > GRAPH_MAX_POINTS:
-        raise BoundedGraphReadError("sample_limit")
-    response = format_system_metric_graph(
-        builder.format_result(result.data, result.columns or []), metric_id
-    )
-    response.update(
-        _complete_metadata(
-            started=started,
-            query_count=1,
-            rows_returned=len(result.data or []),
-        )
-    )
-    return response
+    def with_alias(points: list[dict[str, Any]], alias: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "timestamp": point.get("timestamp"),
+                "value": point.get("value", 0),
+                alias: point.get("value", 0),
+            }
+            for point in points
+        ]
+
+    metrics = {
+        "latency": with_alias(reduced["latency"], "latency"),
+        "tokens": with_alias(reduced["tokens"], "tokens"),
+        "cost": with_alias(reduced["cost"], "cost"),
+        "traffic": [
+            {
+                "timestamp": point.get("timestamp"),
+                "traffic": point.get("value", 0),
+            }
+            for point in reduced["traffic"]
+        ],
+        "prompt_tokens": reduced["prompt_tokens"],
+        "completion_tokens": reduced["completion_tokens"],
+        "input_tokens": reduced["prompt_tokens"],
+        "output_tokens": reduced["completion_tokens"],
+        "total_tokens": with_alias(reduced["tokens"], "tokens"),
+        "error_rate": reduced["error_rate"],
+    }
+    metadata = sample.metadata()
+    metadata["query_elapsed_ms"] = round((monotonic() - started) * 1000, 3)
+    return {**metrics, **metadata}
 
 
 def normalize_eval_graph_output_type(req_data_config: dict[str, Any]) -> str:
@@ -745,6 +883,43 @@ def _zero_filled_points(
     ]
 
 
+def _eval_bucket_values(
+    rows: list[dict[str, Any]],
+    *,
+    interval: str,
+    output_type: str,
+    selected: Any = None,
+) -> dict[datetime, tuple[float, int]]:
+    """Reduce one finite eval-event set into one chart series."""
+
+    states: dict[datetime, dict[str, Any]] = {}
+    selected_choice = str(selected) if selected not in (None, "") else None
+    for row in rows:
+        if row.get("error") or str(row.get("output_str") or "") == "ERROR":
+            continue
+        created_at = row.get("created_at")
+        if not isinstance(created_at, datetime):
+            continue
+        bucket = BaseQueryBuilder._normalize_timestamp(created_at, interval)
+        state = states.setdefault(bucket, {"sum": 0.0, "count": 0})
+        if output_type == "PASS_FAIL" and row.get("output_bool") is not None:
+            matched = bool(row.get("output_bool")) == _selected_bool(selected)
+            state["sum"] += 100.0 if matched else 0.0
+            state["count"] += 1
+        elif output_type == "CHOICES":
+            row_choices = _json_choices(row)
+            if row_choices:
+                state["sum"] += 100.0 if selected_choice in row_choices else 0.0
+                state["count"] += 1
+        elif row.get("output_float") is not None:
+            state["sum"] += float(row["output_float"]) * 100.0
+            state["count"] += 1
+    return {
+        bucket: (state["sum"] / max(state["count"], 1), state["count"])
+        for bucket, state in states.items()
+    }
+
+
 def _decoration_metadata(
     *,
     sample: GraphCandidateSample,
@@ -802,32 +977,12 @@ def _finite_eval_graph(
         eval_config_id=metric_id,
         started=started,
     )
-    states: dict[datetime, dict[str, Any]] = {}
-    for row in rows:
-        if row.get("error") or str(row.get("output_str") or "") == "ERROR":
-            continue
-        created_at = row.get("created_at")
-        if not isinstance(created_at, datetime):
-            continue
-        bucket = BaseQueryBuilder._normalize_timestamp(created_at, interval)
-        state = states.setdefault(bucket, {"sum": 0.0, "count": 0})
-        if output_type == "PASS_FAIL" and row.get("output_bool") is not None:
-            matched = bool(row.get("output_bool")) == _selected_bool(selected)
-            state["sum"] += 100.0 if matched else 0.0
-            state["count"] += 1
-        elif output_type == "CHOICES":
-            row_choices = _json_choices(row)
-            if row_choices:
-                state["sum"] += 100.0 if selected_choice in row_choices else 0.0
-                state["count"] += 1
-        elif row.get("output_float") is not None:
-            state["sum"] += float(row["output_float"]) * 100.0
-            state["count"] += 1
-
-    values = {
-        bucket: (state["sum"] / max(state["count"], 1), state["count"])
-        for bucket, state in states.items()
-    }
+    values = _eval_bucket_values(
+        rows,
+        interval=interval,
+        output_type=output_type,
+        selected=selected_choice if output_type == "CHOICES" else selected,
+    )
     metadata = _decoration_metadata(
         sample=sample,
         truncated=truncated,
@@ -879,6 +1034,92 @@ def fetch_eval_graph_ch(
         req_data_config=req_data_config,
         started=started,
     )
+
+
+def fetch_eval_chart_series_ch(
+    *,
+    analytics: Any,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    interval: str,
+    req_data_config: dict[str, Any],
+    eval_name: str,
+) -> list[dict[str, Any]]:
+    """Return public eval-chart series from one bounded candidate/logger read."""
+
+    started = monotonic()
+    project_id = _validated_project_id(project_id)
+    filters = list(filters or [])
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=project_id,
+        filters=filters,
+        observe_type="trace",
+        deadline_ms=GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
+        allow_time_only_seed=not _active_filters(filters),
+    )
+    _require_renderable_sample(sample)
+    metric_id = str(req_data_config.get("id") or "")
+    output_type = normalize_eval_graph_output_type(req_data_config)
+    rows, truncated, event_query_count, event_rows_returned = _finite_eval_rows(
+        analytics=analytics,
+        sample=sample,
+        observe_type="trace",
+        eval_config_id=metric_id,
+        started=started,
+    )
+    metadata = _decoration_metadata(
+        sample=sample,
+        truncated=truncated,
+        started=started,
+        query_count=sample.query_count + event_query_count,
+        rows_returned=sample.rows_returned + event_rows_returned,
+    )
+    choices = [str(value) for value in (req_data_config.get("choices") or [])]
+    series_values: list[tuple[str, Any]]
+    if output_type == "CHOICES":
+        series_values = [(f"{eval_name} - {choice}", choice) for choice in choices]
+    else:
+        # Historical public charts expose pass rate (True), not a separate fail
+        # series. Score ignores this selector in the reducer.
+        series_values = [(eval_name, True)]
+
+    result: list[dict[str, Any]] = []
+    for name, selected in series_values:
+        values = _eval_bucket_values(
+            rows,
+            interval=interval,
+            output_type=output_type,
+            selected=selected,
+        )
+        points = _zero_filled_points(
+            sample=sample,
+            interval=interval,
+            values=values,
+        )
+        response = enforce_exact_graph_data_contract(
+            {
+                "metric_name": metric_id,
+                "data": points,
+                **metadata,
+            }
+        )
+        result.append(
+            {
+                "name": name,
+                "data": [
+                    {"timestamp": point["timestamp"], "value": point["value"]}
+                    for point in response["data"]
+                ],
+                "id": metric_id,
+                **{
+                    key: value
+                    for key, value in response.items()
+                    if key.startswith("query_")
+                },
+            }
+        )
+    return result
 
 
 def annotation_output_type(
@@ -1024,55 +1265,38 @@ def _finite_annotation_rows(
     label_id: str,
     started: float,
 ) -> tuple[list[dict[str, Any]], bool, int, int]:
-    entity_predicate, entity_params = _annotation_entity_scope(
+    _entity_predicate, entity_params = _annotation_entity_scope(
         sample, observe_type, trace_span_identities
     )
     if not entity_params or not any(entity_params.values()):
         return [], False, 0, 0
-    query = f"""
-    SELECT created_at, value
-    FROM (
-        SELECT
-            created_at,
-            trace_id,
-            observation_span_id,
-            tracer_project_id AS graph_score_project_id,
-            value,
-            _peerdb_is_deleted AS graph_is_deleted,
-            deleted AS graph_soft_deleted
-        FROM model_hub_score
-        PREWHERE label_id = toUUID(%(graph_label_id)s)
-          AND created_at >= %(graph_start_date)s - INTERVAL 7 DAY
-          AND created_at < %(graph_end_date)s + INTERVAL 7 DAY
-        WHERE tracer_project_id = toUUID(%(graph_project_id)s)
-          AND {entity_predicate}
-        ORDER BY _peerdb_version DESC
-        LIMIT 1 BY id
-    )
-    WHERE graph_score_project_id = toUUID(%(graph_project_id)s)
-      AND graph_is_deleted = 0
-      AND graph_soft_deleted = 0
-      AND created_at >= %(graph_start_date)s
-      AND created_at < %(graph_end_date)s
-      AND {entity_predicate}
-    ORDER BY created_at
-    LIMIT %(graph_event_limit)s
-    """
-    params = {
-        **entity_params,
-        "graph_project_id": project_id,
-        "graph_label_id": str(label_id),
-        "graph_start_date": sample.window_start,
-        "graph_end_date": sample.window_end,
-        "graph_event_limit": GRAPH_EVENT_LIMIT + 1,
-    }
-    result = analytics.execute_ch_query(
-        query,
-        params,
-        timeout_ms=_remaining_timeout_ms(started, GRAPH_DECORATION_TIMEOUT_MS),
-        settings=GRAPH_EVENT_READ_SETTINGS,
-    )
-    rows = list(result.data or [])
+    # Score is authoritative in PostgreSQL.  The legacy CDC score table is not
+    # co-located with direct-write CH25 spans, so a V2 query must never try to
+    # join the two clusters.  CH25 has already supplied a finite, project-
+    # scoped candidate set; replay only those exact identities against the
+    # denormalized Score.tracer_project_id index.
+    _remaining_timeout_ms(started, GRAPH_DECORATION_TIMEOUT_MS)
+    try:
+        rows = AnnotationLabelScoresProjectPG().annotation_rows_for_candidates(
+            project_id=project_id,
+            label_id=str(label_id),
+            start_date=sample.window_start,
+            end_date=sample.window_end,
+            trace_ids=tuple(entity_params.get("graph_trace_ids") or ()),
+            span_entities=tuple(entity_params.get("graph_span_entities") or ()),
+            limit=GRAPH_EVENT_LIMIT + 1,
+        )
+    except AnnotationScoreReadUnavailable:
+        raise BoundedGraphReadError("read_budget_exceeded") from None
+    except Exception as exc:
+        # Database availability/time-budget failures are a retryable graph
+        # boundary, never a raw internal error response.  Programming defects
+        # remain visible to the outer sanitized 500 handler.
+        from django.db import DatabaseError
+
+        if isinstance(exc, DatabaseError):
+            raise BoundedGraphReadError("read_budget_exceeded") from None
+        raise
     truncated = len(rows) > GRAPH_EVENT_LIMIT
     return rows[:GRAPH_EVENT_LIMIT], truncated, 1, len(rows)
 
@@ -1119,8 +1343,8 @@ def fetch_annotation_graph_ch(
     label_id = str(req_data_config.get("id") or "")
     if not label_id:
         raise ValueError("Annotation label ID is required")
-    # PostgreSQL is used only for the small ownership/name record. Trace/span
-    # telemetry and graph values remain CH25-only.
+    # PostgreSQL owns the small label record and Score values; trace/span
+    # candidates remain direct-write CH25-only.
     label = get_annotation_labels_for_project(project_id).get(id=label_id)
     sample = read_graph_candidates(
         analytics=analytics,
@@ -1207,7 +1431,10 @@ __all__ = [
     "annotation_output_type",
     "degraded_graph_response",
     "enforce_exact_graph_data_contract",
+    "graph_payload_is_publishable",
+    "fetch_all_system_metrics_ch",
     "fetch_annotation_graph_ch",
+    "fetch_eval_chart_series_ch",
     "fetch_eval_graph_ch",
     "fetch_system_metric_graph_ch",
     "format_system_metric_graph",

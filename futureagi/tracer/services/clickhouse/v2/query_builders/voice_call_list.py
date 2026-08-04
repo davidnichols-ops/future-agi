@@ -7,9 +7,9 @@ attribute shape (call.total_turns, call.talk_ratio, etc.) — these live in
 by the voice observability surface. `V2RewriteMixin` routes every inherited
 `build*` method's SQL through the v2 rewriter at one boundary.
 
-`build_eval_query` resolves the configured legacy-or-direct-write eval table
-itself; `build_annotation_query` reads `model_hub_score`. Both are excluded
-from the span-schema token rewrite because neither query targets `spans`.
+`build_eval_query` pins the direct-write eval table; `build_annotation_query`
+reads `model_hub_score`. Both are excluded from the span-schema token rewrite
+because neither query targets `spans`.
 """
 
 from __future__ import annotations

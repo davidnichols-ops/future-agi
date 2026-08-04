@@ -16,6 +16,7 @@ span IDs, grouped by ``(observation_span_id, label_id)``.
 The three result sets are merged in Python to produce the final response.
 """
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,6 +38,28 @@ from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
 from tracer.services.clickhouse.v2.id_remap_sql import (
     remap_left_join,
     resolved_id_expr,
+)
+
+_INDEXED_SPAN_ANCHOR_COLUMNS = frozenset(
+    {
+        "id",
+        "trace_id",
+        "parent_span_id",
+        "trace_session_id",
+        "end_user_id",
+        "custom_eval_config_id",
+        "model",
+        "provider",
+        "status",
+        "eval_status",
+        "latency_ms",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cost",
+        "input_length",
+        "output_length",
+    }
 )
 
 
@@ -65,6 +88,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
 
     TABLE = "spans"
     ANNOTATION_TABLE = "model_hub_score"
+    # Eval storage is selected independently from the spans generation. A
+    # CH25 span query can legitimately read the legacy-named authoritative
+    # eval table on the same connection.
+    _EVAL_LOGGER_SOURCE = staticmethod(eval_logger_source)
     # Filter compiler class; the v2 list builder overrides this to the v2
     # builder so it reads the v2 dimension tables (end_users, etc.).
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
@@ -263,18 +290,86 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         return 200
 
     def supports_filter_anchor_probe(self) -> bool:
-        """Whether a direct span predicate can seed a sparse full-window read.
+        """Whether an indexed span leaf can seed a sparse graph sentinel."""
 
-        Unlike trace filters, every span filter applies to one physical span,
-        so all directly-indexable leaves can be combined in one unordered
-        sentinel probe.  Residual eval/annotation predicates are deliberately
-        left for the finite latest-state classifier.
+        return self._bounded_anchor_probe and bool(self._filter_anchor_plans())
+
+    @staticmethod
+    def _plan_uses_indexed_anchor(plan: Any) -> bool:
+        """Return whether CH25 can prune this raw seed with a deployed index."""
+
+        predicate = " ".join(str(plan.seed_predicate or "").split())
+        if not predicate or predicate.replace(" ", "") == "1=1":
+            return False
+        # Structured overflow and call_type parse the raw JSON blob.  They have
+        # no production skip index and must never be placed in a broad anchor.
+        if "JSONExtract" in predicate:
+            return False
+        # Typed Maps have deployed key/value blooms. Positive key predicates
+        # remain valid anchors except for literal substring/negative forms whose
+        # compiled expressions cannot use those indexes. String equals/IN is
+        # the one lowerUTF8 form with an EXPLAIN-proven value-index companion.
+        if "mapContains(span_attr_" in predicate:
+            if "NOT mapContains(span_attr_" in predicate:
+                return False
+            if any(
+                fragment in predicate
+                for fragment in (
+                    " != ",
+                    " NOT IN ",
+                    " NOT BETWEEN ",
+                    "positionUTF8(",
+                    "startsWith(",
+                    "endsWith(",
+                )
+            ) or re.search(r"\bIS\s+(?:NOT\s+)?NULL\b", predicate):
+                return False
+            if "lowerUTF8(" in predicate and not (
+                "has(arrayMap(x -> lower(x), mapValues(span_attr_str))" in predicate
+                or "hasAny(arrayMap(x -> lower(x), mapValues(span_attr_str))"
+                in predicate
+            ):
+                return False
+            return True
+        # Direct system leaves are safe only on columns with an explicit bloom,
+        # set, or minmax index and when the generated expression is the raw
+        # indexed column. CH25 EXPLAIN does not use the raw text indexes through
+        # lowerUTF8/toString/substring wrappers.
+        if any(
+            fragment in predicate
+            for fragment in (
+                "lowerUTF8(",
+                "positionUTF8(",
+                "startsWith(",
+                "endsWith(",
+            )
+        ):
+            return False
+        if any(
+            fragment in predicate for fragment in (" != ", " NOT IN ", " NOT BETWEEN ")
+        ) or re.search(r"\bIS\s+(?:NOT\s+)?NULL\b", predicate):
+            return False
+        return any(
+            re.search(rf"\b{re.escape(column)}\b", predicate)
+            for column in _INDEXED_SPAN_ANCHOR_COLUMNS
+        )
+
+    def _filter_anchor_plans(self) -> list[Any]:
+        plans, _ = partition_span_filter_plans(self.filters)
+        return [plan for plan in plans if self._plan_uses_indexed_anchor(plan)]
+
+    def requires_unindexed_graph_sample_slice(self) -> bool:
+        """Whether graph discovery must avoid the complete temporal stratum.
+
+        Time-only reads and directly indexed predicates may use the ordered
+        stratum seed even when there is no separate unordered anchor.  A graph
+        needs the five-minute lane only when it has non-time predicates but no
+        positive indexed superset leaf, such as structured JSON/call_type or a
+        negative/null predicate.
         """
 
-        plans, _ = partition_span_filter_plans(self.filters)
-        return self._bounded_anchor_probe and any(
-            plan.seed_predicate.strip().replace(" ", "") not in {"", "1=1"}
-            for plan in plans
+        return bool(self._active_non_time_filters()) and not bool(
+            self._filter_anchor_plans()
         )
 
     def build_filter_anchor_probe(self, *, limit: int) -> tuple[str, dict[str, Any]]:
@@ -294,16 +389,13 @@ class SpanListQueryBuilder(BaseQueryBuilder):
 
         request_start, request_end = self.parse_time_range(self.filters)
         self.params.update({"start_date": request_start, "end_date": request_end})
-        plans, _ = partition_span_filter_plans(self.filters)
-        seeded_plans = [
-            plan
-            for plan in plans
-            if plan.seed_predicate.strip().replace(" ", "") not in {"", "1=1"}
-        ]
+        seeded_plans = self._filter_anchor_plans()
         params: dict[str, Any] = {
             **self.params,
             "filter_anchor_start": request_start,
             "filter_anchor_end": request_end,
+            "filter_anchor_start_us": _unix_microseconds(request_start),
+            "filter_anchor_end_us": _unix_microseconds(request_end),
             "filter_anchor_limit": int(limit),
         }
         for plan in seeded_plans:
@@ -354,8 +446,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         PREWHERE {self.project_filter_sql()}
           AND is_deleted = 0
           {project_version_fragment}
-          AND start_time >= %(filter_anchor_start)s
-          AND start_time < %(filter_anchor_end)s
+          AND start_time >= fromUnixTimestamp64Micro(%(filter_anchor_start_us)s)
+          AND start_time < fromUnixTimestamp64Micro(%(filter_anchor_end_us)s)
         WHERE {predicate}{datetime_fragment}
           {sampling_fragment}
         LIMIT 1 BY project_id, trace_id, id, start_time
@@ -386,17 +478,27 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         self.params.update({"start_date": request_start, "end_date": request_end})
 
         plans, _ = partition_span_filter_plans(self.filters)
+        # Ordered seeds may use indexed scalar leaves as a safe superset, but
+        # unindexed JSON/call_type predicates are deferred to the finite latest-
+        # state classifier.  Parsing them before ORDER BY would scan the entire
+        # slice merely to discover a rare or absent value.
+        seed_plans = [plan for plan in plans if self._plan_uses_indexed_anchor(plan)]
         params: dict[str, Any] = {
             **self.params,
             "filter_slice_start": slice_start,
             "filter_slice_end": slice_end,
+            # clickhouse-driver truncates bound ``datetime`` values to whole
+            # seconds.  Retain the datetimes for bounded-reader bookkeeping,
+            # while the SQL binds exact DateTime64(6) epoch microseconds.
+            "filter_slice_start_us": _unix_microseconds(slice_start),
+            "filter_slice_end_us": _unix_microseconds(slice_end),
             "filter_seed_limit": int(limit),
         }
         project_version_fragment = ""
         if self.project_version_id:
             params["project_version_id"] = self.project_version_id
             project_version_fragment = "AND project_version_id = %(project_version_id)s"
-        for plan in plans:
+        for plan in seed_plans:
             params.update(
                 {
                     key: value
@@ -404,7 +506,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                     if f"%({key})s" in plan.seed_predicate
                 }
             )
-        predicate = " AND ".join(plan.seed_predicate for plan in plans) or "1 = 1"
+        predicate = " AND ".join(plan.seed_predicate for plan in seed_plans) or "1 = 1"
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
                 self.filters,
@@ -476,8 +578,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         PREWHERE {self.project_filter_sql()}
           AND is_deleted = 0
           {project_version_fragment}
-          AND start_time >= %(filter_slice_start)s
-          AND start_time < %(filter_slice_end)s
+          AND start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)
+          AND start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)
         WHERE {predicate}{datetime_fragment}
           {sampling_fragment}
           {keyset_fragment}
@@ -567,6 +669,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 {
                     "candidate_start_date": request_start,
                     "candidate_end_date": request_end,
+                    "candidate_start_date_us": _unix_microseconds(request_start),
+                    "candidate_end_date_us": _unix_microseconds(request_end),
                 }
             )
         project_version_fragment = ""
@@ -696,8 +800,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 argMax(created_at, _peerdb_version) AS latest_created_at"""
 
         latest_time_fragment = (
-            "\n              AND latest_start_time >= %(candidate_start_date)s"
-            "\n              AND latest_start_time < %(candidate_end_date)s"
+            "\n              AND latest_start_time >= "
+            "fromUnixTimestamp64Micro(%(candidate_start_date_us)s)"
+            "\n              AND latest_start_time < "
+            "fromUnixTimestamp64Micro(%(candidate_end_date_us)s)"
             if scope_to_request_window
             else ""
         )
@@ -1250,8 +1356,16 @@ class SpanListQueryBuilder(BaseQueryBuilder):
               AND (toString(trace_id), observation_span_id) IN %(eval_span_entities)s
             """
 
-        eval_table, _ = eval_logger_source(include_cdc_tombstone_guard=True)
+        eval_table, _ = self._EVAL_LOGGER_SOURCE(include_cdc_tombstone_guard=True)
         eval_version_col = eval_logger_version_column(eval_table)
+        if eval_table.endswith("_v2"):
+            status_projection = "'completed' AS status"
+            skipped_reason_projection = (
+                "CAST(NULL AS Nullable(String)) AS skipped_reason"
+            )
+        else:
+            status_projection = "status"
+            skipped_reason_projection = "skipped_reason"
         live_columns = eval_logger_live_state_columns(eval_table)
         live_projection = ",\n                ".join(
             f"{column} AS latest_state_{index}"
@@ -1327,8 +1441,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 output_str,
                 output_str_list,
                 error,
-                status,
-                skipped_reason,
+                {status_projection},
+                {skipped_reason_projection},
                 {live_projection}
             FROM {eval_table}
             WHERE observation_span_id IN %(span_ids)s

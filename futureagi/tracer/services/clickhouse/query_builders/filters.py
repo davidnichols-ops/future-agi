@@ -128,6 +128,17 @@ class ClickHouseFilterBuilder:
     QUERY_MODE_TRACE = "trace"
     QUERY_MODE_SPAN = "span"
 
+    # Explicit source-injection boundary. The eval-table rollout is independent
+    # from the spans generation, so all builders honor the configured source.
+    @staticmethod
+    def _eval_logger_source(
+        alias: str = "",
+        include_cdc_tombstone_guard: bool = False,
+    ) -> tuple[str, str]:
+        from tracer.services.clickhouse.eval_logger_table import eval_logger_source
+
+        return eval_logger_source(alias, include_cdc_tombstone_guard)
+
     # Numeric per-trace metrics where the trace list displays the
     # **root span**'s value. In QUERY_MODE_TRACE we restrict the inner
     # `trace_id IN (...)` subquery to root spans for these columns so
@@ -371,6 +382,7 @@ class ClickHouseFilterBuilder:
         span_date_scope: bool = False,
         candidate_ids_param: str | None = None,
         candidate_entities_param: str | None = None,
+        strict_trace_project_correlation: bool = False,
     ) -> None:
         self.table = table
         self.annotation_label_ids = annotation_label_ids or []
@@ -418,6 +430,13 @@ class ClickHouseFilterBuilder:
             raise ValueError("candidate_entities_param must be an internal identifier")
         self.candidate_ids_param = candidate_ids_param
         self.candidate_entities_param = candidate_entities_param
+        # Organization trace pages can contain the same textual trace id in
+        # more than one project.  Their residual predicates are compiled as
+        # finite, per-project branches and opt into this guard so score rows
+        # are correlated by their authoritative tracer project as well as by
+        # trace/span identity.  Keep the default off: existing single-project
+        # callers retain byte-for-byte SQL and behaviour.
+        self.strict_trace_project_correlation = bool(strict_trace_project_correlation)
         self._param_counter: int = 0
         self._params: dict[str, Any] = {}
 
@@ -499,6 +518,20 @@ class ClickHouseFilterBuilder:
             return ""
         return f" AND {alias}.created_at >= %(start_date)s - INTERVAL 1 DAY"
 
+    def _score_project_filter(self, alias: str = "s") -> str:
+        """Correlate score rows to one tracer project when explicitly required."""
+
+        if not self.strict_trace_project_correlation:
+            return ""
+        return f" AND {alias}.tracer_project_id = toUUID(%(project_id)s)"
+
+    def _strict_span_project_filter(self) -> str:
+        """Scope an org residual's span-side membership to its branch project."""
+
+        if not self.strict_trace_project_correlation:
+            return ""
+        return " AND project_id = toUUID(%(project_id)s)"
+
     def _scoped_spans_subquery(
         self,
         *,
@@ -548,6 +581,7 @@ class ClickHouseFilterBuilder:
         )
         if score_side_where:
             score_date = self._score_date_filter()
+            score_project = self._score_project_filter()
             score_candidate = self._score_side_candidate_filter()
             id_filter = (
                 f" AND id IN ("
@@ -558,6 +592,7 @@ class ClickHouseFilterBuilder:
                 f"WHERE s.deleted = false "
                 f"AND notEmpty(s.observation_span_id)"
                 f"{score_date}"
+                f"{score_project}"
                 f"{score_candidate}"
                 f" {score_side_where})"
             )
@@ -645,6 +680,7 @@ class ClickHouseFilterBuilder:
         select_keyword = "SELECT DISTINCT" if distinct else "SELECT"
         extra_clause = f" {extra_where}" if extra_where else ""
         date_clause = self._score_date_filter("s")
+        project_clause = self._score_project_filter("s")
         candidate_filter = self._candidate_filter(score_trace_expr)
         # Wrap spans in a project + date-scoped subquery, also gated by
         # ``id IN (score rows matching extra_where)`` — see
@@ -665,6 +701,7 @@ class ClickHouseFilterBuilder:
             f"AND {score_trace_expr} != ''"
             f"{candidate_filter}"
             f"{date_clause}"
+            f"{project_clause}"
             f"{extra_clause}"
         )
 
@@ -722,6 +759,7 @@ class ClickHouseFilterBuilder:
         select_keyword = "SELECT DISTINCT" if distinct else "SELECT"
         extra_clause = f" {extra_where}" if extra_where else ""
         date_clause = self._score_date_filter("s")
+        project_clause = self._score_project_filter("s")
         candidate_filter = self._candidate_span_entity_filter(
             "s.trace_id", score_span_expr
         )
@@ -747,6 +785,7 @@ class ClickHouseFilterBuilder:
             f"AND {score_span_expr} != ''"
             f"{candidate_filter}"
             f"{date_clause}"
+            f"{project_clause}"
             f"{extra_clause}"
         )
 
@@ -978,11 +1017,13 @@ class ClickHouseFilterBuilder:
         if filter_op in NO_VALUE_OPS:
             comparison_op = "=" if filter_op == "is_null" else "!="
             candidate_filter = self._candidate_trace_filter()
+            project_filter = self._strict_span_project_filter()
             return (
                 f"trace_id IN ("
                 f"SELECT trace_id FROM {self.table} "
                 f"WHERE end_user_id {comparison_op} toUUID('00000000-0000-0000-0000-000000000000') "
                 f"AND _peerdb_is_deleted = 0{self._span_membership_date_filter()}"
+                f"{project_filter}"
                 f"{candidate_filter})"
             )
 
@@ -1010,6 +1051,7 @@ class ClickHouseFilterBuilder:
         if not inner:
             return None
         candidate_filter = self._candidate_trace_filter()
+        project_filter = self._strict_span_project_filter()
 
         # Curated EndUser dimension is the ``end_users`` RMT.
         return (
@@ -1020,6 +1062,7 @@ class ClickHouseFilterBuilder:
             f"WHERE {inner} "
             f"AND {self._ENDUSER_DIM_NOT_DELETED}"
             f") AND _peerdb_is_deleted = 0{self._span_membership_date_filter()}"
+            f"{project_filter}"
             f"{candidate_filter})"
         )
 
@@ -1620,13 +1663,11 @@ class ClickHouseFilterBuilder:
         # hardcoded to ``tracer_eval_logger`` with a v2-shaped ``is_deleted``
         # predicate, so on a ``CH25_EVAL_LOGGER_TABLE=tracer_eval_logger_v2``
         # stack filters and display disagreed.
-        from tracer.services.clickhouse.eval_logger_table import eval_logger_source
-
-        eval_table, _ = eval_logger_source()
+        eval_table, _ = self._eval_logger_source()
         eval_version_col, eval_live_columns = self._eval_latest_state_columns(
             eval_table
         )
-        _, eval_not_deleted = eval_logger_source(
+        _, eval_not_deleted = self._eval_logger_source(
             "latest_eval", include_cdc_tombstone_guard=True
         )
         eval_live_projection = ", ".join(
@@ -2138,13 +2179,11 @@ class ClickHouseFilterBuilder:
         # This avoids whole-table FINAL while preventing a superseded live row
         # from surviving a newer CDC/app tombstone. toString() casts UUID →
         # String to match spans.trace_id (String type).
-        from tracer.services.clickhouse.eval_logger_table import eval_logger_source
-
-        eval_table, _ = eval_logger_source()
+        eval_table, _ = self._eval_logger_source()
         eval_version_col, eval_live_columns = self._eval_latest_state_columns(
             eval_table
         )
-        _, eval_not_deleted = eval_logger_source(
+        _, eval_not_deleted = self._eval_logger_source(
             "latest_eval", include_cdc_tombstone_guard=True
         )
         eval_live_projection = ", ".join(
@@ -2155,6 +2194,27 @@ class ClickHouseFilterBuilder:
             if self.score_date_scope
             else ""
         )
+        eval_project_clause = ""
+        if self.strict_trace_project_correlation:
+            from tracer.models.custom_eval_config import CustomEvalConfig
+
+            scoped_config_ids = tuple(
+                str(config_id)
+                for config_id in CustomEvalConfig.objects.filter(
+                    project_id__in=self.project_ids or (),
+                    deleted=False,
+                ).values_list("id", flat=True)
+            )
+            if not scoped_config_ids:
+                return (
+                    "trace_id IN (SELECT "
+                    "toUUID('00000000-0000-0000-0000-000000000000'))"
+                )
+            project_config_param = self._next_param("project_eval_cfg")
+            self._params[project_config_param] = scoped_config_ids
+            eval_project_clause = (
+                f"AND eval_scan.custom_eval_config_id IN %({project_config_param})s "
+            )
         if self.query_mode == self.QUERY_MODE_SPAN:
             candidate_filter = self._candidate_span_entity_filter(
                 "eval_scan.trace_id", "eval_scan.observation_span_id"
@@ -2173,6 +2233,7 @@ class ClickHouseFilterBuilder:
                 "toUUID('00000000-0000-0000-0000-000000000000') "
                 "AND notEmpty(toString(eval_scan.observation_span_id)) "
                 f"{eval_date_clause}"
+                f"{eval_project_clause}"
                 f"{candidate_filter} "
                 f"ORDER BY eval_scan.{eval_version_col} DESC "
                 "LIMIT 1 BY eval_scan.id) AS latest_eval "
@@ -2195,6 +2256,7 @@ class ClickHouseFilterBuilder:
             "AND eval_scan.trace_id != "
             "toUUID('00000000-0000-0000-0000-000000000000') "
             f"{eval_date_clause}"
+            f"{eval_project_clause}"
             f"{candidate_filter} "
             f"ORDER BY eval_scan.{eval_version_col} DESC "
             "LIMIT 1 BY eval_scan.id) AS latest_eval "

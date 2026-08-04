@@ -133,12 +133,8 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
     filters = [_attribute_filter()]
     with (
         mock.patch(
-            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-            return_value=builder_cls,
-        ),
-        mock.patch(
-            "tracer.services.clickhouse.v2.query_service.query_service_for_builder",
-            return_value=analytics,
+            "tracer.views.trace_session.SessionListQueryBuilderV2",
+            builder_cls,
         ),
         mock.patch(
             "tracer.views.trace_session.read_bounded_filter_page",
@@ -149,7 +145,7 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
             return_value=[],
         ),
     ):
-        status, payload = TraceSessionView._list_sessions_clickhouse(
+        legacy_response = TraceSessionView._list_sessions_clickhouse(
             view,
             request,
             project_id=project_id,
@@ -162,7 +158,23 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
                 "page_size": 1,
             },
         )
+        status, payload = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=project_id,
+            project=None,
+            analytics=analytics,
+            validated_data={
+                "filters": filters,
+                "sort_params": [],
+                "page_number": 4,
+                "page_size": 1,
+                "allow_sampled": True,
+            },
+        )
 
+    assert legacy_response[0] == "error"
+    assert legacy_response[1] == 503
     assert status == "ok"
     assert payload["metadata"] == {
         "total_rows": 6,
@@ -174,7 +186,7 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
     }
     assert payload["table"][0]["first_message"] == "first"
     assert payload["table"][0]["last_message"] == "last"
-    bounded_read.assert_called_once()
+    assert bounded_read.call_count == 2
     bounded_kwargs = bounded_read.call_args.kwargs
     assert bounded_kwargs["key_field"] == "session_id"
     assert bounded_kwargs["page_number"] == 4
@@ -183,13 +195,13 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
     assert bounded_kwargs["classify_batch_size"] == 200
     builder.build_candidate_page_query.assert_not_called()
     builder.build.assert_not_called()
-    builder.build_page_metrics_query.assert_called_once_with([session_id])
-    builder.build_content_query.assert_called_once_with([session_id])
-    builder.build_span_attributes_query.assert_called_once_with([session_id])
+    assert builder.build_page_metrics_query.call_count == 2
+    assert builder.build_content_query.call_count == 2
+    assert builder.build_span_attributes_query.call_count == 2
 
 
 @pytest.mark.unit
-def test_candidate_first_session_list_keeps_exact_legacy_metadata():
+def test_candidate_first_session_list_keeps_exact_metadata():
     from tracer.views.trace_session import TraceSessionView
 
     view, request = _view_and_request()
@@ -210,12 +222,8 @@ def test_candidate_first_session_list_keeps_exact_legacy_metadata():
     analytics.execute_ch_query.side_effect = _execute
     with (
         mock.patch(
-            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-            return_value=builder_cls,
-        ),
-        mock.patch(
-            "tracer.services.clickhouse.v2.query_service.query_service_for_builder",
-            return_value=analytics,
+            "tracer.views.trace_session.SessionListQueryBuilderV2",
+            builder_cls,
         ),
         mock.patch(
             "tracer.views.trace_session.read_bounded_filter_page"
@@ -259,12 +267,8 @@ def test_incomplete_bounded_session_list_returns_sanitized_503_without_hydration
 
     with (
         mock.patch(
-            "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-            return_value=builder_cls,
-        ),
-        mock.patch(
-            "tracer.services.clickhouse.v2.query_service.query_service_for_builder",
-            return_value=analytics,
+            "tracer.views.trace_session.SessionListQueryBuilderV2",
+            builder_cls,
         ),
         mock.patch(
             "tracer.views.trace_session.read_bounded_filter_page",

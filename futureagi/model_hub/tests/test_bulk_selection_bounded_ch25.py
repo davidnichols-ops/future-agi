@@ -461,11 +461,11 @@ def test_span_bulk_resolution_replays_exact_123456_microsecond_identity(
 
     analytics = _ClickHouseExecutor(ch_client)
     monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-        lambda query_type: LocalSpanBuilder,
+        "tracer.services.clickhouse.v2.query_builders.span_list.SpanListQueryBuilderV2",
+        LocalSpanBuilder,
     )
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
         lambda: analytics,
     )
     filters = [
@@ -531,11 +531,11 @@ def test_span_bulk_resolution_rejects_same_bare_id_under_two_traces(
 
     analytics = _ClickHouseExecutor(ch_client)
     monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-        lambda query_type: LocalSpanBuilder,
+        "tracer.services.clickhouse.v2.query_builders.span_list.SpanListQueryBuilderV2",
+        LocalSpanBuilder,
     )
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
         lambda: analytics,
     )
     filters = [

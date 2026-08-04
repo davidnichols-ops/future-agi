@@ -8,9 +8,10 @@ import json
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
 
@@ -231,7 +232,7 @@ class TestObservationSpanWorkspaceScopeAPI:
         )
 
         with patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+            "tracer.views.observation_span.V2AnalyticsQueryService"
         ) as analytics_cls:
             response = auth_client.get(
                 "/tracer/observation-span/get_evaluation_details/",
@@ -251,7 +252,7 @@ class TestObservationSpanWorkspaceScopeAPI:
         custom_eval_config,
     ):
         with patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+            "tracer.views.observation_span.V2AnalyticsQueryService"
         ) as analytics_cls:
             analytics_cls.return_value.get_eval_detail_ch.return_value = {
                 "output_bool": 1,
@@ -620,6 +621,65 @@ class TestObservationSpanListSpansAPI:
         # Check for expected keys
         assert "metadata" in data or "table" in data or "column_config" in data
 
+    @override_settings(
+        CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "", "QUERY_TYPES_V2_PRIMARY": ""}
+    )
+    def test_list_spans_uses_direct_v2_pair_when_routing_is_disabled(
+        self, auth_client, project_version
+    ):
+        from tracer.views.observation_span import ObservationSpanView
+
+        analytics = MagicMock(name="v2_span_list_analytics")
+        captured = {}
+
+        def fake_list(
+            view,
+            request,
+            project_version_id,
+            project_version,
+            supplied_analytics,
+            validated_data,
+        ):
+            captured["analytics"] = supplied_analytics
+            return view._gm.success_response(
+                {"metadata": {"total_rows": 0}, "table": [], "column_config": []}
+            )
+
+        with (
+            patch(
+                "tracer.views.observation_span.V2AnalyticsQueryService",
+                return_value=analytics,
+            ) as v2_service,
+            patch(
+                "tracer.views.observation_span.AnalyticsQueryService",
+                side_effect=AssertionError("legacy span-list service selected"),
+            ) as legacy_service,
+            patch(
+                "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+                side_effect=AssertionError("SPAN_LIST dispatch was consulted"),
+            ) as dispatch,
+            patch(
+                "tracer.services.clickhouse.v2.query_service.query_service_for_builder",
+                side_effect=AssertionError("SPAN_LIST service remap was consulted"),
+            ) as service_remap,
+            patch.object(
+                ObservationSpanView,
+                "_list_spans_non_observe_clickhouse",
+                fake_list,
+            ),
+        ):
+            response = auth_client.get(
+                "/tracer/observation-span/list_spans/",
+                {"project_version_id": str(project_version.id)},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert captured["analytics"] is analytics
+        v2_service.assert_called_once_with()
+        legacy_service.assert_not_called()
+        dispatch.assert_not_called()
+        service_remap.assert_not_called()
+
     def test_list_spans_with_pagination(
         self, auth_client, project, project_version, trace, multiple_spans
     ):
@@ -774,6 +834,65 @@ class TestObservationSpanListSpansObserveAPI:
         )
         assert response.status_code == status.HTTP_200_OK
 
+    @override_settings(
+        CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "", "QUERY_TYPES_V2_PRIMARY": ""}
+    )
+    def test_list_spans_observe_uses_direct_v2_pair_when_routing_is_disabled(
+        self, auth_client, observe_project
+    ):
+        from tracer.views.observation_span import ObservationSpanView
+
+        analytics = MagicMock(name="v2_observe_span_list_analytics")
+        captured = {}
+
+        def fake_list(
+            view,
+            request,
+            project_id,
+            validated_data,
+            supplied_analytics,
+            **kwargs,
+        ):
+            captured["analytics"] = supplied_analytics
+            return view._gm.success_response(
+                {"metadata": {"total_rows": 0}, "table": [], "config": []}
+            )
+
+        with (
+            patch(
+                "tracer.views.observation_span.V2AnalyticsQueryService",
+                return_value=analytics,
+            ) as v2_service,
+            patch(
+                "tracer.views.observation_span.AnalyticsQueryService",
+                side_effect=AssertionError("legacy span-list service selected"),
+            ) as legacy_service,
+            patch(
+                "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
+                side_effect=AssertionError("SPAN_LIST dispatch was consulted"),
+            ) as dispatch,
+            patch(
+                "tracer.services.clickhouse.v2.query_service.query_service_for_builder",
+                side_effect=AssertionError("SPAN_LIST service remap was consulted"),
+            ) as service_remap,
+            patch.object(
+                ObservationSpanView,
+                "_list_spans_clickhouse",
+                fake_list,
+            ),
+        ):
+            response = auth_client.get(
+                "/tracer/observation-span/list_spans_observe/",
+                {"project_id": str(observe_project.id)},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert captured["analytics"] is analytics
+        v2_service.assert_called_once_with()
+        legacy_service.assert_not_called()
+        dispatch.assert_not_called()
+        service_remap.assert_not_called()
+
     def test_list_spans_observe_rejects_nested_map_with_typed_400(
         self, auth_client, observe_project
     ):
@@ -805,7 +924,7 @@ class TestObservationSpanListSpansObserveAPI:
     def test_list_spans_observe_fails_closed_when_clickhouse_fails(
         self, auth_client, observe_project, session_trace, monkeypatch
     ):
-        """CH is authoritative and programming defects preserve sanitized 400."""
+        """CH is authoritative and programming defects return sanitized 500."""
         from tracer.services.clickhouse.query_service import QueryType
         from tracer.views.observation_span import ObservationSpanView
 
@@ -840,7 +959,8 @@ class TestObservationSpanListSpansObserveAPI:
             {"project_id": str(observe_project.id), "filters": "[]"},
         )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.json()["code"] == "server_error"
         assert "clickhouse unavailable" not in str(response.json())
 
 
@@ -959,10 +1079,10 @@ class TestObservationSpanGraphMethodsAPI:
         # Accept 200 or 400
         assert response.status_code in [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST]
 
-    def test_get_graph_methods_filtered_system_metric_degrades_without_postgres(
+    def test_get_graph_methods_filtered_system_metric_returns_503_without_postgres(
         self, auth_client, observe_project, monkeypatch
     ):
-        """A CH25 timeout degrades and never rebuilds from stale PG telemetry."""
+        """A CH25 timeout returns 503 and never reads stale PG telemetry."""
         from clickhouse_driver.errors import ServerException
 
         from tracer.views.observation_span import ObservationSpanView
@@ -1023,12 +1143,10 @@ class TestObservationSpanGraphMethodsAPI:
             format="json",
         )
 
-        assert response.status_code == status.HTTP_200_OK
-        result = get_result(response)
-        assert result["data"] == []
-        assert result["query_complete"] is False
-        assert result["query_status"] == "degraded"
-        assert result["query_error_code"] == "read_budget_exceeded"
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        payload = response.json()
+        assert payload["code"] == "service_unavailable"
+        assert "private timeout detail" not in str(payload)
 
     def test_get_graph_methods_rejects_foreign_eval_config_before_ch_read(
         self,

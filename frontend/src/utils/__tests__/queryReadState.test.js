@@ -48,6 +48,22 @@ describe("queryReadState", () => {
     expect(getQueryReadMessage("sampled")).toBe(QUERY_READ_SAMPLED_MESSAGE);
   });
 
+  it("recognizes sampled metadata on public chart-series arrays", () => {
+    const series = [
+      {
+        name: "quality",
+        data: [],
+        query_complete: false,
+        query_status: "sampled",
+        query_sampling_strategy: "time_stratified_latest_state",
+        query_sampling_strata: 8,
+        query_sampling_strata_completed: 8,
+      },
+    ];
+
+    expect(getQueryReadState({ result: series })).toBe("sampled");
+  });
+
   it("uses a generic message for request failures", () => {
     const rawError = "Code: 159 DB::Exception: Timeout exceeded";
     expect(getQueryReadState({ result: rawError }, { isError: true })).toBe(

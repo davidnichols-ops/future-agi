@@ -159,6 +159,11 @@ describe("GraphSection exact graph boundary", () => {
       await screen.findByText("Showing sampled values, not full totals."),
     ).toBeInTheDocument();
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
+    expect(axios.post).toHaveBeenCalledWith(
+      "/tracer/trace/get_graph_methods/",
+      expect.any(Object),
+      { params: { allow_sampled: true } },
+    );
     const chart = screen.getByTestId("apex-chart");
     expect(chart).toBeInTheDocument();
     expect(chart).toHaveAttribute(

@@ -15,7 +15,10 @@ from tracer.serializers.eval_task import (
     EditEvalTaskSerializer,
     EvalTaskListQuerySerializer,
 )
-from tracer.serializers.filters import ObserveGraphDataRequestSerializer
+from tracer.serializers.filters import (
+    ObserveGraphDataQuerySerializer,
+    ObserveGraphDataRequestSerializer,
+)
 from tracer.serializers.monitor import FetchGraphSerializer
 from tracer.serializers.observation_span import (
     ObservationAttributeListQuerySerializer,
@@ -692,6 +695,46 @@ class TestFilterSerializerContracts:
 
         assert serializer.is_valid(), serializer.errors
         assert serializer.validated_data["filters"][0]["column_id"] == "customer_tier"
+        assert serializer.validated_data["allow_sampled"] is False
+
+    def test_graph_query_serializers_accept_explicit_sample_opt_in(self):
+        observe = ObserveGraphDataQuerySerializer(data={"allow_sampled": "true"})
+        project = ProjectGraphDataQuerySerializer(
+            data={
+                "project_id": "1372e742-a10b-4d98-9ca4-31ef4d67115f",
+                "allow_sampled": "true",
+            }
+        )
+        public_chart = FetchGraphSerializer(
+            data={
+                "project_id": "1372e742-a10b-4d98-9ca4-31ef4d67115f",
+                "interval": "day",
+                "req_data_config": json.dumps(
+                    {"id": "latency", "type": "SYSTEM_METRIC"}
+                ),
+                "allow_sampled": "true",
+            }
+        )
+
+        for serializer in (observe, project, public_chart):
+            assert serializer.is_valid(), serializer.errors
+            assert serializer.validated_data["allow_sampled"] is True
+
+    def test_project_version_list_queries_default_closed_and_accept_opt_in(self):
+        project_version_id = "1372e742-a10b-4d98-9ca4-31ef4d67115f"
+        for serializer_class in (TraceListQuerySerializer, SpanListQuerySerializer):
+            closed = serializer_class(data={"project_version_id": project_version_id})
+            opted_in = serializer_class(
+                data={
+                    "project_version_id": project_version_id,
+                    "allow_sampled": "true",
+                }
+            )
+
+            assert closed.is_valid(), closed.errors
+            assert closed.validated_data["allow_sampled"] is False
+            assert opted_in.is_valid(), opted_in.errors
+            assert opted_in.validated_data["allow_sampled"] is True
 
     def test_project_graph_query_rejects_camel_case_project_id(self):
         serializer = ProjectGraphDataQuerySerializer(

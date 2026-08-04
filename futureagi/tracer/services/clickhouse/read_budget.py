@@ -41,6 +41,13 @@ _TRANSIENT_CLICKHOUSE_ERROR_CODES = {
     ErrorCodes.SHARD_HAS_NO_CONNECTIONS,
 }
 
+# Code 386 (NO_COMMON_TYPE) has appeared on customer-facing browse/value APIs
+# when heterogeneous production values reach a ClickHouse comparison.  It is
+# not a timeout and must not be treated as one inside selectors, but at the HTTP
+# read boundary it is an unavailable telemetry response: retryable/sanitized
+# 503, never a client-validation 400 or a leaked server diagnostic.
+_API_READ_UNAVAILABLE_ERROR_CODES = {ErrorCodes.NO_COMMON_TYPE}
+
 _CLICKHOUSE_CONNECT_CODE_RE = re.compile(
     r"\AReceived ClickHouse exception,\s*code:\s*(\d+)\b",
     flags=re.IGNORECASE,
@@ -143,3 +150,21 @@ def is_clickhouse_query_error(exc: Exception) -> bool:
     return isinstance(exc, ClickHouseConnectOperationalError) and bool(
         _CLICKHOUSE_CONNECT_TRANSPORT_RE.match(message)
     )
+
+
+def is_clickhouse_api_read_unavailable_error(exc: Exception) -> bool:
+    """Return whether a public CH read should answer with sanitized HTTP 503.
+
+    Selector-owned budget and transport classification stays deliberately
+    narrow.  This API-boundary classifier additionally covers the production
+    heterogeneous-type failure above, while still rejecting syntax, unknown
+    identifiers/tables, arbitrary runtime errors, and untyped message text.
+    """
+
+    if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+        return True
+    if isinstance(exc, ClickHouseError):
+        return getattr(exc, "code", None) in _API_READ_UNAVAILABLE_ERROR_CODES
+    if isinstance(exc, ClickHouseConnectDatabaseError):
+        return _clickhouse_connect_error_code(exc) in _API_READ_UNAVAILABLE_ERROR_CODES
+    return False

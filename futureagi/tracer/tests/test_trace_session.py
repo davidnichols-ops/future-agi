@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 import pytest
-from clickhouse_driver.errors import ServerException
+from clickhouse_driver.errors import NetworkError, ServerException
 from django.utils import timezone
 from rest_framework import status
 
@@ -21,6 +21,7 @@ from tracer.services.clickhouse.bounded_graph_reads import (
     BoundedGraphReadError,
     GraphCandidateSample,
 )
+from tracer.services.clickhouse.filter_value_reads import FilterValueRead
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 from tracer.services.clickhouse.session_graph import fetch_session_graph_ch
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
@@ -214,7 +215,7 @@ class TestTraceSessionRetrieveAPI:
         monkeypatch.setattr(
             session_utils,
             "_try_session_navigation_ch",
-            lambda req, pid, sid: (str(s1.id), str(s3.id)),
+            lambda req, pid, sid, query_data=None: (str(s1.id), str(s3.id)),
         )
 
         response = auth_client.get(f"/tracer/trace-session/{s2.id}/")
@@ -238,7 +239,7 @@ class TestTraceSessionRetrieveAPI:
         monkeypatch.setattr(
             session_utils,
             "_try_session_navigation_ch",
-            lambda req, pid, sid: (str(s1.id), None),
+            lambda req, pid, sid, query_data=None: (str(s1.id), None),
         )
 
         response = auth_client.get(f"/tracer/trace-session/{s2.id}/")
@@ -262,7 +263,7 @@ class TestTraceSessionRetrieveAPI:
         monkeypatch.setattr(
             session_utils,
             "_try_session_navigation_ch",
-            lambda req, pid, sid: (None, str(s2.id)),
+            lambda req, pid, sid, query_data=None: (None, str(s2.id)),
         )
 
         response = auth_client.get(f"/tracer/trace-session/{s1.id}/")
@@ -306,7 +307,7 @@ class TestTraceSessionListAPI:
     def test_list_sessions_missing_project(self, auth_client):
         """List sessions supports org-scoped listing without project ID."""
         with mock.patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+            "tracer.views.trace_session.V2AnalyticsQueryService"
         ) as analytics_cls:
             response = auth_client.get("/tracer/trace-session/list_sessions/")
 
@@ -318,11 +319,27 @@ class TestTraceSessionListAPI:
         self, auth_client, observe_project, trace_session, session_trace
     ):
         """List sessions for a project."""
-        response = auth_client.get(
-            "/tracer/trace-session/list_sessions/",
-            {"project_id": str(observe_project.id)},
+        from tracer.services.clickhouse.v2.query_service import (
+            V2AnalyticsQueryService,
         )
+
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                wraps=V2AnalyticsQueryService,
+            ) as v2_service,
+            mock.patch(
+                "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+            ) as legacy_service,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/list_sessions/",
+                {"project_id": str(observe_project.id)},
+            )
+
         assert response.status_code == status.HTTP_200_OK
+        v2_service.assert_called_once_with()
+        legacy_service.assert_not_called()
         data = get_result(response)
         assert "metadata" in data or "table" in data
 
@@ -363,7 +380,7 @@ class TestTraceSessionListAPI:
         ]
 
         with mock.patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+            "tracer.views.trace_session.V2AnalyticsQueryService"
         ) as analytics_cls:
             response = auth_client.get(
                 "/tracer/trace-session/list_sessions/",
@@ -434,15 +451,61 @@ class TestTraceSessionExportAPI:
         )
         assert response.status_code == status.HTTP_400_BAD_REQUEST
 
+    def test_export_sessions_unexpected_csv_defect_is_sanitized_500(
+        self, auth_client, observe_project
+    ):
+        list_response = mock.Mock(
+            status_code=status.HTTP_200_OK,
+            data={"result": {"table": []}},
+        )
+        with (
+            mock.patch.object(
+                TraceSessionView,
+                "list_sessions",
+                return_value=list_response,
+            ),
+            mock.patch(
+                "tracer.views.trace_session.pd.DataFrame.to_csv",
+                side_effect=RuntimeError("secret CSV implementation detail"),
+            ),
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/get_trace_session_export_data/",
+                {"project_id": str(observe_project.id)},
+            )
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.data["type"] == "server_error"
+        assert response.data["code"] == "server_error"
+        assert "Sessions could not be exported" in response.data["message"]
+        assert "secret" not in str(response.data)
+        assert "implementation detail" not in str(response.data)
+
     def test_export_sessions_success(
         self, auth_client, observe_project, trace_session, session_trace
     ):
         """Export sessions for a project."""
-        response = auth_client.get(
-            "/tracer/trace-session/get_trace_session_export_data/",
-            {"project_id": str(observe_project.id)},
+        from tracer.services.clickhouse.v2.query_service import (
+            V2AnalyticsQueryService,
         )
+
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                wraps=V2AnalyticsQueryService,
+            ) as v2_service,
+            mock.patch(
+                "tracer.services.clickhouse.query_service.AnalyticsQueryService"
+            ) as legacy_service,
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/get_trace_session_export_data/",
+                {"project_id": str(observe_project.id)},
+            )
+
         assert response.status_code == status.HTTP_200_OK
+        v2_service.assert_called_once_with()
+        legacy_service.assert_not_called()
 
 
 @pytest.mark.integration
@@ -688,6 +751,57 @@ class TestTraceSessionGraphAPI:
         assert payload["query_complete"] is False
         assert payload["query_error_code"] == "sample_limit"
 
+    @pytest.mark.parametrize(
+        ("error_code", "expected_status", "error_type"),
+        [
+            (
+                "unsupported_filter_shape",
+                status.HTTP_400_BAD_REQUEST,
+                "validation_error",
+            ),
+            (
+                "query_failed",
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "server_error",
+            ),
+        ],
+    )
+    def test_session_graph_bounded_failures_preserve_http_taxonomy(
+        self,
+        auth_client,
+        observe_project,
+        error_code,
+        expected_status,
+        error_type,
+    ):
+        with mock.patch(
+            "tracer.views.trace_session.fetch_session_graph_ch",
+            side_effect=BoundedGraphReadError(error_code),
+        ):
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                {
+                    "project_id": str(observe_project.id),
+                    "interval": "day",
+                    "property": "average",
+                    "req_data_config": {
+                        "id": "session_count",
+                        "type": "SYSTEM_METRIC",
+                    },
+                    "filters": [],
+                },
+                format="json",
+            )
+
+        assert response.status_code == expected_status
+        assert response.data["type"] == error_type
+        assert error_code not in str(response.data)
+        if expected_status == status.HTTP_400_BAD_REQUEST:
+            assert "configuration is invalid" in response.data["message"]
+        else:
+            assert response.data["code"] == "server_error"
+            assert "could not be loaded" in response.data["message"]
+
     def test_session_system_graph_rejects_returned_candidate_sample_before_remap(
         self,
     ):
@@ -731,6 +845,63 @@ class TestTraceSessionGraphAPI:
         assert caught.value.error_code == "sample_limit"
         analytics.execute_ch_query.assert_not_called()
 
+    def test_session_system_graph_renders_only_a_fully_executed_labelled_sample(self):
+        window_start = datetime(2026, 1, 1, tzinfo=UTC)
+        session_id = "003b76f1-2b4a-4af5-b0dc-224d687374d4"
+        sample = GraphCandidateSample(
+            rows=(
+                {
+                    "trace_id": "trace-proven-match",
+                    "trace_session_id": session_id,
+                    "start_time": window_start + timedelta(hours=1),
+                    "end_time": window_start + timedelta(hours=1, seconds=2),
+                    "latency_ms": 25,
+                    "cost": 1,
+                    "total_tokens": 10,
+                    "prompt_tokens": 6,
+                    "completion_tokens": 4,
+                    "status": "OK",
+                },
+            ),
+            query_complete=False,
+            query_status="sampled",
+            query_error_code="sample_limit",
+            window_start=window_start,
+            window_end=window_start + timedelta(days=14),
+            elapsed_ms=1,
+            query_count=16,
+            rows_returned=16,
+            result_payload_bytes=100,
+            total_rows_lower_bound=1,
+            sampling_strategy="time_stratified_latest_state",
+            sampling_strata=8,
+            sampling_strata_completed=8,
+        )
+        analytics = mock.Mock()
+        analytics.execute_ch_query.return_value = mock.Mock(data=[], columns=[])
+
+        with mock.patch(
+            "tracer.services.clickhouse.session_graph.read_graph_candidates",
+            return_value=sample,
+        ):
+            graph = fetch_session_graph_ch(
+                analytics=analytics,
+                project_id=str(uuid.uuid4()),
+                filters=[],
+                interval="day",
+                req_data_config={"id": "session_count", "type": "SYSTEM_METRIC"},
+            )
+
+        assert graph["query_complete"] is False
+        assert graph["query_status"] == "sampled"
+        assert graph["query_error_code"] == "sample_limit"
+        assert graph["query_sampled"] is True
+        assert graph["query_sampling_strategy"] == "time_stratified_latest_state"
+        assert graph["query_sampling_strata"] == 8
+        assert graph["query_sampling_strata_completed"] == 8
+        assert any(point["value"] == 1 for point in graph["data"])
+        analytics.execute_ch_query.assert_called_once()
+
     @pytest.mark.parametrize(
         ("failure", "error_code"),
         [
@@ -738,6 +909,10 @@ class TestTraceSessionGraphAPI:
                 ServerException("secret SQL and internal CH stack", 159),
                 "read_budget_exceeded",
             ),
+            (ServerException("secret memory context", 241), "read_budget_exceeded"),
+            (ServerException("secret overflow context", 307), "read_budget_exceeded"),
+            (ServerException("secret type context", 386), "query_failed"),
+            (NetworkError("secret network context"), "query_failed"),
             (ReadDeadlineExceeded("secret deadline context"), "read_budget_exceeded"),
         ],
     )
@@ -781,6 +956,7 @@ class TestTraceSessionGraphAPI:
         assert payload["query_status"] == "degraded"
         assert payload["query_error_code"] == error_code
         rendered = str(response.data)
+        assert "secret" not in rendered
         assert "secret SQL" not in rendered
         assert "internal CH stack" not in rendered
         assert "secret deadline context" not in rendered
@@ -795,7 +971,7 @@ class TestTraceSessionGraphAPI:
             RuntimeError("secret compiler state"),
         ],
     )
-    def test_session_graph_query_defects_are_sanitized_400_without_pg_fallback(
+    def test_session_graph_query_defects_are_sanitized_500_without_pg_fallback(
         self,
         auth_client,
         observe_project,
@@ -826,7 +1002,9 @@ class TestTraceSessionGraphAPI:
                 format="json",
             )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.data["type"] == "server_error"
+        assert response.data["code"] == "server_error"
         rendered = str(response.data)
         assert "secret" not in rendered
         assert "unknown identifier" not in rendered
@@ -963,6 +1141,73 @@ class TestTraceSessionGraphAPI:
         assert payload["query_complete"] is False
         assert payload["query_error_code"] == "sample_limit"
         assert helper_calls[0]["filters"][-1]["column_id"] == "trace_session_id"
+
+    def test_session_annotation_fully_executed_sample_is_a_labelled_200(
+        self,
+        auth_client,
+        observe_project,
+    ):
+        sampled_annotation = {
+            "metric_name": "annotation-id",
+            "data": [
+                {
+                    "timestamp": "2026-08-03T00:00:00Z",
+                    "value": 50,
+                    "primary_traffic": 1,
+                }
+            ],
+            "query_complete": False,
+            "query_status": "sampled",
+            "query_sampled": True,
+            "query_error_code": "sample_limit",
+            "query_sampling_strategy": "time_stratified_latest_state",
+            "query_sampling_strata": 8,
+            "query_sampling_strata_completed": 8,
+        }
+        request_body = {
+            "project_id": str(observe_project.id),
+            "interval": "day",
+            "property": "average",
+            "req_data_config": {
+                "id": "annotation-id",
+                "type": "ANNOTATION",
+                "output_type": "SCORE",
+            },
+            "filters": [],
+        }
+
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.fetch_annotation_graph_ch",
+                return_value=sampled_annotation,
+            ),
+        ):
+            legacy_response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/",
+                request_body,
+                format="json",
+            )
+            response = auth_client.post(
+                "/tracer/trace-session/get_session_graph_data/?allow_sampled=true",
+                request_body,
+                format="json",
+            )
+
+        assert legacy_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        legacy_payload = get_result(legacy_response)
+        assert legacy_payload["data"] == []
+        assert legacy_payload["query_status"] == "degraded"
+        assert response.status_code == status.HTTP_200_OK
+        payload = get_result(response)
+        assert payload["data"] == sampled_annotation["data"]
+        assert payload["query_complete"] is False
+        assert payload["query_status"] == "sampled"
+        assert payload["query_sampled"] is True
+        assert payload["query_sampling_strata_completed"] == 8
 
     def test_session_graph_rejects_unsupported_type_without_any_ch_read(
         self,
@@ -1277,7 +1522,7 @@ class TestTraceSessionWorkspaceScopeAPI:
         settings = analytics.execute_ch_query.call_args.kwargs["settings"]
         assert settings["max_result_rows"] == 501
 
-    def test_session_message_filter_budget_is_explicit_degraded_and_sanitized(
+    def test_session_message_filter_budget_returns_sanitized_503(
         self, auth_client, observe_project
     ):
         analytics = mock.Mock()
@@ -1297,20 +1542,68 @@ class TestTraceSessionWorkspaceScopeAPI:
                 },
             )
 
-        assert response.status_code == status.HTTP_200_OK
-        assert get_result(response) == {
-            "values": [],
-            "next": False,
-            "query_complete": False,
-            "query_status": "degraded",
-            "query_error_code": "read_budget_exceeded",
-        }
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert "temporarily unavailable" in str(response.data)
         assert "private dense-project query" not in str(response.data)
         settings = analytics.execute_ch_query.call_args.kwargs["settings"]
         assert settings["timeout_overflow_mode"] == "throw"
         assert settings["read_overflow_mode"] == "throw"
 
-    def test_session_message_filter_query_defect_is_sanitized_400(
+    @pytest.mark.parametrize(
+        ("error_code", "values", "expected_status"),
+        [
+            (
+                "read_budget_exceeded",
+                ("sample message",),
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+            ),
+            ("sample_limit", ("sample message",), status.HTTP_200_OK),
+            ("sample_limit", (), status.HTTP_503_SERVICE_UNAVAILABLE),
+        ],
+    )
+    def test_session_message_filter_only_publishes_labelled_samples(
+        self, auth_client, observe_project, error_code, values, expected_status
+    ):
+        window_end = datetime.now(UTC)
+        value_read = FilterValueRead(
+            values,
+            False,
+            error_code,
+            window_end - timedelta(days=30),
+            window_end,
+        )
+
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "tracer.views.trace_session.read_session_message_filter_values",
+                return_value=value_read,
+            ),
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/get_session_filter_values/",
+                {
+                    "project_id": str(observe_project.id),
+                    "column": "first_message",
+                },
+            )
+
+        assert response.status_code == expected_status
+        if expected_status == status.HTTP_200_OK:
+            payload = get_result(response)
+            assert payload["values"] == ["sample message"]
+            assert payload["query_complete"] is False
+            assert payload["query_status"] == "sampled"
+            assert payload["query_error_code"] == "sample_limit"
+            assert "query_window_start" in payload
+            assert "query_window_end" in payload
+        else:
+            assert "temporarily unavailable" in str(response.data)
+
+    def test_session_message_filter_query_defect_is_sanitized_500(
         self, auth_client, observe_project
     ):
         analytics = mock.Mock()
@@ -1330,7 +1623,7 @@ class TestTraceSessionWorkspaceScopeAPI:
                 },
             )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
         rendered = str(response.data)
         assert "secret unknown identifier" not in rendered
         assert "DB::Exception" not in rendered
@@ -1370,7 +1663,7 @@ class TestTraceSessionWorkspaceScopeAPI:
             RuntimeError("secret session filter compiler state"),
         ],
     )
-    def test_session_filter_values_query_defects_are_sanitized_400(
+    def test_session_filter_values_query_defects_are_sanitized_500(
         self,
         auth_client,
         observe_project,
@@ -1388,7 +1681,7 @@ class TestTraceSessionWorkspaceScopeAPI:
                 {"project_id": str(observe_project.id), "column": "user_id"},
             )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
         rendered = str(response.data)
         assert "secret" not in rendered
         assert "unknown identifier" not in rendered
@@ -1418,7 +1711,7 @@ class TestTraceSessionWorkspaceScopeAPI:
         )
 
         with mock.patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+            "tracer.views.trace_session.V2AnalyticsQueryService",
             return_value=analytics,
         ):
             response = auth_client.get(
@@ -1457,7 +1750,7 @@ class TestTraceSessionWorkspaceScopeAPI:
         )
 
         with mock.patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+            "tracer.views.trace_session.V2AnalyticsQueryService",
             return_value=analytics,
         ):
             response = auth_client.get(
@@ -1470,6 +1763,38 @@ class TestTraceSessionWorkspaceScopeAPI:
         assert "secret SQL" not in payload
         assert "internal stack" not in payload
 
+    def test_session_list_unsupported_filter_shape_is_sanitized_400(
+        self, auth_client, observe_project
+    ):
+        analytics = mock.Mock()
+        builder = mock.Mock()
+        builder.supports_candidate_first_page.return_value = False
+        builder.supports_bounded_filter_scan.return_value = False
+        builder.bounded_filter_degraded_error_code.return_value = (
+            "unsupported_filter_shape"
+        )
+
+        with (
+            mock.patch(
+                "tracer.views.trace_session.V2AnalyticsQueryService",
+                return_value=analytics,
+            ),
+            mock.patch(
+                "tracer.views.trace_session.SessionListQueryBuilderV2",
+                return_value=builder,
+            ),
+        ):
+            response = auth_client.get(
+                "/tracer/trace-session/list_sessions/",
+                {"project_id": str(observe_project.id)},
+            )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.data["type"] == "validation_error"
+        assert "configuration is invalid" in response.data["message"]
+        assert "unsupported_filter_shape" not in str(response.data)
+        analytics.execute_ch_query.assert_not_called()
+
     @pytest.mark.parametrize(
         "failure",
         [
@@ -1479,7 +1804,7 @@ class TestTraceSessionWorkspaceScopeAPI:
             RuntimeError("secret session compiler invariant failed"),
         ],
     )
-    def test_session_list_query_defects_are_sanitized_400(
+    def test_session_list_query_defects_are_sanitized_500(
         self,
         auth_client,
         observe_project,
@@ -1489,7 +1814,7 @@ class TestTraceSessionWorkspaceScopeAPI:
         analytics.execute_ch_query.side_effect = failure
 
         with mock.patch(
-            "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+            "tracer.views.trace_session.V2AnalyticsQueryService",
             return_value=analytics,
         ):
             response = auth_client.get(
@@ -1497,7 +1822,9 @@ class TestTraceSessionWorkspaceScopeAPI:
                 {"project_id": str(observe_project.id)},
             )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.data["type"] == "server_error"
+        assert response.data["code"] == "server_error"
         rendered = str(response.data)
         assert "secret" not in rendered
         assert "unknown identifier" not in rendered

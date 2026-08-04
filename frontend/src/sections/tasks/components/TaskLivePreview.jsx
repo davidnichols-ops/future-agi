@@ -254,6 +254,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         const resp = await axios.get(endpoints.project.getCallLogs, {
           params: {
             project_id: projectId,
+            allow_sampled: true,
             page: 1,
             page_size: 50,
             filters: JSON.stringify(apiFilters),
@@ -286,6 +287,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
       const resp = await axios.get(url, {
         params: {
           project_id: projectId,
+          allow_sampled: true,
           page_number: 0,
           page_size: 50,
           filters: JSON.stringify(apiFilters),

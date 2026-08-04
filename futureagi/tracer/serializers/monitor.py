@@ -415,3 +415,11 @@ class FetchGraphSerializer(StrictInputSerializer):
     )
     req_data_config = FetchGraphMetricConfigField()
     project_id = serializers.UUIDField()
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Explicitly opt in to bounded sample points. Clients that set this "
+            "must label sampled values as estimates rather than exact totals."
+        ),
+    )

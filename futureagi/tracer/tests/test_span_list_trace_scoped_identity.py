@@ -38,6 +38,9 @@ class _BoundedNonObserveBuilder:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
+    def bounded_filter_degraded_error_code(self):
+        return None
+
     def supports_bounded_filter_scan(self):
         return True
 
@@ -67,12 +70,9 @@ def _bounded_page(*, rows, complete):
 
 def _run_non_observe_bounded_page(monkeypatch, page):
     monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-        lambda _query_type: _BoundedNonObserveBuilder,
-    )
-    monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.query_service.query_service_for_builder",
-        lambda _query_type, _builder_cls, analytics: analytics,
+        observation_span_view,
+        "SpanListQueryBuilderV2",
+        _BoundedNonObserveBuilder,
     )
     monkeypatch.setattr(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page",

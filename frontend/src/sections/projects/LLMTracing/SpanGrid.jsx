@@ -49,6 +49,7 @@ import {
   getQueryReadState,
 } from "src/utils/queryReadState";
 import { createListCursorPagination } from "./listCursorPagination";
+import { getListTotalState } from "./listTotalMetadata";
 
 const ROWS_LIMIT = 25;
 
@@ -424,6 +425,7 @@ const SpanGrid = React.forwardRef(
                   // Omit project_id when null — backend treats absent
                   // project_id as org-scoped (used by user-detail page).
                   ...(observeId ? { project_id: observeId } : {}),
+                  allow_sampled: true,
                   page_size: ROWS_LIMIT,
                   filters: JSON.stringify(
                     toBackendFilters([
@@ -515,9 +517,13 @@ const SpanGrid = React.forwardRef(
               const rows = res?.table || [];
               const metadata = res?.metadata || {};
               cursorPagination.current.recordResponse(pageNumber, metadata);
-              const totalRows = metadata.total_rows;
-              params.api.totalRowCount = totalRows;
-              useSpanGridStore.setState({ totalRowCount: totalRows || 0 });
+              const totalState = getListTotalState(metadata);
+              params.api.totalRowCount = totalState.totalRowCount;
+              params.api.totalRowCountLowerBound =
+                totalState.totalRowCountLowerBound;
+              params.api.totalRowCountIsLowerBound =
+                totalState.totalRowCountIsLowerBound;
+              useSpanGridStore.setState(totalState);
 
               // Infinite-scroll: don't expose total upfront → scrollbar grows as you scroll
               const isLastPage = cursorPagination.current.isLastPage(

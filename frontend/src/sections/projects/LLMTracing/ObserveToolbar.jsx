@@ -88,6 +88,7 @@ const ObserveToolbar = ({
   bulkActions,
   isSimulator,
   allMatching,
+  selectedCountIsLowerBound,
   // Add Evals button
   excludeSimulationCalls,
   onToggleSimulationCalls,
@@ -371,6 +372,7 @@ const ObserveToolbar = ({
           isSimulator={isSimulator}
           actions={bulkActions}
           allMatching={allMatching}
+          selectedCountIsLowerBound={selectedCountIsLowerBound}
         />
       ) : (
         <>
@@ -590,6 +592,7 @@ ObserveToolbar.propTypes = {
   onCompareToggle: PropTypes.func,
   isCompareActive: PropTypes.bool,
   selectedCount: PropTypes.number,
+  selectedCountIsLowerBound: PropTypes.bool,
   allMatching: PropTypes.bool,
   onClearSelection: PropTypes.func,
   onBulkAction: PropTypes.func,

@@ -334,17 +334,21 @@ const PrimaryGraph = ({
       apiEndpoint,
     ],
     queryFn: () =>
-      axios.post(apiEndpoint, {
-        interval: selectedInterval,
-        filters: toBackendFilters(combinedFilters),
-        property: "average",
-        req_data_config: {
-          id: metricDef.id,
-          type: metricDef.apiType || "SYSTEM_METRIC",
-          ...(metricDef.outputType && { output_type: metricDef.outputType }),
+      axios.post(
+        apiEndpoint,
+        {
+          interval: selectedInterval,
+          filters: toBackendFilters(combinedFilters),
+          property: "average",
+          req_data_config: {
+            id: metricDef.id,
+            type: metricDef.apiType || "SYSTEM_METRIC",
+            ...(metricDef.outputType && { output_type: metricDef.outputType }),
+          },
+          project_id: effectiveObserveId,
         },
-        project_id: effectiveObserveId,
-      }),
+        { params: { allow_sampled: true } },
+      ),
     select: (d) => ({
       ...(d.data?.result || {}),
       queryReadState: getQueryReadState(d.data),

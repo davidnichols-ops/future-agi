@@ -157,13 +157,17 @@ const GraphSection = ({
       selectedGraphConfig,
     ],
     queryFn: () =>
-      axios.post(endpoints.project.getTraceGraphData(), {
-        interval: selectedInterval,
-        filters: toBackendFilters(combinedFilters),
-        property: "average",
-        req_data_config: selectedGraphConfig,
-        project_id: observeId,
-      }),
+      axios.post(
+        endpoints.project.getTraceGraphData(),
+        {
+          interval: selectedInterval,
+          filters: toBackendFilters(combinedFilters),
+          property: "average",
+          req_data_config: selectedGraphConfig,
+          project_id: observeId,
+        },
+        { params: { allow_sampled: true } },
+      ),
     enabled: selectedTab === "trace" && Boolean(selectedGraphConfig?.id),
     select: (data) => data.data?.result,
   });
@@ -186,13 +190,17 @@ const GraphSection = ({
       selectedGraphEvals,
     ],
     queryFn: () =>
-      axios.post(endpoints.project.getSpanGraphData(), {
-        interval: selectedInterval,
-        filters: toBackendFilters(combinedFilters),
-        property: "average",
-        req_data_config: selectedGraphConfig,
-        project_id: observeId,
-      }),
+      axios.post(
+        endpoints.project.getSpanGraphData(),
+        {
+          interval: selectedInterval,
+          filters: toBackendFilters(combinedFilters),
+          property: "average",
+          req_data_config: selectedGraphConfig,
+          project_id: observeId,
+        },
+        { params: { allow_sampled: true } },
+      ),
     enabled: selectedTab === "spans" && Boolean(selectedGraphConfig?.id),
     select: (data) => data.data?.result,
   });

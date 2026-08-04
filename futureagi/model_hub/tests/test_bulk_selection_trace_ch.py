@@ -21,10 +21,12 @@ from model_hub.models.ai_model import AIModel
 from model_hub.services.bulk_selection import (
     BulkSelectionReadIncomplete,
     ResolveResult,
+    _bounded_bulk_classify_batch_size,
     _bounded_bulk_worst_case_query_count,
     _resolve_trace_ids_clickhouse,
     _resolve_voice_call_ids_clickhouse,
     _supports_bounded_bulk_prefix,
+    _use_authoritative_eval_source,
     resolve_filtered_trace_ids,
 )
 from tracer.models.project import Project
@@ -45,7 +47,7 @@ def _install_fake_trace_builder(
     error_code=None,
     supports=True,
 ):
-    """Patch TraceListQueryBuilder + AnalyticsQueryService so
+    """Patch the explicit V2 trace builder/service so
     ``_resolve_trace_ids_clickhouse`` runs against a fake CH returning ``rows``.
     ``capture`` records the builder constructor kwargs (page_size, filters)."""
 
@@ -77,45 +79,56 @@ def _install_fake_trace_builder(
         )
 
     monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-        lambda query_type: _FakeBuilder,
+        "tracer.services.clickhouse.v2.query_builders.trace_list.TraceListQueryBuilderV2",
+        _FakeBuilder,
     )
     monkeypatch.setattr(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
         _fake_bounded_read,
     )
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
         _FakeAnalytics,
     )
 
 
-def _install_fake_voice_builder(monkeypatch, *, rows, capture):
-    """Patch VoiceCallListQueryBuilder + AnalyticsQueryService for the voice
-    resolver, and neutralize the simulator post-filter (a second CH read)."""
+def _install_fake_voice_builder(
+    monkeypatch, *, rows, capture, has_more=False, supports=True
+):
+    """Patch the explicit V2 voice builder/service and bounded selector."""
 
     class _FakeBuilder:
         def __init__(self, **kwargs):
             capture.update(kwargs)
 
-        def build(self):
-            return "SELECT trace_id FROM spans", {}
+        def supports_bounded_filter_scan(self):
+            return supports
+
+        def bounded_filter_degraded_error_code(self):
+            return None
+
+        @staticmethod
+        def recommended_filter_classify_batch_size():
+            return 50
 
     class _FakeAnalytics:
         def execute_ch_query(self, query, params, timeout_ms=None):
             return _FakeResult(rows)
 
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_builders.VoiceCallListQueryBuilder",
+        "tracer.services.clickhouse.v2.query_builders.voice_call_list.VoiceCallListQueryBuilderV2",
         _FakeBuilder,
     )
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_service.AnalyticsQueryService",
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
         _FakeAnalytics,
     )
     monkeypatch.setattr(
-        "model_hub.services.bulk_selection._filter_out_simulator_calls_ch",
-        lambda ids, project_id, analytics: ids,
+        "model_hub.services.bulk_selection._read_bounded_bulk_page",
+        lambda **kwargs: (
+            capture.update({"bounded_read": kwargs})
+            or SimpleNamespace(rows=rows, has_more=has_more)
+        ),
     )
 
 
@@ -229,6 +242,28 @@ def test_trace_exclusion_prefix_budget_matches_per_seed_classifier_batches():
     assert _supports_bounded_bulk_prefix(cap=10_000, exclude_count=2_799) is False
 
 
+def test_voice_classifier_batch_scales_only_to_fit_finite_query_budget():
+    assert (
+        _bounded_bulk_classify_batch_size(cap=25, exclude_count=0, preferred=50) == 50
+    )
+    assert (
+        _bounded_bulk_classify_batch_size(
+            cap=10_000,
+            exclude_count=0,
+            preferred=50,
+        )
+        == 130
+    )
+    assert (
+        _bounded_bulk_classify_batch_size(
+            cap=10_000,
+            exclude_count=2_798,
+            preferred=50,
+        )
+        == 200
+    )
+
+
 def test_trace_over_budget_exclusions_fail_closed_without_legacy_build(monkeypatch):
     capture: dict = {}
     _install_fake_trace_builder(monkeypatch, rows=[], capture=capture)
@@ -276,8 +311,12 @@ def test_trace_ch_query_failure_propagates(monkeypatch):
             return None
 
     monkeypatch.setattr(
-        "tracer.services.clickhouse.v2.dispatch.get_query_builder_class",
-        lambda query_type: _Builder,
+        "tracer.services.clickhouse.v2.query_builders.trace_list.TraceListQueryBuilderV2",
+        _Builder,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        lambda: object(),
     )
     monkeypatch.setattr(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
@@ -490,11 +529,11 @@ def test_real_trace_builder_keeps_candidate_scoped_residual_filters(
 
 
 # ---------------------------------------------------------------------------
-# _resolve_voice_call_ids_clickhouse — voice build() has its own internal +1
+# _resolve_voice_call_ids_clickhouse — bounded direct-write V2 selection
 # ---------------------------------------------------------------------------
 def test_voice_truncation_and_flag_passthrough(monkeypatch):
-    # The voice build() adds LIMIT cap+1 internally, so the resolver passes
-    # page_size=cap; remove_simulation_calls must reach the builder.
+    # The bounded prefix needs cap+1 and simulator classification stays at its
+    # candidate-scoped fifty-row ceiling.
     capture: dict = {}
     _install_fake_voice_builder(
         monkeypatch,
@@ -509,11 +548,31 @@ def test_voice_truncation_and_flag_passthrough(monkeypatch):
         remove_simulation_calls=True,
         annotation_label_ids=[],
     )
-    assert capture["page_size"] == 2  # voice adds its own +1
+    assert capture["page_size"] == 3
     assert capture["remove_simulation_calls"] is True
+    assert capture["bounded_read"]["classify_batch_size"] == 50
+    assert capture["bounded_read"]["key_field"] == "trace_id"
     assert res.ids == ["v0", "v1"]
     assert res.truncated is True
     assert res.total_matching == 3
+
+
+def test_voice_default_10000_cap_fits_bounded_simulator_query_budget(monkeypatch):
+    capture: dict = {}
+    _install_fake_voice_builder(monkeypatch, rows=[], capture=capture)
+
+    result = _resolve_voice_call_ids_clickhouse(
+        project_id="p1",
+        filters=[],
+        exclude_ids=set(),
+        cap=10_000,
+        remove_simulation_calls=True,
+        annotation_label_ids=[],
+    )
+
+    assert result == ResolveResult(ids=[], total_matching=0, truncated=False)
+    assert capture["bounded_read"]["cap"] == 10_000
+    assert capture["bounded_read"]["classify_batch_size"] == 130
 
 
 def test_voice_ch_query_failure_propagates(monkeypatch):
@@ -521,12 +580,23 @@ def test_voice_ch_query_failure_propagates(monkeypatch):
         def __init__(self, **kwargs):
             pass
 
-        def build(self):
-            raise RuntimeError("CH down")
+        def supports_bounded_filter_scan(self):
+            return True
+
+        def bounded_filter_degraded_error_code(self):
+            return None
 
     monkeypatch.setattr(
-        "tracer.services.clickhouse.query_builders.VoiceCallListQueryBuilder",
+        "tracer.services.clickhouse.v2.query_builders.voice_call_list.VoiceCallListQueryBuilderV2",
         _Boom,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        "model_hub.services.bulk_selection._read_bounded_bulk_page",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("CH down")),
     )
     with capture_logs() as logs:
         with pytest.raises(RuntimeError, match="CH down"):
@@ -544,6 +614,83 @@ def test_voice_ch_query_failure_propagates(monkeypatch):
         and e["log_level"] == "warning"
         for e in logs
     )
+
+
+@pytest.mark.unit
+def test_voice_simulator_classifier_emits_only_direct_write_columns():
+    from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+        VoiceCallListQueryBuilderV2,
+    )
+
+    filters = [
+        {
+            "column_id": "start_time",
+            "filter_config": {
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [
+                    "2026-07-01T00:00:00Z",
+                    "2026-08-01T00:00:00Z",
+                ],
+            },
+        }
+    ]
+    builder = _use_authoritative_eval_source(
+        VoiceCallListQueryBuilderV2(
+            project_id="00000000-0000-4000-8000-000000000001",
+            filters=filters,
+            remove_simulation_calls=True,
+        )
+    )
+
+    query, params = builder.build_filter_match_query(["trace-candidate"])
+    normalized = " ".join(query.split())
+
+    assert "JSONExtractRaw( attributes_extra, 'raw_log' )" in normalized
+    assert "JSONExtractString( attributes_extra, 'raw_log' )" in normalized
+    assert "argMax(attrs_string, _version) AS latest_span_attr_str" in normalized
+    assert "argMax(is_deleted, _version) AS latest_is_deleted" in normalized
+    assert "attributes_extra AS span_attributes_raw" not in normalized
+    assert "_peerdb_version" not in query
+    assert "_peerdb_is_deleted" not in query
+    assert params["candidate_trace_ids"] == ("trace-candidate",)
+
+
+@pytest.mark.unit
+def test_bulk_v2_filter_uses_configured_authoritative_eval_table(settings):
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
+
+    settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
+    builder = _use_authoritative_eval_source(
+        TraceListQueryBuilderV2(
+            project_id="00000000-0000-4000-8000-000000000001",
+            bounded_identity_only=True,
+            bounded_bulk_scan=True,
+        )
+    )
+    filter_builder = builder._FILTER_BUILDER_CLS(
+        project_id="00000000-0000-4000-8000-000000000001"
+    )
+    where, _ = filter_builder.translate(
+        [
+            {
+                "column_id": "has_eval",
+                "filter_config": {
+                    "filter_type": "boolean",
+                    "filter_op": "equals",
+                    "filter_value": True,
+                },
+            }
+        ]
+    )
+
+    assert "FROM tracer_eval_logger AS eval_scan" in where
+    assert "ORDER BY eval_scan._peerdb_version DESC" in where
+    assert "latest_eval._peerdb_is_deleted = 0" in where
+    assert "(latest_eval.deleted = 0 OR latest_eval.deleted IS NULL)" in where
+    assert "tracer_eval_logger_v2" not in where
 
 
 # ---------------------------------------------------------------------------

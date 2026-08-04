@@ -14,7 +14,7 @@ The result is a ``{nodes, edges}`` structure ready for React Flow rendering.
 """
 
 from datetime import timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
@@ -31,11 +31,12 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
     """
 
     TABLE = "spans"
+    _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
 
     def __init__(
         self,
         project_id: str,
-        filters: Optional[List[Dict]] = None,
+        filters: list[dict] | None = None,
         max_nodes: int = 100,
         max_edges: int = 200,
         **kwargs: Any,
@@ -52,8 +53,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         # ClickHouse to scan all historical spans — triggering OOM on large
         # projects and the intermittent errors seen in TH-4422.
         has_date_filter = any(
-            f.get("column_id") in ("created_at", "start_time")
-            for f in self.filters
+            f.get("column_id") in ("created_at", "start_time") for f in self.filters
         )
         if not has_date_filter:
             self.start_date = self.end_date - timedelta(days=30)
@@ -61,18 +61,57 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         self.params["start_date"] = self.start_date
         self.params["end_date"] = self.end_date
 
-    def build(self) -> Tuple[str, Dict[str, Any]]:
+    def _build_filter_scope(self, span_alias: str) -> tuple[str, str, dict[str, Any]]:
+        """Build one tenant/time-bounded trace membership set for graph filters.
+
+        Filter-builder subqueries require a physical table name.  Passing the
+        edge query's ``child`` alias here used to emit ``FROM child`` for text
+        and attribute filters, which is not a ClickHouse table.  A finite CTE
+        also gives edge and node queries identical filter membership without
+        ambiguous unqualified columns in the self-join.
+        """
+
+        if not self.filters:
+            return "", "", {}
+
+        fb = self._FILTER_BUILDER_CLS(
+            table=self.TABLE,
+            project_id=self.project_id,
+            score_date_scope=True,
+            span_date_scope=True,
+            strict_trace_project_correlation=True,
+        )
+        extra_where, extra_params = fb.translate(self.filters)
+        if not extra_where:
+            return "", "", extra_params
+
+        cte = f"""
+        WITH filtered_trace_ids AS (
+            SELECT DISTINCT trace_id
+            FROM {self.TABLE}
+            PREWHERE project_id = %(project_id)s
+              AND created_at >= %(start_date)s - INTERVAL 1 DAY
+              AND created_at < %(end_date)s + INTERVAL 1 DAY
+            WHERE is_deleted = 0
+              AND start_time >= %(start_date)s
+              AND start_time < %(end_date)s
+              AND ({extra_where})
+        )
+        """
+        membership = (
+            f"AND {span_alias}.trace_id IN (SELECT trace_id FROM filtered_trace_ids)"
+        )
+        return cte, membership, extra_params
+
+    def build(self) -> tuple[str, dict[str, Any]]:
         """Build the edge aggregation query (parent→child transitions).
 
         Returns:
             A ``(query_string, params)`` tuple. Each row represents an edge
             between two node types with aggregate metrics.
         """
-        fb = ClickHouseFilterBuilder(table="child")
-        extra_where, extra_params = fb.translate(self.filters)
+        filter_cte, filter_fragment, extra_params = self._build_filter_scope("child")
         self.params.update(extra_params)
-
-        filter_fragment = f"AND {extra_where}" if extra_where else ""
 
         self.params["max_edges"] = self.max_edges
 
@@ -86,6 +125,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         # projects on the parent side of the self-join. Together this takes
         # the query from 5s+ timeout to ~0.6s on a 236k-span, 7-day window.
         query = f"""
+        {filter_cte}
         SELECT
             parent.name AS source_node,
             parent.observation_type AS source_type,
@@ -111,7 +151,9 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
           AND child.parent_span_id IS NOT NULL
           AND child.parent_span_id != ''
           AND child.created_at >= %(start_date)s - INTERVAL 1 DAY
+          AND child.created_at < %(end_date)s + INTERVAL 1 DAY
           AND parent.created_at >= %(start_date)s - INTERVAL 2 DAY
+          AND parent.created_at < %(end_date)s + INTERVAL 1 DAY
           AND child.start_time >= %(start_date)s
           AND child.start_time < %(end_date)s
           {filter_fragment}
@@ -122,7 +164,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         """
         return query, self.params
 
-    def build_node_metrics(self) -> Tuple[str, Dict[str, Any]]:
+    def build_node_metrics(self) -> tuple[str, dict[str, Any]]:
         """Build the node metrics aggregation query.
 
         Returns per-node aggregates across all spans (not just edges).
@@ -132,14 +174,17 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         Returns:
             A ``(query_string, params)`` tuple.
         """
+        filter_cte, filter_fragment, filter_params = self._build_filter_scope("spans")
         params = {
             "project_id": self.project_id,
             "start_date": self.start_date,
             "end_date": self.end_date,
             "max_nodes": self.max_nodes,
+            **filter_params,
         }
 
         query = f"""
+        {filter_cte}
         SELECT
             name AS node_name,
             observation_type AS node_type,
@@ -152,8 +197,10 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         FROM {self.TABLE}
         {self.project_where()}
           AND created_at >= %(start_date)s - INTERVAL 1 DAY
+          AND created_at < %(end_date)s + INTERVAL 1 DAY
           AND start_time >= %(start_date)s
           AND start_time < %(end_date)s
+          {filter_fragment}
         GROUP BY node_name, node_type
         ORDER BY span_count DESC
         LIMIT %(max_nodes)s
@@ -167,18 +214,18 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
 
     def format_result(
         self,
-        edge_rows: List,
-        edge_columns: List[str],
-        node_rows: List,
-        node_columns: List[str],
-    ) -> Dict[str, Any]:
+        edge_rows: list,
+        edge_columns: list[str],
+        node_rows: list,
+        node_columns: list[str],
+    ) -> dict[str, Any]:
         """Merge edge and node query results into graph response.
 
         Returns:
             ``{"nodes": [...], "edges": [...]}`` dict.
         """
         # Build node lookup from node metrics query
-        node_map: Dict[str, Dict[str, Any]] = {}
+        node_map: dict[str, dict[str, Any]] = {}
         for row in node_rows:
             if isinstance(row, dict):
                 name = row.get("node_name", "")
@@ -215,7 +262,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
             }
 
         # Build edges from edge query
-        edges: List[Dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
         for row in edge_rows:
             if isinstance(row, dict):
                 src_name = row.get("source_node", "")
