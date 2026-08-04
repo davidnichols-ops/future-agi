@@ -931,6 +931,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         limit: int,
         before_start_time: datetime | None = None,
         before_id: Any = None,
+        direction: str = "older",
     ) -> tuple[str, dict[str, Any]]:
         """Return a root-ordered superset after a common anchor sentinel.
 
@@ -939,6 +940,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         when the returned root prefix is mathematically closed.
         """
 
+        if direction not in {"older", "newer"}:
+            raise ValueError("trace seed direction must be older or newer")
         if limit <= 0:
             raise ValueError("limit must be greater than zero")
         if (before_start_time is None) != (before_id is None):
@@ -1002,7 +1005,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if before_start_time is not None:
             if not slice_start <= before_start_time < slice_end:
                 raise ValueError("trace keyset must stay inside its slice")
-            params["filter_before_start_us"] = _unix_microseconds(before_start_time)
+            cursor_prefix = "filter_before" if direction == "older" else "filter_after"
+            params[f"{cursor_prefix}_start_us"] = _unix_microseconds(before_start_time)
             if self.project_ids is not None:
                 if not (
                     isinstance(before_id, tuple)
@@ -1012,41 +1016,44 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     raise ValueError(
                         "org trace keyset must be a (trace_id, project_id) tuple"
                     )
-                params["filter_before_id"] = before_id[0]
-                params["filter_before_project_id"] = before_id[1]
-                keyset_fragment = """
+                params[f"{cursor_prefix}_id"] = before_id[0]
+                params[f"{cursor_prefix}_project_id"] = before_id[1]
+                comparator = "<" if direction == "older" else ">"
+                keyset_fragment = f"""
               AND (
-                  toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
+                  toUnixTimestamp64Micro(start_time) {comparator} %({cursor_prefix}_start_us)s
                   OR (
-                      toUnixTimestamp64Micro(start_time) = %(filter_before_start_us)s
+                      toUnixTimestamp64Micro(start_time) = %({cursor_prefix}_start_us)s
                       AND (
-                          trace_id < %(filter_before_id)s
+                          trace_id {comparator} %({cursor_prefix}_id)s
                           OR (
-                              trace_id = %(filter_before_id)s
-                              AND toString(project_id) < %(filter_before_project_id)s
+                              trace_id = %({cursor_prefix}_id)s
+                              AND toString(project_id) {comparator} %({cursor_prefix}_project_id)s
                           )
                       )
                   )
               )
             """
             else:
-                params["filter_before_id"] = str(before_id)
-                keyset_fragment = """
+                params[f"{cursor_prefix}_id"] = str(before_id)
+                comparator = "<" if direction == "older" else ">"
+                keyset_fragment = f"""
               AND (
-                  toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
+                  toUnixTimestamp64Micro(start_time) {comparator} %({cursor_prefix}_start_us)s
                   OR (
-                      toUnixTimestamp64Micro(start_time) = %(filter_before_start_us)s
-                      AND trace_id < %(filter_before_id)s
+                      toUnixTimestamp64Micro(start_time) = %({cursor_prefix}_start_us)s
+                      AND trace_id {comparator} %({cursor_prefix}_id)s
                   )
               )
             """
         identity_select = (
             "project_id, trace_id" if self.project_ids is not None else "trace_id"
         )
+        order_direction = "DESC" if direction == "older" else "ASC"
         identity_order = (
-            "trace_id DESC, toString(project_id) DESC"
+            f"trace_id {order_direction}, toString(project_id) {order_direction}"
             if self.project_ids is not None
-            else "trace_id DESC"
+            else f"trace_id {order_direction}"
         )
         identity_limit_by = (
             "project_id, trace_id" if self.project_ids is not None else "trace_id"
@@ -1064,11 +1071,39 @@ class TraceListQueryBuilder(BaseQueryBuilder):
           {predicate_fragment}{datetime_fragment}
           {sampling_fragment}
           {keyset_fragment}
-        ORDER BY start_time DESC, {identity_order}
+        ORDER BY start_time {order_direction}, {identity_order}
         LIMIT 1 BY {identity_limit_by}
         LIMIT %(filter_seed_limit)s
         """
         return query, params
+
+    def build_filter_navigation_seed_page(
+        self,
+        *,
+        direction: str,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+        cursor_start_time: datetime | None = None,
+        cursor_order_token: Any = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return raw roots ordered outwards from an exact navigation anchor.
+
+        ``older`` keeps the list's descending order. ``newer`` flips the SQL
+        order before ``LIMIT 1 BY trace`` so each raw seed is a lower bound on
+        the canonical latest-live root; reversing a descending result in Python
+        would not provide that proof.
+        """
+
+        return TraceListQueryBuilder.build_filter_ordered_seed_page(
+            self,
+            slice_start=slice_start,
+            slice_end=slice_end,
+            limit=limit,
+            before_start_time=cursor_start_time,
+            before_id=cursor_order_token,
+            direction=direction,
+        )
 
     def build_filter_seed_page(
         self,
@@ -1297,6 +1332,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         candidate_trace_identities: list[tuple[str, str]] | None = None,
         candidate_identity_only: bool | None = None,
         include_filter_witnesses: bool = True,
+        result_limit: int | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Classify bounded trace IDs against their latest span versions.
 
@@ -1338,6 +1374,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         candidate_count = len(trace_identities) if org_scope else len(trace_ids)
         if candidate_count > candidate_limit:
             raise ValueError("candidate trace batch exceeds bounded limit")
+        output_limit = candidate_count if result_limit is None else int(result_limit)
+        if not 1 <= output_limit <= candidate_limit:
+            raise ValueError("trace result limit exceeds bounded limit")
         if not self.supports_bounded_filter_scan():
             raise ValueError("unsupported bounded trace filter scan")
 
@@ -1739,9 +1778,31 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         ) AS latest_candidates
         WHERE {residual_predicate}
         ORDER BY {result_order}
-        LIMIT {candidate_count}
+        LIMIT {output_limit}
         """
         return query, params
+
+    def build_filter_navigation_target_query(
+        self,
+        *,
+        target_id: str,
+        result_limit: int = 2,
+    ) -> tuple[str, dict[str, Any]]:
+        """Resolve an exact filtered navigation target by latest trace state."""
+
+        normalized_target = str(target_id or "")
+        if not normalized_target:
+            raise ValueError("navigation target id must be non-empty")
+        # Call the base implementation explicitly. V2 subclasses wrap every
+        # public build method once; a dynamic self-call here would rewrite the
+        # nested query twice before this method's outer V2 boundary sees it.
+        return TraceListQueryBuilder.build_filter_match_query(
+            self,
+            [normalized_target],
+            candidate_identity_only=True,
+            include_filter_witnesses=False,
+            result_limit=result_limit,
+        )
 
     def _build_filter_match_query_from_seed_rows(
         self,

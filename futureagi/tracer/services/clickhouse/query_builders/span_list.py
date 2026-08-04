@@ -473,9 +473,12 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         limit: int,
         before_start_time: Any = None,
         before_id: Any = None,
+        direction: str = "older",
     ) -> tuple[str, dict[str, Any]]:
         """Return bounded physical matches as a latest-state candidate superset."""
 
+        if direction not in {"older", "newer"}:
+            raise ValueError("span seed direction must be older or newer")
         if not self.supports_bounded_filter_scan():
             raise ValueError("unsupported bounded span filter scan")
         if limit <= 0:
@@ -559,24 +562,26 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 raise ValueError(
                     "span keyset identity must be an (id, trace_id, project_id) tuple"
                 )
-            params["filter_before_start_us"] = _unix_microseconds(before_start_time)
-            params["filter_before_id"] = before_id[0]
-            params["filter_before_trace_id"] = before_id[1]
-            params["filter_before_project_id"] = before_id[2]
-            keyset_fragment = """
+            cursor_prefix = "filter_before" if direction == "older" else "filter_after"
+            comparator = "<" if direction == "older" else ">"
+            params[f"{cursor_prefix}_start_us"] = _unix_microseconds(before_start_time)
+            params[f"{cursor_prefix}_id"] = before_id[0]
+            params[f"{cursor_prefix}_trace_id"] = before_id[1]
+            params[f"{cursor_prefix}_project_id"] = before_id[2]
+            keyset_fragment = f"""
               AND (
-                  toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
+                  toUnixTimestamp64Micro(start_time) {comparator} %({cursor_prefix}_start_us)s
                   OR (
-                      toUnixTimestamp64Micro(start_time) = %(filter_before_start_us)s
+                      toUnixTimestamp64Micro(start_time) = %({cursor_prefix}_start_us)s
                       AND (
-                          id < %(filter_before_id)s
+                          id {comparator} %({cursor_prefix}_id)s
                           OR (
-                              id = %(filter_before_id)s
+                              id = %({cursor_prefix}_id)s
                               AND (
-                                  trace_id < %(filter_before_trace_id)s
+                                  trace_id {comparator} %({cursor_prefix}_trace_id)s
                                   OR (
-                                      trace_id = %(filter_before_trace_id)s
-                                      AND toString(project_id) < %(filter_before_project_id)s
+                                      trace_id = %({cursor_prefix}_trace_id)s
+                                      AND toString(project_id) {comparator} %({cursor_prefix}_project_id)s
                                   )
                               )
                           )
@@ -585,6 +590,13 @@ class SpanListQueryBuilder(BaseQueryBuilder):
               )
             """
 
+        order_fragment = (
+            "ORDER BY start_time DESC, id DESC, trace_id DESC,\n"
+            "            toString(project_id) DESC"
+            if direction == "older"
+            else "ORDER BY start_time ASC, id ASC, trace_id ASC,\n"
+            "            toString(project_id) ASC"
+        )
         query = f"""
         SELECT project_id, id, trace_id, start_time
         FROM {self.TABLE}
@@ -596,12 +608,33 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         WHERE {predicate}{datetime_fragment}
           {sampling_fragment}
           {keyset_fragment}
-        ORDER BY start_time DESC, id DESC, trace_id DESC,
-            toString(project_id) DESC
+        {order_fragment}
         LIMIT 1 BY project_id, trace_id, id, start_time
         LIMIT %(filter_seed_limit)s
         """
         return query, params
+
+    def build_filter_navigation_seed_page(
+        self,
+        *,
+        direction: str,
+        slice_start: Any,
+        slice_end: Any,
+        limit: int,
+        cursor_start_time: Any = None,
+        cursor_order_token: Any = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return physical span seeds ordered away from a navigation anchor."""
+
+        return SpanListQueryBuilder.build_filter_seed_page(
+            self,
+            slice_start=slice_start,
+            slice_end=slice_end,
+            limit=limit,
+            before_start_time=cursor_start_time,
+            before_id=cursor_order_token,
+            direction=direction,
+        )
 
     def build_filter_match_query(
         self,
@@ -654,6 +687,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         span_ids: tuple[str, ...],
         candidate_identities: tuple[tuple[str, str, str, Any], ...] | None,
         candidate_full_state: bool,
+        result_limit: int | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Resolve candidates by full physical span identity and latest state."""
 
@@ -662,6 +696,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         candidate_count = len(candidate_identities or span_ids)
         if candidate_count > 200:
             raise ValueError("candidate span batch exceeds bounded limit")
+        output_limit = candidate_count if result_limit is None else int(result_limit)
+        if not 1 <= output_limit <= 200:
+            raise ValueError("span result limit exceeds bounded limit")
         if not self.supports_bounded_filter_scan():
             raise ValueError("unsupported bounded span filter scan")
 
@@ -847,9 +884,33 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         WHERE {residual_predicate}
         ORDER BY start_time DESC, id DESC, trace_id DESC,
             toString(project_id) DESC
-        LIMIT {candidate_count}
+        LIMIT {output_limit}
         """
         return query, params
+
+    def build_filter_navigation_target_query(
+        self,
+        *,
+        target_id: str,
+        result_limit: int = 2,
+    ) -> tuple[str, dict[str, Any]]:
+        """Resolve up to two exact filtered rows for an external span id.
+
+        A span id is unique only inside a trace. Returning a two-row sentinel
+        lets navigation reject an ambiguous textual id instead of selecting an
+        arbitrary trace/start-time identity.
+        """
+
+        normalized_target = str(target_id or "")
+        if not normalized_target:
+            raise ValueError("navigation target id must be non-empty")
+        return SpanListQueryBuilder._build_filter_match_query(
+            self,
+            span_ids=(normalized_target,),
+            candidate_identities=None,
+            candidate_full_state=False,
+            result_limit=result_limit,
+        )
 
     # ------------------------------------------------------------------
     # Phase 1: Paginated span list

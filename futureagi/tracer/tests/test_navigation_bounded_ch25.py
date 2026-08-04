@@ -7,22 +7,31 @@ from unittest.mock import MagicMock, patch
 import pytest
 from clickhouse_driver.errors import ServerException
 
-from tracer.selectors.trace_filter_reads import BoundedFilterPage
+from tracer.selectors.trace_filter_reads import BoundedFilterNeighbors
 
 
-def _complete_page(rows, *, has_more=False):
-    return BoundedFilterPage(
-        rows=list(rows),
-        has_more=has_more,
+def _complete_neighbors(rows):
+    newer, current, older = rows
+    return BoundedFilterNeighbors(
+        newer=newer,
+        current=current,
+        older=older,
         complete=True,
-        status="complete",
         error_code=None,
-        total_rows_lower_bound=len(rows),
-        elapsed_ms=0.0,
         query_count=1,
-        rows_returned=len(rows),
-        result_payload_bytes=0,
-        attempts=(),
+        rows_scanned=len(rows),
+    )
+
+
+def _incomplete_neighbors(error_code):
+    return BoundedFilterNeighbors(
+        newer=None,
+        current=None,
+        older=None,
+        complete=False,
+        error_code=error_code,
+        query_count=1,
+        rows_scanned=0,
     )
 
 
@@ -49,10 +58,10 @@ def _ordered_rows(*, span=False):
 def test_trace_navigation_preserves_newest_first_list_direction():
     from tracer.views.trace import TraceView
 
-    page = _complete_page(_ordered_rows())
+    neighbors = _complete_neighbors(_ordered_rows())
     with patch(
-        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
-        return_value=page,
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_neighbors",
+        return_value=neighbors,
     ) as selector:
         response = TraceView()._get_trace_id_by_index_observe_clickhouse(
             MagicMock(),
@@ -67,19 +76,22 @@ def test_trace_navigation_preserves_newest_first_list_direction():
         "next_trace_id": "trace-older",
         "previous_trace_id": "trace-newer",
     }
-    assert selector.call_args.kwargs["page_number"] == 0
-    assert selector.call_args.kwargs["page_size"] == 4095
+    assert selector.call_args.kwargs["target_id"] == "trace-current"
+    assert selector.call_args.kwargs["scan_limit"] == 4095
+    assert selector.call_args.kwargs["page_size"] == 200
+    assert selector.call_args.kwargs["deadline_ms"] == 20_000
+    assert selector.call_args.kwargs["max_query_count"] == 128
 
 
 @pytest.mark.unit
 def test_span_navigation_preserves_newest_first_list_direction():
     from tracer.views.observation_span import ObservationSpanView
 
-    page = _complete_page(_ordered_rows(span=True))
+    neighbors = _complete_neighbors(_ordered_rows(span=True))
     with (
         patch(
-            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
-            return_value=page,
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_neighbors",
+            return_value=neighbors,
         ) as selector,
         patch("tracer.views.observation_span.V2AnalyticsQueryService"),
     ):
@@ -94,8 +106,12 @@ def test_span_navigation_preserves_newest_first_list_direction():
         "next_trace_id": "trace-older",
         "previous_trace_id": "trace-newer",
     }
-    assert selector.call_args.kwargs["page_number"] == 0
-    assert selector.call_args.kwargs["page_size"] == 4095
+    assert selector.call_args.kwargs["target_id"] == "span-current"
+    assert selector.call_args.kwargs["scan_limit"] == 4095
+    assert selector.call_args.kwargs["page_size"] == 200
+    assert selector.call_args.kwargs["deadline_ms"] == 20_000
+    assert selector.call_args.kwargs["max_query_count"] == 128
+    assert selector.call_args.kwargs["require_unique_target"] is True
 
 
 @pytest.mark.unit
@@ -107,12 +123,11 @@ def test_navigation_never_guesses_across_an_unread_page_boundary(kind):
     )
     from tracer.views.trace import TraceNavigationReadUnavailable, TraceView
 
-    rows = _ordered_rows(span=kind == "span")[:2]
-    page = _complete_page(rows, has_more=True)
+    neighbors = _incomplete_neighbors("page_depth_exceeded")
     with (
         patch(
-            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
-            return_value=page,
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_neighbors",
+            return_value=neighbors,
         ),
         patch("tracer.views.observation_span.V2AnalyticsQueryService"),
     ):
@@ -177,6 +192,56 @@ def test_trace_navigation_redacts_clickhouse_timeout():
     assert response.data["result"] == (
         "Trace navigation is temporarily unavailable. Please retry."
     )
+    assert private_error not in str(response.data)
+    assert "DB::Exception" not in str(response.data)
+
+
+@pytest.mark.unit
+def test_span_navigation_redacts_clickhouse_timeout():
+    from tracer.views.observation_span import ObservationSpanView
+
+    project_id = "00000000-0000-0000-0000-000000000001"
+    span_id = "00000000-0000-0000-0000-000000000002"
+    request = SimpleNamespace(
+        validated_query_data={
+            "span_id": span_id,
+            "project_id": project_id,
+            "user_id": None,
+            "filters": [],
+        }
+    )
+    private_error = "Code: 159. DB::Exception: secret SQL and internal stack"
+
+    with (
+        patch(
+            "tracer.views.observation_span._project_workspace_scope_q",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "tracer.views.observation_span._get_request_organization",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "tracer.views.observation_span.Project.objects.get",
+            return_value=SimpleNamespace(trace_type="observe"),
+        ),
+        patch.object(
+            ObservationSpanView,
+            "_bounded_span_navigation_response",
+            side_effect=ServerException(private_error, code=159),
+        ),
+    ):
+        response = (
+            ObservationSpanView.get_trace_id_by_index_spans_as_observe.__wrapped__(
+                ObservationSpanView(), request
+            )
+        )
+
+    assert response.status_code == 503
+    assert response.data["result"] == (
+        "Span navigation is temporarily unavailable. Please retry."
+    )
+    assert response.data["code"] == "service_unavailable"
     assert private_error not in str(response.data)
     assert "DB::Exception" not in str(response.data)
 

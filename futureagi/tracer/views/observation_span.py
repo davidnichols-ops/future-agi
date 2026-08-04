@@ -203,6 +203,9 @@ def _span_filtered_page_depth_exceeded(
 
 
 SPAN_NAVIGATION_CANDIDATE_LIMIT = 4_095
+SPAN_NAVIGATION_SCAN_PAGE_SIZE = 200
+SPAN_NAVIGATION_MAX_QUERIES = 128
+SPAN_NAVIGATION_WALL_DEADLINE_MS = 20_000
 
 
 class SpanNavigationReadUnavailable(RuntimeError):
@@ -3741,7 +3744,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
     ):
         """Return adjacent trace ids from the exact bounded span-list order."""
 
-        from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+        from tracer.selectors.trace_filter_reads import read_bounded_filter_neighbors
         from tracer.services.clickhouse.v2.query_builders.span_list import (
             SpanListQueryBuilderV2,
         )
@@ -3763,38 +3766,26 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             raise SpanNavigationReadUnavailable(
                 error_code or "unsupported_filter_shape"
             )
-        page = read_bounded_filter_page(
+        neighbors = read_bounded_filter_neighbors(
             builder=builder,
             analytics=V2AnalyticsQueryService(),
             filters=list(filters or []),
             key_field="id",
-            page_number=0,
-            page_size=SPAN_NAVIGATION_CANDIDATE_LIMIT,
-            deadline_ms=SPAN_LIST_WALL_DEADLINE_MS,
+            target_id=str(span_id),
+            scan_limit=SPAN_NAVIGATION_CANDIDATE_LIMIT,
+            page_size=SPAN_NAVIGATION_SCAN_PAGE_SIZE,
+            deadline_ms=SPAN_NAVIGATION_WALL_DEADLINE_MS,
+            max_query_count=SPAN_NAVIGATION_MAX_QUERIES,
+            require_unique_target=True,
         )
-        if not page.complete:
-            raise SpanNavigationReadUnavailable(page.error_code or "read_incomplete")
-
-        matching_indexes = [
-            index
-            for index, row in enumerate(page.rows)
-            if str(row.get("id") or "") == str(span_id)
-        ]
-        if len(matching_indexes) != 1:
-            code = (
-                "page_depth_exceeded"
-                if not matching_indexes and page.has_more
-                else "ambiguous_span_identity"
-            )
+        if not neighbors.complete or neighbors.current is None:
+            code = neighbors.error_code or "read_incomplete"
+            if code in {"target_not_found", "ambiguous_identity"}:
+                code = "ambiguous_span_identity"
             raise SpanNavigationReadUnavailable(code)
-        current_index = matching_indexes[0]
-        if page.has_more and current_index == len(page.rows) - 1:
-            raise SpanNavigationReadUnavailable("page_depth_exceeded")
 
-        newer_row = page.rows[current_index - 1] if current_index > 0 else None
-        older_row = (
-            page.rows[current_index + 1] if current_index + 1 < len(page.rows) else None
-        )
+        newer_row = neighbors.newer
+        older_row = neighbors.older
         return self._gm.success_response(
             {
                 "next_trace_id": (

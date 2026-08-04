@@ -114,6 +114,25 @@ class BoundedFilterPage:
     classification_deferred: bool = False
 
 
+@dataclass(frozen=True)
+class BoundedFilterNeighbors:
+    """Exact adjacent rows found through target-anchored bounded reads.
+
+    ``newer`` and ``older`` follow the list's canonical descending order.  A
+    complete result proves the target and both available neighbours without
+    walking the list's global newest-first prefix. Failures carry only stable,
+    sanitized error codes.
+    """
+
+    newer: dict[str, Any] | None
+    current: dict[str, Any] | None
+    older: dict[str, Any] | None
+    complete: bool
+    error_code: str | None
+    query_count: int
+    rows_scanned: int
+
+
 class _BudgetExceeded(Exception):
     def __init__(self, error_code: str):
         self.error_code = error_code
@@ -1485,7 +1504,388 @@ def read_bounded_filter_page(
     )
 
 
+def read_bounded_filter_neighbors(
+    *,
+    builder: FilterPageBuilder,
+    analytics: QueryExecutor,
+    filters: list[dict[str, Any]],
+    key_field: str,
+    target_id: str,
+    deadline_ms: int,
+    scan_limit: int,
+    page_size: int = 200,
+    max_query_count: int = 128,
+    require_unique_target: bool = False,
+    read_settings: dict[str, Any] | None = None,
+) -> BoundedFilterNeighbors:
+    """Resolve one target and its exact neighbours from target-anchored seeds.
+
+    Each direction starts at the target's canonical order key.  The builder
+    emits root/span seeds in the direction's order and the existing finite
+    latest-state classifier applies the complete filter vector.  A side closes
+    only after its best classified row crosses the raw seed cutoff or the
+    current adjacent time slice is exhausted.  No partial side is published.
+    """
+
+    if not key_field or not target_id:
+        raise ValueError("navigation key and target must be non-empty")
+    if deadline_ms <= 0 or scan_limit <= 0 or page_size <= 0:
+        raise ValueError("navigation bounds must be positive")
+    if page_size > _ABSOLUTE_MAX_CANDIDATES:
+        raise ValueError("navigation page exceeds bounded candidate limit")
+    if not 1 <= max_query_count <= _ABSOLUTE_MAX_QUERIES:
+        raise ValueError("navigation query count exceeds bounded read contract")
+
+    target_query_builder = getattr(
+        builder, "build_filter_navigation_target_query", None
+    )
+    seed_page_builder = getattr(builder, "build_filter_navigation_seed_page", None)
+    match_query_builder = getattr(
+        builder, "build_filter_match_query_from_seed_rows", None
+    )
+    order_token_builder = getattr(builder, "bounded_filter_row_order_token", None)
+    seed_order_token_builder = getattr(
+        builder, "bounded_filter_seed_order_token", order_token_builder
+    )
+    row_identity_builder = getattr(builder, "bounded_filter_row_identity", None)
+    seed_identity_builder = getattr(
+        builder, "bounded_filter_seed_identity", row_identity_builder
+    )
+    if not all(
+        callable(value)
+        for value in (
+            target_query_builder,
+            seed_page_builder,
+            match_query_builder,
+            order_token_builder,
+            seed_order_token_builder,
+            row_identity_builder,
+            seed_identity_builder,
+        )
+    ):
+        raise ValueError("navigation builder is missing its bounded protocol")
+
+    request_start, request_end = builder.parse_time_range(filters)
+    request_start = _without_timezone(request_start)
+    request_end = _without_timezone(request_end)
+    started = monotonic()
+    deadline = started + (deadline_ms / 1000)
+    query_count = 0
+    rows_scanned = 0
+    newer: dict[str, Any] | None = None
+    current: dict[str, Any] | None = None
+    older: dict[str, Any] | None = None
+
+    def result(*, complete: bool, error_code: str | None) -> BoundedFilterNeighbors:
+        return BoundedFilterNeighbors(
+            newer=newer,
+            current=current,
+            older=older,
+            complete=complete,
+            error_code=error_code,
+            query_count=query_count,
+            rows_scanned=rows_scanned,
+        )
+
+    def execute(
+        query: str,
+        params: dict[str, Any],
+        *,
+        result_limit: int,
+        active_deadline: float,
+        side_query_limit: int | None = None,
+        side_query_start: int = 0,
+    ) -> QueryResult:
+        nonlocal query_count
+        remaining_ms = int((min(deadline, active_deadline) - monotonic()) * 1000)
+        if remaining_ms < 25:
+            raise _BudgetExceeded("deadline_exceeded")
+        if query_count >= max_query_count:
+            raise _BudgetExceeded("query_budget_exceeded")
+        if (
+            side_query_limit is not None
+            and query_count - side_query_start >= side_query_limit
+        ):
+            raise _BudgetExceeded("query_budget_exceeded")
+        query_count += 1
+        settings = {
+            **_READ_SETTINGS,
+            **(read_settings or {}),
+            "max_result_rows": result_limit,
+        }
+        try:
+            return analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=min(_QUERY_TIMEOUT_MS, remaining_ms),
+                settings=settings,
+            )
+        except Exception as exc:
+            code = (
+                "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+            )
+            raise _BudgetExceeded(code) from None
+
+    try:
+        target_query, target_params = target_query_builder(
+            target_id=target_id,
+            result_limit=2,
+        )
+        if not target_query:
+            return result(complete=False, error_code="target_not_found")
+        target_result = execute(
+            target_query,
+            target_params,
+            result_limit=2,
+            active_deadline=deadline,
+        )
+    except _BudgetExceeded as exc:
+        return result(complete=False, error_code=exc.error_code)
+
+    target_rows = list(target_result.data or [])
+    if not target_rows:
+        return result(complete=False, error_code="target_not_found")
+    if len(target_rows) > 1 or (require_unique_target and len(target_rows) != 1):
+        return result(complete=False, error_code="ambiguous_identity")
+    current = target_rows[0]
+    if str(current.get(key_field) or "") != target_id:
+        return result(complete=False, error_code="classification_drift")
+    current_start = current.get("start_time")
+    if not isinstance(current_start, datetime):
+        return result(complete=False, error_code="invalid_cursor_identity")
+    current_key = (
+        _without_timezone(current_start),
+        order_token_builder(current),
+    )
+    if not request_start <= current_key[0] < request_end:
+        return result(complete=False, error_code="classification_drift")
+
+    recommendation = getattr(builder, "recommended_filter_classify_batch_size", None)
+    raw_batch_size = recommendation() if callable(recommendation) else 200
+    classify_batch_size = min(page_size, int(raw_batch_size or 200))
+    if classify_batch_size <= 0:
+        return result(complete=False, error_code="invalid_read_contract")
+
+    def read_side(
+        direction: str,
+        *,
+        side_deadline: float,
+        side_query_limit: int,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        nonlocal rows_scanned
+        side_query_start = query_count
+        seen_identities: set[Hashable] = set()
+        best_row: dict[str, Any] | None = None
+        best_key: tuple[datetime, Any] | None = None
+        side_rows_scanned = 0
+        side_seed_queries = 0
+        width = _INITIAL_SLICE
+        if direction == "older":
+            slice_end = min(request_end, current_key[0] + timedelta(microseconds=1))
+            slice_start = max(request_start, slice_end - width)
+        else:
+            slice_start = max(request_start, current_key[0])
+            slice_end = min(request_end, slice_start + width)
+        cursor_start_time: datetime | None = current_key[0]
+        cursor_order_token: Any = current_key[1]
+
+        def next_coverage_width(remaining_window: timedelta) -> timedelta:
+            """Schedule the remaining side inside its finite query envelope.
+
+            The normal two-day slice ceiling is useful for dense windows, but
+            would need roughly 183 empty probes to prove a one-year boundary.
+            Navigation reserves enough statements to classify one full final
+            seed page, then distributes the unvisited time across every seed
+            statement still available to this side.  The adaptive width may
+            therefore exceed two days while every individual query retains the
+            existing time, row, byte, memory, and single-thread limits.
+            """
+
+            remaining_queries = max(
+                side_query_limit - (query_count - side_query_start),
+                1,
+            )
+            remaining_rows = max(scan_limit - side_rows_scanned, 1)
+            next_seed_limit = min(page_size, remaining_rows)
+            queries_per_full_page = 1 + ceil(next_seed_limit / classify_batch_size)
+            query_page_attempts = max(
+                remaining_queries // queries_per_full_page,
+                1,
+            )
+            row_page_attempts = max(ceil(remaining_rows / page_size), 1)
+            bounded_seed_attempts = max(
+                _MAX_SEED_ATTEMPTS - side_seed_queries,
+                1,
+            )
+            remaining_seed_attempts = min(
+                query_page_attempts,
+                row_page_attempts,
+                bounded_seed_attempts,
+            )
+            return max(width, remaining_window / remaining_seed_attempts)
+
+        while slice_start < slice_end and side_rows_scanned < scan_limit:
+            remaining_rows = scan_limit - side_rows_scanned
+            seed_limit = min(page_size, remaining_rows)
+            try:
+                seed_query, seed_params = seed_page_builder(
+                    direction=direction,
+                    slice_start=slice_start,
+                    slice_end=slice_end,
+                    limit=seed_limit,
+                    cursor_start_time=cursor_start_time,
+                    cursor_order_token=cursor_order_token,
+                )
+                seed_result = execute(
+                    seed_query,
+                    seed_params,
+                    result_limit=seed_limit,
+                    active_deadline=side_deadline,
+                    side_query_limit=side_query_limit,
+                    side_query_start=side_query_start,
+                )
+                side_seed_queries += 1
+            except _BudgetExceeded as exc:
+                return None, exc.error_code
+
+            seed_rows = list(seed_result.data or [])
+            if len(seed_rows) > seed_limit:
+                return None, "row_limit_exceeded"
+            side_rows_scanned += len(seed_rows)
+            rows_scanned += len(seed_rows)
+            seed_keys: list[tuple[datetime, Any]] = []
+            for seed_row in seed_rows:
+                seed_start = seed_row.get("start_time")
+                if not isinstance(seed_start, datetime):
+                    return None, "invalid_cursor_identity"
+                seed_keys.append(
+                    (
+                        _without_timezone(seed_start),
+                        seed_order_token_builder(seed_row),
+                    )
+                )
+            if any(
+                (left <= right if direction == "older" else left >= right)
+                for left, right in zip(seed_keys, seed_keys[1:], strict=False)
+            ):
+                return None, "seed_order_drift"
+
+            unseen_rows: list[dict[str, Any]] = []
+            for seed_row in seed_rows:
+                identity = seed_identity_builder(seed_row)
+                if identity in seen_identities:
+                    continue
+                seen_identities.add(identity)
+                unseen_rows.append(seed_row)
+
+            for offset in range(0, len(unseen_rows), classify_batch_size):
+                batch = unseen_rows[offset : offset + classify_batch_size]
+                match_query, match_params = match_query_builder(batch)
+                if not match_query:
+                    continue
+                try:
+                    match_result = execute(
+                        match_query,
+                        match_params,
+                        result_limit=len(batch),
+                        active_deadline=side_deadline,
+                        side_query_limit=side_query_limit,
+                        side_query_start=side_query_start,
+                    )
+                except _BudgetExceeded as exc:
+                    return None, exc.error_code
+                batch_identities = {seed_identity_builder(row) for row in batch}
+                for match_row in match_result.data or []:
+                    if row_identity_builder(match_row) not in batch_identities:
+                        return None, "classification_drift"
+                    match_start = match_row.get("start_time")
+                    if not isinstance(match_start, datetime):
+                        return None, "classification_drift"
+                    match_key = (
+                        _without_timezone(match_start),
+                        order_token_builder(match_row),
+                    )
+                    if direction == "older":
+                        if not match_key < current_key:
+                            continue
+                        if best_key is None or match_key > best_key:
+                            best_row, best_key = match_row, match_key
+                    else:
+                        if not match_key > current_key:
+                            continue
+                        if best_key is None or match_key < best_key:
+                            best_row, best_key = match_row, match_key
+
+            slice_exhausted = len(seed_rows) < seed_limit
+            cutoff = seed_keys[-1] if seed_keys else None
+            cutoff_closes = bool(
+                best_key is not None
+                and cutoff is not None
+                and (best_key >= cutoff if direction == "older" else best_key <= cutoff)
+            )
+            best_in_active_slice = bool(
+                best_key is not None and slice_start <= best_key[0] < slice_end
+            )
+            if cutoff_closes or (
+                slice_exhausted and best_row is not None and best_in_active_slice
+            ):
+                return best_row, None
+
+            if side_rows_scanned >= scan_limit:
+                return None, PAGE_DEPTH_EXCEEDED_CODE
+
+            if not slice_exhausted:
+                if not seed_rows:
+                    return None, "cursor_stalled"
+                cursor_start_time, cursor_order_token = seed_keys[-1]
+                continue
+
+            if direction == "older":
+                if slice_start <= request_start:
+                    return None, None
+                slice_end = slice_start
+                width = min(width * 2, _MAX_SLICE)
+                active_width = next_coverage_width(slice_end - request_start)
+                slice_start = max(request_start, slice_end - active_width)
+            else:
+                if slice_end >= request_end:
+                    return None, None
+                slice_start = slice_end
+                width = min(width * 2, _MAX_SLICE)
+                active_width = next_coverage_width(request_end - slice_start)
+                slice_end = min(request_end, slice_start + active_width)
+            cursor_start_time = None
+            cursor_order_token = None
+
+        if side_rows_scanned >= scan_limit:
+            return None, PAGE_DEPTH_EXCEEDED_CODE
+        return None, None
+
+    remaining_seconds = max(deadline - monotonic(), 0.0)
+    side_seconds = remaining_seconds / 2
+    side_query_limit = max((max_query_count - query_count) // 2, 1)
+    older, older_error = read_side(
+        "older",
+        side_deadline=min(deadline, monotonic() + side_seconds),
+        side_query_limit=side_query_limit,
+    )
+    if older_error:
+        return result(complete=False, error_code=older_error)
+    newer, newer_error = read_side(
+        "newer",
+        side_deadline=deadline,
+        # The older side retains its fixed half-budget so the newer side can
+        # always start. Once it finishes, every unused statement is safely
+        # available to the final side under the unchanged global ceiling.
+        side_query_limit=max(max_query_count - query_count, 1),
+    )
+    if newer_error:
+        return result(complete=False, error_code=newer_error)
+    return result(complete=True, error_code=None)
+
+
 __all__ = [
+    "BoundedFilterNeighbors",
     "BoundedFilterPage",
     "FilterReadAttempt",
     "PAGE_DEPTH_EXCEEDED_CODE",
@@ -1494,5 +1894,6 @@ __all__ = [
     "bounded_numbered_page_depth_exceeded",
     "degraded_bounded_filter_page",
     "numbered_page_depth_exceeded",
+    "read_bounded_filter_neighbors",
     "read_bounded_filter_page",
 ]

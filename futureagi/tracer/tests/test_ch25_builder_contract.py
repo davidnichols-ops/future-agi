@@ -272,6 +272,25 @@ class TestListBuilderOutputContract:
             }:
                 start, end = builder.parse_time_range(builder.filters)
                 result = method(slice_start=start, slice_end=end, limit=2)
+            elif name == "build_filter_navigation_seed_page":
+                start, end = builder.parse_time_range(builder.filters)
+                result = method(
+                    direction="older",
+                    slice_start=start,
+                    slice_end=end,
+                    limit=2,
+                )
+            elif name == "build_filter_navigation_target_query":
+                result = method(target_id="contract-navigation-target", result_limit=2)
+            elif name == "build_user_dimension_query":
+                result = method(
+                    [
+                        {
+                            "project_id": "contract-test-proj",
+                            "physical_end_user_ids": ("contract-end-user",),
+                        }
+                    ]
+                )
             elif name in {
                 "build_filter_identity_match_query_from_seed_rows",
                 "build_filter_match_query_from_seed_rows",

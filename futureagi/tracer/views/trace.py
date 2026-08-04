@@ -172,6 +172,9 @@ TRACE_LIST_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
 }
 TRACE_NAVIGATION_CANDIDATE_LIMIT = 4_095
+TRACE_NAVIGATION_SCAN_PAGE_SIZE = 200
+TRACE_NAVIGATION_MAX_QUERIES = 128
+TRACE_NAVIGATION_WALL_DEADLINE_MS = 20_000
 _CLICKHOUSE_ERROR_CODE_RE = re.compile(r"\bcode:\s*(\d+)\b", re.IGNORECASE)
 _OPTIONAL_USER_ENRICHMENT_ERROR_CODES = frozenset({497})
 
@@ -3418,7 +3421,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         self, request, trace_id, project_id, filters, analytics
     ):
         """Return exact adjacent ids from the same bounded list order."""
-        from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+        from tracer.selectors.trace_filter_reads import read_bounded_filter_neighbors
         from tracer.services.clickhouse.v2.query_builders.trace_list import (
             TraceListQueryBuilderV2,
         )
@@ -3431,43 +3434,35 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             bounded_internal_scan=True,
             bounded_identity_only=True,
             bounded_bulk_scan=True,
+            # Navigation consumes only membership and canonical root order.
+            # Omitting physical filter witnesses raises the exact classifier's
+            # safe batch from 20 to 100 without changing filter membership.
+            bounded_include_filter_witnesses=False,
         )
         error_code = builder.bounded_filter_degraded_error_code()
         if error_code or not builder.supports_bounded_filter_scan():
             raise TraceNavigationReadUnavailable(
                 error_code or "unsupported_filter_shape"
             )
-        page = read_bounded_filter_page(
+        neighbors = read_bounded_filter_neighbors(
             builder=builder,
             analytics=analytics,
             filters=list(filters or []),
             key_field="trace_id",
-            page_number=0,
-            page_size=TRACE_NAVIGATION_CANDIDATE_LIMIT,
-            deadline_ms=TRACE_LIST_WALL_DEADLINE_MS,
+            target_id=str(trace_id),
+            scan_limit=TRACE_NAVIGATION_CANDIDATE_LIMIT,
+            page_size=TRACE_NAVIGATION_SCAN_PAGE_SIZE,
+            deadline_ms=TRACE_NAVIGATION_WALL_DEADLINE_MS,
+            max_query_count=TRACE_NAVIGATION_MAX_QUERIES,
         )
-        if not page.complete:
-            raise TraceNavigationReadUnavailable(page.error_code or "read_incomplete")
+        if not neighbors.complete or neighbors.current is None:
+            code = neighbors.error_code or "read_incomplete"
+            if code == "target_not_found":
+                code = "trace_not_in_list"
+            raise TraceNavigationReadUnavailable(code)
 
-        ordered_ids = [
-            str(row.get("trace_id") or "") for row in page.rows if row.get("trace_id")
-        ]
-        try:
-            current_index = ordered_ids.index(str(trace_id))
-        except ValueError:
-            code = "page_depth_exceeded" if page.has_more else "trace_not_in_list"
-            raise TraceNavigationReadUnavailable(code) from None
-        if page.has_more and current_index == len(ordered_ids) - 1:
-            # The older sentinel is outside the returned page; guessing would
-            # make navigation disagree with page N.
-            raise TraceNavigationReadUnavailable("page_depth_exceeded")
-
-        newer_trace = ordered_ids[current_index - 1] if current_index > 0 else None
-        older_trace = (
-            ordered_ids[current_index + 1]
-            if current_index + 1 < len(ordered_ids)
-            else None
-        )
+        newer_trace = str(neighbors.newer.get("trace_id")) if neighbors.newer else None
+        older_trace = str(neighbors.older.get("trace_id")) if neighbors.older else None
 
         response = {
             "next_trace_id": str(older_trace) if older_trace else None,
