@@ -1321,6 +1321,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     values = [
                         {
                             "value": row.value,
+                            "type": row.type,
                             "label": (
                                 "true"
                                 if row.value is True
@@ -1333,11 +1334,12 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     ]
                     metadata = read.metadata.public_payload()
                     if not read.metadata.query_complete:
-                        if read.metadata.query_error_code == "sample_limit" and values:
-                            # The bounded selector completed its finite sample
-                            # and proved usable values, but hit the public value
-                            # cap.  Publish that result as an explicit sample;
-                            # every resource/timeout/partial replay remains a
+                        if read.metadata.query_error_code == "sample_limit":
+                            # The bounded selector completed its finite sample,
+                            # but cannot claim a complete distribution (or
+                            # global absence). Publish both non-empty and empty
+                            # samples with explicit coverage metadata. Every
+                            # resource/timeout/partial replay remains a
                             # retryable error instead of an empty 200 response.
                             metadata["query_status"] = "sampled"
                         else:

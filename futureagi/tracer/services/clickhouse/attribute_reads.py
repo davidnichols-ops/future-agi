@@ -2095,7 +2095,15 @@ class AttributeReadSelector:
                     truncated = True
                     usable_sample_found = True
                     break
-                elif segment_truncated:
+                elif segment_truncated and lane_name != "json":
+                    # Typed Map candidates have selective key indexes, so a
+                    # short ordered continuation may page past stale versions
+                    # to a live value. The JSON lane is an identity-only
+                    # sample with no key index; continuing it repeatedly can
+                    # never prove absence and only spends the operation/query
+                    # budget. One finite sample + exact latest-state hydration
+                    # per temporal segment is the complete JSON fallback
+                    # contract, with ``sample_limit`` preserving incompleteness.
                     fallback_states.append(
                         {
                             "lane_name": lane_name,

@@ -25,6 +25,7 @@ from tracer.models.dashboard import Dashboard, DashboardWidget
 from tracer.models.project import Project
 from tracer.serializers.dashboard import (
     DashboardCreateUpdateSerializer,
+    DashboardFilterValuesResponseSerializer,
     DashboardQuerySerializer,
     DashboardWidgetSerializer,
 )
@@ -54,10 +55,12 @@ from tracer.services.clickhouse.v2.query_builders.dashboard import (
 from tracer.views.dashboard import DashboardViewSet, _normalize_dashboard_query_filters
 
 
-def _attribute_value_read(values=(), *, complete=True, error_code=None):
+def _attribute_value_read(
+    values=(), *, attribute_type="string", complete=True, error_code=None
+):
     now = datetime(2026, 8, 1, tzinfo=UTC)
     return AttributeValueRead(
-        tuple(AttributeValueRow(value, "string", 1) for value in values),
+        tuple(AttributeValueRow(value, attribute_type, 1) for value in values),
         AttributeReadMetadata(
             query_complete=complete,
             query_status="complete" if complete else "degraded",
@@ -1227,7 +1230,7 @@ class TestMetricsEndpoint:
 
         assert response.status_code == 200
         assert response.json()["result"]["values"] == [
-            {"value": "checkout", "label": "checkout"}
+            {"value": "checkout", "type": "string", "label": "checkout"}
         ]
         mock_selector_cls.return_value.read_values.assert_called_once_with(
             [str(observe_project.id)],
@@ -1399,13 +1402,12 @@ class TestMetricsEndpoint:
         mock_selector_cls.return_value.read_values.assert_called_once()
 
     @pytest.mark.parametrize(
-        ("values", "error_code"),
+        "values",
         [
-            ((), "read_budget_exceeded"),
-            (("partial-value",), "read_budget_exceeded"),
-            ((), "sample_limit"),
+            (),
+            ("partial-value",),
         ],
-        ids=["empty-budget", "partial-budget", "empty-sample"],
+        ids=["empty-budget", "partial-budget"],
     )
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.AttributeReadSelector")
@@ -1413,14 +1415,13 @@ class TestMetricsEndpoint:
         self,
         mock_selector_cls,
         values,
-        error_code,
         auth_client,
         observe_project,
     ):
         mock_selector_cls.return_value.read_values.return_value = _attribute_value_read(
             values,
             complete=False,
-            error_code=error_code,
+            error_code="read_budget_exceeded",
         )
 
         response = auth_client.get(
@@ -1434,7 +1435,37 @@ class TestMetricsEndpoint:
         assert "temporarily unavailable" in payload
         assert response.json()["code"] == "service_unavailable"
         assert "partial-value" not in payload
-        assert error_code not in payload
+        assert "read_budget_exceeded" not in payload
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_custom_attribute_empty_cap_is_labelled_sample(
+        self,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        mock_selector_cls.return_value.read_values.return_value = _attribute_value_read(
+            (),
+            complete=False,
+            error_code="sample_limit",
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=absent_heavy_key&metric_type=custom_attribute"
+            f"&project_ids={observe_project.id}&source=traces"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["result"] == {
+            "values": [],
+            "query_complete": False,
+            "query_status": "sampled",
+            "query_error_code": "sample_limit",
+            "query_window_start": "2025-08-01T00:00:00Z",
+            "query_window_end": "2026-08-01T00:00:00Z",
+        }
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.AttributeReadSelector")
@@ -1459,11 +1490,56 @@ class TestMetricsEndpoint:
         assert response.status_code == 200
         payload = response.json()["result"]
         assert payload["values"] == [
-            {"value": "verified-value", "label": "verified-value"}
+            {
+                "value": "verified-value",
+                "type": "string",
+                "label": "verified-value",
+            }
         ]
         assert payload["query_complete"] is False
         assert payload["query_status"] == "sampled"
         assert payload["query_error_code"] == "sample_limit"
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_custom_attribute_preserves_json_array_type(
+        self,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        mock_selector_cls.return_value.read_values.return_value = _attribute_value_read(
+            ("Rechazado",), attribute_type="array"
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=final_status&metric_type=custom_attribute"
+            f"&project_ids={observe_project.id}&source=traces"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["result"]["values"] == [
+            {
+                "value": "Rechazado",
+                "type": "array",
+                "label": "Rechazado",
+            }
+        ]
+
+    def test_filter_values_response_serializer_accepts_legacy_options_without_type(
+        self,
+    ):
+        serializer = DashboardFilterValuesResponseSerializer(
+            data={
+                "status": True,
+                "result": {
+                    "values": [{"value": "legacy", "label": "legacy"}],
+                },
+            }
+        )
+
+        assert serializer.is_valid(), serializer.errors
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)

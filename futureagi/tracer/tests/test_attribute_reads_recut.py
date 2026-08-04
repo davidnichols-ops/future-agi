@@ -2332,18 +2332,20 @@ def test_absent_heavy_json_key_uses_only_bounded_identity_seeds():
     )
 
     assert read.rows == ()
+    assert read.metadata.query_complete is False
     assert read.metadata.query_status == "degraded"
     assert read.metadata.query_error_code == "sample_limit"
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
     ]
-    assert len(candidate_calls) == ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+    windows = adaptive_attribute_windows(NOW)
+    assert len(candidate_calls) == 2 * len(windows)
     assert all("attributes_extra" not in call.sql for call in candidate_calls)
     assert all("JSONHas(attributes_extra" not in call.sql for call in candidate_calls)
     json_calls = [
         call for call in candidate_calls if "candidate_version" not in call.sql
     ]
-    assert json_calls
+    assert len(json_calls) == len(windows)
     assert all(call.timeout_ms <= 750 for call in json_calls)
     assert all(
         call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
@@ -2356,11 +2358,82 @@ def test_absent_heavy_json_key_uses_only_bounded_identity_seeds():
         for call in executor.calls
         if "segment_start" not in call.params and "JSONHas(attributes_extra" in call.sql
     ]
-    assert hydration_calls
+    assert len(hydration_calls) == len(windows)
     assert all(
         len(call.params["candidate_ids_0"]) <= ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT
         for call in hydration_calls
     )
+    # Five typed seeds plus one JSON identity seed and exact hydration for
+    # each of the five adaptive bands. No JSON continuation can consume the
+    # 30-query safety ceiling while chasing an absent key.
+    assert read.metadata.query_count == 3 * len(windows)
+    assert len(executor.calls) == read.metadata.query_count
+
+
+def test_explicit_seven_day_json_miss_samples_each_day_once_without_false_complete():
+    starts_by_id: dict[str, datetime] = {}
+    json_candidate_page = 0
+
+    def respond(call, _):
+        nonlocal json_candidate_page
+        if "segment_start" in call.params:
+            if "candidate_version" in call.sql:
+                return []
+            page = json_candidate_page
+            json_candidate_page += 1
+            rows = [
+                _candidate(
+                    PROJECT_A,
+                    f"daily-json-{page:02d}-{index:02d}",
+                    start_time=call.params["segment_start"]
+                    + timedelta(seconds=index + 1),
+                )
+                for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
+            ]
+            starts_by_id.update((str(row["id"]), row["start_time"]) for row in rows)
+            return rows
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                start_time=starts_by_id[span_id],
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="arrays",
+    ).read_values(
+        [PROJECT_A],
+        "absent_json_array",
+        window_start=NOW - timedelta(days=7),
+        window_end=NOW,
+    )
+
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    json_calls = [
+        call for call in candidate_calls if "candidate_version" not in call.sql
+    ]
+    hydration_calls = [
+        call
+        for call in executor.calls
+        if "segment_start" not in call.params and "JSONHas(attributes_extra" in call.sql
+    ]
+    assert read.rows == ()
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "degraded"
+    assert read.metadata.query_error_code == "sample_limit"
+    assert len(candidate_calls) == 14
+    assert len(json_calls) == 7
+    assert len(hydration_calls) == 7
+    assert read.metadata.query_count == 21
+    assert len(executor.calls) == 21
 
 
 def test_timeout_on_first_segment_has_no_retry():
@@ -2764,7 +2837,9 @@ def test_dashboard_final_status_picker_returns_rejected_from_selector(
 
     assert response.status_code == 200
     payload = response.data["result"]
-    assert payload["values"] == [{"value": "Rejected", "label": "Rejected"}]
+    assert payload["values"] == [
+        {"value": "Rejected", "type": "string", "label": "Rejected"}
+    ]
     assert payload["query_complete"] is True
     assert captured["project_ids"] == [PROJECT_A]
     assert captured["key"] == "final_status"
@@ -2806,10 +2881,79 @@ def test_dashboard_json_array_value_picker_preserves_scalar_json_types(monkeypat
 
     assert response.status_code == 200
     assert response.data["result"]["values"] == [
-        {"value": True, "label": "true"},
-        {"value": 7, "label": "7"},
-        {"value": "seven", "label": "seven"},
+        {"value": True, "type": "array", "label": "true"},
+        {"value": 7, "type": "array", "label": "7"},
+        {"value": "seven", "type": "array", "label": "seven"},
     ]
+
+
+def test_dashboard_empty_sample_limit_is_an_explicit_200_sample(monkeypatch):
+    from tracer.views.dashboard import DashboardViewSet
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "read_values",
+        lambda *_args, **_kwargs: AttributeValueRead(
+            (),
+            _metadata(complete=False, error_code="sample_limit"),
+        ),
+    )
+    monkeypatch.setattr("tracer.views.dashboard.is_clickhouse_enabled", lambda: False)
+    monkeypatch.setattr(
+        "tracer.views.dashboard.project_queryset_for_request",
+        lambda _request: _ProjectScope([PROJECT_A]),
+    )
+
+    request = _authenticated_get(
+        "/tracer/dashboard/filter_values/",
+        {
+            "metric_name": "absent_heavy_key",
+            "metric_type": "custom_attribute",
+            "project_ids": PROJECT_A,
+            "source": "traces",
+        },
+    )
+    response = DashboardViewSet.as_view({"get": "filter_values"})(request)
+
+    assert response.status_code == 200
+    assert response.data["result"]["values"] == []
+    assert response.data["result"]["query_complete"] is False
+    assert response.data["result"]["query_status"] == "sampled"
+    assert response.data["result"]["query_error_code"] == "sample_limit"
+
+
+def test_dashboard_empty_read_budget_remains_a_sanitized_503(monkeypatch):
+    from tracer.views.dashboard import DashboardViewSet
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "read_values",
+        lambda *_args, **_kwargs: AttributeValueRead(
+            (),
+            _metadata(complete=False, error_code="read_budget_exceeded"),
+        ),
+    )
+    monkeypatch.setattr("tracer.views.dashboard.is_clickhouse_enabled", lambda: False)
+    monkeypatch.setattr(
+        "tracer.views.dashboard.project_queryset_for_request",
+        lambda _request: _ProjectScope([PROJECT_A]),
+    )
+
+    request = _authenticated_get(
+        "/tracer/dashboard/filter_values/",
+        {
+            "metric_name": "absent_heavy_key",
+            "metric_type": "custom_attribute",
+            "project_ids": PROJECT_A,
+            "source": "traces",
+        },
+    )
+    response = DashboardViewSet.as_view({"get": "filter_values"})(request)
+
+    assert response.status_code == 503
+    payload = json.dumps(response.data)
+    assert "temporarily unavailable" in payload
+    assert "read_budget_exceeded" not in payload
 
 
 @pytest.mark.parametrize("code", [159, 241, 307])

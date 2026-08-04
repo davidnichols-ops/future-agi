@@ -667,6 +667,9 @@ const QueryInput = forwardRef(function QueryInput(
   const rangeFromInvalid =
     isNumericRange && !isValidRangeNumericInput(rangeFrom);
   const rangeToInvalid = isNumericRange && !isValidRangeNumericInput(rangeTo);
+  const hasStaticValueChoices = Boolean(
+    phase === "value" && fieldMap[partialField]?.choices?.length,
+  );
 
   const options = useMemo(() => {
     if (phase === "field")
@@ -717,6 +720,19 @@ const QueryInput = forwardRef(function QueryInput(
     const q = inputValue.toLowerCase();
     return options.filter((o) => o.label.toLowerCase().includes(q));
   }, [options, inputValue]);
+
+  const hasExactInputOption = useMemo(() => {
+    const candidate = inputValue.trim().toLowerCase();
+    if (!candidate) return false;
+    return options.some((option) =>
+      [option.id, option.label].some(
+        (value) =>
+          String(value ?? "")
+            .trim()
+            .toLowerCase() === candidate,
+      ),
+    );
+  }, [inputValue, options]);
 
   const commitFilter = useCallback(
     (field, op, value) => {
@@ -836,7 +852,20 @@ const QueryInput = forwardRef(function QueryInput(
 
   const handleSelect = useCallback(
     (_, option) => {
-      if (!option || typeof option === "string") return;
+      if (!option) return;
+      if (typeof option === "string") {
+        const explicitValue = option.trim();
+        if (
+          phase !== "value" ||
+          hasStaticValueChoices ||
+          !explicitValue ||
+          (isNumericScalar && !isCompleteNumericInput(explicitValue))
+        ) {
+          return;
+        }
+        commitFilter(partialField, partialOp, explicitValue);
+        return;
+      }
       if (phase === "field") {
         setPartialField(option.id);
         setInputValue("");
@@ -864,6 +893,8 @@ const QueryInput = forwardRef(function QueryInput(
       reopenDropdown,
       onFieldChange,
       opDefFor,
+      hasStaticValueChoices,
+      isNumericScalar,
     ],
   );
 
@@ -916,9 +947,13 @@ const QueryInput = forwardRef(function QueryInput(
         !isRangePhase &&
         e.key === "Enter" &&
         inputValue.trim() &&
-        filtered.length === 0 &&
+        !hasStaticValueChoices &&
+        !hasExactInputOption &&
         (!isNumericScalar || isCompleteNumericInput(inputValue.trim()))
       ) {
+        // MUI's Autocomplete otherwise commits the first highlighted fuzzy
+        // suggestion after this input-level handler returns.
+        e.defaultMuiPrevented = true;
         e.preventDefault();
         commitFilter(partialField, partialOp, inputValue.trim());
         return;
@@ -946,9 +981,10 @@ const QueryInput = forwardRef(function QueryInput(
       partialField,
       partialOp,
       tokens,
-      filtered,
       commitFilter,
       editToken,
+      hasStaticValueChoices,
+      hasExactInputOption,
     ],
   );
 
@@ -1130,11 +1166,7 @@ const QueryInput = forwardRef(function QueryInput(
   return (
     <Autocomplete
       size="small"
-      freeSolo={
-        phase === "value" &&
-        !isRangePhase &&
-        !fieldMap[partialField]?.choices?.length
-      }
+      freeSolo={phase === "value" && !isRangePhase && !hasStaticValueChoices}
       options={filtered}
       getOptionLabel={(o) => (typeof o === "string" ? o : o.label)}
       inputValue={inputValue}

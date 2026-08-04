@@ -460,8 +460,29 @@ class DashboardFilterValuesQuerySerializer(serializers.Serializer):
             raise serializers.ValidationError(str(exc)) from exc
 
 
+class DashboardFilterValueOptionSerializer(serializers.Serializer):
+    """One filter-picker option with optional custom-attribute provenance.
+
+    ``type`` is additive so existing system/eval/annotation/dataset options
+    keep their established ``value``/``label`` shape.  Custom-attribute
+    options populate it from ``AttributeValueRow.type`` so an overflow-array
+    member cannot be mistaken for a typed-Map text value by API consumers.
+    """
+
+    value = serializers.JSONField(allow_null=True)
+    label = serializers.CharField()
+    type = serializers.ChoiceField(
+        choices=["string", "number", "boolean", "array"],
+        required=False,
+    )
+    # Annotator options retain these established optional presentation fields.
+    name = serializers.CharField(required=False)
+    email = serializers.CharField(required=False)
+    description = serializers.CharField(required=False)
+
+
 class DashboardFilterValuesResultSerializer(serializers.Serializer):
-    values = serializers.ListField(child=serializers.JSONField())
+    values = DashboardFilterValueOptionSerializer(many=True)
     query_complete = serializers.BooleanField(required=False)
     query_status = serializers.ChoiceField(
         choices=["complete", "sampled", "degraded"],
