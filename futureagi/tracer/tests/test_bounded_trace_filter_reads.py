@@ -3280,6 +3280,7 @@ class _FakeExecutor:
         self.builder = builder
         self.fail = fail
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.settings_by_query: list[tuple[str, dict[str, Any]]] = []
 
     def execute_ch_query(
         self,
@@ -3290,6 +3291,7 @@ class _FakeExecutor:
         settings: dict[str, Any],
     ) -> QueryResult:
         self.calls.append((query, params))
+        self.settings_by_query.append((query, dict(settings)))
         if self.fail is not None:
             raise self.fail
         if query == "match":
@@ -3317,6 +3319,31 @@ class _FakeExecutor:
                 ]
             rows = rows[: params["limit"]]
         return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+
+@pytest.mark.parametrize("key_field", ["session_id", "span_id", "trace_id"])
+def test_bounded_reads_enable_map_key_subcolumn_optimization(key_field: str) -> None:
+    rows = _rows(1, 2)
+    for row in rows:
+        row[key_field] = row["id"]
+    builder = _FakeBuilder(rows)
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field=key_field,
+        page_number=0,
+        page_size=1,
+    )
+
+    assert page.complete is True
+    assert executor.settings_by_query
+    assert all(
+        settings["optimize_functions_to_subcolumns"] == 1
+        for _, settings in executor.settings_by_query
+    )
 
 
 @dataclass
