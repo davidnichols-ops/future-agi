@@ -723,7 +723,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Return raw positive-Map witnesses for a finite trace batch.
 
         This optional probe is deliberately narrower than the general latest-
-        state classifier.  It is a complete *superset* only when the request
+        state classifier. It remains finite at 512 identities and is a
+        complete *superset* only when the request
         has one positive typed-Map equality/IN leaf: a trace whose latest live
         span satisfies that leaf must have at least one raw live row satisfying
         the same leaf.  Returned identities still require latest-state
@@ -739,7 +740,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if (
             not isinstance(seed_rows, list)
             or not seed_rows
-            or len(seed_rows) > 100
+            or len(seed_rows) > 512
             or self._bounded_identity_only
             or self._bounded_internal_scan
             or self._bounded_membership_filters is not None
@@ -793,7 +794,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     return "", {}
                 identities.append((project_id, trace_id))
             candidate_identities = tuple(dict.fromkeys(identities))
-            if not candidate_identities or len(candidate_identities) > 100:
+            if not candidate_identities or len(candidate_identities) > 512:
                 return "", {}
             candidate_fragment = (
                 "AND (project_id, trace_id) IN %(filter_candidate_trace_identities)s"
@@ -818,7 +819,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     return "", {}
                 trace_ids.append(trace_id)
             candidate_trace_ids = tuple(dict.fromkeys(trace_ids))
-            if not candidate_trace_ids or len(candidate_trace_ids) > 100:
+            if not candidate_trace_ids or len(candidate_trace_ids) > 512:
                 return "", {}
             candidate_fragment = "AND trace_id IN %(filter_candidate_trace_ids)s"
             candidate_params = {

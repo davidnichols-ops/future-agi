@@ -777,55 +777,59 @@ def read_bounded_filter_page(
         if defer_classification:
             deferred_candidate_by_id.update(candidate_seed_rows)
             return False
+
+        probe_classified_tail: Hashable | None = None
+        if (
+            identity_only_classification
+            and candidate_witness_probe_enabled
+            and callable(candidate_witness_probe_builder)
+        ):
+            probe_query, probe_params = candidate_witness_probe_builder(
+                [candidate_seed_rows[identity] for identity in candidate_identities]
+            )
+            if probe_query:
+                try:
+                    probe_result = execute(
+                        kind="prefilter",
+                        query=probe_query,
+                        params=probe_params,
+                        active_start=active_start,
+                        active_end=active_end,
+                        result_limit=len(candidate_identities),
+                    )
+                except _BudgetExceeded as exc:
+                    if exc.error_code != "read_budget_exceeded":
+                        raise
+                    # The probe is optional. A resource failure proves
+                    # nothing, so permanently fall back to the unchanged
+                    # exact classifier for this request.
+                    candidate_witness_probe_enabled = False
+                    candidate_witness_probe_abandoned = True
+                else:
+                    probe_candidates = candidate_identities
+                    witness_identities = {
+                        row_identity(row) for row in probe_result.data or []
+                    }
+                    candidate_identities = [
+                        identity
+                        for identity in probe_candidates
+                        if identity in witness_identities
+                    ]
+                    # The finite raw probe proves every omitted identity cannot
+                    # match. Preserve the original ordered tail for the page
+                    # cutoff proof even though only witnesses need argMax.
+                    probe_classified_tail = probe_candidates[-1]
+                    if len(candidate_identities) * 4 >= len(probe_candidates) * 3:
+                        # A broad raw superset cannot amortize its own read;
+                        # keep this batch exact and stop speculating.
+                        candidate_witness_probe_enabled = False
+                        candidate_witness_probe_abandoned = True
+
         for batch_offset in range(0, len(candidate_identities), classify_batch_size):
             identity_batch = candidate_identities[
                 batch_offset : batch_offset + classify_batch_size
             ]
             classified_identity_batch = identity_batch
-            if (
-                identity_only_classification
-                and candidate_witness_probe_enabled
-                and callable(candidate_witness_probe_builder)
-            ):
-                probe_query, probe_params = candidate_witness_probe_builder(
-                    [candidate_seed_rows[identity] for identity in identity_batch]
-                )
-                if probe_query:
-                    try:
-                        probe_result = execute(
-                            kind="prefilter",
-                            query=probe_query,
-                            params=probe_params,
-                            active_start=active_start,
-                            active_end=active_end,
-                            result_limit=len(identity_batch),
-                        )
-                    except _BudgetExceeded as exc:
-                        if exc.error_code != "read_budget_exceeded":
-                            raise
-                        # The probe is optional. A resource failure proves
-                        # nothing, so permanently fall back to the unchanged
-                        # exact classifier for this request.
-                        candidate_witness_probe_enabled = False
-                        candidate_witness_probe_abandoned = True
-                    else:
-                        witness_identities = {
-                            row_identity(row) for row in probe_result.data or []
-                        }
-                        identity_batch = [
-                            identity
-                            for identity in identity_batch
-                            if identity in witness_identities
-                        ]
-                        if (
-                            len(identity_batch) * 4
-                            >= len(classified_identity_batch) * 3
-                        ):
-                            # A broad raw superset cannot amortize its own read;
-                            # keep this batch exact and stop speculating.
-                            candidate_witness_probe_enabled = False
-                            candidate_witness_probe_abandoned = True
-
             candidate_batch = [
                 str(candidate_seed_rows[identity].get(key_field, ""))
                 for identity in identity_batch
@@ -893,7 +897,11 @@ def read_bounded_filter_page(
                     if monotonic() > classification_deadline:
                         raise _BudgetExceeded("deadline_exceeded")
 
-            if stop_on_ordered_prefix and len(matched_by_id) >= prefix_needed:
+            if (
+                probe_classified_tail is None
+                and stop_on_ordered_prefix
+                and len(matched_by_id) >= prefix_needed
+            ):
                 ordered_matches = sorted(
                     matched_by_id.values(), key=result_row_key, reverse=True
                 )
@@ -903,6 +911,17 @@ def read_bounded_filter_page(
                 ]
                 if cutoff >= seed_row_key(last_classified_seed):
                     return True
+        if (
+            probe_classified_tail is not None
+            and stop_on_ordered_prefix
+            and len(matched_by_id) >= prefix_needed
+        ):
+            ordered_matches = sorted(
+                matched_by_id.values(), key=result_row_key, reverse=True
+            )
+            cutoff = result_row_key(ordered_matches[prefix_needed - 1])
+            if cutoff >= seed_row_key(candidate_seed_rows[probe_classified_tail]):
+                return True
         return False
 
     def classify_or_buffer_seed_rows(
@@ -960,8 +979,14 @@ def read_bounded_filter_page(
                 stop_on_ordered_prefix=stop_on_ordered_prefix,
             )
 
-        while len(pending_identity_candidates) >= classify_batch_size:
-            if flush(classify_batch_size):
+        pending_flush_size = (
+            max_candidates
+            if candidate_witness_probe_enabled
+            and callable(candidate_witness_probe_builder)
+            else classify_batch_size
+        )
+        while len(pending_identity_candidates) >= pending_flush_size:
+            if flush(pending_flush_size):
                 return True
         if force and pending_identity_candidates:
             return flush(len(pending_identity_candidates))

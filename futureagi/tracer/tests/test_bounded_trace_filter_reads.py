@@ -470,7 +470,7 @@ def test_trace_candidate_witness_probe_rejects_unbounded_or_invalid_candidates()
         ],
     )
 
-    too_many = [{"trace_id": f"trace-{index}"} for index in range(101)]
+    too_many = [{"trace_id": f"trace-{index}"} for index in range(513)]
     assert builder.build_filter_candidate_witness_probe(too_many) == ("", {})
     assert builder.build_filter_candidate_witness_probe([{}]) == ("", {})
 
