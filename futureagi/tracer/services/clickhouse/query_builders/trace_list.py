@@ -500,6 +500,23 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return 512
         return 50
 
+    def use_identity_only_filter_classification(self) -> bool:
+        """Defer presentation hydration until the exact public page is proven.
+
+        Eval/task and graph readers already request the identity-only
+        projection explicitly.  Normal trace lists can use the same lightweight
+        latest-state membership projection while scanning ordered candidates,
+        then hydrate only the final page through one separately bounded query.
+        """
+
+        return not self._bounded_identity_only
+
+    @staticmethod
+    def recommended_filter_page_hydration_reserve_ms() -> int:
+        """Reserve one bounded statement for exact-root page hydration."""
+
+        return 300
+
     def bounded_filter_seed_identity(
         self, row: dict[str, Any]
     ) -> tuple[str, str, str, Any] | tuple[str, str] | str:
@@ -1009,8 +1026,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             )
             root_fragment = "AND (parent_span_id IS NULL OR parent_span_id = '')"
             order_fragment = (
-                "ORDER BY start_time DESC, trace_id DESC, "
-                "toString(project_id) DESC"
+                "ORDER BY start_time DESC, trace_id DESC, toString(project_id) DESC"
                 if self.project_ids is not None
                 else "ORDER BY start_time DESC, trace_id DESC"
             )
@@ -1045,6 +1061,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         *,
         candidate_full_state: bool = False,
         candidate_trace_identities: list[tuple[str, str]] | None = None,
+        candidate_identity_only: bool | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Classify bounded trace IDs against their latest span versions.
 
@@ -1233,6 +1250,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # tuple below preserves the remaining immutable identity fields.
         witness_selects: list[str] = []
         witness_aliases: list[str] = []
+        identity_only = (
+            self._bounded_identity_only
+            if candidate_identity_only is None
+            else bool(candidate_identity_only)
+        )
         if self._bounded_identity_only:
             for witness_index, plan in enumerate(any_span_plans):
                 witness_alias = f"filter_witness_{witness_index}"
@@ -1370,7 +1392,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             else "start_time DESC, trace_id DESC"
         )
 
-        if self._bounded_identity_only:
+        if identity_only:
             identity_project_select = (
                 "grouped_project_id AS project_id,\n                "
                 if org_scope
@@ -1378,14 +1400,18 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             )
             per_trace_select_fragment = f"""{identity_project_select}grouped_trace_id AS trace_id,
                 argMaxIf(
-                    latest_start_time,
+                    tuple(grouped_id, latest_start_time),
                     {canonical_root_order},
                     {canonical_root_condition}
-                ) AS start_time{witness_select_fragment}"""
+                ) AS canonical_root_identity{witness_select_fragment}"""
             public_select_fragment = (
-                f"project_id, trace_id, start_time{witness_public_fragment}"
+                "project_id, trace_id, canonical_root_identity.1 AS root_span_id, "
+                f"canonical_root_identity.2 AS start_time{witness_public_fragment}"
                 if org_scope
-                else f"trace_id, start_time{witness_public_fragment}"
+                else (
+                    "trace_id, canonical_root_identity.1 AS root_span_id, "
+                    f"canonical_root_identity.2 AS start_time{witness_public_fragment}"
+                )
             )
             hydrate_root_aggregate_fragment = ""
         else:
@@ -1482,9 +1508,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """
         return query, params
 
-    def build_filter_match_query_from_seed_rows(
+    def _build_filter_match_query_from_seed_rows(
         self,
         candidate_rows: list[dict[str, Any]],
+        *,
+        candidate_identity_only: bool | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Replay root-seeded candidates by bounded trace identity.
 
@@ -1495,7 +1523,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         trace_ids = [str(row.get("trace_id") or "") for row in candidate_rows]
         if self.project_ids is None:
-            return self.build_filter_match_query(trace_ids)
+            return self.build_filter_match_query(
+                trace_ids,
+                candidate_identity_only=candidate_identity_only,
+            )
         trace_identities = [
             (str(row.get("project_id") or ""), str(row.get("trace_id") or ""))
             for row in candidate_rows
@@ -1504,6 +1535,163 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return self.build_filter_match_query(
             trace_ids,
             candidate_trace_identities=trace_identities,
+            candidate_identity_only=candidate_identity_only,
+        )
+
+    def build_filter_match_query_from_seed_rows(
+        self,
+        candidate_rows: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        return self._build_filter_match_query_from_seed_rows(candidate_rows)
+
+    def build_filter_identity_match_query_from_seed_rows(
+        self,
+        candidate_rows: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Classify membership/order without reading presentation columns."""
+
+        return self._build_filter_match_query_from_seed_rows(
+            candidate_rows,
+            candidate_identity_only=True,
+        )
+
+    def build_filter_page_hydration_query(
+        self,
+        candidate_rows: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Hydrate light columns for exact canonical roots on the proven page."""
+
+        normalized_identities = tuple(
+            dict.fromkeys(
+                (
+                    str(row.get("project_id") or self.project_id or ""),
+                    str(row.get("trace_id") or ""),
+                    str(row.get("root_span_id") or ""),
+                    _unix_microseconds(row["start_time"]),
+                )
+                for row in candidate_rows
+                if (row.get("project_id") or self.project_id)
+                and row.get("trace_id")
+                and row.get("root_span_id")
+                and isinstance(row.get("start_time"), datetime)
+            )
+        )
+        if len(normalized_identities) != len(candidate_rows):
+            raise ValueError("page hydration requires exact canonical root identities")
+        if not normalized_identities:
+            return "", {}
+        if len(normalized_identities) > 512:
+            raise ValueError("page hydration exceeds bounded trace limit")
+
+        params: dict[str, Any] = {
+            **self.params,
+            "page_hydration_trace_ids": tuple(
+                dict.fromkeys(identity[1] for identity in normalized_identities)
+            ),
+            "page_hydration_root_identities": normalized_identities,
+            "page_hydration_root_dates": tuple(
+                dict.fromkeys(
+                    (
+                        row["start_time"].replace(tzinfo=UTC)
+                        if row["start_time"].tzinfo is None
+                        else row["start_time"].astimezone(UTC)
+                    ).date()
+                    for row in candidate_rows
+                    if isinstance(row.get("start_time"), datetime)
+                )
+            ),
+        }
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = (
+                "AND latest_project_version_id = %(project_version_id)s"
+            )
+        result_order = (
+            "start_time DESC, trace_id DESC, project_id DESC"
+            if self.project_ids is not None
+            else "start_time DESC, trace_id DESC"
+        )
+        query = f"""
+        SELECT
+            root_span_id,
+            trace_id,
+            latest_trace_name AS trace_name,
+            latest_name AS span_name,
+            latest_observation_type AS observation_type,
+            latest_status AS status,
+            start_time,
+            latest_end_time AS end_time,
+            latest_latency_ms AS latency_ms,
+            latest_cost AS cost,
+            latest_total_tokens AS total_tokens,
+            latest_prompt_tokens AS prompt_tokens,
+            latest_completion_tokens AS completion_tokens,
+            latest_model AS model,
+            latest_provider AS provider,
+            latest_trace_session_id AS trace_session_id,
+            project_id
+        FROM (
+            SELECT
+                toString(project_id) AS project_id,
+                trace_id,
+                id AS root_span_id,
+                start_time,
+                argMax(tuple(parent_span_id), _peerdb_version).1
+                    AS latest_parent_span_id,
+                argMax(is_deleted, _peerdb_version) AS latest_is_deleted,
+                argMax(tuple(project_version_id), _peerdb_version).1
+                    AS latest_project_version_id,
+                argMax(trace_name, _peerdb_version) AS latest_trace_name,
+                argMax(name, _peerdb_version) AS latest_name,
+                argMax(observation_type, _peerdb_version)
+                    AS latest_observation_type,
+                argMax(tuple(status), _peerdb_version).1 AS latest_status,
+                argMax(tuple(end_time), _peerdb_version).1 AS latest_end_time,
+                argMax(tuple(latency_ms), _peerdb_version).1 AS latest_latency_ms,
+                argMax(tuple(cost), _peerdb_version).1 AS latest_cost,
+                argMax(tuple(total_tokens), _peerdb_version).1
+                    AS latest_total_tokens,
+                argMax(tuple(prompt_tokens), _peerdb_version).1
+                    AS latest_prompt_tokens,
+                argMax(tuple(completion_tokens), _peerdb_version).1
+                    AS latest_completion_tokens,
+                argMax(tuple(model), _peerdb_version).1 AS latest_model,
+                argMax(tuple(provider), _peerdb_version).1 AS latest_provider,
+                argMax(tuple(trace_session_id), _peerdb_version).1
+                    AS latest_trace_session_id
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND trace_id IN %(page_hydration_trace_ids)s
+              AND toDate(start_time) IN %(page_hydration_root_dates)s
+              AND (
+                  toString(project_id), trace_id, id,
+                  toUnixTimestamp64Micro(start_time)
+              ) IN %(page_hydration_root_identities)s
+            GROUP BY project_id, trace_id, id, start_time
+        ) AS latest_page_roots
+        WHERE latest_is_deleted = 0
+          AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
+          {project_version_fragment}
+        ORDER BY {result_order}
+        LIMIT {len(normalized_identities)}
+        """
+        return query, params
+
+    def bounded_filter_page_hydration_identity(
+        self,
+        row: dict[str, Any],
+    ) -> tuple[str, str, str, Any]:
+        """Return the immutable canonical-root tuple used by page hydration."""
+
+        start_time = row.get("start_time")
+        return (
+            str(row.get("project_id") or self.project_id or ""),
+            str(row.get("trace_id") or ""),
+            str(row.get("root_span_id") or ""),
+            _unix_microseconds(start_time)
+            if isinstance(start_time, datetime)
+            else start_time,
         )
 
     def _span_time_window(

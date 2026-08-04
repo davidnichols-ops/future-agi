@@ -474,6 +474,91 @@ def test_root_seed_replay_does_not_trust_one_raw_physical_root_id() -> None:
     assert sql.count("FROM spans") == 1
 
 
+def test_trace_page_classifies_identity_only_then_hydrates_exact_roots() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+    )
+    seed_rows = [
+        {
+            "trace_id": "trace-a",
+            "root_span_id": "root-a",
+            "start_time": END - timedelta(minutes=1),
+        }
+    ]
+
+    identity_sql, identity_params = (
+        builder.build_filter_identity_match_query_from_seed_rows(seed_rows)
+    )
+    hydration_sql, hydration_params = builder.build_filter_page_hydration_query(
+        seed_rows
+    )
+
+    assert builder.use_identity_only_filter_classification() is True
+    assert "canonical_root_identity.1 AS root_span_id" in identity_sql
+    assert "canonical_root_identity.2 AS start_time" in identity_sql
+    assert "latest_trace_name" not in identity_sql
+    assert "latest_total_tokens" not in identity_sql
+    assert "latest_attr_exists_0" in identity_sql
+    assert identity_params["candidate_trace_ids"] == ("trace-a",)
+    assert "page_hydration_root_identities" in hydration_params
+    assert hydration_params["page_hydration_root_identities"] == (
+        (
+            PROJECT_ID,
+            "trace-a",
+            "root-a",
+            int(seed_rows[0]["start_time"].replace(tzinfo=UTC).timestamp() * 1_000_000),
+        ),
+    )
+    assert "toDate(start_time) IN %(page_hydration_root_dates)s" in hydration_sql
+    assert "toUnixTimestamp64Micro(start_time)" in hydration_sql
+    assert "latest_trace_name AS trace_name" in hydration_sql
+    assert "latest_total_tokens AS total_tokens" in hydration_sql
+    assert "latest_attr_exists_0" not in hydration_sql
+    assert " FINAL" not in hydration_sql
+
+
+def test_existing_identity_only_trace_consumer_does_not_add_page_hydration() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+        bounded_identity_only=True,
+    )
+
+    sql, _ = builder.build_filter_match_query(["trace-a"])
+
+    assert builder.use_identity_only_filter_classification() is False
+    assert "canonical_root_identity.1 AS root_span_id" in sql
+    assert "canonical_root_identity.2 AS start_time" in sql
+    assert "filter_witness_0" in sql
+
+
+def test_ch25_rewrites_identity_classifier_and_exact_root_hydration() -> None:
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+    )
+    rows = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": "trace-a",
+            "root_span_id": "root-a",
+            "start_time": END - timedelta(minutes=1),
+        }
+    ]
+
+    identity_sql, _ = builder.build_filter_identity_match_query_from_seed_rows(rows)
+    hydration_sql, _ = builder.build_filter_page_hydration_query(rows)
+
+    for sql in (identity_sql, hydration_sql):
+        assert "_peerdb_version" not in sql
+        assert "_peerdb_is_deleted" not in sql
+        assert "_version" in sql
+        assert "SETTINGS" in sql
+    assert "canonical_root_identity.1 AS root_span_id" in identity_sql
+    assert "toUnixTimestamp64Micro(start_time)" in hydration_sql
+
+
 def test_org_trace_builder_keeps_project_in_seed_classifier_and_page_keys() -> None:
     project_b = "00000000-0000-4000-8000-000000000002"
     filters = [_time_filter(), _attribute_filter("final_status", "Rejected")]
@@ -521,9 +606,7 @@ def test_org_trace_builder_keeps_project_in_seed_classifier_and_page_keys() -> N
         in ordered_sql
     )
     assert "LIMIT 1 BY project_id, trace_id" in ordered_sql
-    assert (
-        "toString(project_id) < %(filter_before_project_id)s" in ordered_sql
-    )
+    assert "toString(project_id) < %(filter_before_project_id)s" in ordered_sql
     assert ordered_params["filter_before_id"] == "shared-trace"
     assert ordered_params["filter_before_project_id"] == project_b
     assert match_params["candidate_trace_identities"] == (
@@ -3064,6 +3147,169 @@ class _FakeExecutor:
         return QueryResult(rows, len(rows), "clickhouse", 1.0)
 
 
+@dataclass
+class _IdentityHydrationFakeBuilder(_FakeBuilder):
+    @staticmethod
+    def use_identity_only_filter_classification() -> bool:
+        return True
+
+    @staticmethod
+    def recommended_filter_page_hydration_reserve_ms() -> int:
+        return 300
+
+    @staticmethod
+    def build_filter_identity_match_query_from_seed_rows(rows):
+        return "match_identity", {"candidate_ids": tuple(row["id"] for row in rows)}
+
+    @staticmethod
+    def build_filter_page_hydration_query(rows):
+        return "hydrate", {"candidate_ids": tuple(row["id"] for row in rows)}
+
+    @staticmethod
+    def bounded_filter_page_hydration_identity(row):
+        start_time = row["start_time"]
+        if start_time.tzinfo is not None:
+            start_time = start_time.astimezone(UTC).replace(tzinfo=None)
+        return row["id"], row["root_span_id"], start_time
+
+
+class _IdentityHydrationFakeExecutor(_FakeExecutor):
+    def __init__(
+        self,
+        builder,
+        *,
+        hydration_rows=None,
+        reverse_hydration=False,
+        clock=None,
+        durations_ms=None,
+    ):
+        super().__init__(builder)
+        self.hydration_rows = hydration_rows
+        self.reverse_hydration = reverse_hydration
+        self.clock = clock
+        self.durations_ms = dict(durations_ms or {})
+        self.timeouts: list[tuple[str, int]] = []
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.timeouts.append((query, timeout_ms))
+        if query in {"match_identity", "hydrate"}:
+            self.calls.append((query, params))
+            wanted = set(params["candidate_ids"])
+            source = (
+                self.hydration_rows
+                if query == "hydrate" and self.hydration_rows is not None
+                else (
+                    self.builder.rows
+                    if self.builder.match_rows is None
+                    else self.builder.match_rows
+                )
+            )
+            rows = [row for row in source if row["id"] in wanted]
+            if query == "match_identity":
+                rows = [
+                    {
+                        "id": row["id"],
+                        "root_span_id": row["root_span_id"],
+                        "start_time": row["start_time"],
+                    }
+                    for row in rows
+                ]
+            elif self.reverse_hydration:
+                rows = list(reversed(rows))
+            result = QueryResult(rows, len(rows), "clickhouse", 1.0)
+        else:
+            result = super().execute_ch_query(
+                query, params, timeout_ms=timeout_ms, settings=settings
+            )
+
+        duration_ms = int(self.durations_ms.get(query, 0))
+        if self.clock is not None and duration_ms:
+            self.clock.advance_ms(min(duration_ms, timeout_ms))
+            if duration_ms >= timeout_ms:
+                raise ReadDeadlineExceeded(f"{query} timeout")
+        return result
+
+
+@dataclass
+class _OrgIdentityHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
+    @staticmethod
+    def bounded_filter_row_identity(row):
+        return row["project_id"], row["trace_id"]
+
+    @staticmethod
+    def bounded_filter_row_order_token(row):
+        return row["trace_id"], row["project_id"]
+
+    bounded_filter_seed_identity = bounded_filter_row_identity
+    bounded_filter_seed_order_token = bounded_filter_row_order_token
+
+    @staticmethod
+    def build_filter_identity_match_query_from_seed_rows(rows):
+        return "match_identity_org", {
+            "candidate_identities": tuple(
+                (row["project_id"], row["trace_id"]) for row in rows
+            )
+        }
+
+    @staticmethod
+    def build_filter_page_hydration_query(rows):
+        return "hydrate_org", {
+            "candidate_identities": tuple(
+                (row["project_id"], row["trace_id"]) for row in rows
+            )
+        }
+
+    @staticmethod
+    def bounded_filter_page_hydration_identity(row):
+        start_time = row["start_time"]
+        if start_time.tzinfo is not None:
+            start_time = start_time.astimezone(UTC).replace(tzinfo=None)
+        return (
+            row["project_id"],
+            row["trace_id"],
+            row["root_span_id"],
+            start_time,
+        )
+
+
+class _OrgIdentityHydrationFakeExecutor(_FakeExecutor):
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        del timeout_ms, settings
+        self.calls.append((query, params))
+        identity = self.builder.bounded_filter_row_identity
+        order_token = self.builder.bounded_filter_row_order_token
+        if query in {"match_identity_org", "hydrate_org"}:
+            wanted = set(params["candidate_identities"])
+            rows = [row for row in self.builder.rows if identity(row) in wanted]
+            if query == "match_identity_org":
+                rows = [
+                    {
+                        "project_id": row["project_id"],
+                        "trace_id": row["trace_id"],
+                        "root_span_id": row["root_span_id"],
+                        "start_time": row["start_time"],
+                    }
+                    for row in rows
+                ]
+            else:
+                rows = list(reversed(rows))
+            return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+        rows = [
+            row
+            for row in self.builder.rows
+            if params["slice_start"] <= row["start_time"] < params["slice_end"]
+        ]
+        rows.sort(key=lambda row: (row["start_time"], order_token(row)), reverse=True)
+        if params["before_start_time"] is not None:
+            boundary = params["before_start_time"], params["before_id"]
+            rows = [
+                row for row in rows if (row["start_time"], order_token(row)) < boundary
+            ]
+        rows = rows[: params["limit"]]
+        return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+
 class _UnindexedAnySpanFakeBuilder(_FakeBuilder):
     def supports_filter_anchor_probe(self) -> bool:
         return False
@@ -3120,11 +3366,7 @@ class _OrderedRootFakeExecutor(_FakeExecutor):
         rows.sort(key=lambda row: (row["start_time"], row["id"]), reverse=True)
         if params["before_start_time"] is not None:
             boundary = params["before_start_time"], params["before_id"]
-            rows = [
-                row
-                for row in rows
-                if (row["start_time"], row["id"]) < boundary
-            ]
+            rows = [row for row in rows if (row["start_time"], row["id"]) < boundary]
         distinct_traces: list[dict[str, Any]] = []
         seen_trace_ids: set[str] = set()
         for row in rows:
@@ -5453,6 +5695,424 @@ def test_ordered_trace_inner_prefix_does_not_trust_tombstoned_raw_cutoff() -> No
     assert page.has_more is True
     assert [len(call["candidate_ids"]) for call in classify_calls] == [50, 50]
     assert page.query_count == 3
+
+
+def test_selector_hydrates_only_the_proven_identity_page() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+            "trace_name": f"presented-{index}",
+        }
+        for index in range(3)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder, reverse_hydration=True)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.has_more is True
+    assert [row["id"] for row in page.rows] == ["trace-0", "trace-1"]
+    assert [row["trace_name"] for row in page.rows] == [
+        "presented-0",
+        "presented-1",
+    ]
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "match_identity",
+        "hydrate",
+    ]
+    assert [attempt.kind for attempt in page.attempts] == [
+        "seed",
+        "classify",
+        "hydrate",
+    ]
+
+
+def test_identity_hydration_preserves_numbered_page_n() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+            "trace_name": f"presented-{index}",
+        }
+        for index in range(6)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=6,
+        recommended_seed_batch_size=6,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder, reverse_hydration=True)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=1,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.has_more is True
+    assert [row["id"] for row in page.rows] == ["trace-2", "trace-3"]
+    hydration_call = next(
+        params for query, params in executor.calls if query == "hydrate"
+    )
+    assert hydration_call["candidate_ids"] == ("trace-2", "trace-3")
+
+
+def test_identity_hydration_keeps_same_text_org_traces_distinct() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    rows = [
+        {
+            "project_id": project_id,
+            "trace_id": "shared-trace",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=1),
+            "trace_name": f"presented-{index}",
+        }
+        for index, project_id in enumerate((PROJECT_ID, project_b))
+    ]
+    rows.append(
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": "older-trace",
+            "root_span_id": "root-older",
+            "start_time": END - timedelta(seconds=2),
+            "trace_name": "presented-older",
+        }
+    )
+    builder = _OrgIdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        key_field="trace_id",
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    executor = _OrgIdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="trace_id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert [(row["project_id"], row["trace_id"]) for row in page.rows] == [
+        (project_b, "shared-trace"),
+        (PROJECT_ID, "shared-trace"),
+    ]
+    hydration = next(
+        params for query, params in executor.calls if query == "hydrate_org"
+    )
+    assert set(hydration["candidate_identities"]) == {
+        (PROJECT_ID, "shared-trace"),
+        (project_b, "shared-trace"),
+    }
+
+
+def test_identity_hydration_preserves_cursor_disjointness() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+            "trace_name": f"presented-{index}",
+        }
+        for index in range(6)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    first = read_bounded_filter_page(
+        builder=builder,
+        analytics=_IdentityHydrationFakeExecutor(builder),
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+    second = read_bounded_filter_page(
+        builder=builder,
+        analytics=_IdentityHydrationFakeExecutor(builder),
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        cursor_start_time=first.rows[-1]["start_time"],
+        cursor_order_token=first.rows[-1]["id"],
+    )
+
+    assert first.complete is True and second.complete is True
+    assert [row["id"] for row in first.rows] == ["trace-0", "trace-1"]
+    assert [row["id"] for row in second.rows] == ["trace-2", "trace-3"]
+    assert {row["id"] for row in first.rows}.isdisjoint(
+        row["id"] for row in second.rows
+    )
+
+
+@pytest.mark.parametrize("drift_field", ["root_span_id", "start_time"])
+def test_identity_hydration_fails_closed_on_canonical_root_drift(drift_field) -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+            "trace_name": f"presented-{index}",
+        }
+        for index in range(3)
+    ]
+    hydration_rows = [dict(row) for row in rows]
+    if drift_field == "root_span_id":
+        hydration_rows[0][drift_field] = "replacement-root"
+    else:
+        hydration_rows[0][drift_field] -= timedelta(microseconds=1)
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=_IdentityHydrationFakeExecutor(
+            builder, hydration_rows=hydration_rows
+        ),
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is False
+    assert page.rows == []
+    assert page.has_more is False
+    assert page.error_code == "classification_drift"
+
+
+def test_identity_hydration_normalizes_aware_and_naive_root_time() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+            "trace_name": f"presented-{index}",
+        }
+        for index in range(3)
+    ]
+    hydration_rows = [
+        {**row, "start_time": row["start_time"].replace(tzinfo=UTC)} for row in rows
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=_IdentityHydrationFakeExecutor(
+            builder, hydration_rows=hydration_rows
+        ),
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == ["trace-0", "trace-1"]
+
+
+def test_identity_hydration_reserves_query_and_wall_budget() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+            "trace_name": f"presented-{index}",
+        }
+        for index in range(3)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    clock = _ManualMonotonic()
+    executor = _IdentityHydrationFakeExecutor(
+        builder,
+        clock=clock,
+        durations_ms={"seed": 1_000, "match_identity": 850, "hydrate": 299},
+    )
+
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(start=builder.start, end=builder.end)],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=2_200,
+            max_query_count=3,
+        )
+
+    assert page.complete is True
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "match_identity",
+        "hydrate",
+    ]
+    assert executor.timeouts[0] == ("seed", 1_500)
+    assert 899 <= executor.timeouts[1][1] <= 900
+    assert executor.timeouts[2] == ("hydrate", 300)
+    assert page.elapsed_ms == pytest.approx(2_149)
+
+    preflight_executor = _IdentityHydrationFakeExecutor(builder)
+    preflight = read_bounded_filter_page(
+        builder=builder,
+        analytics=preflight_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        max_query_count=2,
+    )
+    assert preflight.complete is False
+    assert preflight.error_code == "page_depth_exceeded"
+    assert preflight_executor.calls == []
+
+
+def test_identity_hydration_timeout_is_sanitized_and_never_returns_identity_rows() -> (
+    None
+):
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(3)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    clock = _ManualMonotonic()
+    executor = _IdentityHydrationFakeExecutor(
+        builder,
+        clock=clock,
+        durations_ms={"hydrate": 301},
+    )
+
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(start=builder.start, end=builder.end)],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=2_200,
+            max_query_count=3,
+        )
+
+    assert page.complete is False
+    assert page.rows == []
+    assert page.error_code == "read_budget_exceeded"
+    assert page.attempts[-1].kind == "hydrate"
+    assert page.attempts[-1].error_code == "read_budget_exceeded"
+
+
+def test_identity_hydration_supports_the_api_page_size_500_envelope() -> None:
+    rows = [
+        {
+            "id": f"trace-{index:03d}",
+            "root_span_id": f"root-{index:03d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+            "trace_name": f"presented-{index:03d}",
+        }
+        for index in range(501)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=50,
+        recommended_seed_batch_size=501,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder, reverse_hydration=True)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=500,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.has_more is True
+    assert len(page.rows) == 500
+    assert page.rows[0]["id"] == "trace-000"
+    assert page.rows[-1]["id"] == "trace-499"
+    classify_calls = [
+        params for query, params in executor.calls if query == "match_identity"
+    ]
+    assert [len(call["candidate_ids"]) for call in classify_calls] == [50] * 10 + [1]
+    hydration_call = next(
+        params for query, params in executor.calls if query == "hydrate"
+    )
+    assert len(hydration_call["candidate_ids"]) == 500
+    assert page.query_count == 13
 
 
 def test_read_budget_failure_is_degraded_sanitized_and_not_retried() -> None:

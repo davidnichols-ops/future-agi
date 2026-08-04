@@ -330,6 +330,42 @@ def read_bounded_filter_page(
     if cursor_start_time is not None:
         cursor_key = (_without_timezone(cursor_start_time), cursor_order_token)
 
+    identity_classification_capability = getattr(
+        builder, "use_identity_only_filter_classification", None
+    )
+    identity_match_builder = getattr(
+        builder, "build_filter_identity_match_query_from_seed_rows", None
+    )
+    page_hydration_builder = getattr(builder, "build_filter_page_hydration_query", None)
+    hydration_identity_builder = getattr(
+        builder, "bounded_filter_page_hydration_identity", None
+    )
+    hydration_reserve_builder = getattr(
+        builder, "recommended_filter_page_hydration_reserve_ms", None
+    )
+    identity_only_classification = (
+        not include_incomplete_rows
+        and not defer_classification
+        and callable(identity_classification_capability)
+        and bool(identity_classification_capability())
+    )
+    if identity_only_classification and not (
+        callable(identity_match_builder)
+        and callable(page_hydration_builder)
+        and callable(hydration_identity_builder)
+        and callable(hydration_reserve_builder)
+    ):
+        raise ValueError(
+            "identity-only filter classification requires a hydration query"
+        )
+    reserved_hydration_queries = 1 if identity_only_classification else 0
+    reserved_hydration_ms = (
+        int(hydration_reserve_builder()) if identity_only_classification else 0
+    )
+    if identity_only_classification and reserved_hydration_ms < 25:
+        raise ValueError("page hydration reserve must be at least 25 ms")
+    classification_deadline = deadline - (reserved_hydration_ms / 1000)
+
     # Resolve the optional anchor plan once, before the numbered-page preflight,
     # and reuse it at execution time.  The probe is speculative: when it reaches
     # its sentinel the ordered seed/classifier path still has to run, so that
@@ -486,6 +522,7 @@ def read_bounded_filter_page(
     }
     if bounded_numbered_page_depth_exceeded(
         **page_depth_kwargs,
+        reserved_query_count=reserved_hydration_queries,
     ):
         return BoundedFilterPage(
             rows=[],
@@ -504,10 +541,12 @@ def read_bounded_filter_page(
         anchor_can_run
         and not anchor_probe_only
         and (
-            recommended_anchor_strata > max_query_count
+            recommended_anchor_strata + reserved_hydration_queries > max_query_count
             or bounded_numbered_page_depth_exceeded(
                 **page_depth_kwargs,
-                reserved_query_count=recommended_anchor_strata,
+                reserved_query_count=(
+                    recommended_anchor_strata + reserved_hydration_queries
+                ),
             )
         )
     ):
@@ -570,11 +609,20 @@ def read_bounded_filter_page(
         result_limit: int = _ABSOLUTE_MAX_CANDIDATES,
         timeout_cap_ms: int | None = None,
         max_bytes_to_read_cap: int | None = None,
+        use_reserved_query_budget: bool = False,
     ) -> QueryResult:
-        remaining_ms = int((deadline - monotonic()) * 1000)
+        active_deadline = (
+            deadline if use_reserved_query_budget else classification_deadline
+        )
+        remaining_ms = int((active_deadline - monotonic()) * 1000)
         if remaining_ms < 25:
             raise _BudgetExceeded("deadline_exceeded")
-        if len(attempts) >= max_query_count:
+        active_query_limit = (
+            max_query_count
+            if use_reserved_query_budget
+            else max_query_count - reserved_hydration_queries
+        )
+        if len(attempts) >= active_query_limit:
             raise _BudgetExceeded("query_budget_exceeded")
         attempt_started = monotonic()
         statement_timeout_ms = min(_QUERY_TIMEOUT_MS, remaining_ms)
@@ -719,10 +767,14 @@ def read_bounded_filter_page(
                 str(candidate_seed_rows[identity].get(key_field, ""))
                 for identity in identity_batch
             ]
-            seeded_match_builder = getattr(
-                builder,
-                "build_filter_match_query_from_seed_rows",
-                None,
+            seeded_match_builder = (
+                identity_match_builder
+                if identity_only_classification
+                else getattr(
+                    builder,
+                    "build_filter_match_query_from_seed_rows",
+                    None,
+                )
             )
             if callable(seeded_match_builder):
                 match_query, match_params = seeded_match_builder(
@@ -1057,6 +1109,51 @@ def read_bounded_filter_page(
         if page_complete or include_incomplete_rows
         else []
     )
+
+    if page_complete and identity_only_classification and page_rows:
+        try:
+            hydration_query, hydration_params = page_hydration_builder(page_rows)
+            hydration_result = execute(
+                kind="hydrate",
+                query=hydration_query,
+                params=hydration_params,
+                active_start=request_start,
+                active_end=request_end,
+                result_limit=page_size,
+                timeout_cap_ms=reserved_hydration_ms,
+                use_reserved_query_budget=True,
+            )
+            expected_by_id = {row_identity(row): row for row in page_rows}
+            hydrated_by_id = {
+                row_identity(row): row for row in hydration_result.data or []
+            }
+            hydration_is_stable = (
+                len(expected_by_id) == len(page_rows)
+                and len(hydrated_by_id) == len(hydration_result.data or [])
+                and set(hydrated_by_id) == set(expected_by_id)
+                and all(
+                    result_row_key(hydrated_by_id[identity])
+                    == result_row_key(expected_row)
+                    and hydration_identity_builder(hydrated_by_id[identity])
+                    == hydration_identity_builder(expected_row)
+                    for identity, expected_row in expected_by_id.items()
+                )
+            )
+            if not hydration_is_stable:
+                page_complete = False
+                degraded_error_code = "classification_drift"
+                page_rows = []
+                has_more = False
+            else:
+                page_rows = sorted(
+                    hydrated_by_id.values(), key=result_row_key, reverse=True
+                )
+        except _BudgetExceeded as exc:
+            page_complete = False
+            degraded_error_code = exc.error_code
+            page_rows = []
+            has_more = False
+
     error_code = (
         None if page_complete else degraded_error_code or "scan_budget_exceeded"
     )

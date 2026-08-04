@@ -272,7 +272,11 @@ class TestListBuilderOutputContract:
             }:
                 start, end = builder.parse_time_range(builder.filters)
                 result = method(slice_start=start, slice_end=end, limit=2)
-            elif name == "build_filter_match_query_from_seed_rows":
+            elif name in {
+                "build_filter_identity_match_query_from_seed_rows",
+                "build_filter_match_query_from_seed_rows",
+                "build_filter_page_hydration_query",
+            }:
                 start, _ = builder.parse_time_range(builder.filters)
                 result = method(
                     [
@@ -280,6 +284,7 @@ class TestListBuilderOutputContract:
                             "project_id": "contract-test-proj",
                             "trace_id": "dummy-trace-id",
                             "id": "dummy-span-id",
+                            "root_span_id": "dummy-span-id",
                             "start_time": start,
                         }
                     ]
