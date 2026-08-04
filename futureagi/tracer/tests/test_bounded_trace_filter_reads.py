@@ -286,6 +286,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert "%(candidate_start_date)s - INTERVAL 1 DAY" not in match_sql
     assert "%(candidate_end_date)s + INTERVAL 1 DAY" not in match_sql
     assert builder.filter_seed_proves_result_order() is False
+    assert builder.filter_cursor_seed_keyset_is_safe() is False
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 50
 
@@ -304,6 +305,10 @@ def test_long_window_trace_seeds_two_hundred_but_classifies_fifty() -> None:
     assert builder.skip_full_window_filter_anchor_probe() is True
     assert builder.recommended_filter_anchor_probe_limit() == 64
     assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
+    assert builder.recommended_filter_anchor_probe_strata() == 4
+    assert (
+        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 96 * 1024 * 1024
+    )
 
 
 def test_short_window_trace_keeps_full_sparse_anchor_probe() -> None:
@@ -318,6 +323,8 @@ def test_short_window_trace_keeps_full_sparse_anchor_probe() -> None:
     assert builder.skip_full_window_filter_anchor_probe() is False
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
+    assert builder.recommended_filter_anchor_probe_strata() is None
+    assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
 
 
 def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
@@ -349,11 +356,11 @@ def test_eval_trace_any_span_large_prefix_fails_closed_at_query_ceiling() -> Non
         "seed_batch_size": 200,
     }
 
-    # This helper is only the mechanical preflight estimate: it does not
-    # reserve the optional anchor read or model classifier chunks restarting
-    # per seed page. Passing this boundary is not an end-to-end guarantee;
-    # runtime accounting still fails closed if the actual 128-read budget is
-    # exhausted.
+    # This helper is only the mechanical preflight estimate: this bulk builder
+    # has no optional anchor, and the estimate does not model classifier chunks
+    # restarting per seed page. Passing this boundary is not an end-to-end
+    # guarantee; runtime accounting still fails closed if the actual 128-read
+    # budget is exhausted.
     assert bounded_numbered_page_depth_exceeded(page_size=2_459, **common) is False
     # The next public row is rejected by even that optimistic estimate before
     # CH is contacted, instead of widening back to the unsafe classifier batch.
@@ -3069,13 +3076,27 @@ class _UnindexedAnySpanFakeBuilder(_FakeBuilder):
         return "ordered_seed", params
 
 
+class _UnsafeTraceCursorFakeBuilder(_UnindexedAnySpanFakeBuilder):
+    @staticmethod
+    def filter_cursor_seed_keyset_is_safe() -> bool:
+        return False
+
+
 class _AnchorFakeBuilder(_FakeBuilder):
     def supports_filter_anchor_probe(self) -> bool:
         return True
 
     @staticmethod
-    def build_filter_anchor_probe(*, limit: int) -> tuple[str, dict[str, Any]]:
-        return "anchor", {"limit": limit}
+    def build_filter_anchor_probe(
+        *,
+        limit: int,
+        slice_start: datetime | None = None,
+        slice_end: datetime | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        params = {"limit": limit}
+        if slice_start is not None and slice_end is not None:
+            params.update(slice_start=slice_start, slice_end=slice_end)
+        return "anchor", params
 
     def build_filter_ordered_seed_page(
         self,
@@ -3111,6 +3132,14 @@ class _SmallAnchorFakeBuilder(_SkipFullAnchorFakeBuilder):
     def recommended_filter_anchor_probe_timeout_ms() -> int:
         return 300
 
+    @staticmethod
+    def recommended_filter_anchor_probe_strata() -> int:
+        return 4
+
+    @staticmethod
+    def recommended_filter_anchor_probe_max_bytes_to_read() -> int:
+        return 96 * 1024 * 1024
+
 
 class _AnchorFakeExecutor(_FakeExecutor):
     def execute_ch_query(
@@ -3129,7 +3158,14 @@ class _AnchorFakeExecutor(_FakeExecutor):
                 settings=settings,
             )
         self.calls.append((query, params))
-        rows = self.builder.rows[: params["limit"]]
+        rows = self.builder.rows
+        if "slice_start" in params:
+            rows = [
+                row
+                for row in rows
+                if params["slice_start"] <= row["start_time"] < params["slice_end"]
+            ]
+        rows = rows[: params["limit"]]
         return QueryResult(rows, len(rows), "clickhouse", 1.0)
 
 
@@ -3138,9 +3174,11 @@ class _TimedAnchorFakeExecutor(_AnchorFakeExecutor):
         super().__init__(builder)
         self.fail_anchor = fail_anchor
         self.timeouts: list[tuple[str, int]] = []
+        self.settings: list[tuple[str, dict[str, Any]]] = []
 
     def execute_ch_query(self, query, params, *, timeout_ms, settings):
         self.timeouts.append((query, timeout_ms))
+        self.settings.append((query, settings))
         if query == "anchor" and self.fail_anchor:
             self.calls.append((query, params))
             raise ReadDeadlineExceeded("anchor timeout")
@@ -3396,6 +3434,27 @@ def test_session_numbered_page_ceiling_is_deterministic() -> None:
     assert bounded_numbered_page_depth_exceeded(page_number=158, **common) is False
     # Page 159 needs 4,801 rows, beyond 24 x 200 finite seed candidates.
     assert bounded_numbered_page_depth_exceeded(page_number=159, **common) is True
+
+
+def test_numbered_page_budget_can_reserve_a_speculative_anchor_query() -> None:
+    common = {
+        "page_number": 0,
+        "page_size": 200,
+        "max_query_count": 3,
+        "classify_batch_size": 200,
+        "seed_batch_size": 200,
+    }
+
+    # A 201-row prefix needs one ordered seed plus two classifiers. When an
+    # anchor may run first, the same page cannot fit the three-query ceiling.
+    assert bounded_numbered_page_depth_exceeded(**common) is False
+    assert (
+        bounded_numbered_page_depth_exceeded(
+            **common,
+            reserved_query_count=1,
+        )
+        is True
+    )
 
 
 def test_voice_numbered_page_ceiling_is_deterministic() -> None:
@@ -4172,9 +4231,30 @@ def test_long_window_sparse_indexed_anchor_is_exact_under_small_timeout() -> Non
 
     assert page.complete is True
     assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
-    assert [query for query, _ in executor.calls] == ["anchor", "match"]
+    assert [query for query, _ in executor.calls] == [
+        "anchor",
+        "anchor",
+        "anchor",
+        "anchor",
+        "match",
+    ]
     assert executor.calls[0][1]["limit"] == 64
-    assert 0 < executor.timeouts[0][1] <= 300
+    anchor_calls = [params for query, params in executor.calls if query == "anchor"]
+    assert [params["limit"] for params in anchor_calls] == [64, 61, 61, 61]
+    assert anchor_calls[0]["slice_end"] == END
+    assert anchor_calls[-1]["slice_start"] == START
+    assert all(
+        newer["slice_start"] == older["slice_end"]
+        for newer, older in zip(anchor_calls, anchor_calls[1:], strict=False)
+    )
+    assert all(
+        0 < timeout <= 300 for query, timeout in executor.timeouts if query == "anchor"
+    )
+    assert all(
+        settings["max_bytes_to_read"] == 96 * 1024 * 1024
+        for query, settings in executor.settings
+        if query == "anchor"
+    )
 
 
 def test_long_window_common_indexed_anchor_falls_back_to_ordered_roots() -> None:
@@ -4200,6 +4280,53 @@ def test_long_window_common_indexed_anchor_falls_back_to_ordered_roots() -> None
         "match",
     ]
     assert executor.calls[0][1]["limit"] == 64
+
+
+def test_partitioned_anchor_uses_one_row_global_sentinel_at_stratum_boundary() -> None:
+    rows = _rows(*range(1, 64))
+    rows.append({"id": "older", "start_time": END - timedelta(days=100)})
+    builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    anchor_params = [params for query, params in executor.calls if query == "anchor"]
+    assert [params["limit"] for params in anchor_params] == [64, 1]
+    assert [query for query, _ in executor.calls[2:]] == ["ordered_seed", "match"]
+
+
+def test_anchor_budget_boundary_skips_probe_but_preserves_fallback() -> None:
+    rows = _rows(*range(1, 301))
+    builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=200,
+        deadline_ms=5_000,
+        max_query_count=3,
+    )
+
+    assert page.complete is True
+    assert page.error_code is None
+    assert [query for query, _ in executor.calls] == [
+        "ordered_seed",
+        "match",
+        "match",
+    ]
 
 
 def test_long_window_indexed_anchor_timeout_falls_back_without_degrading() -> None:
@@ -4935,6 +5062,71 @@ def test_ordered_trace_inner_prefix_keeps_cursor_pages_disjoint() -> None:
         row["id"] for row in second.rows
     )
     assert first.query_count == second.query_count == 2
+
+
+def test_trace_cursor_rescans_tied_raw_roots_before_tombstone_classification() -> None:
+    tied = END - timedelta(minutes=1)
+    raw_rows = [
+        {"id": trace_id, "start_time": start_time}
+        for trace_id, start_time in (
+            ("trace-zz", tied),
+            ("trace-y", tied),
+            ("trace-x", tied),
+            ("trace-w", tied),
+            ("trace-v", tied - timedelta(minutes=2)),
+        )
+    ]
+    match_rows = [
+        # trace-zz's tied, newer raw root is tombstoned. Its alternate live root
+        # is older than the public cursor and must remain visible on page two.
+        {"id": "trace-zz", "start_time": tied - timedelta(minutes=1)},
+        {"id": "trace-y", "start_time": tied},
+        {"id": "trace-x", "start_time": tied},
+        {"id": "trace-w", "start_time": tied},
+        {"id": "trace-v", "start_time": tied - timedelta(minutes=2)},
+    ]
+    builder = _UnsafeTraceCursorFakeBuilder(
+        raw_rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=match_rows,
+        seed_proves_order=False,
+    )
+
+    first = read_bounded_filter_page(
+        builder=builder,
+        analytics=_FakeExecutor(builder),
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+    second_executor = _FakeExecutor(builder)
+    second = read_bounded_filter_page(
+        builder=builder,
+        analytics=second_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        cursor_start_time=first.rows[-1]["start_time"],
+        cursor_order_token=first.rows[-1]["id"],
+    )
+
+    assert [row["id"] for row in first.rows] == ["trace-y", "trace-x"]
+    assert [row["id"] for row in second.rows] == ["trace-w", "trace-zz"]
+    assert first.complete is True and second.complete is True
+    assert {row["id"] for row in first.rows}.isdisjoint(
+        row["id"] for row in second.rows
+    )
+    second_seed = next(
+        params for query, params in second_executor.calls if query == "ordered_seed"
+    )
+    assert second_seed["slice_end"] == builder.end
+    assert second_seed["before_start_time"] is None
+    assert second_seed["before_id"] is None
 
 
 def test_ordered_trace_inner_prefix_does_not_trust_tombstoned_raw_cutoff() -> None:

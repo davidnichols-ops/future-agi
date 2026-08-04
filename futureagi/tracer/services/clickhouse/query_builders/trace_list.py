@@ -70,12 +70,17 @@ _INDEXED_TRACE_ANY_SPAN_ANCHOR_COLUMNS = frozenset(
 # remain independently capped and may still acquire 200 identities at once.
 _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE = 20
 
-# A long-window list gets one cheap sparse-value proof before it enters the
-# ordered-root fallback.  Sixty-four includes an exhaustiveness sentinel while
-# keeping the index probe substantially smaller than the short-window 513-row
-# proof; 300 ms prevents a common value from consuming the request budget.
+# A long-window list gets a small, partitioned sparse-value proof before it
+# enters the ordered-root fallback. Sixty-four is one global exhaustiveness
+# sentinel across four adjacent time strata. Each statement gets only 300 ms
+# and 96 MiB: even if every speculative stratum reaches its byte ceiling, the
+# combined optional work stays comfortably below the normal 512 MiB statement
+# envelope. The selector discards the entire probe set on any sentinel or
+# resource failure, so none of these limits can change membership.
 _LONG_WINDOW_ANCHOR_SENTINEL = 64
 _LONG_WINDOW_ANCHOR_TIMEOUT_MS = 300
+_LONG_WINDOW_ANCHOR_STRATA = 4
+_LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 96 * 1024 * 1024
 
 
 def _unix_microseconds(value: datetime) -> int:
@@ -344,6 +349,20 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
         return not any(plan.scope == "any" for plan in plans)
 
+    @staticmethod
+    def filter_cursor_seed_keyset_is_safe() -> bool:
+        """Do not apply a public cursor directly to raw root candidates.
+
+        A trace's newest raw root is only an upper bound on its canonical live
+        root. If that physical row is tombstoned, latest-state classification
+        can select an older alternate root that belongs after the signed public
+        cursor. Starting the raw seed query at that cursor would skip the trace
+        before classification. The bounded selector must instead scan from the
+        frozen request end and apply the public cursor to classified rows.
+        """
+
+        return False
+
     def _filter_anchor_plans(self) -> list[LatestFilterPredicate]:
         """Return directly selective any-span leaves safe for a broad probe.
 
@@ -578,7 +597,27 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return _LONG_WINDOW_ANCHOR_TIMEOUT_MS
         return None
 
-    def build_filter_anchor_probe(self, *, limit: int) -> tuple[str, dict[str, Any]]:
+    def recommended_filter_anchor_probe_strata(self) -> int | None:
+        """Partition only the optional long-window list probe."""
+
+        if self.recommended_filter_anchor_probe_limit() is not None:
+            return _LONG_WINDOW_ANCHOR_STRATA
+        return None
+
+    def recommended_filter_anchor_probe_max_bytes_to_read(self) -> int | None:
+        """Return the per-stratum byte ceiling for optional list probes."""
+
+        if self.recommended_filter_anchor_probe_limit() is not None:
+            return _LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ
+        return None
+
+    def build_filter_anchor_probe(
+        self,
+        *,
+        limit: int,
+        slice_start: datetime | None = None,
+        slice_end: datetime | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         """Return a finite unordered any-span candidate sentinel.
 
         ``DISTINCT ... LIMIT`` can stop after the sentinel and uses the
@@ -589,9 +628,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         physical latest state before it can become a result.
         """
 
-        if limit <= 1:
+        if limit <= 0 or (limit == 1 and slice_start is None and slice_end is None):
             raise ValueError("anchor probe limit must include a sentinel")
         request_start, request_end = self.parse_time_range(self.filters)
+        if (slice_start is None) != (slice_end is None):
+            raise ValueError("anchor probe slice values must be provided together")
+        anchor_start = request_start if slice_start is None else slice_start
+        anchor_end = request_end if slice_end is None else slice_end
+        if not request_start <= anchor_start < anchor_end <= request_end:
+            raise ValueError("trace anchor slice must stay inside the request window")
         self.start_date, self.end_date = request_start, request_end
         anchor_plans = self._filter_anchor_plans()
         if not anchor_plans:
@@ -605,10 +650,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         params: dict[str, Any] = {
             **self.params,
             **anchor_params,
-            "filter_anchor_start": request_start,
-            "filter_anchor_end": request_end,
-            "filter_anchor_start_us": _unix_microseconds(request_start),
-            "filter_anchor_end_us": _unix_microseconds(request_end),
+            "filter_anchor_start": anchor_start,
+            "filter_anchor_end": anchor_end,
+            "filter_anchor_start_us": _unix_microseconds(anchor_start),
+            "filter_anchor_end_us": _unix_microseconds(anchor_end),
             "filter_anchor_limit": int(limit),
         }
         project_version_fragment = ""

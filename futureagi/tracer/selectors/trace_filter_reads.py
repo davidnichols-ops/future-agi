@@ -20,6 +20,7 @@ _MAX_CANDIDATES = 512
 _ABSOLUTE_MAX_CANDIDATES = 512
 _ABSOLUTE_MAX_QUERIES = 128
 _SELECTIVE_ANCHOR_SENTINEL = 513
+_MAX_OPTIONAL_ANCHOR_STRATA = 4
 # Keep one slow-but-bounded statement within the client deadline so the next
 # seed/classifier can run. Production showed successful reads
 # at 0.79-1.26 s under load; the caller's wall deadline, query count, rows,
@@ -161,6 +162,7 @@ def bounded_numbered_page_depth_exceeded(
     max_query_count: int | None = None,
     classify_batch_size: int = 200,
     seed_batch_size: int = 200,
+    reserved_query_count: int = 0,
 ) -> bool:
     """Return whether page N cannot fit inside the finite selector contract.
 
@@ -181,14 +183,18 @@ def bounded_numbered_page_depth_exceeded(
         max_query_count = min(max_seed_attempts * 2, _ABSOLUTE_MAX_QUERIES)
     if not 1 <= max_query_count <= _ABSOLUTE_MAX_QUERIES:
         raise ValueError("max_query_count exceeds the bounded read contract")
+    if not 0 <= reserved_query_count <= max_query_count:
+        raise ValueError("reserved_query_count exceeds max_query_count")
     if not 1 <= classify_batch_size <= max_candidates:
         raise ValueError("classify_batch_size exceeds max_candidates")
     if not 1 <= seed_batch_size <= max_candidates:
         raise ValueError("seed_batch_size exceeds max_candidates")
     prefix_needed = ((page_number + 1) * page_size) + 1
     candidate_limit = min(max_candidates, max(seed_batch_size, prefix_needed))
-    minimum_query_count = ceil(prefix_needed / candidate_limit) + ceil(
-        prefix_needed / classify_batch_size
+    minimum_query_count = (
+        reserved_query_count
+        + ceil(prefix_needed / candidate_limit)
+        + ceil(prefix_needed / classify_batch_size)
     )
     return (
         prefix_needed > max_seed_attempts * max_candidates
@@ -323,6 +329,121 @@ def read_bounded_filter_page(
     cursor_key: tuple[datetime, Any] | None = None
     if cursor_start_time is not None:
         cursor_key = (_without_timezone(cursor_start_time), cursor_order_token)
+
+    # Resolve the optional anchor plan once, before the numbered-page preflight,
+    # and reuse it at execution time.  The probe is speculative: when it reaches
+    # its sentinel the ordered seed/classifier path still has to run, so that
+    # path must reserve the probe's physical query up front.
+    anchor_builder = getattr(builder, "build_filter_anchor_probe", None)
+    anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
+    ordered_seed_builder = getattr(builder, "build_filter_ordered_seed_page", None)
+    recommended_anchor_limit: int | None = None
+    recommended_anchor_timeout_ms: int | None = None
+    recommended_anchor_strata = 1
+    recommended_anchor_max_bytes_to_read: int | None = None
+    if anchor_probe_limit is None and not anchor_probe_only:
+        anchor_limit_builder = getattr(
+            builder, "recommended_filter_anchor_probe_limit", None
+        )
+        if callable(anchor_limit_builder):
+            raw_anchor_limit = anchor_limit_builder()
+            if raw_anchor_limit is not None:
+                recommended_anchor_limit = int(raw_anchor_limit)
+                if not 2 <= recommended_anchor_limit <= max_candidates:
+                    raise ValueError(
+                        "recommended anchor probe limit exceeds max_candidates"
+                    )
+                anchor_timeout_builder = getattr(
+                    builder, "recommended_filter_anchor_probe_timeout_ms", None
+                )
+                if callable(anchor_timeout_builder):
+                    raw_anchor_timeout = anchor_timeout_builder()
+                    if raw_anchor_timeout is not None:
+                        recommended_anchor_timeout_ms = int(raw_anchor_timeout)
+                        if recommended_anchor_timeout_ms <= 0:
+                            raise ValueError(
+                                "recommended anchor probe timeout must be positive"
+                            )
+                anchor_strata_builder = getattr(
+                    builder, "recommended_filter_anchor_probe_strata", None
+                )
+                if callable(anchor_strata_builder):
+                    raw_anchor_strata = anchor_strata_builder()
+                    if raw_anchor_strata is not None:
+                        recommended_anchor_strata = int(raw_anchor_strata)
+                        if (
+                            not 1
+                            <= recommended_anchor_strata
+                            <= _MAX_OPTIONAL_ANCHOR_STRATA
+                        ):
+                            raise ValueError(
+                                "recommended anchor probe strata exceeds bounded contract"
+                            )
+                anchor_bytes_builder = getattr(
+                    builder,
+                    "recommended_filter_anchor_probe_max_bytes_to_read",
+                    None,
+                )
+                if callable(anchor_bytes_builder):
+                    raw_anchor_bytes = anchor_bytes_builder()
+                    if raw_anchor_bytes is not None:
+                        recommended_anchor_max_bytes_to_read = int(raw_anchor_bytes)
+                        if not (
+                            0
+                            < recommended_anchor_max_bytes_to_read
+                            < _READ_SETTINGS["max_bytes_to_read"]
+                        ):
+                            raise ValueError(
+                                "recommended anchor byte cap must tighten the read contract"
+                            )
+    anchor_limit = (
+        anchor_probe_limit
+        or recommended_anchor_limit
+        or min(
+            _SELECTIVE_ANCHOR_SENTINEL,
+            max_candidates + 1,
+        )
+    )
+    skip_full_anchor_builder = getattr(
+        builder,
+        "skip_full_window_filter_anchor_probe",
+        None,
+    )
+    skip_full_window_anchor = (
+        anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
+        and anchor_probe_limit is None
+        and not anchor_probe_only
+        and callable(skip_full_anchor_builder)
+        and bool(skip_full_anchor_builder())
+    )
+    anchor_can_run = (
+        cursor_key is None
+        and (
+            anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
+            or anchor_probe_limit is not None
+            or recommended_anchor_limit is not None
+        )
+        and callable(anchor_builder)
+        and callable(anchor_support)
+        and bool(anchor_support())
+        and not skip_full_window_anchor
+        and (callable(ordered_seed_builder) or seed_proves_result_order)
+    )
+
+    cursor_seed_keyset_capability = getattr(
+        builder, "filter_cursor_seed_keyset_is_safe", None
+    )
+    cursor_seed_keyset_is_safe = (
+        bool(cursor_seed_keyset_capability())
+        if callable(cursor_seed_keyset_capability)
+        else True
+    )
+    if (
+        cursor_key is not None
+        and not cursor_seed_keyset_is_safe
+        and not callable(ordered_seed_builder)
+    ):
+        raise ValueError("unsafe cursor seeds require an ordered seed builder")
     if request_start >= request_end:
         return BoundedFilterPage(
             rows=[],
@@ -354,14 +475,17 @@ def read_bounded_filter_page(
     if not 1 <= candidate_floor <= max_candidates:
         raise ValueError("recommended seed batch size exceeds max_candidates")
     candidate_limit = min(max_candidates, max(candidate_floor, prefix_needed))
+    page_depth_kwargs = {
+        "page_number": page_number,
+        "page_size": page_size,
+        "max_seed_attempts": max_seed_attempts,
+        "max_candidates": max_candidates,
+        "max_query_count": max_query_count,
+        "classify_batch_size": classify_batch_size,
+        "seed_batch_size": candidate_floor,
+    }
     if bounded_numbered_page_depth_exceeded(
-        page_number=page_number,
-        page_size=page_size,
-        max_seed_attempts=max_seed_attempts,
-        max_candidates=max_candidates,
-        max_query_count=max_query_count,
-        classify_batch_size=classify_batch_size,
-        seed_batch_size=candidate_floor,
+        **page_depth_kwargs,
     ):
         return BoundedFilterPage(
             rows=[],
@@ -376,6 +500,21 @@ def read_bounded_filter_page(
             result_payload_bytes=0,
             attempts=(),
         )
+    if (
+        anchor_can_run
+        and not anchor_probe_only
+        and (
+            recommended_anchor_strata > max_query_count
+            or bounded_numbered_page_depth_exceeded(
+                **page_depth_kwargs,
+                reserved_query_count=recommended_anchor_strata,
+            )
+        )
+    ):
+        # The optional probe may fall back after its last physical stratum.
+        # If the fallback cannot retain its complete budget, skip speculation
+        # before contacting ClickHouse.
+        anchor_can_run = False
 
     attempts: list[FilterReadAttempt] = []
     # A trace any-span seed is a physical *span*, while the classified result
@@ -401,16 +540,22 @@ def read_bounded_filter_page(
             result_payload_bytes=0,
             attempts=(),
         )
-    # Include rows tied on the cursor timestamp; the strict complete-order
-    # predicate below removes the cursor row and every row before it.
+    # Safe seed/result orders may start directly at the signed cursor. Trace
+    # raw roots are only an upper bound on the canonical live-root order: a
+    # tombstoned newer root can expose an older alternate root. Those cursors
+    # therefore restart at the frozen request end, then apply the signed public
+    # boundary after latest-state classification below.
+    use_cursor_seed_keyset = cursor_key is not None and cursor_seed_keyset_is_safe
     slice_end = (
         min(request_end, cursor_key[0] + timedelta(microseconds=1))
-        if cursor_key is not None
+        if use_cursor_seed_keyset
         else request_end
     )
     slice_width = _INITIAL_SLICE
-    before_start_time: datetime | None = cursor_key[0] if cursor_key else None
-    before_id: Any = cursor_key[1] if cursor_key else None
+    before_start_time: datetime | None = (
+        cursor_key[0] if use_cursor_seed_keyset else None
+    )
+    before_id: Any = cursor_key[1] if use_cursor_seed_keyset else None
     forced_width_cap: timedelta | None = None
     page_complete = False
     degraded_error_code: str | None = None
@@ -424,6 +569,7 @@ def read_bounded_filter_page(
         active_end: datetime,
         result_limit: int = _ABSOLUTE_MAX_CANDIDATES,
         timeout_cap_ms: int | None = None,
+        max_bytes_to_read_cap: int | None = None,
     ) -> QueryResult:
         remaining_ms = int((deadline - monotonic()) * 1000)
         if remaining_ms < 25:
@@ -437,15 +583,23 @@ def read_bounded_filter_page(
                 raise ValueError("query timeout cap must be positive")
             statement_timeout_ms = min(statement_timeout_ms, timeout_cap_ms)
         try:
+            settings = {
+                **_READ_SETTINGS,
+                **(read_settings or {}),
+                "max_result_rows": result_limit,
+            }
+            if max_bytes_to_read_cap is not None:
+                if max_bytes_to_read_cap <= 0:
+                    raise ValueError("query byte cap must be positive")
+                settings["max_bytes_to_read"] = min(
+                    int(settings["max_bytes_to_read"]),
+                    max_bytes_to_read_cap,
+                )
             result = analytics.execute_ch_query(
                 query,
                 params,
                 timeout_ms=statement_timeout_ms,
-                settings={
-                    **_READ_SETTINGS,
-                    **(read_settings or {}),
-                    "max_result_rows": result_limit,
-                },
+                settings=settings,
             )
         except Exception as exc:
             if not is_read_budget_error(exc):
@@ -616,56 +770,8 @@ def read_bounded_filter_page(
         # an attempted probe reaches the sentinel (or its read budget), switch
         # to ordered root batches, where a proven page prefix can close without
         # materialising the tenant-wide set that triggered Code 159.
-        anchor_builder = getattr(builder, "build_filter_anchor_probe", None)
-        anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
-        ordered_seed_builder = getattr(builder, "build_filter_ordered_seed_page", None)
         use_seed_loop = True
         seed_page_builder = builder.build_filter_seed_page
-        recommended_anchor_limit: int | None = None
-        recommended_anchor_timeout_ms: int | None = None
-        if anchor_probe_limit is None and not anchor_probe_only:
-            anchor_limit_builder = getattr(
-                builder, "recommended_filter_anchor_probe_limit", None
-            )
-            if callable(anchor_limit_builder):
-                raw_anchor_limit = anchor_limit_builder()
-                if raw_anchor_limit is not None:
-                    recommended_anchor_limit = int(raw_anchor_limit)
-                    if not 2 <= recommended_anchor_limit <= max_candidates:
-                        raise ValueError(
-                            "recommended anchor probe limit exceeds max_candidates"
-                        )
-                    anchor_timeout_builder = getattr(
-                        builder, "recommended_filter_anchor_probe_timeout_ms", None
-                    )
-                    if callable(anchor_timeout_builder):
-                        raw_anchor_timeout = anchor_timeout_builder()
-                        if raw_anchor_timeout is not None:
-                            recommended_anchor_timeout_ms = int(raw_anchor_timeout)
-                            if recommended_anchor_timeout_ms <= 0:
-                                raise ValueError(
-                                    "recommended anchor probe timeout must be positive"
-                                )
-        anchor_limit = (
-            anchor_probe_limit
-            or recommended_anchor_limit
-            or min(
-                _SELECTIVE_ANCHOR_SENTINEL,
-                max_candidates + 1,
-            )
-        )
-        skip_full_anchor_builder = getattr(
-            builder,
-            "skip_full_window_filter_anchor_probe",
-            None,
-        )
-        skip_full_window_anchor = (
-            anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
-            and anchor_probe_limit is None
-            and not anchor_probe_only
-            and callable(skip_full_anchor_builder)
-            and bool(skip_full_anchor_builder())
-        )
         if cursor_key is not None:
             # Continuations must start from the signed *result* tuple. Trace
             # any-span seeds are ordered by the matching physical child, not
@@ -674,31 +780,84 @@ def read_bounded_filter_page(
             if callable(ordered_seed_builder):
                 seed_page_builder = ordered_seed_builder
                 seed_proves_result_order = True
-        elif (
-            (
-                anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
-                or anchor_probe_limit is not None
-                or recommended_anchor_limit is not None
-            )
-            and callable(anchor_builder)
-            and callable(anchor_support)
-            and bool(anchor_support())
-            and not skip_full_window_anchor
-            and (callable(ordered_seed_builder) or seed_proves_result_order)
-        ):
+        elif anchor_can_run:
             try:
-                anchor_query, anchor_params = anchor_builder(limit=anchor_limit)
-                anchor_result = execute(
-                    kind="anchor",
-                    query=anchor_query,
-                    params=anchor_params,
-                    active_start=request_start,
-                    active_end=request_end,
-                    result_limit=anchor_limit,
-                    timeout_cap_ms=recommended_anchor_timeout_ms,
-                )
-                anchor_rows = list(anchor_result.data or [])
-                if len(anchor_rows) < anchor_limit:
+                anchor_rows_by_id: dict[Hashable, dict[str, Any]] = {}
+                anchor_hit_sentinel = False
+                if recommended_anchor_strata > 1 and not anchor_probe_only:
+                    duration = request_end - request_start
+                    duration_us = (
+                        duration.days * 86_400_000_000
+                        + duration.seconds * 1_000_000
+                        + duration.microseconds
+                    )
+                    boundaries = [
+                        request_start
+                        + timedelta(
+                            microseconds=(duration_us * index)
+                            // recommended_anchor_strata
+                        )
+                        for index in range(recommended_anchor_strata + 1)
+                    ]
+                    boundaries[0], boundaries[-1] = request_start, request_end
+                    anchor_slices = list(
+                        reversed(
+                            list(
+                                zip(
+                                    boundaries[:-1],
+                                    boundaries[1:],
+                                    strict=False,
+                                )
+                            )
+                        )
+                    )
+                else:
+                    anchor_slices = [(request_start, request_end)]
+
+                for anchor_start, anchor_end in anchor_slices:
+                    remaining_anchor_limit = anchor_limit - len(anchor_rows_by_id)
+                    if remaining_anchor_limit <= 0:
+                        anchor_hit_sentinel = True
+                        break
+                    if recommended_anchor_strata > 1 and not anchor_probe_only:
+                        anchor_query, anchor_params = anchor_builder(
+                            limit=remaining_anchor_limit,
+                            slice_start=anchor_start,
+                            slice_end=anchor_end,
+                        )
+                    else:
+                        anchor_query, anchor_params = anchor_builder(
+                            limit=remaining_anchor_limit
+                        )
+                    anchor_result = execute(
+                        kind="anchor",
+                        query=anchor_query,
+                        params=anchor_params,
+                        active_start=anchor_start,
+                        active_end=anchor_end,
+                        result_limit=remaining_anchor_limit,
+                        timeout_cap_ms=recommended_anchor_timeout_ms,
+                        max_bytes_to_read_cap=(
+                            recommended_anchor_max_bytes_to_read
+                            if recommended_anchor_strata > 1 and not anchor_probe_only
+                            else None
+                        ),
+                    )
+                    stratum_rows = list(anchor_result.data or [])
+                    if len(stratum_rows) >= remaining_anchor_limit:
+                        anchor_hit_sentinel = True
+                        break
+                    for row in stratum_rows:
+                        anchor_rows_by_id[row_identity(row)] = row
+
+                anchor_rows = [
+                    row
+                    for _, row in sorted(
+                        anchor_rows_by_id.items(),
+                        key=lambda item: repr(item[0]),
+                    )
+                ]
+                if not anchor_hit_sentinel:
                     classify_seed_rows(
                         anchor_rows,
                         active_start=request_start,
@@ -715,7 +874,7 @@ def read_bounded_filter_page(
                     # retains explicit sampled metadata.
                     if anchor_probe_limit is not None:
                         classify_seed_rows(
-                            anchor_rows,
+                            list(anchor_result.data or []),
                             active_start=request_start,
                             active_end=request_end,
                         )
