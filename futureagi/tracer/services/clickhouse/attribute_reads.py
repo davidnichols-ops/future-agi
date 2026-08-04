@@ -62,6 +62,10 @@ ATTRIBUTE_READ_EXPLICIT_SEGMENT = timedelta(days=1)
 # sentinel, so callers never mistake this discovery sample for a complete
 # distribution.
 ATTRIBUTE_READ_CANDIDATE_LIMIT = 64
+# Value pickers replay full typed Map values only after acquiring a finite
+# identity set. Keep that acquisition deliberately tiny so a key lookup cannot
+# pull another large values block before LIMIT stops the read.
+ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT = 8
 # Exact-key discovery may continue through a small number of deterministic
 # candidate pages when a storage-order first probe replays entirely to
 # cleared/tombstoned latest state. This cap is shared across adaptive bands and
@@ -778,7 +782,9 @@ class AttributeReadSelector:
             windows: list[tuple[datetime, datetime]] = []
             segment_end = end
             while segment_end > start:
-                segment_start = max(start, segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT)
+                segment_start = max(
+                    start, segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                )
                 windows.append((segment_start, segment_end))
                 segment_end = segment_start
             return tuple(windows)
@@ -1335,9 +1341,12 @@ class AttributeReadSelector:
             "OR length(attrs_bool.keys) > 0"
             if exact_key is None
             else (
-                "mapContains(attrs_string, %(attribute_key)s) "
-                "OR mapContains(attrs_number, %(attribute_key)s) "
-                "OR mapContains(attrs_bool, %(attribute_key)s)"
+                "(indexHint(has(mapKeys(attrs_string), %(attribute_key)s)) "
+                "AND has(attrs_string.keys, %(attribute_key)s)) "
+                "OR (indexHint(has(mapKeys(attrs_number), %(attribute_key)s)) "
+                "AND has(attrs_number.keys, %(attribute_key)s)) "
+                "OR (indexHint(has(mapKeys(attrs_bool), %(attribute_key)s)) "
+                "AND has(attrs_bool.keys, %(attribute_key)s))"
             )
         )
         json_predicate = (
@@ -1703,32 +1712,20 @@ class AttributeReadSelector:
             )
 
         typed_predicate = (
-            "mapContains(attrs_string, %(attribute_key)s) "
-            "OR mapContains(attrs_number, %(attribute_key)s) "
-            "OR mapContains(attrs_bool, %(attribute_key)s)"
+            "(indexHint(has(mapKeys(attrs_string), %(attribute_key)s)) "
+            "AND has(attrs_string.keys, %(attribute_key)s)) "
+            "OR (indexHint(has(mapKeys(attrs_number), %(attribute_key)s)) "
+            "AND has(attrs_number.keys, %(attribute_key)s)) "
+            "OR (indexHint(has(mapKeys(attrs_bool), %(attribute_key)s)) "
+            "AND has(attrs_bool.keys, %(attribute_key)s))"
         )
         json_predicate = "JSONHas(attributes_extra, %(attribute_key)s)"
         pushed_search: str | None = None
-        # ClickHouse's case-insensitive UTF-8 folding is not identical to
-        # Python's full Unicode casefold. Restrict pushdown to ASCII needles so
-        # it can only remove rows that the final literal Python match would also
-        # remove; non-ASCII search remains bounded by key and is filtered after
-        # latest-state replay.
+        # Typed Map acquisition remains key-only; exact search is applied in
+        # Python after finite latest-state replay. Preserve the existing ASCII
+        # pushdown only for the independent JSON lane.
         if normalized_search and normalized_search.isascii():
             pushed_search = normalized_search
-            typed_predicate = (
-                "(mapContains(attrs_string, %(attribute_key)s) "
-                "AND positionCaseInsensitiveUTF8("
-                "attrs_string[%(attribute_key)s], %(attribute_search)s) > 0) "
-                "OR (mapContains(attrs_number, %(attribute_key)s) "
-                "AND positionCaseInsensitiveUTF8("
-                "toString(attrs_number[%(attribute_key)s]), "
-                "%(attribute_search)s) > 0) "
-                "OR (mapContains(attrs_bool, %(attribute_key)s) "
-                "AND positionCaseInsensitiveUTF8("
-                "if(attrs_bool[%(attribute_key)s] = 0, 'false', 'true'), "
-                "%(attribute_search)s) > 0)"
-            )
             json_predicate = (
                 "JSONHas(attributes_extra, %(attribute_key)s) "
                 "AND positionCaseInsensitiveUTF8("
@@ -1858,8 +1855,10 @@ class AttributeReadSelector:
                         segment,
                         predicate=predicate,
                         attribute_key=key,
-                        attribute_search=pushed_search,
-                        candidate_limit=ATTRIBUTE_READ_CANDIDATE_LIMIT,
+                        attribute_search=(
+                            pushed_search if lane_name == "json" else None
+                        ),
+                        candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
                         query_timeout_ms=timeout_ms,
                     )
                     rows = self._verify_latest(
@@ -1939,10 +1938,12 @@ class AttributeReadSelector:
                         state["segment"],
                         predicate=state["predicate"],
                         attribute_key=key,
-                        attribute_search=pushed_search,
+                        attribute_search=(
+                            pushed_search if state["lane_name"] == "json" else None
+                        ),
                         ordered=True,
                         before_identity=state["before_identity"],
-                        candidate_limit=ATTRIBUTE_READ_CANDIDATE_LIMIT,
+                        candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
                         query_timeout_ms=state["timeout_ms"],
                     )
                     rows = self._verify_latest(

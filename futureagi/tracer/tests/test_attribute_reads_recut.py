@@ -30,6 +30,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_MAX_PROJECTS,
     ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT,
+    ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
     AttributeCardinalityRead,
     AttributeDetailRead,
@@ -480,7 +481,8 @@ def test_general_exact_key_probe_finds_rare_key_in_later_band(
     candidate_sql = next(
         call.sql for call in executor.calls if "segment_start" in call.params
     )
-    assert "mapContains(attrs_string, %(attribute_key)s)" in candidate_sql
+    assert "indexHint(has(mapKeys(attrs_string), %(attribute_key)s))" in candidate_sql
+    assert "has(attrs_string.keys, %(attribute_key)s)" in candidate_sql
     assert "length(attrs_string.keys)" not in candidate_sql
     assert "argMin(" not in candidate_sql
     assert "LIMIT 1 BY project_id, trace_id, id, start_time" not in candidate_sql
@@ -1564,7 +1566,7 @@ def test_value_search_treats_unicode_like_metacharacters_as_literals():
     )
 
 
-def test_ascii_value_search_is_pushed_into_exact_candidates_and_finds_rare_value():
+def test_ascii_value_search_uses_key_only_typed_candidates_and_exact_replay():
     candidate_queries = 0
 
     def respond(call, _):
@@ -1601,10 +1603,13 @@ def test_ascii_value_search_is_pushed_into_exact_candidates_and_finds_rare_value
     assert [row.value for row in read.rows] == ["prefix NeEdLe%_\\path suffix"]
     candidates = [call for call in executor.calls if "segment_start" in call.params]
     assert len(candidates) == 5
+    assert all("attribute_search" not in call.params for call in candidates)
+    assert all("positionCaseInsensitiveUTF8" not in call.sql for call in candidates)
     assert all(
-        call.params["attribute_search"] == "needle%_\\path" for call in candidates
+        "indexHint(has(mapKeys(attrs_string), %(attribute_key)s))" in call.sql
+        and "has(attrs_string.keys, %(attribute_key)s)" in call.sql
+        for call in candidates
     )
-    assert all("positionCaseInsensitiveUTF8" in call.sql for call in candidates)
     assert all("LIKE" not in call.sql.upper() for call in candidates)
     assert all("needle%_\\path" not in call.sql for call in candidates)
 
@@ -1617,7 +1622,7 @@ def test_value_read_stops_after_first_verified_dense_sample():
             trace_id=f"trace-recent-{index:04d}",
             start_time=NOW - timedelta(seconds=index + 1),
         )
-        for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+        for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
     ]
     older = _candidate(
         PROJECT_A,
@@ -1658,7 +1663,9 @@ def test_value_read_stops_after_first_verified_dense_sample():
     ).read_values([PROJECT_A], "final_status")
 
     assert read.rows == (
-        AttributeValueRow("recent-value", "string", ATTRIBUTE_READ_CANDIDATE_LIMIT),
+        AttributeValueRow(
+            "recent-value", "string", ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT
+        ),
     )
     assert read.metadata.query_complete is False
     assert read.metadata.query_error_code == "sample_limit"
@@ -1669,6 +1676,10 @@ def test_value_read_stops_after_first_verified_dense_sample():
         if call.params.get("segment_start") == recent_start
     ]
     assert len(recent_candidate_calls) == 1
+    assert (
+        recent_candidate_calls[0].params["candidate_limit"]
+        == ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1
+    )
     assert "LIMIT 1 BY" not in recent_candidate_calls[0].sql
 
 
@@ -1680,7 +1691,7 @@ def test_dense_typed_value_sample_stops_before_json_lane():
             trace_id=f"trace-typed-{index:03d}",
             start_time=NOW - timedelta(hours=1, seconds=index),
         )
-        for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+        for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
     ]
     by_id = {str(row["id"]): row for row in candidates}
 
@@ -1716,7 +1727,7 @@ def test_dense_typed_value_sample_stops_before_json_lane():
         AttributeValueRow(
             "Rejected",
             "string",
-            ATTRIBUTE_READ_CANDIDATE_LIMIT,
+            ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
         ),
     )
     assert read.metadata.query_status == "sampled"
@@ -1779,13 +1790,13 @@ def test_value_search_pages_past_seed_stale_matches_to_live_value():
             trace_id=f"trace-stale-value-{index:04d}",
             start_time=NOW - timedelta(seconds=index + 1),
         )
-        for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT)
+        for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT)
     ]
     live = _candidate(
         PROJECT_A,
         "live-value",
         trace_id="trace-live-value",
-        start_time=NOW - timedelta(seconds=ATTRIBUTE_READ_CANDIDATE_LIMIT + 1),
+        start_time=NOW - timedelta(seconds=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1),
     )
     rows_by_id = {str(row["id"]): row for row in [*stale, live]}
     recent_start = adaptive_attribute_windows(NOW)[0][0]
@@ -1816,7 +1827,17 @@ def test_value_search_pages_past_seed_stale_matches_to_live_value():
     assert read.rows == (AttributeValueRow("Rejected", "string", 1),)
     assert read.metadata.query_complete is True
     candidates = [call for call in executor.calls if "segment_start" in call.params]
-    assert all(call.params["attribute_search"] == "Rejected" for call in candidates)
+    assert all("attribute_search" not in call.params for call in candidates)
+    assert all(
+        call.params["candidate_limit"] == ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1
+        for call in candidates
+    )
+    assert all("positionCaseInsensitiveUTF8" not in call.sql for call in candidates)
+    assert all(
+        "indexHint(has(mapKeys(attrs_string), %(attribute_key)s))" in call.sql
+        and "has(attrs_string.keys, %(attribute_key)s)" in call.sql
+        for call in candidates
+    )
     continuation = next(
         call for call in candidates if "candidate_before_start_us" in call.params
     )
@@ -2048,7 +2069,7 @@ def test_candidate_sample_cap_is_explicitly_degraded_and_query_count_bounded():
                     trace_id=f"trace-span-{page:02d}-{index:04d}",
                     start_time=NOW - timedelta(seconds=page * 1_000 + index + 1),
                 )
-                for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+                for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
             ]
             starts_by_id.update((str(row["id"]), row["start_time"]) for row in rows)
             return rows
@@ -2074,7 +2095,7 @@ def test_candidate_sample_cap_is_explicitly_degraded_and_query_count_bounded():
         AttributeValueRow(
             "same",
             "string",
-            ATTRIBUTE_READ_CANDIDATE_LIMIT,
+            ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
         ),
     )
     assert read.metadata.query_complete is False
