@@ -426,12 +426,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         )
 
     def recommended_filter_seed_batch_size(self) -> int:
-        """Keep presentation reads within the finite trace working set.
+        """Amortize cheap identity seeds without widening classification.
 
         Bulk identity-only eval/task selection has its own 200-row envelope.
-        Normal list, navigation, and graph reads hydrate root presentation
-        state and therefore retain the production-safe 50-trace ceiling even
-        when an any-span leaf has a selective anchor.
+        Normal any-span lists also seed only root identity, ID, and timestamp;
+        acquiring 200 ordered roots reduces sparse long-window round trips.
+        The independent classifier recommendation remains at the
+        production-safe 50-trace ceiling and hydrates presentation state.
         """
 
         if self._bounded_bulk_scan:
@@ -444,6 +445,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._has_unindexed_any_span_filter()
         ):
             return 512
+        if request_end - request_start > timedelta(hours=1) and any(
+            plan.scope == "any" for plan in plans
+        ):
+            return 200
         return 50
 
     def recommended_filter_classify_batch_size(self) -> int | None:

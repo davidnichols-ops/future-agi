@@ -286,11 +286,11 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert "%(candidate_start_date)s - INTERVAL 1 DAY" not in match_sql
     assert "%(candidate_end_date)s + INTERVAL 1 DAY" not in match_sql
     assert builder.filter_seed_proves_result_order() is False
-    assert builder.recommended_filter_seed_batch_size() == 50
+    assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 50
 
 
-def test_long_window_trace_presentation_batches_stay_at_fifty() -> None:
+def test_long_window_trace_seeds_two_hundred_but_classifies_fifty() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[
@@ -299,7 +299,7 @@ def test_long_window_trace_presentation_batches_stay_at_fifty() -> None:
         ],
     )
 
-    assert builder.recommended_filter_seed_batch_size() == 50
+    assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 50
     assert builder.skip_full_window_filter_anchor_probe() is True
 
@@ -348,9 +348,7 @@ def test_eval_trace_any_span_large_prefix_fails_closed_at_query_ceiling() -> Non
     # per seed page. Passing this boundary is not an end-to-end guarantee;
     # runtime accounting still fails closed if the actual 128-read budget is
     # exhausted.
-    assert (
-        bounded_numbered_page_depth_exceeded(page_size=2_459, **common) is False
-    )
+    assert bounded_numbered_page_depth_exceeded(page_size=2_459, **common) is False
     # The next public row is rejected by even that optimistic estimate before
     # CH is contacted, instead of widening back to the unsafe classifier batch.
     assert bounded_numbered_page_depth_exceeded(page_size=2_460, **common) is True
@@ -375,7 +373,7 @@ def test_call_type_trace_filter_skips_unindexed_window_anchor() -> None:
     assert "JSONExtract" not in ordered_sql
     assert "parent_span_id IS NULL" in ordered_sql
     assert "JSONExtract" in match_sql
-    assert builder.recommended_filter_seed_batch_size() == 50
+    assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 50
 
 
@@ -396,7 +394,7 @@ def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
     assert "JSONExtract" not in anchor_sql
     assert anchor_params["latest_filter_key_0"] == "final_status"
     assert "latest_filter_param_1" not in anchor_params
-    assert builder.recommended_filter_seed_batch_size() == 50
+    assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 50
 
 
@@ -2943,6 +2941,7 @@ class _FakeBuilder:
     match_rows: list[dict[str, Any]] | None = None
     seed_proves_order: bool = True
     recommended_batch_size: int | None = None
+    recommended_seed_batch_size: int | None = None
 
     def parse_time_range(
         self, _filters: list[dict[str, Any]]
@@ -2976,6 +2975,9 @@ class _FakeBuilder:
 
     def recommended_filter_classify_batch_size(self) -> int | None:
         return self.recommended_batch_size
+
+    def recommended_filter_seed_batch_size(self) -> int:
+        return self.recommended_seed_batch_size or self.recommended_batch_size or 200
 
 
 class _FakeExecutor:
@@ -4570,6 +4572,220 @@ def test_builder_batch_recommendation_caps_seed_and_classifier_working_set() -> 
     assert len(page.rows) == 25
     assert [call["limit"] for call in seed_calls] == [50]
     assert [len(call["candidate_ids"]) for call in classify_calls] == [50]
+
+
+def test_ordered_trace_seed_uses_two_hundred_but_stops_after_proven_prefix() -> None:
+    timestamp = END - timedelta(minutes=1)
+    rows = [
+        {"id": f"trace-{index:03d}", "start_time": timestamp} for index in range(200)
+    ]
+    builder = _UnindexedAnySpanFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        seed_proves_order=False,
+        recommended_batch_size=50,
+        recommended_seed_batch_size=200,
+    )
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    seed_calls = [params for query, params in executor.calls if query == "ordered_seed"]
+    classify_calls = [params for query, params in executor.calls if query == "match"]
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == [
+        f"trace-{index:03d}" for index in range(199, 174, -1)
+    ]
+    assert page.has_more is True
+    assert [call["limit"] for call in seed_calls] == [200]
+    assert [len(call["candidate_ids"]) for call in classify_calls] == [50]
+    assert page.query_count == 2
+
+
+def test_ordered_trace_seed_closes_sparse_query_33_tail_with_unchanged_classifier() -> (
+    None
+):
+    window_start = END - timedelta(minutes=5)
+    rows = [
+        {
+            "id": f"trace-{index:04d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+        }
+        for index in range(800)
+    ]
+    builder = _UnindexedAnySpanFakeBuilder(
+        rows,
+        start=window_start,
+        end=END,
+        match_rows=[],
+        seed_proves_order=False,
+        recommended_batch_size=50,
+        recommended_seed_batch_size=200,
+    )
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        max_query_count=32,
+    )
+
+    seed_calls = [params for query, params in executor.calls if query == "ordered_seed"]
+    classify_calls = [params for query, params in executor.calls if query == "match"]
+    assert page.complete is True
+    assert page.rows == []
+    assert [call["limit"] for call in seed_calls] == [200] * 5
+    assert [len(call["candidate_ids"]) for call in classify_calls] == [50] * 16
+    assert page.query_count == 21
+
+
+def test_ordered_trace_inner_prefix_is_exact_for_page_n() -> None:
+    rows = [
+        {
+            "id": f"trace-{index:03d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+        }
+        for index in range(200)
+    ]
+    builder = _UnindexedAnySpanFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        seed_proves_order=False,
+        recommended_batch_size=50,
+        recommended_seed_batch_size=200,
+    )
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=1,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    classify_calls = [params for query, params in executor.calls if query == "match"]
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == [
+        f"trace-{index:03d}" for index in range(25, 50)
+    ]
+    assert page.has_more is True
+    assert [len(call["candidate_ids"]) for call in classify_calls] == [50, 50]
+    assert page.query_count == 3
+
+
+def test_ordered_trace_inner_prefix_keeps_cursor_pages_disjoint() -> None:
+    rows = [
+        {
+            "id": f"trace-{index:03d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+        }
+        for index in range(300)
+    ]
+    builder = _UnindexedAnySpanFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        seed_proves_order=False,
+        recommended_batch_size=50,
+        recommended_seed_batch_size=200,
+    )
+    first_executor = _FakeExecutor(builder)
+    first = read_bounded_filter_page(
+        builder=builder,
+        analytics=first_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+    second_executor = _FakeExecutor(builder)
+    second = read_bounded_filter_page(
+        builder=builder,
+        analytics=second_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        cursor_start_time=first.rows[-1]["start_time"],
+        cursor_order_token=first.rows[-1]["id"],
+    )
+
+    assert [row["id"] for row in first.rows] == [
+        f"trace-{index:03d}" for index in range(25)
+    ]
+    assert [row["id"] for row in second.rows] == [
+        f"trace-{index:03d}" for index in range(25, 50)
+    ]
+    assert {row["id"] for row in first.rows}.isdisjoint(
+        row["id"] for row in second.rows
+    )
+    assert first.query_count == second.query_count == 2
+
+
+def test_ordered_trace_inner_prefix_does_not_trust_tombstoned_raw_cutoff() -> None:
+    rows = [
+        {
+            "id": f"trace-{index:03d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+        }
+        for index in range(200)
+    ]
+    # The 26th raw candidate resolves to an older alternate live root after
+    # its newer raw root is tombstoned. The first 50-ID classifier has enough
+    # matches numerically, but its public cutoff is older than the raw boundary,
+    # so the next classifier must run and admit trace-050 ahead of it.
+    match_rows = [dict(row) for row in rows[:26]]
+    match_rows[-1]["start_time"] = END - timedelta(seconds=1)
+    match_rows.append(dict(rows[50]))
+    builder = _UnindexedAnySpanFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=match_rows,
+        seed_proves_order=False,
+        recommended_batch_size=50,
+        recommended_seed_batch_size=200,
+    )
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    classify_calls = [params for query, params in executor.calls if query == "match"]
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == [
+        f"trace-{index:03d}" for index in range(25)
+    ]
+    assert page.has_more is True
+    assert [len(call["candidate_ids"]) for call in classify_calls] == [50, 50]
+    assert page.query_count == 3
 
 
 def test_read_budget_failure_is_degraded_sanitized_and_not_retried() -> None:

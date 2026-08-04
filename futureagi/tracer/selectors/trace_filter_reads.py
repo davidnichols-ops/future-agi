@@ -521,7 +521,21 @@ def read_bounded_filter_page(
         *,
         active_start: datetime,
         active_end: datetime,
-    ) -> None:
+        stop_on_ordered_prefix: bool = False,
+    ) -> bool:
+        """Classify finite seeds and report an exact ordered-prefix proof.
+
+        Root-ordered seed rows are an upper bound on the canonical live-root
+        order for their trace: latest-state tombstones can move a classified
+        result older, but cannot move it ahead of that trace's newest raw live
+        root seed.  After each finite classifier chunk, a full public prefix
+        whose cutoff is no older than the last classified raw seed therefore
+        cannot be displaced by any remaining seed in the same ordered page.
+
+        Callers must leave ``stop_on_ordered_prefix`` false for unordered
+        any-span anchors, direct child seeds, and deferred graph acquisition.
+        """
+
         candidate_seed_rows: dict[Hashable, dict[str, Any]] = {}
         for row in candidate_rows:
             public_identity = str(row.get(key_field, ""))
@@ -536,7 +550,7 @@ def read_bounded_filter_page(
         candidate_identities = list(candidate_seed_rows)
         if defer_classification:
             deferred_candidate_by_id.update(candidate_seed_rows)
-            return
+            return False
         for batch_offset in range(0, len(candidate_identities), classify_batch_size):
             identity_batch = candidate_identities[
                 batch_offset : batch_offset + classify_batch_size
@@ -577,6 +591,16 @@ def read_bounded_filter_page(
                     continue
                 if str(row.get(key_field, "")):
                     matched_by_id[identity] = row
+
+            if stop_on_ordered_prefix and len(matched_by_id) >= prefix_needed:
+                ordered_matches = sorted(
+                    matched_by_id.values(), key=result_row_key, reverse=True
+                )
+                cutoff = result_row_key(ordered_matches[prefix_needed - 1])
+                last_classified_seed = candidate_seed_rows[identity_batch[-1]]
+                if cutoff >= seed_row_key(last_classified_seed):
+                    return True
+        return False
 
     try:
         # Eligible any-span trace filters first ask a direct key+value predicate
@@ -749,11 +773,16 @@ def read_bounded_filter_page(
                 seen_seed_ids.add(raw_identity)
                 new_candidate_rows.append(row)
 
-            classify_seed_rows(
+            prefix_is_proven = classify_seed_rows(
                 new_candidate_rows,
                 active_start=slice_start,
                 active_end=slice_end,
+                stop_on_ordered_prefix=seed_proves_result_order,
             )
+
+            if prefix_is_proven:
+                page_complete = True
+                break
 
             slice_exhausted = len(seed_rows) < candidate_limit
             ordered_matches = sorted(
