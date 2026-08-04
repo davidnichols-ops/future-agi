@@ -14,6 +14,7 @@ from tracer.services.clickhouse.list_cursor import (
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
+    exact_total_explicitly_required,
     normalize_cursor_query,
     snapshot_cursor_supported,
     snapshot_read_settings,
@@ -33,6 +34,24 @@ def _request(*, user_id="u1", org_id="o1", workspace_id="w1", auth_id="a1"):
         workspace=SimpleNamespace(pk=workspace_id),
         auth=SimpleNamespace(pk=auth_id),
     )
+
+
+@pytest.mark.parametrize(
+    ("query_params", "validated_data", "expected"),
+    [
+        ({}, {}, False),
+        ({"allow_sampled": "false"}, {"allow_sampled": False}, True),
+        ({"allow_sampled": "true"}, {"allow_sampled": True}, False),
+    ],
+)
+def test_exact_total_is_required_only_by_explicit_false(
+    query_params,
+    validated_data,
+    expected,
+):
+    request = SimpleNamespace(query_params=query_params)
+
+    assert exact_total_explicitly_required(request, validated_data) is expected
 
 
 def _token(**overrides):

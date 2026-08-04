@@ -2017,6 +2017,11 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
         organization=organization,
         user=SimpleNamespace(organization=organization),
     )
+    strict_request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+        query_params={"allow_sampled": "false"},
+    )
     bounded = BoundedFilterPage(
         rows=[],
         has_more=False,
@@ -2046,7 +2051,7 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
         ) as bounded_read,
     ):
         eval_config.objects.filter.return_value.select_related.return_value = []
-        legacy_response = view._list_traces_of_session_clickhouse(
+        omitted_status, omitted_payload = view._list_traces_of_session_clickhouse(
             request,
             project_id=PROJECT_ID,
             validated_data={
@@ -2056,6 +2061,22 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
                 ],
                 "page_number": 0,
                 "page_size": 25,
+            },
+            analytics=analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+        explicit_false_response = view._list_traces_of_session_clickhouse(
+            strict_request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "allow_sampled": False,
             },
             analytics=analytics,
             org_project_ids=None,
@@ -2078,8 +2099,11 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
             org=organization,
         )
 
-    assert legacy_response[0] == "error"
-    assert legacy_response[1][0] == 503
+    assert omitted_status == "ok"
+    assert omitted_payload["metadata"]["query_complete"] is True
+    assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert explicit_false_response[0] == "error"
+    assert explicit_false_response[1][0] == 503
     assert status == "ok"
     assert isinstance(bounded_read.call_args.kwargs["builder"], TraceListQueryBuilderV2)
     assert payload["metadata"]["query_complete"] is True
@@ -2095,7 +2119,12 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
     CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
 )
 def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
-    from tracer.views.trace import TRACE_LIST_READ_SETTINGS, TraceView
+    from tracer.views.trace import (
+        TRACE_LIST_CANDIDATE_DEADLINE_MS,
+        TRACE_LIST_READ_SETTINGS,
+        TRACE_LIST_WALL_DEADLINE_MS,
+        TraceView,
+    )
 
     started = END - timedelta(minutes=1)
     row = {
@@ -2195,7 +2224,10 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
     assert payload["table"][0]["trace_id"] == "trace-a"
     assert payload["metadata"]["query_count"] == 4
     assert 0 <= payload["metadata"]["query_elapsed_ms"] < 3_000
-    assert bounded_read.call_args.kwargs["deadline_ms"] <= 2_500
+    assert (
+        bounded_read.call_args.kwargs["deadline_ms"] <= TRACE_LIST_CANDIDATE_DEADLINE_MS
+    )
+    assert TRACE_LIST_CANDIDATE_DEADLINE_MS < TRACE_LIST_WALL_DEADLINE_MS < 30_000
     assert len(analytics.calls) == 3
     assert all(0 < timeout_ms <= 900 for _, timeout_ms, _ in analytics.calls)
     assert all(
@@ -2527,6 +2559,11 @@ def test_non_observe_trace_list_uses_v2_builder_without_routing_config() -> None
         organization=organization,
         user=SimpleNamespace(organization=organization),
     )
+    strict_request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+        query_params={"allow_sampled": "false"},
+    )
     view.request = request
     bounded = BoundedFilterPage(
         rows=[],
@@ -2561,7 +2598,7 @@ def test_non_observe_trace_list_uses_v2_builder_without_routing_config() -> None
             project_id=PROJECT_ID
         )
         eval_config.objects.filter.return_value.select_related.return_value = []
-        legacy_response = view._list_traces_clickhouse(
+        omitted_status, omitted_payload = view._list_traces_clickhouse(
             request,
             project_version_id,
             analytics,
@@ -2573,6 +2610,21 @@ def test_non_observe_trace_list_uses_v2_builder_without_routing_config() -> None
                 "sort_params": [],
                 "page_number": 3,
                 "page_size": 25,
+            },
+        )
+        explicit_false_response = view._list_traces_clickhouse(
+            strict_request,
+            project_version_id,
+            analytics,
+            {
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "sort_params": [],
+                "page_number": 3,
+                "page_size": 25,
+                "allow_sampled": False,
             },
         )
         status, payload = view._list_traces_clickhouse(
@@ -2591,8 +2643,11 @@ def test_non_observe_trace_list_uses_v2_builder_without_routing_config() -> None
             },
         )
 
-    assert legacy_response[0] == "error"
-    assert legacy_response[1][0] == 503
+    assert omitted_status == "ok"
+    assert omitted_payload["metadata"]["query_complete"] is True
+    assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert explicit_false_response[0] == "error"
+    assert explicit_false_response[1][0] == 503
     assert status == "ok"
     bounded_kwargs = bounded_read.call_args.kwargs
     assert isinstance(bounded_kwargs["builder"], TraceListQueryBuilderV2)
@@ -2837,6 +2892,11 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
         organization=organization,
         user=SimpleNamespace(organization=organization),
     )
+    strict_request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+        query_params={"allow_sampled": "false"},
+    )
     bounded = BoundedFilterPage(
         rows=[],
         has_more=False,
@@ -2872,7 +2932,7 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
         ) as service_remap,
     ):
         eval_config.objects.filter.return_value.select_related.return_value = []
-        legacy_response = view._list_spans_clickhouse(
+        omitted_status, omitted_payload = view._list_spans_clickhouse(
             request,
             project_id=PROJECT_ID,
             validated_data={
@@ -2882,6 +2942,22 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
                 ],
                 "page_number": 0,
                 "page_size": 50,
+            },
+            analytics=v2_analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+        explicit_false_response = view._list_spans_clickhouse(
+            strict_request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("prompt_slug", "agent_2_identity_disclosure"),
+                ],
+                "page_number": 0,
+                "page_size": 50,
+                "allow_sampled": False,
             },
             analytics=v2_analytics,
             org_project_ids=None,
@@ -2904,8 +2980,11 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
             org=organization,
         )
 
-    assert legacy_response[0] == "error"
-    assert legacy_response[1][0] == 503
+    assert omitted_status == "ok"
+    assert omitted_payload["metadata"]["query_complete"] is True
+    assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert explicit_false_response[0] == "error"
+    assert explicit_false_response[1][0] == 503
     assert status == "ok"
     bounded_kwargs = bounded_read.call_args.kwargs
     assert isinstance(bounded_kwargs["builder"], SpanListQueryBuilderV2)
@@ -2937,6 +3016,8 @@ def test_non_observe_span_list_uses_direct_v2_builder_without_dispatch() -> None
         success_response=lambda payload: ("ok", payload),
         custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
     )
+    request = SimpleNamespace()
+    strict_request = SimpleNamespace(query_params={"allow_sampled": "false"})
     analytics = mock.MagicMock()
     bounded = BoundedFilterPage(
         rows=[],
@@ -2972,8 +3053,8 @@ def test_non_observe_span_list_uses_direct_v2_builder_without_dispatch() -> None
         ) as service_remap,
     ):
         eval_config.objects.filter.return_value.select_related.return_value = []
-        legacy_response = view._list_spans_non_observe_clickhouse(
-            SimpleNamespace(),
+        omitted_status, omitted_payload = view._list_spans_non_observe_clickhouse(
+            request,
             "00000000-0000-4000-8000-000000000099",
             SimpleNamespace(project_id=PROJECT_ID),
             analytics,
@@ -2983,8 +3064,20 @@ def test_non_observe_span_list_uses_direct_v2_builder_without_dispatch() -> None
                 "page_size": 25,
             },
         )
+        explicit_false_response = view._list_spans_non_observe_clickhouse(
+            strict_request,
+            "00000000-0000-4000-8000-000000000099",
+            SimpleNamespace(project_id=PROJECT_ID),
+            analytics,
+            {
+                "filters": [_time_filter()],
+                "page_number": 0,
+                "page_size": 25,
+                "allow_sampled": False,
+            },
+        )
         status_name, payload = view._list_spans_non_observe_clickhouse(
-            SimpleNamespace(),
+            request,
             "00000000-0000-4000-8000-000000000099",
             SimpleNamespace(project_id=PROJECT_ID),
             analytics,
@@ -2996,8 +3089,11 @@ def test_non_observe_span_list_uses_direct_v2_builder_without_dispatch() -> None
             },
         )
 
-    assert legacy_response[0] == "error"
-    assert legacy_response[1][0] == 503
+    assert omitted_status == "ok"
+    assert omitted_payload["metadata"]["query_complete"] is True
+    assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert explicit_false_response[0] == "error"
+    assert explicit_false_response[1][0] == 503
     assert status_name == "ok"
     assert payload["metadata"]["total_rows"] == 0
     assert payload["metadata"]["total_rows_is_lower_bound"] is True

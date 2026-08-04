@@ -97,6 +97,7 @@ from tracer.services.clickhouse.list_cursor import (
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
+    exact_total_explicitly_required,
     frozen_window_filter,
     snapshot_cursor_supported,
     snapshot_read_settings,
@@ -153,11 +154,12 @@ ERROR_RESPONSES = {
     500: ApiErrorResponseSerializer,
 }
 
-TRACE_LIST_WALL_DEADLINE_MS = 3_000
-# Empty/sparse scans do not need page enrichment. Give their final bounded
-# classifier enough room to finish while retaining 500 ms inside the endpoint
-# wall; matched pages still reserve hydration before using this ceiling.
-TRACE_LIST_CANDIDATE_DEADLINE_MS = 2_500
+TRACE_LIST_WALL_DEADLINE_MS = 10_000
+# The candidate reader remains a single bounded pass. Production qualification
+# showed a complete heavy-tenant proof just beyond the former 2.5 s ceiling, so
+# allow it up to 8 s while retaining 2 s for hydration and enrichment. This is
+# only a ceiling: healthy reads return immediately and issue no additional query.
+TRACE_LIST_CANDIDATE_DEADLINE_MS = 8_000
 TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 900
 TRACE_LIST_READ_SETTINGS = {
     "max_threads": 1,
@@ -4597,9 +4599,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 next_cursor=next_cursor,
             )
         )
-        if metadata.get("total_rows_is_lower_bound") and not validated_data.get(
-            "allow_sampled", False
-        ):
+        if metadata.get(
+            "total_rows_is_lower_bound"
+        ) and exact_total_explicitly_required(request, validated_data):
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Trace data is temporarily unavailable. Please retry.",
@@ -5586,9 +5588,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     "query_result_payload_bytes": bounded_page.result_payload_bytes,
                 }
             )
-        if metadata.get("total_rows_is_lower_bound") and not query_params.get(
-            "allow_sampled", False
-        ):
+        if metadata.get(
+            "total_rows_is_lower_bound"
+        ) and exact_total_explicitly_required(request, query_params):
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Trace data is temporarily unavailable. Please retry.",

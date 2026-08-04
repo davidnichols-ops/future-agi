@@ -19,6 +19,7 @@ import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import ceil
 from typing import TYPE_CHECKING, Any
 
 from tracer.models.eval_task import RowType, RunType
@@ -40,11 +41,19 @@ _BUILDER_BY_ROW_TYPE = {
 }
 
 _EVAL_TASK_TOTAL_READ_SECONDS = 10.0
+_EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS = 22.0
+_EVAL_TASK_HISTORICAL_TRACE_POPULATION_SECONDS = 60.0
 _EVAL_TASK_MAX_READ_ATTEMPTS = 128
 # Seed pages are identity-only and capped at the shared production-proven 512
 # rows. Classifiers remain separately chunked to 200 physical identities.
 _EVAL_TASK_MAX_CANDIDATES = 512
 _EVAL_TASK_CLASSIFY_BATCH_SIZE = 200
+_EVAL_TASK_TRACE_MEMBERSHIP_BATCH_SIZE = 100
+_EVAL_TASK_TRACE_WITNESS_BATCH_SIZE = 100
+_EVAL_TASK_TRACE_WITNESS_QUERY_RESERVE = 16
+_EVAL_TASK_TRACE_WITNESS_SECONDS_RESERVE = 10.0
+_EVAL_TASK_TRACE_WITNESS_QUERY_TIMEOUT_MS = 1_500
+_EVAL_TASK_TRACE_WITNESS_PREFLIGHT_MS_PER_BATCH = 500
 _EVAL_TASK_BUFFERED_ID_LIMIT = 10_000
 _EVAL_TASK_STREAM_READ_SETTINGS = {
     "max_execution_time": 10,
@@ -53,6 +62,17 @@ _EVAL_TASK_STREAM_READ_SETTINGS = {
     "max_memory_usage": 512 * 1024 * 1024,
     "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
+}
+_EVAL_TASK_TRACE_WITNESS_READ_SETTINGS = {
+    "max_execution_time": 2,
+    "max_threads": 1,
+    "max_block_size": 8192,
+    "max_rows_to_read": 5_000_000,
+    "max_memory_usage": 256 * 1024 * 1024,
+    "max_bytes_to_read": 512 * 1024 * 1024,
+    "read_overflow_mode": "throw",
+    "result_overflow_mode": "throw",
+    "timeout_overflow_mode": "throw",
 }
 _SAFE_READ_BUDGET_MESSAGE = (
     "Evaluation task row selection exceeded its read budget. "
@@ -181,6 +201,161 @@ def _trace_filter_witnesses_from_rows(
                 )
             )
     return tuple(witnesses)
+
+
+def _validated_trace_filter_witnesses(
+    rows: Iterable[dict[str, Any]],
+    *,
+    ui_filters: list[dict[str, Any]],
+    project_id: str,
+) -> tuple[TraceFilterWitness, ...]:
+    """Return a complete exact witness matrix or fail the buffered selection."""
+
+    buffered_rows = list(rows)
+    descriptors = _trace_any_span_filter_descriptors(ui_filters)
+    if not descriptors or not buffered_rows:
+        return ()
+    trace_ids = [str(row.get("trace_id") or "") for row in buffered_rows]
+    if any(not trace_id for trace_id in trace_ids) or len(set(trace_ids)) != len(
+        trace_ids
+    ):
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+    witnesses = _trace_filter_witnesses_from_rows(
+        buffered_rows,
+        ui_filters=ui_filters,
+        project_id=project_id,
+    )
+    if {(witness.trace_id, witness.filter_ordinal) for witness in witnesses} != {
+        (trace_id, ordinal)
+        for trace_id in trace_ids
+        for ordinal in range(len(descriptors))
+    }:
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+    return witnesses
+
+
+def _normalized_trace_replay_identity(
+    row: dict[str, Any], *, project_id: str
+) -> tuple[str, str, str, datetime] | None:
+    """Return the immutable canonical-root identity used across both phases."""
+
+    trace_id = str(row.get("trace_id") or "")
+    root_span_id = str(row.get("root_span_id") or "")
+    start_time = row.get("start_time")
+    if not trace_id or not root_span_id or not isinstance(start_time, datetime):
+        return None
+    normalized_start = (
+        start_time.astimezone(UTC).replace(tzinfo=None)
+        if start_time.tzinfo is not None
+        else start_time
+    )
+    return (
+        str(row.get("project_id") or project_id),
+        trace_id,
+        root_span_id,
+        normalized_start,
+    )
+
+
+def _replay_historical_trace_filter_witnesses(
+    analytics,
+    *,
+    builder,
+    rows: list[dict[str, Any]],
+    phase_one_query_count: int,
+    read_started: float,
+    ui_filters: list[dict[str, Any]],
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Replay only proven traces to attach exact any-span filter witnesses.
+
+    The first phase proves membership/order without expensive ``argMinIf``
+    witness projections. This phase replays the final matched prefix in the
+    production-qualified 100-trace batches. It is fully buffered and compares the
+    immutable project/trace/root/start identity before returning anything, so a
+    concurrent latest-state change fails closed rather than targeting a stale
+    span in the evaluation mapping.
+    """
+
+    descriptors = _trace_any_span_filter_descriptors(ui_filters)
+    if not rows or not descriptors:
+        return rows
+
+    required_queries = ceil(len(rows) / _EVAL_TASK_TRACE_WITNESS_BATCH_SIZE)
+    if phase_one_query_count + required_queries > _EVAL_TASK_MAX_READ_ATTEMPTS:
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+
+    expected_by_trace: dict[str, tuple[str, str, str, datetime]] = {}
+    for row in rows:
+        identity = _normalized_trace_replay_identity(row, project_id=project_id)
+        if identity is None or identity[1] in expected_by_trace:
+            raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+        expected_by_trace[identity[1]] = identity
+
+    total_deadline = read_started + _EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS
+    # The largest production tenant completed a 100-trace exact replay in
+    # 429 ms. Reserve 500 ms per batch before the first replay read, so the
+    # default 1,000-row task has a realistic 5 s preflight inside its separately
+    # padded 10 s wall budget and no partial witness set is ever produced.
+    if int((total_deadline - time.monotonic()) * 1000) < (
+        required_queries * _EVAL_TASK_TRACE_WITNESS_PREFLIGHT_MS_PER_BATCH
+    ):
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+
+    replayed_rows: list[dict[str, Any]] = []
+    trace_ids = list(expected_by_trace)
+    for offset in range(0, len(trace_ids), _EVAL_TASK_TRACE_WITNESS_BATCH_SIZE):
+        remaining_ms = int((total_deadline - time.monotonic()) * 1000)
+        if remaining_ms < 25:
+            raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+        batch = trace_ids[offset : offset + _EVAL_TASK_TRACE_WITNESS_BATCH_SIZE]
+        try:
+            query, query_params = builder.build_filter_match_query(
+                batch,
+                include_filter_witnesses=True,
+            )
+            if not query:
+                raise ValueError("trace witness replay query is empty")
+            result = analytics.execute_ch_query(
+                query,
+                query_params,
+                timeout_ms=min(
+                    _EVAL_TASK_TRACE_WITNESS_QUERY_TIMEOUT_MS,
+                    remaining_ms,
+                ),
+                settings={
+                    **_EVAL_TASK_TRACE_WITNESS_READ_SETTINGS,
+                    "max_result_rows": len(batch),
+                },
+            )
+        except Exception as exc:
+            if (
+                not isinstance(exc, ValueError)
+                and not is_read_budget_error(exc)
+                and not is_clickhouse_query_error(exc)
+            ):
+                raise
+            raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
+        replayed_rows.extend(result.data or [])
+
+    replayed_by_trace: dict[str, dict[str, Any]] = {}
+    for row in replayed_rows:
+        identity = _normalized_trace_replay_identity(row, project_id=project_id)
+        if identity is None or identity[1] in replayed_by_trace:
+            raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+        if expected_by_trace.get(identity[1]) != identity:
+            raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+        replayed_by_trace[identity[1]] = row
+    if set(replayed_by_trace) != set(expected_by_trace):
+        raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
+
+    _validated_trace_filter_witnesses(
+        replayed_rows,
+        ui_filters=ui_filters,
+        project_id=project_id,
+    )
+
+    return [replayed_by_trace[trace_id] for trace_id in expected_by_trace]
 
 
 def iter_desired_rows(
@@ -463,7 +638,7 @@ def _resolve_bounded_historical_span_ids(
             return list(normalized_ids)
         witnesses: tuple[TraceFilterWitness, ...] = ()
         if row_type == RowType.TRACES and ui_filters is not None:
-            witnesses = _trace_filter_witnesses_from_rows(
+            witnesses = _validated_trace_filter_witnesses(
                 rows,
                 ui_filters=ui_filters,
                 project_id=str(project_id),
@@ -533,16 +708,38 @@ def _resolve_bounded_historical_span_ids(
         )
 
     query_type, key_field = _BUILDER_BY_ROW_TYPE[row_type]
+    trace_any_span_witnesses = bool(
+        row_type == RowType.TRACES
+        and include_trace_filter_witnesses
+        and _trace_any_span_filter_descriptors(ui_filters)
+    )
+    trace_population_proof = bool(
+        trace_any_span_witnesses and requires_population_proof
+    )
+    trace_witness_replay = bool(trace_any_span_witnesses and not trace_population_proof)
     builder = get_v2_class(query_type)(
         project_id=str(project_id),
         filters=ui_filters,
         bounded_internal_scan=True,
         bounded_identity_only=True,
-        # Trace classification normally hydrates presentation columns in
-        # 50-ID batches. Eval selection projects only identity + order, so the
-        # already-bounded bulk mode safely classifies 200 candidates per read.
-        # This keeps a 10k task below the shared 128-query proof ceiling.
+        # Trace evaluation projects only identity + order. Any-span tasks use
+        # the two-phase membership/witness contract below; other trace filters
+        # retain the established bounded bulk envelope.
         bounded_bulk_scan=row_type == RowType.TRACES,
+        # Normal historical trace tasks first prove membership/order in 100-ID
+        # batches, then replay witnesses only for the final matched prefix.
+        # High-limit population proofs attach witnesses in one pass below.
+        **(
+            {"bounded_include_filter_witnesses": not trace_witness_replay}
+            if row_type == RowType.TRACES
+            else {}
+        ),
+        # A configured limit above the 10k executable buffer needs a population
+        # proof, not a newest-first trace page. For any-span trace filters this
+        # lets the bounded reader exhaust the directly filtered physical seed
+        # stream (or stop at the exact 10k+1 sentinel) instead of scanning every
+        # tenant root. Accepted sets are still fully exhausted and ID-sorted.
+        **({"bounded_population_proof": True} if trace_population_proof else {}),
         bounded_sampling_salt=str(salt),
         bounded_sampling_rate=float(sampling_rate),
     )
@@ -590,6 +787,40 @@ def _resolve_bounded_historical_span_ids(
                 _EVAL_TASK_CLASSIFY_BATCH_SIZE,
                 max(1, int(recommended)),
             )
+    if trace_witness_replay:
+        classify_batch_size = min(
+            classify_batch_size,
+            _EVAL_TASK_TRACE_MEMBERSHIP_BATCH_SIZE,
+        )
+
+    read_started = time.monotonic()
+    phase_one_deadline_seconds = _EVAL_TASK_TOTAL_READ_SECONDS
+    phase_one_query_count = _EVAL_TASK_MAX_READ_ATTEMPTS
+    phase_one_seed_attempts = _EVAL_TASK_MAX_READ_ATTEMPTS
+    if trace_witness_replay:
+        phase_one_deadline_seconds = (
+            _EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS
+            - _EVAL_TASK_TRACE_WITNESS_SECONDS_RESERVE
+        )
+        # Normal trace tasks reserve the last ten seconds for exact witness
+        # replay. The replay preflights the actual phase-one query count plus
+        # its exact number of 100-trace batches before reading.
+        phase_one_query_count -= _EVAL_TASK_TRACE_WITNESS_QUERY_RESERVE
+    elif trace_population_proof:
+        # Population-proof classification attaches exact witnesses in the same
+        # production-qualified 100-trace query. There is no second pass to
+        # reserve. At the production-qualified 522 ms ceiling,
+        # all 101 classifier batches for a complete 10k set need about 53 s;
+        # this workflow-only path therefore has its own finite 60 s wall cap.
+        phase_one_deadline_seconds = _EVAL_TASK_HISTORICAL_TRACE_POPULATION_SECONDS
+        # Reserve the worst-case exact classifiers before scheduling adjacent
+        # time slices. With a 10k+1 sentinel and 100-trace batches this leaves
+        # 27 physical-seed attempts, so the adaptive scheduler covers even a
+        # year-long request with broad bounded slices instead of planning 128
+        # narrow seeds that later classifier queries could crowd out.
+        phase_one_seed_attempts = _EVAL_TASK_MAX_READ_ATTEMPTS - ceil(
+            (bounded_limit + 1) / classify_batch_size
+        )
 
     try:
         page = read_bounded_filter_page(
@@ -599,12 +830,17 @@ def _resolve_bounded_historical_span_ids(
             key_field=key_field,
             page_number=0,
             page_size=bounded_limit,
-            deadline_ms=int(_EVAL_TASK_TOTAL_READ_SECONDS * 1000),
-            max_seed_attempts=_EVAL_TASK_MAX_READ_ATTEMPTS,
+            deadline_ms=int(phase_one_deadline_seconds * 1000),
+            max_seed_attempts=phase_one_seed_attempts,
             max_candidates=_EVAL_TASK_MAX_CANDIDATES,
-            max_query_count=_EVAL_TASK_MAX_READ_ATTEMPTS,
+            max_query_count=phase_one_query_count,
             classify_batch_size=classify_batch_size,
             retry_wide_read_budget=True,
+            read_settings=(
+                _EVAL_TASK_TRACE_WITNESS_READ_SETTINGS
+                if trace_population_proof
+                else None
+            ),
         )
     except Exception as exc:
         if not is_read_budget_error(exc) and not isinstance(exc, ValueError):
@@ -618,9 +854,20 @@ def _resolve_bounded_historical_span_ids(
         # A bounded 10k+sentinel read proves whether the complete sampled set
         # fits. Never materialize a partial prefix when it does not.
         raise EvalTaskReadBudgetExceeded(_SAFE_ROW_LIMIT_MESSAGE)
+    resolved_rows = page.rows
+    if trace_witness_replay:
+        resolved_rows = _replay_historical_trace_filter_witnesses(
+            analytics,
+            builder=builder,
+            rows=page.rows,
+            phase_one_query_count=page.query_count,
+            read_started=read_started,
+            ui_filters=ui_filters,
+            project_id=str(project_id),
+        )
     if row_type == RowType.SPANS:
         identities_by_span_id: dict[str, set[tuple[str, Any]]] = {}
-        for row in page.rows:
+        for row in resolved_rows:
             span_id = str(row.get("id") or "")
             trace_id = str(row.get("trace_id") or "")
             start_time = row.get("start_time")
@@ -636,17 +883,19 @@ def _resolve_bounded_historical_span_ids(
         resolved = list(
             dict.fromkeys(
                 str(row[key_field])
-                for row in page.rows
+                for row in resolved_rows
                 if row.get(key_field) not in (None, "")
             )
         )
         final_ids = sorted(resolved) if requires_population_proof else resolved
-        return resolved_result(final_ids, page.rows, ui_filters=ui_filters)
+        return resolved_result(final_ids, resolved_rows, ui_filters=ui_filters)
     resolved = [
-        str(row[key_field]) for row in page.rows if row.get(key_field) not in (None, "")
+        str(row[key_field])
+        for row in resolved_rows
+        if row.get(key_field) not in (None, "")
     ]
     final_ids = sorted(resolved) if requires_population_proof else resolved
-    return resolved_result(final_ids, page.rows, ui_filters=ui_filters)
+    return resolved_result(final_ids, resolved_rows, ui_filters=ui_filters)
 
 
 def _resolve_buffered_legacy_ids(

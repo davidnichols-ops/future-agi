@@ -448,6 +448,7 @@ def test_eval_internal_classifier_projects_only_identity_and_order(
 def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    captured: dict = {}
     filters = [
         _time_filter(),
         _attribute_filter("final_status", "Rejected"),
@@ -471,14 +472,14 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
 
     witness_start = END - timedelta(minutes=1)
 
-    def fake_read(**_kwargs):
+    def fake_read(**kwargs):
+        captured.update(kwargs)
         return BoundedFilterPage(
             rows=[
                 {
                     "trace_id": "trace-a",
+                    "root_span_id": "root-a",
                     "start_time": witness_start,
-                    "filter_witness_0": ("span-status", witness_start),
-                    "filter_witness_1": ("span-tier", witness_start),
                 }
             ],
             has_more=False,
@@ -496,8 +497,34 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
     monkeypatch.setattr(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
     )
+
+    class ReplayAnalytics:
+        def execute_ch_query(self, _query, params, *, timeout_ms, settings):
+            assert params["candidate_trace_ids"] == ("trace-a",)
+            assert timeout_ms <= 1_500
+            assert settings["max_execution_time"] == 2
+            assert settings["max_threads"] == 1
+            assert settings["max_rows_to_read"] == 5_000_000
+            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_result_rows"] == 1
+            return QueryResult(
+                [
+                    {
+                        "trace_id": "trace-a",
+                        "root_span_id": "root-a",
+                        "start_time": witness_start,
+                        "filter_witness_0": ("span-status", witness_start),
+                        "filter_witness_1": ("span-tier", witness_start),
+                    }
+                ],
+                1,
+                "clickhouse",
+                1.0,
+            )
+
     result = row_resolver._resolve_bounded_historical_span_ids(
-        object(),
+        ReplayAnalytics(),
         sql=None,
         params=None,
         project_id=PROJECT_ID,
@@ -522,6 +549,407 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
         "final_status",
         "customer_tier",
     ]
+    assert captured["deadline_ms"] == 12_000
+    assert captured["max_query_count"] == 112
+    assert captured["classify_batch_size"] == 100
+    phase_one_builder = captured["builder"]
+    assert phase_one_builder._bounded_include_filter_witnesses is False
+    membership_sql, _ = phase_one_builder.build_filter_match_query_from_seed_rows(
+        [
+            {
+                "trace_id": "trace-a",
+                "root_span_id": "root-a",
+                "start_time": witness_start,
+            }
+        ]
+    )
+    assert "filter_witness_0" not in membership_sql
+    assert "argMinIf(tuple(grouped_id, latest_start_time)" not in membership_sql
+
+
+def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population() -> None:
+    """Exercise the real 100k wire limit through the real bounded reader.
+
+    The population is deliberately smaller than the 10k executable buffer. The
+    direct child-span seed is unordered, so success also proves the reader
+    exhausted the complete request window before returning the ID-sorted set.
+    """
+
+    window_start = END - timedelta(minutes=10)
+    root_start = END - timedelta(minutes=1)
+    source_rows = {
+        "trace-b": {
+            "trace_id": "trace-b",
+            "root_span_id": "root-b",
+            "start_time": root_start,
+            "matched_span_id": "status-b",
+        },
+        "trace-a": {
+            "trace_id": "trace-a",
+            "root_span_id": "root-a",
+            "start_time": root_start - timedelta(seconds=1),
+            "matched_span_id": "status-a",
+        },
+    }
+
+    class SparsePopulationAnalytics:
+        calls: list[tuple[str, dict]] = []
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.calls.append((query, params))
+            assert timeout_ms <= 1_500
+            assert settings["max_threads"] == 1
+            assert settings["max_rows_to_read"] == 5_000_000
+            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+
+            candidate_ids = params.get("candidate_trace_ids")
+            if candidate_ids is not None:
+                # Population-proof mode is one phase: each exact membership
+                # classifier carries the physical witness and there is no
+                # post-page replay query.
+                assert "filter_witness_0" in query
+                rows = [
+                    {
+                        **source_rows[trace_id],
+                        "filter_witness_0": (
+                            source_rows[trace_id]["matched_span_id"],
+                            source_rows[trace_id]["start_time"],
+                        ),
+                    }
+                    for trace_id in candidate_ids
+                ]
+                return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+            assert "id AS matched_span_id" in query
+            assert "parent_span_id IS NULL" not in query
+            rows = [
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": row["trace_id"],
+                    "matched_span_id": row["matched_span_id"],
+                    "start_time": row["start_time"],
+                }
+                for row in source_rows.values()
+                if params["filter_slice_start"]
+                <= row["start_time"]
+                < params["filter_slice_end"]
+            ]
+            return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+    analytics = SparsePopulationAnalytics()
+    result = row_resolver._resolve_bounded_historical_span_ids(
+        analytics,
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={
+            "filters": [_attribute_filter("final_status", "Rejected")],
+            "date_range": [window_start, END],
+        },
+        limit=100_000,
+        batch_size=10_000,
+        row_type=RowType.TRACES,
+        include_trace_filter_witnesses=True,
+    )
+
+    assert result.ids == ("trace-a", "trace-b")
+    assert {
+        (witness.trace_id, witness.span_id) for witness in result.trace_filter_witnesses
+    } == {("trace-a", "status-a"), ("trace-b", "status-b")}
+    seed_queries = [
+        query
+        for query, params in analytics.calls
+        if "candidate_trace_ids" not in params
+    ]
+    classifier_queries = [
+        query for query, params in analytics.calls if "candidate_trace_ids" in params
+    ]
+    assert len(seed_queries) == 2
+    assert len(classifier_queries) == 1
+
+
+def test_trace_eval_witness_replay_uses_hundred_id_batches_with_hard_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    witness_start = END - timedelta(minutes=1)
+    rows = [
+        {
+            "trace_id": f"trace-{index:02d}",
+            "root_span_id": f"root-{index:02d}",
+            "start_time": witness_start - timedelta(seconds=index),
+        }
+        for index in range(205)
+    ]
+
+    def fake_read(**kwargs):
+        assert kwargs["max_query_count"] == 112
+        return BoundedFilterPage(
+            rows=rows,
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=len(rows),
+            elapsed_ms=1,
+            query_count=12,
+            rows_returned=len(rows),
+            result_payload_bytes=1_000,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    class ReplayAnalytics:
+        batch_sizes: list[int] = []
+
+        def execute_ch_query(self, _query, params, *, timeout_ms, settings):
+            trace_ids = params["candidate_trace_ids"]
+            self.batch_sizes.append(len(trace_ids))
+            assert len(trace_ids) <= 100
+            assert timeout_ms <= 1_500
+            assert settings == {
+                "max_execution_time": 2,
+                "max_threads": 1,
+                "max_block_size": 8192,
+                "max_rows_to_read": 5_000_000,
+                "max_memory_usage": 256 * 1024 * 1024,
+                "max_bytes_to_read": 512 * 1024 * 1024,
+                "read_overflow_mode": "throw",
+                "result_overflow_mode": "throw",
+                "timeout_overflow_mode": "throw",
+                "max_result_rows": len(trace_ids),
+            }
+            by_trace = {row["trace_id"]: row for row in rows}
+            replayed = [
+                {
+                    **by_trace[trace_id],
+                    "filter_witness_0": (f"span-{trace_id}", witness_start),
+                }
+                for trace_id in trace_ids
+            ]
+            return QueryResult(replayed, len(replayed), "clickhouse", 1.0)
+
+    analytics = ReplayAnalytics()
+    result = row_resolver._resolve_bounded_historical_span_ids(
+        analytics,
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={
+            "filters": [_attribute_filter("final_status", "Rejected")],
+            "date_range": [START, END],
+        },
+        limit=250,
+        batch_size=250,
+        row_type=RowType.TRACES,
+        include_trace_filter_witnesses=True,
+    )
+
+    assert result.ids == tuple(row["trace_id"] for row in rows)
+    assert analytics.batch_sizes == [100, 100, 5]
+    assert len(result.trace_filter_witnesses) == len(rows)
+
+
+def test_trace_eval_witness_replay_preflights_total_query_cap_without_partial_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        {
+            "trace_id": f"trace-{index:04d}",
+            "root_span_id": f"root-{index:04d}",
+            "start_time": END - timedelta(seconds=index),
+        }
+        for index in range(1_601)
+    ]
+
+    def fake_read(**kwargs):
+        assert kwargs["max_query_count"] == 112
+        return BoundedFilterPage(
+            rows=rows,
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=len(rows),
+            elapsed_ms=1,
+            query_count=112,
+            rows_returned=len(rows),
+            result_payload_bytes=10_000,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    class MustNotReplay:
+        def execute_ch_query(self, *_args, **_kwargs):
+            raise AssertionError("replay must be rejected before the first CH read")
+
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="Narrow the time range",
+    ):
+        row_resolver._resolve_bounded_historical_span_ids(
+            MustNotReplay(),
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "filters": [_attribute_filter("final_status", "Rejected")],
+                "date_range": [START, END],
+            },
+            limit=2_000,
+            batch_size=2_000,
+            row_type=RowType.TRACES,
+            include_trace_filter_witnesses=True,
+        )
+
+
+def test_trace_eval_witness_replay_never_returns_a_partial_second_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        {
+            "trace_id": f"trace-{index:02d}",
+            "root_span_id": f"root-{index:02d}",
+            "start_time": END - timedelta(seconds=index),
+        }
+        for index in range(101)
+    ]
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        lambda **_kwargs: BoundedFilterPage(
+            rows=rows,
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=len(rows),
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=len(rows),
+            result_payload_bytes=500,
+            attempts=(),
+        ),
+    )
+
+    class SecondBatchFails:
+        calls = 0
+
+        def execute_ch_query(self, _query, params, **_kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise ValueError("simulated bounded replay failure")
+            replayed = [
+                {
+                    **rows[index],
+                    "filter_witness_0": (
+                        f"span-{trace_id}",
+                        rows[index]["start_time"],
+                    ),
+                }
+                for index, trace_id in enumerate(params["candidate_trace_ids"])
+            ]
+            return QueryResult(replayed, len(replayed), "clickhouse", 1.0)
+
+    analytics = SecondBatchFails()
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="Narrow the time range",
+    ):
+        row_resolver._resolve_bounded_historical_span_ids(
+            analytics,
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "filters": [_attribute_filter("final_status", "Rejected")],
+                "date_range": [START, END],
+            },
+            limit=25,
+            batch_size=25,
+            row_type=RowType.TRACES,
+            include_trace_filter_witnesses=True,
+        )
+    assert analytics.calls == 2
+
+
+@pytest.mark.parametrize("drift_field", ["root_span_id", "start_time"])
+def test_trace_eval_witness_replay_fails_closed_on_canonical_identity_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    drift_field: str,
+) -> None:
+    membership_row = {
+        "trace_id": "trace-a",
+        "root_span_id": "root-a",
+        "start_time": END - timedelta(minutes=1),
+    }
+
+    def fake_read(**_kwargs):
+        return BoundedFilterPage(
+            rows=[membership_row],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=1,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=1,
+            result_payload_bytes=20,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    class DriftAnalytics:
+        def execute_ch_query(self, _query, _params, **_kwargs):
+            replayed = {
+                **membership_row,
+                "filter_witness_0": ("span-status", membership_row["start_time"]),
+            }
+            replayed[drift_field] = (
+                "replacement-root"
+                if drift_field == "root_span_id"
+                else membership_row["start_time"] - timedelta(microseconds=1)
+            )
+            return QueryResult([replayed], 1, "clickhouse", 1.0)
+
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="Narrow the time range",
+    ):
+        row_resolver._resolve_bounded_historical_span_ids(
+            DriftAnalytics(),
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "filters": [_attribute_filter("final_status", "Rejected")],
+                "date_range": [START, END],
+            },
+            limit=25,
+            batch_size=25,
+            row_type=RowType.TRACES,
+            include_trace_filter_witnesses=True,
+        )
 
 
 def test_trace_legacy_observation_type_is_root_scoped_before_cap() -> None:
@@ -1180,6 +1608,120 @@ def test_shared_candidate_reader_proves_large_eval_prefix_within_query_cap(
     assert len(page.rows) == limit
     assert page.has_more is True
     assert page.query_count <= 102
+
+
+def test_population_proof_buffers_dense_10k_sentinel_within_128_queries() -> None:
+    started_at = END - timedelta(minutes=1)
+    rows = [
+        {"trace_id": f"trace-{index:05d}", "start_time": started_at}
+        for index in range(10_001)
+    ]
+
+    class PopulationBuilder:
+        @staticmethod
+        def parse_time_range(_filters):
+            return END - timedelta(minutes=5), END
+
+        @staticmethod
+        def filter_seed_proves_result_order():
+            return False
+
+        @staticmethod
+        def filter_seed_proves_population_bound():
+            return True
+
+        @staticmethod
+        def recommended_filter_classify_batch_size():
+            return 100
+
+        @staticmethod
+        def recommended_filter_seed_batch_size():
+            return 512
+
+        @staticmethod
+        def bounded_filter_row_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_row_order_token(row):
+            return row["trace_id"]
+
+        bounded_filter_seed_identity = bounded_filter_row_identity
+        bounded_filter_seed_order_token = bounded_filter_row_order_token
+
+        @staticmethod
+        def build_filter_seed_page(
+            *,
+            slice_start,
+            slice_end,
+            limit,
+            before_start_time=None,
+            before_id=None,
+        ):
+            return "direct_seed", {
+                "slice_start": slice_start,
+                "slice_end": slice_end,
+                "limit": limit,
+                "before_start_time": before_start_time,
+                "before_id": before_id,
+            }
+
+        @staticmethod
+        def build_filter_match_query_from_seed_rows(candidate_rows):
+            return "classify_with_witness", {"candidate_rows": candidate_rows}
+
+    class PopulationAnalytics:
+        calls: list[str] = []
+
+        def execute_ch_query(self, query, params, **_kwargs):
+            self.calls.append(query)
+            if query == "classify_with_witness":
+                result_rows = list(params["candidate_rows"])
+            else:
+                result_rows = sorted(
+                    rows,
+                    key=lambda row: (row["start_time"], row["trace_id"]),
+                    reverse=True,
+                )
+                if params["before_start_time"] is not None:
+                    boundary = params["before_start_time"], params["before_id"]
+                    result_rows = [
+                        row
+                        for row in result_rows
+                        if (row["start_time"], row["trace_id"]) < boundary
+                    ]
+                result_rows = result_rows[: params["limit"]]
+            return QueryResult(
+                result_rows,
+                len(result_rows),
+                "clickhouse",
+                0.0,
+            )
+
+    analytics = PopulationAnalytics()
+    page = read_bounded_filter_page(
+        builder=PopulationBuilder(),
+        analytics=analytics,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        key_field="trace_id",
+        page_number=0,
+        page_size=10_000,
+        deadline_ms=60_000,
+        max_seed_attempts=128,
+        max_candidates=512,
+        max_query_count=128,
+        classify_batch_size=100,
+    )
+
+    assert page.complete is True
+    assert page.has_more is True
+    assert len(page.rows) == 10_000
+    assert analytics.calls.count("direct_seed") == 20
+    assert analytics.calls.count("classify_with_witness") == 101
+    assert page.query_count == 121
 
 
 @pytest.mark.parametrize(

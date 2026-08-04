@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from rest_framework.fields import empty
 
 from model_hub.serializers.contracts import (
     EvalApiLogTableQuerySerializer,
@@ -720,21 +721,40 @@ class TestFilterSerializerContracts:
             assert serializer.is_valid(), serializer.errors
             assert serializer.validated_data["allow_sampled"] is True
 
-    def test_project_version_list_queries_default_closed_and_accept_opt_in(self):
+    def test_list_query_sample_contract_distinguishes_omitted_false_and_true(self):
         project_version_id = "1372e742-a10b-4d98-9ca4-31ef4d67115f"
-        for serializer_class in (TraceListQuerySerializer, SpanListQuerySerializer):
-            closed = serializer_class(data={"project_version_id": project_version_id})
+        serializers_and_base_data = (
+            (TraceListQuerySerializer, {"project_version_id": project_version_id}),
+            (SpanListQuerySerializer, {"project_version_id": project_version_id}),
+            (TraceObserveListQuerySerializer, {}),
+            (SpanObserveListQuerySerializer, {}),
+        )
+        for serializer_class, base_data in serializers_and_base_data:
+            omitted = serializer_class(data=base_data)
+            strict = serializer_class(
+                data={
+                    **base_data,
+                    "allow_sampled": "false",
+                }
+            )
             opted_in = serializer_class(
                 data={
-                    "project_version_id": project_version_id,
+                    **base_data,
                     "allow_sampled": "true",
                 }
             )
 
-            assert closed.is_valid(), closed.errors
-            assert closed.validated_data["allow_sampled"] is False
+            assert omitted.is_valid(), omitted.errors
+            assert "allow_sampled" not in omitted.validated_data
+            assert strict.is_valid(), strict.errors
+            assert strict.validated_data["allow_sampled"] is False
             assert opted_in.is_valid(), opted_in.errors
             assert opted_in.validated_data["allow_sampled"] is True
+            field = serializer_class().fields["allow_sampled"]
+            assert field.default is empty
+            help_text = field.help_text
+            assert "Omit for backward-compatible" in help_text
+            assert "false to require an exact total" in help_text
 
     def test_project_graph_query_rejects_camel_case_project_id(self):
         serializer = ProjectGraphDataQuerySerializer(

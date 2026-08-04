@@ -326,6 +326,25 @@ def read_bounded_filter_page(
     seed_proves_result_order = (
         bool(seed_order_proof()) if callable(seed_order_proof) else True
     )
+    population_bound_proof = getattr(
+        builder,
+        "filter_seed_proves_population_bound",
+        None,
+    )
+    seed_proves_population_bound = (
+        bool(population_bound_proof()) if callable(population_bound_proof) else False
+    )
+    if seed_proves_population_bound and (
+        page_number != 0
+        or cursor_start_time is not None
+        or include_incomplete_rows
+        or defer_classification
+        or anchor_probe_only
+        or anchor_probe_limit is not None
+    ):
+        raise ValueError(
+            "population-bound seeds require one exact page-zero population proof"
+        )
     request_start, request_end = builder.parse_time_range(filters)
     request_start = _without_timezone(request_start)
     request_end = _without_timezone(request_end)
@@ -466,7 +485,8 @@ def read_bounded_filter_page(
         and bool(skip_full_anchor_builder())
     )
     anchor_can_run = (
-        cursor_key is None
+        not seed_proves_population_bound
+        and cursor_key is None
         and (
             anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
             or anchor_probe_limit is not None
@@ -986,14 +1006,16 @@ def read_bounded_filter_page(
         """Amortize sparse identity classifiers across adjacent seed reads.
 
         Full-presentation span reads and explicit graph/eval/task identity
-        consumers retain their existing immediate-classification behavior.
-        Only normal trace pages, which hydrate the final public page through a
-        separate exact-root query, buffer fewer than one classifier batch.
-        Insertion order is newest-first across the ordered seed stream, so the
-        existing cutoff proof remains valid for every flushed prefix.
+        consumers normally retain immediate classification. Normal trace pages
+        buffer because they hydrate a final public page separately; the
+        eval-only population proof also buffers so 512-row physical seed pages
+        become exact 100-trace witness batches instead of six partial queries.
+        Insertion order is newest-first across an ordered seed stream. The
+        population proof does not use that order: it accepts only exhaustion or
+        a 10k+1 rejection sentinel.
         """
 
-        if not identity_only_classification:
+        if not identity_only_classification and not seed_proves_population_bound:
             return classify_seed_rows(
                 candidate_rows,
                 active_start=active_start,
@@ -1209,7 +1231,8 @@ def read_bounded_filter_page(
                     seed_page_builder = ordered_seed_builder
                     seed_proves_result_order = True
         elif (
-            callable(ordered_seed_builder)
+            not seed_proves_population_bound
+            and callable(ordered_seed_builder)
             and callable(anchor_support)
             and bool(anchor_support())
         ):
@@ -1219,7 +1242,11 @@ def read_bounded_filter_page(
             # without an extra full-slice exhaustion read.
             seed_page_builder = ordered_seed_builder
             seed_proves_result_order = True
-        elif callable(ordered_seed_builder) and not seed_proves_result_order:
+        elif (
+            not seed_proves_population_bound
+            and callable(ordered_seed_builder)
+            and not seed_proves_result_order
+        ):
             # Some any-span predicates (notably structured JSON/call_type)
             # have no selective index. A whole-window anchor probe would be
             # the broad scan this bounded reader exists to avoid, so start
@@ -1290,6 +1317,29 @@ def read_bounded_filter_page(
                 active_end=slice_end,
                 stop_on_ordered_prefix=seed_proves_result_order,
             )
+            if (
+                seed_proves_population_bound
+                and len(matched_by_id) + len(pending_identity_candidates)
+                >= prefix_needed
+            ):
+                # Classify the final sub-100 candidate remainder immediately
+                # when it can establish the oversize sentinel. Otherwise a
+                # dense 10k+1 set would waste seed reads walking older slices
+                # while one unclassified trace already proves rejection.
+                classify_or_buffer_seed_rows(
+                    [],
+                    active_start=slice_start,
+                    active_end=slice_end,
+                    force=True,
+                )
+            if seed_proves_population_bound and len(matched_by_id) >= prefix_needed:
+                # The caller needs only one of two exact proofs: complete
+                # exhaustion at or below its buffer, or one classified
+                # sentinel above it. The latter is enough to reject the task
+                # before witness replay and before any task row can be written;
+                # unordered rows are never exposed as a public list page.
+                page_complete = True
+                break
             if (
                 not prefix_is_proven
                 and seed_proves_result_order

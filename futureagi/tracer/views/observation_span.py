@@ -115,6 +115,7 @@ from tracer.services.clickhouse.list_cursor import (
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
+    exact_total_explicitly_required,
     frozen_window_filter,
     snapshot_cursor_supported,
     snapshot_read_settings,
@@ -2420,9 +2421,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 next_cursor=next_cursor,
             )
         )
-        if metadata.get("total_rows_is_lower_bound") and not validated_data.get(
-            "allow_sampled", False
-        ):
+        if metadata.get(
+            "total_rows_is_lower_bound"
+        ) and exact_total_explicitly_required(request, validated_data):
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Span data is temporarily unavailable. Please retry.",
@@ -2750,9 +2751,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     "query_result_payload_bytes": bounded_page.result_payload_bytes,
                 }
             )
-        if metadata.get("total_rows_is_lower_bound") and not validated_data.get(
-            "allow_sampled", False
-        ):
+        if metadata.get(
+            "total_rows_is_lower_bound"
+        ) and exact_total_explicitly_required(request, validated_data):
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Span data is temporarily unavailable. Please retry.",

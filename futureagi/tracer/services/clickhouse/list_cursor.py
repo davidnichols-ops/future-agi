@@ -126,6 +126,27 @@ def normalize_cursor_query(query: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def exact_total_explicitly_required(
+    request: Any,
+    validated_data: dict[str, Any],
+) -> bool:
+    """Return whether the client explicitly rejected a bounded total.
+
+    ``allow_sampled`` was added after the list APIs were already deployed, so
+    older clients omit it.  A complete bounded page is safe to return to those
+    clients as long as its lower-bound total is labelled truthfully.  Clients
+    that explicitly send ``allow_sampled=false`` retain the strict exact-total
+    contract.  Incomplete pages are rejected before this compatibility check.
+    """
+
+    query_params = getattr(request, "query_params", None)
+    return (
+        query_params is not None
+        and "allow_sampled" in query_params
+        and validated_data.get("allow_sampled") is False
+    )
+
+
 def cursor_scope_for_request(
     request: Any,
     *,

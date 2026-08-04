@@ -178,6 +178,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         bounded_identity_only: bool = False,
         bounded_membership_filters: list[dict] | None = None,
         bounded_bulk_scan: bool = False,
+        bounded_include_filter_witnesses: bool = True,
+        bounded_population_proof: bool = False,
         bounded_sampling_salt: str | None = None,
         bounded_sampling_rate: float | None = None,
         **kwargs: Any,
@@ -206,6 +208,26 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self._bounded_bulk_scan = bool(bounded_bulk_scan)
         if self._bounded_bulk_scan and not self._bounded_identity_only:
             raise ValueError("bounded_bulk_scan requires bounded_identity_only")
+        self._bounded_include_filter_witnesses = bool(bounded_include_filter_witnesses)
+        if (
+            not self._bounded_include_filter_witnesses
+            and not self._bounded_identity_only
+        ):
+            raise ValueError(
+                "membership-only classification requires bounded_identity_only"
+            )
+        self._bounded_population_proof = bool(bounded_population_proof)
+        if self._bounded_population_proof and not (
+            self._bounded_internal_scan
+            and self._bounded_identity_only
+            and self._bounded_bulk_scan
+            and project_id is not None
+            and project_ids is None
+        ):
+            raise ValueError(
+                "bounded_population_proof requires one-project internal "
+                "identity-only bulk classification"
+            )
         if (bounded_sampling_salt is None) != (bounded_sampling_rate is None):
             raise ValueError(
                 "bounded_sampling_salt and bounded_sampling_rate must be paired"
@@ -360,6 +382,22 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
         return not any(plan.scope == "any" for plan in plans)
 
+    def filter_seed_proves_population_bound(self) -> bool:
+        """Whether the direct seed may prove only exhaustion or an oversize set.
+
+        Historical eval tasks configured above the executable 10k buffer do not
+        consume the reader's newest-first page. They accept a result only after
+        the complete filtered population is exhausted, and reject it as soon as
+        a 10k+1 sentinel is exact-classified. In that one mode an unordered,
+        directly filtered physical-span seed is both cheaper and sufficient;
+        it must never be used to expose a numbered trace-list prefix.
+        """
+
+        if not self._bounded_population_proof:
+            return False
+        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        return any(plan.scope == "any" for plan in plans)
+
     @staticmethod
     def filter_cursor_seed_keyset_is_safe() -> bool:
         """Ordered-root seeds may keyset at the public trace cursor.
@@ -497,10 +535,18 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
         # Explicit identity-only consumers retain their established envelopes.
-        # In particular, any-span eval/task and navigation classifiers replay
-        # every physical child and stay at the production-proven graph batch.
+        # A historical task can opt into membership-only classification and
+        # replay witnesses separately; all one-phase any-span consumers stay at
+        # the production-proven graph batch.
         if self._bounded_bulk_scan:
             if any(plan.scope == "any" for plan in plans):
+                if self._bounded_population_proof:
+                    # Population-proof classifiers may attach witnesses in the
+                    # same exact pass. Production-qualified 100-trace batches
+                    # keep the complete 10k+sentinel proof within 128 queries.
+                    return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
+                if not self._bounded_include_filter_witnesses:
+                    return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
                 return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
             return 200
         request_start, request_end = self._bounded_request_window
@@ -1056,7 +1102,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # this leaf. The classifier below applies every leaf against global
         # latest state. Applying all leaves here would be wrong because two
         # different child spans may satisfy two different trace filters.
-        seed_plans = [any_span_plans[0]] if any_span_plans else root_plans
+        indexed_any_span_plans = [
+            plan for plan in any_span_plans if self._plan_uses_indexed_anchor(plan)
+        ]
+        seed_plans = (
+            [indexed_any_span_plans[0] if indexed_any_span_plans else any_span_plans[0]]
+            if any_span_plans
+            else root_plans
+        )
         seed_predicates = [
             plan.raw_witness_predicate or plan.seed_predicate for plan in seed_plans
         ]
@@ -1727,8 +1780,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self,
         candidate_rows: list[dict[str, Any]],
         *,
-        include_filter_witnesses: bool = True,
+        include_filter_witnesses: bool | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        if include_filter_witnesses is None:
+            include_filter_witnesses = self._bounded_include_filter_witnesses
         return self._build_filter_match_query_from_seed_rows(
             candidate_rows,
             include_filter_witnesses=include_filter_witnesses,
