@@ -1598,13 +1598,12 @@ def test_value_search_treats_unicode_like_metacharacters_as_literals():
     assert all("%_\\路径" not in call.sql for call in executor.calls)
     assert all("customer.quote'key" not in call.sql for call in executor.calls)
     assert all(
-        call.params["attribute_key"] == "customer.quote'key" for call in executor.calls
+        call.params["attribute_key"] == "customer.quote'key"
+        for call in executor.calls
         if "attribute_key" in call.params
     )
     certificate = next(
-        call
-        for call in executor.calls
-        if "max(_version) AS latest_version" in call.sql
+        call for call in executor.calls if "max(_version) AS latest_version" in call.sql
     )
     assert "attribute_key" not in certificate.params
     assert all(
@@ -2038,12 +2037,8 @@ def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
         call for call in executor.calls if "segment_start" in call.params
     ]
     assert len(candidate_calls) == 14
-    assert all(
-        "candidate_version" in call.sql for call in candidate_calls[:7]
-    )
-    assert all(
-        "candidate_version" not in call.sql for call in candidate_calls[7:]
-    )
+    assert all("candidate_version" in call.sql for call in candidate_calls[:7])
+    assert all("candidate_version" not in call.sql for call in candidate_calls[7:])
     assert all("attributes_extra" not in call.sql for call in candidate_calls)
     assert all("JSONHas(attributes_extra" not in call.sql for call in candidate_calls)
     assert all("attribute_search" not in call.params for call in candidate_calls)
@@ -2054,8 +2049,7 @@ def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
     json_hydration = next(
         call
         for call in executor.calls
-        if "segment_start" not in call.params
-        and "JSONHas(attributes_extra" in call.sql
+        if "segment_start" not in call.params and "JSONHas(attributes_extra" in call.sql
     )
     assert len(json_hydration.params["candidate_ids_0"]) == 1
 
@@ -2182,8 +2176,7 @@ def test_value_search_pages_past_seed_stale_matches_to_live_value():
     )
     assert continuation.params["candidate_before_id"] == stale[-1]["id"]
     assert all(
-        "toUInt64(_version) AS candidate_version" in call.sql
-        for call in candidates
+        "toUInt64(_version) AS candidate_version" in call.sql for call in candidates
     )
     ordered_call = next(call for call in candidates if "LIMIT 1 BY" in call.sql)
     assert ordered_call.sql.index("_version DESC") < ordered_call.sql.index(
@@ -2321,9 +2314,7 @@ def test_absent_heavy_json_key_uses_only_bounded_identity_seeds():
                 )
                 for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
             ]
-            starts_by_id.update(
-                (str(row["id"]), row["start_time"]) for row in rows
-            )
+            starts_by_id.update((str(row["id"]), row["start_time"]) for row in rows)
             return rows
 
         return [
@@ -2363,13 +2354,11 @@ def test_absent_heavy_json_key_uses_only_bounded_identity_seeds():
     hydration_calls = [
         call
         for call in executor.calls
-        if "segment_start" not in call.params
-        and "JSONHas(attributes_extra" in call.sql
+        if "segment_start" not in call.params and "JSONHas(attributes_extra" in call.sql
     ]
     assert hydration_calls
     assert all(
-        len(call.params["candidate_ids_0"])
-        <= ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT
+        len(call.params["candidate_ids_0"]) <= ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT
         for call in hydration_calls
     )
 
@@ -2537,14 +2526,11 @@ def test_value_search_miss_never_exceeds_hard_query_ceiling():
                 _candidate(
                     PROJECT_A,
                     f"miss-{page:02d}-{index:02d}",
-                    start_time=NOW
-                    - timedelta(days=1, seconds=page * 100 + index + 1),
+                    start_time=NOW - timedelta(days=1, seconds=page * 100 + index + 1),
                 )
                 for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
             ]
-            starts_by_id.update(
-                (str(row["id"]), row["start_time"]) for row in rows
-            )
+            starts_by_id.update((str(row["id"]), row["start_time"]) for row in rows)
             return rows
 
         requested_ids = call.params["candidate_ids_0"]
