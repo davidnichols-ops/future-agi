@@ -288,7 +288,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.filter_seed_proves_result_order() is False
     assert builder.filter_cursor_seed_keyset_is_safe() is True
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 100
 
 
 def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
@@ -301,7 +301,7 @@ def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
     )
 
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 100
     assert builder.skip_full_window_filter_anchor_probe() is True
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
@@ -385,7 +385,7 @@ def test_call_type_trace_filter_skips_unindexed_window_anchor() -> None:
     assert "parent_span_id IS NULL" in ordered_sql
     assert "JSONExtract" in match_sql
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 100
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
 
@@ -422,7 +422,7 @@ def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
     assert anchor_params["latest_filter_key_0"] == "final_status"
     assert "latest_filter_param_1" not in anchor_params
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 100
 
 
 def test_trace_candidate_classifier_prunes_to_request_partitions() -> None:
@@ -528,6 +528,9 @@ def test_existing_identity_only_trace_consumer_does_not_add_page_hydration() -> 
     sql, _ = builder.build_filter_match_query(["trace-a"])
 
     assert builder.use_identity_only_filter_classification() is False
+    # Graph/eval/task callers set this mode explicitly and retain their
+    # established 50-row envelope; only normal list pages use 100.
+    assert builder.recommended_filter_classify_batch_size() == 50
     assert "canonical_root_identity.1 AS root_span_id" in sql
     assert "canonical_root_identity.2 AS start_time" in sql
     assert "filter_witness_0" in sql

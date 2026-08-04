@@ -70,6 +70,14 @@ _INDEXED_TRACE_ANY_SPAN_ANCHOR_COLUMNS = frozenset(
 # remain independently capped and may still acquire 200 identities at once.
 _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE = 20
 
+# Normal trace pages classify identities only and hydrate at most the final
+# public page in a separate bounded statement. Classifying 100 identities per
+# statement halves sparse long-window round trips without widening graph,
+# eval/task, navigation, or other explicitly identity-only consumers. The
+# selector still enforces its independent 256 MiB/512 MiB memory/read caps and
+# fails closed on either limit.
+_NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE = 100
+
 # A long-window list gets a small, partitioned sparse-value proof before it
 # enters the ordered-root fallback. Sixty-four is one global exhaustiveness
 # sentinel across four adjacent time strata. Each statement gets only 300 ms
@@ -481,12 +489,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Keep the candidate-trace latest-state scan below CH's memory ceiling."""
 
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
-        # Normal list/graph classifiers hydrate the complete light root row and
-        # stay at the production-proven 50-trace ceiling. Identity-only
-        # consumers can retain 200 for root/residual-only filters. Any-span
-        # filters are different: their classifier must replay every physical
-        # child for each candidate trace, so use the production-proven graph
-        # batch even though the public projection contains only identities.
+        # Explicit identity-only consumers retain their established envelopes.
+        # In particular, any-span eval/task and navigation classifiers replay
+        # every physical child and stay at the production-proven graph batch.
         if self._bounded_bulk_scan:
             if any(plan.scope == "any" for plan in plans):
                 return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
@@ -498,6 +503,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._has_unindexed_any_span_filter()
         ):
             return 512
+        # A normal list now projects only membership/order identities during
+        # classification and hydrates its final public page separately. Keep
+        # this recommendation isolated from graph/eval/task builders, which set
+        # bounded_identity_only explicitly and must retain their old batches.
+        if not self._bounded_identity_only and not self._bounded_internal_scan:
+            return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
         return 50
 
     def use_identity_only_filter_classification(self) -> bool:
