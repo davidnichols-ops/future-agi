@@ -154,7 +154,10 @@ ERROR_RESPONSES = {
 }
 
 TRACE_LIST_WALL_DEADLINE_MS = 3_000
-TRACE_LIST_CANDIDATE_DEADLINE_MS = 2_200
+# Empty/sparse scans do not need page enrichment. Give their final bounded
+# classifier enough room to finish while retaining 500 ms inside the endpoint
+# wall; matched pages still reserve hydration before using this ceiling.
+TRACE_LIST_CANDIDATE_DEADLINE_MS = 2_500
 TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 900
 TRACE_LIST_READ_SETTINGS = {
     "max_threads": 1,

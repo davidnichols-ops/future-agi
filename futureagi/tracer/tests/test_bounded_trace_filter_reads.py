@@ -2016,7 +2016,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
     assert payload["table"][0]["trace_id"] == "trace-a"
     assert payload["metadata"]["query_count"] == 4
     assert 0 <= payload["metadata"]["query_elapsed_ms"] < 3_000
-    assert bounded_read.call_args.kwargs["deadline_ms"] <= 2_200
+    assert bounded_read.call_args.kwargs["deadline_ms"] <= 2_500
     assert len(analytics.calls) == 3
     assert all(0 < timeout_ms <= 900 for _, timeout_ms, _ in analytics.calls)
     assert all(
