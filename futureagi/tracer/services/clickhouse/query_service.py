@@ -132,6 +132,22 @@ class AnalyticsQueryService:
             self._ch_client = get_clickhouse_client()
         return self._ch_client
 
+    @property
+    def supports_per_query_read_settings(self) -> bool:
+        """Whether query-local resource ceilings reach ClickHouse.
+
+        A server profile locked at ``readonly=1`` rejects every query-local
+        setting.  Optional reads whose safety depends on a tighter timeout or
+        byte ceiling must therefore be skipped on that lane instead of merely
+        assuming the requested settings were enforced.
+        """
+
+        client = self.ch_client
+        return not bool(
+            getattr(client, "server_enforced_readonly", False)
+            or getattr(client, "server_profile_locked", False)
+        )
+
     def should_use_clickhouse(self, query_type: QueryType | str) -> bool:
         """Compatibility shim for legacy route-toggle callers/tests."""
         return is_clickhouse_enabled()

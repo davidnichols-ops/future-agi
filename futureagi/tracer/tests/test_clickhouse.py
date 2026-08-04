@@ -3908,6 +3908,26 @@ class TestErrorAnalysisQueryBuilder:
 class TestAnalyticsQueryService:
     """Test the dispatch layer."""
 
+    @pytest.mark.parametrize(
+        ("server_enforced_readonly", "server_profile_locked", "expected"),
+        ((False, False, True), (True, False, False), (False, True, False)),
+    )
+    def test_reports_whether_per_query_read_settings_reach_clickhouse(
+        self,
+        server_enforced_readonly,
+        server_profile_locked,
+        expected,
+    ):
+        from tracer.services.clickhouse.query_service import AnalyticsQueryService
+
+        service = AnalyticsQueryService()
+        service._ch_client = mock.Mock(
+            server_enforced_readonly=server_enforced_readonly,
+            server_profile_locked=server_profile_locked,
+        )
+
+        assert service.supports_per_query_read_settings is expected
+
     def test_get_backend_status(self):
         """get_backend_status reports CH enablement + connectivity."""
         from tracer.services.clickhouse.query_service import AnalyticsQueryService

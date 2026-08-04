@@ -589,13 +589,17 @@ def read_bounded_filter_page(
     # indexable prefilter before the first full-window classifier batch; the
     # exact classifier still validates every surviving identity. Unsupported
     # filter shapes return no probe and retain the existing exact path.
+    probe_limits_enforced = bool(
+        getattr(analytics, "supports_per_query_read_settings", True)
+    )
     candidate_witness_probe_enabled = bool(
-        identity_only_classification
+        probe_limits_enforced
+        and identity_only_classification
         and callable(candidate_witness_probe_builder)
         and callable(candidate_witness_probe_preference)
         and candidate_witness_probe_preference()
     )
-    candidate_witness_probe_abandoned = False
+    candidate_witness_probe_abandoned = not probe_limits_enforced
     if cursor_key is not None and cursor_key[0] < request_start:
         return BoundedFilterPage(
             rows=[],
@@ -684,7 +688,18 @@ def read_bounded_filter_page(
                 settings=settings,
             )
         except Exception as exc:
-            if not is_read_budget_error(exc):
+            if is_read_budget_error(exc):
+                error_code = "read_budget_exceeded"
+            elif kind == "prefilter" and isinstance(exc, RuntimeError):
+                # The witness probe is an optional optimization. Some guarded
+                # executors report their own statement timeout/resource cap as
+                # a generic RuntimeError, so account and abandon only this
+                # speculative read; the unchanged exact classifier still
+                # decides membership. Never extend this fallback to required
+                # seed/classify/hydration reads, whose unexpected failures must
+                # remain visible to callers.
+                error_code = "prefilter_unavailable"
+            else:
                 raise
             attempts.append(
                 FilterReadAttempt(
@@ -694,10 +709,10 @@ def read_bounded_filter_page(
                     elapsed_ms=(monotonic() - attempt_started) * 1000,
                     rows_returned=0,
                     result_payload_bytes=0,
-                    error_code="read_budget_exceeded",
+                    error_code=error_code,
                 )
             )
-            raise _BudgetExceeded("read_budget_exceeded") from None
+            raise _BudgetExceeded(error_code) from None
         rows = list(result.data or [])
         attempts.append(
             FilterReadAttempt(
@@ -831,9 +846,7 @@ def read_bounded_filter_page(
                         active_end=active_end,
                         result_limit=len(candidate_identities),
                         timeout_cap_ms=_CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS,
-                        max_bytes_to_read_cap=(
-                            _CANDIDATE_WITNESS_PREFILTER_MAX_BYTES
-                        ),
+                        max_bytes_to_read_cap=(_CANDIDATE_WITNESS_PREFILTER_MAX_BYTES),
                     )
                 except _BudgetExceeded:
                     # The probe is optional. A resource failure proves

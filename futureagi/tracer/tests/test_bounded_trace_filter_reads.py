@@ -3419,7 +3419,7 @@ class _CandidateWitnessHydrationFakeExecutor(_IdentityHydrationFakeExecutor):
         builder,
         *,
         witness_ids=(),
-        fail_prefilter=False,
+        fail_prefilter: bool | Exception = False,
         **kwargs,
     ):
         super().__init__(builder, **kwargs)
@@ -3439,6 +3439,8 @@ class _CandidateWitnessHydrationFakeExecutor(_IdentityHydrationFakeExecutor):
         self.timeouts.append((query, timeout_ms))
         self.prefilter_settings.append(dict(settings))
         if self.fail_prefilter:
+            if isinstance(self.fail_prefilter, Exception):
+                raise self.fail_prefilter
             raise ReadDeadlineExceeded("candidate witness budget")
         rows = [
             {"id": candidate_id}
@@ -6238,11 +6240,12 @@ def test_broad_candidate_witness_prefilter_falls_through_to_exact_classifier() -
         "match_identity",
         "hydrate",
     ]
-    assert next(timeout for query, timeout in executor.timeouts if query == "prefilter") == 250
-    assert len(executor.prefilter_settings) == 1
     assert (
-        executor.prefilter_settings[0]["max_bytes_to_read"] == 96 * 1024 * 1024
+        next(timeout for query, timeout in executor.timeouts if query == "prefilter")
+        == 250
     )
+    assert len(executor.prefilter_settings) == 1
+    assert executor.prefilter_settings[0]["max_bytes_to_read"] == 96 * 1024 * 1024
     assert executor.prefilter_settings[0]["max_threads"] == 1
 
 
@@ -6293,6 +6296,91 @@ def test_candidate_witness_read_failure_falls_back_to_exact_classifier() -> None
         "classify",
         "classify",
     ]
+
+
+def test_candidate_witness_skips_probe_without_enforced_query_limits() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(3)
+    ]
+    builder = _CandidateWitnessHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(builder)
+    executor.supports_per_query_read_settings = False
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.rows == []
+    assert [query for query, _ in executor.calls] == ["seed", "match_identity"]
+    assert [attempt.kind for attempt in page.attempts] == ["seed", "classify"]
+    assert executor.prefilter_settings == []
+
+
+def test_candidate_witness_runtime_failure_falls_back_to_exact_classifier() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(3)
+    ]
+    builder = _CandidateWitnessHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        fail_prefilter=RuntimeError("private guarded-executor resource diagnostic"),
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.rows == []
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "prefilter",
+        "match_identity",
+    ]
+    assert [attempt.kind for attempt in page.attempts] == [
+        "seed",
+        "prefilter",
+        "classify",
+    ]
+    assert page.attempts[1].error_code == "prefilter_unavailable"
+    assert "private guarded-executor" not in repr(page)
 
 
 def test_identity_hydration_keeps_same_text_org_traces_distinct() -> None:
