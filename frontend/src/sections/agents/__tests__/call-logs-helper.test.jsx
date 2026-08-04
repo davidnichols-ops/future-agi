@@ -94,6 +94,7 @@ describe("useCallLogs", () => {
     expect(axiosMocks.agentGetCallLogs).not.toHaveBeenCalled();
     expect(axiosMocks.get).toHaveBeenCalledWith(axiosMocks.projectGetCallLogs, {
       params: {
+        allow_sampled: true,
         page: 1,
         page_size: 25,
         project_id: "project-1",
