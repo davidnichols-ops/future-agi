@@ -5786,6 +5786,150 @@ def test_identity_hydration_preserves_numbered_page_n() -> None:
     assert hydration_call["candidate_ids"] == ("trace-2", "trace-3")
 
 
+def test_identity_classifier_batches_sparse_candidates_across_adjacent_slices() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - offset,
+        }
+        for index, offset in enumerate(
+            (
+                timedelta(minutes=1),
+                timedelta(minutes=6),
+                timedelta(minutes=16),
+            )
+        )
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=20),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=4,
+        recommended_seed_batch_size=4,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    classify_calls = [
+        params for query, params in executor.calls if query == "match_identity"
+    ]
+    assert page.complete is True
+    assert page.rows == []
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "seed",
+        "seed",
+        "match_identity",
+    ]
+    assert classify_calls[0]["candidate_ids"] == (
+        "trace-0",
+        "trace-1",
+        "trace-2",
+    )
+
+
+def test_sparse_identity_classifier_uses_only_one_eager_partial_flush() -> None:
+    rows = [
+        {
+            "id": f"trace-{minute:02d}-{index:02d}",
+            "root_span_id": f"root-{minute:02d}-{index:02d}",
+            "start_time": END - timedelta(minutes=minute, microseconds=index),
+        }
+        for minute in (1, 6, 16)
+        for index in range(30)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=20),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=100,
+        recommended_seed_batch_size=100,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    classify_calls = [
+        params for query, params in executor.calls if query == "match_identity"
+    ]
+    assert page.complete is True
+    assert page.rows == []
+    assert [len(call["candidate_ids"]) for call in classify_calls] == [30, 60]
+
+
+def test_sparse_buffer_flush_preserves_exact_page_order_and_hydration() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - offset,
+            "trace_name": f"presented-{index}",
+        }
+        for index, offset in enumerate(
+            (
+                timedelta(minutes=1),
+                timedelta(minutes=6),
+                timedelta(minutes=16),
+            )
+        )
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=20),
+        end=END,
+        recommended_batch_size=100,
+        recommended_seed_batch_size=100,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder, reverse_hydration=True)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.has_more is True
+    assert [row["id"] for row in page.rows] == ["trace-0", "trace-1"]
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "seed",
+        "seed",
+        "match_identity",
+        "hydrate",
+    ]
+    classifier = next(
+        params for query, params in executor.calls if query == "match_identity"
+    )
+    assert classifier["candidate_ids"] == ("trace-0", "trace-1", "trace-2")
+    hydration = next(params for query, params in executor.calls if query == "hydrate")
+    assert hydration["candidate_ids"] == ("trace-0", "trace-1")
+
+
 def test_identity_hydration_keeps_same_text_org_traces_distinct() -> None:
     project_b = "00000000-0000-4000-8000-000000000002"
     rows = [

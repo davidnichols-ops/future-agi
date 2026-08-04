@@ -562,6 +562,15 @@ def read_bounded_filter_page(
     seen_candidate_ids: set[Hashable] = set()
     matched_by_id: dict[Hashable, dict[str, Any]] = {}
     deferred_candidate_by_id: dict[Hashable, dict[str, Any]] = {}
+    # Normal trace lists classify only identities, so sparse adjacent slices
+    # can share one classifier statement without widening its per-query batch.
+    # Keep each row's acquisition bounds solely for truthful attempt metadata;
+    # the exact classifier is still constrained by the immutable candidate
+    # identities carried by the rows themselves.
+    pending_identity_candidates: dict[
+        Hashable, tuple[dict[str, Any], datetime, datetime]
+    ] = {}
+    eager_identity_prefix_flush_used = False
     if cursor_key is not None and cursor_key[0] < request_start:
         return BoundedFilterPage(
             rows=[],
@@ -825,6 +834,68 @@ def read_bounded_filter_page(
                     return True
         return False
 
+    def classify_or_buffer_seed_rows(
+        candidate_rows: list[dict[str, Any]],
+        *,
+        active_start: datetime,
+        active_end: datetime,
+        stop_on_ordered_prefix: bool = False,
+        force: bool = False,
+    ) -> bool:
+        """Amortize sparse identity classifiers across adjacent seed reads.
+
+        Full-presentation span reads and explicit graph/eval/task identity
+        consumers retain their existing immediate-classification behavior.
+        Only normal trace pages, which hydrate the final public page through a
+        separate exact-root query, buffer fewer than one classifier batch.
+        Insertion order is newest-first across the ordered seed stream, so the
+        existing cutoff proof remains valid for every flushed prefix.
+        """
+
+        if not identity_only_classification:
+            return classify_seed_rows(
+                candidate_rows,
+                active_start=active_start,
+                active_end=active_end,
+                stop_on_ordered_prefix=stop_on_ordered_prefix,
+            )
+
+        for row in candidate_rows:
+            public_identity = str(row.get(key_field, ""))
+            if not public_identity:
+                continue
+            candidate_identity = row_identity(row)
+            if (
+                candidate_identity in seen_candidate_ids
+                or candidate_identity in pending_identity_candidates
+            ):
+                continue
+            pending_identity_candidates[candidate_identity] = (
+                row,
+                active_start,
+                active_end,
+            )
+
+        def flush(batch_size: int) -> bool:
+            batch_identities = list(pending_identity_candidates)[:batch_size]
+            batch_entries = [
+                pending_identity_candidates.pop(identity)
+                for identity in batch_identities
+            ]
+            return classify_seed_rows(
+                [entry[0] for entry in batch_entries],
+                active_start=min(entry[1] for entry in batch_entries),
+                active_end=max(entry[2] for entry in batch_entries),
+                stop_on_ordered_prefix=stop_on_ordered_prefix,
+            )
+
+        while len(pending_identity_candidates) >= classify_batch_size:
+            if flush(classify_batch_size):
+                return True
+        if force and pending_identity_candidates:
+            return flush(len(pending_identity_candidates))
+        return False
+
     try:
         # Eligible any-span trace filters first ask a direct key+value predicate
         # for a finite DISTINCT trace-id sentinel. If it exhausts, that is an
@@ -1066,12 +1137,30 @@ def read_bounded_filter_page(
                 seen_seed_ids.add(raw_identity)
                 new_candidate_rows.append(row)
 
-            prefix_is_proven = classify_seed_rows(
+            prefix_is_proven = classify_or_buffer_seed_rows(
                 new_candidate_rows,
                 active_start=slice_start,
                 active_end=slice_end,
                 stop_on_ordered_prefix=seed_proves_result_order,
             )
+            if (
+                not prefix_is_proven
+                and seed_proves_result_order
+                and pending_identity_candidates
+                and not eager_identity_prefix_flush_used
+                and len(matched_by_id) + len(pending_identity_candidates)
+                >= prefix_needed
+            ):
+                # Do not defer a partial classifier batch when it is the only
+                # remaining uncertainty in an otherwise provable public page.
+                eager_identity_prefix_flush_used = True
+                prefix_is_proven = classify_or_buffer_seed_rows(
+                    [],
+                    active_start=slice_start,
+                    active_end=slice_end,
+                    stop_on_ordered_prefix=True,
+                    force=True,
+                )
 
             if prefix_is_proven:
                 page_complete = True
@@ -1081,7 +1170,11 @@ def read_bounded_filter_page(
             ordered_matches = sorted(
                 matched_by_id.values(), key=result_row_key, reverse=True
             )
-            if seed_proves_result_order and len(ordered_matches) >= prefix_needed:
+            if (
+                not pending_identity_candidates
+                and seed_proves_result_order
+                and len(ordered_matches) >= prefix_needed
+            ):
                 cutoff = result_row_key(ordered_matches[prefix_needed - 1])
                 prefix_is_proven = (
                     cutoff[0] >= slice_start
@@ -1102,6 +1195,13 @@ def read_bounded_filter_page(
                 continue
 
             if slice_start <= request_start:
+                classify_or_buffer_seed_rows(
+                    [],
+                    active_start=request_start,
+                    active_end=request_end,
+                    stop_on_ordered_prefix=seed_proves_result_order,
+                    force=True,
+                )
                 page_complete = True
                 break
             slice_end = slice_start
