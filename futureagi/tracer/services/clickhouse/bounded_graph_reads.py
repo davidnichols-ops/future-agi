@@ -305,7 +305,14 @@ def _classify_deferred_trace_strata(
         if remaining_ms < 25:
             raise BoundedGraphReadError("read_budget_exceeded")
         classifier_query, classifier_params = (
-            classifier_builder.build_filter_match_query_from_seed_rows(candidate_batch)
+            classifier_builder.build_filter_match_query_from_seed_rows(
+                candidate_batch,
+                # Eval/task selection needs a physical witness for each
+                # any-span leaf. Graph membership consumes only the proven
+                # trace/root identity, so avoid duplicate argMinIf work over
+                # every classified child span.
+                include_filter_witnesses=False,
+            )
         )
         if not classifier_query:  # pragma: no cover - guarded by non-empty IDs
             continue

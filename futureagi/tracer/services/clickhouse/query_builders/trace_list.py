@@ -1062,6 +1062,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         candidate_full_state: bool = False,
         candidate_trace_identities: list[tuple[str, str]] | None = None,
         candidate_identity_only: bool | None = None,
+        include_filter_witnesses: bool = True,
     ) -> tuple[str, dict[str, Any]]:
         """Classify bounded trace IDs against their latest span versions.
 
@@ -1255,7 +1256,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             if candidate_identity_only is None
             else bool(candidate_identity_only)
         )
-        if self._bounded_identity_only:
+        if self._bounded_identity_only and include_filter_witnesses:
             for witness_index, plan in enumerate(any_span_plans):
                 witness_alias = f"filter_witness_{witness_index}"
                 witness_aliases.append(witness_alias)
@@ -1513,6 +1514,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         candidate_rows: list[dict[str, Any]],
         *,
         candidate_identity_only: bool | None = None,
+        include_filter_witnesses: bool = True,
     ) -> tuple[str, dict[str, Any]]:
         """Replay root-seeded candidates by bounded trace identity.
 
@@ -1526,6 +1528,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return self.build_filter_match_query(
                 trace_ids,
                 candidate_identity_only=candidate_identity_only,
+                include_filter_witnesses=include_filter_witnesses,
             )
         trace_identities = [
             (str(row.get("project_id") or ""), str(row.get("trace_id") or ""))
@@ -1536,13 +1539,19 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             trace_ids,
             candidate_trace_identities=trace_identities,
             candidate_identity_only=candidate_identity_only,
+            include_filter_witnesses=include_filter_witnesses,
         )
 
     def build_filter_match_query_from_seed_rows(
         self,
         candidate_rows: list[dict[str, Any]],
+        *,
+        include_filter_witnesses: bool = True,
     ) -> tuple[str, dict[str, Any]]:
-        return self._build_filter_match_query_from_seed_rows(candidate_rows)
+        return self._build_filter_match_query_from_seed_rows(
+            candidate_rows,
+            include_filter_witnesses=include_filter_witnesses,
+        )
 
     def build_filter_identity_match_query_from_seed_rows(
         self,

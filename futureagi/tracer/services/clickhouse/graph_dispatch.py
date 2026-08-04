@@ -40,8 +40,14 @@ GRAPH_EVENT_LIMIT = 2_000
 # fans each trace set into child-span reads, so keep the same finite 40-trace
 # envelope used by the long-window sampler before any decoration query runs.
 GRAPH_TRACE_DECORATION_CANDIDATE_LIMIT = 40
-GRAPH_TRACE_ENTITY_BATCH_SIZE = 5
-GRAPH_SPAN_METRIC_BATCH_SIZE = 512
+# Candidate discovery is already capped at forty trace IDs and 4,097 returned
+# physical identities. Keep it in one bounded statement to avoid rescanning the
+# same project/window once per five traces.
+GRAPH_TRACE_ENTITY_BATCH_SIZE = GRAPH_TRACE_DECORATION_CANDIDATE_LIMIT
+# A 1,024-identity replay remains well below the 4,096 global sentinel while
+# removing the extra metric statement observed for the twelve-trace graph
+# sample. Additive sufficient statistics preserve exact cross-batch merges.
+GRAPH_SPAN_METRIC_BATCH_SIZE = 1_024
 _GRAPH_BASE_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,

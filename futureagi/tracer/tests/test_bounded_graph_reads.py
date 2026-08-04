@@ -689,8 +689,8 @@ def test_trace_multi_child_filters_match_across_separate_temporal_strata():
     assert classifier_params["candidate_start_date"] == window_start
     assert classifier_params["candidate_end_date"] == window_end
     assert classifier_query.count("countIf(") >= 3
-    assert "filter_witness_0" in classifier_query
-    assert "filter_witness_1" in classifier_query
+    assert "filter_witness_0" not in classifier_query
+    assert "filter_witness_1" not in classifier_query
 
 
 @pytest.mark.unit
@@ -3243,12 +3243,12 @@ def test_short_window_4096_traces_use_newest_40_for_bounded_decoration(
         len(decorated_trace_ids)
         == graph_dispatch.GRAPH_TRACE_DECORATION_CANDIDATE_LIMIT
     )
-    assert len(entity_calls) == 8
+    assert len(entity_calls) == 1
     assert all(
         len(params["graph_trace_ids"]) <= graph_dispatch.GRAPH_TRACE_ENTITY_BATCH_SIZE
         for _, params, *_ in entity_calls
     )
-    assert len(analytics.calls) == 9
+    assert len(analytics.calls) == 2
     assert response["query_count"] == sample.query_count + len(analytics.calls)
     assert response["query_count"] <= 32
     assert response["query_complete"] is False
@@ -3517,6 +3517,73 @@ def test_trace_metric_batches_merge_exact_nullable_averages(monkeypatch):
     assert metrics["prompt_tokens"][0]["value"] == 12
     assert metrics["completion_tokens"][0]["value"] == 18
     assert metrics["error_rate"][0]["value"] == 25
+    assert metadata["query_count"] == _sample().query_count + 3
+
+
+@pytest.mark.unit
+def test_trace_metric_default_batch_keeps_1025_identities_exact():
+    trace_id = "11111111-1111-4111-8111-111111111111"
+    identities = [
+        {
+            "trace_id": trace_id,
+            "id": f"span-{index}",
+            "start_time": START + timedelta(microseconds=index),
+        }
+        for index in range(1_025)
+    ]
+    analytics = _SequenceAnalytics(
+        [
+            identities,
+            [
+                {
+                    "time_bucket": START,
+                    "graph_latency_sum": 1_024,
+                    "graph_latency_count": 1_024,
+                    "total_tokens": 1_024,
+                    "graph_cost_sum": 1_024,
+                    "graph_cost_count": 1_024,
+                    "traffic_count": 1_024,
+                    "prompt_tokens": 1_024,
+                    "completion_tokens": 1_024,
+                    "graph_error_count": 0,
+                }
+            ],
+            [
+                {
+                    "time_bucket": START,
+                    "graph_latency_sum": 1,
+                    "graph_latency_count": 1,
+                    "total_tokens": 1,
+                    "graph_cost_sum": 1,
+                    "graph_cost_count": 1,
+                    "traffic_count": 1,
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "graph_error_count": 1,
+                }
+            ],
+        ]
+    )
+
+    metrics, metadata = graph_dispatch._fetch_trace_system_metrics(
+        analytics=analytics,
+        sample=_sample(),
+        project_id=PROJECT_ID,
+        interval="hour",
+        started=graph_dispatch.monotonic(),
+        timeout_ms=1_200,
+    )
+
+    metric_calls = [
+        call for call in analytics.calls if "graph_span_identities" in call[1]
+    ]
+    assert [len(call[1]["graph_span_identities"]) for call in metric_calls] == [
+        graph_dispatch.GRAPH_SPAN_METRIC_BATCH_SIZE,
+        1,
+    ]
+    assert metrics["traffic"][0]["traffic"] == 1_025
+    assert metrics["latency"][0]["value"] == 1
+    assert metrics["error_rate"][0]["value"] == pytest.approx(100 / 1_025)
     assert metadata["query_count"] == _sample().query_count + 3
 
 
