@@ -70,6 +70,13 @@ _INDEXED_TRACE_ANY_SPAN_ANCHOR_COLUMNS = frozenset(
 # remain independently capped and may still acquire 200 identities at once.
 _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE = 20
 
+# A long-window list gets one cheap sparse-value proof before it enters the
+# ordered-root fallback.  Sixty-four includes an exhaustiveness sentinel while
+# keeping the index probe substantially smaller than the short-window 513-row
+# proof; 300 ms prevents a common value from consuming the request budget.
+_LONG_WINDOW_ANCHOR_SENTINEL = 64
+_LONG_WINDOW_ANCHOR_TIMEOUT_MS = 300
+
 
 def _unix_microseconds(value: datetime) -> int:
     """Encode DateTime64(6) without driver tuple-datetime precision loss."""
@@ -546,6 +553,30 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         request_start, request_end = self._bounded_request_window
         return request_end - request_start > timedelta(hours=1)
+
+    def recommended_filter_anchor_probe_limit(self) -> int | None:
+        """Recommend a small sparse-value sentinel for long-window lists.
+
+        Only a positive index-usable any-span leaf can supply the candidate
+        superset. Bulk eval/task reads keep their existing protocol, and short
+        windows retain the full 513-row sparse/common proof.
+        """
+
+        request_start, request_end = self._bounded_request_window
+        if (
+            not self._bounded_bulk_scan
+            and request_end - request_start > timedelta(hours=1)
+            and self._filter_anchor_plans()
+        ):
+            return _LONG_WINDOW_ANCHOR_SENTINEL
+        return None
+
+    def recommended_filter_anchor_probe_timeout_ms(self) -> int | None:
+        """Bound only the optional long-window list probe."""
+
+        if self.recommended_filter_anchor_probe_limit() is not None:
+            return _LONG_WINDOW_ANCHOR_TIMEOUT_MS
+        return None
 
     def build_filter_anchor_probe(self, *, limit: int) -> tuple[str, dict[str, Any]]:
         """Return a finite unordered any-span candidate sentinel.

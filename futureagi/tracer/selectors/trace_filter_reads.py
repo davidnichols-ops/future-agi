@@ -423,6 +423,7 @@ def read_bounded_filter_page(
         active_start: datetime,
         active_end: datetime,
         result_limit: int = _ABSOLUTE_MAX_CANDIDATES,
+        timeout_cap_ms: int | None = None,
     ) -> QueryResult:
         remaining_ms = int((deadline - monotonic()) * 1000)
         if remaining_ms < 25:
@@ -430,11 +431,16 @@ def read_bounded_filter_page(
         if len(attempts) >= max_query_count:
             raise _BudgetExceeded("query_budget_exceeded")
         attempt_started = monotonic()
+        statement_timeout_ms = min(_QUERY_TIMEOUT_MS, remaining_ms)
+        if timeout_cap_ms is not None:
+            if timeout_cap_ms <= 0:
+                raise ValueError("query timeout cap must be positive")
+            statement_timeout_ms = min(statement_timeout_ms, timeout_cap_ms)
         try:
             result = analytics.execute_ch_query(
                 query,
                 params,
-                timeout_ms=min(_QUERY_TIMEOUT_MS, remaining_ms),
+                timeout_ms=statement_timeout_ms,
                 settings={
                     **_READ_SETTINGS,
                     **(read_settings or {}),
@@ -615,9 +621,38 @@ def read_bounded_filter_page(
         ordered_seed_builder = getattr(builder, "build_filter_ordered_seed_page", None)
         use_seed_loop = True
         seed_page_builder = builder.build_filter_seed_page
-        anchor_limit = anchor_probe_limit or min(
-            _SELECTIVE_ANCHOR_SENTINEL,
-            max_candidates + 1,
+        recommended_anchor_limit: int | None = None
+        recommended_anchor_timeout_ms: int | None = None
+        if anchor_probe_limit is None and not anchor_probe_only:
+            anchor_limit_builder = getattr(
+                builder, "recommended_filter_anchor_probe_limit", None
+            )
+            if callable(anchor_limit_builder):
+                raw_anchor_limit = anchor_limit_builder()
+                if raw_anchor_limit is not None:
+                    recommended_anchor_limit = int(raw_anchor_limit)
+                    if not 2 <= recommended_anchor_limit <= max_candidates:
+                        raise ValueError(
+                            "recommended anchor probe limit exceeds max_candidates"
+                        )
+                    anchor_timeout_builder = getattr(
+                        builder, "recommended_filter_anchor_probe_timeout_ms", None
+                    )
+                    if callable(anchor_timeout_builder):
+                        raw_anchor_timeout = anchor_timeout_builder()
+                        if raw_anchor_timeout is not None:
+                            recommended_anchor_timeout_ms = int(raw_anchor_timeout)
+                            if recommended_anchor_timeout_ms <= 0:
+                                raise ValueError(
+                                    "recommended anchor probe timeout must be positive"
+                                )
+        anchor_limit = (
+            anchor_probe_limit
+            or recommended_anchor_limit
+            or min(
+                _SELECTIVE_ANCHOR_SENTINEL,
+                max_candidates + 1,
+            )
         )
         skip_full_anchor_builder = getattr(
             builder,
@@ -643,6 +678,7 @@ def read_bounded_filter_page(
             (
                 anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
                 or anchor_probe_limit is not None
+                or recommended_anchor_limit is not None
             )
             and callable(anchor_builder)
             and callable(anchor_support)
@@ -659,6 +695,7 @@ def read_bounded_filter_page(
                     active_start=request_start,
                     active_end=request_end,
                     result_limit=anchor_limit,
+                    timeout_cap_ms=recommended_anchor_timeout_ms,
                 )
                 anchor_rows = list(anchor_result.data or [])
                 if len(anchor_rows) < anchor_limit:

@@ -302,6 +302,8 @@ def test_long_window_trace_seeds_two_hundred_but_classifies_fifty() -> None:
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 50
     assert builder.skip_full_window_filter_anchor_probe() is True
+    assert builder.recommended_filter_anchor_probe_limit() == 64
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
 
 
 def test_short_window_trace_keeps_full_sparse_anchor_probe() -> None:
@@ -314,6 +316,8 @@ def test_short_window_trace_keeps_full_sparse_anchor_probe() -> None:
     )
 
     assert builder.skip_full_window_filter_anchor_probe() is False
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
 
 
 def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
@@ -331,6 +335,8 @@ def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
     # the high-read phase and must be split independently.
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 20
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
 
 
 def test_eval_trace_any_span_large_prefix_fails_closed_at_query_ceiling() -> None:
@@ -375,6 +381,22 @@ def test_call_type_trace_filter_skips_unindexed_window_anchor() -> None:
     assert "JSONExtract" in match_sql
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 50
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
+
+
+def test_negative_only_trace_filter_skips_long_window_anchor() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected", operation="not_equals"),
+        ],
+    )
+
+    assert builder.supports_filter_anchor_probe() is False
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
 
 
 def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
@@ -3080,6 +3102,16 @@ class _SkipFullAnchorFakeBuilder(_AnchorFakeBuilder):
         return True
 
 
+class _SmallAnchorFakeBuilder(_SkipFullAnchorFakeBuilder):
+    @staticmethod
+    def recommended_filter_anchor_probe_limit() -> int:
+        return 64
+
+    @staticmethod
+    def recommended_filter_anchor_probe_timeout_ms() -> int:
+        return 300
+
+
 class _AnchorFakeExecutor(_FakeExecutor):
     def execute_ch_query(
         self,
@@ -3099,6 +3131,22 @@ class _AnchorFakeExecutor(_FakeExecutor):
         self.calls.append((query, params))
         rows = self.builder.rows[: params["limit"]]
         return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+
+class _TimedAnchorFakeExecutor(_AnchorFakeExecutor):
+    def __init__(self, builder: _FakeBuilder, *, fail_anchor: bool = False):
+        super().__init__(builder)
+        self.fail_anchor = fail_anchor
+        self.timeouts: list[tuple[str, int]] = []
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.timeouts.append((query, timeout_ms))
+        if query == "anchor" and self.fail_anchor:
+            self.calls.append((query, params))
+            raise ReadDeadlineExceeded("anchor timeout")
+        return super().execute_ch_query(
+            query, params, timeout_ms=timeout_ms, settings=settings
+        )
 
 
 class _VersionedFakeExecutor(_FakeExecutor):
@@ -4105,6 +4153,153 @@ def test_lower_anchor_limit_is_opt_in_and_keeps_list_sentinel_unchanged() -> Non
             page_size=2,
             anchor_probe_limit=3,
         )
+
+
+def test_long_window_sparse_indexed_anchor_is_exact_under_small_timeout() -> None:
+    rows = _rows(1, 2, 3)
+    builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert [query for query, _ in executor.calls] == ["anchor", "match"]
+    assert executor.calls[0][1]["limit"] == 64
+    assert 0 < executor.timeouts[0][1] <= 300
+
+
+def test_long_window_common_indexed_anchor_falls_back_to_ordered_roots() -> None:
+    rows = _rows(*range(1, 71))
+    builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert [query for query, _ in executor.calls] == [
+        "anchor",
+        "ordered_seed",
+        "match",
+    ]
+    assert executor.calls[0][1]["limit"] == 64
+
+
+def test_long_window_indexed_anchor_timeout_falls_back_without_degrading() -> None:
+    rows = _rows(1, 2, 3)
+    builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
+    executor = _TimedAnchorFakeExecutor(builder, fail_anchor=True)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert [query for query, _ in executor.calls] == [
+        "anchor",
+        "ordered_seed",
+        "match",
+    ]
+    assert executor.timeouts[0] == ("anchor", 300)
+    assert page.attempts[0].error_code == "read_budget_exceeded"
+
+
+def test_graph_explicit_anchor_limit_overrides_long_window_list_recommendation() -> (
+    None
+):
+    rows = _rows(1, 2, 3)
+    builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        max_seed_attempts=1,
+        max_candidates=3,
+        max_query_count=2,
+        classify_batch_size=3,
+        include_incomplete_rows=True,
+        anchor_probe_only=True,
+        anchor_probe_limit=3,
+    )
+
+    assert page.complete is False
+    assert page.error_code == "sample_limit"
+    assert executor.calls[0] == ("anchor", {"limit": 3})
+    assert executor.timeouts[0][1] > 300
+
+
+def test_small_anchor_preserves_numbered_and_cursor_page_order() -> None:
+    rows = _rows(1, 2, 3, 4, 5)
+    builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
+
+    first_executor = _TimedAnchorFakeExecutor(builder)
+    first = read_bounded_filter_page(
+        builder=builder,
+        analytics=first_executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+    numbered_executor = _TimedAnchorFakeExecutor(builder)
+    numbered = read_bounded_filter_page(
+        builder=builder,
+        analytics=numbered_executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=1,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+    cursor_executor = _TimedAnchorFakeExecutor(builder)
+    cursor = read_bounded_filter_page(
+        builder=builder,
+        analytics=cursor_executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        cursor_start_time=first.rows[-1]["start_time"],
+        cursor_order_token=first.rows[-1]["id"],
+    )
+
+    assert [row["id"] for row in first.rows] == ["span-0", "span-1"]
+    assert [row["id"] for row in numbered.rows] == ["span-2", "span-3"]
+    assert [row["id"] for row in cursor.rows] == ["span-2", "span-3"]
+    assert first.complete and numbered.complete and cursor.complete
+    assert "anchor" not in [query for query, _ in cursor_executor.calls]
 
 
 def test_bounded_reader_keeps_page_zero_and_page_n_disjoint() -> None:
