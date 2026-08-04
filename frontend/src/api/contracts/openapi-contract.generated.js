@@ -79001,7 +79001,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "values": {
           "type": "array",
           "items": {
-            "type": "object"
+            "$ref": "#/definitions/DashboardFilterValueOption"
           }
         },
         "query_complete": {
@@ -93245,6 +93245,50 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "payment_type": {
           "title": "Payment type",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "DashboardFilterValueOption": {
+      "required": [
+        "value",
+        "label"
+      ],
+      "type": "object",
+      "properties": {
+        "value": {
+          "title": "Value",
+          "type": "object",
+          "x-nullable": true
+        },
+        "label": {
+          "title": "Label",
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "title": "Type",
+          "type": "string",
+          "enum": [
+            "string",
+            "number",
+            "boolean",
+            "array"
+          ]
+        },
+        "name": {
+          "title": "Name",
+          "type": "string",
+          "minLength": 1
+        },
+        "email": {
+          "title": "Email",
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "title": "Description",
           "type": "string",
           "minLength": 1
         }

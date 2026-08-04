@@ -18572,6 +18572,31 @@ export interface DashboardCreateUpdateApi {
   description?: string;
 }
 
+export type DashboardFilterValueOptionApiType = typeof DashboardFilterValueOptionApiType[keyof typeof DashboardFilterValueOptionApiType];
+
+
+export const DashboardFilterValueOptionApiType = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+  array: 'array',
+} as const;
+
+export type DashboardFilterValueOptionApiValue = { [key: string]: unknown };
+
+export interface DashboardFilterValueOptionApi {
+  value: DashboardFilterValueOptionApiValue;
+  /** @minLength 1 */
+  label: string;
+  type?: DashboardFilterValueOptionApiType;
+  /** @minLength 1 */
+  name?: string;
+  /** @minLength 1 */
+  email?: string;
+  /** @minLength 1 */
+  description?: string;
+}
+
 export type DashboardFilterValuesResultApiQueryStatus = typeof DashboardFilterValuesResultApiQueryStatus[keyof typeof DashboardFilterValuesResultApiQueryStatus];
 
 
@@ -18590,10 +18615,8 @@ export const DashboardFilterValuesResultApiQueryErrorCode = {
   query_failed: 'query_failed',
 } as const;
 
-export type DashboardFilterValuesResultApiValuesItem = { [key: string]: unknown };
-
 export interface DashboardFilterValuesResultApi {
-  values: DashboardFilterValuesResultApiValuesItem[];
+  values: DashboardFilterValueOptionApi[];
   query_complete?: boolean;
   query_status?: DashboardFilterValuesResultApiQueryStatus;
   query_error_code?: DashboardFilterValuesResultApiQueryErrorCode;

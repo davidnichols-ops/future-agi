@@ -34353,12 +34353,23 @@ export const TracerDashboardFilterValuesQueryParams = zod.object({
 
 export const tracerDashboardFilterValuesResponseStatusDefault = true;
 
+
+
+
+
 export const TracerDashboardFilterValuesResponse = zod.object({
   "status": zod.boolean().default(tracerDashboardFilterValuesResponseStatusDefault),
   "result": zod.object({
   "values": zod.array(zod.object({
+  "value": zod.object({
 
-}).passthrough()),
+}).passthrough(),
+  "label": zod.string().min(1),
+  "type": zod.enum(['string', 'number', 'boolean', 'array']).optional(),
+  "name": zod.string().min(1).optional(),
+  "email": zod.string().min(1).optional(),
+  "description": zod.string().min(1).optional()
+})),
   "query_complete": zod.boolean().optional(),
   "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
