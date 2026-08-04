@@ -337,6 +337,11 @@ def read_bounded_filter_page(
         builder, "build_filter_identity_match_query_from_seed_rows", None
     )
     page_hydration_builder = getattr(builder, "build_filter_page_hydration_query", None)
+    candidate_witness_probe_builder = getattr(
+        builder,
+        "build_filter_candidate_witness_probe",
+        None,
+    )
     hydration_identity_builder = getattr(
         builder, "bounded_filter_page_hydration_identity", None
     )
@@ -571,6 +576,8 @@ def read_bounded_filter_page(
         Hashable, tuple[dict[str, Any], datetime, datetime]
     ] = {}
     eager_identity_prefix_flush_used = False
+    candidate_witness_probe_enabled = False
+    candidate_witness_probe_abandoned = False
     if cursor_key is not None and cursor_key[0] < request_start:
         return BoundedFilterPage(
             rows=[],
@@ -764,6 +771,8 @@ def read_bounded_filter_page(
             seen_candidate_ids.add(candidate_identity)
             candidate_seed_rows[candidate_identity] = row
 
+        nonlocal candidate_witness_probe_abandoned, candidate_witness_probe_enabled
+
         candidate_identities = list(candidate_seed_rows)
         if defer_classification:
             deferred_candidate_by_id.update(candidate_seed_rows)
@@ -772,6 +781,51 @@ def read_bounded_filter_page(
             identity_batch = candidate_identities[
                 batch_offset : batch_offset + classify_batch_size
             ]
+            classified_identity_batch = identity_batch
+            if (
+                identity_only_classification
+                and candidate_witness_probe_enabled
+                and callable(candidate_witness_probe_builder)
+            ):
+                probe_query, probe_params = candidate_witness_probe_builder(
+                    [candidate_seed_rows[identity] for identity in identity_batch]
+                )
+                if probe_query:
+                    try:
+                        probe_result = execute(
+                            kind="prefilter",
+                            query=probe_query,
+                            params=probe_params,
+                            active_start=active_start,
+                            active_end=active_end,
+                            result_limit=len(identity_batch),
+                        )
+                    except _BudgetExceeded as exc:
+                        if exc.error_code != "read_budget_exceeded":
+                            raise
+                        # The probe is optional. A resource failure proves
+                        # nothing, so permanently fall back to the unchanged
+                        # exact classifier for this request.
+                        candidate_witness_probe_enabled = False
+                        candidate_witness_probe_abandoned = True
+                    else:
+                        witness_identities = {
+                            row_identity(row) for row in probe_result.data or []
+                        }
+                        identity_batch = [
+                            identity
+                            for identity in identity_batch
+                            if identity in witness_identities
+                        ]
+                        if (
+                            len(identity_batch) * 4
+                            >= len(classified_identity_batch) * 3
+                        ):
+                            # A broad raw superset cannot amortize its own read;
+                            # keep this batch exact and stop speculating.
+                            candidate_witness_probe_enabled = False
+                            candidate_witness_probe_abandoned = True
+
             candidate_batch = [
                 str(candidate_seed_rows[identity].get(key_field, ""))
                 for identity in identity_batch
@@ -785,7 +839,9 @@ def read_bounded_filter_page(
                     None,
                 )
             )
-            if callable(seeded_match_builder):
+            if not identity_batch:
+                match_result = None
+            elif callable(seeded_match_builder):
                 match_query, match_params = seeded_match_builder(
                     [candidate_seed_rows[identity] for identity in identity_batch]
                 )
@@ -793,43 +849,58 @@ def read_bounded_filter_page(
                 match_query, match_params = builder.build_filter_match_query(
                     candidate_batch
                 )
-            if not match_query:
-                continue
-            match_result = execute(
-                kind="classify",
-                query=match_query,
-                params=match_params,
-                active_start=active_start,
-                active_end=active_end,
-                result_limit=max_candidates,
-            )
-            had_matches_before_query = bool(matched_by_id)
-            for row in match_result.data:
-                identity = row_identity(row)
-                # A classifier can return an updated ordering value different
-                # from its raw seed. Apply the signed result boundary again so
-                # continuation pages remain strictly disjoint.
-                if cursor_key is not None and result_row_key(row) >= cursor_key:
+            if identity_batch:
+                if not match_query:
                     continue
-                if str(row.get(key_field, "")):
-                    matched_by_id[identity] = row
+                match_result = execute(
+                    kind="classify",
+                    query=match_query,
+                    params=match_params,
+                    active_start=active_start,
+                    active_end=active_end,
+                    result_limit=max_candidates,
+                )
+                had_matches_before_query = bool(matched_by_id)
+                for row in match_result.data:
+                    identity = row_identity(row)
+                    # A classifier can return an updated ordering value different
+                    # from its raw seed. Apply the signed result boundary again so
+                    # continuation pages remain strictly disjoint.
+                    if cursor_key is not None and result_row_key(row) >= cursor_key:
+                        continue
+                    if str(row.get(key_field, "")):
+                        matched_by_id[identity] = row
 
-            if (
-                identity_only_classification
-                and not had_matches_before_query
-                and matched_by_id
-            ):
-                if len(attempts) > max_query_count - reserved_hydration_queries:
-                    raise _BudgetExceeded("query_budget_exceeded")
-                if monotonic() > classification_deadline:
-                    raise _BudgetExceeded("deadline_exceeded")
+                if (
+                    identity_only_classification
+                    and callable(candidate_witness_probe_builder)
+                    and not candidate_witness_probe_abandoned
+                    and not match_result.data
+                ):
+                    # One exact zero-yield batch establishes that this request
+                    # is on the sparse path. Subsequent finite candidate batches
+                    # can first use a raw positive witness as a complete
+                    # superset, while this first/common batch stays unchanged.
+                    candidate_witness_probe_enabled = True
+
+                if (
+                    identity_only_classification
+                    and not had_matches_before_query
+                    and matched_by_id
+                ):
+                    if len(attempts) > max_query_count - reserved_hydration_queries:
+                        raise _BudgetExceeded("query_budget_exceeded")
+                    if monotonic() > classification_deadline:
+                        raise _BudgetExceeded("deadline_exceeded")
 
             if stop_on_ordered_prefix and len(matched_by_id) >= prefix_needed:
                 ordered_matches = sorted(
                     matched_by_id.values(), key=result_row_key, reverse=True
                 )
                 cutoff = result_row_key(ordered_matches[prefix_needed - 1])
-                last_classified_seed = candidate_seed_rows[identity_batch[-1]]
+                last_classified_seed = candidate_seed_rows[
+                    classified_identity_batch[-1]
+                ]
                 if cutoff >= seed_row_key(last_classified_seed):
                     return True
         return False

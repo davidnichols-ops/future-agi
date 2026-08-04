@@ -3400,6 +3400,46 @@ class _IdentityHydrationFakeExecutor(_FakeExecutor):
 
 
 @dataclass
+class _CandidateWitnessHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
+    @staticmethod
+    def build_filter_candidate_witness_probe(rows):
+        return "prefilter", {"candidate_ids": tuple(row["id"] for row in rows)}
+
+
+class _CandidateWitnessHydrationFakeExecutor(_IdentityHydrationFakeExecutor):
+    def __init__(
+        self,
+        builder,
+        *,
+        witness_ids=(),
+        fail_prefilter=False,
+        **kwargs,
+    ):
+        super().__init__(builder, **kwargs)
+        self.witness_ids = set(witness_ids)
+        self.fail_prefilter = fail_prefilter
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        if query != "prefilter":
+            return super().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+        self.calls.append((query, params))
+        self.timeouts.append((query, timeout_ms))
+        if self.fail_prefilter:
+            raise ReadDeadlineExceeded("candidate witness budget")
+        rows = [
+            {"id": candidate_id}
+            for candidate_id in params["candidate_ids"]
+            if candidate_id in self.witness_ids
+        ]
+        return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+
+@dataclass
 class _OrgIdentityHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
     @staticmethod
     def bounded_filter_row_identity(row):
@@ -6094,6 +6134,147 @@ def test_sparse_buffer_flush_preserves_exact_page_order_and_hydration() -> None:
     assert classifier["candidate_ids"] == ("trace-0", "trace-1", "trace-2")
     hydration = next(params for query, params in executor.calls if query == "hydrate")
     assert hydration["candidate_ids"] == ("trace-0", "trace-1")
+
+
+def test_sparse_exact_zero_enables_finite_candidate_witness_prefilter() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(6)
+    ]
+    builder = _CandidateWitnessHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=2,
+        recommended_seed_batch_size=6,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        # This raw witness is deliberately stale: the exact classifier's
+        # latest-state result is empty, so it must never become public.
+        witness_ids={"trace-2"},
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.rows == []
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "match_identity",
+        "prefilter",
+        "match_identity",
+        "prefilter",
+    ]
+    exact_batches = [
+        params["candidate_ids"]
+        for query, params in executor.calls
+        if query == "match_identity"
+    ]
+    assert exact_batches == [("trace-0", "trace-1"), ("trace-2",)]
+    assert [attempt.kind for attempt in page.attempts] == [
+        "seed",
+        "classify",
+        "prefilter",
+        "classify",
+        "prefilter",
+    ]
+
+
+def test_candidate_witness_probe_never_runs_on_healthy_first_batch() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(3)
+    ]
+    builder = _CandidateWitnessHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == ["trace-0", "trace-1"]
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "match_identity",
+        "hydrate",
+    ]
+
+
+def test_candidate_witness_read_failure_falls_back_to_exact_classifier() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(4)
+    ]
+    builder = _CandidateWitnessHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=2,
+        recommended_seed_batch_size=4,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        fail_prefilter=True,
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.rows == []
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "match_identity",
+        "prefilter",
+        "match_identity",
+    ]
+    assert executor.calls[-1][1]["candidate_ids"] == ("trace-2", "trace-3")
+    assert page.attempts[-2].kind == "prefilter"
+    assert page.attempts[-2].error_code == "read_budget_exceeded"
+    assert page.attempts[-1].kind == "classify"
 
 
 def test_identity_hydration_keeps_same_text_org_traces_distinct() -> None:
