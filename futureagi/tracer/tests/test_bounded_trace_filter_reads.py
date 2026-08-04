@@ -3187,6 +3187,51 @@ class _TimedAnchorFakeExecutor(_AnchorFakeExecutor):
         )
 
 
+@dataclass
+class _ManualMonotonic:
+    seconds: float = 0.0
+
+    def __call__(self) -> float:
+        return self.seconds
+
+    def advance_ms(self, milliseconds: int) -> None:
+        self.seconds += milliseconds / 1000
+
+
+class _ProductionTimedAnchorFakeExecutor(_TimedAnchorFakeExecutor):
+    """Advance a manual clock and enforce the selector's statement timeout."""
+
+    def __init__(
+        self,
+        builder: _FakeBuilder,
+        *,
+        clock: _ManualMonotonic,
+        anchor_durations_ms: list[int],
+        seed_duration_ms: int,
+        match_duration_ms: int,
+    ):
+        super().__init__(builder)
+        self.clock = clock
+        self.anchor_durations_ms = list(anchor_durations_ms)
+        self.seed_duration_ms = seed_duration_ms
+        self.match_duration_ms = match_duration_ms
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        result = super().execute_ch_query(
+            query, params, timeout_ms=timeout_ms, settings=settings
+        )
+        if query == "anchor":
+            duration_ms = self.anchor_durations_ms.pop(0)
+        elif query in {"seed", "ordered_seed"}:
+            duration_ms = self.seed_duration_ms
+        else:
+            duration_ms = self.match_duration_ms
+        self.clock.advance_ms(min(duration_ms, timeout_ms))
+        if duration_ms >= timeout_ms:
+            raise ReadDeadlineExceeded(f"{query} timeout")
+        return result
+
+
 class _VersionedFakeExecutor(_FakeExecutor):
     """Apply the same raw-version table filter used by CH cursor reads."""
 
@@ -4302,6 +4347,93 @@ def test_partitioned_anchor_uses_one_row_global_sentinel_at_stratum_boundary() -
     anchor_params = [params for query, params in executor.calls if query == "anchor"]
     assert [params["limit"] for params in anchor_params] == [64, 1]
     assert [query for query, _ in executor.calls[2:]] == ["ordered_seed", "match"]
+
+
+def test_partitioned_anchors_share_one_wall_budget_before_exact_fallback() -> None:
+    rows = _rows(1, 2, 3)
+    builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
+    clock = _ManualMonotonic()
+    executor = _ProductionTimedAnchorFakeExecutor(
+        builder,
+        clock=clock,
+        # Every stratum is individually under the former 300 ms cap. Four
+        # independent allowances would spend 1.16 s, leaving too little of the
+        # production 2.2 s list deadline for these healthy exact reads.
+        anchor_durations_ms=[290, 290, 290, 290],
+        seed_duration_ms=550,
+        match_duration_ms=550,
+    )
+
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter()],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=2_200,
+        )
+
+    assert page.complete is True
+    assert page.error_code is None
+    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert [query for query, _ in executor.calls] == [
+        "anchor",
+        "ordered_seed",
+        "match",
+    ]
+    assert executor.timeouts[0] == ("anchor", 300)
+    assert executor.anchor_durations_ms == [290, 290, 290]
+    assert page.elapsed_ms == pytest.approx(1_390)
+
+
+@pytest.mark.parametrize(
+    ("first_anchor_ms", "expected_anchor_calls"),
+    [
+        (274, 2),
+        (277, 1),
+    ],
+)
+def test_partitioned_anchor_wall_budget_honors_minimum_statement_boundary(
+    first_anchor_ms: int,
+    expected_anchor_calls: int,
+) -> None:
+    rows = _rows(1, 2, 3)
+    builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
+    clock = _ManualMonotonic()
+    executor = _ProductionTimedAnchorFakeExecutor(
+        builder,
+        clock=clock,
+        anchor_durations_ms=[first_anchor_ms, 290, 290, 290],
+        seed_duration_ms=10,
+        match_duration_ms=10,
+    )
+
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter()],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=2_200,
+        )
+
+    assert page.complete is True
+    assert page.error_code is None
+    anchor_timeouts = [
+        timeout for query, timeout in executor.timeouts if query == "anchor"
+    ]
+    assert len(anchor_timeouts) == expected_anchor_calls
+    assert anchor_timeouts[0] == 300
+    if expected_anchor_calls == 2:
+        assert 25 <= anchor_timeouts[1] <= 26
+    assert [query for query, _ in executor.calls[-2:]] == [
+        "ordered_seed",
+        "match",
+    ]
 
 
 def test_anchor_budget_boundary_skips_probe_but_preserves_fallback() -> None:

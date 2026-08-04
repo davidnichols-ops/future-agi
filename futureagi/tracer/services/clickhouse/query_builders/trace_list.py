@@ -591,7 +591,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return None
 
     def recommended_filter_anchor_probe_timeout_ms(self) -> int | None:
-        """Bound only the optional long-window list probe."""
+        """Bound total optional long-window list probe wall time.
+
+        The selector shares this allowance across every partition and also
+        uses the remainder as each statement's timeout. It is intentionally
+        not multiplied by the four strata: ordered roots must retain the rest
+        of the request deadline whenever the speculative probe is incomplete.
+        """
 
         if self.recommended_filter_anchor_probe_limit() is not None:
             return _LONG_WINDOW_ANCHOR_TIMEOUT_MS

@@ -784,6 +784,15 @@ def read_bounded_filter_page(
             try:
                 anchor_rows_by_id: dict[Hashable, dict[str, Any]] = {}
                 anchor_hit_sentinel = False
+                # ``recommended_anchor_timeout_ms`` is an aggregate wall cap
+                # for the optional partitioned probe, not four independent
+                # allowances.  A sparse value can otherwise spend almost
+                # 4 x 300 ms before discovering that the last stratum is
+                # common, starving the exact ordered seed/classifier fallback
+                # that would have completed inside the request deadline.
+                # Explicit graph anchors remain single-query reads and keep
+                # their existing statement timeout contract.
+                anchor_wall_started: float | None = None
                 if recommended_anchor_strata > 1 and not anchor_probe_only:
                     duration = request_end - request_start
                     duration_us = (
@@ -819,6 +828,31 @@ def read_bounded_filter_page(
                     if remaining_anchor_limit <= 0:
                         anchor_hit_sentinel = True
                         break
+                    anchor_timeout_cap_ms = recommended_anchor_timeout_ms
+                    if (
+                        recommended_anchor_strata > 1
+                        and not anchor_probe_only
+                        and recommended_anchor_timeout_ms is not None
+                    ):
+                        if anchor_wall_started is None:
+                            anchor_wall_started = monotonic()
+                        else:
+                            anchor_elapsed_ms = int(
+                                (monotonic() - anchor_wall_started) * 1000
+                            )
+                            anchor_remaining_ms = (
+                                recommended_anchor_timeout_ms - anchor_elapsed_ms
+                            )
+                            if anchor_remaining_ms < 25:
+                                # The probe has not covered every stratum, so
+                                # its partial candidates prove nothing. Discard
+                                # them and preserve the ordered exact fallback.
+                                anchor_hit_sentinel = True
+                                break
+                            anchor_timeout_cap_ms = min(
+                                recommended_anchor_timeout_ms,
+                                anchor_remaining_ms,
+                            )
                     if recommended_anchor_strata > 1 and not anchor_probe_only:
                         anchor_query, anchor_params = anchor_builder(
                             limit=remaining_anchor_limit,
@@ -836,7 +870,7 @@ def read_bounded_filter_page(
                         active_start=anchor_start,
                         active_end=anchor_end,
                         result_limit=remaining_anchor_limit,
-                        timeout_cap_ms=recommended_anchor_timeout_ms,
+                        timeout_cap_ms=anchor_timeout_cap_ms,
                         max_bytes_to_read_cap=(
                             recommended_anchor_max_bytes_to_read
                             if recommended_anchor_strata > 1 and not anchor_probe_only
