@@ -563,7 +563,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                                   trace_id < %(filter_before_trace_id)s
                                   OR (
                                       trace_id = %(filter_before_trace_id)s
-                                      AND project_id < toUUID(%(filter_before_project_id)s)
+                                      AND toString(project_id) < %(filter_before_project_id)s
                                   )
                               )
                           )
@@ -583,7 +583,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         WHERE {predicate}{datetime_fragment}
           {sampling_fragment}
           {keyset_fragment}
-        ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC
+        ORDER BY start_time DESC, id DESC, trace_id DESC,
+            toString(project_id) DESC
         LIMIT 1 BY project_id, trace_id, id, start_time
         LIMIT %(filter_seed_limit)s
         """
@@ -831,7 +832,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
               AND {predicate}
         ) AS latest_candidates
         WHERE {residual_predicate}
-        ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC
+        ORDER BY start_time DESC, id DESC, trace_id DESC,
+            toString(project_id) DESC
         LIMIT {candidate_count}
         """
         return query, params

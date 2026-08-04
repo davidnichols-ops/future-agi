@@ -286,7 +286,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert "%(candidate_start_date)s - INTERVAL 1 DAY" not in match_sql
     assert "%(candidate_end_date)s + INTERVAL 1 DAY" not in match_sql
     assert builder.filter_seed_proves_result_order() is False
-    assert builder.filter_cursor_seed_keyset_is_safe() is False
+    assert builder.filter_cursor_seed_keyset_is_safe() is True
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 50
 
@@ -518,9 +518,14 @@ def test_org_trace_builder_keeps_project_in_seed_classifier_and_page_keys() -> N
 
     assert "SELECT DISTINCT project_id, trace_id" in anchor_sql
     assert "SELECT project_id, trace_id, id AS root_span_id" in ordered_sql
-    assert "ORDER BY start_time DESC, trace_id DESC, project_id DESC" in ordered_sql
+    assert (
+        "ORDER BY start_time DESC, trace_id DESC, toString(project_id) DESC"
+        in ordered_sql
+    )
     assert "LIMIT 1 BY project_id, trace_id" in ordered_sql
-    assert "project_id < toUUID(%(filter_before_project_id)s)" in ordered_sql
+    assert (
+        "toString(project_id) < %(filter_before_project_id)s" in ordered_sql
+    )
     assert ordered_params["filter_before_id"] == "shared-trace"
     assert ordered_params["filter_before_project_id"] == project_b
     assert match_params["candidate_trace_identities"] == (
@@ -536,7 +541,10 @@ def test_org_trace_builder_keeps_project_in_seed_classifier_and_page_keys() -> N
     )
     assert "GROUP BY project_id, trace_id, id, start_time" in match_sql
     assert "GROUP BY grouped_project_id, grouped_trace_id" in match_sql
-    assert "ORDER BY start_time DESC, trace_id DESC, project_id DESC" in match_sql
+    assert (
+        "ORDER BY start_time DESC, trace_id DESC, toString(project_id) DESC"
+        in match_sql
+    )
     assert "LIMIT 2" in match_sql
     assert builder.bounded_filter_row_identity(seed_rows[0]) == (
         PROJECT_ID,
@@ -603,6 +611,8 @@ def test_span_seed_replay_uses_trace_scoped_otel_identity() -> None:
         slice_start=END - timedelta(minutes=5),
         slice_end=END,
         limit=100,
+        before_start_time=END - timedelta(minutes=1),
+        before_id=("shared-span-id", "trace-z", PROJECT_ID),
     )
     match_sql, params = builder.build_filter_match_query_from_seed_rows(
         [
@@ -625,9 +635,10 @@ def test_span_seed_replay_uses_trace_scoped_otel_identity() -> None:
     assert "project_version_id = %(project_version_id)s" in seed_sql
     assert seed_params["project_version_id"] == project_version_id
     assert "LIMIT 1 BY project_id, trace_id, id, start_time" in seed_sql
-    assert (
-        "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC" in seed_sql
-    )
+    assert "ORDER BY start_time DESC, id DESC, trace_id DESC," in seed_sql
+    assert "toString(project_id) DESC" in seed_sql
+    assert "toString(project_id) < %(filter_before_project_id)s" in seed_sql
+    assert seed_params["filter_before_project_id"] == PROJECT_ID
     assert params["candidate_span_ids"] == ("shared-span-id",)
     assert params["candidate_span_trace_ids"] == ("trace-a", "trace-b")
     first_start = END - timedelta(minutes=1)
@@ -649,6 +660,8 @@ def test_span_seed_replay_uses_trace_scoped_otel_identity() -> None:
     assert params["candidate_span_dates"] == (first_start.date(),)
     assert "toUnixTimestamp64Micro(start_time)" in match_sql
     assert "IN %(candidate_span_identities)s" in match_sql
+    assert "ORDER BY start_time DESC, id DESC, trace_id DESC," in match_sql
+    assert "toString(project_id) DESC" in match_sql
     assert "project_version_id = %(project_version_id)s" in match_sql
     assert params["project_version_id"] == project_version_id
     assert "GROUP BY project_id, trace_id, id, start_time" in match_sql
@@ -3076,10 +3089,54 @@ class _UnindexedAnySpanFakeBuilder(_FakeBuilder):
         return "ordered_seed", params
 
 
-class _UnsafeTraceCursorFakeBuilder(_UnindexedAnySpanFakeBuilder):
+class _OrderedTraceCursorFakeBuilder(_UnindexedAnySpanFakeBuilder):
     @staticmethod
     def filter_cursor_seed_keyset_is_safe() -> bool:
-        return False
+        return True
+
+
+class _OrderedRootFakeExecutor(_FakeExecutor):
+    """Model WHERE keysetting before ORDER BY / LIMIT 1 BY trace."""
+
+    def execute_ch_query(
+        self,
+        query: str,
+        params: dict[str, Any],
+        *,
+        timeout_ms: int,
+        settings: dict[str, Any],
+    ) -> QueryResult:
+        if query != "ordered_seed":
+            return super().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+        self.calls.append((query, params))
+        rows = [
+            row
+            for row in self.builder.rows
+            if params["slice_start"] <= row["start_time"] < params["slice_end"]
+        ]
+        rows.sort(key=lambda row: (row["start_time"], row["id"]), reverse=True)
+        if params["before_start_time"] is not None:
+            boundary = params["before_start_time"], params["before_id"]
+            rows = [
+                row
+                for row in rows
+                if (row["start_time"], row["id"]) < boundary
+            ]
+        distinct_traces: list[dict[str, Any]] = []
+        seen_trace_ids: set[str] = set()
+        for row in rows:
+            trace_id = str(row["id"])
+            if trace_id in seen_trace_ids:
+                continue
+            seen_trace_ids.add(trace_id)
+            distinct_traces.append(row)
+        limited = distinct_traces[: params["limit"]]
+        return QueryResult(limited, len(limited), "clickhouse", 1.0)
 
 
 class _AnchorFakeBuilder(_FakeBuilder):
@@ -4712,6 +4769,48 @@ def test_org_trace_cursor_continues_across_project_collision_without_skip() -> N
     assert [page.has_more for page in pages] == [True, True, False]
 
 
+def test_org_span_cursor_tie_uses_canonical_project_string_order() -> None:
+    project_low = "00000000-0000-4000-8000-000000000001"
+    project_high = "00000000-0000-4000-8000-000000000010"
+    timestamp = END - timedelta(minutes=1)
+    rows = [
+        {
+            "id": "shared-span",
+            "trace_id": "shared-trace",
+            "project_id": project_id,
+            "start_time": timestamp,
+        }
+        for project_id in (project_low, project_high)
+    ]
+    builder = _PhysicalCursorFakeBuilder(rows)
+
+    first = read_bounded_filter_page(
+        builder=builder,
+        analytics=_PhysicalCursorFakeExecutor(builder),
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+    )
+    second = read_bounded_filter_page(
+        builder=builder,
+        analytics=_PhysicalCursorFakeExecutor(builder),
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+        cursor_start_time=timestamp,
+        cursor_order_token=("shared-span", "shared-trace", project_high),
+    )
+
+    assert [first.rows[0]["project_id"], second.rows[0]["project_id"]] == [
+        project_high,
+        project_low,
+    ]
+    assert first.has_more is True
+    assert second.has_more is False
+
+
 def test_cursor_keyset_preserves_same_identity_rows_one_microsecond_apart() -> None:
     newest = END - timedelta(minutes=1)
     rows = [
@@ -5196,16 +5295,21 @@ def test_ordered_trace_inner_prefix_keeps_cursor_pages_disjoint() -> None:
     assert first.query_count == second.query_count == 2
 
 
-def test_trace_cursor_rescans_tied_raw_roots_before_tombstone_classification() -> None:
+def test_trace_cursor_keysets_before_limit_by_and_keeps_older_live_root() -> None:
     tied = END - timedelta(minutes=1)
     raw_rows = [
-        {"id": trace_id, "start_time": start_time}
-        for trace_id, start_time in (
-            ("trace-zz", tied),
-            ("trace-y", tied),
-            ("trace-x", tied),
-            ("trace-w", tied),
-            ("trace-v", tied - timedelta(minutes=2)),
+        {"id": trace_id, "root_span_id": root_id, "start_time": start_time}
+        for trace_id, root_id, start_time in (
+            # The stale live version of this physical root is visible to the
+            # non-FINAL seed, but its newer tombstone makes the classifier pick
+            # root-old. On page two the public keyset excludes root-new while
+            # root-old remains a valid physical seed below the cursor.
+            ("trace-zz", "root-new-tombstoned", tied),
+            ("trace-y", "root-y", tied),
+            ("trace-x", "root-x", tied),
+            ("trace-w", "root-w", tied),
+            ("trace-zz", "root-old-live", tied - timedelta(minutes=1)),
+            ("trace-v", "root-v", tied - timedelta(minutes=2)),
         )
     ]
     match_rows = [
@@ -5217,7 +5321,7 @@ def test_trace_cursor_rescans_tied_raw_roots_before_tombstone_classification() -
         {"id": "trace-w", "start_time": tied},
         {"id": "trace-v", "start_time": tied - timedelta(minutes=2)},
     ]
-    builder = _UnsafeTraceCursorFakeBuilder(
+    builder = _OrderedTraceCursorFakeBuilder(
         raw_rows,
         start=END - timedelta(minutes=5),
         end=END,
@@ -5227,14 +5331,14 @@ def test_trace_cursor_rescans_tied_raw_roots_before_tombstone_classification() -
 
     first = read_bounded_filter_page(
         builder=builder,
-        analytics=_FakeExecutor(builder),
+        analytics=_OrderedRootFakeExecutor(builder),
         filters=[_time_filter(start=builder.start, end=builder.end)],
         key_field="id",
         page_number=0,
         page_size=2,
         deadline_ms=5_000,
     )
-    second_executor = _FakeExecutor(builder)
+    second_executor = _OrderedRootFakeExecutor(builder)
     second = read_bounded_filter_page(
         builder=builder,
         analytics=second_executor,
@@ -5256,9 +5360,55 @@ def test_trace_cursor_rescans_tied_raw_roots_before_tombstone_classification() -
     second_seed = next(
         params for query, params in second_executor.calls if query == "ordered_seed"
     )
-    assert second_seed["slice_end"] == builder.end
-    assert second_seed["before_start_time"] is None
-    assert second_seed["before_id"] is None
+    assert second_seed["slice_end"] == tied + timedelta(microseconds=1)
+    assert second_seed["before_start_time"] == tied
+    assert second_seed["before_id"] == "trace-x"
+
+
+def test_trace_cursor_page_one_hundred_keeps_constant_query_work() -> None:
+    rows = [
+        {
+            "id": f"trace-{index:04d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+        }
+        for index in range(2_600)
+    ]
+    builder = _OrderedTraceCursorFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        seed_proves_order=False,
+        recommended_batch_size=50,
+        recommended_seed_batch_size=200,
+    )
+    cursor_start_time = None
+    cursor_order_token = None
+    seen: list[str] = []
+    query_counts: list[int] = []
+
+    for _page_index in range(101):
+        executor = _OrderedRootFakeExecutor(builder)
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(start=builder.start, end=builder.end)],
+            key_field="id",
+            page_number=0,
+            page_size=25,
+            deadline_ms=5_000,
+            cursor_start_time=cursor_start_time,
+            cursor_order_token=cursor_order_token,
+        )
+        assert page.complete is True
+        assert len(page.rows) == 25
+        assert page.has_more is True
+        query_counts.append(page.query_count)
+        seen.extend(str(row["id"]) for row in page.rows)
+        cursor_start_time = page.rows[-1]["start_time"]
+        cursor_order_token = page.rows[-1]["id"]
+
+    assert seen == [f"trace-{index:04d}" for index in range(2_525)]
+    assert query_counts == [2] * 101
 
 
 def test_ordered_trace_inner_prefix_does_not_trust_tombstoned_raw_cutoff() -> None:

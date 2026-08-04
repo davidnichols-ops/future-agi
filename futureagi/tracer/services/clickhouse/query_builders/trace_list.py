@@ -351,17 +351,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
     @staticmethod
     def filter_cursor_seed_keyset_is_safe() -> bool:
-        """Do not apply a public cursor directly to raw root candidates.
+        """Ordered-root seeds may keyset at the public trace cursor.
 
-        A trace's newest raw root is only an upper bound on its canonical live
-        root. If that physical row is tombstoned, latest-state classification
-        can select an older alternate root that belongs after the signed public
-        cursor. Starting the raw seed query at that cursor would skip the trace
-        before classification. The bounded selector must instead scan from the
-        frozen request end and apply the public cursor to classified rows.
+        The cursor predicate is applied to physical roots *before* ``LIMIT 1
+        BY trace``.  If a newer raw root is tombstoned and the canonical live
+        root is older than the cursor, that older physical root still satisfies
+        the predicate and seeds the trace for latest-state classification.  The
+        direct any-span child seed does not share this property; cursor reads
+        must continue to select ``build_filter_ordered_seed_page`` first.
         """
 
-        return False
+        return True
 
     def _filter_anchor_plans(self) -> list[LatestFilterPredicate]:
         """Return directly selective any-span leaves safe for a broad probe.
@@ -786,7 +786,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                           trace_id < %(filter_before_id)s
                           OR (
                               trace_id = %(filter_before_id)s
-                              AND project_id < toUUID(%(filter_before_project_id)s)
+                              AND toString(project_id) < %(filter_before_project_id)s
                           )
                       )
                   )
@@ -807,7 +807,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             "project_id, trace_id" if self.project_ids is not None else "trace_id"
         )
         identity_order = (
-            "trace_id DESC, project_id DESC"
+            "trace_id DESC, toString(project_id) DESC"
             if self.project_ids is not None
             else "trace_id DESC"
         )
@@ -950,7 +950,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                                   trace_id < %(filter_before_trace_id)s
                                   OR (
                                       trace_id = %(filter_before_trace_id)s
-                                      AND project_id < toUUID(%(filter_before_project_id)s)
+                                      AND toString(project_id) < %(filter_before_project_id)s
                                   )
                               )
                           )
@@ -979,7 +979,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                           trace_id < %(filter_before_id)s
                           OR (
                               trace_id = %(filter_before_id)s
-                              AND project_id < toUUID(%(filter_before_project_id)s)
+                              AND toString(project_id) < %(filter_before_project_id)s
                           )
                       )
                   )
@@ -1001,7 +1001,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             select_fragment = "project_id, trace_id, id AS matched_span_id, start_time"
             root_fragment = ""
             order_fragment = (
-                "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC"
+                "ORDER BY start_time DESC, id DESC, trace_id DESC, "
+                "toString(project_id) DESC"
             )
             limit_by_fragment = "LIMIT 1 BY project_id, trace_id, id, start_time"
         else:
@@ -1012,7 +1013,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             )
             root_fragment = "AND (parent_span_id IS NULL OR parent_span_id = '')"
             order_fragment = (
-                "ORDER BY start_time DESC, trace_id DESC, project_id DESC"
+                "ORDER BY start_time DESC, trace_id DESC, "
+                "toString(project_id) DESC"
                 if self.project_ids is not None
                 else "ORDER BY start_time DESC, trace_id DESC"
             )
@@ -1367,7 +1369,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             "grouped_project_id, grouped_trace_id" if org_scope else "grouped_trace_id"
         )
         result_order = (
-            "start_time DESC, trace_id DESC, project_id DESC"
+            "start_time DESC, trace_id DESC, toString(project_id) DESC"
             if org_scope
             else "start_time DESC, trace_id DESC"
         )

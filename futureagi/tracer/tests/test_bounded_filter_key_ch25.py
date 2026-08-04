@@ -2540,9 +2540,11 @@ def test_trace_pages_keep_older_live_root_when_newer_raw_root_is_tombstoned(
         analytics=LocalAnalytics(),
         filters=filters,
         key_field="trace_id",
-        page_number=1,
+        page_number=0,
         page_size=1,
         deadline_ms=10_000,
+        cursor_start_time=first.rows[-1]["start_time"],
+        cursor_order_token=first.rows[-1]["trace_id"],
     )
 
     assert first.complete is True and second.complete is True

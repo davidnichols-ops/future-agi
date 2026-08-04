@@ -540,11 +540,11 @@ def read_bounded_filter_page(
             result_payload_bytes=0,
             attempts=(),
         )
-    # Safe seed/result orders may start directly at the signed cursor. Trace
-    # raw roots are only an upper bound on the canonical live-root order: a
-    # tombstoned newer root can expose an older alternate root. Those cursors
-    # therefore restart at the frozen request end, then apply the signed public
-    # boundary after latest-state classification below.
+    # Safe seed/result orders may start directly at the signed cursor. A trace
+    # ordered-root builder remains safe with tombstones because its cursor
+    # predicate runs before LIMIT 1 BY trace: the older canonical physical root
+    # can seed the trace even when a newer raw root was later tombstoned. Direct
+    # any-span child order remains unrelated to the public trace order.
     use_cursor_seed_keyset = cursor_key is not None and cursor_seed_keyset_is_safe
     slice_end = (
         min(request_end, cursor_key[0] + timedelta(microseconds=1))
