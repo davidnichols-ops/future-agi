@@ -6006,7 +6006,7 @@ def test_identity_hydration_reserves_query_and_wall_budget() -> None:
         "hydrate",
     ]
     assert executor.timeouts[0] == ("seed", 1_500)
-    assert 899 <= executor.timeouts[1][1] <= 900
+    assert 1_199 <= executor.timeouts[1][1] <= 1_200
     assert executor.timeouts[2] == ("hydrate", 300)
     assert page.elapsed_ms == pytest.approx(2_149)
 
@@ -6022,8 +6022,11 @@ def test_identity_hydration_reserves_query_and_wall_budget() -> None:
         max_query_count=2,
     )
     assert preflight.complete is False
-    assert preflight.error_code == "page_depth_exceeded"
-    assert preflight_executor.calls == []
+    assert preflight.error_code == "query_budget_exceeded"
+    assert [query for query, _ in preflight_executor.calls] == [
+        "seed",
+        "match_identity",
+    ]
 
 
 def test_identity_hydration_timeout_is_sanitized_and_never_returns_identity_rows() -> (
@@ -6068,6 +6071,85 @@ def test_identity_hydration_timeout_is_sanitized_and_never_returns_identity_rows
     assert page.error_code == "read_budget_exceeded"
     assert page.attempts[-1].kind == "hydrate"
     assert page.attempts[-1].error_code == "read_budget_exceeded"
+
+
+def test_absent_identity_filter_can_use_the_full_query_budget() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(3)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=4,
+        recommended_seed_batch_size=4,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        max_candidates=4,
+        max_query_count=2,
+    )
+
+    assert page.complete is True
+    assert page.rows == []
+    assert page.error_code is None
+    assert page.query_count == 2
+    assert [query for query, _ in executor.calls] == ["seed", "match_identity"]
+
+
+def test_late_first_identity_match_fails_closed_before_hydration() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(3)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    clock = _ManualMonotonic()
+    executor = _IdentityHydrationFakeExecutor(
+        builder,
+        clock=clock,
+        durations_ms={"seed": 500, "match_identity": 250},
+    )
+
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(start=builder.start, end=builder.end)],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=1_000,
+            max_query_count=3,
+        )
+
+    assert page.complete is False
+    assert page.rows == []
+    assert page.error_code == "deadline_exceeded"
+    assert [query for query, _ in executor.calls] == ["seed", "match_identity"]
 
 
 def test_identity_hydration_supports_the_api_page_size_500_envelope() -> None:

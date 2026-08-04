@@ -522,7 +522,6 @@ def read_bounded_filter_page(
     }
     if bounded_numbered_page_depth_exceeded(
         **page_depth_kwargs,
-        reserved_query_count=reserved_hydration_queries,
     ):
         return BoundedFilterPage(
             rows=[],
@@ -541,12 +540,10 @@ def read_bounded_filter_page(
         anchor_can_run
         and not anchor_probe_only
         and (
-            recommended_anchor_strata + reserved_hydration_queries > max_query_count
+            recommended_anchor_strata > max_query_count
             or bounded_numbered_page_depth_exceeded(
                 **page_depth_kwargs,
-                reserved_query_count=(
-                    recommended_anchor_strata + reserved_hydration_queries
-                ),
+                reserved_query_count=recommended_anchor_strata,
             )
         )
     ):
@@ -611,15 +608,18 @@ def read_bounded_filter_page(
         max_bytes_to_read_cap: int | None = None,
         use_reserved_query_budget: bool = False,
     ) -> QueryResult:
+        hydration_reserve_is_active = bool(matched_by_id)
         active_deadline = (
-            deadline if use_reserved_query_budget else classification_deadline
+            deadline
+            if use_reserved_query_budget or not hydration_reserve_is_active
+            else classification_deadline
         )
         remaining_ms = int((active_deadline - monotonic()) * 1000)
         if remaining_ms < 25:
             raise _BudgetExceeded("deadline_exceeded")
         active_query_limit = (
             max_query_count
-            if use_reserved_query_budget
+            if use_reserved_query_budget or not hydration_reserve_is_active
             else max_query_count - reserved_hydration_queries
         )
         if len(attempts) >= active_query_limit:
@@ -794,6 +794,7 @@ def read_bounded_filter_page(
                 active_end=active_end,
                 result_limit=max_candidates,
             )
+            had_matches_before_query = bool(matched_by_id)
             for row in match_result.data:
                 identity = row_identity(row)
                 # A classifier can return an updated ordering value different
@@ -803,6 +804,16 @@ def read_bounded_filter_page(
                     continue
                 if str(row.get(key_field, "")):
                     matched_by_id[identity] = row
+
+            if (
+                identity_only_classification
+                and not had_matches_before_query
+                and matched_by_id
+            ):
+                if len(attempts) > max_query_count - reserved_hydration_queries:
+                    raise _BudgetExceeded("query_budget_exceeded")
+                if monotonic() > classification_deadline:
+                    raise _BudgetExceeded("deadline_exceeded")
 
             if stop_on_ordered_prefix and len(matched_by_id) >= prefix_needed:
                 ordered_matches = sorted(
