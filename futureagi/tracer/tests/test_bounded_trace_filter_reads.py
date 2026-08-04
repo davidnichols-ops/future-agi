@@ -309,6 +309,172 @@ def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
     assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
 
 
+@pytest.mark.parametrize(
+    ("filter_type", "operation", "value", "map_column"),
+    [
+        ("text", "equals", "Rejected", "span_attr_str"),
+        ("text", "in", ["Rejected", "Queued"], "span_attr_str"),
+        ("number", "equals", 7, "span_attr_num"),
+        ("boolean", "in", [True, False], "span_attr_bool"),
+    ],
+)
+def test_trace_candidate_witness_probe_is_finite_typed_map_superset(
+    filter_type: str,
+    operation: str,
+    value: object,
+    map_column: str,
+) -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter(
+                "final_status",
+                value,
+                filter_type=filter_type,
+                operation=operation,
+            ),
+        ],
+    )
+
+    sql, params = builder.build_filter_candidate_witness_probe(
+        [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
+    )
+
+    assert "SELECT DISTINCT trace_id" in sql
+    assert "project_id = %(project_id)s" in sql
+    assert "is_deleted = 0" in sql
+    assert "trace_id IN %(filter_candidate_trace_ids)s" in sql
+    assert (
+        "start_time >= fromUnixTimestamp64Micro(%(filter_candidate_start_us)s)" in sql
+    )
+    assert "start_time < fromUnixTimestamp64Micro(%(filter_candidate_end_us)s)" in sql
+    assert f"mapContains({map_column}, %(latest_filter_key_0)s)" in sql
+    assert " FINAL" not in sql
+    assert "argMax(" not in sql
+    assert params["filter_candidate_trace_ids"] == ("trace-a", "trace-b")
+    assert params["filter_candidate_witness_limit"] == 2
+    assert params["filter_candidate_start_us"] == 1_735_689_600_000_000
+    assert params["filter_candidate_end_us"] == 1_767_225_600_000_000
+    assert params["latest_filter_key_0"] == "final_status"
+
+
+def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    builder = TraceListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+        ],
+    )
+
+    sql, params = builder.build_filter_candidate_witness_probe(
+        [
+            {"project_id": PROJECT_ID, "trace_id": "shared-trace"},
+            {"project_id": project_b, "trace_id": "shared-trace"},
+        ]
+    )
+
+    assert "SELECT DISTINCT project_id, trace_id" in sql
+    assert "project_id IN %(project_ids)s" in sql
+    assert "(project_id, trace_id) IN %(filter_candidate_trace_identities)s" in sql
+    assert params["filter_candidate_trace_identities"] == (
+        (PROJECT_ID, "shared-trace"),
+        (project_b, "shared-trace"),
+    )
+    assert params["filter_candidate_witness_limit"] == 2
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [
+        TraceListQueryBuilder(
+            project_id=PROJECT_ID,
+            filters=[
+                _time_filter(),
+                _attribute_filter("final_status", "Rejected", operation="not_equals"),
+            ],
+        ),
+        TraceListQueryBuilder(
+            project_id=PROJECT_ID,
+            filters=[
+                _time_filter(),
+                _attribute_filter(
+                    "payload",
+                    {"state": "Rejected"},
+                    filter_type="map",
+                ),
+            ],
+        ),
+        TraceListQueryBuilder(
+            project_id=PROJECT_ID,
+            filters=[_time_filter(), _system_filter("trace_name", "checkout")],
+        ),
+        TraceListQueryBuilder(
+            project_id=PROJECT_ID,
+            filters=[_time_filter(), _annotation_filter("label-a", "Rejected")],
+        ),
+        TraceListQueryBuilder(
+            project_id=PROJECT_ID,
+            filters=[
+                _time_filter(),
+                _attribute_filter("final_status", "Rejected"),
+                _attribute_filter("country", "ES"),
+            ],
+        ),
+        TraceListQueryBuilder(
+            project_id=PROJECT_ID,
+            filters=[
+                _time_filter(),
+                _attribute_filter("final_status", "Rejected"),
+            ],
+            bounded_identity_only=True,
+        ),
+        TraceListQueryBuilder(
+            project_id=PROJECT_ID,
+            filters=[
+                _time_filter(),
+                _attribute_filter("final_status", "Rejected"),
+            ],
+            bounded_internal_scan=True,
+        ),
+    ],
+    ids=[
+        "negative",
+        "json-map",
+        "root",
+        "residual",
+        "multi-filter",
+        "identity-only",
+        "internal",
+    ],
+)
+def test_trace_candidate_witness_probe_is_unavailable_for_unsafe_shapes(
+    builder: TraceListQueryBuilder,
+) -> None:
+    assert builder.build_filter_candidate_witness_probe([{"trace_id": "trace-a"}]) == (
+        "",
+        {},
+    )
+
+
+def test_trace_candidate_witness_probe_rejects_unbounded_or_invalid_candidates() -> (
+    None
+):
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+    )
+
+    too_many = [{"trace_id": f"trace-{index}"} for index in range(101)]
+    assert builder.build_filter_candidate_witness_probe(too_many) == ("", {})
+    assert builder.build_filter_candidate_witness_probe([{}]) == ("", {})
+
+
 def test_short_window_trace_keeps_full_sparse_anchor_probe() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,

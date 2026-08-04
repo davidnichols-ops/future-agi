@@ -27,7 +27,10 @@ from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.eval_status import (
     non_terminal_eval_marker,
 )
-from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.filters import (
+    ClickHouseFilterBuilder,
+    normalize_filter_op,
+)
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     LatestFilterPredicate,
     partition_trace_filter_plans,
@@ -710,6 +713,152 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         WHERE {anchor.seed_predicate}
           {sampling_fragment}
         LIMIT %(filter_anchor_limit)s
+        """
+        return query, params
+
+    def build_filter_candidate_witness_probe(
+        self,
+        seed_rows: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Return raw positive-Map witnesses for a finite trace batch.
+
+        This optional probe is deliberately narrower than the general latest-
+        state classifier.  It is a complete *superset* only when the request
+        has one positive typed-Map equality/IN leaf: a trace whose latest live
+        span satisfies that leaf must have at least one raw live row satisfying
+        the same leaf.  Returned identities still require latest-state
+        classification; identities absent from this finite result cannot
+        satisfy the request.
+
+        Every other shape returns an unavailable sentinel instead of widening
+        the query.  In particular, JSON, negative/root/residual/multi-filter
+        requests and explicit identity-only/internal consumers retain their
+        existing classifier path.
+        """
+
+        if (
+            not isinstance(seed_rows, list)
+            or not seed_rows
+            or len(seed_rows) > 100
+            or self._bounded_identity_only
+            or self._bounded_internal_scan
+            or self._bounded_membership_filters is not None
+            or self.search
+        ):
+            return "", {}
+
+        try:
+            plans, residual_filters = partition_trace_filter_plans(
+                self._bounded_filters()
+            )
+        except (TypeError, ValueError):
+            return "", {}
+        active_filters = self._active_non_time_filters()
+        if len(active_filters) != 1 or len(plans) != 1 or residual_filters:
+            return "", {}
+
+        item = active_filters[0]
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        if not isinstance(config, dict):
+            return "", {}
+        column_type = str(config.get("col_type") or config.get("colType") or "").upper()
+        operation = normalize_filter_op(
+            str(config.get("filter_op") or config.get("filterOp") or "")
+        )
+        anchor = plans[0]
+        seed_predicate = " ".join(str(anchor.seed_predicate or "").split())
+        if (
+            column_type != "SPAN_ATTRIBUTE"
+            or operation not in {"equals", "in"}
+            or anchor.scope != "any"
+            or not self._plan_uses_indexed_anchor(anchor)
+            or "JSONExtract" in seed_predicate
+            or not re.search(
+                r"\bmapContains\(span_attr_(?:str|num|bool),",
+                seed_predicate,
+            )
+        ):
+            return "", {}
+
+        org_scope = self.project_ids is not None
+        if org_scope:
+            allowed_projects = set(self.project_ids or ())
+            identities: list[tuple[str, str]] = []
+            for row in seed_rows:
+                if not isinstance(row, dict):
+                    return "", {}
+                project_id = str(row.get("project_id") or "")
+                trace_id = str(row.get("trace_id") or "")
+                if not project_id or project_id not in allowed_projects or not trace_id:
+                    return "", {}
+                identities.append((project_id, trace_id))
+            candidate_identities = tuple(dict.fromkeys(identities))
+            if not candidate_identities or len(candidate_identities) > 100:
+                return "", {}
+            candidate_fragment = (
+                "AND (project_id, trace_id) IN %(filter_candidate_trace_identities)s"
+            )
+            candidate_params: dict[str, Any] = {
+                "filter_candidate_trace_identities": candidate_identities,
+            }
+            select_fragment = "project_id, trace_id"
+            candidate_count = len(candidate_identities)
+        else:
+            if not self.project_id:
+                return "", {}
+            trace_ids: list[str] = []
+            for row in seed_rows:
+                if not isinstance(row, dict):
+                    return "", {}
+                row_project_id = row.get("project_id")
+                if row_project_id and str(row_project_id) != str(self.project_id):
+                    return "", {}
+                trace_id = str(row.get("trace_id") or "")
+                if not trace_id:
+                    return "", {}
+                trace_ids.append(trace_id)
+            candidate_trace_ids = tuple(dict.fromkeys(trace_ids))
+            if not candidate_trace_ids or len(candidate_trace_ids) > 100:
+                return "", {}
+            candidate_fragment = "AND trace_id IN %(filter_candidate_trace_ids)s"
+            candidate_params = {
+                "filter_candidate_trace_ids": candidate_trace_ids,
+            }
+            select_fragment = "trace_id"
+            candidate_count = len(candidate_trace_ids)
+
+        request_start, request_end = self._bounded_request_window
+        if request_start >= request_end:
+            return "", {}
+        anchor_params = {
+            key: value
+            for key, value in anchor.params.items()
+            if f"%({key})s" in anchor.seed_predicate
+        }
+        params: dict[str, Any] = {
+            **self.params,
+            **anchor_params,
+            **candidate_params,
+            "filter_candidate_start_us": _unix_microseconds(request_start),
+            "filter_candidate_end_us": _unix_microseconds(request_end),
+            "filter_candidate_witness_limit": candidate_count,
+        }
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = "AND project_version_id = %(project_version_id)s"
+
+        query = f"""
+        SELECT DISTINCT {select_fragment}
+        FROM {self.TABLE}
+        PREWHERE {self.project_filter_sql()}
+          AND is_deleted = 0
+          {project_version_fragment}
+          {candidate_fragment}
+          AND start_time >= fromUnixTimestamp64Micro(%(filter_candidate_start_us)s)
+          AND start_time < fromUnixTimestamp64Micro(%(filter_candidate_end_us)s)
+        WHERE {anchor.seed_predicate}
+        LIMIT %(filter_candidate_witness_limit)s
         """
         return query, params
 
