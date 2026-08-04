@@ -38539,7 +38539,6 @@ export const tracerObservationSpanListSpansObserveQueryPageSizeMax = 500;
 export const tracerObservationSpanListSpansObserveQueryCursorMax = 4096;
 
 export const tracerObservationSpanListSpansObserveQueryCursorModeDefault = false;
-export const tracerObservationSpanListSpansObserveQueryAllowSampledDefault = false;
 
 export const TracerObservationSpanListSpansObserveQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -38551,7 +38550,7 @@ export const TracerObservationSpanListSpansObserveQueryParams = zod.object({
   "page_size": zod.number().min(1).max(tracerObservationSpanListSpansObserveQueryPageSizeMax).default(tracerObservationSpanListSpansObserveQueryPageSizeDefault),
   "cursor": zod.string().min(1).max(tracerObservationSpanListSpansObserveQueryCursorMax).optional().describe('Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.'),
   "cursor_mode": zod.boolean().default(tracerObservationSpanListSpansObserveQueryCursorModeDefault),
-  "allow_sampled": zod.boolean().default(tracerObservationSpanListSpansObserveQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.')
+  "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.')
 })
 
 
@@ -42355,7 +42354,7 @@ export const tracerTraceListTracesQueryPageNumberMin = 0;
 export const tracerTraceListTracesQueryPageSizeDefault = 30;
 export const tracerTraceListTracesQueryPageSizeMax = 500;
 
-export const tracerTraceListTracesQueryAllowSampledDefault = false;
+
 
 export const TracerTraceListTracesQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -42366,7 +42365,7 @@ export const TracerTraceListTracesQueryParams = zod.object({
   "sort_params": zod.string().min(1).default(tracerTraceListTracesQuerySortParamsDefault),
   "page_number": zod.number().min(tracerTraceListTracesQueryPageNumberMin).default(tracerTraceListTracesQueryPageNumberDefault).describe('Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range.'),
   "page_size": zod.number().min(1).max(tracerTraceListTracesQueryPageSizeMax).default(tracerTraceListTracesQueryPageSizeDefault),
-  "allow_sampled": zod.boolean().default(tracerTraceListTracesQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.')
+  "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.')
 })
 
 export const tracerTraceListTracesResponseResultsItemNameMax = 2000;
@@ -42419,7 +42418,6 @@ export const tracerTraceListTracesOfSessionQueryPageSizeMax = 500;
 export const tracerTraceListTracesOfSessionQueryCursorMax = 4096;
 
 export const tracerTraceListTracesOfSessionQueryCursorModeDefault = false;
-export const tracerTraceListTracesOfSessionQueryAllowSampledDefault = false;
 
 export const TracerTraceListTracesOfSessionQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -42432,7 +42430,7 @@ export const TracerTraceListTracesOfSessionQueryParams = zod.object({
   "page_size": zod.number().min(1).max(tracerTraceListTracesOfSessionQueryPageSizeMax).default(tracerTraceListTracesOfSessionQueryPageSizeDefault),
   "cursor": zod.string().min(1).max(tracerTraceListTracesOfSessionQueryCursorMax).optional().describe('Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.'),
   "cursor_mode": zod.boolean().default(tracerTraceListTracesOfSessionQueryCursorModeDefault),
-  "allow_sampled": zod.boolean().default(tracerTraceListTracesOfSessionQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.'),
+  "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.'),
   "interval": zod.string().optional()
 })
 
