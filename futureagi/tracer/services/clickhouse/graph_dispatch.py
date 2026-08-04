@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from time import monotonic
 from typing import Any
@@ -35,6 +36,12 @@ GRAPH_WALL_DEADLINE_MS = 4_400
 GRAPH_QUERY_TIMEOUT_MS = 1_200
 GRAPH_DECORATION_TIMEOUT_MS = 900
 GRAPH_EVENT_LIMIT = 2_000
+# A short-window selector may prove as many as 4,096 trace matches. Decoration
+# fans each trace set into child-span reads, so keep the same finite 40-trace
+# envelope used by the long-window sampler before any decoration query runs.
+GRAPH_TRACE_DECORATION_CANDIDATE_LIMIT = 40
+GRAPH_TRACE_ENTITY_BATCH_SIZE = 5
+GRAPH_SPAN_METRIC_BATCH_SIZE = 512
 _GRAPH_BASE_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
@@ -189,6 +196,58 @@ def _candidate_trace_ids(sample: GraphCandidateSample) -> tuple[str, ...]:
         dict.fromkeys(
             str(row.get("trace_id")) for row in sample.rows if row.get("trace_id")
         )
+    )
+
+
+def _trace_decoration_row_key(row: dict[str, Any]) -> tuple[datetime, str]:
+    start_time = row.get("start_time")
+    if not isinstance(start_time, datetime):
+        normalized_start = datetime.min
+    elif start_time.tzinfo is None:
+        normalized_start = start_time
+    else:
+        normalized_start = start_time.astimezone(UTC).replace(tzinfo=None)
+    return normalized_start, str(row.get("trace_id") or "")
+
+
+def _bounded_trace_decoration_sample(
+    sample: GraphCandidateSample,
+) -> GraphCandidateSample:
+    """Cap trace fan-out to the globally newest finite identity sample."""
+
+    ordered_rows = sorted(
+        (row for row in sample.rows if row.get("trace_id")),
+        key=_trace_decoration_row_key,
+        reverse=True,
+    )
+    unique_rows: list[dict[str, Any]] = []
+    seen_trace_ids: set[str] = set()
+    for row in ordered_rows:
+        trace_id = str(row["trace_id"])
+        if trace_id in seen_trace_ids:
+            continue
+        seen_trace_ids.add(trace_id)
+        unique_rows.append(row)
+
+    if len(unique_rows) <= GRAPH_TRACE_DECORATION_CANDIDATE_LIMIT:
+        return sample
+
+    sampling_strata = sample.sampling_strata if sample.sampling_strata > 0 else 1
+    sampling_strata_completed = (
+        sample.sampling_strata_completed
+        if sample.sampling_strata_completed > 0
+        else sampling_strata
+    )
+    return replace(
+        sample,
+        rows=tuple(unique_rows[:GRAPH_TRACE_DECORATION_CANDIDATE_LIMIT]),
+        query_complete=False,
+        query_status="sampled",
+        query_error_code="sample_limit",
+        total_rows_lower_bound=max(sample.total_rows_lower_bound, len(unique_rows)),
+        sampling_strategy=(sample.sampling_strategy or "newest_trace_candidates"),
+        sampling_strata=sampling_strata,
+        sampling_strata_completed=sampling_strata_completed,
     )
 
 
@@ -374,7 +433,9 @@ def _finite_trace_span_candidates(
     row can contribute to a graph.
     """
 
-    trace_ids = _candidate_trace_ids(sample)
+    bounded_sample = _bounded_trace_decoration_sample(sample)
+    trace_candidates_truncated = bounded_sample is not sample
+    trace_ids = _candidate_trace_ids(bounded_sample)
     if not trace_ids:
         return (), False, 0, 0
     query = """
@@ -388,28 +449,48 @@ def _finite_trace_span_candidates(
     ORDER BY start_time DESC, id DESC, trace_id DESC
     LIMIT %(graph_entity_limit)s
     """
-    result = analytics.execute_ch_query(
-        query,
-        {
-            "graph_project_id": project_id,
-            "graph_trace_ids": trace_ids,
-            "graph_start_date": sample.window_start,
-            "graph_end_date": sample.window_end,
-            "graph_entity_limit": GRAPH_CANDIDATE_LIMIT + 1,
-        },
-        timeout_ms=_remaining_timeout_ms(started, timeout_cap_ms),
-        settings=GRAPH_ENTITY_READ_SETTINGS,
-    )
-    rows = list(result.data or [])
-    truncated = len(rows) > GRAPH_CANDIDATE_LIMIT
-    span_identities = tuple(
-        dict.fromkeys(
+    identities: list[SpanIdentity] = []
+    rows_returned = 0
+    query_count = 0
+    truncated = trace_candidates_truncated
+    for batch_offset in range(0, len(trace_ids), GRAPH_TRACE_ENTITY_BATCH_SIZE):
+        trace_batch = trace_ids[
+            batch_offset : batch_offset + GRAPH_TRACE_ENTITY_BATCH_SIZE
+        ]
+        result = analytics.execute_ch_query(
+            query,
+            {
+                "graph_project_id": project_id,
+                "graph_trace_ids": trace_batch,
+                "graph_start_date": sample.window_start,
+                "graph_end_date": sample.window_end,
+                "graph_entity_limit": GRAPH_CANDIDATE_LIMIT + 1,
+            },
+            timeout_ms=_remaining_timeout_ms(started, timeout_cap_ms),
+            settings=GRAPH_ENTITY_READ_SETTINGS,
+        )
+        batch_rows = list(result.data or [])
+        query_count += 1
+        rows_returned += len(batch_rows)
+        truncated = truncated or len(batch_rows) > GRAPH_CANDIDATE_LIMIT
+        identities.extend(
             identity
-            for row in rows[:GRAPH_CANDIDATE_LIMIT]
+            for row in batch_rows[: GRAPH_CANDIDATE_LIMIT + 1]
             if (identity := _span_identity(row)) is not None
         )
+
+    ordered_identities = sorted(
+        dict.fromkeys(identities),
+        key=lambda identity: (identity[2], identity[1], identity[0]),
+        reverse=True,
     )
-    return span_identities, truncated, 1, len(rows)
+    truncated = truncated or len(ordered_identities) > GRAPH_CANDIDATE_LIMIT
+    return (
+        tuple(ordered_identities[:GRAPH_CANDIDATE_LIMIT]),
+        truncated,
+        query_count,
+        rows_returned,
+    )
 
 
 def _trace_system_metric_query(
@@ -421,21 +502,23 @@ def _trace_system_metric_query(
 ) -> tuple[str, dict[str, Any]]:
     """Aggregate every live span belonging to a finite candidate trace set."""
 
-    trace_ids = _candidate_trace_ids(sample)
+    trace_ids = tuple(dict.fromkeys(identity[0] for identity in span_identities))
     if not trace_ids or not span_identities:
         return "", {}
     bucket_fn = BaseQueryBuilder.time_bucket_expr(interval)
     query = f"""
     SELECT
         {bucket_fn}(latest_start_time) AS time_bucket,
-        avg(latest_latency_ms) AS avg_latency,
+        sum(toFloat64(latest_latency_ms)) AS graph_latency_sum,
+        count(latest_latency_ms) AS graph_latency_count,
         sum(latest_total_tokens) AS total_tokens,
-        avg(latest_cost) AS avg_cost,
+        sum(latest_cost) AS graph_cost_sum,
+        count(latest_cost) AS graph_cost_count,
         count() AS traffic_count,
         sum(latest_prompt_tokens) AS prompt_tokens,
         sum(latest_completion_tokens) AS completion_tokens,
         countIf(upper(latest_status) IN ('ERROR', 'ERRORED', 'FAILED'))
-            * 100.0 / greatest(count(), 1) AS error_rate
+            AS graph_error_count
     FROM (
         SELECT
             id AS grouped_id,
@@ -492,6 +575,7 @@ def _fetch_trace_system_metrics(
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Aggregate all metrics for a finite set of trace candidates once."""
 
+    sample = _bounded_trace_decoration_sample(sample)
     _ensure_point_budget(
         start_date=sample.window_start,
         end_date=sample.window_end,
@@ -509,25 +593,136 @@ def _fetch_trace_system_metrics(
         started=started,
         timeout_cap_ms=timeout_ms,
     )
-    query, params = _trace_system_metric_query(
-        sample=sample,
-        span_identities=span_identities,
-        interval=interval,
-        project_id=project_id,
-    )
-    rows: list[dict[str, Any]] = []
-    columns: list[str] = []
+    bucket_totals: dict[datetime, dict[str, float]] = {}
     metric_query_count = 0
-    if query:
+    metric_rows_returned = 0
+    for batch_offset in range(0, len(span_identities), GRAPH_SPAN_METRIC_BATCH_SIZE):
+        identity_batch = span_identities[
+            batch_offset : batch_offset + GRAPH_SPAN_METRIC_BATCH_SIZE
+        ]
+        query, params = _trace_system_metric_query(
+            sample=sample,
+            span_identities=identity_batch,
+            interval=interval,
+            project_id=project_id,
+        )
+        if not query:
+            continue
         result = analytics.execute_ch_query(
             query,
             params,
             timeout_ms=min(timeout_ms, _remaining_timeout_ms(started, timeout_ms)),
             settings=GRAPH_READ_SETTINGS,
         )
-        rows = list(result.data or [])
-        columns = list(result.columns or [])
-        metric_query_count = 1
+        partial_rows = list(result.data or [])
+        partial_columns = list(result.columns or [])
+        metric_query_count += 1
+        metric_rows_returned += len(partial_rows)
+        column_indexes = {name: index for index, name in enumerate(partial_columns)}
+
+        def value(
+            row: Any,
+            name: str,
+            default: Any = 0,
+            indexes: dict[str, int] = column_indexes,
+        ) -> Any:
+            if isinstance(row, dict):
+                return row.get(name, default)
+            index = indexes.get(name)
+            return row[index] if index is not None and index < len(row) else default
+
+        for row in partial_rows:
+            time_bucket = value(row, "time_bucket", None)
+            if not isinstance(time_bucket, datetime):
+                raise AssertionError("trace metric query returned an invalid bucket")
+            traffic = float(value(row, "traffic_count", 0) or 0)
+            totals = bucket_totals.setdefault(
+                time_bucket,
+                {
+                    "latency_sum": 0.0,
+                    "latency_count": 0.0,
+                    "total_tokens": 0.0,
+                    "cost_sum": 0.0,
+                    "cost_count": 0.0,
+                    "traffic": 0.0,
+                    "prompt_tokens": 0.0,
+                    "completion_tokens": 0.0,
+                    "error_count": 0.0,
+                },
+            )
+            # Real queries return additive sufficient statistics. The fallback
+            # names keep deterministic unit fakes and older shadow evidence
+            # readable while exercising the same exact weighted merge.
+            totals["latency_sum"] += float(
+                value(
+                    row,
+                    "graph_latency_sum",
+                    float(value(row, "avg_latency", 0) or 0) * traffic,
+                )
+                or 0
+            )
+            totals["latency_count"] += float(
+                value(row, "graph_latency_count", traffic) or 0
+            )
+            totals["total_tokens"] += float(value(row, "total_tokens", 0) or 0)
+            totals["cost_sum"] += float(
+                value(
+                    row,
+                    "graph_cost_sum",
+                    float(value(row, "avg_cost", 0) or 0) * traffic,
+                )
+                or 0
+            )
+            totals["cost_count"] += float(value(row, "graph_cost_count", traffic) or 0)
+            totals["traffic"] += traffic
+            totals["prompt_tokens"] += float(value(row, "prompt_tokens", 0) or 0)
+            totals["completion_tokens"] += float(
+                value(row, "completion_tokens", 0) or 0
+            )
+            totals["error_count"] += float(
+                value(
+                    row,
+                    "graph_error_count",
+                    float(value(row, "error_rate", 0) or 0) * traffic / 100.0,
+                )
+                or 0
+            )
+
+    rows: list[dict[str, Any]] = []
+    for time_bucket, totals in sorted(bucket_totals.items()):
+        traffic = totals["traffic"]
+        rows.append(
+            {
+                "time_bucket": time_bucket,
+                "avg_latency": (
+                    totals["latency_sum"] / totals["latency_count"]
+                    if totals["latency_count"]
+                    else 0.0
+                ),
+                "total_tokens": totals["total_tokens"],
+                "avg_cost": (
+                    totals["cost_sum"] / totals["cost_count"]
+                    if totals["cost_count"]
+                    else 0.0
+                ),
+                "traffic_count": int(traffic),
+                "prompt_tokens": totals["prompt_tokens"],
+                "completion_tokens": totals["completion_tokens"],
+                "error_rate": (
+                    totals["error_count"] * 100.0 / traffic if traffic else 0.0
+                ),
+            }
+        )
+    columns = [
+        "time_bucket",
+        "avg_latency",
+        "total_tokens",
+        "avg_cost",
+        "traffic_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "error_rate",
+    ]
     if len(rows) > GRAPH_MAX_POINTS:
         raise BoundedGraphReadError("sample_limit")
 
@@ -544,7 +739,9 @@ def _fetch_trace_system_metrics(
         truncated=span_ids_truncated,
         started=started,
         query_count=sample.query_count + identity_query_count + metric_query_count,
-        rows_returned=(sample.rows_returned + identity_rows_returned + len(rows)),
+        rows_returned=(
+            sample.rows_returned + identity_rows_returned + metric_rows_returned
+        ),
     )
     if metadata.get("query_status") == "degraded":
         metrics = {key: [] for key in metrics}
@@ -962,6 +1159,8 @@ def _finite_eval_graph(
     req_data_config: dict[str, Any],
     started: float,
 ) -> dict[str, Any]:
+    if str(observe_type or "").strip().lower() == "trace":
+        sample = _bounded_trace_decoration_sample(sample)
     metric_id = str(req_data_config.get("id") or "")
     output_type = normalize_eval_graph_output_type(req_data_config)
     selected = req_data_config.get("value")
@@ -1059,6 +1258,7 @@ def fetch_eval_chart_series_ch(
         allow_time_only_seed=not _active_filters(filters),
     )
     _require_renderable_sample(sample)
+    sample = _bounded_trace_decoration_sample(sample)
     metric_id = str(req_data_config.get("id") or "")
     output_type = normalize_eval_graph_output_type(req_data_config)
     rows, truncated, event_query_count, event_rows_returned = _finite_eval_rows(
@@ -1160,7 +1360,8 @@ def _finite_trace_span_ids(
         started=started,
         timeout_cap_ms=GRAPH_DECORATION_TIMEOUT_MS,
     )
-    trace_ids = _candidate_trace_ids(sample)
+    bounded_sample = _bounded_trace_decoration_sample(sample)
+    trace_ids = _candidate_trace_ids(bounded_sample)
     if not trace_ids or not candidate_span_identities:
         return (), truncated, seed_query_count, seed_rows_returned
     query = """
@@ -1355,6 +1556,8 @@ def fetch_annotation_graph_ch(
         allow_time_only_seed=True,
     )
     _require_renderable_sample(sample)
+    if str(observe_type or "").strip().lower() == "trace":
+        sample = _bounded_trace_decoration_sample(sample)
     trace_span_identities: tuple[SpanIdentity, ...] = ()
     trace_span_ids_truncated = False
     span_identity_query_count = 0

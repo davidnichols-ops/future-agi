@@ -54,6 +54,10 @@ GRAPH_DECORATION_CANDIDATE_DEADLINE_MS = 3_100
 GRAPH_MAX_POINTS = 10_000
 GRAPH_ANY_SPAN_STRATA = 8
 GRAPH_ANY_SPAN_ROWS_PER_STRATUM = 49
+# A long-window trace graph is already an explicitly incomplete temporal sample.
+# Four visible traces plus one sentinel per stratum bound its raw union at 40;
+# span graphs retain the established 49-row representative ceiling.
+GRAPH_TRACE_ROWS_PER_STRATUM = 4
 # A long-window sparse-anchor sentinel distinguishes a common predicate before
 # the ordered stratum reads begin. Common predicates deliberately switch to a
 # small representative ceiling: replaying 512 identities in each of eight
@@ -67,18 +71,21 @@ GRAPH_ANY_SPAN_DISTRIBUTED_AFTER = timedelta(hours=1)
 # intentionally incomplete and is always published as sampled metadata.
 GRAPH_UNINDEXED_SAMPLE_SLICE = timedelta(minutes=5)
 
-# Keep the one graph-union classifier inside the same finite resource envelope
-# as the shared bounded selector. The query is scoped to at most eight 50-ID
-# anchor sentinels; it never constructs a tenant/window-wide membership Set.
+# Keep every graph-union classifier inside the same finite resource envelope as
+# the shared bounded selector. Production readback showed that one 400-trace
+# classifier still read 4.29 GiB. The trace-specific sample above bounds the
+# union at 40, and whole-trace 20-ID chunks preserve full-window multi-filter
+# semantics in at most two classifier statements.
 GRAPH_TRACE_UNION_QUERY_TIMEOUT_MS = 750
+GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE = 20
+GRAPH_TRACE_UNION_MAX_QUERY_COUNT = 32
 GRAPH_TRACE_UNION_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
     "max_memory_usage": 256 * 1024 * 1024,
     "max_bytes_to_read": 512 * 1024 * 1024,
     "read_overflow_mode": "throw",
-    "max_result_rows": GRAPH_ANY_SPAN_STRATA
-    * (GRAPH_ANY_SPAN_ROWS_PER_STRATUM + 1),
+    "max_result_rows": GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE,
     "result_overflow_mode": "throw",
 }
 
@@ -140,7 +147,7 @@ class GraphCandidateSample:
 
 @dataclass(frozen=True)
 class _DeferredTraceStratum:
-    """Finite graph-only candidates awaiting one full-window classifier."""
+    """Finite graph-only candidates awaiting full-window classification."""
 
     builder: Any
     candidate_rows: tuple[dict[str, Any], ...]
@@ -243,12 +250,13 @@ def _classify_deferred_trace_strata(
     deadline_ms: int,
     rows_per_stratum: int,
 ) -> tuple[dict[Hashable, dict[str, Any]], float, int, int, int, int]:
-    """Classify the de-duplicated trace union once across the full window.
+    """Classify a de-duplicated trace union in bounded full-window chunks.
 
     Every input row is still only an untrusted anchor/root seed. This helper is
     the sole boundary that turns those finite identities into graph candidates.
-    It reuses the trace list builder's full latest-state, multi-filter query and
-    reapplies each stratum's 49-row visible ceiling after classification.
+    A trace is never divided by time or filter leaf: each chunk reuses the trace
+    list builder's complete latest-state, multi-filter query. Results stay local
+    until every chunk succeeds, then each stratum's visible ceiling is reapplied.
     """
 
     union_by_id: dict[str, dict[str, Any]] = {}
@@ -260,55 +268,81 @@ def _classify_deferred_trace_strata(
     if not union_by_id:
         return {}, 0.0, 0, 0, 0, 0
 
-    absolute_ceiling = GRAPH_ANY_SPAN_STRATA * (
-        GRAPH_ANY_SPAN_ROWS_PER_STRATUM + 1
-    )
+    absolute_ceiling = len(strata) * (rows_per_stratum + 1)
     if len(union_by_id) > absolute_ceiling:
         raise AssertionError("trace graph union exceeds its finite identity ceiling")
 
-    remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
-    if remaining_ms < 25:
-        raise BoundedGraphReadError("read_budget_exceeded")
+    union_rows = list(union_by_id.values())
+    classifier_query_count = (
+        len(union_rows) + GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE - 1
+    ) // GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
+    if len(strata) + classifier_query_count > GRAPH_TRACE_UNION_MAX_QUERY_COUNT:
+        raise AssertionError("trace graph union exceeds its finite query ceiling")
+
     classifier_builder = strata[0].builder
-    classifier_query, classifier_params = (
-        classifier_builder.build_filter_match_query_from_seed_rows(
-            list(union_by_id.values())
+    classified_by_id: dict[str, dict[str, Any]] = {}
+    classifier_elapsed_ms = 0.0
+    classifier_rows_returned = 0
+    classifier_payload_bytes = 0
+    executed_query_count = 0
+    for batch_offset in range(
+        0,
+        len(union_rows),
+        GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE,
+    ):
+        candidate_batch = union_rows[
+            batch_offset : batch_offset + GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
+        ]
+        remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
+        if remaining_ms < 25:
+            raise BoundedGraphReadError("read_budget_exceeded")
+        classifier_query, classifier_params = (
+            classifier_builder.build_filter_match_query_from_seed_rows(candidate_batch)
         )
-    )
-    if not classifier_query:
-        return {}, 0.0, 0, 0, 0, 0
+        if not classifier_query:  # pragma: no cover - guarded by non-empty IDs
+            continue
+        classifier_started = monotonic()
+        try:
+            classifier_result = analytics.execute_ch_query(
+                classifier_query,
+                classifier_params,
+                timeout_ms=min(GRAPH_TRACE_UNION_QUERY_TIMEOUT_MS, remaining_ms),
+                settings={
+                    **GRAPH_TRACE_UNION_READ_SETTINGS,
+                    "max_result_rows": len(candidate_batch),
+                },
+            )
+        except Exception as exc:
+            if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+                raise
+            logger.warning(
+                "trace graph union classifier degraded",
+                batch_index=(batch_offset // GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE),
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+            public_code = (
+                "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+            )
+            # No classified rows have crossed this helper's return boundary, so
+            # a late chunk failure remains atomic.
+            raise BoundedGraphReadError(public_code, retryable=True) from None
 
-    classifier_started = monotonic()
-    try:
-        classifier_result = analytics.execute_ch_query(
-            classifier_query,
-            classifier_params,
-            timeout_ms=min(GRAPH_TRACE_UNION_QUERY_TIMEOUT_MS, remaining_ms),
-            settings={
-                **GRAPH_TRACE_UNION_READ_SETTINGS,
-                "max_result_rows": len(union_by_id),
-            },
-        )
-    except Exception as exc:
-        if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
-            raise
-        logger.warning(
-            "trace graph union classifier degraded",
-            error_type=type(exc).__name__,
-            exc_info=True,
-        )
-        public_code = (
-            "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
-        )
-        raise BoundedGraphReadError(public_code, retryable=True) from None
+        classifier_elapsed_ms += (monotonic() - classifier_started) * 1000
+        classified_rows = list(classifier_result.data or [])
+        candidate_ids = {str(row.get("trace_id") or "") for row in candidate_batch}
+        for row in classified_rows:
+            trace_id = str(row.get("trace_id") or "")
+            if trace_id and trace_id not in candidate_ids:
+                raise AssertionError(
+                    "trace classifier returned an unrequested identity"
+                )
+            if trace_id:
+                classified_by_id[trace_id] = row
+        executed_query_count += 1
+        classifier_rows_returned += len(classified_rows)
+        classifier_payload_bytes += _result_payload_bytes(classified_rows)
 
-    classifier_elapsed_ms = (monotonic() - classifier_started) * 1000
-    classified_rows = list(classifier_result.data or [])
-    classified_by_id = {
-        str(row.get("trace_id") or ""): row
-        for row in classified_rows
-        if row.get("trace_id")
-    }
     visible_by_id: dict[Hashable, dict[str, Any]] = {}
     total_rows_lower_bound = 0
     for stratum in strata:
@@ -335,9 +369,9 @@ def _classify_deferred_trace_strata(
     return (
         visible_by_id,
         classifier_elapsed_ms,
-        1,
-        len(classified_rows),
-        _result_payload_bytes(classified_rows),
+        executed_query_count,
+        classifier_rows_returned,
+        classifier_payload_bytes,
         total_rows_lower_bound,
     )
 
@@ -397,9 +431,9 @@ def _read_time_distributed_candidates(
     )
     force_temporal_sample = False
     # Indexed any-span trace filters acquire every disjoint stratum first, then
-    # replay the de-duplicated <=400-ID union once. If an indexed anchor times
-    # out, the existing five-minute root fallback feeds the same union; raw
-    # anchors/root seeds never enter ``rows_by_id`` directly.
+    # replay the de-duplicated <=40-ID union in full-window chunks. If an indexed anchor
+    # times out, the existing five-minute root fallback feeds the same union;
+    # raw anchors/root seeds never enter ``rows_by_id`` directly.
     defer_trace_classification = False
     deferred_trace_strata: list[_DeferredTraceStratum] = []
 
@@ -477,9 +511,9 @@ def _read_time_distributed_candidates(
             )
             stratum_builder_kwargs["filters"] = stratum_filters
             stratum_builder = builder_class(**stratum_builder_kwargs)
-        # One extra identity is the finite has-more sentinel. Keeping the whole
-        # stratum working set at 50 avoids the 512-row classifier that exceeded
-        # the production graph deadline.
+        # One extra identity is the finite has-more sentinel. Keeping the
+        # stratum working set at the caller-specific sample ceiling avoids the
+        # oversized classifier that exceeded the production graph deadline.
         candidate_limit = rows_per_stratum + 1
         max_seed_attempts = (
             rows_per_stratum + 1 + candidate_limit - 1
@@ -521,13 +555,13 @@ def _read_time_distributed_candidates(
                 max_seed_attempts=seed_attempts,
                 max_query_count=query_limit,
                 # The visible rows plus one has-more sentinel stay finite. A
-                # sparse/unattested path retains the 49-row representative
-                # ceiling.
+                # sparse/unattested path retains the caller-specific
+                # representative ceiling.
                 max_candidates=candidate_count,
                 classify_batch_size=classify_size,
                 include_incomplete_rows=True,
                 # An indexed graph stratum is one disjoint piece of the frozen
-                # request window.  Its 50th raw identity is therefore a local
+                # request window. Its extra raw identity is therefore a local
                 # sample sentinel: classify that finite set and never enter the
                 # ORDER BY seed path for directly anchorable predicates.
                 anchor_probe_only=use_anchor,
@@ -830,7 +864,11 @@ def read_graph_candidates(
             window_end=window_end,
             deadline_ms=deadline_ms,
             classify_batch_size=int(classify_batch_size or 50),
-            rows_per_stratum=GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
+            rows_per_stratum=(
+                GRAPH_TRACE_ROWS_PER_STRATUM
+                if mode == "trace"
+                else GRAPH_ANY_SPAN_ROWS_PER_STRATUM
+            ),
             synthetic_time_only_seed=synthetic_time_only_seed,
         )
 
