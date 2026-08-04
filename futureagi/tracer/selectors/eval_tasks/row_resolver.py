@@ -730,7 +730,15 @@ def _resolve_bounded_historical_span_ids(
         # batches, then replay witnesses only for the final matched prefix.
         # High-limit population proofs attach witnesses in one pass below.
         **(
-            {"bounded_include_filter_witnesses": not trace_witness_replay}
+            {
+                # Attach witness projections in phase one only when a high-limit
+                # population proof must finish in one pass.  Callers that do not
+                # request witnesses and normal two-phase tasks both need the
+                # lightweight membership classifier; treating "no replay" as
+                # "include witnesses" shrank those batches from 100 traces to 20
+                # and repeated the expensive argMinIf projections unnecessarily.
+                "bounded_include_filter_witnesses": trace_population_proof
+            }
             if row_type == RowType.TRACES
             else {}
         ),

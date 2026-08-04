@@ -172,7 +172,7 @@ def test_task_filters_merge_legacy_and_canonical_lists() -> None:
     ("row_type", "identity", "expected_classify_batch"),
     [
         (RowType.SPANS, "id", 200),
-        (RowType.TRACES, "trace_id", 20),
+        (RowType.TRACES, "trace_id", 100),
     ],
 )
 def test_bounded_resolver_returns_only_a_complete_latest_state_page(
@@ -233,8 +233,21 @@ def test_bounded_resolver_returns_only_a_complete_latest_state_page(
     assert captured["builder"].supports_bounded_filter_scan() is True
     assert captured["builder"]._bounded_identity_only is True
     if row_type == RowType.TRACES:
-        assert captured["builder"]._bounded_bulk_scan is True
-        assert captured["builder"].skip_full_window_filter_anchor_probe() is True
+        trace_builder = captured["builder"]
+        assert trace_builder._bounded_bulk_scan is True
+        assert trace_builder._bounded_include_filter_witnesses is False
+        assert trace_builder.skip_full_window_filter_anchor_probe() is True
+        membership_sql, _ = trace_builder.build_filter_match_query_from_seed_rows(
+            [
+                {
+                    "trace_id": "trace-a",
+                    "root_span_id": "root-a",
+                    "start_time": END - timedelta(minutes=1),
+                }
+            ]
+        )
+        assert "filter_witness_0" not in membership_sql
+        assert "argMinIf(tuple(grouped_id, latest_start_time)" not in membership_sql
 
 
 def test_bounded_historical_session_selector_proves_and_sorts_full_population(
@@ -567,7 +580,9 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
     assert "argMinIf(tuple(grouped_id, latest_start_time)" not in membership_sql
 
 
-def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population() -> None:
+def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Exercise the real 100k wire limit through the real bounded reader.
 
     The population is deliberately smaller than the 10k executable buffer. The
@@ -637,6 +652,17 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population() -> No
             ]
             return QueryResult(rows, len(rows), "clickhouse", 1.0)
 
+    captured: dict = {}
+    real_read = read_bounded_filter_page
+
+    def capture_read(**kwargs):
+        captured.update(kwargs)
+        return real_read(**kwargs)
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", capture_read
+    )
+
     analytics = SparsePopulationAnalytics()
     result = row_resolver._resolve_bounded_historical_span_ids(
         analytics,
@@ -669,6 +695,8 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population() -> No
     ]
     assert len(seed_queries) == 2
     assert len(classifier_queries) == 1
+    assert captured["classify_batch_size"] == 100
+    assert captured["builder"]._bounded_include_filter_witnesses is True
 
 
 def test_trace_eval_witness_replay_uses_hundred_id_batches_with_hard_caps(
