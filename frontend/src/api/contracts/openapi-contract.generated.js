@@ -30389,6 +30389,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "500": {
             "$ref": "#/definitions/ApiErrorResponse"
           },
+          "503": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
           }
@@ -32594,6 +32597,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "500": {
             "$ref": "#/definitions/ApiErrorResponse"
           },
+          "503": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
           "default": {
             "$ref": "#/definitions/ManagementAPIErrorResponse"
           }
@@ -32672,7 +32678,15 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "requestBody": {
           "$ref": "#/definitions/ObserveGraphDataRequest"
         },
-        "queryParameters": {},
+        "queryParameters": {
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
         "responses": {
           "200": {
             "$ref": "#/definitions/ObserveGraphDataResponse"
@@ -32681,6 +32695,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "$ref": "#/definitions/ApiErrorResponse"
           },
           "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
             "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
@@ -32803,6 +32820,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "$ref": "#/definitions/ApiErrorResponse"
           },
           "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
             "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
@@ -33159,6 +33179,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
             }
           },
           "cursor_mode": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "allow_sampled": {
             "required": false,
             "schema": {
               "type": "boolean",
@@ -33985,6 +34012,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "minLength": 1,
               "default": "[]"
             }
+          },
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "responses": {
@@ -34083,7 +34117,15 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "requestBody": {
           "$ref": "#/definitions/ProjectUsersAggregateGraphDataRequest"
         },
-        "queryParameters": {},
+        "queryParameters": {
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
         "responses": {
           "201": {
             "$ref": "#/definitions/ProjectUsersAggregateGraphDataRequest"
@@ -35120,7 +35162,15 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "requestBody": {
           "$ref": "#/definitions/TraceSessionGraphDataRequest"
         },
-        "queryParameters": {},
+        "queryParameters": {
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
         "responses": {
           "200": {
             "$ref": "#/definitions/ObserveGraphDataResponse"
@@ -35270,6 +35320,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
             }
           }
         },
@@ -35636,7 +35693,15 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "requestBody": {
           "$ref": "#/definitions/ObserveGraphDataRequest"
         },
-        "queryParameters": {},
+        "queryParameters": {
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
         "responses": {
           "200": {
             "$ref": "#/definitions/ObserveGraphDataResponse"
@@ -35645,6 +35710,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "$ref": "#/definitions/ApiErrorResponse"
           },
           "500": {
+            "$ref": "#/definitions/ApiErrorResponse"
+          },
+          "503": {
             "$ref": "#/definitions/ApiErrorResponse"
           },
           "default": {
@@ -35982,6 +36050,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "maximum": 500,
               "default": 30
             }
+          },
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "responses": {
@@ -36111,6 +36186,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "default": false
             }
           },
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
           "interval": {
             "required": false,
             "schema": {
@@ -36180,6 +36262,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
             }
           },
           "remove_simulation_calls": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "allow_sampled": {
             "required": false,
             "schema": {
               "type": "boolean",
@@ -56433,6 +56522,12 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Project id",
           "type": "string",
           "format": "uuid"
+        },
+        "allow_sampled": {
+          "title": "Allow sampled",
+          "description": "Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.",
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -60965,6 +61060,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
+            "sampled",
             "degraded"
           ]
         },
@@ -69774,6 +69870,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
+            "sampled",
             "degraded"
           ]
         },
@@ -69823,6 +69920,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
+            "sampled",
             "degraded"
           ]
         },
@@ -69872,6 +69970,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
+            "sampled",
             "degraded"
           ]
         },

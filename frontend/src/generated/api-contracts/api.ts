@@ -1141,6 +1141,7 @@ import type {
   TracerObservationSpanGetEvalAttributesListParams,
   TracerObservationSpanGetEvaluationDetails200,
   TracerObservationSpanGetEvaluationDetailsParams,
+  TracerObservationSpanGetGraphMethodsParams,
   TracerObservationSpanGetObservationSpanFields200,
   TracerObservationSpanGetObservationSpanFieldsParams,
   TracerObservationSpanGetSpanAttributesListParams,
@@ -1163,6 +1164,7 @@ import type {
   TracerProjectGetGraphData200,
   TracerProjectGetGraphDataParams,
   TracerProjectGetUserGraphDataParams,
+  TracerProjectGetUsersAggregateGraphDataParams,
   TracerProjectList200,
   TracerProjectListParams,
   TracerProjectListProjectIdsParams,
@@ -1186,6 +1188,7 @@ import type {
   TracerTraceAnnotationGetAnnotationValuesParams,
   TracerTraceGetEvalNames200,
   TracerTraceGetEvalNamesParams,
+  TracerTraceGetGraphMethodsParams,
   TracerTraceGetProperties200,
   TracerTraceGetPropertiesParams,
   TracerTraceGetTraceExportData200,
@@ -1201,6 +1204,7 @@ import type {
   TracerTraceListTracesParams,
   TracerTraceListVoiceCallsParams,
   TracerTraceSessionGetSessionFilterValuesParams,
+  TracerTraceSessionGetSessionGraphDataParams,
   TracerTraceSessionGetTraceSessionExportData200,
   TracerTraceSessionGetTraceSessionExportDataParams,
   TracerTraceSessionList200,
@@ -58413,15 +58417,20 @@ export type tracerDashboardFilterValuesResponse500 = {
   status: 500
 }
 
+export type tracerDashboardFilterValuesResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerDashboardFilterValuesResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerDashboardFilterValuesResponseSuccess = (tracerDashboardFilterValuesResponse200) & {
   headers: Headers;
 };
-export type tracerDashboardFilterValuesResponseError = (tracerDashboardFilterValuesResponse400 | tracerDashboardFilterValuesResponse500 | tracerDashboardFilterValuesResponseDefault) & {
+export type tracerDashboardFilterValuesResponseError = (tracerDashboardFilterValuesResponse400 | tracerDashboardFilterValuesResponse500 | tracerDashboardFilterValuesResponse503 | tracerDashboardFilterValuesResponseDefault) & {
   headers: Headers;
 };
 
@@ -62163,15 +62172,20 @@ export type tracerObservationSpanGetEvalAttributesListResponse500 = {
   status: 500
 }
 
+export type tracerObservationSpanGetEvalAttributesListResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerObservationSpanGetEvalAttributesListResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500 | 503>
 }
 
 export type tracerObservationSpanGetEvalAttributesListResponseSuccess = (tracerObservationSpanGetEvalAttributesListResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanGetEvalAttributesListResponseError = (tracerObservationSpanGetEvalAttributesListResponse400 | tracerObservationSpanGetEvalAttributesListResponse404 | tracerObservationSpanGetEvalAttributesListResponse500 | tracerObservationSpanGetEvalAttributesListResponseDefault) & {
+export type tracerObservationSpanGetEvalAttributesListResponseError = (tracerObservationSpanGetEvalAttributesListResponse400 | tracerObservationSpanGetEvalAttributesListResponse404 | tracerObservationSpanGetEvalAttributesListResponse500 | tracerObservationSpanGetEvalAttributesListResponse503 | tracerObservationSpanGetEvalAttributesListResponseDefault) & {
   headers: Headers;
 };
 
@@ -62297,34 +62311,51 @@ export type tracerObservationSpanGetGraphMethodsResponse500 = {
   status: 500
 }
 
+export type tracerObservationSpanGetGraphMethodsResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerObservationSpanGetGraphMethodsResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerObservationSpanGetGraphMethodsResponseSuccess = (tracerObservationSpanGetGraphMethodsResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanGetGraphMethodsResponseError = (tracerObservationSpanGetGraphMethodsResponse400 | tracerObservationSpanGetGraphMethodsResponse500 | tracerObservationSpanGetGraphMethodsResponseDefault) & {
+export type tracerObservationSpanGetGraphMethodsResponseError = (tracerObservationSpanGetGraphMethodsResponse400 | tracerObservationSpanGetGraphMethodsResponse500 | tracerObservationSpanGetGraphMethodsResponse503 | tracerObservationSpanGetGraphMethodsResponseDefault) & {
   headers: Headers;
 };
 
 export type tracerObservationSpanGetGraphMethodsResponse = (tracerObservationSpanGetGraphMethodsResponseSuccess | tracerObservationSpanGetGraphMethodsResponseError)
 
-export const getTracerObservationSpanGetGraphMethodsUrl = () => {
+export const getTracerObservationSpanGetGraphMethodsUrl = (params?: TracerObservationSpanGetGraphMethodsParams,) => {
+  const normalizedParams = new URLSearchParams();
 
+  Object.entries(params || {}).forEach(([key, value]) => {
 
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
 
+  const stringifiedParams = normalizedParams.toString();
 
-  return `/tracer/observation-span/get_graph_methods/`
+  return stringifiedParams.length > 0 ? `/tracer/observation-span/get_graph_methods/?${stringifiedParams}` : `/tracer/observation-span/get_graph_methods/`
 }
 
 /**
  * Fetch data for the observe graph with optimized queries
  */
-export const tracerObservationSpanGetGraphMethods = async (observeGraphDataRequestApi: ObserveGraphDataRequestApi, options?: RequestInit): Promise<tracerObservationSpanGetGraphMethodsResponse> => {
+export const tracerObservationSpanGetGraphMethods = async (observeGraphDataRequestApi: ObserveGraphDataRequestApi,
+    params?: TracerObservationSpanGetGraphMethodsParams, options?: RequestInit): Promise<tracerObservationSpanGetGraphMethodsResponse> => {
 
-  return apiMutator<tracerObservationSpanGetGraphMethodsResponse>(getTracerObservationSpanGetGraphMethodsUrl(),
+  return apiMutator<tracerObservationSpanGetGraphMethodsResponse>(getTracerObservationSpanGetGraphMethodsUrl(params),
   {
     ...options,
     method: 'POST',
@@ -62407,15 +62438,20 @@ export type tracerObservationSpanGetSpanAttributesListResponse500 = {
   status: 500
 }
 
+export type tracerObservationSpanGetSpanAttributesListResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerObservationSpanGetSpanAttributesListResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 404 | 500 | 503>
 }
 
 export type tracerObservationSpanGetSpanAttributesListResponseSuccess = (tracerObservationSpanGetSpanAttributesListResponse200) & {
   headers: Headers;
 };
-export type tracerObservationSpanGetSpanAttributesListResponseError = (tracerObservationSpanGetSpanAttributesListResponse400 | tracerObservationSpanGetSpanAttributesListResponse404 | tracerObservationSpanGetSpanAttributesListResponse500 | tracerObservationSpanGetSpanAttributesListResponseDefault) & {
+export type tracerObservationSpanGetSpanAttributesListResponseError = (tracerObservationSpanGetSpanAttributesListResponse400 | tracerObservationSpanGetSpanAttributesListResponse404 | tracerObservationSpanGetSpanAttributesListResponse500 | tracerObservationSpanGetSpanAttributesListResponse503 | tracerObservationSpanGetSpanAttributesListResponseDefault) & {
   headers: Headers;
 };
 
@@ -64112,12 +64148,23 @@ export type tracerProjectGetUsersAggregateGraphDataResponseError = (tracerProjec
 
 export type tracerProjectGetUsersAggregateGraphDataResponse = (tracerProjectGetUsersAggregateGraphDataResponseSuccess | tracerProjectGetUsersAggregateGraphDataResponseError)
 
-export const getTracerProjectGetUsersAggregateGraphDataUrl = () => {
+export const getTracerProjectGetUsersAggregateGraphDataUrl = (params?: TracerProjectGetUsersAggregateGraphDataParams,) => {
+  const normalizedParams = new URLSearchParams();
 
+  Object.entries(params || {}).forEach(([key, value]) => {
 
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
 
+  const stringifiedParams = normalizedParams.toString();
 
-  return `/tracer/project/get_users_aggregate_graph_data/`
+  return stringifiedParams.length > 0 ? `/tracer/project/get_users_aggregate_graph_data/?${stringifiedParams}` : `/tracer/project/get_users_aggregate_graph_data/`
 }
 
 /**
@@ -64125,9 +64172,10 @@ export const getTracerProjectGetUsersAggregateGraphDataUrl = () => {
 All metrics are aggregated at the user level.
  * @summary Fetch time-series aggregate user metrics for the observe graph.
  */
-export const tracerProjectGetUsersAggregateGraphData = async (projectUsersAggregateGraphDataRequestApi: ProjectUsersAggregateGraphDataRequestApi, options?: RequestInit): Promise<tracerProjectGetUsersAggregateGraphDataResponse> => {
+export const tracerProjectGetUsersAggregateGraphData = async (projectUsersAggregateGraphDataRequestApi: ProjectUsersAggregateGraphDataRequestApi,
+    params?: TracerProjectGetUsersAggregateGraphDataParams, options?: RequestInit): Promise<tracerProjectGetUsersAggregateGraphDataResponse> => {
 
-  return apiMutator<tracerProjectGetUsersAggregateGraphDataResponse>(getTracerProjectGetUsersAggregateGraphDataUrl(),
+  return apiMutator<tracerProjectGetUsersAggregateGraphDataResponse>(getTracerProjectGetUsersAggregateGraphDataUrl(params),
   {
     ...options,
     method: 'POST',
@@ -66112,12 +66160,23 @@ export type tracerTraceSessionGetSessionGraphDataResponseError = (tracerTraceSes
 
 export type tracerTraceSessionGetSessionGraphDataResponse = (tracerTraceSessionGetSessionGraphDataResponseSuccess | tracerTraceSessionGetSessionGraphDataResponseError)
 
-export const getTracerTraceSessionGetSessionGraphDataUrl = () => {
+export const getTracerTraceSessionGetSessionGraphDataUrl = (params?: TracerTraceSessionGetSessionGraphDataParams,) => {
+  const normalizedParams = new URLSearchParams();
 
+  Object.entries(params || {}).forEach(([key, value]) => {
 
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
 
+  const stringifiedParams = normalizedParams.toString();
 
-  return `/tracer/trace-session/get_session_graph_data/`
+  return stringifiedParams.length > 0 ? `/tracer/trace-session/get_session_graph_data/?${stringifiedParams}` : `/tracer/trace-session/get_session_graph_data/`
 }
 
 /**
@@ -66130,9 +66189,10 @@ export const getTracerTraceSessionGetSessionGraphDataUrl = () => {
 Response shape matches trace graph: {metric_name, data: [{timestamp, value, primary_traffic}]}
  * @summary Fetch time-series session metrics for the observe graph.
  */
-export const tracerTraceSessionGetSessionGraphData = async (traceSessionGraphDataRequestApi: TraceSessionGraphDataRequestApi, options?: RequestInit): Promise<tracerTraceSessionGetSessionGraphDataResponse> => {
+export const tracerTraceSessionGetSessionGraphData = async (traceSessionGraphDataRequestApi: TraceSessionGraphDataRequestApi,
+    params?: TracerTraceSessionGetSessionGraphDataParams, options?: RequestInit): Promise<tracerTraceSessionGetSessionGraphDataResponse> => {
 
-  return apiMutator<tracerTraceSessionGetSessionGraphDataResponse>(getTracerTraceSessionGetSessionGraphDataUrl(),
+  return apiMutator<tracerTraceSessionGetSessionGraphDataResponse>(getTracerTraceSessionGetSessionGraphDataUrl(params),
   {
     ...options,
     method: 'POST',
@@ -66818,34 +66878,51 @@ export type tracerTraceGetGraphMethodsResponse500 = {
   status: 500
 }
 
+export type tracerTraceGetGraphMethodsResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerTraceGetGraphMethodsResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200 | 400 | 500>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerTraceGetGraphMethodsResponseSuccess = (tracerTraceGetGraphMethodsResponse200) & {
   headers: Headers;
 };
-export type tracerTraceGetGraphMethodsResponseError = (tracerTraceGetGraphMethodsResponse400 | tracerTraceGetGraphMethodsResponse500 | tracerTraceGetGraphMethodsResponseDefault) & {
+export type tracerTraceGetGraphMethodsResponseError = (tracerTraceGetGraphMethodsResponse400 | tracerTraceGetGraphMethodsResponse500 | tracerTraceGetGraphMethodsResponse503 | tracerTraceGetGraphMethodsResponseDefault) & {
   headers: Headers;
 };
 
 export type tracerTraceGetGraphMethodsResponse = (tracerTraceGetGraphMethodsResponseSuccess | tracerTraceGetGraphMethodsResponseError)
 
-export const getTracerTraceGetGraphMethodsUrl = () => {
+export const getTracerTraceGetGraphMethodsUrl = (params?: TracerTraceGetGraphMethodsParams,) => {
+  const normalizedParams = new URLSearchParams();
 
+  Object.entries(params || {}).forEach(([key, value]) => {
 
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()))
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString())
+    }
+  });
 
+  const stringifiedParams = normalizedParams.toString();
 
-  return `/tracer/trace/get_graph_methods/`
+  return stringifiedParams.length > 0 ? `/tracer/trace/get_graph_methods/?${stringifiedParams}` : `/tracer/trace/get_graph_methods/`
 }
 
 /**
  * Fetch data for the observe graph with optimized queries
  */
-export const tracerTraceGetGraphMethods = async (observeGraphDataRequestApi: ObserveGraphDataRequestApi, options?: RequestInit): Promise<tracerTraceGetGraphMethodsResponse> => {
+export const tracerTraceGetGraphMethods = async (observeGraphDataRequestApi: ObserveGraphDataRequestApi,
+    params?: TracerTraceGetGraphMethodsParams, options?: RequestInit): Promise<tracerTraceGetGraphMethodsResponse> => {
 
-  return apiMutator<tracerTraceGetGraphMethodsResponse>(getTracerTraceGetGraphMethodsUrl(),
+  return apiMutator<tracerTraceGetGraphMethodsResponse>(getTracerTraceGetGraphMethodsUrl(params),
   {
     ...options,
     method: 'POST',

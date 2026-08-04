@@ -9485,7 +9485,7 @@ export const ApiTracesSpanAttributeDetailListResponse = zod.object({
   "p50": zod.number().optional(),
   "p95": zod.number().optional(),
   "query_complete": zod.boolean(),
-  "query_status": zod.enum(['complete', 'degraded']),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().datetime({"offset":true}),
   "query_window_end": zod.string().datetime({"offset":true})
@@ -9518,7 +9518,7 @@ export const ApiTracesSpanAttributeKeysListResponse = zod.object({
   "count": zod.number()
 })),
   "query_complete": zod.boolean(),
-  "query_status": zod.enum(['complete', 'degraded']),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().datetime({"offset":true}),
   "query_window_end": zod.string().datetime({"offset":true})
@@ -9554,7 +9554,7 @@ export const ApiTracesSpanAttributeValuesListResponse = zod.object({
   "type": zod.enum(['string', 'number', 'boolean', 'array']).optional()
 })),
   "query_complete": zod.boolean(),
-  "query_status": zod.enum(['complete', 'degraded']),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().datetime({"offset":true}),
   "query_window_end": zod.string().datetime({"offset":true})
@@ -33864,6 +33864,7 @@ export const TracerChartsFetchGraphQueryParams = zod.object({
 
 export const tracerChartsFetchGraphResponseResultsItemFiltersDefault = [];
 export const tracerChartsFetchGraphResponseResultsItemPropertyDefault = `average`;
+export const tracerChartsFetchGraphResponseResultsItemAllowSampledDefault = false;
 
 export const TracerChartsFetchGraphResponse = zod.object({
   "count": zod.number(),
@@ -33885,7 +33886,8 @@ export const TracerChartsFetchGraphResponse = zod.object({
 })).default(tracerChartsFetchGraphResponseResultsItemFiltersDefault),
   "property": zod.string().default(tracerChartsFetchGraphResponseResultsItemPropertyDefault),
   "req_data_config": zod.string(),
-  "project_id": zod.string().uuid()
+  "project_id": zod.string().uuid(),
+  "allow_sampled": zod.boolean().default(tracerChartsFetchGraphResponseResultsItemAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
 }))
 })
 
@@ -37854,7 +37856,7 @@ export const TracerObservationSpanGetEvalAttributesListResponse = zod.object({
   "status": zod.boolean().default(tracerObservationSpanGetEvalAttributesListResponseStatusDefault),
   "result": zod.array(zod.string().min(1)),
   "query_complete": zod.boolean().optional(),
-  "query_status": zod.enum(['complete', 'degraded']).optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().datetime({"offset":true}).optional(),
   "query_window_end": zod.string().datetime({"offset":true}).optional()
@@ -37948,6 +37950,12 @@ export const TracerObservationSpanGetEvaluationDetailsResponse = zod.object({
 /**
  * Fetch data for the observe graph with optimized queries
  */
+export const tracerObservationSpanGetGraphMethodsQueryAllowSampledDefault = false;
+
+export const TracerObservationSpanGetGraphMethodsQueryParams = zod.object({
+  "allow_sampled": zod.boolean().default(tracerObservationSpanGetGraphMethodsQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+})
+
 export const tracerObservationSpanGetGraphMethodsBodyFiltersDefault = [];
 export const tracerObservationSpanGetGraphMethodsBodyIntervalDefault = `day`;
 export const tracerObservationSpanGetGraphMethodsBodyPropertyDefault = `average`;
@@ -38140,7 +38148,7 @@ export const TracerObservationSpanGetSpanAttributesListResponse = zod.object({
   "status": zod.boolean().default(tracerObservationSpanGetSpanAttributesListResponseStatusDefault),
   "result": zod.array(zod.string().min(1)),
   "query_complete": zod.boolean().optional(),
-  "query_status": zod.enum(['complete', 'degraded']).optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().datetime({"offset":true}).optional(),
   "query_window_end": zod.string().datetime({"offset":true}).optional()
@@ -38522,6 +38530,7 @@ export const tracerObservationSpanListSpansObserveQueryPageSizeMax = 500;
 export const tracerObservationSpanListSpansObserveQueryCursorMax = 4096;
 
 export const tracerObservationSpanListSpansObserveQueryCursorModeDefault = false;
+export const tracerObservationSpanListSpansObserveQueryAllowSampledDefault = false;
 
 export const TracerObservationSpanListSpansObserveQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -38532,7 +38541,8 @@ export const TracerObservationSpanListSpansObserveQueryParams = zod.object({
   "page_number": zod.number().min(tracerObservationSpanListSpansObserveQueryPageNumberMin).default(tracerObservationSpanListSpansObserveQueryPageNumberDefault).describe('Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range.'),
   "page_size": zod.number().min(1).max(tracerObservationSpanListSpansObserveQueryPageSizeMax).default(tracerObservationSpanListSpansObserveQueryPageSizeDefault),
   "cursor": zod.string().min(1).max(tracerObservationSpanListSpansObserveQueryCursorMax).optional().describe('Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.'),
-  "cursor_mode": zod.boolean().default(tracerObservationSpanListSpansObserveQueryCursorModeDefault)
+  "cursor_mode": zod.boolean().default(tracerObservationSpanListSpansObserveQueryCursorModeDefault),
+  "allow_sampled": zod.boolean().default(tracerObservationSpanListSpansObserveQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.')
 })
 
 
@@ -39841,14 +39851,15 @@ export const tracerProjectGetGraphDataQueryIntervalDefault = `hour`;
 
 export const tracerProjectGetGraphDataQueryFiltersDefault = `[]`;
 
-
+export const tracerProjectGetGraphDataQueryAllowSampledDefault = false;
 
 export const TracerProjectGetGraphDataQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
   "limit": zod.number().optional().describe('Number of results to return per page.'),
   "project_id": zod.string().uuid(),
   "interval": zod.string().min(1).default(tracerProjectGetGraphDataQueryIntervalDefault),
-  "filters": zod.string().min(1).default(tracerProjectGetGraphDataQueryFiltersDefault)
+  "filters": zod.string().min(1).default(tracerProjectGetGraphDataQueryFiltersDefault),
+  "allow_sampled": zod.boolean().default(tracerProjectGetGraphDataQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
 })
 
 export const tracerProjectGetGraphDataResponseResultsItemNameMax = 255;
@@ -39939,6 +39950,12 @@ export const TracerProjectGetUserMetricsBody = zod.object({
 All metrics are aggregated at the user level.
  * @summary Fetch time-series aggregate user metrics for the observe graph.
  */
+export const tracerProjectGetUsersAggregateGraphDataQueryAllowSampledDefault = false;
+
+export const TracerProjectGetUsersAggregateGraphDataQueryParams = zod.object({
+  "allow_sampled": zod.boolean().default(tracerProjectGetUsersAggregateGraphDataQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+})
+
 export const tracerProjectGetUsersAggregateGraphDataBodyIntervalDefault = `day`;
 
 export const tracerProjectGetUsersAggregateGraphDataBodyFiltersDefault = [];
@@ -41492,6 +41509,12 @@ export const TracerTraceSessionGetSessionFilterValuesResponse = zod.array(Tracer
 Response shape matches trace graph: {metric_name, data: [{timestamp, value, primary_traffic}]}
  * @summary Fetch time-series session metrics for the observe graph.
  */
+export const tracerTraceSessionGetSessionGraphDataQueryAllowSampledDefault = false;
+
+export const TracerTraceSessionGetSessionGraphDataQueryParams = zod.object({
+  "allow_sampled": zod.boolean().default(tracerTraceSessionGetSessionGraphDataQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+})
+
 export const tracerTraceSessionGetSessionGraphDataBodyFiltersDefault = [];
 export const tracerTraceSessionGetSessionGraphDataBodyIntervalDefault = `day`;
 export const tracerTraceSessionGetSessionGraphDataBodyPropertyDefault = `average`;
@@ -41613,7 +41636,7 @@ export const tracerTraceSessionListSessionsQueryPageNumberMin = 0;
 export const tracerTraceSessionListSessionsQueryPageSizeDefault = 30;
 export const tracerTraceSessionListSessionsQueryPageSizeMax = 500;
 
-
+export const tracerTraceSessionListSessionsQueryAllowSampledDefault = false;
 
 export const TracerTraceSessionListSessionsQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -41625,7 +41648,8 @@ export const TracerTraceSessionListSessionsQueryParams = zod.object({
   "sort_params": zod.string().min(1).default(tracerTraceSessionListSessionsQuerySortParamsDefault),
   "page_number": zod.number().min(tracerTraceSessionListSessionsQueryPageNumberMin).default(tracerTraceSessionListSessionsQueryPageNumberDefault).describe('Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range.'),
   "page_size": zod.number().min(1).max(tracerTraceSessionListSessionsQueryPageSizeMax).default(tracerTraceSessionListSessionsQueryPageSizeDefault),
-  "interval": zod.string().optional()
+  "interval": zod.string().optional(),
+  "allow_sampled": zod.boolean().default(tracerTraceSessionListSessionsQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.')
 })
 
 
@@ -42029,6 +42053,12 @@ export const TracerTraceGetEvalNamesResponse = zod.object({
 /**
  * Fetch data for the observe graph with optimized queries
  */
+export const tracerTraceGetGraphMethodsQueryAllowSampledDefault = false;
+
+export const TracerTraceGetGraphMethodsQueryParams = zod.object({
+  "allow_sampled": zod.boolean().default(tracerTraceGetGraphMethodsQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+})
+
 export const tracerTraceGetGraphMethodsBodyFiltersDefault = [];
 export const tracerTraceGetGraphMethodsBodyIntervalDefault = `day`;
 export const tracerTraceGetGraphMethodsBodyPropertyDefault = `average`;
@@ -42316,7 +42346,7 @@ export const tracerTraceListTracesQueryPageNumberMin = 0;
 export const tracerTraceListTracesQueryPageSizeDefault = 30;
 export const tracerTraceListTracesQueryPageSizeMax = 500;
 
-
+export const tracerTraceListTracesQueryAllowSampledDefault = false;
 
 export const TracerTraceListTracesQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -42326,7 +42356,8 @@ export const TracerTraceListTracesQueryParams = zod.object({
   "filters": zod.string().min(1).default(tracerTraceListTracesQueryFiltersDefault),
   "sort_params": zod.string().min(1).default(tracerTraceListTracesQuerySortParamsDefault),
   "page_number": zod.number().min(tracerTraceListTracesQueryPageNumberMin).default(tracerTraceListTracesQueryPageNumberDefault).describe('Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range.'),
-  "page_size": zod.number().min(1).max(tracerTraceListTracesQueryPageSizeMax).default(tracerTraceListTracesQueryPageSizeDefault)
+  "page_size": zod.number().min(1).max(tracerTraceListTracesQueryPageSizeMax).default(tracerTraceListTracesQueryPageSizeDefault),
+  "allow_sampled": zod.boolean().default(tracerTraceListTracesQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.')
 })
 
 export const tracerTraceListTracesResponseResultsItemNameMax = 2000;
@@ -42379,6 +42410,7 @@ export const tracerTraceListTracesOfSessionQueryPageSizeMax = 500;
 export const tracerTraceListTracesOfSessionQueryCursorMax = 4096;
 
 export const tracerTraceListTracesOfSessionQueryCursorModeDefault = false;
+export const tracerTraceListTracesOfSessionQueryAllowSampledDefault = false;
 
 export const TracerTraceListTracesOfSessionQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -42391,6 +42423,7 @@ export const TracerTraceListTracesOfSessionQueryParams = zod.object({
   "page_size": zod.number().min(1).max(tracerTraceListTracesOfSessionQueryPageSizeMax).default(tracerTraceListTracesOfSessionQueryPageSizeDefault),
   "cursor": zod.string().min(1).max(tracerTraceListTracesOfSessionQueryCursorMax).optional().describe('Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.'),
   "cursor_mode": zod.boolean().default(tracerTraceListTracesOfSessionQueryCursorModeDefault),
+  "allow_sampled": zod.boolean().default(tracerTraceListTracesOfSessionQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.'),
   "interval": zod.string().optional()
 })
 
@@ -42476,13 +42509,15 @@ export const tracerTraceListVoiceCallsQueryPageSizeDefault = 30;
 export const tracerTraceListVoiceCallsQueryPageSizeMax = 500;
 
 export const tracerTraceListVoiceCallsQueryRemoveSimulationCallsDefault = false;
+export const tracerTraceListVoiceCallsQueryAllowSampledDefault = false;
 
 export const TracerTraceListVoiceCallsQueryParams = zod.object({
   "project_id": zod.string().uuid(),
   "filters": zod.string().min(1).default(tracerTraceListVoiceCallsQueryFiltersDefault),
   "page": zod.number().min(1).default(tracerTraceListVoiceCallsQueryPageDefault).describe('One-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.'),
   "page_size": zod.number().min(1).max(tracerTraceListVoiceCallsQueryPageSizeMax).default(tracerTraceListVoiceCallsQueryPageSizeDefault),
-  "remove_simulation_calls": zod.boolean().default(tracerTraceListVoiceCallsQueryRemoveSimulationCallsDefault)
+  "remove_simulation_calls": zod.boolean().default(tracerTraceListVoiceCallsQueryRemoveSimulationCallsDefault),
+  "allow_sampled": zod.boolean().default(tracerTraceListVoiceCallsQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.')
 })
 
 export const tracerTraceListVoiceCallsResponseCountMin = 0;

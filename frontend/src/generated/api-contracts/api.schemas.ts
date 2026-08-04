@@ -3788,6 +3788,7 @@ export type SpanAttributeDetailResponseApiQueryStatus = typeof SpanAttributeDeta
 
 export const SpanAttributeDetailResponseApiQueryStatus = {
   complete: 'complete',
+  sampled: 'sampled',
   degraded: 'degraded',
 } as const;
 
@@ -3844,6 +3845,7 @@ export type SpanAttributeKeysResponseApiQueryStatus = typeof SpanAttributeKeysRe
 
 export const SpanAttributeKeysResponseApiQueryStatus = {
   complete: 'complete',
+  sampled: 'sampled',
   degraded: 'degraded',
 } as const;
 
@@ -3887,6 +3889,7 @@ export type SpanAttributeValuesResponseApiQueryStatus = typeof SpanAttributeValu
 
 export const SpanAttributeValuesResponseApiQueryStatus = {
   complete: 'complete',
+  sampled: 'sampled',
   degraded: 'degraded',
 } as const;
 
@@ -18518,6 +18521,8 @@ export interface FetchGraphApi {
   property?: string;
   req_data_config: string;
   project_id: string;
+  /** Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals. */
+  allow_sampled?: boolean;
 }
 
 export type CustomEvalConfigApiConfig = { [key: string]: unknown };
@@ -20149,6 +20154,7 @@ export type ObservationAttributeListResponseApiQueryStatus = typeof ObservationA
 
 export const ObservationAttributeListResponseApiQueryStatus = {
   complete: 'complete',
+  sampled: 'sampled',
   degraded: 'degraded',
 } as const;
 
@@ -26550,6 +26556,13 @@ export type TracerObservationSpanGetEvaluationDetails200 = {
   results: ObservationSpanApi[];
 };
 
+export type TracerObservationSpanGetGraphMethodsParams = {
+/**
+ * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ */
+allow_sampled?: boolean;
+};
+
 export type TracerObservationSpanGetObservationSpanFieldsParams = {
 /**
  * A page number within the paginated result set.
@@ -26722,6 +26735,10 @@ page_size?: number;
  */
 cursor?: string;
 cursor_mode?: boolean;
+/**
+ * Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.
+ */
+allow_sampled?: boolean;
 };
 
 export type TracerObservationSpanRetrieveLoadingParams = {
@@ -26881,6 +26898,10 @@ interval?: string;
  * @minLength 1
  */
 filters?: string;
+/**
+ * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ */
+allow_sampled?: boolean;
 };
 
 export type TracerProjectGetGraphData200 = {
@@ -26893,6 +26914,13 @@ export type TracerProjectGetGraphData200 = {
 export type TracerProjectGetUserGraphDataParams = {
 project_id: string;
 end_user_id: string;
+};
+
+export type TracerProjectGetUsersAggregateGraphDataParams = {
+/**
+ * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ */
+allow_sampled?: boolean;
 };
 
 export type TracerProjectListProjectIdsParams = {
@@ -27036,6 +27064,13 @@ export const TracerTraceSessionGetSessionFilterValuesColumn = {
   last_message: 'last_message',
 } as const;
 
+export type TracerTraceSessionGetSessionGraphDataParams = {
+/**
+ * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ */
+allow_sampled?: boolean;
+};
+
 export type TracerTraceSessionGetTraceSessionExportDataParams = {
 /**
  * A page number within the paginated result set.
@@ -27085,6 +27120,10 @@ page_number?: number;
  */
 page_size?: number;
 interval?: string;
+/**
+ * Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.
+ */
+allow_sampled?: boolean;
 };
 
 export type TracerTraceListParams = {
@@ -27144,6 +27183,13 @@ export type TracerTraceGetEvalNames200 = {
   next?: string;
   previous?: string;
   results: TraceApi[];
+};
+
+export type TracerTraceGetGraphMethodsParams = {
+/**
+ * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ */
+allow_sampled?: boolean;
 };
 
 export type TracerTraceGetPropertiesParams = {
@@ -27259,6 +27305,10 @@ page_number?: number;
  * @maximum 500
  */
 page_size?: number;
+/**
+ * Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.
+ */
+allow_sampled?: boolean;
 };
 
 export type TracerTraceListTraces200 = {
@@ -27301,6 +27351,10 @@ page_size?: number;
  */
 cursor?: string;
 cursor_mode?: boolean;
+/**
+ * Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.
+ */
+allow_sampled?: boolean;
 interval?: string;
 };
 
@@ -27321,6 +27375,10 @@ page?: number;
  */
 page_size?: number;
 remove_simulation_calls?: boolean;
+/**
+ * Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.
+ */
+allow_sampled?: boolean;
 };
 
 export type TracerTraceVoiceCallDetailParams = {
