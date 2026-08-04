@@ -594,6 +594,7 @@ def read_bounded_filter_page(
     )
     candidate_witness_probe_enabled = bool(
         probe_limits_enforced
+        and identity_only_classification
         and callable(candidate_witness_probe_builder)
         and callable(candidate_witness_probe_preference)
         and candidate_witness_probe_preference()
@@ -809,8 +810,6 @@ def read_bounded_filter_page(
         if defer_classification:
             deferred_candidate_by_id.update(candidate_seed_rows)
             return False
-        if not candidate_identities:
-            return False
 
         probe_classified_tail: Hashable | None = None
         prefilter_query_reserve = (
@@ -829,8 +828,10 @@ def read_bounded_filter_page(
         ):
             candidate_witness_probe_enabled = False
             candidate_witness_probe_abandoned = True
-        if candidate_witness_probe_enabled and callable(
-            candidate_witness_probe_builder
+        if (
+            identity_only_classification
+            and candidate_witness_probe_enabled
+            and callable(candidate_witness_probe_builder)
         ):
             probe_query, probe_params = candidate_witness_probe_builder(
                 [candidate_seed_rows[identity] for identity in candidate_identities]

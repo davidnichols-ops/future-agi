@@ -722,19 +722,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return query, params
 
     def _candidate_witness_anchor_plan(self) -> LatestFilterPredicate | None:
-        """Return the raw predicate that is a complete candidate superset.
+        """Return the raw predicate that is a complete candidate superset."""
 
-        Normal presentation reads and explicitly bounded bulk identity reads
-        can use this optional prefilter. Other internal/identity consumers keep
-        their established classifier path because they may carry a different
-        surrounding temporal contract.
-        """
-
-        unsupported_internal_mode = (
-            self._bounded_identity_only or self._bounded_internal_scan
-        ) and not self._bounded_bulk_scan
         if (
-            unsupported_internal_mode
+            self._bounded_identity_only
+            or self._bounded_internal_scan
             or self._bounded_membership_filters is not None
             or self.search
         ):

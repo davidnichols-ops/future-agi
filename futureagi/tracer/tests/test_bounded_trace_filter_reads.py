@@ -513,12 +513,6 @@ def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
     assert builder.recommended_filter_classify_batch_size() == 20
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
-    assert builder.prefer_filter_candidate_witness_probe_first() is True
-    probe_sql, probe_params = builder.build_filter_candidate_witness_probe(
-        [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
-    )
-    assert "trace_id IN %(filter_candidate_trace_ids)s" in probe_sql
-    assert probe_params["filter_candidate_trace_ids"] == ("trace-a", "trace-b")
 
 
 def test_eval_trace_any_span_large_prefix_fails_closed_at_query_ceiling() -> None:
@@ -3426,19 +3420,6 @@ class _CandidateWitnessHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
         return "prefilter", {"candidate_ids": tuple(row["id"] for row in rows)}
 
 
-@dataclass
-class _CandidateWitnessExplicitIdentityFakeBuilder(_FakeBuilder):
-    """Model an eval selector whose classifier output is already final."""
-
-    @staticmethod
-    def prefer_filter_candidate_witness_probe_first():
-        return True
-
-    @staticmethod
-    def build_filter_candidate_witness_probe(rows):
-        return "prefilter", {"candidate_ids": tuple(row["id"] for row in rows)}
-
-
 class _CandidateWitnessHydrationFakeExecutor(_IdentityHydrationFakeExecutor):
     def __init__(
         self,
@@ -6220,55 +6201,6 @@ def test_sparse_candidates_are_prefiltered_before_full_window_classification() -
         if query == "match_identity"
     ]
     assert exact_batches == [("trace-2",)]
-    assert [attempt.kind for attempt in page.attempts] == [
-        "seed",
-        "prefilter",
-        "classify",
-    ]
-
-
-def test_explicit_identity_selector_prefilters_but_returns_only_exact_witnesses() -> (
-    None
-):
-    rows = [
-        {
-            "id": f"trace-{index}",
-            "root_span_id": f"root-{index}",
-            "start_time": END - timedelta(seconds=index + 1),
-            "filter_witness_0": (f"span-{index}", END - timedelta(seconds=index + 1)),
-        }
-        for index in range(6)
-    ]
-    exact_row = rows[2]
-    builder = _CandidateWitnessExplicitIdentityFakeBuilder(
-        rows,
-        start=END - timedelta(minutes=5),
-        end=END,
-        # The raw probe also returns a stale trace. Only the exact classifier's
-        # latest-state row is allowed into the eval selector result.
-        match_rows=[exact_row],
-        recommended_batch_size=2,
-        recommended_seed_batch_size=6,
-    )
-    executor = _CandidateWitnessHydrationFakeExecutor(
-        builder,
-        witness_ids={"trace-2", "trace-4"},
-    )
-
-    page = read_bounded_filter_page(
-        builder=builder,
-        analytics=executor,
-        filters=[_time_filter(start=builder.start, end=builder.end)],
-        key_field="id",
-        page_number=0,
-        page_size=25,
-        deadline_ms=5_000,
-    )
-
-    assert page.complete is True
-    assert page.rows == [exact_row]
-    assert [query for query, _ in executor.calls] == ["seed", "prefilter", "match"]
-    assert executor.calls[-1][1]["candidate_ids"] == ("trace-2", "trace-4")
     assert [attempt.kind for attempt in page.attempts] == [
         "seed",
         "prefilter",
