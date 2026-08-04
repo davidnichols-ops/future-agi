@@ -63,6 +63,7 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
                       WHERE survivor_id IN %(attr_session_ids)s
                   )
               )
+              AND (parent_span_id IS NULL OR parent_span_id = '')
         ),
         latest_roots AS (
             SELECT

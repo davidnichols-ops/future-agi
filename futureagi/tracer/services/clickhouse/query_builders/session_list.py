@@ -969,6 +969,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                       WHERE survivor_id IN %(candidate_session_ids)s
                   )
               )
+              AND (parent_span_id IS NULL OR parent_span_id = '')
         ),
         latest_roots AS (
             SELECT
@@ -1217,6 +1218,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                       WHERE survivor_id IN %(content_session_ids)s
                   )
               )
+              AND (parent_span_id IS NULL OR parent_span_id = '')
         ),
         latest_roots AS (
             SELECT

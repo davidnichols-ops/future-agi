@@ -205,11 +205,13 @@ def test_attribute_bulk_filter_uses_bounded_seed_and_latest_candidate_classifier
     assert "argMax(is_deleted, _version) AS latest_is_deleted" in match_sql
     assert "argMax(mapContains(attrs_string" in match_sql
     assert "latest_attr_value_0" in match_sql
-    assert "mapContains(attrs_string" in seed_sql
+    assert "indexHint(has(mapKeys(attrs_string)" in seed_sql
+    assert "has(attrs_string.keys" in seed_sql
     candidate_roots = match_sql.split("candidate_root_identities AS (", 1)[1].split(
         "latest_roots AS (", 1
     )[0]
-    assert "mapContains(attrs_string" in candidate_roots
+    assert "indexHint(has(mapKeys(attrs_string)" in candidate_roots
+    assert "has(attrs_string.keys" in candidate_roots
     # The witness only narrows physical identities. Exact latest-state replay
     # and matching-root ordering retain the existing classifier semantics.
     assert "latest_attr_exists_0 AND" in match_sql
@@ -401,14 +403,27 @@ def test_session_page_enrichments_replay_tombstones_and_resolve_remaps():
     )
     session_id = str(uuid.uuid4())
 
+    metrics_sql, _ = builder.build_page_metrics_query([session_id])
     content_sql, _ = builder.build_content_query([session_id])
     attrs_sql, _ = builder.build_span_attributes_query([session_id])
 
-    for sql in (content_sql, attrs_sql):
+    for sql in (metrics_sql, content_sql, attrs_sql):
+        candidate_sql = sql.split("candidate_root_identities AS (", 1)[1].split(
+            "),\n        latest_roots AS (", 1
+        )[0]
         assert "candidate_root_identities AS" in sql
+        # A latest live root always has at least its latest raw root row, so
+        # this is a safe candidate witness. Root-to-child corrections and
+        # tombstones are still rejected by the exact latest-state phase below.
+        assert "(parent_span_id IS NULL OR parent_span_id = '')" in candidate_sql
         assert "trace_session_id_remap" in sql
+        assert (
+            "argMax(tuple(parent_span_id), _version).1 AS latest_parent_span_id"
+            in sql
+        )
         assert "argMax(is_deleted, _version) AS latest_is_deleted" in sql
         assert "latest_is_deleted = 0" in sql
+        assert "(latest_parent_span_id IS NULL OR latest_parent_span_id = '')" in sql
 
 
 def _ch25_client():
