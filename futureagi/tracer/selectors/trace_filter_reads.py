@@ -576,7 +576,14 @@ def read_bounded_filter_page(
         Hashable, tuple[dict[str, Any], datetime, datetime]
     ] = {}
     eager_identity_prefix_flush_used = False
-    candidate_witness_probe_enabled = False
+    # A builder may expose a finite raw-witness query only when it is a
+    # complete superset of exact latest-state membership. Run that cheap,
+    # indexable prefilter before the first full-window classifier batch; the
+    # exact classifier still validates every surviving identity. Unsupported
+    # filter shapes return no probe and retain the existing exact path.
+    candidate_witness_probe_enabled = bool(
+        identity_only_classification and callable(candidate_witness_probe_builder)
+    )
     candidate_witness_probe_abandoned = False
     if cursor_key is not None and cursor_key[0] < request_start:
         return BoundedFilterPage(
@@ -824,6 +831,9 @@ def read_bounded_filter_page(
                         # keep this batch exact and stop speculating.
                         candidate_witness_probe_enabled = False
                         candidate_witness_probe_abandoned = True
+            else:
+                candidate_witness_probe_enabled = False
+                candidate_witness_probe_abandoned = True
 
         for batch_offset in range(0, len(candidate_identities), classify_batch_size):
             identity_batch = candidate_identities[
@@ -881,10 +891,9 @@ def read_bounded_filter_page(
                     and not candidate_witness_probe_abandoned
                     and not match_result.data
                 ):
-                    # One exact zero-yield batch establishes that this request
-                    # is on the sparse path. Subsequent finite candidate batches
-                    # can first use a raw positive witness as a complete
-                    # superset, while this first/common batch stays unchanged.
+                    # Keep the prefilter enabled after an exact zero-yield
+                    # batch. This also covers builders that elect to expose a
+                    # safe probe only after observing their first batch.
                     candidate_witness_probe_enabled = True
 
                 if (

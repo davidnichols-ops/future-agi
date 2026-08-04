@@ -6136,7 +6136,7 @@ def test_sparse_buffer_flush_preserves_exact_page_order_and_hydration() -> None:
     assert hydration["candidate_ids"] == ("trace-0", "trace-1")
 
 
-def test_sparse_exact_zero_enables_finite_candidate_witness_prefilter() -> None:
+def test_sparse_candidates_are_prefiltered_before_full_window_classification() -> None:
     rows = [
         {
             "id": f"trace-{index}",
@@ -6174,27 +6174,23 @@ def test_sparse_exact_zero_enables_finite_candidate_witness_prefilter() -> None:
     assert page.rows == []
     assert [query for query, _ in executor.calls] == [
         "seed",
-        "match_identity",
         "prefilter",
         "match_identity",
-        "prefilter",
     ]
     exact_batches = [
         params["candidate_ids"]
         for query, params in executor.calls
         if query == "match_identity"
     ]
-    assert exact_batches == [("trace-0", "trace-1"), ("trace-2",)]
+    assert exact_batches == [("trace-2",)]
     assert [attempt.kind for attempt in page.attempts] == [
         "seed",
-        "classify",
         "prefilter",
         "classify",
-        "prefilter",
     ]
 
 
-def test_candidate_witness_probe_never_runs_on_healthy_first_batch() -> None:
+def test_broad_candidate_witness_prefilter_falls_through_to_exact_classifier() -> None:
     rows = [
         {
             "id": f"trace-{index}",
@@ -6210,7 +6206,10 @@ def test_candidate_witness_probe_never_runs_on_healthy_first_batch() -> None:
         recommended_batch_size=3,
         recommended_seed_batch_size=3,
     )
-    executor = _CandidateWitnessHydrationFakeExecutor(builder)
+    executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        witness_ids={row["id"] for row in rows},
+    )
 
     page = read_bounded_filter_page(
         builder=builder,
@@ -6226,6 +6225,7 @@ def test_candidate_witness_probe_never_runs_on_healthy_first_batch() -> None:
     assert [row["id"] for row in page.rows] == ["trace-0", "trace-1"]
     assert [query for query, _ in executor.calls] == [
         "seed",
+        "prefilter",
         "match_identity",
         "hydrate",
     ]
@@ -6267,14 +6267,17 @@ def test_candidate_witness_read_failure_falls_back_to_exact_classifier() -> None
     assert page.rows == []
     assert [query for query, _ in executor.calls] == [
         "seed",
-        "match_identity",
         "prefilter",
+        "match_identity",
         "match_identity",
     ]
     assert executor.calls[-1][1]["candidate_ids"] == ("trace-2", "trace-3")
-    assert page.attempts[-2].kind == "prefilter"
-    assert page.attempts[-2].error_code == "read_budget_exceeded"
-    assert page.attempts[-1].kind == "classify"
+    assert page.attempts[1].kind == "prefilter"
+    assert page.attempts[1].error_code == "read_budget_exceeded"
+    assert [attempt.kind for attempt in page.attempts[2:]] == [
+        "classify",
+        "classify",
+    ]
 
 
 def test_identity_hydration_keeps_same_text_org_traces_distinct() -> None:
