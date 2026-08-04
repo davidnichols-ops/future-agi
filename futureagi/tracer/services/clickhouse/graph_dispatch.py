@@ -803,15 +803,27 @@ def fetch_system_metric_graph_ch(
     # finite production read.  Use the same bounded latest-state candidate lane
     # for time-only and filtered graphs.  Long windows are intentionally marked
     # sampled; short exhausted candidate sets remain exact.
+    normalized_observe_type = str(observe_type or "").strip().lower()
+    candidate_read_options: dict[str, Any] = {}
+    if normalized_observe_type == "trace":
+        # A trace graph still has to discover child-span identities and replay
+        # their latest state after candidate selection.  Keep that work inside
+        # the same reservation already used by eval, annotation, and session
+        # graphs instead of allowing the selector to consume the whole request
+        # wall deadline.
+        candidate_read_options["deadline_ms"] = (
+            GRAPH_DECORATION_CANDIDATE_DEADLINE_MS
+        )
     sample = read_graph_candidates(
         analytics=analytics,
         project_id=project_id,
         filters=filters,
         observe_type=observe_type,
         allow_time_only_seed=not _active_filters(filters),
+        **candidate_read_options,
     )
     _require_renderable_sample(sample)
-    if str(observe_type or "").strip().lower() == "trace":
+    if normalized_observe_type == "trace":
         return _fetch_trace_system_metric_graph(
             analytics=analytics,
             sample=sample,

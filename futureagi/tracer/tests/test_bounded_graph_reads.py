@@ -366,7 +366,7 @@ def test_filtered_graph_candidates_are_finite_latest_state_samples(
     assert "argMax(" in classify_query
     assert "FINAL" not in classify_query
     assert classify_params[candidate_param] in {("trace-1",), ("span-1",)}
-    assert seed_timeout <= 750 and classify_timeout <= 750
+    assert seed_timeout <= 1_500 and classify_timeout <= 1_500
     assert seed_settings["max_threads"] == classify_settings["max_threads"] == 1
 
 
@@ -504,7 +504,11 @@ def test_default_long_window_is_frozen_once_for_every_trace_stratum(
     assert sample.query_complete is False
     assert sample.query_status == "sampled"
     assert sample.query_error_code == "sample_limit"
-    assert sample.sampling_strata_completed == sample.sampling_strata == 8
+    assert (
+        sample.sampling_strata_completed
+        == sample.sampling_strata
+        == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    )
     assert default_calls == 1
     seed_ranges = [
         (params["filter_slice_start"], params["filter_slice_end"])
@@ -605,7 +609,7 @@ def test_long_graph_map_filter_uses_bounded_strata_and_candidate_classifiers() -
 def test_trace_root_before_child_after_stratum_boundary_uses_full_membership_window():
     window_start = datetime(2026, 1, 1)
     window_end = window_start + timedelta(days=8)
-    boundary = window_start + timedelta(days=1)
+    boundary = window_start + timedelta(days=2)
     root_time = boundary - timedelta(microseconds=1)
     child_time = boundary + timedelta(microseconds=1)
     analytics = _CrossStratumTraceAnalytics(
@@ -677,7 +681,7 @@ def test_trace_multi_child_filters_match_across_separate_temporal_strata():
     )
     assert (
         sum("filter_anchor_limit" in params for _, params, *_ in analytics.calls)
-        == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        == bounded_graph_reads.GRAPH_TRACE_STRATA
     )
     assert (
         sum("candidate_trace_ids" in params for _, params, *_ in analytics.calls) == 1
@@ -693,10 +697,11 @@ def test_trace_multi_child_filters_match_across_separate_temporal_strata():
 def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
     window_start = datetime(2026, 1, 1)
     window_end = window_start + timedelta(days=8)
-    stratum_width = (window_end - window_start) / 8
+    stratum_count = bounded_graph_reads.GRAPH_TRACE_STRATA
+    stratum_width = (window_end - window_start) / stratum_count
     root_times: dict[str, datetime] = {}
     child_times: dict[str, datetime] = {}
-    for stratum in range(8):
+    for stratum in range(stratum_count):
         for index in range(60):
             trace_id = f"trace-{stratum}-{index:02d}"
             root_times[trace_id] = (
@@ -704,7 +709,9 @@ def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
                 + (stratum_width * stratum)
                 + timedelta(hours=6, microseconds=index)
             )
-            child_stratum = stratum + 1 if stratum < 7 else stratum - 1
+            child_stratum = (
+                stratum + 1 if stratum < stratum_count - 1 else stratum - 1
+            )
             child_times[trace_id] = (
                 window_start
                 + (stratum_width * child_stratum)
@@ -777,17 +784,17 @@ def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
         observe_type="trace",
     )
 
-    # The first child-time stratum is genuinely empty; the other seven each
-    # contribute the bounded trace sample. Coverage metadata still records
-    # all eight probes, including the exhausted empty stratum.
+    # The first child-time stratum is genuinely empty; every other stratum
+    # contributes the bounded trace sample. Coverage metadata still records
+    # all trace probes, including the exhausted empty stratum.
     assert len(sample.rows) == (
-        (bounded_graph_reads.GRAPH_ANY_SPAN_STRATA - 1)
+        (bounded_graph_reads.GRAPH_TRACE_STRATA - 1)
         * bounded_graph_reads.GRAPH_TRACE_ROWS_PER_STRATUM
     )
     assert sample.query_complete is False
     assert sample.query_status == "sampled"
     assert sample.query_error_code == "sample_limit"
-    assert sample.sampling_strata == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert sample.sampling_strata == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert sample.sampling_strata_completed == sample.sampling_strata
     classifier_calls = [
         call for call in analytics.calls if "candidate_trace_ids" in call[1]
@@ -795,14 +802,11 @@ def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
     classifier_sizes = [
         len(params["candidate_trace_ids"]) for _, params, *_ in classifier_calls
     ]
-    assert classifier_sizes == [
-        bounded_graph_reads.GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE,
-        (
-            (bounded_graph_reads.GRAPH_ANY_SPAN_STRATA - 1)
-            * (bounded_graph_reads.GRAPH_TRACE_ROWS_PER_STRATUM + 1)
-            - bounded_graph_reads.GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
-        ),
-    ]
+    expected_union_size = (
+        (bounded_graph_reads.GRAPH_TRACE_STRATA - 1)
+        * (bounded_graph_reads.GRAPH_TRACE_ROWS_PER_STRATUM + 1)
+    )
+    assert classifier_sizes == [expected_union_size]
     classifier_ids = [
         trace_id
         for _, params, *_ in classifier_calls
@@ -810,7 +814,7 @@ def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
     ]
     assert len(classifier_ids) == len(set(classifier_ids)) == sum(classifier_sizes)
     assert len(classifier_ids) <= (
-        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        bounded_graph_reads.GRAPH_TRACE_STRATA
         * (bounded_graph_reads.GRAPH_TRACE_ROWS_PER_STRATUM + 1)
     )
     assert all(
@@ -1134,7 +1138,7 @@ def test_long_window_incomplete_rows_are_sampled_only_for_cardinality_limits(
             graph_dispatch._require_renderable_sample(sample)
         assert caught.value.error_code == public_error
 
-    assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(calls) == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert all(call["anchor_probe_only"] is True for call in calls)
     assert all(
         call["anchor_probe_limit"]
@@ -1247,10 +1251,14 @@ def test_stratum_anchor_timeout_uses_sanitized_temporal_sample(monkeypatch):
     assert sample.query_complete is False
     assert sample.query_status == "sampled"
     assert sample.query_error_code == "sample_limit"
-    assert sample.sampling_strata_completed == sample.sampling_strata == 8
-    assert len(sample.rows) == 8
+    assert (
+        sample.sampling_strata_completed
+        == sample.sampling_strata
+        == bounded_graph_reads.GRAPH_TRACE_STRATA
+    )
+    assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert raw_error not in repr(sample)
-    assert read_count == 9
+    assert read_count == bounded_graph_reads.GRAPH_TRACE_STRATA + 1
     assert read_calls[0]["anchor_probe_only"] is True
     assert all(call["anchor_probe_only"] is False for call in read_calls[1:])
     assert all(
@@ -1328,7 +1336,7 @@ def test_sparse_old_and_new_matches_are_exact_across_stratum_anchors(window_days
     anchor_calls = [
         call for call in analytics.calls if "filter_anchor_limit" in call[1]
     ]
-    assert len(anchor_calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(anchor_calls) == bounded_graph_reads.GRAPH_TRACE_STRATA
     anchor_ranges = [
         (params["filter_anchor_start"], params["filter_anchor_end"])
         for _, params, *_ in anchor_calls
@@ -1399,7 +1407,7 @@ def test_long_window_scalar_datetime_bounds_are_preserved_by_stratum_anchors(
     expected_end = window_end + (
         timedelta(microseconds=1) if upper_op == "less_than_or_equal" else timedelta(0)
     )
-    assert len(anchor_ranges) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(anchor_ranges) == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert anchor_ranges[0][0] == expected_start
     assert anchor_ranges[-1][1] == expected_end
     assert all(
@@ -1439,7 +1447,7 @@ def test_empty_long_window_is_exact_and_not_mislabeled_as_sampled(window_days):
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("window_days", "failure_stratum"),
-    [(14, 0), (180, 3), (365, 7)],
+    [(14, 0), (180, 2), (365, 3)],
 )
 def test_failure_in_any_stratum_never_becomes_a_renderable_sample(
     monkeypatch,
@@ -1499,13 +1507,13 @@ def test_failure_in_any_stratum_never_becomes_a_renderable_sample(
         observe_type="trace",
     )
 
-    assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(calls) == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert sample.query_complete is False
     assert sample.query_status == "degraded"
     assert sample.query_error_code == "read_budget_exceeded"
-    assert sample.sampling_strata == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert sample.sampling_strata == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert sample.sampling_strata_completed == (
-        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA - 1
+        bounded_graph_reads.GRAPH_TRACE_STRATA - 1
     )
     with pytest.raises(BoundedGraphReadError) as caught:
         graph_dispatch._require_renderable_sample(sample)
@@ -2264,11 +2272,11 @@ def test_common_raw_latest_rare_filter_returns_deterministic_stratified_sample(
     window_width = window_end - window_start
     rows = []
     rows_per_stratum = 100
-    for stratum in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA):
+    for stratum in range(bounded_graph_reads.GRAPH_TRACE_STRATA):
         stratum_start = window_start + (
-            window_width * stratum / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+            window_width * stratum / bounded_graph_reads.GRAPH_TRACE_STRATA
         )
-        stratum_width = window_width / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        stratum_width = window_width / bounded_graph_reads.GRAPH_TRACE_STRATA
         for index in range(rows_per_stratum):
             rows.append(
                 {
@@ -2323,7 +2331,7 @@ def test_common_raw_latest_rare_filter_returns_deterministic_stratified_sample(
     assert tuple(row["trace_id"] for row in first.rows) == tuple(
         row["trace_id"] for row in second.rows
     )
-    assert len(first.rows) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(first.rows) == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert first.query_complete is False
     assert first.query_status == "sampled"
     assert first.query_error_code == "sample_limit"
@@ -2331,19 +2339,19 @@ def test_common_raw_latest_rare_filter_returns_deterministic_stratified_sample(
         "time_stratified_latest_state"
     )
     assert first.metadata()["query_sampling_strata_completed"] == (
-        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        bounded_graph_reads.GRAPH_TRACE_STRATA
     )
     classifier_sizes = [
         len(params["candidate_trace_ids"])
         for _, params, *_ in analytics.calls
         if "candidate_trace_ids" in params
     ]
-    # Eight five-ID anchor sentinels are de-duplicated into two bounded,
-    # full-window latest-state replay chunks. Only proven rows are visible;
-    # stale raw anchors in this fixture must never leak into the sample.
+    # Four four-ID anchor sentinels fit into one bounded, full-window
+    # latest-state replay. Only proven rows are visible; stale raw anchors in
+    # this fixture must never leak into the sample.
     assert classifier_sizes == [
-        bounded_graph_reads.GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE,
-        bounded_graph_reads.GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE,
+        bounded_graph_reads.GRAPH_TRACE_STRATA
+        * (bounded_graph_reads.GRAPH_TRACE_ROWS_PER_STRATUM + 1)
     ]
     assert tuple(row["trace_id"] for row in first.rows) == tuple(
         row["trace_id"]
@@ -2353,18 +2361,18 @@ def test_common_raw_latest_rare_filter_returns_deterministic_stratified_sample(
             reverse=True,
         )
     )
-    assert len(first.rows) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(first.rows) == bounded_graph_reads.GRAPH_TRACE_STRATA
 
 
 @pytest.mark.unit
-def test_trace_classifier_chunk_failure_is_atomic_and_sanitized() -> None:
+def test_trace_classifier_failure_is_atomic_and_sanitized() -> None:
     window_end = datetime(2026, 7, 31, 7)
     window_start = window_end - timedelta(days=14)
     window_width = window_end - window_start
     rows = []
-    for stratum in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA):
+    for stratum in range(bounded_graph_reads.GRAPH_TRACE_STRATA):
         stratum_start = window_start + (
-            window_width * stratum / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+            window_width * stratum / bounded_graph_reads.GRAPH_TRACE_STRATA
         )
         for index in range(bounded_graph_reads.GRAPH_TRACE_ROWS_PER_STRATUM + 1):
             rows.append(
@@ -2376,15 +2384,14 @@ def test_trace_classifier_chunk_failure_is_atomic_and_sanitized() -> None:
                 }
             )
 
-    class _FailingSecondClassifier(_LatestRareCandidateAnalytics):
+    class _FailingClassifier(_LatestRareCandidateAnalytics):
         classifier_calls = 0
 
         def execute_ch_query(self, query, params, *, timeout_ms, settings):
             if "candidate_trace_ids" in params:
                 self.classifier_calls += 1
-                if self.classifier_calls == 2:
-                    self.calls.append((query, params, timeout_ms, settings))
-                    raise ReadDeadlineExceeded("private classifier timeout")
+                self.calls.append((query, params, timeout_ms, settings))
+                raise ReadDeadlineExceeded("private classifier timeout")
             return super().execute_ch_query(
                 query,
                 params,
@@ -2392,7 +2399,7 @@ def test_trace_classifier_chunk_failure_is_atomic_and_sanitized() -> None:
                 settings=settings,
             )
 
-    analytics = _FailingSecondClassifier(observe_type="trace", rows=rows)
+    analytics = _FailingClassifier(observe_type="trace", rows=rows)
     with pytest.raises(BoundedGraphReadError) as caught:
         read_graph_candidates(
             analytics=analytics,
@@ -2407,7 +2414,7 @@ def test_trace_classifier_chunk_failure_is_atomic_and_sanitized() -> None:
     classifier_calls = [
         call for call in analytics.calls if "candidate_trace_ids" in call[1]
     ]
-    assert len(classifier_calls) == 2
+    assert len(classifier_calls) == 1
     assert caught.value.error_code == "read_budget_exceeded"
     assert "private classifier timeout" not in str(caught.value)
 
@@ -2457,13 +2464,13 @@ def test_distributed_sample_uses_one_shared_deadline_instead_of_equal_slices(
     distributed_calls = calls
     old_equal_slice_ms = (
         bounded_graph_reads.GRAPH_CANDIDATE_DEADLINE_MS
-        // bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        // bounded_graph_reads.GRAPH_TRACE_STRATA
     )
-    assert len(distributed_calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(distributed_calls) == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert all(call["deadline_ms"] > old_equal_slice_ms for call in distributed_calls)
     assert sample.query_status == "sampled"
     assert sample.sampling_strata_completed == (
-        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        bounded_graph_reads.GRAPH_TRACE_STRATA
     )
 
 
@@ -2501,7 +2508,7 @@ def test_partial_or_empty_stratified_deadline_is_not_renderable(
         )
 
     # distributed_started, first-stratum check, and optional second-stratum
-    # check. Crossing the deadline before all eight strata must
+    # check. Crossing the deadline before all planned strata must
     # never turn zero or partial temporal coverage into a sampled graph.
     clock = iter([0.0, 4.0] if completed_strata == 0 else [0.0, 0.0, 4.0])
     monkeypatch.setattr(bounded_graph_reads, "monotonic", lambda: next(clock))
@@ -2573,14 +2580,18 @@ def test_code_307_stratum_anchor_uses_temporal_sample_without_leaking_details(
         observe_type="trace",
     )
 
-    assert len(calls) == 9
+    assert len(calls) == bounded_graph_reads.GRAPH_TRACE_STRATA + 1
     assert calls[0]["anchor_probe_only"] is True
     assert all(call["anchor_probe_only"] is False for call in calls[1:])
     assert sample.query_complete is False
     assert sample.query_status == "sampled"
     assert sample.query_error_code == "sample_limit"
-    assert sample.sampling_strata_completed == sample.sampling_strata == 8
-    assert len(sample.rows) == 8
+    assert (
+        sample.sampling_strata_completed
+        == sample.sampling_strata
+        == bounded_graph_reads.GRAPH_TRACE_STRATA
+    )
+    assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert "private" not in repr(sample)
 
 
@@ -2596,12 +2607,17 @@ def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
     window_end = datetime(2026, 7, 31, 7)
     window_start = window_end - timedelta(days=window_days)
     window_width = window_end - window_start
+    stratum_count = (
+        bounded_graph_reads.GRAPH_TRACE_STRATA
+        if observe_type == "trace"
+        else bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    )
     rows = []
-    for stratum in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA):
+    for stratum in range(stratum_count):
         stratum_start = window_start + (
-            window_width * stratum / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+            window_width * stratum / stratum_count
         )
-        stratum_width = window_width / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        stratum_width = window_width / stratum_count
         for index in range(60):
             row = {
                 "trace_id": f"trace-{stratum}-{index:03d}",
@@ -2653,7 +2669,7 @@ def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
     )
 
     assert response["query_status"] == "sampled"
-    assert response["query_sample_size"] == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert response["query_sample_size"] == stratum_count
     assert any(point["value"] == 50 for point in response["data"])
     assert not any(
         call[1].get("filter_anchor_limit") == 513 for call in analytics.calls
@@ -2710,15 +2726,18 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
         if observe_type == "trace"
         else bounded_graph_reads.GRAPH_ANY_SPAN_ROWS_PER_STRATUM
     )
-    assert len(first.rows) == (
-        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA * rows_per_stratum
+    stratum_count = (
+        bounded_graph_reads.GRAPH_TRACE_STRATA
+        if observe_type == "trace"
+        else bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
     )
+    assert len(first.rows) == stratum_count * rows_per_stratum
     assert first.query_complete is False
     assert first.query_status == "sampled"
     assert first.query_error_code == "sample_limit"
     assert first.sampling_strategy == "time_stratified_latest_state"
-    assert first.sampling_strata == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
-    assert first.sampling_strata_completed == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert first.sampling_strata == stratum_count
+    assert first.sampling_strata_completed == stratum_count
     assert first.total_rows_lower_bound >= len(first.rows)
     if observe_type == "trace":
         # The long-window selector already emits at most 40 globally ordered
@@ -2739,7 +2758,7 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
         for _, params, *_ in first_analytics.calls
         if "filter_anchor_limit" in params
     ]
-    assert len(anchor_ranges) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(anchor_ranges) == stratum_count
     assert anchor_ranges[0][0] == window_start
     assert anchor_ranges[-1][1] == window_end
     assert all(
@@ -2758,16 +2777,30 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
         for query, params, *_ in first_analytics.calls
         if "filter_anchor_limit" in params
     )
-    assert len(first_analytics.calls) <= (bounded_graph_reads.GRAPH_ANY_SPAN_STRATA * 2)
+    assert len(first_analytics.calls) <= (stratum_count * 2)
     if observe_type == "trace":
+        classifier_calls = [
+            call
+            for call in first_analytics.calls
+            if "candidate_trace_ids" in call[1]
+        ]
         classifiers = [
             query
-            for query, params, *_ in first_analytics.calls
+            for query, params, *_ in classifier_calls
             if "candidate_trace_ids" in params
         ]
-        assert classifiers
+        assert len(classifier_calls) == 1
         assert all("latest_latency_ms" not in query for query in classifiers)
-    stratum_width = window_width / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        union_size = len(classifier_calls[0][1]["candidate_trace_ids"])
+        assert union_size <= (
+            bounded_graph_reads.GRAPH_TRACE_STRATA
+            * (bounded_graph_reads.GRAPH_TRACE_ROWS_PER_STRATUM + 1)
+        )
+        assert union_size <= bounded_graph_reads.GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
+        assert first.sampling_strata == first.sampling_strata_completed == 4
+    else:
+        assert first.sampling_strata == first.sampling_strata_completed == 8
+    stratum_width = window_width / stratum_count
     assert all(
         any(
             window_start + stratum_width * index
@@ -2775,7 +2808,7 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
             < window_start + stratum_width * (index + 1)
             for row in first.rows
         )
-        for index in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA)
+        for index in range(stratum_count)
     )
 
 
@@ -3068,6 +3101,45 @@ def test_trace_system_graph_decorates_sample_with_any_live_span_semantics(monkey
     assert len(analytics.calls) == 2
     assert "argMax(is_deleted, _version)" in analytics.calls[1][0]
     assert "latest_is_deleted = 0" in analytics.calls[1][0]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("observe_type", "expected_deadline_ms"),
+    [
+        ("trace", bounded_graph_reads.GRAPH_DECORATION_CANDIDATE_DEADLINE_MS),
+        ("span", None),
+    ],
+)
+def test_system_graph_reserves_decoration_time_only_for_trace_candidates(
+    monkeypatch,
+    observe_type,
+    expected_deadline_ms,
+):
+    candidate_calls = []
+    sample = replace(_sample(), rows=())
+
+    def _candidates(**kwargs):
+        candidate_calls.append(kwargs)
+        return sample
+
+    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", _candidates)
+
+    response = graph_dispatch.fetch_system_metric_graph_ch(
+        analytics=object(),
+        project_id=PROJECT_ID,
+        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
+        interval="hour",
+        metric_id="latency",
+        observe_type=observe_type,
+    )
+
+    assert response["query_complete"] is True
+    assert len(candidate_calls) == 1
+    if expected_deadline_ms is None:
+        assert "deadline_ms" not in candidate_calls[0]
+    else:
+        assert candidate_calls[0]["deadline_ms"] == expected_deadline_ms
 
 
 class _DecorationAnalytics:

@@ -53,11 +53,19 @@ GRAPH_CANDIDATE_DEADLINE_MS = 3_900
 GRAPH_DECORATION_CANDIDATE_DEADLINE_MS = 3_100
 GRAPH_MAX_POINTS = 10_000
 GRAPH_ANY_SPAN_STRATA = 8
+# Indexed trace candidates still require one or more ClickHouse decoration
+# phases. Four disjoint quarters keep temporal coverage explicit while bounding
+# that candidate work; unindexed trace micro-samples and span candidates retain
+# eight strata.
+GRAPH_TRACE_STRATA = 4
 GRAPH_ANY_SPAN_ROWS_PER_STRATUM = 49
 # A long-window trace graph is already an explicitly incomplete temporal sample.
-# Four visible traces plus one sentinel per stratum bound its raw union at 40;
-# span graphs retain the established 49-row representative ceiling.
-GRAPH_TRACE_ROWS_PER_STRATUM = 4
+# Three visible traces plus one sentinel in each of four disjoint strata preserves
+# full-window temporal coverage while bounding the raw union at 16 identities.
+# The union therefore needs one 20-ID full-window classifier, and at most 12
+# proven traces enter final child-span/eval/annotation decoration. Span graphs
+# aggregate in process and retain the established 49-row ceiling.
+GRAPH_TRACE_ROWS_PER_STRATUM = 3
 # A long-window sparse-anchor sentinel distinguishes a common predicate before
 # the ordered stratum reads begin. Common predicates deliberately switch to a
 # small representative ceiling: replaying 512 identities in each of eight
@@ -387,6 +395,7 @@ def _read_time_distributed_candidates(
     window_end: datetime,
     deadline_ms: int,
     classify_batch_size: int,
+    stratum_ceiling: int = GRAPH_ANY_SPAN_STRATA,
     rows_per_stratum: int = GRAPH_ANY_SPAN_ROWS_PER_STRATUM,
     synthetic_time_only_seed: bool = False,
 ) -> GraphCandidateSample:
@@ -394,15 +403,20 @@ def _read_time_distributed_candidates(
 
     Trace attributes may live on any child span.  A single newest-first scan
     can consume its budget in the latest dense slice and show no older shape.
-    Eight disjoint time strata keep the work finite and temporally distributed. A
-    stratum is marked complete only when its seed was exhausted, so the
-    combined graph can never advertise a sample as exact.
+    Disjoint time strata keep the work finite and temporally distributed.
+    Indexed trace graphs use four quarters so candidate work leaves time for
+    required decoration. Unindexed trace micro-samples retain eight slices,
+    as do span graphs that aggregate candidates in process. A stratum is marked
+    complete only when its seed was exhausted, so the combined graph can never
+    advertise a sample as exact.
     """
 
     if not 1 <= rows_per_stratum <= GRAPH_ANY_SPAN_ROWS_PER_STRATUM:
         raise ValueError("graph rows_per_stratum exceeds the bounded contract")
+    if not 1 <= stratum_ceiling <= GRAPH_ANY_SPAN_STRATA:
+        raise ValueError("graph stratum ceiling exceeds the bounded contract")
     stratum_count = min(
-        GRAPH_ANY_SPAN_STRATA,
+        stratum_ceiling,
         max(1, deadline_ms // 250),
     )
     distributed_started = monotonic()
@@ -854,6 +868,12 @@ def read_graph_candidates(
     window_start, window_end = builder.parse_time_range(effective_filters)
     classify_batch_size = builder.recommended_filter_classify_batch_size()
     if window_end - window_start > GRAPH_ANY_SPAN_DISTRIBUTED_AFTER:
+        anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
+        indexed_trace_sample = (
+            mode == "trace"
+            and callable(anchor_support)
+            and bool(anchor_support())
+        )
         return _read_time_distributed_candidates(
             analytics=analytics,
             builder_class=builder_class,
@@ -864,6 +884,11 @@ def read_graph_candidates(
             window_end=window_end,
             deadline_ms=deadline_ms,
             classify_batch_size=int(classify_batch_size or 50),
+            stratum_ceiling=(
+                GRAPH_TRACE_STRATA
+                if indexed_trace_sample
+                else GRAPH_ANY_SPAN_STRATA
+            ),
             rows_per_stratum=(
                 GRAPH_TRACE_ROWS_PER_STRATUM
                 if mode == "trace"
@@ -1078,6 +1103,7 @@ __all__ = [
     "GRAPH_CANDIDATE_DEADLINE_MS",
     "GRAPH_DECORATION_CANDIDATE_DEADLINE_MS",
     "GRAPH_MAX_POINTS",
+    "GRAPH_TRACE_STRATA",
     "GraphCandidateSample",
     "aggregate_system_candidate_graph",
     "read_graph_candidates",

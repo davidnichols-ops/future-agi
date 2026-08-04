@@ -20,7 +20,11 @@ _MAX_CANDIDATES = 512
 _ABSOLUTE_MAX_CANDIDATES = 512
 _ABSOLUTE_MAX_QUERIES = 128
 _SELECTIVE_ANCHOR_SENTINEL = 513
-_QUERY_TIMEOUT_MS = 750
+# Keep one slow-but-bounded statement within the client deadline so the next
+# seed/classifier can run. Production showed successful reads
+# at 0.79-1.26 s under load; the caller's wall deadline, query count, rows,
+# bytes, memory, and single-thread settings remain the authoritative envelope.
+_QUERY_TIMEOUT_MS = 1_500
 # Trace/span list queries fetch one additional page-sized de-duplication
 # margin; 5,000 is also the existing server-side result ceiling used by those
 # endpoints.  Keeping one public ceiling makes numbered-page work finite for

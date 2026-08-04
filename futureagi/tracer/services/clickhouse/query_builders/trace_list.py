@@ -532,10 +532,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Avoid the 513-row broad sentinel outside a short trace window.
 
         The full sparse/common probe is useful for short windows, but on the
-        largest tenant its fixed 513-row scan crosses the 750 ms native client
-        deadline under load before the ordered fallback can start. Graph
-        strata provide a smaller explicit ``anchor_probe_limit`` and are not
-        covered by this full-window recommendation.
+        largest tenant its fixed 513-row scan crossed the former 750 ms native
+        client cliff under load before the ordered fallback could start. Skip
+        that avoidable broad work instead of relying only on timeout headroom.
+        Graph strata provide a smaller explicit ``anchor_probe_limit`` and are
+        not covered by this full-window recommendation.
         """
 
         request_start, request_end = self._bounded_request_window

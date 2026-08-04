@@ -1027,7 +1027,7 @@ def test_shared_candidate_reader_proves_large_eval_prefix_within_query_cap(
 
     class SyntheticAnalytics:
         def execute_ch_query(self, query, params, *, timeout_ms, settings):
-            assert timeout_ms <= 750
+            assert timeout_ms <= 1_500
             if query == "classify":
                 assert settings["max_result_rows"] == 200
                 result_rows = list(params["candidate_rows"])
