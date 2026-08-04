@@ -574,20 +574,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return request_end - request_start > timedelta(hours=1)
 
     def recommended_filter_anchor_probe_limit(self) -> int | None:
-        """Recommend a small sparse-value sentinel for long-window lists.
+        """Skip speculative whole-window reads for long-window lists.
 
-        Only a positive index-usable any-span leaf can supply the candidate
-        superset. Bulk eval/task reads keep their existing protocol, and short
-        windows retain the full 513-row sparse/common proof.
+        Production showed that a single optional partition can read more than
+        500 MiB when the server-locked read-only profile cannot accept the
+        caller's per-query timeout/read settings. Two such probes exhausted the
+        case read ceiling before the exact ordered-root fallback ran. Short
+        windows retain the existing 513-row probe, and graph callers retain
+        their explicit per-stratum ``anchor_probe_limit`` contract.
         """
 
-        request_start, request_end = self._bounded_request_window
-        if (
-            not self._bounded_bulk_scan
-            and request_end - request_start > timedelta(hours=1)
-            and self._filter_anchor_plans()
-        ):
-            return _LONG_WINDOW_ANCHOR_SENTINEL
         return None
 
     def recommended_filter_anchor_probe_timeout_ms(self) -> int | None:

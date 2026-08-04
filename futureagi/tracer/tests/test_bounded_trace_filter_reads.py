@@ -291,7 +291,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.recommended_filter_classify_batch_size() == 50
 
 
-def test_long_window_trace_seeds_two_hundred_but_classifies_fifty() -> None:
+def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[
@@ -303,12 +303,10 @@ def test_long_window_trace_seeds_two_hundred_but_classifies_fifty() -> None:
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 50
     assert builder.skip_full_window_filter_anchor_probe() is True
-    assert builder.recommended_filter_anchor_probe_limit() == 64
-    assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
-    assert builder.recommended_filter_anchor_probe_strata() == 4
-    assert (
-        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 96 * 1024 * 1024
-    )
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
+    assert builder.recommended_filter_anchor_probe_strata() is None
+    assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
 
 
 def test_short_window_trace_keeps_full_sparse_anchor_probe() -> None:
