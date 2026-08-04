@@ -277,8 +277,14 @@ def test_raw_new_session_seed_classifier_expands_group_and_keeps_all_filters():
     assert "trace_session_id_remap FINAL" in match_sql
     assert "argMin(old_id, toString(old_id)) OVER" not in match_sql
     assert match_sql.count("FROM trace_session_id_remap FINAL") == 2
+    assert "FROM trace_sessions FINAL" not in match_sql
+    assert "candidate_target_new_ids AS" in match_sql
     assert "PREWHERE old_id IN (" in match_sql
     assert "WHERE new_id IN (" in match_sql
+    assert "arrayConcat(groupArray(old_id), [new_id])" in match_sql
+    assert "SELECT arrayJoin(group_ids) AS any_id" in match_sql
+    assert "AS candidate_session_pairs" in match_sql
+    assert "SELECT arrayJoin(candidate_session_pairs) AS pair" in match_sql
     assert "AS Array(UUID)" in match_sql
     assert "candidate_filter_sessions AS" in match_sql
     assert "candidate_raw_session_id = candidate_ts_remap.any_id" in match_sql
@@ -637,8 +643,21 @@ def test_session_page_enrichments_replay_tombstones_and_resolve_remaps():
     session_id = str(uuid.uuid4())
 
     metrics_sql, _ = builder.build_page_metrics_query([session_id])
-    content_sql, _ = builder.build_content_query([session_id])
+    content_sql, content_params = builder.build_content_query([session_id])
     attrs_sql, _ = builder.build_span_attributes_query([session_id])
+
+    assert content_params["candidate_filter_session_id_array"] == [session_id]
+    # One primary-key old-ID probe plus one authoritative reverse new-ID pass.
+    # The scalar tuple-array wrapper executes those source arms once even though
+    # content hydration consumes the tiny map in multiple CTE stages.
+    assert content_sql.count("FROM trace_session_id_remap FINAL") == 2
+    assert "WHERE new_id IN (" in content_sql
+    assert "candidate_target_new_ids AS" in content_sql
+    assert "PREWHERE old_id IN (" in content_sql
+    assert "AS candidate_session_pairs" in content_sql
+    assert "SELECT arrayJoin(candidate_session_pairs) AS pair" in content_sql
+    assert "trace_session_id IN %(content_session_ids)s" in content_sql
+    assert "if(ts_remap.survivor_id IS NULL OR ts_remap.survivor_id = " in content_sql
 
     for sql in (metrics_sql, content_sql, attrs_sql):
         candidate_sql = sql.split("candidate_root_identities AS (", 1)[1].split(

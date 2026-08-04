@@ -330,6 +330,87 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             values.extend(str(value) for value in raw_values if value)
         return tuple(dict.fromkeys(values))
 
+    def _candidate_survivor_map_sql(
+        self,
+        params: dict[str, Any],
+        session_ids: tuple[str, ...],
+    ) -> str:
+        """Return an exact survivor map for one finite session-ID set.
+
+        The remap table is ordered only by ``old_id``. Resolve old-ID inputs with
+        a primary-key point probe, then perform one authoritative reverse
+        ``new_id`` pass for both old and new inputs. The caller materializes this
+        relation once as a scalar tuple array, so ClickHouse never repeats that
+        reverse pass when the classifier consumes the map in several stages.
+        """
+
+        if not session_ids:
+            raise ValueError("candidate survivor map requires bounded IDs")
+        params["candidate_filter_session_id_array"] = list(session_ids)
+        return """
+            WITH
+            candidate_filter_ids AS (
+                SELECT arrayJoin(
+                    CAST(%(candidate_filter_session_id_array)s AS Array(UUID))
+                ) AS candidate_id
+            ),
+            candidate_target_new_ids AS (
+                SELECT DISTINCT new_id
+                FROM trace_session_id_remap FINAL
+                PREWHERE old_id IN (
+                    SELECT candidate_id FROM candidate_filter_ids
+                )
+                UNION DISTINCT
+                SELECT candidate_id AS new_id
+                FROM candidate_filter_ids
+            ),
+            candidate_remap_groups AS (
+                SELECT
+                    new_id,
+                    argMin(old_id, toString(old_id)) AS survivor_id,
+                    arrayDistinct(
+                        arrayConcat(groupArray(old_id), [new_id])
+                ) AS group_ids
+                FROM trace_session_id_remap FINAL
+                WHERE new_id IN (
+                    SELECT new_id FROM candidate_target_new_ids
+                )
+                GROUP BY new_id
+            )
+            SELECT arrayJoin(group_ids) AS any_id, survivor_id
+            FROM candidate_remap_groups
+        """
+
+    def _candidate_survivor_map_ctes(
+        self,
+        params: dict[str, Any],
+        session_ids: tuple[str, ...],
+    ) -> str:
+        """Materialize one finite map as a query-wide scalar tuple array.
+
+        ClickHouse table CTEs are macros, not materialized results. The session
+        classifier references its map while seeding, expanding and replaying;
+        embedding the base relation directly would repeat the dimension/remap
+        reads for each reference. A scalar subquery is executed once as a set,
+        while the tiny array can be expanded repeatedly without table reads.
+        """
+
+        map_sql = self._candidate_survivor_map_sql(params, session_ids)
+        return f"""
+        (
+            SELECT groupArray(tuple(any_id, survivor_id))
+            FROM ({map_sql})
+        ) AS candidate_session_pairs,
+        ts_survivor_map AS (
+            SELECT
+                tupleElement(pair, 1) AS any_id,
+                tupleElement(pair, 2) AS survivor_id
+            FROM (
+                SELECT arrayJoin(candidate_session_pairs) AS pair
+            )
+        )
+        """
+
     def _candidate_session_ctes(
         self,
         params: dict[str, Any],
@@ -492,60 +573,20 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             self._SESSION_ID_FILTER_COLS
         )
         seed_session_ids = candidate_session_ids or positive_session_ids
-        ts_map = survivor_map_subquery("trace_session_id_remap")
+        ts_map_ctes = (
+            f"ts_survivor_map AS ({survivor_map_subquery('trace_session_id_remap')})"
+        )
         candidate_session_cte = ""
         root_session_seed = ""
         if seed_session_ids:
             params["candidate_filter_session_ids"] = seed_session_ids
-            params["candidate_filter_session_id_array"] = list(seed_session_ids)
             # A seed may carry any member of a consolidation group: its
             # survivor old ID, a non-survivor old ID, or the deterministic new
-            # ID. Resolve only the finite input set to target new-ID groups,
-            # then expand those groups once. This preserves the exact
-            # many-old→one-new survivor rule without rebuilding the 1M+ row
-            # global survivor map in every classifier batch.
-            ts_map = """
-            WITH
-            candidate_filter_ids AS (
-                SELECT arrayJoin(
-                    CAST(%(candidate_filter_session_id_array)s AS Array(UUID))
-                ) AS candidate_id
-            ),
-            candidate_target_new_ids AS (
-                SELECT DISTINCT new_id
-                FROM trace_session_id_remap FINAL
-                PREWHERE old_id IN (
-                    SELECT candidate_id FROM candidate_filter_ids
-                )
-                UNION DISTINCT
-                SELECT candidate_id AS new_id
-                FROM candidate_filter_ids
-            ),
-            candidate_remap_rows AS (
-                SELECT old_id, new_id
-                FROM trace_session_id_remap FINAL
-                WHERE new_id IN (
-                    SELECT new_id FROM candidate_target_new_ids
-                )
-            ),
-            candidate_remap_groups AS (
-                SELECT
-                    new_id,
-                    argMin(old_id, toString(old_id)) AS survivor_id
-                FROM candidate_remap_rows
-                GROUP BY new_id
-            )
-            SELECT any_id, min(survivor_id) AS survivor_id
-            FROM (
-                SELECT rows.old_id AS any_id, groups.survivor_id AS survivor_id
-                FROM candidate_remap_rows AS rows
-                INNER JOIN candidate_remap_groups AS groups USING (new_id)
-                UNION ALL
-                SELECT new_id AS any_id, survivor_id
-                FROM candidate_remap_groups
-            )
-            GROUP BY any_id
-            """
+            # ID. Resolve the finite old-ID side by primary key, reverse the
+            # resulting/new input IDs in one authoritative pass, and materialize
+            # that tiny map once. This preserves the exact many-old→one-new
+            # survivor rule without repeating the non-key scan at every CTE use.
+            ts_map_ctes = self._candidate_survivor_map_ctes(params, seed_session_ids)
             resolved_candidate_session = resolved_id_expr(
                 "candidate_raw_session_id", "candidate_ts_remap"
             )
@@ -710,7 +751,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             f"AND {resolved_session_clause}" if resolved_session_clause else ""
         )
         return f"""
-        ts_survivor_map AS ({ts_map})
+        {ts_map_ctes}
         {candidate_session_cte}
         {eu_map_cte},
         candidate_root_identities AS (
@@ -1303,11 +1344,19 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         if len(ids) > 200:
             raise ValueError("content session page exceeds bounded limit")
         params = {**self.params, "content_session_ids": ids}
-        ts_map = survivor_map_subquery("trace_session_id_remap")
+        # The page contains at most 200 canonical session IDs.  Building the
+        # global survivor map here scans ``trace_session_id_remap`` twice even
+        # though hydration can only return those finite sessions.  Expand only
+        # their consolidation groups and materialize the finite map once,
+        # preserving the identical old/new -> survivor mapping while keeping
+        # the span read page-scoped.
+        # An unmapped direct-CH session still follows the explicit raw-ID arm
+        # below and ``resolved_id_expr`` falls back to that raw ID.
+        ts_map_ctes = self._candidate_survivor_map_ctes(params, ids)
         resolved_ts = resolved_id_expr("latest_trace_session_id", "ts_remap")
         query = f"""
         WITH
-        ts_survivor_map AS ({ts_map}),
+        {ts_map_ctes},
         candidate_root_identities AS (
             SELECT DISTINCT project_id, trace_id, id, start_time
             FROM {self.TABLE}
