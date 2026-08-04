@@ -444,6 +444,57 @@ _ORDERED_STRATIFIED_CANDIDATE_SQL = """
     LIMIT %(candidate_limit)s
 """
 
+# Typed value pickers carry the raw row version alongside the physical
+# identity, but deliberately never project a Map value.  The version is a
+# narrow certificate input: an exact latest-state replay below decides whether
+# this key-bearing row is still current before any wide value subcolumn is
+# hydrated.
+_TYPED_VALUE_CANDIDATE_SQL = """
+    SELECT
+        toString(project_id) AS project_id,
+        toString(trace_id) AS trace_id,
+        toString(id) AS id,
+        start_time,
+        toUInt64(_version) AS candidate_version
+    FROM spans AS attribute_source
+    PREWHERE project_id IN %(project_ids)s
+      AND start_time >= %(segment_start)s
+      AND start_time < %(segment_end)s
+    WHERE is_deleted = 0
+      AND ({candidate_predicate})
+    ORDER BY
+        attribute_source.project_id ASC,
+        attribute_source.observation_type ASC,
+        attribute_source.service_name ASC,
+        toStartOfHour(attribute_source.start_time) ASC,
+        attribute_source.trace_id ASC,
+        attribute_source.id ASC
+    LIMIT %(candidate_limit)s
+"""
+
+_ORDERED_TYPED_VALUE_CANDIDATE_SQL = """
+    SELECT
+        toString(project_id) AS project_id,
+        toString(trace_id) AS trace_id,
+        toString(id) AS id,
+        start_time,
+        toUInt64(_version) AS candidate_version
+    FROM spans AS attribute_source
+    PREWHERE project_id IN %(project_ids)s
+      AND start_time >= %(segment_start)s
+      AND start_time < %(segment_end)s
+    WHERE is_deleted = 0
+      AND ({candidate_predicate})
+    ORDER BY
+        start_time DESC,
+        id DESC,
+        trace_id DESC,
+        toString(attribute_source.project_id) DESC,
+        _version DESC
+    LIMIT 1 BY project_id, trace_id, id, start_time
+    LIMIT %(candidate_limit)s
+"""
+
 _LATEST_TARGET_SQL = """
     SELECT
         toString(project_id) AS project_id,
@@ -530,20 +581,19 @@ _LATEST_TYPED_TARGET_SQL = """
     )
 """
 
-# Resolve tombstones and key presence without reading any Map value
-# subcolumns.  High-churn tenants can leave many raw candidate versions whose
-# latest row cleared the selected key; hydrating their wide values first made
-# each picker page read gigabytes only to discard every row in Python.
-_LATEST_TYPED_PRESENCE_SQL = """
+# Certify candidate versions and tombstones without reading any Map subcolumn.
+# The candidate query already proved that its raw row had the requested key;
+# only a row whose version is still latest and live may advance to value
+# hydration.  High-churn tenants therefore pay this narrow replay for stale or
+# cleared identities instead of replaying their wide Map keys or values.
+_LATEST_TYPED_VERSION_SQL = """
     SELECT
         toString(project_id) AS project_id,
         toString(trace_id) AS trace_id,
         toString(id) AS id,
         start_time,
-        tupleElement(latest_state, 1) AS is_deleted,
-        tupleElement(latest_state, 2) AS string_present,
-        tupleElement(latest_state, 3) AS number_present,
-        tupleElement(latest_state, 4) AS boolean_present
+        max(_version) AS latest_version,
+        argMax(is_deleted, _version) AS is_deleted
     FROM
     (
         SELECT
@@ -551,20 +601,13 @@ _LATEST_TYPED_PRESENCE_SQL = """
             trace_id,
             id,
             start_time,
-            argMax(
-                tuple(
-                    is_deleted,
-                    has(attrs_string.keys, %(attribute_key)s),
-                    has(attrs_number.keys, %(attribute_key)s),
-                    has(attrs_bool.keys, %(attribute_key)s)
-                ),
-                _version
-            ) AS latest_state
+            _version,
+            is_deleted
         FROM spans AS attribute_source
         PREWHERE project_id IN %(project_ids)s
           AND ({candidate_predicate})
-        GROUP BY project_id, trace_id, id, start_time
     )
+    GROUP BY project_id, trace_id, id, start_time
 """
 
 _LATEST_BROWSE_SQL = """
@@ -937,7 +980,12 @@ class AttributeReadSelector:
         before_identity: PhysicalSpanIdentity | None = None,
         candidate_limit: int,
         query_timeout_ms: int | None = None,
-    ) -> tuple[tuple[PhysicalSpanIdentity, ...], bool]:
+        include_versions: bool = False,
+    ) -> tuple[
+        tuple[PhysicalSpanIdentity, ...],
+        bool,
+        dict[PhysicalSpanIdentity, int],
+    ]:
         segment_start, segment_end = segment
         params: dict[str, Any] = {
             "project_ids": project_ids,
@@ -952,6 +1000,14 @@ class AttributeReadSelector:
         ordered = ordered or before_identity is not None
         candidate_sql = _ORDERED_CANDIDATE_SQL if ordered else _CANDIDATE_SQL
         query_settings: dict[str, Any] = {}
+        if include_versions:
+            if stratified:
+                raise ValueError("Versioned attribute candidates cannot be stratified")
+            candidate_sql = (
+                _ORDERED_TYPED_VALUE_CANDIDATE_SQL
+                if ordered
+                else _TYPED_VALUE_CANDIDATE_SQL
+            )
         if stratified:
             candidate_sql = (
                 _ORDERED_STRATIFIED_CANDIDATE_SQL
@@ -1009,6 +1065,7 @@ class AttributeReadSelector:
         truncated = len(rows) > candidate_limit
         identities: list[PhysicalSpanIdentity] = []
         seen: set[PhysicalSpanIdentity] = set()
+        versions: dict[PhysicalSpanIdentity, int] = {}
         for row in rows[:candidate_limit]:
             candidate_project_id = str(row.get("project_id") or "")
             candidate_trace_id = str(row.get("trace_id") or "")
@@ -1031,7 +1088,21 @@ class AttributeReadSelector:
             if identity not in seen:
                 seen.add(identity)
                 identities.append(identity)
-        return tuple(identities), truncated
+            if include_versions:
+                try:
+                    candidate_version = int(row["candidate_version"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise IncompleteLatestStateReplay(
+                        "Attribute candidate query omitted its row version"
+                    ) from exc
+                if candidate_version < 0:
+                    raise IncompleteLatestStateReplay(
+                        "Attribute candidate query returned an invalid row version"
+                    )
+                prior_version = versions.get(identity)
+                if prior_version is None or candidate_version > prior_version:
+                    versions[identity] = candidate_version
+        return tuple(identities), truncated, versions
 
     def _verify_latest(
         self,
@@ -1076,30 +1147,28 @@ class AttributeReadSelector:
         *,
         project_ids: tuple[str, ...],
         candidate_ids: tuple[PhysicalSpanIdentity, ...],
+        candidate_versions: dict[PhysicalSpanIdentity, int],
         attribute_key: str,
         query_timeout_ms: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Hydrate values only for finite identities whose latest row has *key*."""
+        """Hydrate only key-bearing candidate rows certified latest and live."""
 
-        presence_rows = self._verify_latest(
-            sql=_LATEST_TYPED_PRESENCE_SQL,
+        if set(candidate_versions) != set(candidate_ids):
+            raise IncompleteLatestStateReplay(
+                "Attribute value candidates had incomplete version certificates"
+            )
+        version_rows = self._verify_latest(
+            sql=_LATEST_TYPED_VERSION_SQL,
             project_ids=project_ids,
             candidate_ids=candidate_ids,
-            attribute_key=attribute_key,
             query_timeout_ms=query_timeout_ms,
         )
         active_ids = tuple(
             self._physical_identity(row)
-            for row in presence_rows
+            for row in version_rows
             if int(row.get("is_deleted") or 0) == 0
-            and any(
-                bool(row.get(field))
-                for field in (
-                    "string_present",
-                    "number_present",
-                    "boolean_present",
-                )
-            )
+            and int(row.get("latest_version", -1))
+            == candidate_versions[self._physical_identity(row)]
         )
         if not active_ids:
             return []
@@ -1544,7 +1613,7 @@ class AttributeReadSelector:
                 if lane_name == "json" and not json_lane_available:
                     continue
                 try:
-                    candidate_ids, segment_truncated = self._candidate_ids(
+                    candidate_ids, segment_truncated, _ = self._candidate_ids(
                         projects,
                         segment,
                         predicate=predicate,
@@ -1636,7 +1705,7 @@ class AttributeReadSelector:
                     state["complete"] = True
                     continue
                 try:
-                    candidate_ids, segment_truncated = self._candidate_ids(
+                    candidate_ids, segment_truncated, _ = self._candidate_ids(
                         projects,
                         state["segment"],
                         predicate=state["predicate"],
@@ -1927,7 +1996,11 @@ class AttributeReadSelector:
                 if lane_name == "json" and not json_lane_available:
                     continue
                 try:
-                    candidate_ids, segment_truncated = self._candidate_ids(
+                    (
+                        candidate_ids,
+                        segment_truncated,
+                        candidate_versions,
+                    ) = self._candidate_ids(
                         projects,
                         segment,
                         predicate=predicate,
@@ -1937,11 +2010,13 @@ class AttributeReadSelector:
                         ),
                         candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
                         query_timeout_ms=timeout_ms,
+                        include_versions=lane_name == "typed",
                     )
                     rows = (
                         self._verify_latest_typed_values(
                             project_ids=projects,
                             candidate_ids=candidate_ids,
+                            candidate_versions=candidate_versions,
                             attribute_key=key,
                             query_timeout_ms=timeout_ms,
                         )
@@ -2019,7 +2094,11 @@ class AttributeReadSelector:
                     state["complete"] = True
                     continue
                 try:
-                    candidate_ids, segment_truncated = self._candidate_ids(
+                    (
+                        candidate_ids,
+                        segment_truncated,
+                        candidate_versions,
+                    ) = self._candidate_ids(
                         projects,
                         state["segment"],
                         predicate=state["predicate"],
@@ -2031,11 +2110,13 @@ class AttributeReadSelector:
                         before_identity=state["before_identity"],
                         candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
                         query_timeout_ms=state["timeout_ms"],
+                        include_versions=state["lane_name"] == "typed",
                     )
                     rows = (
                         self._verify_latest_typed_values(
                             project_ids=projects,
                             candidate_ids=candidate_ids,
+                            candidate_versions=candidate_versions,
                             attribute_key=key,
                             query_timeout_ms=state["timeout_ms"],
                         )
@@ -2230,7 +2311,7 @@ class AttributeReadSelector:
         covered_start = overall_end
         for segment in windows:
             try:
-                candidate_ids, segment_truncated = self._candidate_ids(
+                candidate_ids, segment_truncated, _ = self._candidate_ids(
                     projects,
                     segment,
                     predicate="1",
