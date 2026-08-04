@@ -530,6 +530,43 @@ _LATEST_TYPED_TARGET_SQL = """
     )
 """
 
+# Resolve tombstones and key presence without reading any Map value
+# subcolumns.  High-churn tenants can leave many raw candidate versions whose
+# latest row cleared the selected key; hydrating their wide values first made
+# each picker page read gigabytes only to discard every row in Python.
+_LATEST_TYPED_PRESENCE_SQL = """
+    SELECT
+        toString(project_id) AS project_id,
+        toString(trace_id) AS trace_id,
+        toString(id) AS id,
+        start_time,
+        tupleElement(latest_state, 1) AS is_deleted,
+        tupleElement(latest_state, 2) AS string_present,
+        tupleElement(latest_state, 3) AS number_present,
+        tupleElement(latest_state, 4) AS boolean_present
+    FROM
+    (
+        SELECT
+            project_id,
+            trace_id,
+            id,
+            start_time,
+            argMax(
+                tuple(
+                    is_deleted,
+                    has(attrs_string.keys, %(attribute_key)s),
+                    has(attrs_number.keys, %(attribute_key)s),
+                    has(attrs_bool.keys, %(attribute_key)s)
+                ),
+                _version
+            ) AS latest_state
+        FROM spans AS attribute_source
+        PREWHERE project_id IN %(project_ids)s
+          AND ({candidate_predicate})
+        GROUP BY project_id, trace_id, id, start_time
+    )
+"""
+
 _LATEST_BROWSE_SQL = """
     SELECT
         toString(project_id) AS project_id,
@@ -1033,6 +1070,46 @@ class AttributeReadSelector:
                 "Attribute candidate latest-state replay was incomplete"
             )
         return rows
+
+    def _verify_latest_typed_values(
+        self,
+        *,
+        project_ids: tuple[str, ...],
+        candidate_ids: tuple[PhysicalSpanIdentity, ...],
+        attribute_key: str,
+        query_timeout_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Hydrate values only for finite identities whose latest row has *key*."""
+
+        presence_rows = self._verify_latest(
+            sql=_LATEST_TYPED_PRESENCE_SQL,
+            project_ids=project_ids,
+            candidate_ids=candidate_ids,
+            attribute_key=attribute_key,
+            query_timeout_ms=query_timeout_ms,
+        )
+        active_ids = tuple(
+            self._physical_identity(row)
+            for row in presence_rows
+            if int(row.get("is_deleted") or 0) == 0
+            and any(
+                bool(row.get(field))
+                for field in (
+                    "string_present",
+                    "number_present",
+                    "boolean_present",
+                )
+            )
+        )
+        if not active_ids:
+            return []
+        return self._verify_latest(
+            sql=_LATEST_TYPED_TARGET_SQL,
+            project_ids=project_ids,
+            candidate_ids=active_ids,
+            attribute_key=attribute_key,
+            query_timeout_ms=query_timeout_ms,
+        )
 
     @staticmethod
     def _physical_identity(row: dict[str, Any]) -> PhysicalSpanIdentity:
@@ -1861,12 +1938,21 @@ class AttributeReadSelector:
                         candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
                         query_timeout_ms=timeout_ms,
                     )
-                    rows = self._verify_latest(
-                        sql=replay_sql,
-                        project_ids=projects,
-                        candidate_ids=candidate_ids,
-                        attribute_key=key,
-                        query_timeout_ms=timeout_ms,
+                    rows = (
+                        self._verify_latest_typed_values(
+                            project_ids=projects,
+                            candidate_ids=candidate_ids,
+                            attribute_key=key,
+                            query_timeout_ms=timeout_ms,
+                        )
+                        if lane_name == "typed"
+                        else self._verify_latest(
+                            sql=replay_sql,
+                            project_ids=projects,
+                            candidate_ids=candidate_ids,
+                            attribute_key=key,
+                            query_timeout_ms=timeout_ms,
+                        )
                     )
                 except Exception as exc:
                     if lane_name == "json" and is_read_budget_error(exc):
@@ -1946,12 +2032,21 @@ class AttributeReadSelector:
                         candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
                         query_timeout_ms=state["timeout_ms"],
                     )
-                    rows = self._verify_latest(
-                        sql=state["replay_sql"],
-                        project_ids=projects,
-                        candidate_ids=candidate_ids,
-                        attribute_key=key,
-                        query_timeout_ms=state["timeout_ms"],
+                    rows = (
+                        self._verify_latest_typed_values(
+                            project_ids=projects,
+                            candidate_ids=candidate_ids,
+                            attribute_key=key,
+                            query_timeout_ms=state["timeout_ms"],
+                        )
+                        if state["lane_name"] == "typed"
+                        else self._verify_latest(
+                            sql=state["replay_sql"],
+                            project_ids=projects,
+                            candidate_ids=candidate_ids,
+                            attribute_key=key,
+                            query_timeout_ms=state["timeout_ms"],
+                        )
                     )
                 except Exception as exc:
                     if state["lane_name"] == "json" and is_read_budget_error(exc):

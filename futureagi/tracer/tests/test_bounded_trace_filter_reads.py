@@ -290,7 +290,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.filter_seed_proves_result_order() is False
     assert builder.filter_cursor_seed_keyset_is_safe() is True
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_classify_batch_size() == 200
 
 
 def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
@@ -303,7 +303,7 @@ def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
     )
 
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_classify_batch_size() == 200
     assert builder.skip_full_window_filter_anchor_probe() is True
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
@@ -571,6 +571,7 @@ def test_negative_only_trace_filter_skips_long_window_anchor() -> None:
     )
 
     assert builder.supports_filter_anchor_probe() is False
+    assert builder.recommended_filter_classify_batch_size() == 100
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
 

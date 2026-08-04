@@ -1086,7 +1086,17 @@ def test_reused_span_ids_keep_trace_and_start_time_scoped_tombstones():
                 return []
             emitted = True
             return candidates
-        return latest
+        wanted = set(call.params["candidate_physical_identities_0"])
+        return [
+            row
+            for row in latest
+            if (
+                row["trace_id"],
+                row["id"],
+                _unix_microseconds(row["start_time"]),
+            )
+            in wanted
+        ]
 
     executor = RecordingExecutor(respond)
     read = AttributeReadSelector(
@@ -1124,7 +1134,7 @@ def test_detail_read_uses_latest_versions_and_does_not_resurrect_tombstones():
                 _candidate(PROJECT_A, "later-updated"),
                 _candidate(PROJECT_A, "still-live"),
             ]
-        return [
+        latest = [
             _target_row(
                 PROJECT_A,
                 "later-deleted",
@@ -1133,6 +1143,17 @@ def test_detail_read_uses_latest_versions_and_does_not_resurrect_tombstones():
             ),
             _target_row(PROJECT_A, "later-updated", string="new-value"),
             _target_row(PROJECT_A, "still-live", string="new-value"),
+        ]
+        wanted = set(call.params["candidate_physical_identities_0"])
+        return [
+            row
+            for row in latest
+            if (
+                row["trace_id"],
+                row["id"],
+                _unix_microseconds(row["start_time"]),
+            )
+            in wanted
         ]
 
     executor = RecordingExecutor(respond)
@@ -1732,7 +1753,10 @@ def test_dense_typed_value_sample_stops_before_json_lane():
     )
     assert read.metadata.query_status == "sampled"
     assert read.metadata.query_error_code == "sample_limit"
-    assert read.metadata.query_count == 2
+    assert read.metadata.query_count == 3
+    presence_call = executor.calls[1]
+    assert "attrs_string.keys" in presence_call.sql
+    assert "attrs_string[%(attribute_key)s]" not in presence_call.sql
 
 
 def test_explicit_window_json_value_runs_after_empty_typed_probe():
