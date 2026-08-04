@@ -165,7 +165,7 @@ def test_task_filters_merge_legacy_and_canonical_lists() -> None:
     ("row_type", "identity", "expected_classify_batch"),
     [
         (RowType.SPANS, "id", 200),
-        (RowType.TRACES, "trace_id", 200),
+        (RowType.TRACES, "trace_id", 20),
     ],
 )
 def test_bounded_resolver_returns_only_a_complete_latest_state_page(

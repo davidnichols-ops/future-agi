@@ -332,16 +332,26 @@ class TestSpanAttributeKeysPartitionPruning:
     def test_windows_by_start_time_with_streaming_identity_limit(self, monkeypatch):
         calls = self._capture_calls(monkeypatch, recent_days=7)
         assert len(calls) == 1
-        sql, params, _, _ = calls[0]
+        sql, params, _, settings = calls[0]
         # start_time is the partition key -> CH can prune to the window.
         assert "start_time >= %(segment_start)s" in sql
         assert "start_time < %(segment_end)s" in sql
         assert params["segment_start"] < params["segment_end"]
-        assert "LIMIT 1 BY project_id, trace_id, id, start_time" in sql
+        # Picker reads are explicitly sampled. The initial probe follows the
+        # storage key so LIMIT can stop early; latest-state replay still
+        # verifies every retained physical identity before it is exposed.
+        assert "LIMIT 1 BY project_id, trace_id, id, start_time" not in sql
         assert "GROUP BY" not in sql
-        assert (
-            "ORDER BY start_time DESC, id DESC, trace_id DESC, project_id DESC" in sql
-        )
+        for storage_key in (
+            "attribute_source.project_id ASC",
+            "attribute_source.observation_type ASC",
+            "attribute_source.service_name ASC",
+            "toStartOfHour(attribute_source.start_time) ASC",
+            "attribute_source.trace_id ASC",
+            "attribute_source.id ASC",
+        ):
+            assert storage_key in sql
+        assert settings["optimize_read_in_order"] == 1
 
     def test_reads_keys_subcolumn_not_whole_map(self, monkeypatch):
         sql = self._capture_calls(monkeypatch, recent_days=7)[0][0]
@@ -353,11 +363,15 @@ class TestSpanAttributeKeysPartitionPruning:
         assert "mapKeys(" not in sql
 
     def test_preserves_hard_query_limits(self, monkeypatch):
+        from tracer.services.clickhouse.attribute_reads import (
+            ATTRIBUTE_READ_CANDIDATE_LIMIT,
+        )
+
         sql, params, timeout_ms, settings = self._capture_calls(
             monkeypatch, recent_days=7
         )[0]
         assert "LIMIT %(candidate_limit)s" in sql
-        assert params["candidate_limit"] == 513
+        assert params["candidate_limit"] == ATTRIBUTE_READ_CANDIDATE_LIMIT + 1
         assert timeout_ms <= 1_500
         assert settings["max_threads"] == 1
         assert settings["max_bytes_to_read"] <= 512 * 1024 * 1024

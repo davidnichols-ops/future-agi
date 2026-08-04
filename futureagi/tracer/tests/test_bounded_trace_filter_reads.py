@@ -303,6 +303,46 @@ def test_long_window_trace_presentation_batches_stay_at_fifty() -> None:
     assert builder.recommended_filter_classify_batch_size() == 50
 
 
+def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(days=14), END),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+        ],
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+    )
+
+    # Acquiring identity-only roots is cheap; latest-state any-span replay is
+    # the high-read phase and must be split independently.
+    assert builder.recommended_filter_seed_batch_size() == 200
+    assert builder.recommended_filter_classify_batch_size() == 20
+
+
+def test_eval_trace_any_span_large_prefix_fails_closed_at_query_ceiling() -> None:
+    common = {
+        "page_number": 0,
+        "max_seed_attempts": 128,
+        "max_candidates": 512,
+        "max_query_count": 128,
+        "classify_batch_size": 20,
+        "seed_batch_size": 200,
+    }
+
+    # This helper is only the mechanical preflight estimate: it does not
+    # reserve the optional anchor read or model classifier chunks restarting
+    # per seed page. Passing this boundary is not an end-to-end guarantee;
+    # runtime accounting still fails closed if the actual 128-read budget is
+    # exhausted.
+    assert (
+        bounded_numbered_page_depth_exceeded(page_size=2_459, **common) is False
+    )
+    # The next public row is rejected by even that optimistic estimate before
+    # CH is contacted, instead of widening back to the unsafe classifier batch.
+    assert bounded_numbered_page_depth_exceeded(page_size=2_460, **common) is True
+
+
 def test_call_type_trace_filter_skips_unindexed_window_anchor() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,

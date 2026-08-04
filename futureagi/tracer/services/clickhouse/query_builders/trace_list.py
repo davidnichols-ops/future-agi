@@ -62,6 +62,14 @@ _INDEXED_TRACE_ANY_SPAN_ANCHOR_COLUMNS = frozenset(
     }
 )
 
+# A latest-state trace classifier touches every physical span for each
+# candidate trace.  On the largest production tenant, one 25-trace any-span
+# classifier crossed the 512 MiB per-query safety ceiling even though its
+# identity-only projection completed quickly.  Twenty is the largest batch
+# already exercised below that ceiling by the bounded graph path; seed reads
+# remain independently capped and may still acquire 200 identities at once.
+_BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE = 20
+
 
 def _unix_microseconds(value: datetime) -> int:
     """Encode DateTime64(6) without driver tuple-datetime precision loss."""
@@ -441,14 +449,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def recommended_filter_classify_batch_size(self) -> int | None:
         """Keep the candidate-trace latest-state scan below CH's memory ceiling."""
 
-        # Normal list/graph classifiers hydrate the complete light root row and
-        # stay at the production-proven 50-trace ceiling.  ID-only internal
-        # consumers (eval/task and bulk selection) project just trace_id +
-        # start_time, so they can use the selector's 200-candidate batch without
-        # materialising the presentation columns for every candidate.
-        if self._bounded_bulk_scan:
-            return 200
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        # Normal list/graph classifiers hydrate the complete light root row and
+        # stay at the production-proven 50-trace ceiling. Identity-only
+        # consumers can retain 200 for root/residual-only filters. Any-span
+        # filters are different: their classifier must replay every physical
+        # child for each candidate trace, so use the production-proven graph
+        # batch even though the public projection contains only identities.
+        if self._bounded_bulk_scan:
+            if any(plan.scope == "any" for plan in plans):
+                return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
+            return 200
         request_start, request_end = self._bounded_request_window
         if (
             request_end - request_start <= timedelta(hours=1)
