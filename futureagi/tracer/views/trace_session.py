@@ -1363,7 +1363,9 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     page_number=page_number,
                     page_size=page_size,
                     max_candidates=200,
-                    classify_batch_size=200,
+                    classify_batch_size=(
+                        SessionListQueryBuilderV2.recommended_filter_classify_batch_size()
+                    ),
                     seed_batch_size=200,
                 )
             ):
@@ -2525,10 +2527,10 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 page_number=page_number,
                 page_size=page_size,
                 deadline_ms=read_deadline.remaining_ms(SESSION_LIST_QUERY_TIMEOUT_MS),
-                # Session seed and classifier statements are intentionally
-                # capped at 200 IDs by the builder contract.
+                # Seed acquisition stays broad; exact attribute replay uses the
+                # builder's smaller production-safe classifier recommendation.
                 max_candidates=200,
-                classify_batch_size=200,
+                classify_batch_size=builder.recommended_filter_classify_batch_size(),
                 read_settings=_session_read_settings(max_result_rows=200),
             )
             if not bounded_page.complete:

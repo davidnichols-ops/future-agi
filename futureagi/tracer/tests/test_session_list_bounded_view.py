@@ -82,6 +82,7 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
     builder = mock.MagicMock()
     builder.supports_candidate_first_page.return_value = False
     builder.supports_bounded_filter_scan.return_value = True
+    builder.recommended_filter_classify_batch_size.return_value = 50
     builder.build_page_metrics_query.return_value = ("page metrics", {})
     builder.build_content_query.return_value = ("page content", {})
     builder.build_span_attributes_query.return_value = ("page attributes", {})
@@ -192,7 +193,7 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
     assert bounded_kwargs["page_number"] == 4
     assert bounded_kwargs["page_size"] == 1
     assert bounded_kwargs["max_candidates"] == 200
-    assert bounded_kwargs["classify_batch_size"] == 200
+    assert bounded_kwargs["classify_batch_size"] == 50
     builder.build_candidate_page_query.assert_not_called()
     builder.build.assert_not_called()
     assert builder.build_page_metrics_query.call_count == 2

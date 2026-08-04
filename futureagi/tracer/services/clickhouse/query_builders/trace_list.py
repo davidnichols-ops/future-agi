@@ -395,7 +395,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def _plan_uses_indexed_anchor(plan: LatestFilterPredicate) -> bool:
         """Return whether an any-span predicate has a safe broad sentinel."""
 
-        predicate = " ".join(str(plan.seed_predicate or "").split())
+        predicate = " ".join(
+            str(plan.raw_witness_predicate or plan.seed_predicate or "").split()
+        )
         if not predicate or predicate.replace(" ", "") == "1=1":
             return False
         if "JSONExtract" in predicate:
@@ -675,10 +677,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if not anchor_plans:
             raise ValueError("trace anchor probe requires an indexed any-span filter")
         anchor = anchor_plans[0]
+        anchor_predicate = anchor.raw_witness_predicate or anchor.seed_predicate
         anchor_params = {
             key: value
             for key, value in anchor.params.items()
-            if f"%({key})s" in anchor.seed_predicate
+            if f"%({key})s" in anchor_predicate
         }
         params: dict[str, Any] = {
             **self.params,
@@ -710,7 +713,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
           {project_version_fragment}
           AND start_time >= fromUnixTimestamp64Micro(%(filter_anchor_start_us)s)
           AND start_time < fromUnixTimestamp64Micro(%(filter_anchor_end_us)s)
-        WHERE {anchor.seed_predicate}
+        WHERE {anchor_predicate}
           {sampling_fragment}
         LIMIT %(filter_anchor_limit)s
         """
@@ -898,6 +901,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self.start_date, self.end_date = request_start, request_end
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
         root_plans = [plan for plan in plans if plan.scope == "root"]
+        root_seed_predicates = [
+            plan.raw_witness_predicate or plan.seed_predicate for plan in root_plans
+        ]
         params: dict[str, Any] = {
             **self.params,
             "filter_slice_start": slice_start,
@@ -910,15 +916,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             "filter_slice_end_us": _unix_microseconds(slice_end),
             "filter_seed_limit": int(limit),
         }
-        for plan in root_plans:
+        for plan, seed_predicate in zip(root_plans, root_seed_predicates, strict=True):
             params.update(
                 {
                     key: value
                     for key, value in plan.params.items()
-                    if f"%({key})s" in plan.seed_predicate
+                    if f"%({key})s" in seed_predicate
                 }
             )
-        root_predicate = " AND ".join(plan.seed_predicate for plan in root_plans)
+        root_predicate = " AND ".join(root_seed_predicates)
         predicate_fragment = f"AND {root_predicate}" if root_predicate else ""
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
@@ -1049,6 +1055,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # latest state. Applying all leaves here would be wrong because two
         # different child spans may satisfy two different trace filters.
         seed_plans = [any_span_plans[0]] if any_span_plans else root_plans
+        seed_predicates = [
+            plan.raw_witness_predicate or plan.seed_predicate for plan in seed_plans
+        ]
         params: dict[str, Any] = {
             **self.params,
             "filter_slice_start": slice_start,
@@ -1064,16 +1073,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if self.project_version_id:
             params["project_version_id"] = self.project_version_id
             project_version_fragment = "AND project_version_id = %(project_version_id)s"
-        for plan in seed_plans:
+        for plan, seed_predicate in zip(seed_plans, seed_predicates, strict=True):
             params.update(
                 {
                     key: value
                     for key, value in plan.params.items()
-                    if f"%({key})s" in plan.seed_predicate
+                    if f"%({key})s" in seed_predicate
                 }
             )
 
-        predicate = " AND ".join(plan.seed_predicate for plan in seed_plans)
+        predicate = " AND ".join(seed_predicates)
         predicate_fragment = f"AND {predicate}" if predicate else ""
         # Trace datetime leaves bind to the displayed root timestamp. An
         # any-span seed is only a superset, so defer the complement to root

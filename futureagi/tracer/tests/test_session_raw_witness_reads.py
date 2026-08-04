@@ -66,12 +66,16 @@ def test_session_seed_pushes_indexed_scalar_witness_before_group_and_limit() -> 
     witness = "mapContains(attrs_string, %(latest_filter_key_0)s)"
     value_bloom = "hasAny(arrayMap(x -> lower(x), mapValues(attrs_string))"
     assert witness in sql
-    assert value_bloom in sql
+    assert value_bloom not in sql
     assert sql.index(witness) < sql.index("GROUP BY session_id")
     assert sql.index(witness) < sql.index("LIMIT %(filter_seed_limit)s")
     assert params["latest_filter_key_0"] == "final_status"
-    assert params["latest_filter_param_0"] == ("rechazado",)
-    assert params["latest_filter_index_0_0"] == "rechazado"
+    assert "latest_filter_param_0" not in params
+    assert "latest_filter_index_0_0" not in params
+
+    match_sql, match_params = builder.build_filter_match_query([CANDIDATE_SESSION_ID])
+    assert "lowerUTF8(toString(latest_attr_value_0)) IN" in match_sql
+    assert match_params["latest_filter_param_0"] == ("rechazado",)
 
 
 @pytest.mark.unit
@@ -93,7 +97,7 @@ def test_session_seed_prefers_indexed_scalar_when_json_filter_comes_first() -> N
     )
 
     assert "mapContains(attrs_string, %(latest_filter_key_1)s)" in sql
-    assert "hasAny(arrayMap(x -> lower(x), mapValues(attrs_string))" in sql
+    assert "mapValues(attrs_string)" not in sql
     assert "%(latest_filter_key_0)s" not in sql
     assert params["latest_filter_key_1"] == "final_status"
     assert "latest_filter_key_0" not in params
@@ -121,7 +125,7 @@ def test_session_seed_prefers_indexed_scalar_when_json_filter_comes_first() -> N
         ),
     ],
 )
-def test_positive_json_only_filter_uses_a_raw_candidate_witness(
+def test_positive_json_only_filter_defers_parsing_to_exact_classifier(
     filter_type: str,
     value: object,
     raw_expression: str,
@@ -141,10 +145,16 @@ def test_positive_json_only_filter_uses_a_raw_candidate_witness(
         limit=200,
     )
 
-    assert "JSONHas(attributes_extra, %(latest_filter_key_0)s)" in sql
-    assert raw_expression in sql
-    assert sql.index(raw_expression) < sql.index("GROUP BY session_id")
-    assert params["latest_filter_key_0"] == "customer_context"
+    assert "JSONHas(attributes_extra, %(latest_filter_key_0)s)" not in sql
+    assert raw_expression not in sql
+    assert "latest_filter_key_0" not in params
+
+    plans, residual = builder._bounded_span_filter_parts()
+    assert residual == []
+    assert plans[0].raw_witness_predicate is None
+    match_sql, match_params = builder.build_filter_match_query([CANDIDATE_SESSION_ID])
+    assert raw_expression in match_sql
+    assert match_params["latest_filter_key_0"] == "customer_context"
 
 
 @pytest.mark.unit

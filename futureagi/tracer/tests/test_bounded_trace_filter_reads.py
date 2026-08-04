@@ -264,8 +264,9 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     )
     assert "start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)" in seed_sql
     assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in seed_sql
-    assert "arrayMap(x -> lower(x), mapValues(span_attr_str))" in seed_sql
+    assert "mapValues(span_attr_str)" not in seed_sql
     assert seed_params["latest_filter_key_0"] == "final_status"
+    assert "latest_filter_param_0" not in seed_params
     assert "parent_span_id IS NULL" not in seed_sql
     assert "id AS matched_span_id" in seed_sql
     assert " FINAL" not in seed_sql
@@ -997,7 +998,7 @@ def test_trace_and_span_seed_slice_bounds_preserve_microseconds() -> None:
         assert params["candidate_end_date_us"] == 1_735_689_601_654_321
 
 
-def test_v2_span_seed_uses_deployed_string_value_bloom_companion() -> None:
+def test_v2_span_seed_uses_key_only_witness_before_exact_replay() -> None:
     filters = [
         _time_filter(),
         _attribute_filter("final_status", ["Rejected"], operation="in"),
@@ -1010,11 +1011,11 @@ def test_v2_span_seed_uses_deployed_string_value_bloom_companion() -> None:
         limit=100,
     )
 
-    assert (
-        "hasAny(arrayMap(x -> lower(x), mapValues(attrs_string)), "
-        "[%(latest_filter_index_0_0)s])" in sql
-    )
-    assert params["latest_filter_index_0_0"] == "rejected"
+    assert "mapContains(attrs_string, %(latest_filter_key_0)s)" in sql
+    assert "mapValues(attrs_string)" not in sql
+    assert params["latest_filter_key_0"] == "final_status"
+    assert "latest_filter_param_0" not in params
+    assert "latest_filter_index_0_0" not in params
 
     prompt_builder = SpanListQueryBuilderV2(
         project_id=PROJECT_ID,
@@ -1028,11 +1029,10 @@ def test_v2_span_seed_uses_deployed_string_value_bloom_companion() -> None:
         slice_end=END,
         limit=100,
     )
-    assert (
-        "has(arrayMap(x -> lower(x), mapValues(attrs_string)), "
-        "%(latest_filter_param_0)s)" in prompt_sql
-    )
-    assert prompt_params["latest_filter_param_0"] == "agent_2_identity_disclosure"
+    assert "mapContains(attrs_string, %(latest_filter_key_0)s)" in prompt_sql
+    assert "mapValues(attrs_string)" not in prompt_sql
+    assert prompt_params["latest_filter_key_0"] == "prompt_slug"
+    assert "latest_filter_param_0" not in prompt_params
 
 
 @pytest.mark.parametrize(
@@ -1656,7 +1656,7 @@ def test_attribute_key_is_bound_and_preserved_for_all_map_expressions() -> None:
         assert key not in sql
         assert "%(latest_filter_key_0)s" in sql
     assert "mapContains(attrs_string, %(latest_filter_key_0)s)" in seed_sql
-    assert "attrs_string[%(latest_filter_key_0)s]" in seed_sql
+    assert "attrs_string[%(latest_filter_key_0)s]" not in seed_sql
     assert "argMax(mapContains(attrs_string, %(latest_filter_key_0)s)" in match_sql
     assert "argMax(attrs_string[%(latest_filter_key_0)s], _version)" in match_sql
     assert seed_params["latest_filter_key_0"] == key

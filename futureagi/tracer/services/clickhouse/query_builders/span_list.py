@@ -298,7 +298,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     def _plan_uses_indexed_anchor(plan: Any) -> bool:
         """Return whether CH25 can prune this raw seed with a deployed index."""
 
-        predicate = " ".join(str(plan.seed_predicate or "").split())
+        predicate = " ".join(
+            str(plan.raw_witness_predicate or plan.seed_predicate or "").split()
+        )
         if not predicate or predicate.replace(" ", "") == "1=1":
             return False
         # Structured overflow and call_type parse the raw JSON blob.  They have
@@ -390,6 +392,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         request_start, request_end = self.parse_time_range(self.filters)
         self.params.update({"start_date": request_start, "end_date": request_end})
         seeded_plans = self._filter_anchor_plans()
+        seeded_predicates = [
+            plan.raw_witness_predicate or plan.seed_predicate for plan in seeded_plans
+        ]
         params: dict[str, Any] = {
             **self.params,
             "filter_anchor_start": request_start,
@@ -398,15 +403,15 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             "filter_anchor_end_us": _unix_microseconds(request_end),
             "filter_anchor_limit": int(limit),
         }
-        for plan in seeded_plans:
+        for plan, seed_predicate in zip(seeded_plans, seeded_predicates, strict=True):
             params.update(
                 {
                     key: value
                     for key, value in plan.params.items()
-                    if f"%({key})s" in plan.seed_predicate
+                    if f"%({key})s" in seed_predicate
                 }
             )
-        predicate = " AND ".join(plan.seed_predicate for plan in seeded_plans)
+        predicate = " AND ".join(seeded_predicates)
 
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
@@ -483,6 +488,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         # state classifier.  Parsing them before ORDER BY would scan the entire
         # slice merely to discover a rare or absent value.
         seed_plans = [plan for plan in plans if self._plan_uses_indexed_anchor(plan)]
+        seed_predicates = [
+            plan.raw_witness_predicate or plan.seed_predicate for plan in seed_plans
+        ]
         params: dict[str, Any] = {
             **self.params,
             "filter_slice_start": slice_start,
@@ -498,15 +506,15 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         if self.project_version_id:
             params["project_version_id"] = self.project_version_id
             project_version_fragment = "AND project_version_id = %(project_version_id)s"
-        for plan in seed_plans:
+        for plan, seed_predicate in zip(seed_plans, seed_predicates, strict=True):
             params.update(
                 {
                     key: value
                     for key, value in plan.params.items()
-                    if f"%({key})s" in plan.seed_predicate
+                    if f"%({key})s" in seed_predicate
                 }
             )
-        predicate = " AND ".join(plan.seed_predicate for plan in seed_plans) or "1 = 1"
+        predicate = " AND ".join(seed_predicates) or "1 = 1"
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
                 self.filters,

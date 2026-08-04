@@ -293,7 +293,7 @@ def test_bounded_historical_session_selector_proves_and_sorts_full_population(
     assert captured["deadline_ms"] == 10_000
     assert captured["max_query_count"] == 128
     assert captured["max_candidates"] == 512
-    assert captured["classify_batch_size"] == 200
+    assert captured["classify_batch_size"] == 50
     assert captured["builder"]._bounded_internal_scan is True
     assert captured["builder"]._bounded_sampling_salt == "task-salt"
     assert captured["builder"]._bounded_sampling_rate == 25.0

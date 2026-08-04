@@ -225,8 +225,16 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         ) and self.bounded_filter_degraded_error_code() is None
 
     @staticmethod
-    def recommended_filter_classify_batch_size() -> int:
+    def recommended_filter_seed_batch_size() -> int:
         return 200
+
+    @staticmethod
+    def recommended_filter_classify_batch_size() -> int:
+        # Attribute argMax replay still touches complete Map state for every
+        # physical root in the candidate sessions.  Production's largest
+        # tenant exceeded the endpoint deadline at 200; keep seed acquisition
+        # broad and split only the exact latest-state replay.
+        return 50
 
     @staticmethod
     def filter_seed_proves_result_order() -> bool:
@@ -709,7 +717,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             raise ValueError("unsupported bounded session filter scan")
         # Seed rows contain only the remap-resolved identity/order tuple. Eval
         # population proofs may acquire the shared 512-row working set, while
-        # the latest-state classifier remains independently capped at 200.
+        # callers split exact latest-state replay using the smaller recommended
+        # classifier batch.
         if limit <= 0 or limit > 512:
             raise ValueError("session seed limit must be between 1 and 512")
         if (before_start_time is None) != (before_id is None):
