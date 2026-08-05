@@ -4,8 +4,8 @@
     {
       "id": "model_hub/tests/test_dataset_validators.py::TestValidateAndConvertCellValue::test_array_invalid_json",
       "reason": "pre-existing failure at CI introduction (baseline 2026-08, post-Redis-fix core)",
-      "owner": "unassigned",
-      "issue": "",
+      "owner": "tanmaycode1",
+      "issue": "https://github.com/future-agi/future-agi/issues/1984",
       "added": "2026-08-05",
       "expires": "2026-09-19",
       "mode": "run"
@@ -13,8 +13,8 @@
     {
       "id": "model_hub/tests/test_dataset_validators.py::TestValidateAndConvertCellValue::test_json_malformed_repaired",
       "reason": "pre-existing failure at CI introduction (baseline 2026-08, post-Redis-fix core)",
-      "owner": "unassigned",
-      "issue": "",
+      "owner": "tanmaycode1",
+      "issue": "https://github.com/future-agi/future-agi/issues/1984",
       "added": "2026-08-05",
       "expires": "2026-09-19",
       "mode": "run"
@@ -22,8 +22,8 @@
     {
       "id": "model_hub/tests/test_upload_file_api.py::test_upload_file_link_infers_file_extension_without_forcing_object_key",
       "reason": "pre-existing failure at CI introduction (baseline 2026-08, post-Redis-fix core)",
-      "owner": "unassigned",
-      "issue": "",
+      "owner": "nik13",
+      "issue": "https://github.com/future-agi/future-agi/issues/1984",
       "added": "2026-08-05",
       "expires": "2026-09-19",
       "mode": "run"
@@ -31,8 +31,8 @@
     {
       "id": "tfc/tests/test_api_error_response_shapes.py::test_product_api_errors_use_common_envelope_or_tracked_burn_down_debt",
       "reason": "pre-existing failure at CI introduction (baseline 2026-08, post-Redis-fix core)",
-      "owner": "unassigned",
-      "issue": "",
+      "owner": "nik13",
+      "issue": "https://github.com/future-agi/future-agi/issues/1984",
       "added": "2026-08-05",
       "expires": "2026-09-19",
       "mode": "run"
@@ -40,8 +40,8 @@
     {
       "id": "tfc/utils/tests/test_distributed_locks.py::TestDistributedStateErrorHandling::test_cleanup_stale_handles_exception",
       "reason": "pre-existing failure at CI introduction (baseline 2026-08, post-Redis-fix core)",
-      "owner": "unassigned",
-      "issue": "",
+      "owner": "chirag",
+      "issue": "https://github.com/future-agi/future-agi/issues/1984",
       "added": "2026-08-05",
       "expires": "2026-09-19",
       "mode": "run"

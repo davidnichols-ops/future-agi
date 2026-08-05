@@ -315,16 +315,18 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(ee_marker)
         for entry in quarantine:
             sel = entry["id"]
-            if (
-                item.nodeid == sel
-                or item.nodeid.startswith(sel + "::")
-                or item.nodeid.startswith(sel + "/")
-            ):
+            if item.nodeid == sel or item.nodeid.startswith(sel + "::"):
                 reason = f"quarantined: {entry['reason']} (owner {entry['owner']})"
                 if entry.get("mode", "run") == "skip":
                     item.add_marker(_pytest.mark.skip(reason=reason))
                 else:
-                    item.add_marker(_pytest.mark.xfail(reason=reason, strict=False))
+                    # Strict unless the entry opts out with a literal JSON
+                    # ``false``; a quarantined test that starts passing then
+                    # fails the run as XPASS and the entry has to be removed.
+                    # ``is not False`` always yields a bool, so a hand-edited
+                    # non-bool value cannot crash the session.
+                    strict = entry.get("strict", True) is not False
+                    item.add_marker(_pytest.mark.xfail(reason=reason, strict=strict))
                 break
 
 

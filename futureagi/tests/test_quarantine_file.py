@@ -29,6 +29,41 @@ def test_entries_have_required_fields_and_valid_modes():
         seen.add(e["id"])
 
 
+def test_entries_are_test_scoped_and_owned():
+    for e in _entries():
+        assert "::" in e["id"], (
+            f"{e['id']} quarantines a whole file or directory; "
+            "entries must name a single test (path::test_name)"
+        )
+        owner = e["owner"].strip()
+        assert owner and owner != "unassigned", (
+            f"{e['id']} has no owner; quarantine needs someone accountable for it"
+        )
+        issue = e.get("issue")
+        assert isinstance(issue, str) and issue.strip(), (
+            f"{e['id']} has no tracking issue"
+        )
+
+
+def test_scoped_and_owned_assertions_pass_on_compliant_entries(tmp_path, monkeypatch):
+    """The ratchet above only proves entries are non-compliant if it also passes
+    on compliant ones."""
+    compliant = {
+        "id": "some/module.py::TestThing::test_thing",
+        "reason": "flaky under parallel CH access",
+        "owner": "atharva",
+        "issue": "TH-1234",
+        "added": "2026-08-05",
+        "expires": "2026-09-19",
+        "mode": "run",
+    }
+    path = tmp_path / ".test_quarantine.json"
+    path.write_text(json.dumps({"version": 1, "entries": [compliant]}))
+    monkeypatch.setitem(globals(), "QUARANTINE", path)
+
+    test_entries_are_test_scoped_and_owned()
+
+
 def test_expiry_window_is_capped():
     for e in _entries():
         added = datetime.date.fromisoformat(e["added"])
