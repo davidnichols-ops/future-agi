@@ -3328,7 +3328,7 @@ def test_value_search_miss_never_exceeds_hard_query_ceiling():
     assert read.rows == ()
     assert read.metadata.query_complete is False
     assert read.metadata.query_status == "degraded"
-    assert read.metadata.query_error_code == "read_budget_exceeded"
+    assert read.metadata.query_error_code == "sample_limit"
     assert read.metadata.query_count == ATTRIBUTE_READ_MAX_QUERY_COUNT
     assert len(executor.calls) == ATTRIBUTE_READ_MAX_QUERY_COUNT
 
@@ -3368,8 +3368,8 @@ def test_query_ceiling_retains_values_but_never_claims_complete(monkeypatch):
 
     assert read.rows == (AttributeValueRow("Rejected", "string", 1),)
     assert read.metadata.query_complete is False
-    assert read.metadata.query_status == "degraded"
-    assert read.metadata.query_error_code == "read_budget_exceeded"
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
     assert read.metadata.query_count == 4
     assert len(executor.calls) == 4
 
@@ -3401,7 +3401,7 @@ def test_query_ceiling_without_decoded_values_returns_degraded(monkeypatch):
     assert read.rows == ()
     assert read.metadata.query_complete is False
     assert read.metadata.query_status == "degraded"
-    assert read.metadata.query_error_code == "read_budget_exceeded"
+    assert read.metadata.query_error_code == "sample_limit"
     assert read.metadata.query_count == 4
     assert len(executor.calls) == 4
 
@@ -3752,6 +3752,64 @@ def test_eval_picker_uses_selector_for_keys_and_cardinality_without_pg_fallback(
         "json_attribute_mode": "all",
         "exact_key": "rare.customer.key",
     }
+
+
+def test_session_eval_picker_without_verified_sessions_returns_static_sample(
+    monkeypatch,
+):
+    """No recent session rows must not turn valid static fields into a 503."""
+
+    from tracer.views.observation_span import ObservationSpanView
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "discover_keys",
+        lambda *_args, **_kwargs: AttributeKeyRead(
+            (AttributeKeyRow("call.participant_phone_number", "string", 1),),
+            _metadata(),
+        ),
+    )
+
+    def sample_cardinality(self, project_ids, **kwargs):
+        assert project_ids == [PROJECT_A]
+        assert kwargs == {"ensure_session_sample": True}
+        return AttributeCardinalityRead(
+            max_spans_per_trace=64,
+            max_traces_per_session=0,
+            metadata=_metadata(
+                complete=False,
+                error_code="sample_limit",
+                sampled=True,
+            ),
+        )
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "sample_cardinality",
+        sample_cardinality,
+    )
+    monkeypatch.setattr(
+        ObservationSpanView,
+        "_attribute_project_for_request",
+        staticmethod(lambda _request, _project_id: True),
+    )
+    request = _authenticated_get(
+        "/tracer/observation-span/get_eval_attributes_list/",
+        {
+            "filters": json.dumps({"project_id": PROJECT_A}),
+            "row_type": "sessions",
+            "q": "call.participant_phone_number",
+        },
+    )
+
+    response = ObservationSpanView.as_view({"get": "get_eval_attributes_list"})(request)
+
+    assert response.status_code == 200
+    assert response.data["result"] == ["name", "bookmarked"]
+    assert response.data["query_complete"] is False
+    assert response.data["query_status"] == "sampled"
+    assert response.data["query_error_code"] == "sample_limit"
+    assert not any(path.startswith("traces.") for path in response.data["result"])
 
 
 @pytest.mark.parametrize(

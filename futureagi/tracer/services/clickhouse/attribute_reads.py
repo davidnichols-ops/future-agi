@@ -2241,8 +2241,12 @@ class AttributeReadSelector:
                     )
                 except Exception as exc:
                     if isinstance(exc, AttributeReadQueryLimitExceeded):
+                        # The application query ceiling is a deterministic
+                        # sample boundary, not a ClickHouse failure. Every row
+                        # retained so far completed latest-state replay, so
+                        # preserve it as an explicitly incomplete sample.
                         typed_lane_halted = True
-                        mark_budget_exceeded()
+                        truncated = True
                         break
                     if lane_name == "json" and is_read_budget_error(exc):
                         json_lane_available = False
@@ -2384,8 +2388,12 @@ class AttributeReadSelector:
                     )
                 except Exception as exc:
                     if isinstance(exc, AttributeReadQueryLimitExceeded):
+                        # No in-flight replay was interrupted: the next
+                        # bounded page simply did not start. This is finite
+                        # sample exhaustion, while real server/deadline errors
+                        # below remain fail-closed as read-budget failures.
                         typed_lane_halted = True
-                        mark_budget_exceeded()
+                        truncated = True
                         break
                     if state["lane_name"] == "json" and is_read_budget_error(exc):
                         json_lane_available = False
@@ -2464,7 +2472,7 @@ class AttributeReadSelector:
             except Exception as exc:
                 if isinstance(exc, AttributeReadQueryLimitExceeded):
                     typed_lane_halted = True
-                    mark_budget_exceeded()
+                    truncated = True
                 elif is_read_budget_error(exc):
                     json_lane_available = False
                     mark_json_budget_exceeded()

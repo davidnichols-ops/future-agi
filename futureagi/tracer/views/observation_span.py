@@ -3047,6 +3047,12 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             if not self._attribute_metadata_allows_success(
                 cardinality.metadata,
                 has_verified_results=cardinality_has_verified_results,
+                # A project with no verified session-bearing spans still has
+                # valid static session fields (name/bookmarked). Publish those
+                # with explicit sample coverage and zero invented
+                # ``traces.<n>`` positions. Resource/deadline failures remain
+                # degraded and continue to return the sanitized 503 below.
+                allow_empty_sample=row_type == "sessions",
             ):
                 return self._attribute_read_unavailable_response()
             metadata = merge_read_metadata(discovery_metadata, cardinality.metadata)
