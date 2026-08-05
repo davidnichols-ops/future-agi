@@ -62,7 +62,7 @@ def _install_ee_usage_stubs_if_missing() -> None:
     metering = _make("ee.usage.services.metering")
 
     def check_usage(*args, **kwargs):
-        return {"allowed": True}
+        return types.SimpleNamespace(allowed=True, reason="")
 
     metering.check_usage = check_usage
 

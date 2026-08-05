@@ -26,6 +26,7 @@ from tracer.services.clickhouse.query_builders.trace_detail import (
 )
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.span_reader import merge_span_attributes
+from tracer.utils.helper import _normalize_eval_output_type
 
 if TYPE_CHECKING:
     from rest_framework.request import Request
@@ -34,6 +35,22 @@ if TYPE_CHECKING:
     from tracer.views.trace import TraceView
 
 logger = structlog.get_logger(__name__)
+
+
+def _parse_output_str_list(raw) -> list[str]:
+    """Parse a CHOICES eval's ``output_str_list`` (CH JSON string or native list)."""
+    import json
+
+    if isinstance(raw, list):
+        return [str(x) for x in raw if x not in (None, "")]
+    if isinstance(raw, str) and raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed if x not in (None, "")]
+    return []
 
 
 class TraceDetailHandlerV2(V2RewriteMixin, TraceDetailHandler):
@@ -237,6 +254,8 @@ def retrieve_trace_detail_ch(
     # ----- Phase 8: Batch fetch eval scores from CH -----
     eval_map = {}
     try:
+        from model_hub.utils.eval_list import derive_output_type
+
         eval_rows = list(detail_read.evals)
         # Reuse only the project-scoped config objects resolved before the CH
         # eval query. Never label or return a row whose config was not proven
@@ -250,7 +269,7 @@ def retrieve_trace_detail_ch(
                 "name": config.name
                 or (config.eval_template.name if config.eval_template else config_id),
                 "output_type": (
-                    getattr(config.eval_template, "output_type_normalized", None)
+                    derive_output_type(config.eval_template)
                     if config.eval_template
                     else None
                 ),
@@ -272,12 +291,25 @@ def retrieve_trace_detail_ch(
             if sid not in eval_map:
                 eval_map[sid] = []
             info = config_lookup[cid]
-            # Compute score from output columns
+            # Score is type-dependent; the CH mirror coerces unused typed
+            # columns to 0, so route by type (choices → str_list, Pass/Fail →
+            # bool, percentage → float) instead of trusting a populated column.
             output_float = row.get("output_float")
             output_bool = row.get("output_bool")
             output_str = row.get("output_str")
+            str_list = _parse_output_str_list(row.get("output_str_list"))
 
-            if output_float is not None:
+            is_pass_fail = (
+                _normalize_eval_output_type(info.get("output_type")) == "PASS_FAIL"
+            )
+            score_label = None
+            if str_list:
+                # Choices: no numeric score — surface the option(s), score None.
+                score = None
+                score_label = ", ".join(str_list)
+            elif is_pass_fail and output_bool is not None:
+                score = 100 if output_bool else 0
+            elif output_float is not None:
                 score = round(output_float * 100, 2)
             elif output_bool is not None:
                 score = 100 if output_bool else 0
@@ -303,11 +335,22 @@ def retrieve_trace_detail_ch(
             is_non_terminal = status in ("pending", "running", "skipped")
             drop_derived = is_errored or is_non_terminal
             eval_score = None if drop_derived else score
-            result_value = (
-                None
-                if drop_derived
-                else (output_str or (output_bool if output_bool is not None else None))
-            )
+            eval_score_label = None if drop_derived else score_label
+            # Choices: per-option list the drawer renders as separate chips.
+            eval_score_items = None if drop_derived else (str_list or None)
+
+            # ``result`` = the raw verdict, by type: choices → the option list,
+            # Pass/Fail → the bool, free-text → output_str, numeric → None.
+            if drop_derived:
+                result_value = None
+            elif str_list:
+                result_value = str_list
+            elif output_str:
+                result_value = output_str
+            elif is_pass_fail and output_bool is not None:
+                result_value = output_bool
+            else:
+                result_value = None
 
             eval_map[sid].append(
                 {
@@ -316,6 +359,8 @@ def retrieve_trace_detail_ch(
                     "output_type": info.get("output_type"),
                     "template_type": info.get("template_type"),
                     "score": eval_score,
+                    "score_label": eval_score_label,
+                    "score_items": eval_score_items,
                     "result": result_value,
                     "explanation": (
                         explanation
