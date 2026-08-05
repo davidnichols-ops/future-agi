@@ -2994,7 +2994,12 @@ class TestDashboardQueryBuilder:
             assert "usage_main_scan.workspace_id = toUUID(%(workspace_id)s)" in sql
 
     def test_eval_metric_scopes_trace_attached_rows_to_selected_projects(self):
-        """Workspace scope alone must not mix sibling-project trace evals."""
+        """Workspace scope alone must not mix sibling-project trace evals.
+
+        The simple metric must read the large usage slice exactly once. Trace
+        ownership comes from the narrow project-key relation rather than a
+        second pass over the same usage rows.
+        """
         project_id = str(uuid.uuid4())
         config = {
             "project_ids": [project_id],
@@ -3021,14 +3026,9 @@ class TestDashboardQueryBuilder:
                 "PREWHERE trace_project_scan.project_id IN %(project_ids)s"
                 in compact_sql
             )
-            assert "INNER JOIN (" in compact_sql
-            assert "AS bounded_trace_candidates" in compact_sql
-            assert "usage_trace_candidate" in compact_sql
-            assert (
-                "SELECT DISTINCT "
-                "toUUIDOrZero(usage_trace_candidate.eval_trace_id) AS trace_id"
-                in compact_sql
-            )
+            assert "AS bounded_trace_candidates" not in compact_sql
+            assert "usage_trace_candidate" not in compact_sql
+            assert compact_sql.count("FROM usage_apicalllog AS") == 1
             assert "GROUP BY trace_project_scan.id" in compact_sql
             assert (
                 "uniqExact(trace_project_scan.project_id) AS project_identity_count"

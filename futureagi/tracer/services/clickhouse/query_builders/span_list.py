@@ -17,7 +17,7 @@ The three result sets are merged in Python to produce the final response.
 """
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from tracer.services.clickhouse.eval_logger_table import (
@@ -29,7 +29,10 @@ from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.eval_status import (
     non_terminal_eval_marker,
 )
-from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.filters import (
+    ClickHouseFilterBuilder,
+    normalize_filter_op,
+)
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     partition_span_filter_plans,
     supports_span_filters,
@@ -61,6 +64,12 @@ _INDEXED_SPAN_ANCHOR_COLUMNS = frozenset(
         "output_length",
     }
 )
+_UNINDEXED_POSITIVE_MICRO_SEED_WIDTH = timedelta(minutes=5)
+_UNINDEXED_POSITIVE_MICRO_SEED_STRATA = 4
+_LONG_WINDOW_VALUE_ANCHOR_SENTINEL = 64
+_LONG_WINDOW_VALUE_ANCHOR_TIMEOUT_MS = 300
+_LONG_WINDOW_VALUE_ANCHOR_STRATA = 4
+_LONG_WINDOW_VALUE_ANCHOR_MAX_BYTES_TO_READ = 96 * 1024 * 1024
 
 
 def _unix_microseconds(value: datetime) -> int:
@@ -292,7 +301,13 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     def supports_filter_anchor_probe(self) -> bool:
         """Whether an indexed span leaf can seed a sparse graph sentinel."""
 
-        return self._bounded_anchor_probe and bool(self._filter_anchor_plans())
+        return bool(
+            self._filter_anchor_plans()
+            and (
+                self._bounded_anchor_probe
+                or self._positive_typed_map_anchor_plan() is not None
+            )
+        )
 
     @staticmethod
     def _plan_uses_indexed_anchor(plan: Any) -> bool:
@@ -312,10 +327,11 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         # be used on older parts.
         if re.search(r"\bhas\(span_attr_(?:str|num|bool)\.keys,", predicate):
             return True
-        # Typed Maps have deployed key/value blooms. Positive key predicates
-        # remain valid anchors except for literal substring/negative forms whose
-        # compiled expressions cannot use those indexes. String equals/IN is
-        # the one lowerUTF8 form with an EXPLAIN-proven value-index companion.
+        # Typed Maps have a deployed key bloom. Positive key predicates remain
+        # valid anchors except for literal substring/negative forms whose
+        # compiled expressions cannot use an index. Unicode text equality does
+        # not claim the ASCII-only value bloom; the keys subcolumn check above
+        # is its only safe indexed witness.
         if "mapContains(span_attr_" in predicate:
             if "NOT mapContains(span_attr_" in predicate:
                 return False
@@ -363,7 +379,64 @@ class SpanListQueryBuilder(BaseQueryBuilder):
 
     def _filter_anchor_plans(self) -> list[Any]:
         plans, _ = partition_span_filter_plans(self.filters)
-        return [plan for plan in plans if self._plan_uses_indexed_anchor(plan)]
+        candidates = [
+            (index, plan)
+            for index, plan in enumerate(plans)
+            if self._plan_uses_indexed_anchor(plan)
+        ]
+        candidates.sort(
+            key=lambda item: (
+                item[1].raw_witness_rank is None,
+                item[1].raw_witness_rank
+                if item[1].raw_witness_rank is not None
+                else 1_000_000,
+                item[0],
+            )
+        )
+        return [plan for _, plan in candidates]
+
+    def _positive_typed_map_anchor_plan(self) -> Any | None:
+        """Return a rank-zero scalar Map equality/IN anchor, if present."""
+
+        for plan in self._filter_anchor_plans():
+            predicate = str(plan.raw_witness_predicate or plan.seed_predicate or "")
+            if (
+                plan.raw_witness_rank == 0
+                and "JSONExtract" not in predicate
+                and re.search(
+                    r"\bmapContains\(span_attr_(?:str|num|bool),",
+                    predicate,
+                )
+            ):
+                return plan
+        return None
+
+    def recommended_filter_anchor_probe_limit(self) -> int | None:
+        """Use a small exact value sentinel for long-window list reads."""
+
+        request_start, request_end = self._bounded_request_window
+        if (
+            not self._bounded_anchor_probe
+            and request_end - request_start > timedelta(hours=1)
+            and self._positive_typed_map_anchor_plan() is not None
+        ):
+            return _LONG_WINDOW_VALUE_ANCHOR_SENTINEL
+        return None
+
+    def recommended_filter_anchor_probe_timeout_ms(self) -> int | None:
+        if self.recommended_filter_anchor_probe_limit() is not None:
+            return _LONG_WINDOW_VALUE_ANCHOR_TIMEOUT_MS
+        return None
+
+    def recommended_filter_anchor_probe_strata(self) -> int | None:
+        if self.recommended_filter_anchor_probe_limit() is not None:
+            return _LONG_WINDOW_VALUE_ANCHOR_STRATA
+        return None
+
+    def recommended_filter_anchor_probe_max_bytes_to_read(self) -> int | None:
+        if self.recommended_filter_anchor_probe_limit() is not None:
+            return _LONG_WINDOW_VALUE_ANCHOR_MAX_BYTES_TO_READ
+        return None
 
     def requires_unindexed_graph_sample_slice(self) -> bool:
         """Whether graph discovery must avoid the complete temporal stratum.
@@ -379,7 +452,78 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             self._filter_anchor_plans()
         )
 
-    def build_filter_anchor_probe(self, *, limit: int) -> tuple[str, dict[str, Any]]:
+    def _unindexed_positive_micro_seed_plan(self) -> Any | None:
+        """Return one positive call-type JSON plan safe for raw micro-seeding."""
+
+        plans, residual_filters = partition_span_filter_plans(self.filters)
+        active_filters = self._active_non_time_filters()
+        if residual_filters or len(plans) != len(active_filters):
+            return None
+        for item, plan in zip(active_filters, plans, strict=True):
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            if not isinstance(config, dict):
+                continue
+            key = str(item.get("column_id") or item.get("columnId") or "")
+            operation = normalize_filter_op(
+                str(config.get("filter_op") or config.get("filterOp") or "")
+            )
+            if (
+                key == "call_type"
+                and operation in {"equals", "in"}
+                and "JSONExtract" in plan.seed_predicate
+                and not self._plan_uses_indexed_anchor(plan)
+            ):
+                return plan
+        return None
+
+    def recommended_filter_unindexed_micro_seed_width(self) -> timedelta | None:
+        """Request one newest fixed-width JSON seed before normal scanning."""
+
+        request_start, request_end = self._bounded_request_window
+        if (
+            not self._bounded_anchor_probe
+            and request_end - request_start > timedelta(hours=1)
+            and self._unindexed_positive_micro_seed_plan() is not None
+        ):
+            return _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH
+        return None
+
+    def recommended_filter_unindexed_micro_seed_strata(self) -> int | None:
+        """Sample fixed micro-slices across the complete long window."""
+
+        if self.recommended_filter_unindexed_micro_seed_width() is not None:
+            return _UNINDEXED_POSITIVE_MICRO_SEED_STRATA
+        return None
+
+    def build_filter_unindexed_micro_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Seed finite raw JSON matches inside one fixed micro-slice."""
+
+        return self.build_filter_seed_page(
+            slice_start=slice_start,
+            slice_end=slice_end,
+            limit=limit,
+            _unindexed_positive_micro_seed=True,
+        )
+
+    @staticmethod
+    def filter_unindexed_micro_seed_proves_result_order() -> bool:
+        """A physical span micro-seed uses the public span order."""
+
+        return True
+
+    def build_filter_anchor_probe(
+        self,
+        *,
+        limit: int,
+        slice_start: datetime | None = None,
+        slice_end: datetime | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         """Return at most ``limit`` unordered physical span candidates.
 
         An exhausted probe is a complete *superset*, not a final result.  The
@@ -395,6 +539,12 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             raise ValueError("span anchor probe requires a direct span filter")
 
         request_start, request_end = self.parse_time_range(self.filters)
+        if (slice_start is None) != (slice_end is None):
+            raise ValueError("span anchor slice values must be provided together")
+        anchor_start = request_start if slice_start is None else slice_start
+        anchor_end = request_end if slice_end is None else slice_end
+        if not request_start <= anchor_start < anchor_end <= request_end:
+            raise ValueError("span anchor slice must stay inside request window")
         self.params.update({"start_date": request_start, "end_date": request_end})
         seeded_plans = self._filter_anchor_plans()
         seeded_predicates = [
@@ -402,10 +552,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         ]
         params: dict[str, Any] = {
             **self.params,
-            "filter_anchor_start": request_start,
-            "filter_anchor_end": request_end,
-            "filter_anchor_start_us": _unix_microseconds(request_start),
-            "filter_anchor_end_us": _unix_microseconds(request_end),
+            "filter_anchor_start": anchor_start,
+            "filter_anchor_end": anchor_end,
+            "filter_anchor_start_us": _unix_microseconds(anchor_start),
+            "filter_anchor_end_us": _unix_microseconds(anchor_end),
             "filter_anchor_limit": int(limit),
         }
         for plan, seed_predicate in zip(seeded_plans, seeded_predicates, strict=True):
@@ -481,6 +631,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         before_start_time: Any = None,
         before_id: Any = None,
         direction: str = "older",
+        _unindexed_positive_micro_seed: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Return bounded physical matches as a latest-state candidate superset."""
 
@@ -502,10 +653,21 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         # unindexed JSON/call_type predicates are deferred to the finite latest-
         # state classifier.  Parsing them before ORDER BY would scan the entire
         # slice merely to discover a rare or absent value.
-        seed_plans = [plan for plan in plans if self._plan_uses_indexed_anchor(plan)]
-        seed_predicates = [
-            plan.raw_witness_predicate or plan.seed_predicate for plan in seed_plans
-        ]
+        if _unindexed_positive_micro_seed:
+            micro_seed_plan = self._unindexed_positive_micro_seed_plan()
+            if micro_seed_plan is None:
+                raise ValueError("unindexed positive span seed is unavailable")
+            if slice_end - slice_start > _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH:
+                raise ValueError("unindexed positive span seed exceeds micro-slice")
+            seed_plans = [micro_seed_plan]
+            seed_predicates = [micro_seed_plan.seed_predicate]
+        else:
+            seed_plans = [
+                plan for plan in plans if self._plan_uses_indexed_anchor(plan)
+            ]
+            seed_predicates = [
+                plan.raw_witness_predicate or plan.seed_predicate for plan in seed_plans
+            ]
         params: dict[str, Any] = {
             **self.params,
             "filter_slice_start": slice_start,

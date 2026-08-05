@@ -60,7 +60,12 @@ ATTRIBUTE_READ_MAX_QUERY_COUNT = 30
 # rare/absent JSON key cannot consume the whole picker deadline after typed Map
 # rows have already been verified.
 ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS = 750
-ATTRIBUTE_READ_EXPLICIT_SEGMENT = timedelta(days=1)
+# Production A/B on the largest US project showed that one-day and 12-hour
+# attribute seeds exceed the 500k-row picker envelope on historical dense
+# windows, while six-hour seeds return the exact requested key/value in a
+# bounded sample. Keep this below the storage-density failure threshold; the
+# whole-operation query/deadline caps still bound long-window discovery.
+ATTRIBUTE_READ_EXPLICIT_SEGMENT = timedelta(hours=6)
 # Keep each storage-order seed small enough that dense projects stop inside the
 # read envelope before ClickHouse pulls another large attribute block.  The
 # extra row requested by ``_candidate_ids`` remains an explicit truncation
@@ -317,6 +322,44 @@ def adaptive_attribute_windows(
         windows.append((end - timedelta(days=boundary), end - timedelta(days=previous)))
         previous = boundary
     return tuple(windows)
+
+
+def _prioritize_explicit_attribute_windows(
+    windows: list[tuple[datetime, datetime]],
+) -> tuple[tuple[datetime, datetime], ...]:
+    """Put a bounded, full-range temporal sample before remaining slices.
+
+    Exact key/value picker operations reserve at least one candidate page for
+    the JSON lane. When an explicit range contains more six-hour slices than
+    the remaining typed-page budget, sample evenly from newest through oldest
+    first. The untouched slices stay in deterministic newest-first order after
+    that prefix, so a caller with spare query budget can continue without gaps
+    or duplicate probes. Metadata remains sampled whenever the hard page/query
+    ceilings stop before the full list is consumed.
+    """
+
+    probe_count = max(ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT - 1, 1)
+    if len(windows) <= probe_count:
+        return tuple(windows)
+    if probe_count == 1:
+        return tuple(windows)
+    last_index = len(windows) - 1
+    sampled_indices = tuple(
+        (position * last_index) // (probe_count - 1) for position in range(probe_count)
+    )
+    sampled = set(sampled_indices)
+    return tuple(
+        [windows[index] for index in sampled_indices]
+        + [window for index, window in enumerate(windows) if index not in sampled]
+    )
+
+
+def _attribute_window_bounds(
+    windows: tuple[tuple[datetime, datetime], ...],
+) -> tuple[datetime, datetime]:
+    """Return request bounds independently of temporal probe ordering."""
+
+    return min(start for start, _ in windows), max(end for _, end in windows)
 
 
 class V2AttributeQueryExecutor:
@@ -744,7 +787,7 @@ class AttributeReadSelector:
     Each public operation gets one six-second wall budget shared by all of its
     adaptive candidate and latest-state replay queries. Default-horizon reads
     keep the existing finite band/page caps; caller-supplied windows are split
-    into adjacent day probes under the same whole-operation deadline. Common
+    into adjacent six-hour probes under the same whole-operation deadline. Common
     dense typed reads stop after one candidate/replay pair and explicitly
     report a sample. Reusing a
     selector for a second public operation starts a fresh operation budget;
@@ -887,7 +930,7 @@ class AttributeReadSelector:
             if start >= end:
                 raise ValueError("window_start must be before window_end")
             # Explicit dashboard/eval windows can be dense even at seven days.
-            # Walk adjacent newest-first day slices so a single picker probe
+            # Walk adjacent newest-first six-hour slices so one picker probe
             # cannot turn the entire requested range into one physical scan.
             windows: list[tuple[datetime, datetime]] = []
             segment_end = end
@@ -897,7 +940,7 @@ class AttributeReadSelector:
                 )
                 windows.append((segment_start, segment_end))
                 segment_end = segment_start
-            return tuple(windows)
+            return _prioritize_explicit_attribute_windows(windows)
         return adaptive_attribute_windows(
             self._window_end,
             horizon_days=horizon_days,
@@ -1496,7 +1539,7 @@ class AttributeReadSelector:
             window_start=window_start,
             window_end=window_end,
         )
-        overall_start, overall_end = windows[-1][0], windows[0][1]
+        overall_start, overall_end = _attribute_window_bounds(windows)
         if not projects:
             return AttributeKeyRead(
                 (),
@@ -1636,6 +1679,10 @@ class AttributeReadSelector:
         fallback_states: list[dict[str, Any]] = []
         exact_found = False
         candidate_pages = 0
+        typed_first_probe_limit = ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT - (
+            1 if exact_key is not None and self._reads_json_overflow else 0
+        )
+        typed_first_probe_limit_reached = False
         probe_groups = (
             tuple((segment, tuple(lanes)) for segment in windows)
             if exact_key is None
@@ -1654,10 +1701,10 @@ class AttributeReadSelector:
                     continue
                 if (
                     exact_key is not None
-                    and candidate_pages
-                    >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+                    and lane_name == "typed"
+                    and candidate_pages >= typed_first_probe_limit
                 ):
-                    typed_lane_halted = True
+                    typed_first_probe_limit_reached = True
                     truncated = True
                     break
                 try:
@@ -1731,6 +1778,7 @@ class AttributeReadSelector:
             if (
                 exact_found
                 or typed_lane_halted
+                or typed_first_probe_limit_reached
                 or (exact_key is None and lane_found and segment_truncated)
             ):
                 break
@@ -1968,12 +2016,13 @@ class AttributeReadSelector:
         key = validate_attribute_key(key)
         normalized_search = validate_attribute_search(search or "")
         max_values = min(max(int(max_values), 1), ATTRIBUTE_READ_MAX_VALUES)
+        explicit_window = window_start is not None
         windows = self._windows(
             horizon_days=horizon_days,
             window_start=window_start,
             window_end=window_end,
         )
-        overall_start, overall_end = windows[-1][0], windows[0][1]
+        overall_start, overall_end = _attribute_window_bounds(windows)
         if not projects:
             return AttributeValueRead(
                 (),
@@ -2110,12 +2159,38 @@ class AttributeReadSelector:
         # fall through after typed absence has been checked in every band.
         fallback_states: list[dict[str, Any]] = []
         candidate_pages = 0
+        deferred_json_lane = False
+        typed_probe_coverage_truncated = False
+        typed_first_probe_limit = ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT - (
+            2 if self._reads_json_overflow else 0
+        )
         usable_sample_found = False
         typed_usable_sample_found = False
         for lane_name, predicate, replay_sql, json_mode, timeout_ms in lanes:
-            for segment in windows:
-                if candidate_pages >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT:
+            # JSON-enabled reads reserve one page for a deterministic typed
+            # continuation and one for a bounded JSON fallback. When typed
+            # coverage finishes without a stale continuation, its unused
+            # reservation remains available to the normal bounded JSON walk.
+            if lane_name == "json" and fallback_states:
+                deferred_json_lane = True
+                continue
+            lane_candidate_page_limit = (
+                typed_first_probe_limit
+                if lane_name == "typed"
+                else (
+                    min(
+                        candidate_pages + 1,
+                        ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
+                    )
+                    if typed_probe_coverage_truncated
+                    else ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+                )
+            )
+            for segment_index, segment in enumerate(windows):
+                if candidate_pages >= lane_candidate_page_limit:
                     truncated = True
+                    if lane_name == "typed":
+                        typed_probe_coverage_truncated = True
                     break
                 if lane_name == "json" and not json_lane_available:
                     continue
@@ -2181,10 +2256,14 @@ class AttributeReadSelector:
                     truncated = True
                 if lane_name == "typed" and usable_value_seen:
                     typed_usable_sample_found = True
-                if segment_truncated and usable_value_seen:
+                unvisited_segments = segment_index + 1 < len(windows)
+                if usable_value_seen and (
+                    segment_truncated or (explicit_window and unvisited_segments)
+                ):
                     # The picker has useful verified values. Stop immediately
-                    # instead of scanning JSON and older bands; the sentinel
-                    # keeps the intentionally partial distribution honest.
+                    # instead of scanning JSON and more temporal strata. The
+                    # response remains an explicit sample whenever coverage
+                    # was truncated or any requested slice was not visited.
                     truncated = True
                     usable_sample_found = True
                     break
@@ -2231,18 +2310,23 @@ class AttributeReadSelector:
 
         # Phase two round-robins only the stale-only truncated lanes. It restarts
         # each lane at ordered page one; a cursor is derived exclusively from a
-        # preceding page with that same deterministic order.
+        # preceding page with that same deterministic order. When JSON was
+        # deferred behind stale typed candidates, its reserved final page must
+        # remain available after this continuation phase.
+        continuation_page_limit = ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT - (
+            1 if deferred_json_lane else 0
+        )
         while (
             not typed_lane_halted
             and not usable_sample_found
-            and candidate_pages < ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+            and candidate_pages < continuation_page_limit
             and any(not state["complete"] for state in fallback_states)
         ):
             progressed = False
             for state in fallback_states:
                 if state["complete"]:
                     continue
-                if candidate_pages >= ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT:
+                if candidate_pages >= continuation_page_limit:
                     break
                 if state["lane_name"] == "json" and not json_lane_available:
                     state["complete"] = True
@@ -2313,6 +2397,13 @@ class AttributeReadSelector:
                 if usable_value_seen:
                     truncated = truncated or segment_truncated
                     state["complete"] = True
+                    if state["lane_name"] == "typed" and deferred_json_lane:
+                        # Typed values take precedence over legacy JSON. This is
+                        # still a sample because the deferred JSON population
+                        # and any remaining continuation states were not read.
+                        typed_usable_sample_found = True
+                        usable_sample_found = True
+                        truncated = True
                 elif not segment_truncated:
                     state["complete"] = True
                 elif not candidate_ids:
@@ -2324,8 +2415,57 @@ class AttributeReadSelector:
                 else:
                     state["before_identity"] = candidate_ids[-1]
 
+                if usable_sample_found:
+                    break
+
             if typed_lane_halted or not progressed:
                 break
+
+        # A stale, truncated typed page must not starve a live legacy-JSON
+        # value. Spend exactly one reserved identity-only JSON page after typed
+        # continuation. One page can improve discovery, but cannot prove global
+        # JSON absence, so the result always remains explicitly sampled.
+        if (
+            deferred_json_lane
+            and not typed_lane_halted
+            and not usable_sample_found
+            and json_lane_available
+            and candidate_pages < ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+        ):
+            _, predicate, replay_sql, json_mode, timeout_ms = lanes[1]
+            segment = windows[0]
+            try:
+                candidate_ids, _, _ = self._candidate_ids(
+                    projects,
+                    segment,
+                    predicate=predicate,
+                    attribute_key=key,
+                    candidate_limit=ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
+                    query_timeout_ms=timeout_ms,
+                    candidate_query_settings=_JSON_VALUE_CANDIDATE_SETTINGS,
+                    include_versions=False,
+                )
+                rows = self._verify_latest(
+                    sql=replay_sql,
+                    project_ids=projects,
+                    candidate_ids=candidate_ids,
+                    attribute_key=key,
+                    query_timeout_ms=timeout_ms,
+                )
+            except Exception as exc:
+                if isinstance(exc, AttributeReadQueryLimitExceeded):
+                    typed_lane_halted = True
+                    mark_budget_exceeded()
+                elif is_read_budget_error(exc):
+                    json_lane_available = False
+                    mark_json_budget_exceeded()
+                else:
+                    raise
+            else:
+                candidate_pages += 1
+                covered_start = min(covered_start, segment[0])
+                consume_rows(rows, json_mode=json_mode)
+                truncated = True
 
         if any(not state["complete"] for state in fallback_states):
             truncated = True
@@ -2455,7 +2595,7 @@ class AttributeReadSelector:
             window_start=None,
             window_end=None,
         )
-        overall_start, overall_end = windows[-1][0], windows[0][1]
+        overall_start, overall_end = _attribute_window_bounds(windows)
         if not projects:
             return AttributeCardinalityRead(
                 0,

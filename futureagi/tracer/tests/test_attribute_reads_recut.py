@@ -268,7 +268,7 @@ def test_adaptive_windows_are_adjacent_half_open_7d_14d_30d_6mo_1yr_bands():
 
 
 @pytest.mark.parametrize("days", [7, 14])
-def test_explicit_dense_windows_are_adjacent_newest_first_day_segments(days: int):
+def test_explicit_dense_windows_sample_six_hour_strata_across_full_range(days: int):
     executor = RecordingExecutor()
 
     read = AttributeReadSelector(
@@ -286,17 +286,73 @@ def test_explicit_dense_windows_are_adjacent_newest_first_day_segments(days: int
         (call.params["segment_start"], call.params["segment_end"])
         for call in executor.calls
     ]
-    assert len(segments) == days
-    assert segments[0] == (NOW - timedelta(days=1), NOW)
-    assert segments[-1] == (
+    assert len(segments) == ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+    assert len(set(segments)) == len(segments)
+    assert segments[0] == (NOW - timedelta(hours=6), NOW)
+    assert (
         NOW - timedelta(days=days),
-        NOW - timedelta(days=days - 1),
+        NOW - timedelta(days=days) + timedelta(hours=6),
+    ) in segments[: ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT - 1]
+    assert all(end - start == timedelta(hours=6) for start, end in segments)
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
+
+
+@pytest.mark.parametrize("operation", ["keys", "values"])
+def test_explicit_temporal_sampling_accepts_value_in_oldest_six_hour_slice(
+    operation: str,
+):
+    window_start = NOW - timedelta(days=7)
+    oldest_value_time = window_start + timedelta(minutes=1)
+    candidate = _candidate(
+        PROJECT_A,
+        "oldest-six-hour-value",
+        start_time=oldest_value_time,
     )
-    assert all(
-        newer[0] == older[1]
-        for newer, older in zip(segments, segments[1:], strict=False)
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            return (
+                [candidate]
+                if call.params["segment_start"]
+                <= oldest_value_time
+                < call.params["segment_end"]
+                else []
+            )
+        return [
+            _target_row(
+                PROJECT_A,
+                "oldest-six-hour-value",
+                start_time=oldest_value_time,
+                string="Rechazado",
+            )
+        ]
+
+    selector = AttributeReadSelector(
+        RecordingExecutor(respond),
+        now=NOW,
+        typed_only=True,
     )
-    assert read.metadata.query_complete is True
+    if operation == "keys":
+        read = selector.discover_keys(
+            [PROJECT_A],
+            exact_key="final_status",
+            window_start=window_start,
+            window_end=NOW,
+        )
+        assert read.rows == (AttributeKeyRow("final_status", "string", 1),)
+    else:
+        read = selector.read_values(
+            [PROJECT_A],
+            "final_status",
+            window_start=window_start,
+            window_end=NOW,
+        )
+        assert read.rows == (AttributeValueRow("Rechazado", "string", 1),)
+
+    assert read.metadata.query_window_start == window_start
+    assert read.metadata.query_window_end == NOW
 
 
 @pytest.mark.parametrize(
@@ -2190,7 +2246,9 @@ def test_typed_value_candidate_deduplicates_to_highest_raw_version():
     )
 
     assert read.rows == (AttributeValueRow("Rejected", "string", 1),)
-    assert read.metadata.query_complete is True
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
     assert read.metadata.query_count == 3
     assert len(executor.calls) == 3
 
@@ -2209,6 +2267,12 @@ def test_typed_value_all_stale_versions_skip_value_hydration():
 
     def respond(call, _):
         if "segment_start" in call.params:
+            if not (
+                call.params["segment_start"]
+                <= candidates[0]["start_time"]
+                < call.params["segment_end"]
+            ):
+                return []
             return candidates
         return [
             {
@@ -2236,8 +2300,8 @@ def test_typed_value_all_stale_versions_skip_value_hydration():
 
     assert read.rows == ()
     assert read.metadata.query_status == "complete"
-    assert read.metadata.query_count == 2
-    assert len(executor.calls) == 2
+    assert read.metadata.query_count == 5
+    assert len(executor.calls) == 5
     certificate_call = executor.calls[1]
     assert "max(_version) AS latest_version" in certificate_call.sql
     assert "attrs_" not in certificate_call.sql
@@ -2284,17 +2348,19 @@ def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
     )
 
     assert read.rows == (AttributeValueRow("accepted", "array", 1),)
-    assert read.metadata.query_complete is True
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
     ]
-    assert len(candidate_calls) == 14
-    assert all("candidate_version" in call.sql for call in candidate_calls[:7])
-    assert all("candidate_version" not in call.sql for call in candidate_calls[7:])
+    assert len(candidate_calls) == ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT - 1
+    assert all("candidate_version" in call.sql for call in candidate_calls[:-1])
+    assert "candidate_version" not in candidate_calls[-1].sql
     assert all("attributes_extra" not in call.sql for call in candidate_calls)
     assert all("JSONHas(attributes_extra" not in call.sql for call in candidate_calls)
     assert all("attribute_search" not in call.params for call in candidate_calls)
-    first_json_call = candidate_calls[7]
+    first_json_call = candidate_calls[-1]
     assert first_json_call.settings["max_bytes_to_read"] == 64 * 1024 * 1024
     assert first_json_call.settings["max_rows_to_read"] == 100_000
     assert first_json_call.settings["max_block_size"] == 2_048
@@ -2304,6 +2370,159 @@ def test_explicit_window_json_value_runs_after_all_typed_bands_are_empty():
         if "segment_start" not in call.params and "JSONHas(attributes_extra" in call.sql
     )
     assert len(json_hydration.params["candidate_ids_0"]) == 1
+
+
+def test_stale_typed_page_reaches_live_typed_continuation_with_json_enabled():
+    stale_candidates = [
+        _candidate(
+            PROJECT_A,
+            f"stale-before-live-{index:02d}",
+            start_time=NOW - timedelta(hours=1, seconds=index),
+        )
+        for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
+    ]
+    live_candidate = _candidate(
+        PROJECT_A,
+        "live-typed-continuation",
+        start_time=NOW - timedelta(hours=2),
+    )
+    rows_by_id = {str(row["id"]): row for row in [*stale_candidates, live_candidate]}
+    unordered_typed_calls = 0
+
+    def respond(call, _):
+        nonlocal unordered_typed_calls
+        if "segment_start" in call.params:
+            if "candidate_version" not in call.sql:
+                pytest.fail("JSON sampling ran after a live typed continuation")
+            if "LIMIT 1 BY" in call.sql:
+                return [live_candidate]
+            unordered_typed_calls += 1
+            return stale_candidates if unordered_typed_calls == 1 else []
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    span_id,
+                    trace_id=rows_by_id[span_id]["trace_id"],
+                    start_time=rows_by_id[span_id]["start_time"],
+                    latest_version=(1 if span_id == "live-typed-continuation" else 2),
+                )
+                for span_id in call.params["candidate_ids_0"]
+            ]
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=rows_by_id[span_id]["trace_id"],
+                start_time=rows_by_id[span_id]["start_time"],
+                string="Rechazado",
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        json_attribute_mode="arrays",
+    ).read_values(
+        [PROJECT_A],
+        "final_status",
+        window_start=NOW - timedelta(days=7),
+        window_end=NOW,
+    )
+
+    assert read.rows == (AttributeValueRow("Rechazado", "string", 1),)
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert sum("LIMIT 1 BY" in call.sql for call in candidate_calls) == 1
+    assert all("candidate_version" in call.sql for call in candidate_calls)
+    assert len(candidate_calls) == ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT - 1
+
+
+def test_stale_typed_continuation_cannot_starve_live_json_value():
+    stale_candidates = [
+        _candidate(
+            PROJECT_A,
+            f"stale-typed-{index:02d}",
+            start_time=NOW - timedelta(hours=1, seconds=index),
+        )
+        for index in range(ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT + 1)
+    ]
+    stale_by_id = {str(row["id"]): row for row in stale_candidates}
+    typed_candidate_calls = 0
+
+    def respond(call, _):
+        nonlocal typed_candidate_calls
+        if "segment_start" in call.params:
+            if "candidate_version" in call.sql:
+                typed_candidate_calls += 1
+                return stale_candidates if typed_candidate_calls == 1 else []
+            return [
+                _candidate(
+                    PROJECT_A,
+                    "live-json-array",
+                    start_time=NOW - timedelta(hours=1),
+                )
+            ]
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    span_id,
+                    trace_id=stale_by_id[span_id]["trace_id"],
+                    start_time=stale_by_id[span_id]["start_time"],
+                    latest_version=2,
+                )
+                for span_id in call.params["candidate_ids_0"]
+            ]
+        return [
+            _target_row(
+                PROJECT_A,
+                "live-json-array",
+                start_time=NOW - timedelta(hours=1),
+                legacy_raw='["accepted"]',
+            )
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="arrays",
+    ).read_values(
+        [PROJECT_A],
+        "json_array",
+        window_start=NOW - timedelta(days=7),
+        window_end=NOW,
+    )
+
+    assert read.rows == (AttributeValueRow("accepted", "array", 1),)
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    continuation_index = next(
+        index
+        for index, call in enumerate(candidate_calls)
+        if "candidate_version" in call.sql and "LIMIT 1 BY" in call.sql
+    )
+    json_candidate_indexes = [
+        index
+        for index, call in enumerate(candidate_calls)
+        if "candidate_version" not in call.sql
+    ]
+    assert json_candidate_indexes == [len(candidate_calls) - 1]
+    assert continuation_index < json_candidate_indexes[0]
+    assert len(candidate_calls) == ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT
+    assert all("attributes_extra" not in call.sql for call in candidate_calls)
 
 
 def test_older_typed_value_is_verified_before_json_overflow_lane():
@@ -2622,7 +2841,7 @@ def test_absent_heavy_json_key_uses_only_bounded_identity_seeds():
     assert len(executor.calls) == read.metadata.query_count
 
 
-def test_explicit_seven_day_json_miss_samples_each_day_once_without_false_complete():
+def test_explicit_seven_day_json_miss_reserves_one_bounded_json_sample():
     starts_by_id: dict[str, datetime] = {}
     json_candidate_page = 0
 
@@ -2681,11 +2900,11 @@ def test_explicit_seven_day_json_miss_samples_each_day_once_without_false_comple
     assert read.metadata.query_complete is False
     assert read.metadata.query_status == "degraded"
     assert read.metadata.query_error_code == "sample_limit"
-    assert len(candidate_calls) == 14
-    assert len(json_calls) == 7
-    assert len(hydration_calls) == 7
-    assert read.metadata.query_count == 21
-    assert len(executor.calls) == 21
+    assert len(candidate_calls) == ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT - 1
+    assert len(json_calls) == 1
+    assert len(hydration_calls) == 1
+    assert read.metadata.query_count == 15
+    assert len(executor.calls) == 15
 
 
 def test_timeout_on_first_segment_has_no_retry():

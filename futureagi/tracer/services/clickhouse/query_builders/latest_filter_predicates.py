@@ -289,13 +289,13 @@ def _raw_uuid_seed_predicate(
 ) -> str | None:
     """Return an index-usable UUID equality seed without changing semantics.
 
-    UUID identity columns are exposed to the frontend as text, so their
+    UUID-shaped identity columns are exposed to the frontend as text, so their
     latest-state classifier remains the ordinary case-insensitive text
-    comparison.  For canonical UUID equality/IN values, however, the raw
-    ``Nullable(UUID)`` column is an exact candidate superset and lets
-    ClickHouse apply its bloom-filter index.  Invalid/non-canonical values and
-    every negative or substring operation deliberately keep the generic text
-    predicate.
+    comparison. For canonical UUID equality/IN values, however, the raw
+    identity column is an exact candidate superset and lets ClickHouse apply
+    its skip indexes before reading wider columns. Invalid/non-canonical values
+    and every negative or substring operation deliberately keep the generic
+    text predicate.
     """
 
     operation = normalize_filter_op(
@@ -368,38 +368,70 @@ def _attribute_plan(
     )
     if seed_params != params:
         raise AssertionError("latest and seed predicates must share bound values")
+    # Preserve the semantic raw-row comparison before adding optional physical
+    # index companions.  The deployed string-value bloom is built with
+    # ASCII-only ``lower()`` while the public equality contract uses
+    # ``lowerUTF8()``.  An ASCII filter value does not imply that stored values
+    # are ASCII (for example, the Kelvin sign folds to ``k`` under Unicode), so
+    # that companion must never participate in an exhaustive raw witness.
+    exact_seed_predicate = seed_predicate
     params[key_param] = key
     operation = normalize_filter_op(
         str(config.get("filter_op") or config.get("filterOp") or "")
     )
-    if map_column == "span_attr_str" and operation in {"equals", "in"}:
+    if map_column == "span_attr_num" and operation in {"equals", "in"}:
         bound_value = params[f"latest_filter_param_{index}"]
         normalized_values = (
             bound_value if isinstance(bound_value, tuple) else (bound_value,)
         )
-        # The deployed CH25 value bloom uses lower(), which is ASCII-only.
-        # Add its exact expression only when it is semantically implied by
-        # the Unicode-aware predicate; non-ASCII values keep correctness and
-        # simply skip this optional pruning companion.
-        if normalized_values and all(
-            isinstance(item_value, str) and item_value.isascii()
-            for item_value in normalized_values
-        ):
-            lowered_values = "arrayMap(x -> lower(x), mapValues(span_attr_str))"
-            if operation == "equals":
-                index_predicate = (
-                    f"has({lowered_values}, %(latest_filter_param_{index})s)"
-                )
-            else:
-                placeholders: list[str] = []
-                for value_index, item_value in enumerate(normalized_values):
-                    index_param = f"latest_filter_index_{index}_{value_index}"
-                    params[index_param] = item_value
-                    placeholders.append(f"%({index_param})s")
-                index_predicate = (
-                    f"hasAny({lowered_values}, [{', '.join(placeholders)}])"
-                )
-            seed_predicate = f"({seed_predicate}) AND {index_predicate}"
+        # The numeric Map value bloom is expression-based. Keep the exact
+        # key/value comparison as the semantic predicate and add the implied
+        # values expression solely so ClickHouse can prune value-absent parts.
+        numeric_values = "mapValues(span_attr_num)"
+        if operation == "equals":
+            index_predicate = f"has({numeric_values}, %(latest_filter_param_{index})s)"
+        else:
+            placeholders = []
+            for value_index, item_value in enumerate(normalized_values):
+                index_param = f"latest_filter_index_{index}_{value_index}"
+                params[index_param] = item_value
+                placeholders.append(f"%({index_param})s")
+            index_predicate = f"hasAny({numeric_values}, [{', '.join(placeholders)}])"
+        seed_predicate = f"({seed_predicate}) AND {index_predicate}"
+
+    positive_witness_operations = {
+        "equals",
+        "in",
+        "contains",
+        "starts_with",
+        "ends_with",
+        "between",
+        "greater_than",
+        "greater_than_or_equal",
+        "less_than",
+        "less_than_or_equal",
+        "is_not_null",
+    }
+    key_witness_predicate = (
+        f"(indexHint(has(mapKeys({map_column}), {bound_key})) AND "
+        f"has({map_column}.keys, {bound_key}))"
+    )
+    raw_witness_predicate = None
+    if operation in positive_witness_operations:
+        raw_witness_predicate = key_witness_predicate
+        if operation in {"equals", "in"}:
+            # Positive scalar equality is safe to apply to raw physical rows:
+            # every latest-live match necessarily has one physical live row
+            # with the same key/value. The latest-state classifier remains the
+            # source of truth and removes stale versions and tombstones.
+            exhaustive_value_predicate = (
+                exact_seed_predicate
+                if map_column == "span_attr_str"
+                else seed_predicate
+            )
+            raw_witness_predicate = (
+                f"({key_witness_predicate}) AND ({exhaustive_value_predicate})"
+            )
     return LatestFilterPredicate(
         aggregates=(
             f"argMax(mapContains({map_column}, {bound_key}), _peerdb_version) AS {exists_alias}",
@@ -409,41 +441,10 @@ def _attribute_plan(
         seed_predicate=seed_predicate,
         params=params,
         scope=scope,
-        raw_witness_predicate=(
-            f"(indexHint(has(mapKeys({map_column}), {bound_key})) AND "
-            f"has({map_column}.keys, {bound_key}))"
-            if operation
-            in {
-                "equals",
-                "in",
-                "contains",
-                "starts_with",
-                "ends_with",
-                "between",
-                "greater_than",
-                "greater_than_or_equal",
-                "less_than",
-                "less_than_or_equal",
-                "is_not_null",
-            }
-            else None
-        ),
+        raw_witness_predicate=raw_witness_predicate,
         raw_witness_rank=(
             {"equals": 0, "in": 0}.get(operation, 10)
-            if operation
-            in {
-                "equals",
-                "in",
-                "contains",
-                "starts_with",
-                "ends_with",
-                "between",
-                "greater_than",
-                "greater_than_or_equal",
-                "less_than",
-                "less_than_or_equal",
-                "is_not_null",
-            }
+            if operation in positive_witness_operations
             else None
         ),
     )
@@ -919,7 +920,7 @@ def _column_plan(
         value_type=value_type,
         index=index,
     )
-    if column == "trace_session_id":
+    if column == "trace_session_id" or (column == "trace_id" and scope == "root"):
         seed_predicate = (
             _raw_uuid_seed_predicate(
                 column=column,

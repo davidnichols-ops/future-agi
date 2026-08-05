@@ -69,10 +69,10 @@ def test_session_seed_pushes_indexed_scalar_witness_before_group_and_limit() -> 
     assert witness in sql
     assert index_companion in sql
     assert value_bloom not in sql
-    assert sql.index(witness) < sql.index("GROUP BY session_id")
+    assert sql.index(witness) < sql.index("GROUP BY seed_spans.trace_session_id")
     assert sql.index(witness) < sql.index("LIMIT %(filter_seed_limit)s")
     assert params["latest_filter_key_0"] == "final_status"
-    assert "latest_filter_param_0" not in params
+    assert params["latest_filter_param_0"] == ("rechazado",)
     assert "latest_filter_index_0_0" not in params
 
     match_sql, match_params = builder.build_filter_match_query([CANDIDATE_SESSION_ID])
@@ -102,6 +102,8 @@ def test_session_seed_prefers_indexed_scalar_when_json_filter_comes_first() -> N
     assert "mapValues(attrs_string)" not in sql
     assert "%(latest_filter_key_0)s" not in sql
     assert params["latest_filter_key_1"] == "final_status"
+    assert params["latest_filter_param_1"] == ("rechazado",)
+    assert "latest_filter_index_1_0" not in params
     assert "latest_filter_key_0" not in params
 
     match_sql, match_params = builder.build_filter_match_query([CANDIDATE_SESSION_ID])

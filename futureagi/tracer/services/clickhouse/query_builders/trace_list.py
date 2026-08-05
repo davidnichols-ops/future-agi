@@ -94,6 +94,11 @@ _LONG_WINDOW_ANCHOR_TIMEOUT_MS = 300
 _LONG_WINDOW_ANCHOR_STRATA = 4
 _LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 96 * 1024 * 1024
 _LONG_WINDOW_CANDIDATE_WITNESS_STRATA = 8
+_UNINDEXED_POSITIVE_MICRO_SEED_WIDTH = timedelta(minutes=5)
+_UNINDEXED_POSITIVE_MICRO_SEED_STRATA = 4
+_CANONICAL_TRACE_ID_SEED_PREDICATE = re.compile(
+    r"trace_id (?:=|IN) %\(latest_filter_param_\d+\)s"
+)
 
 
 def _unix_microseconds(value: datetime) -> int:
@@ -425,11 +430,37 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """
 
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
-        return [
-            plan
-            for plan in plans
+        candidates = [
+            (index, plan)
+            for index, plan in enumerate(plans)
             if plan.scope == "any" and self._plan_uses_indexed_anchor(plan)
         ]
+        candidates.sort(
+            key=lambda item: (
+                item[1].raw_witness_rank is None,
+                item[1].raw_witness_rank
+                if item[1].raw_witness_rank is not None
+                else 1_000_000,
+                item[0],
+            )
+        )
+        return [plan for _, plan in candidates]
+
+    def _positive_typed_map_anchor_plan(self) -> LatestFilterPredicate | None:
+        """Return the best rank-zero scalar Map equality/IN anchor."""
+
+        for plan in self._filter_anchor_plans():
+            predicate = str(plan.raw_witness_predicate or plan.seed_predicate or "")
+            if (
+                plan.raw_witness_rank == 0
+                and "JSONExtract" not in predicate
+                and re.search(
+                    r"\bmapContains\(span_attr_(?:str|num|bool),",
+                    predicate,
+                )
+            ):
+                return plan
+        return None
 
     @staticmethod
     def _plan_uses_indexed_anchor(plan: LatestFilterPredicate) -> bool:
@@ -506,6 +537,81 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             self._plan_uses_indexed_anchor(plan) for plan in plans
         )
 
+    def _unindexed_positive_micro_seed_plan(self) -> LatestFilterPredicate | None:
+        """Return one exact raw call-type seed safe for a five-minute probe.
+
+        ``call_type`` is derived from the JSON overflow and has no production
+        skip index.  Its positive equality/IN predicate is nevertheless a
+        complete *raw* superset for latest-state membership: every latest live
+        match has a physical live row with the same value.  Restrict this
+        optimization to that explicitly supported shape; negative/null JSON
+        predicates must keep the ordered candidate path because raw absence is
+        not a latest-state proof.
+        """
+
+        plans, residual_filters = partition_trace_filter_plans(self._bounded_filters())
+        active_filters = self._active_non_time_filters()
+        if residual_filters or len(plans) != len(active_filters):
+            return None
+        for item, plan in zip(active_filters, plans, strict=True):
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            if not isinstance(config, dict):
+                continue
+            key = str(item.get("column_id") or item.get("columnId") or "")
+            operation = normalize_filter_op(
+                str(config.get("filter_op") or config.get("filterOp") or "")
+            )
+            if (
+                key == "call_type"
+                and operation in {"equals", "in"}
+                and plan.scope == "any"
+                and "JSONExtract" in plan.seed_predicate
+                and not self._plan_uses_indexed_anchor(plan)
+            ):
+                return plan
+        return None
+
+    def recommended_filter_unindexed_micro_seed_width(self) -> timedelta | None:
+        """Request one newest fixed-width JSON seed before ordered fallback."""
+
+        request_start, request_end = self._bounded_request_window
+        if (
+            (not self._bounded_identity_only or self._bounded_internal_scan)
+            and request_end - request_start > timedelta(hours=1)
+            and self._unindexed_positive_micro_seed_plan() is not None
+        ):
+            return _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH
+        return None
+
+    def recommended_filter_unindexed_micro_seed_strata(self) -> int | None:
+        """Sample fixed micro-slices across the complete long window."""
+
+        if self.recommended_filter_unindexed_micro_seed_width() is not None:
+            return _UNINDEXED_POSITIVE_MICRO_SEED_STRATA
+        return None
+
+    def build_filter_unindexed_micro_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Seed finite raw JSON matches inside one fixed micro-slice."""
+
+        return self.build_filter_seed_page(
+            slice_start=slice_start,
+            slice_end=slice_end,
+            limit=limit,
+            _unindexed_positive_micro_seed=True,
+        )
+
+    @staticmethod
+    def filter_unindexed_micro_seed_proves_result_order() -> bool:
+        """A matching child's timestamp does not prove its root-trace order."""
+
+        return False
+
     def recommended_filter_seed_batch_size(self) -> int:
         """Amortize cheap identity seeds without widening classification.
 
@@ -536,6 +642,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Keep the candidate-trace latest-state scan below CH's memory ceiling."""
 
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        if (
+            not self._bounded_population_proof
+            and self._unindexed_positive_micro_seed_plan() is not None
+        ):
+            # A call-type classifier parses JSON for every physical span of
+            # each candidate trace. Keep the same twenty-trace envelope already
+            # qualified by the bounded graph union instead of allowing the
+            # identity-only list/eval fast path to widen it to one hundred.
+            return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
         # Explicit identity-only consumers retain their established envelopes.
         # A historical task can opt into membership-only classification and
         # replay witnesses separately; all one-phase any-span consumers stay at
@@ -654,7 +769,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """
 
         request_start, request_end = self._bounded_request_window
-        return request_end - request_start > timedelta(hours=1)
+        return bool(
+            request_end - request_start > timedelta(hours=1)
+            and self.recommended_filter_anchor_probe_limit() is None
+        )
 
     def recommended_filter_anchor_probe_limit(self) -> int | None:
         """Skip speculative whole-window reads for long-window lists.
@@ -667,6 +785,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         their explicit per-stratum ``anchor_probe_limit`` contract.
         """
 
+        request_start, request_end = self._bounded_request_window
+        if (
+            request_end - request_start > timedelta(hours=1)
+            and self._positive_typed_map_anchor_plan() is not None
+        ):
+            return _LONG_WINDOW_ANCHOR_SENTINEL
         return None
 
     def recommended_filter_anchor_probe_timeout_ms(self) -> int | None:
@@ -982,10 +1106,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             raise ValueError(
                 "candidate witness slice must stay inside the request window"
             )
+        witness_predicate = anchor.raw_witness_predicate
+        if not witness_predicate:
+            return "", {}
         anchor_params = {
             key: value
             for key, value in anchor.params.items()
-            if f"%({key})s" in anchor.seed_predicate
+            if f"%({key})s" in witness_predicate
         }
         params: dict[str, Any] = {
             **self.params,
@@ -1009,7 +1136,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
           {candidate_fragment}
           AND start_time >= fromUnixTimestamp64Micro(%(filter_candidate_start_us)s)
           AND start_time < fromUnixTimestamp64Micro(%(filter_candidate_end_us)s)
-        WHERE {anchor.seed_predicate}
+        WHERE {witness_predicate}
         LIMIT %(filter_candidate_witness_limit)s
         """
         return query, params
@@ -1043,8 +1170,19 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self.start_date, self.end_date = request_start, request_end
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
         root_plans = [plan for plan in plans if plan.scope == "root"]
+        root_seed_plan_predicates = [
+            (plan, plan.raw_witness_predicate or plan.seed_predicate)
+            for plan in root_plans
+        ]
+        trace_id_prewhere_predicates = [
+            predicate
+            for _plan, predicate in root_seed_plan_predicates
+            if _CANONICAL_TRACE_ID_SEED_PREDICATE.fullmatch(predicate)
+        ]
         root_seed_predicates = [
-            plan.raw_witness_predicate or plan.seed_predicate for plan in root_plans
+            predicate
+            for _plan, predicate in root_seed_plan_predicates
+            if not _CANONICAL_TRACE_ID_SEED_PREDICATE.fullmatch(predicate)
         ]
         params: dict[str, Any] = {
             **self.params,
@@ -1058,7 +1196,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             "filter_slice_end_us": _unix_microseconds(slice_end),
             "filter_seed_limit": int(limit),
         }
-        for plan, seed_predicate in zip(root_plans, root_seed_predicates, strict=True):
+        for plan, seed_predicate in root_seed_plan_predicates:
             params.update(
                 {
                     key: value
@@ -1068,6 +1206,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             )
         root_predicate = " AND ".join(root_seed_predicates)
         predicate_fragment = f"AND {root_predicate}" if root_predicate else ""
+        trace_id_prewhere_predicate = " AND ".join(trace_id_prewhere_predicates)
+        trace_id_prewhere_fragment = (
+            f"AND {trace_id_prewhere_predicate}" if trace_id_prewhere_predicate else ""
+        )
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
                 self.filters,
@@ -1155,6 +1297,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         PREWHERE {self.project_filter_sql()}
           AND is_deleted = 0
           {project_version_fragment}
+          {trace_id_prewhere_fragment}
           AND (parent_span_id IS NULL OR parent_span_id = '')
           AND start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)
           AND start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)
@@ -1204,6 +1347,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         limit: int,
         before_start_time: datetime | None = None,
         before_id: Any = None,
+        _unindexed_positive_micro_seed: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Return a bounded root-order superset for latest-state classification."""
 
@@ -1228,17 +1372,32 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # this leaf. The classifier below applies every leaf against global
         # latest state. Applying all leaves here would be wrong because two
         # different child spans may satisfy two different trace filters.
-        indexed_any_span_plans = [
-            plan for plan in any_span_plans if self._plan_uses_indexed_anchor(plan)
-        ]
-        seed_plans = (
-            [indexed_any_span_plans[0] if indexed_any_span_plans else any_span_plans[0]]
-            if any_span_plans
-            else root_plans
-        )
-        seed_predicates = [
-            plan.raw_witness_predicate or plan.seed_predicate for plan in seed_plans
-        ]
+        if _unindexed_positive_micro_seed:
+            micro_seed_plan = self._unindexed_positive_micro_seed_plan()
+            if micro_seed_plan is None:
+                raise ValueError("unindexed positive trace seed is unavailable")
+            if slice_end - slice_start > _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH:
+                raise ValueError("unindexed positive trace seed exceeds micro-slice")
+            seed_plans = [micro_seed_plan]
+            # Unlike the key-only indexed anchor, this optional probe needs the
+            # exact positive JSON predicate to reduce the candidate population.
+            seed_predicates = [micro_seed_plan.seed_predicate]
+        else:
+            indexed_any_span_plans = [
+                plan for plan in any_span_plans if self._plan_uses_indexed_anchor(plan)
+            ]
+            seed_plans = (
+                [
+                    indexed_any_span_plans[0]
+                    if indexed_any_span_plans
+                    else any_span_plans[0]
+                ]
+                if any_span_plans
+                else root_plans
+            )
+            seed_predicates = [
+                plan.raw_witness_predicate or plan.seed_predicate for plan in seed_plans
+            ]
         params: dict[str, Any] = {
             **self.params,
             "filter_slice_start": slice_start,

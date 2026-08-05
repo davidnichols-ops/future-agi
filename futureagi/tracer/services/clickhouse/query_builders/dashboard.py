@@ -26,6 +26,7 @@ from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     compile_span_attribute_row_predicate,
 )
 from tracer.services.clickhouse.trace_project_scope import (
+    latest_live_project_traces_sql,
     latest_live_trace_projects_sql,
 )
 from tracer.services.clickhouse.v2.id_remap_sql import (
@@ -1340,25 +1341,18 @@ class DashboardQueryBuilder:
                 "usage_main_scan.organization_id = toUUID(%(organization_id)s)"
             )
 
-        # Candidate first, then physical-latest, then live/status predicates.
+        # Physical predicate first, then physical-latest, then live/status.
         # Table-level FINAL previously merged every usage row before the
-        # template/time filters and the second self-scan built an ordered set
-        # of the same data. On large tenants that pair is the Code 159 hot path.
+        # template/time filters. On large tenants that was the Code 159 hot path.
         # Keeping the deletion predicates outside LIMIT 1 BY is required: an
         # inner live filter would resurrect a superseded row after a tombstone.
-        usage_trace_candidates = f"""
-            SELECT DISTINCT
-                toUUIDOrZero(usage_trace_candidate.eval_trace_id) AS trace_id
-            FROM usage_apicalllog AS usage_trace_candidate
-            PREWHERE {_usage_main_scope.replace("usage_main_scan", "usage_trace_candidate")}
-              AND usage_trace_candidate.source_id = %(eval_template_id)s
-              AND usage_trace_candidate.created_at >= %(start_date)s
-              AND usage_trace_candidate.created_at < %(end_date)s
-            WHERE usage_trace_candidate.eval_trace_id != ''
-        """
-        trace_projects = latest_live_trace_projects_sql(
-            candidate_trace_ids_sql=usage_trace_candidates
-        )
+        # Resolve ownership from the narrow ``traces`` primary-key prefix.  The
+        # previous candidate relation reread this same usage slice before the
+        # main latest-state scan.  Large but otherwise healthy slices therefore
+        # crossed the query-wide row budget only because every usage row was
+        # consumed twice.  Project membership is immutable; latest-live and
+        # ambiguous-ID handling remain exact in the project-bounded relation.
+        trace_projects = latest_live_project_traces_sql()
         eval_source = f"""
             (
                 SELECT
@@ -1629,6 +1623,16 @@ class DashboardQueryBuilder:
             # Reuse the already tenant/template/time-bounded eval candidates;
             # converting their UUID projection back to String matches the
             # physical spans.trace_id type without changing membership.
+            usage_trace_candidates = f"""
+                SELECT DISTINCT
+                    toUUIDOrZero(usage_trace_candidate.eval_trace_id) AS trace_id
+                FROM usage_apicalllog AS usage_trace_candidate
+                PREWHERE {_usage_main_scope.replace("usage_main_scan", "usage_trace_candidate")}
+                  AND usage_trace_candidate.source_id = %(eval_template_id)s
+                  AND usage_trace_candidate.created_at >= %(start_date)s
+                  AND usage_trace_candidate.created_at < %(end_date)s
+                WHERE usage_trace_candidate.eval_trace_id != ''
+            """
             span_trace_candidates = (
                 "SELECT toString(trace_id) AS trace_id FROM ("
                 f"{usage_trace_candidates}"

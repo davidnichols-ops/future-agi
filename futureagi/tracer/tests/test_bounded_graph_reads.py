@@ -1721,7 +1721,7 @@ def test_stale_saturated_span_anchor_uses_bounded_ordered_fallback(monkeypatch):
 
 
 @pytest.mark.unit
-def test_span_anchor_probe_is_graph_opt_in_not_a_list_behavior_change():
+def test_span_typed_map_anchor_is_bounded_for_lists_and_graphs():
     from tracer.services.clickhouse.v2.query_builders.span_list import (
         SpanListQueryBuilderV2,
     )
@@ -1737,8 +1737,16 @@ def test_span_anchor_probe_is_graph_opt_in_not_a_list_behavior_change():
         bounded_anchor_probe=True,
     )
 
-    assert list_builder.supports_filter_anchor_probe() is False
+    assert list_builder.supports_filter_anchor_probe() is True
+    assert list_builder.recommended_filter_anchor_probe_limit() == 64
+    assert list_builder.recommended_filter_anchor_probe_timeout_ms() == 300
+    assert list_builder.recommended_filter_anchor_probe_strata() == 4
+    assert (
+        list_builder.recommended_filter_anchor_probe_max_bytes_to_read()
+        == 96 * 1024 * 1024
+    )
     assert graph_builder.supports_filter_anchor_probe() is True
+    assert graph_builder.recommended_filter_anchor_probe_limit() is None
 
 
 @pytest.mark.unit
@@ -1823,6 +1831,11 @@ def test_span_mixed_structured_anchor_uses_only_the_indexed_typed_map_leaf():
     assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in anchor_query
     assert anchor_params["latest_filter_key_0"] == "final_status"
     assert "mapValues(attrs_string)" not in anchor_query
+    assert (
+        "lowerUTF8(toString(attrs_string[%(latest_filter_key_0)s])) = "
+        "%(latest_filter_param_0)s" in anchor_query
+    )
+    assert anchor_params["latest_filter_param_0"] == "rejected"
     assert "JSONExtract" not in anchor_query
     assert "inbound" not in anchor_params.values()
 
@@ -1913,6 +1926,12 @@ def test_typed_map_key_subcolumn_remains_a_safe_graph_anchor(
     assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in anchor_query
     assert anchor_params["latest_filter_key_0"] == "final_status"
     assert "mapValues(attrs_string)" not in anchor_query
+    assert anchor_params["latest_filter_param_0"] == (
+        "rejected" if filter_op == "equals" else ("rejected", "approved")
+    )
+    assert "lowerUTF8(toString(attrs_string[%(latest_filter_key_0)s]))" in anchor_query
+    assert "latest_filter_index_0_0" not in anchor_params
+    assert "latest_filter_index_0_1" not in anchor_params
     assert "Rejected" not in anchor_params.values()
     assert "Approved" not in anchor_params.values()
 

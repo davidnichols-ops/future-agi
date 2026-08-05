@@ -211,7 +211,7 @@ def test_final_status_plan_is_typed_map_only_with_bound_key_and_value() -> None:
     assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in (
         plan.seed_predicate
     )
-    assert "mapValues(span_attr_str)" in plan.seed_predicate
+    assert "mapValues(span_attr_str)" not in plan.seed_predicate
     assert "span_attributes_raw" not in plan.seed_predicate
     assert "JSON" not in plan.seed_predicate
     assert "final_status" not in plan.seed_predicate
@@ -243,8 +243,12 @@ def test_final_status_v2_seed_respects_trace_any_span_scope(
     if seed_applies_attribute:
         assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in sql
         assert "mapValues(attrs_string)" not in sql
+        assert (
+            "lowerUTF8(toString(attrs_string[%(latest_filter_key_0)s])) = "
+            "%(latest_filter_param_0)s" in sql
+        )
         assert params["latest_filter_key_0"] == "final_status"
-        assert "latest_filter_param_0" not in params
+        assert params["latest_filter_param_0"] == "rejected"
     else:
         assert "mapContains(attrs_string" not in sql
         assert "mapValues(attrs_string)" not in sql

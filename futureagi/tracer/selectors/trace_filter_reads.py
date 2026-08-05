@@ -32,6 +32,8 @@ _CANDIDATE_WITNESS_PREFILTER_STRATA = 8
 _CANDIDATE_WITNESS_PREFILTER_MAX_ATTEMPTS = 32
 _CANDIDATE_WITNESS_PREFILTER_TOTAL_MS = 2_000
 _CANDIDATE_WITNESS_EXACT_RESERVE_MS = 1_000
+_UNINDEXED_POSITIVE_MICRO_SEED_TIMEOUT_MS = 200
+_UNINDEXED_POSITIVE_MICRO_SEED_MAX_BYTES = 96 * 1024 * 1024
 # Trace/span list queries fetch one additional page-sized de-duplication
 # margin; 5,000 is also the existing server-side result ceiling used by those
 # endpoints.  Keeping one public ceiling makes numbered-page work finite for
@@ -472,6 +474,9 @@ def read_bounded_filter_page(
     if identity_only_classification and reserved_hydration_ms < 25:
         raise ValueError("page hydration reserve must be at least 25 ms")
     classification_deadline = deadline - (reserved_hydration_ms / 1000)
+    probe_limits_enforced = bool(
+        getattr(analytics, "supports_per_query_read_settings", True)
+    )
 
     # Resolve the optional anchor plan once, before the numbered-page preflight,
     # and reuse it at execution time.  The probe is speculative: when it reaches
@@ -571,6 +576,11 @@ def read_bounded_filter_page(
         and callable(anchor_support)
         and bool(anchor_support())
         and not skip_full_window_anchor
+        # Anchor probes rely on tighter statement/byte caps. A locked executor
+        # may strip per-query settings; skip speculation instead of allowing a
+        # bounded optimization to inherit the server's 30-second ceiling and
+        # crowd out the exact fallback.
+        and probe_limits_enforced
         and (callable(ordered_seed_builder) or seed_proves_result_order)
     )
 
@@ -688,9 +698,6 @@ def read_bounded_filter_page(
     # indexable prefilter before the first full-window classifier batch; the
     # exact classifier still validates every surviving identity. Unsupported
     # filter shapes return no probe and retain the existing exact path.
-    probe_limits_enforced = bool(
-        getattr(analytics, "supports_per_query_read_settings", True)
-    )
     candidate_witness_probe_enabled = bool(
         probe_limits_enforced
         and candidate_witness_prefilter_allowed
@@ -810,7 +817,9 @@ def read_bounded_filter_page(
         except Exception as exc:
             if is_read_budget_error(exc):
                 error_code = "read_budget_exceeded"
-            elif kind == "prefilter" and isinstance(exc, (RuntimeError, TimeoutError)):
+            elif kind in {"prefilter", "micro_seed"} and isinstance(
+                exc, (RuntimeError, TimeoutError)
+            ):
                 # The witness probe is an optional optimization. Some guarded
                 # executors report their own statement timeout/resource cap as
                 # a generic RuntimeError, so account and abandon only this
@@ -937,6 +946,16 @@ def read_bounded_filter_page(
             return False
 
         probe_classified_tail: Hashable | None = None
+        # A stratified witness probe can require several full-window slices.
+        # When the complete candidate set already fits in one bounded exact
+        # classifier, that speculation cannot reduce the physical classifier
+        # count and is strictly extra failure/latency surface.  Skip it for
+        # this batch only; a later, larger seed batch may still benefit from
+        # the probe.
+        candidate_witness_probe_can_reduce_query_count = not (
+            candidate_witness_probe_strata > 1
+            and len(candidate_identities) <= candidate_witness_fallback_batch_size
+        )
         prefilter_query_reserve = (
             1
             + ceil(len(candidate_identities) / candidate_witness_fallback_batch_size)
@@ -947,18 +966,23 @@ def read_bounded_filter_page(
             if candidate_witness_probe_strata > 1
             else _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS
         ) + _CANDIDATE_WITNESS_EXACT_RESERVE_MS
-        if candidate_witness_probe_enabled and (
-            candidate_witness_probe_attempt_count + candidate_witness_probe_strata
-            > candidate_witness_probe_attempt_limit
-            or len(attempts) + prefilter_query_reserve > max_query_count
-            or int((classification_deadline - monotonic()) * 1000)
-            < prefilter_time_reserve_ms
+        if (
+            candidate_witness_probe_enabled
+            and candidate_witness_probe_can_reduce_query_count
+            and (
+                candidate_witness_probe_attempt_count + candidate_witness_probe_strata
+                > candidate_witness_probe_attempt_limit
+                or len(attempts) + prefilter_query_reserve > max_query_count
+                or int((classification_deadline - monotonic()) * 1000)
+                < prefilter_time_reserve_ms
+            )
         ):
             candidate_witness_probe_enabled = False
             candidate_witness_probe_abandoned = True
         if (
             candidate_witness_prefilter_allowed
             and candidate_witness_probe_enabled
+            and candidate_witness_probe_can_reduce_query_count
             and callable(candidate_witness_probe_builder)
         ):
             probe_candidates = candidate_identities
@@ -1117,7 +1141,10 @@ def read_bounded_filter_page(
 
         active_classify_batch_size = (
             candidate_witness_fallback_batch_size
-            if candidate_witness_probe_abandoned
+            if (
+                candidate_witness_probe_abandoned
+                or not candidate_witness_probe_can_reduce_query_count
+            )
             else classify_batch_size
         )
         for batch_offset in range(
@@ -1299,6 +1326,169 @@ def read_bounded_filter_page(
         return False
 
     try:
+        # Positive call-type/JSON predicates have no skip index, so evaluating
+        # them over an adaptive multi-day seed is the broad scan this reader is
+        # designed to avoid. Give builders a small fixed-width raw predicate
+        # seed in each deterministic temporal stratum. The distributed union
+        # finds old as well as new matches without ever parsing JSON over a
+        # broad slice. Its rows are only candidates and cross the exact latest-
+        # state classifier before entering ``matched_by_id``. Trace order is
+        # still proven by the unchanged ordered-root fallback. A span builder
+        # may close directly only when the *newest* micro-slice alone contains
+        # the complete public prefix sentinel; distributed samples never claim
+        # absence or global order. Any resource failure restores pre-probe
+        # selector state and continues through the original fail-closed path.
+        micro_seed_builder = getattr(
+            builder, "build_filter_unindexed_micro_seed_page", None
+        )
+        micro_width_builder = getattr(
+            builder, "recommended_filter_unindexed_micro_seed_width", None
+        )
+        micro_strata_builder = getattr(
+            builder, "recommended_filter_unindexed_micro_seed_strata", None
+        )
+        micro_order_proof = getattr(
+            builder, "filter_unindexed_micro_seed_proves_result_order", None
+        )
+        micro_width = (
+            micro_width_builder()
+            if callable(micro_width_builder) and callable(micro_seed_builder)
+            else None
+        )
+        micro_strata = (
+            micro_strata_builder()
+            if callable(micro_strata_builder) and micro_width is not None
+            else None
+        )
+        use_seed_loop = True
+        if (
+            isinstance(micro_width, timedelta)
+            and micro_width > timedelta(0)
+            and type(micro_strata) is int
+            and 1 <= micro_strata <= _MAX_OPTIONAL_ANCHOR_STRATA
+        ):
+            micro_limit = min(candidate_limit, prefix_needed)
+            micro_classify_queries = ceil(micro_limit / classify_batch_size)
+            micro_reserved_queries = micro_strata + micro_classify_queries
+            micro_time_reserve_ms = (
+                micro_strata * _UNINDEXED_POSITIVE_MICRO_SEED_TIMEOUT_MS
+                + _CANDIDATE_WITNESS_EXACT_RESERVE_MS
+            )
+            micro_can_run = bool(
+                probe_limits_enforced
+                and cursor_key is None
+                and micro_reserved_queries <= max_query_count
+                and not bounded_numbered_page_depth_exceeded(
+                    **page_depth_kwargs,
+                    reserved_query_count=micro_reserved_queries,
+                )
+                and int((classification_deadline - monotonic()) * 1000)
+                >= micro_time_reserve_ms
+            )
+            if micro_can_run:
+                saved_seen_seed_ids = set(seen_seed_ids)
+                saved_seen_candidate_ids = set(seen_candidate_ids)
+                saved_matched_by_id = dict(matched_by_id)
+                saved_pending_candidates = dict(pending_identity_candidates)
+                try:
+                    request_duration = request_end - request_start
+                    request_duration_us = (
+                        request_duration.days * 86_400_000_000
+                        + request_duration.seconds * 1_000_000
+                        + request_duration.microseconds
+                    )
+                    micro_boundaries = [
+                        request_start
+                        + timedelta(
+                            microseconds=(request_duration_us * index) // micro_strata
+                        )
+                        for index in range(micro_strata + 1)
+                    ]
+                    micro_boundaries[0], micro_boundaries[-1] = (
+                        request_start,
+                        request_end,
+                    )
+                    micro_slices = [
+                        (max(stratum_start, stratum_end - micro_width), stratum_end)
+                        for stratum_start, stratum_end in reversed(
+                            list(
+                                zip(
+                                    micro_boundaries[:-1],
+                                    micro_boundaries[1:],
+                                    strict=False,
+                                )
+                            )
+                        )
+                        if stratum_start < stratum_end
+                    ]
+                    raw_micro_rows: list[dict[str, Any]] = []
+                    newest_micro_saturated = False
+                    for micro_index, (micro_start, micro_end) in enumerate(
+                        micro_slices
+                    ):
+                        remaining_limit = micro_limit - len(raw_micro_rows)
+                        if remaining_limit <= 0:
+                            break
+                        micro_query, micro_params = micro_seed_builder(
+                            slice_start=micro_start,
+                            slice_end=micro_end,
+                            limit=remaining_limit,
+                        )
+                        micro_result = execute(
+                            kind="micro_seed",
+                            query=micro_query,
+                            params=micro_params,
+                            active_start=micro_start,
+                            active_end=micro_end,
+                            result_limit=remaining_limit,
+                            timeout_cap_ms=(_UNINDEXED_POSITIVE_MICRO_SEED_TIMEOUT_MS),
+                            max_bytes_to_read_cap=(
+                                _UNINDEXED_POSITIVE_MICRO_SEED_MAX_BYTES
+                            ),
+                        )
+                        result_rows = list(micro_result.data or [])
+                        if micro_index == 0 and len(result_rows) >= remaining_limit:
+                            newest_micro_saturated = True
+                        raw_micro_rows.extend(result_rows)
+                    micro_rows = sorted(
+                        raw_micro_rows,
+                        key=seed_row_key,
+                        reverse=True,
+                    )
+                    new_micro_rows: list[dict[str, Any]] = []
+                    for row in micro_rows:
+                        raw_identity = seed_identity(row)
+                        if (
+                            not str(row.get(key_field, ""))
+                            or raw_identity in seen_seed_ids
+                        ):
+                            continue
+                        seen_seed_ids.add(raw_identity)
+                        new_micro_rows.append(row)
+                    micro_prefix_proven = classify_or_buffer_seed_rows(
+                        new_micro_rows,
+                        active_start=request_start,
+                        active_end=request_end,
+                        stop_on_ordered_prefix=(
+                            newest_micro_saturated and bool(micro_order_proof())
+                            if callable(micro_order_proof)
+                            else False
+                        ),
+                        force=True,
+                    )
+                    if micro_prefix_proven:
+                        page_complete = True
+                        use_seed_loop = False
+                except _BudgetExceeded:
+                    seen_seed_ids.clear()
+                    seen_seed_ids.update(saved_seen_seed_ids)
+                    seen_candidate_ids.clear()
+                    seen_candidate_ids.update(saved_seen_candidate_ids)
+                    matched_by_id.clear()
+                    matched_by_id.update(saved_matched_by_id)
+                    pending_identity_candidates.clear()
+                    pending_identity_candidates.update(saved_pending_candidates)
+
         # Eligible any-span trace filters first ask a direct key+value predicate
         # for a finite DISTINCT trace-id sentinel. If it exhausts, that is an
         # exact candidate superset and no root-history scan is needed. Long
@@ -1306,9 +1496,10 @@ def read_bounded_filter_page(
         # an attempted probe reaches the sentinel (or its read budget), switch
         # to ordered root batches, where a proven page prefix can close without
         # materialising the tenant-wide set that triggered Code 159.
-        use_seed_loop = True
         seed_page_builder = builder.build_filter_seed_page
-        if cursor_key is not None:
+        if not use_seed_loop:
+            pass
+        elif cursor_key is not None:
             # Continuations must start from the signed *result* tuple. Trace
             # any-span seeds are ordered by the matching physical child, not
             # by the public root trace, so use the root-ordered fallback when

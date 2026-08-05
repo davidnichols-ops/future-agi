@@ -267,7 +267,8 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert "indexHint(has(mapKeys(span_attr_str), %(latest_filter_key_0)s))" in seed_sql
     assert "mapValues(span_attr_str)" not in seed_sql
     assert seed_params["latest_filter_key_0"] == "final_status"
-    assert "latest_filter_param_0" not in seed_params
+    assert seed_params["latest_filter_param_0"] == ("rejected",)
+    assert "latest_filter_index_0_0" not in seed_params
     assert "parent_span_id IS NULL" not in seed_sql
     assert "id AS matched_span_id" in seed_sql
     assert " FINAL" not in seed_sql
@@ -304,11 +305,13 @@ def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
 
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 100
-    assert builder.skip_full_window_filter_anchor_probe() is True
-    assert builder.recommended_filter_anchor_probe_limit() is None
-    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
-    assert builder.recommended_filter_anchor_probe_strata() is None
-    assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
+    assert builder.skip_full_window_filter_anchor_probe() is False
+    assert builder.recommended_filter_anchor_probe_limit() == 64
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
+    assert builder.recommended_filter_anchor_probe_strata() == 4
+    assert (
+        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 96 * 1024 * 1024
+    )
 
 
 @pytest.mark.parametrize(
@@ -543,8 +546,8 @@ def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
     # the high-read phase and must be split independently.
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 20
-    assert builder.recommended_filter_anchor_probe_limit() is None
-    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
+    assert builder.recommended_filter_anchor_probe_limit() == 64
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
     assert (
         builder.supports_filter_candidate_witness_prefilter_without_hydration() is False
     )
@@ -687,10 +690,8 @@ def test_eval_trace_any_span_large_prefix_fails_closed_at_query_ceiling() -> Non
 
 
 def test_call_type_trace_filter_skips_unindexed_window_anchor() -> None:
-    builder = TraceListQueryBuilder(
-        project_id=PROJECT_ID,
-        filters=[_time_filter(), _system_filter("call_type", "inbound")],
-    )
+    filters = [_time_filter(), _system_filter("call_type", "inbound")]
+    builder = TraceListQueryBuilder(project_id=PROJECT_ID, filters=filters)
 
     ordered_sql, _ = builder.build_filter_ordered_seed_page(
         slice_start=END - timedelta(minutes=5),
@@ -706,9 +707,63 @@ def test_call_type_trace_filter_skips_unindexed_window_anchor() -> None:
     assert "parent_span_id IS NULL" in ordered_sql
     assert "JSONExtract" in match_sql
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_classify_batch_size() == 20
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
+    assert builder.recommended_filter_unindexed_micro_seed_width() == timedelta(
+        minutes=5
+    )
+    assert builder.recommended_filter_unindexed_micro_seed_strata() == 4
+    micro_sql, micro_params = builder.build_filter_unindexed_micro_seed_page(
+        slice_start=END - timedelta(minutes=5),
+        slice_end=END,
+        limit=26,
+    )
+    assert "JSONExtractString(span_attributes_raw, 'raw_log', 'type')" in micro_sql
+    assert micro_params["filter_seed_limit"] == 26
+    with pytest.raises(ValueError, match="exceeds micro-slice"):
+        builder.build_filter_unindexed_micro_seed_page(
+            slice_start=END - timedelta(minutes=6),
+            slice_end=END,
+            limit=26,
+        )
+    graph_builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=filters,
+        bounded_identity_only=True,
+    )
+    assert graph_builder.recommended_filter_unindexed_micro_seed_width() is None
+
+
+def test_call_type_span_filter_has_exact_micro_seed_only() -> None:
+    filters = [_time_filter(), _system_filter("call_type", "inbound")]
+    builder = SpanListQueryBuilder(project_id=PROJECT_ID, filters=filters)
+
+    ordinary_sql, _ = builder.build_filter_seed_page(
+        slice_start=END - timedelta(minutes=5),
+        slice_end=END,
+        limit=26,
+    )
+    micro_sql, micro_params = builder.build_filter_unindexed_micro_seed_page(
+        slice_start=END - timedelta(minutes=5),
+        slice_end=END,
+        limit=26,
+    )
+
+    assert "JSONExtract" not in ordinary_sql
+    assert "JSONExtractString(span_attributes_raw, 'raw_log', 'type')" in micro_sql
+    assert micro_params["filter_seed_limit"] == 26
+    assert builder.recommended_filter_unindexed_micro_seed_width() == timedelta(
+        minutes=5
+    )
+    assert builder.recommended_filter_unindexed_micro_seed_strata() == 4
+    assert builder.filter_unindexed_micro_seed_proves_result_order() is True
+    graph_builder = SpanListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=filters,
+        bounded_anchor_probe=True,
+    )
+    assert graph_builder.recommended_filter_unindexed_micro_seed_width() is None
 
 
 def test_negative_only_trace_filter_skips_long_window_anchor() -> None:
@@ -755,7 +810,7 @@ def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
     assert anchor_params["latest_filter_key_0"] == "final_status"
     assert "latest_filter_param_1" not in anchor_params
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_classify_batch_size() == 20
 
 
 def test_trace_candidate_classifier_prunes_to_request_partitions() -> None:
@@ -1169,7 +1224,7 @@ def test_trace_and_span_seed_slice_bounds_preserve_microseconds() -> None:
         assert params["candidate_end_date_us"] == 1_735_689_601_654_321
 
 
-def test_v2_span_seed_uses_key_only_witness_before_exact_replay() -> None:
+def test_v2_span_seed_uses_typed_value_witness_before_exact_replay() -> None:
     filters = [
         _time_filter(),
         _attribute_filter("final_status", ["Rejected"], operation="in"),
@@ -1186,7 +1241,7 @@ def test_v2_span_seed_uses_key_only_witness_before_exact_replay() -> None:
     assert "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))" in sql
     assert "mapValues(attrs_string)" not in sql
     assert params["latest_filter_key_0"] == "final_status"
-    assert "latest_filter_param_0" not in params
+    assert params["latest_filter_param_0"] == ("rejected",)
     assert "latest_filter_index_0_0" not in params
 
     prompt_builder = SpanListQueryBuilderV2(
@@ -1206,8 +1261,8 @@ def test_v2_span_seed_uses_key_only_witness_before_exact_replay() -> None:
         "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))" in prompt_sql
     )
     assert "mapValues(attrs_string)" not in prompt_sql
+    assert prompt_params["latest_filter_param_0"] == "agent_2_identity_disclosure"
     assert prompt_params["latest_filter_key_0"] == "prompt_slug"
-    assert "latest_filter_param_0" not in prompt_params
 
 
 @pytest.mark.parametrize(
@@ -1833,10 +1888,11 @@ def test_attribute_key_is_bound_and_preserved_for_all_map_expressions() -> None:
         assert key not in sql
         assert "%(latest_filter_key_0)s" in sql
     assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in seed_sql
-    assert "attrs_string[%(latest_filter_key_0)s]" not in seed_sql
+    assert "attrs_string[%(latest_filter_key_0)s]" in seed_sql
     assert "argMax(mapContains(attrs_string, %(latest_filter_key_0)s)" in match_sql
     assert "argMax(attrs_string[%(latest_filter_key_0)s], _version)" in match_sql
     assert seed_params["latest_filter_key_0"] == key
+    assert seed_params["latest_filter_param_0"] == value.lower()
     assert match_params["latest_filter_key_0"] == key
     assert match_params["latest_filter_param_0"] == value.lower()
 
@@ -3915,6 +3971,34 @@ class _UnindexedAnySpanFakeBuilder(_FakeBuilder):
         return "ordered_seed", params
 
 
+class _DistributedMicroSeedFakeBuilder(_UnindexedAnySpanFakeBuilder):
+    @staticmethod
+    def recommended_filter_unindexed_micro_seed_width() -> timedelta:
+        return timedelta(minutes=5)
+
+    @staticmethod
+    def recommended_filter_unindexed_micro_seed_strata() -> int:
+        return 4
+
+    def build_filter_unindexed_micro_seed_page(
+        self,
+        *,
+        slice_start: datetime,
+        slice_end: datetime,
+        limit: int,
+    ) -> tuple[str, dict[str, Any]]:
+        _, params = self.build_filter_seed_page(
+            slice_start=slice_start,
+            slice_end=slice_end,
+            limit=limit,
+        )
+        return "micro_seed", params
+
+    @staticmethod
+    def filter_unindexed_micro_seed_proves_result_order() -> bool:
+        return False
+
+
 class _OrderedTraceCursorFakeBuilder(_UnindexedAnySpanFakeBuilder):
     @staticmethod
     def filter_cursor_seed_keyset_is_safe() -> bool:
@@ -5879,6 +5963,129 @@ def test_unindexed_any_span_reader_starts_with_ordered_root_batches() -> None:
     assert seed_queries == ["ordered_seed"]
 
 
+def test_unindexed_micro_seeds_are_distributed_and_empty_never_proves_absence() -> None:
+    window_start = END - timedelta(days=120)
+    builder = _DistributedMicroSeedFakeBuilder(
+        [],
+        start=window_start,
+        end=END,
+        seed_proves_order=False,
+    )
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+        deadline_ms=5_000,
+    )
+
+    micro_calls = [params for query, params in executor.calls if query == "micro_seed"]
+    assert len(micro_calls) == 4
+    assert all(
+        params["slice_end"] - params["slice_start"] == timedelta(minutes=5)
+        for params in micro_calls
+    )
+    assert min(
+        params["slice_end"] for params in micro_calls
+    ) == window_start + timedelta(days=30)
+    assert any(query == "ordered_seed" for query, _params in executor.calls)
+    assert page.complete is True
+    assert page.rows == []
+
+
+def test_unindexed_micro_seed_finds_old_candidate_before_ordered_proof() -> None:
+    window_start = END - timedelta(days=120)
+    old_match = {
+        "id": "old-json-match",
+        "start_time": window_start + timedelta(days=30, minutes=-1),
+    }
+    builder = _DistributedMicroSeedFakeBuilder(
+        [old_match],
+        start=window_start,
+        end=END,
+        seed_proves_order=False,
+    )
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+        deadline_ms=5_000,
+    )
+
+    call_names = [query for query, _params in executor.calls]
+    assert call_names[:4] == ["micro_seed"] * 4
+    assert call_names.index("match") < call_names.index("ordered_seed")
+    assert [row["id"] for row in page.rows] == ["old-json-match"]
+    assert page.complete is True
+
+
+def test_unindexed_micro_seed_skips_when_statement_caps_cannot_be_enforced() -> None:
+    window_start = END - timedelta(days=120)
+    builder = _DistributedMicroSeedFakeBuilder(
+        [],
+        start=window_start,
+        end=END,
+        seed_proves_order=False,
+    )
+    executor = _FakeExecutor(builder)
+    executor.supports_per_query_read_settings = False
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+        deadline_ms=5_000,
+    )
+
+    call_names = [query for query, _params in executor.calls]
+    assert "micro_seed" not in call_names
+    assert call_names
+    assert set(call_names) == {"ordered_seed"}
+    assert page.complete is True
+    assert page.rows == []
+
+
+def test_recommended_anchor_skips_when_statement_caps_cannot_be_enforced() -> None:
+    window_start = END - timedelta(days=120)
+    builder = _SmallAnchorFakeBuilder(
+        [],
+        start=window_start,
+        end=END,
+        seed_proves_order=False,
+    )
+    executor = _TimedAnchorFakeExecutor(builder)
+    executor.supports_per_query_read_settings = False
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+        deadline_ms=5_000,
+    )
+
+    call_names = [query for query, _params in executor.calls]
+    assert "anchor" not in call_names
+    assert call_names
+    assert set(call_names) == {"ordered_seed"}
+    assert page.complete is True
+    assert page.rows == []
+
+
 def test_any_span_customer_match_set_uses_200_candidate_query_budget() -> None:
     """1,063 matches need six classifier batches, not eleven 100-row batches."""
 
@@ -6985,6 +7192,48 @@ def test_candidate_witness_strata_cover_boundaries_before_excluding() -> None:
     )
     exact = [params for query, params in executor.calls if query == "match"]
     assert exact == [{"candidate_ids": ("trace-0", "trace-1")}]
+    assert page.complete is True
+
+
+def test_candidate_witness_small_stratified_batch_uses_one_exact_query() -> None:
+    class OneBatchFallbackBuilder(_StratifiedCandidateWitnessFakeBuilder):
+        @staticmethod
+        def recommended_filter_candidate_witness_fallback_classify_batch_size():
+            return 100
+
+    window_start = END - timedelta(hours=8)
+    rows = _stratified_witness_rows(END)
+    builder = OneBatchFallbackBuilder(
+        rows,
+        start=window_start,
+        end=END,
+        match_rows=rows,
+        # Eval trace membership uses the production-qualified 100-ID exact
+        # fallback behind the optional long-window witness probe.
+        recommended_batch_size=100,
+        recommended_seed_batch_size=4,
+    )
+    executor = _StratifiedCandidateWitnessFakeExecutor(
+        builder,
+        # This would fail the newest optional stratum if one were attempted.
+        blocked_instant=END - timedelta(minutes=30),
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=3,
+        deadline_ms=5_000,
+        max_query_count=32,
+    )
+
+    assert [query for query, _ in executor.calls] == ["seed", "match"]
+    assert executor.calls[-1][1]["candidate_ids"] == tuple(row["id"] for row in rows)
+    assert [attempt.kind for attempt in page.attempts] == ["seed", "classify"]
+    assert all(attempt.error_code is None for attempt in page.attempts)
     assert page.complete is True
 
 
