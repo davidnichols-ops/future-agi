@@ -19,19 +19,66 @@ const payloadCandidates = (payload) => {
     )
     .filter(Boolean);
 
-  return candidates.flatMap((candidate) =>
-    candidate?.metadata ? [candidate, candidate.metadata] : [candidate],
+  return candidates.flatMap((candidate) => [
+    candidate,
+    ...(candidate?.metadata ? [candidate.metadata] : []),
+    ...(Array.isArray(candidate?.metrics) ? candidate.metrics : []),
+  ]);
+};
+
+const hasBoundedReadMetadata = (candidate) =>
+  Object.keys(candidate || {}).some(
+    (key) =>
+      key === "query_complete" ||
+      key === "query_status" ||
+      key === "query_sampled" ||
+      key.startsWith("query_error_") ||
+      key.startsWith("query_sample_") ||
+      key.startsWith("query_sampling_"),
   );
+
+const hasValidStatusPair = (candidate) => {
+  if (!hasBoundedReadMetadata(candidate)) return true;
+
+  const status = candidate?.query_status;
+  const complete = candidate?.query_complete;
+  if (typeof complete !== "boolean") return false;
+
+  if (status === "complete") {
+    return (
+      complete === true &&
+      !candidate?.query_error_code &&
+      candidate?.query_sampled !== true
+    );
+  }
+  if (status === "sampled") {
+    return complete === false && candidate?.query_sampled !== false;
+  }
+  if (status === "degraded") return complete === false;
+  return false;
 };
 
 const hasCompleteSamplingCoverage = (candidate) => {
   const planned = candidate?.query_sampling_strata;
-  return (
+  const hasCompletedStrata =
+    candidate?.query_complete === false &&
     Boolean(candidate?.query_sampling_strategy) &&
     Number.isInteger(planned) &&
     planned > 0 &&
-    candidate?.query_sampling_strata_completed === planned
-  );
+    candidate?.query_sampling_strata_completed === planned;
+  const hasBoundedDashboardSample =
+    candidate?.query_complete === false &&
+    candidate?.query_error_code === "sample_limit" &&
+    candidate?.query_sampling_strategy ===
+      "bounded_physical_rows_per_time_bucket" &&
+    Number.isInteger(candidate?.query_sampling_interval_seconds) &&
+    candidate.query_sampling_interval_seconds > 0 &&
+    Number.isInteger(candidate?.query_sample_limit) &&
+    candidate.query_sample_limit > 0 &&
+    Number.isInteger(candidate?.query_sample_per_bucket) &&
+    candidate.query_sample_per_bucket > 0 &&
+    candidate.query_sample_per_bucket <= candidate.query_sample_limit;
+  return hasCompletedStrata || hasBoundedDashboardSample;
 };
 
 /**
@@ -48,11 +95,19 @@ export function getQueryReadState(payload, { isError = false } = {}) {
     return "error";
   }
 
+  const invalidMetadata = candidates.some(
+    (candidate) => !hasValidStatusPair(candidate),
+  );
+
   const sampledCandidates = candidates.filter(
     (candidate) => candidate?.query_status === "sampled",
   );
-  const sampled = sampledCandidates.some(hasCompleteSamplingCoverage);
-  const invalidSample = sampledCandidates.length > 0 && !sampled;
+  const sampled =
+    sampledCandidates.length > 0 &&
+    sampledCandidates.every(hasCompleteSamplingCoverage);
+  const invalidSample = sampledCandidates.some(
+    (candidate) => !hasCompleteSamplingCoverage(candidate),
+  );
   const degraded = candidates.some(
     (candidate) =>
       candidate?.query_status === "degraded" ||
@@ -61,7 +116,7 @@ export function getQueryReadState(payload, { isError = false } = {}) {
       candidate?.queryReadState === "degraded",
   );
 
-  if (degraded || invalidSample) return "degraded";
+  if (invalidMetadata || degraded || invalidSample) return "degraded";
   return sampled ? "sampled" : "complete";
 }
 

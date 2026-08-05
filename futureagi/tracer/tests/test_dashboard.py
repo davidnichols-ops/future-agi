@@ -26,6 +26,7 @@ from tracer.models.project import Project
 from tracer.serializers.dashboard import (
     DashboardCreateUpdateSerializer,
     DashboardFilterValuesResponseSerializer,
+    DashboardQueryApiResponseSerializer,
     DashboardQuerySerializer,
     DashboardWidgetSerializer,
 )
@@ -49,6 +50,8 @@ from tracer.services.clickhouse.query_builders.dashboard import (
 from tracer.services.clickhouse.query_builders.dashboard_base import (
     DashboardQueryBuilderBase,
 )
+from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+from tracer.services.clickhouse.server_readonly import without_query_settings
 from tracer.services.clickhouse.v2.query_builders.dashboard import (
     DashboardQueryBuilderV2,
 )
@@ -231,6 +234,7 @@ def dashboard_widget(db, dashboard, user):
 def sample_query_config():
     return {
         "project_ids": [str(uuid.uuid4())],
+        "allow_sampled": True,
         "granularity": "day",
         "time_range": {"preset": "7D"},
         "metrics": [
@@ -2150,7 +2154,7 @@ class TestDashboardQueryBuilder:
                 }
             ],
         }
-        custom_sql, _, _ = DashboardQueryBuilderV2(
+        custom_sql, custom_params, custom_info = DashboardQueryBuilderV2(
             custom_metric_config
         ).build_all_queries()[0]
 
@@ -2165,20 +2169,444 @@ class TestDashboardQueryBuilder:
                 }
             ],
         }
-        breakdown_sql, _, _ = DashboardQueryBuilderV2(
+        breakdown_sql, breakdown_params, breakdown_info = DashboardQueryBuilderV2(
             breakdown_config
         ).build_all_queries()[0]
 
-        for sql in (custom_sql, breakdown_sql):
+        for sql, params, metric_info in (
+            (custom_sql, custom_params, custom_info),
+            (breakdown_sql, breakdown_params, breakdown_info),
+        ):
+            slice_count = sum(
+                key.startswith("_raw_attr_slice_start_") for key in params
+            )
             assert "created_at >=" not in sql
             assert "start_time >= %(start_date)s" in sql
             assert "start_time < %(end_date)s" in sql
             assert "project_id IN %(project_ids)s" in sql
             assert "is_deleted = 0" in sql
             assert "mapContains(attrs_string" in sql
+            assert 1 <= slice_count <= 64
+            assert sql.count("PREWHERE") == slice_count + 1
+            assert (
+                "toUnixTimestamp64Micro(start_time),\n        _version\n    ) IN ("
+                in sql
+            )
+            assert "LIMIT %(_raw_attr_candidates_per_bucket)s BY" not in sql
+            assert sql.count("LIMIT %(_raw_attr_candidates_per_bucket)s") == (
+                slice_count
+            )
+            assert sql.count("UNION ALL") == slice_count - 1
+            assert "LIMIT %(_raw_attr_candidate_limit)s" in sql
+            assert "SELECT *\n    FROM spans\n    PREWHERE" in sql
+            assert params["_raw_attr_slice_start_0"] == params["start_date"]
+            assert (
+                params[f"_raw_attr_slice_end_{slice_count - 1}"] == params["end_date"]
+            )
+            assert "optimize_move_to_prewhere" not in sql
+            candidate_sql = sql.split(") IN (", 1)[1].split(")\n    LIMIT", 1)[0]
+            assert "attrs_string[" not in candidate_sql
+            assert "mapValues(attrs_string)" not in candidate_sql
+            assert params["_raw_attr_candidates_per_bucket"] == 128
+            assert params["_raw_attr_candidate_limit"] == 8192
+            assert metric_info["query_complete"] is False
+            assert metric_info["query_status"] == "sampled"
+            assert metric_info["query_error_code"] == "sample_limit"
+            assert metric_info["query_sampling_interval_seconds"] == 86400
+            assert metric_info["query_sample_limit"] == 8192
+            assert metric_info["query_sample_per_bucket"] == 128
 
         assert "uniq(attrs_string" in custom_sql
-        assert "(parent_span_id IS NULL OR parent_span_id = '')" in breakdown_sql
+        assert "parent_span_id" not in custom_sql
+        breakdown_slice_count = sum(
+            key.startswith("_raw_attr_slice_start_") for key in breakdown_params
+        )
+        assert (
+            breakdown_sql.count("(parent_span_id IS NULL OR parent_span_id = '')")
+            == breakdown_slice_count + 1
+        )
+
+    def test_raw_attribute_sampling_is_v2_shape_local(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        custom_metric = {
+            "id": "final_status",
+            "name": "final_status",
+            "type": "custom_attribute",
+            "attribute_key": "final_status",
+            "attribute_type": "string",
+            "aggregation": "count_distinct",
+        }
+
+        v1_sql, _, v1_info = DashboardQueryBuilder(
+            {**sample_query_config, "metrics": [custom_metric]}
+        ).build_all_queries()[0]
+        system_sql, _, system_info = DashboardQueryBuilderV2(
+            sample_query_config
+        ).build_all_queries()[0]
+
+        assert "_raw_attr_candidate_limit" not in v1_sql
+        assert "query_status" not in v1_info
+        assert "_raw_attr_candidate_limit" not in system_sql
+        assert "query_status" not in system_info
+
+    def test_raw_attribute_sampling_requires_explicit_opt_in(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        config = {
+            **sample_query_config,
+            "allow_sampled": False,
+            "metrics": [
+                {
+                    "id": "final_status",
+                    "name": "final_status",
+                    "type": "custom_attribute",
+                    "attribute_key": "final_status",
+                    "attribute_type": "string",
+                    "aggregation": "count_distinct",
+                }
+            ],
+        }
+
+        builder = DashboardQueryBuilderV2(config)
+        metric_info = builder.metric_info(config["metrics"][0])
+
+        assert metric_info["query_complete"] is False
+        assert metric_info["query_status"] == "degraded"
+        assert metric_info["query_error_code"] == "query_failed"
+        with pytest.raises(InvalidMetricCombinationError, match="allow_sampled=true"):
+            builder.build_metric_query(config["metrics"][0])
+
+    def test_raw_attribute_sampling_covers_legacy_metric_and_scalar_filter_gaps(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        canonical_filter = {
+            "column_id": "final_status",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "Rechazado",
+            },
+        }
+        internal_filter = {
+            "metric_type": "custom_attribute",
+            "metric_name": "final_status",
+            "operator": "equal_to",
+            "value": "Rechazado",
+            "attribute_type": "string",
+            "canonical_filter": canonical_filter,
+        }
+
+        unknown_sql, unknown_params, unknown_info = DashboardQueryBuilderV2(
+            {
+                **sample_query_config,
+                "metrics": [
+                    {
+                        "name": "legacy_numeric_attribute",
+                        "type": "system_metric",
+                        "aggregation": "avg",
+                    }
+                ],
+            }
+        ).build_all_queries()[0]
+        filtered_sql, filtered_params, filtered_info = DashboardQueryBuilderV2(
+            {**sample_query_config, "filters": [internal_filter]}
+        ).build_all_queries()[0]
+
+        for sql, params, info in (
+            (unknown_sql, unknown_params, unknown_info),
+            (filtered_sql, filtered_params, filtered_info),
+        ):
+            slice_count = sum(
+                key.startswith("_raw_attr_slice_start_") for key in params
+            )
+            assert sql.count("PREWHERE") == slice_count + 1
+            assert "SELECT *\n    FROM spans\n    PREWHERE" in sql
+            assert info["query_status"] == "sampled"
+        assert "attrs_number" in unknown_sql
+        assert "legacy_numeric_attribute" in unknown_params.values()
+        assert "attrs_string" in filtered_sql
+        assert "Rechazado" not in filtered_sql
+        assert "rechazado" in filtered_params.values()
+
+    def test_time_to_first_token_sample_candidates_require_metric_key(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        metric = {
+            "id": "time_to_first_token",
+            "name": "time_to_first_token",
+            "type": "system_metric",
+            "aggregation": "avg",
+        }
+
+        sql, params, metric_info = DashboardQueryBuilderV2(
+            {**sample_query_config, "metrics": [metric]}
+        ).build_all_queries()[0]
+
+        assert "has(attrs_number.keys, %(_raw_attr_presence_key_0)s)" in sql
+        assert params["_raw_attr_presence_key_0"] == (
+            "gen_ai.server.time_to_first_token"
+        )
+        assert metric_info["query_status"] == "sampled"
+
+    def test_canonical_boolean_array_and_map_filters_compile_together(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        canonical_filters = [
+            {
+                "column_id": "is_final",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "boolean",
+                    "filter_op": "equals",
+                    "filter_value": True,
+                },
+            },
+            {
+                "column_id": "labels",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "array",
+                    "filter_op": "contains",
+                    "filter_value": ["vip", True, 2],
+                },
+            },
+            {
+                "column_id": "routing",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "map",
+                    "filter_op": "equals",
+                    "filter_value": {"tier": "gold", "enabled": True},
+                },
+            },
+        ]
+        config = _normalize_dashboard_query_filters(
+            {**sample_query_config, "filters": canonical_filters}
+        )
+
+        sql, params, metric_info = DashboardQueryBuilderV2(config).build_all_queries()[
+            0
+        ]
+
+        assert "mapContains(attrs_bool" in sql
+        assert "JSONExtractArrayRaw(attributes_extra" in sql
+        assert "JSONExtractRaw(attributes_extra" in sql
+        assert "JSONLength(JSONExtractRaw(attributes_extra" in sql
+        slice_count = sum(key.startswith("_raw_attr_slice_start_") for key in params)
+        assert sql.count("PREWHERE") == slice_count + 1
+        assert metric_info["query_status"] == "sampled"
+        assert "True" not in sql
+        assert 1 in params.values()
+
+    def test_legacy_is_not_set_filter_does_not_require_candidate_key_presence(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        legacy_filter = {
+            "metric_type": "custom_attribute",
+            "metric_name": "optional_status",
+            "operator": "is_not_set",
+            "value": None,
+            "attribute_type": "string",
+        }
+
+        sql, params, metric_info = DashboardQueryBuilderV2(
+            {**sample_query_config, "filters": [legacy_filter]}
+        ).build_all_queries()[0]
+
+        assert "attrs_string['optional_status'] = ''" in sql
+        assert "_raw_attr_presence_key_0" not in params
+        assert metric_info["query_status"] == "sampled"
+
+    def test_legacy_boolean_filter_uses_boolean_map_in_both_sample_phases(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        legacy_filter = {
+            "metric_type": "custom_attribute",
+            "metric_name": "is_final",
+            "operator": "equal_to",
+            "value": True,
+            "attribute_type": "boolean",
+        }
+
+        sql, params, metric_info = DashboardQueryBuilderV2(
+            {**sample_query_config, "filters": [legacy_filter]}
+        ).build_all_queries()[0]
+
+        assert "attrs_bool['is_final'] = %(f_0_val)s" in sql
+        assert "has(attrs_bool.keys, %(_raw_attr_presence_key_0)s)" in sql
+        assert "attrs_string['is_final']" not in sql
+        assert params["f_0_val"] is True
+        assert metric_info["query_status"] == "sampled"
+
+    def test_long_minute_window_stratifies_without_truncating_the_tail(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        custom_metric = {
+            "id": "final_status",
+            "name": "final_status",
+            "type": "custom_attribute",
+            "attribute_key": "final_status",
+            "attribute_type": "string",
+            "aggregation": "count_distinct",
+        }
+        config = {
+            **sample_query_config,
+            "granularity": "minute",
+            "time_range": {
+                "custom_start": "2025-01-01T00:00:00Z",
+                "custom_end": "2026-01-01T00:00:00Z",
+            },
+            "metrics": [custom_metric],
+        }
+
+        sql, params, metric_info = DashboardQueryBuilderV2(config).build_all_queries()[
+            0
+        ]
+
+        slice_count = sum(key.startswith("_raw_attr_slice_start_") for key in params)
+        assert slice_count == 64
+        assert sql.count("UNION ALL") == 63
+        assert sql.count("LIMIT %(_raw_attr_candidates_per_bucket)s") == 64
+        assert "LIMIT %(_raw_attr_candidates_per_bucket)s BY" not in sql
+        assert params["_raw_attr_candidates_per_bucket"] == 128
+        assert metric_info["query_sampling_interval_seconds"] == 492750
+        assert metric_info["query_sample_per_bucket"] == 128
+        assert params["_raw_attr_slice_start_0"] == datetime(2025, 1, 1, tzinfo=UTC)
+        assert params["_raw_attr_slice_end_63"] == datetime(2026, 1, 1, tzinfo=UTC)
+        stripped = without_query_settings(sql)
+        assert "SETTINGS" not in stripped
+        assert "SELECT *\n    FROM spans\n    PREWHERE" in stripped
+        assert stripped.count("LIMIT %(_raw_attr_candidate_limit)s") == 2
+
+    def test_raw_attribute_sample_prewhere_stays_inside_id_remap_source(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        config = {
+            **sample_query_config,
+            "metrics": [
+                {
+                    "id": "final_status",
+                    "name": "final_status",
+                    "type": "custom_attribute",
+                    "attribute_key": "final_status",
+                    "attribute_type": "string",
+                    "aggregation": "count_distinct",
+                    "filters": [
+                        {
+                            "metric_type": "system_metric",
+                            "metric_name": "session",
+                            "operator": "equal_to",
+                            "value": "00000000-0000-4000-8000-000000000002",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        sql, params, metric_info = DashboardQueryBuilderV2(config).build_all_queries()[
+            0
+        ]
+
+        remap_end = sql.index(") AS spans")
+        sample_prewhere = sql.index("PREWHERE (\n        project_id")
+        assert "trace_session_id_remap" in sql
+        assert sample_prewhere < remap_end
+        assert "\nPREWHERE" not in sql[remap_end : sql.index("\nWHERE", remap_end)]
+        slice_count = sum(key.startswith("_raw_attr_slice_start_") for key in params)
+        assert sql.count("PREWHERE") == slice_count + 1
+        assert metric_info["query_status"] == "sampled"
+
+    def test_raw_sampling_ignores_non_trace_filter_and_breakdown_sources(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        config = {
+            **sample_query_config,
+            "filters": [
+                {
+                    "metric_type": "custom_attribute",
+                    "metric_name": "dataset_only_key",
+                    "operator": "equal_to",
+                    "value": "ignored",
+                    "attribute_type": "string",
+                    "source": "datasets",
+                }
+            ],
+            "breakdowns": [
+                {
+                    "type": "custom_attribute",
+                    "name": "simulation_only_key",
+                    "attribute_type": "string",
+                    "source": "simulation",
+                }
+            ],
+        }
+
+        sql, params, metric_info = DashboardQueryBuilderV2(config).build_all_queries()[
+            0
+        ]
+
+        assert "_raw_attr_candidate_limit" not in params
+        assert "dataset_only_key" not in sql
+        assert "simulation_only_key" not in sql
+        assert "query_status" not in metric_info
+
+    def test_sampled_metric_metadata_survives_both_dashboard_formatters(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        config = {
+            **sample_query_config,
+            "metrics": [
+                {
+                    "id": "final_status",
+                    "name": "final_status",
+                    "type": "custom_attribute",
+                    "attribute_key": "final_status",
+                    "attribute_type": "string",
+                    "aggregation": "count_distinct",
+                }
+            ],
+        }
+        builder = DashboardQueryBuilderV2(config)
+        metric_info = builder.metric_info(config["metrics"][0])
+
+        trace_payload = builder.format_results([(metric_info, [])])
+        base_formatter = DashboardQueryBuilderBase(config)
+        merged_metric = base_formatter._format_metric_result(
+            metric_info,
+            [],
+            [],
+            {},
+        )
+
+        for formatted_metric in (trace_payload["metrics"][0], merged_metric):
+            assert formatted_metric["query_complete"] is False
+            assert formatted_metric["query_status"] == "sampled"
+            assert formatted_metric["query_error_code"] == "sample_limit"
+            assert (
+                formatted_metric["query_sampling_strategy"]
+                == "bounded_physical_rows_per_time_bucket"
+            )
+            assert formatted_metric["query_sampling_interval_seconds"] == 86400
+            assert formatted_metric["query_sample_limit"] == 8192
+            assert formatted_metric["query_sample_per_bucket"] == 128
+
+        serializer = DashboardQueryApiResponseSerializer(
+            data={"status": True, "result": trace_payload}
+        )
+        assert serializer.is_valid(), serializer.errors
 
     def test_breakdown_query_prunes_partitions(self):
         """A latency average broken down by a custom span attribute must emit
@@ -2296,6 +2724,92 @@ class TestDashboardQueryBuilder:
         sql, _, _ = queries[0]
         assert "eval_output_str" in sql
         assert "eval_score" in sql
+
+    def test_eval_metric_compiles_typed_canonical_span_filters(self):
+        canonical_filters = [
+            {
+                "column_id": "is_final",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "boolean",
+                    "filter_op": "equals",
+                    "filter_value": True,
+                },
+            },
+            {
+                "column_id": "routing",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "map",
+                    "filter_op": "contains",
+                    "filter_value": {"tier": "gold"},
+                },
+            },
+        ]
+        config = _normalize_dashboard_query_filters(
+            {
+                "project_ids": ["proj1"],
+                "granularity": "day",
+                "time_range": {"preset": "7D"},
+                "metrics": [
+                    {
+                        "id": "typed-eval-filter",
+                        "name": "quality",
+                        "type": "eval_metric",
+                        "config_id": str(uuid.uuid4()),
+                        "output_type": "SCORE",
+                        "aggregation": "avg",
+                    }
+                ],
+                "filters": canonical_filters,
+            }
+        )
+
+        sql, params, metric_info = DashboardQueryBuilderV2(config).build_all_queries()[
+            0
+        ]
+
+        assert "FROM spans AS s" in sql
+        assert "usage_span_trace_candidates" in sql
+        assert "s.project_id IN %(project_ids)s" in sql
+        assert "s.trace_id IN (SELECT toString(trace_id) AS trace_id" in sql
+        assert "mapContains(attrs_bool" in sql
+        assert "JSONExtractRaw(attributes_extra" in sql
+        assert "True" not in sql
+        assert 1 in params.values()
+        assert "query_status" not in metric_info
+
+    def test_eval_metric_legacy_boolean_filter_uses_boolean_map(self):
+        config = {
+            "project_ids": ["proj1"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": "legacy-boolean-eval-filter",
+                    "name": "quality",
+                    "type": "eval_metric",
+                    "config_id": str(uuid.uuid4()),
+                    "output_type": "SCORE",
+                    "aggregation": "avg",
+                }
+            ],
+            "filters": [
+                {
+                    "metric_type": "custom_attribute",
+                    "metric_name": "is_final",
+                    "operator": "equal_to",
+                    "value": True,
+                    "attribute_type": "boolean",
+                }
+            ],
+        }
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "s.attrs_bool['is_final'] = %(_evf_0_val)s" in sql
+        assert "s.attrs_string['is_final']" not in sql
+        assert params["_evf_0_val"] is True
 
     def test_eval_metric_sum_uses_output_string_fallback(self):
         config = {
@@ -2747,6 +3261,7 @@ class TestDashboardQueryBuilder:
     def test_v2_string_attribute_metric_uses_map_key_bloom_predicate(self):
         config = {
             "project_ids": ["00000000-0000-4000-8000-000000000001"],
+            "allow_sampled": True,
             "granularity": "day",
             "time_range": {"preset": "7D"},
             "metrics": [
@@ -2782,6 +3297,7 @@ class TestDashboardQueryBuilder:
     def test_v2_custom_metric_alias_like_key_is_bound_as_data(self, attribute_key):
         config = {
             "project_ids": ["00000000-0000-4000-8000-000000000001"],
+            "allow_sampled": True,
             "granularity": "day",
             "time_range": {"preset": "7D"},
             "metrics": [
@@ -2865,6 +3381,7 @@ class TestDashboardQueryBuilder:
     def test_v2_custom_attribute_breakdown_uses_map_key_bloom_predicate(self):
         config = {
             "project_ids": ["00000000-0000-4000-8000-000000000001"],
+            "allow_sampled": True,
             "granularity": "day",
             "time_range": {"preset": "7D"},
             "metrics": [
@@ -2908,6 +3425,7 @@ class TestDashboardQueryBuilder:
         label_id = "00000000-0000-4000-8000-000000000077"
         config = {
             "project_ids": ["00000000-0000-4000-8000-000000000001"],
+            "allow_sampled": True,
             "granularity": "day",
             "time_range": {"preset": "7D"},
             "metrics": [
@@ -2976,6 +3494,7 @@ class TestDashboardAttrRollupRouting:
             metric["filters"] = metric_filters
         return {
             "project_ids": [str(uuid.uuid4())],
+            "allow_sampled": True,
             "granularity": granularity,
             "time_range": {"preset": "30D"},
             "metrics": [metric],
@@ -3007,7 +3526,7 @@ class TestDashboardAttrRollupRouting:
         # [FIX] final_status → rollup. RED without the routing branch.
         self._enable(settings)
         config = self._config(breakdowns=[self._bd("final_status")])
-        sql, params, _ = self._v2(config).build_all_queries()[0]
+        sql, params, metric_info = self._v2(config).build_all_queries()[0]
         # Targets the rollup, reads merged state, and does NOT scan the Map.
         assert "dashboard_attr_rollup" in sql
         assert "sumMerge(latency_sum)" in sql
@@ -3020,6 +3539,7 @@ class TestDashboardAttrRollupRouting:
         # attr_key is passed as a param, filtered on in the rollup.
         assert params["attr_key"] == "final_status"
         assert "attr_key = %(attr_key)s" in sql
+        assert "query_status" not in metric_info
 
     def test_covered_breakdown_country_routes_to_rollup(self, settings):
         # [FIX] country → rollup too.
@@ -3045,9 +3565,10 @@ class TestDashboardAttrRollupRouting:
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         settings.DASHBOARD_ATTR_ROLLUP_COVERED_SINCE = self._COVERED_SINCE
         config = self._config(breakdowns=[self._bd("final_status")])
-        sql, _, _ = self._v2(config).build_all_queries()[0]
+        sql, _, metric_info = self._v2(config).build_all_queries()[0]
         assert "dashboard_attr_rollup" not in sql
         assert "FROM spans" in sql
+        assert metric_info["query_status"] == "sampled"
 
     def test_coverage_unset_falls_back_to_spans(self, settings):
         # [FALLBACK] FIX 2 — flag on but no coverage date set → spans path.
@@ -3594,6 +4115,52 @@ class TestSerializerValidation:
 
 
 class TestDashboardQueryExecution:
+    def test_metric_read_budget_degrades_only_the_affected_metric(self):
+        builder = MagicMock()
+        builder.metrics = [
+            {"id": "slow", "name": "slow"},
+            {"id": "healthy", "name": "healthy"},
+        ]
+        builder.metric_info.side_effect = lambda metric: dict(metric)
+        builder.build_metric_query.side_effect = lambda metric: (
+            f"SELECT '{metric['id']}'",
+            {},
+        )
+
+        def fetch_rows(sql, _params):
+            if "slow" in sql:
+                raise ReadDeadlineExceeded("deadline")
+            return [{"time_bucket": "2026-08-01T00:00:00", "value": 1}]
+
+        results = DashboardViewSet._run_metric_queries(
+            builder,
+            "traces",
+            fetch_rows,
+        )
+
+        slow_info, slow_rows = results[0]
+        healthy_info, healthy_rows = results[1]
+        assert slow_rows == []
+        assert slow_info["query_complete"] is False
+        assert slow_info["query_status"] == "degraded"
+        assert slow_info["query_error_code"] == "read_budget_exceeded"
+        assert "deadline" not in slow_info["error"]
+        assert healthy_info["id"] == "healthy"
+        assert healthy_rows[0]["value"] == 1
+
+    def test_metric_programming_error_still_fails_closed(self):
+        builder = MagicMock()
+        builder.metrics = [{"id": "broken", "name": "broken"}]
+        builder.metric_info.return_value = {"id": "broken", "name": "broken"}
+        builder.build_metric_query.return_value = ("SELECT broken", {})
+
+        with pytest.raises(RuntimeError, match="compiler defect"):
+            DashboardViewSet._run_metric_queries(
+                builder,
+                "traces",
+                lambda *_args: (_ for _ in ()).throw(RuntimeError("compiler defect")),
+            )
+
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.V2AnalyticsQueryService")
     def test_query_action(self, mock_analytics_cls, auth_client, observe_project):
@@ -4996,10 +5563,16 @@ class TestFrontendPayloadSimulation:
 
     def test_eval_filter_frontend_payload(self):
         eval_uuid = str(uuid.uuid4())
+        workspace_uuid = str(uuid.uuid4())
         config = {
             "project_ids": ["proj-1"],
+            "organization_id": str(uuid.uuid4()),
+            "workspace_id": workspace_uuid,
             "granularity": "day",
-            "time_range": {"preset": "7D"},
+            "time_range": {
+                "custom_start": "2026-01-01T00:00:00Z",
+                "custom_end": "2026-07-01T00:00:00Z",
+            },
             "metrics": [
                 {
                     "id": "latency",
@@ -5022,8 +5595,82 @@ class TestFrontendPayloadSimulation:
         builder = DashboardQueryBuilder(config)
         queries = builder.build_all_queries()
         sql, params, _ = queries[0]
+        compact_sql = " ".join(sql.split())
+
         assert "eval_score" in sql
         assert "trace_id IN" in sql
+        assert "usage_apicalllog FINAL" not in sql
+        assert "FROM usage_apicalllog AS usage_s_eval_filter_scan_0" in compact_sql
+        assert (
+            "PREWHERE usage_s_eval_filter_scan_0.workspace_id = "
+            "toUUID(%(s_scope_id_0)s)"
+        ) in compact_sql
+        assert "usage_s_eval_filter_scan_0.created_at >= %(start_date)s" in compact_sql
+        assert "usage_s_eval_filter_scan_0.created_at < %(end_date)s" in compact_sql
+        assert (
+            "ORDER BY usage_s_eval_filter_scan_0._peerdb_version DESC "
+            "LIMIT 1 BY usage_s_eval_filter_scan_0.id"
+        ) in compact_sql
+        assert "usage_s_eval_filter_latest_0._peerdb_is_deleted = 0" in compact_sql
+        assert "usage_s_eval_filter_latest_0.deleted = 0" in compact_sql
+        assert "usage_s_eval_filter_latest_0.status = 'success'" in compact_sql
+        assert params["s_scope_id_0"] == workspace_uuid
+        assert params["start_date"] == datetime(2026, 1, 1, tzinfo=UTC)
+        assert params["end_date"] == datetime(2026, 7, 1, tzinfo=UTC)
+
+    def test_annotation_filter_bounds_final_before_json_value_filter(self):
+        organization_uuid = str(uuid.uuid4())
+        label_uuid = str(uuid.uuid4())
+        config = {
+            "project_ids": ["proj-1"],
+            "organization_id": organization_uuid,
+            "workspace_id": str(uuid.uuid4()),
+            "granularity": "day",
+            "time_range": {
+                "custom_start": "2026-01-01T00:00:00Z",
+                "custom_end": "2026-07-01T00:00:00Z",
+            },
+            "metrics": [
+                {
+                    "id": "latency",
+                    "name": "latency",
+                    "type": "system_metric",
+                    "aggregation": "avg",
+                }
+            ],
+            "filters": [
+                {
+                    "metric_type": "annotation_metric",
+                    "metric_name": label_uuid,
+                    "operator": "greater_than",
+                    "value": "0.5",
+                }
+            ],
+            "breakdowns": [],
+        }
+
+        sql, params, _ = DashboardQueryBuilder(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert (
+            "FROM model_hub_score AS annotation_s_filter_0 FINAL PREWHERE"
+            in compact_sql
+        )
+        assert (
+            "annotation_s_filter_0.label_id = toUUID(%(s_label_id_0)s)" in compact_sql
+        )
+        assert (
+            "annotation_s_filter_0.organization_id = toUUID(%(s_ann_org_id_0)s)"
+        ) in compact_sql
+        assert "annotation_s_filter_0.created_at >= %(start_date)s" in compact_sql
+        assert "annotation_s_filter_0.created_at < %(end_date)s" in compact_sql
+        assert "annotation_s_filter_0._peerdb_is_deleted = 0" in compact_sql
+        assert "annotation_s_filter_0.deleted = 0" in compact_sql
+        assert "annotation_s_filter_0.trace_id IS NOT NULL" in compact_sql
+        assert params["s_ann_org_id_0"] == organization_uuid
+        assert params["s_label_id_0"] == label_uuid
+        assert params["start_date"] == datetime(2026, 1, 1, tzinfo=UTC)
+        assert params["end_date"] == datetime(2026, 7, 1, tzinfo=UTC)
 
     # --- Breakdowns ---
 
@@ -5416,6 +6063,11 @@ class TestDashboardQuerySerializer:
         }
         serializer = DashboardQuerySerializer(data=data)
         assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["allow_sampled"] is False
+
+        opted_in = DashboardQuerySerializer(data={**data, "allow_sampled": True})
+        assert opted_in.is_valid(), opted_in.errors
+        assert opted_in.validated_data["allow_sampled"] is True
 
     def test_canonical_filters_with_source_metadata_pass(self):
         data = {
@@ -5809,6 +6461,7 @@ def _single_metric_config(metric, breakdowns=None):
         "project_ids": ["11111111-1111-1111-1111-111111111111"],
         "organization_id": "22222222-2222-2222-2222-222222222222",
         "workspace_id": "33333333-3333-3333-3333-333333333333",
+        "allow_sampled": True,
         "granularity": "day",
         "time_range": {"preset": "7D"},
         "metrics": [metric],
@@ -5832,6 +6485,61 @@ class TestDashboardV2RewriteRouting:
         assert "_peerdb_is_deleted" not in sql
         assert "use_skip_indexes_if_final = 0" in sql
         assert "use_skip_indexes_if_final = 1" not in sql
+
+    def test_bounded_legacy_filter_subqueries_preserve_legacy_cdc_columns(self):
+        eval_uuid = str(uuid.uuid4())
+        annotation_uuid = str(uuid.uuid4())
+        config = _single_metric_config(
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "aggregation": "avg",
+            }
+        )
+        config["time_range"] = {
+            "custom_start": "2026-01-01T00:00:00Z",
+            "custom_end": "2026-07-01T00:00:00Z",
+        }
+        config["filters"] = [
+            {
+                "metric_type": "eval_metric",
+                "metric_name": eval_uuid,
+                "operator": "greater_than",
+                "value": "0.5",
+                "output_type": "SCORE",
+            },
+            {
+                "metric_type": "annotation_metric",
+                "metric_name": annotation_uuid,
+                "operator": "greater_than",
+                "value": "0.5",
+            },
+        ]
+
+        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "usage_apicalllog FINAL" not in sql
+        assert "usage_s_eval_filter_scan_0.created_at >= %(start_date)s" in compact_sql
+        assert "usage_s_eval_filter_scan_0.created_at < %(end_date)s" in compact_sql
+        assert "usage_s_eval_filter_scan_0._peerdb_version" in sql
+        assert "usage_s_eval_filter_latest_0._peerdb_is_deleted = 0" in sql
+        assert "usage_s_eval_filter_scan_0._version" not in sql
+        assert "usage_s_eval_filter_latest_0.is_deleted" not in sql
+
+        assert (
+            "FROM model_hub_score AS annotation_s_filter_1 FINAL PREWHERE"
+            in compact_sql
+        )
+        assert "annotation_s_filter_1.created_at >= %(start_date)s" in compact_sql
+        assert "annotation_s_filter_1.created_at < %(end_date)s" in compact_sql
+        assert "annotation_s_filter_1._peerdb_is_deleted = 0" in sql
+        assert "annotation_s_filter_1.is_deleted" not in sql
+
+        # The same rewrite must still target the CH25 spans source.
+        assert "is_deleted = 0" in sql
+        assert "use_skip_indexes_if_final = 0" in sql
 
     def test_settings_appended_exactly_once(self):
         config = _single_metric_config(
@@ -5914,8 +6622,131 @@ class TestDashboardV2RewriteRouting:
         )
         assert "ON annotation_trace_project.trace_id = a.trace_id" in compact_sql
         assert "annotation_trace_project.project_id IN %(project_ids)s" in compact_sql
+        assert "FROM model_hub_score AS annotation_span_candidate" in compact_sql
+        assert (
+            "annotation_span_candidate.organization_id = "
+            "toUUID(%(annotation_organization_id)s)"
+        ) in compact_sql
+        assert (
+            "annotation_span_candidate.label_id = toUUID(%(annotation_label_id)s)"
+        ) in compact_sql
+        assert "annotation_span_candidate.created_at >= %(start_date)s" in compact_sql
+        assert "annotation_span_candidate.created_at < %(end_date)s" in compact_sql
+        assert (
+            "PREWHERE annotation_span_scan.project_id IN %(project_ids)s" in compact_sql
+        )
+        assert "WHERE annotation_span_scan.id IN (" in compact_sql
         assert "a.trace_id IN (" not in compact_sql
         assert params["annotation_organization_id"] == config["organization_id"]
+
+    def test_annotation_metric_applies_global_and_metric_span_filters_bounded(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "column_id": "routing",
+                    "filter_config": {
+                        "col_type": "SPAN_ATTRIBUTE",
+                        "filter_type": "map",
+                        "filter_op": "contains",
+                        "filter_value": {"tier": "gold"},
+                    },
+                },
+                {
+                    "column_id": "status",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "ERROR",
+                    },
+                },
+            ],
+        }
+        config = _normalize_dashboard_query_filters(
+            {
+                **_single_metric_config(metric),
+                "filters": [
+                    {
+                        "column_id": "is_final",
+                        "filter_config": {
+                            "col_type": "SPAN_ATTRIBUTE",
+                            "filter_type": "boolean",
+                            "filter_op": "equals",
+                            "filter_value": True,
+                        },
+                    }
+                ],
+            }
+        )
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "AS annotation_subject_span" in compact_sql
+        assert "AS annotation_subject_candidate" in compact_sql
+        assert "s.project_id IN %(project_ids)s" in compact_sql
+        assert "s.trace_id IN (" in compact_sql
+        assert "s.parent_span_id = ''" in compact_sql
+        assert "s.is_deleted = 0" in compact_sql
+        assert "mapContains(s.attrs_bool" in compact_sql
+        assert "JSONExtractRaw(s.attributes_extra" in compact_sql
+        assert "s.status = %(_ann_span_filter_2_value)s" in compact_sql
+        assert params["_ann_span_filter_2_value"] == "ERROR"
+        assert params["latest_filter_key_0"] == "is_final"
+        assert params["latest_filter_key_1"] == "routing"
+
+    def test_annotation_metric_applies_bounded_eval_and_annotation_filters(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        eval_id = "55555555-5555-4555-8555-555555555555"
+        other_label_id = "66666666-6666-4666-8666-666666666666"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "annotation_metric",
+                    "metric_name": other_label_id,
+                    "operator": "greater_than",
+                    "value": 0.2,
+                }
+            ],
+        }
+        config = _single_metric_config(metric)
+        config["filters"] = [
+            {
+                "metric_type": "eval_metric",
+                "metric_name": eval_id,
+                "operator": "greater_than",
+                "value": 0.5,
+                "output_type": "SCORE",
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        subject_expr = (
+            "if(a.trace_id IS NOT NULL, toString(a.trace_id), "
+            "annotation_subject_span.trace_id) IN ("
+        )
+        assert compact_sql.count(subject_expr) == 2
+        assert "FROM usage_apicalllog AS usage_ann_metric_eval_filter_scan_0" in sql
+        assert "FROM model_hub_score AS annotation_ann_metric_filter_1 FINAL" in sql
+        assert "created_at >= %(start_date)s" in sql
+        assert "created_at < %(end_date)s" in sql
+        assert params["ann_metric_eval_id_0"] == eval_id
+        assert params["ann_metric_label_id_1"] == other_label_id
 
     def test_v1_annotation_metric_preserves_trace_dictionary_scope(self):
         config = _single_metric_config(
@@ -5933,7 +6764,7 @@ class TestDashboardV2RewriteRouting:
 
         assert "dictGet('trace_dict', 'project_id', a.trace_id)" in sql
         assert "FROM traces AS trace_project_scan" not in sql
-        assert "annotation_organization_id" not in params
+        assert params["annotation_organization_id"] == config["organization_id"]
 
     def test_user_breakdown_reads_bounded_direct_end_users_not_dictionary(self):
         config = _single_metric_config(

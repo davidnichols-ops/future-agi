@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   fromAxisConfigPayload,
   getAggColumnLabel,
+  getDashboardMetricSeriesState,
   getYAxisRangeWarning,
   seriesHasDataPoints,
   toAxisConfigPayload,
@@ -140,6 +141,56 @@ const series = (values) => [
 ];
 
 const leftAxis = (bounds) => ({ leftY: bounds });
+
+describe("getDashboardMetricSeriesState", () => {
+  const point = { timestamp: "2026-07-09T00:00:00Z", value: 12 };
+  const sampledMetric = {
+    name: "final_status",
+    aggregation: "count_distinct",
+    query_complete: false,
+    query_status: "sampled",
+    query_error_code: "sample_limit",
+    query_sampling_strategy: "bounded_physical_rows_per_time_bucket",
+    query_sampling_interval_seconds: 86400,
+    query_sample_limit: 8192,
+    query_sample_per_bucket: 128,
+    series: [{ name: "total", data: [point] }],
+  };
+
+  it("labels sampled series and excludes degraded siblings", () => {
+    const degradedMetric = {
+      name: "latency",
+      aggregation: "avg",
+      query_complete: false,
+      query_status: "degraded",
+      query_error_code: "read_budget_exceeded",
+      series: [{ name: "total", data: [point] }],
+    };
+
+    const state = getDashboardMetricSeriesState([
+      sampledMetric,
+      degradedMetric,
+    ]);
+
+    expect(state.hasSampledMetrics).toBe(true);
+    expect(state.hasDegradedMetrics).toBe(true);
+    expect(state.series).toHaveLength(1);
+    expect(state.series[0].name).toBe(
+      "final_status (count_distinct) (sampled)",
+    );
+    expect(state.series[0].metricName).toBe("final_status");
+  });
+
+  it("fails closed instead of plotting a malformed sample", () => {
+    const state = getDashboardMetricSeriesState([
+      { ...sampledMetric, query_error_code: "query_failed" },
+    ]);
+
+    expect(state.hasSampledMetrics).toBe(false);
+    expect(state.hasDegradedMetrics).toBe(true);
+    expect(state.series).toEqual([]);
+  });
+});
 
 describe("getYAxisRangeWarning", () => {
   it("returns null when no min/max is configured", () => {

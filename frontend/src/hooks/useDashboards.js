@@ -233,7 +233,10 @@ export function useDuplicateWidget() {
 export function useWidgetQuery() {
   return useMutation({
     mutationFn: ({ dashboardId, widgetId }) =>
-      axios.post(endpoints.dashboard.widgetQuery(dashboardId, widgetId)),
+      axios.post(endpoints.dashboard.widgetQuery(dashboardId, widgetId), {
+        allow_sampled: true,
+      }),
+    meta: { errorHandled: true },
   });
 }
 
@@ -242,14 +245,22 @@ export function usePreviewQuery() {
     mutationFn: ({ dashboardId, queryConfig }) =>
       axios.post(endpoints.dashboard.widgetPreview(dashboardId), {
         query_config: queryConfig,
+        allow_sampled: true,
       }),
+    meta: { errorHandled: true },
   });
 }
 
 export function useDashboardQuery() {
   return useMutation({
     mutationFn: (queryConfig) =>
-      axios.post(endpoints.dashboard.query, queryConfig),
+      axios.post(endpoints.dashboard.query, {
+        ...queryConfig,
+        allow_sampled: true,
+      }),
+    // Dashboard surfaces render a generic retry state. Keep raw backend/DB
+    // details out of the global mutation snackbar.
+    meta: { errorHandled: true },
   });
 }
 

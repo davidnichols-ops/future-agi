@@ -13,7 +13,6 @@ from tfc.routers import uses_db
 from tfc.utils.api_contracts import validated_request
 from tfc.utils.api_serializers import (
     ApiErrorResponseSerializer,
-    EmptyRequestSerializer,
 )
 from tfc.utils.base_viewset import BaseModelViewSetMixin
 from tfc.utils.general_methods import GeneralMethods
@@ -30,6 +29,7 @@ from tracer.serializers.dashboard import (
     DashboardPreviewQuerySerializer,
     DashboardQueryApiResponseSerializer,
     DashboardQuerySerializer,
+    DashboardSampleOptInSerializer,
     DashboardSerializer,
     DashboardWidgetSerializer,
 )
@@ -119,6 +119,10 @@ def _dashboard_filter_to_internal(filter_item):
         internal["output_type"] = filter_item["output_type"]
     if metric_type == "custom_attribute":
         internal["attribute_type"] = "number" if filter_type == "number" else "string"
+        # Keep the validated canonical shape for typed span-attribute
+        # compilation. The legacy flattened fields above remain for saved
+        # configs and non-attribute dashboard builders.
+        internal["canonical_filter"] = filter_item
     return internal
 
 
@@ -173,11 +177,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
     def _run_metric_queries(builder, source, fetch_rows):
         """Build + execute each metric in parallel; return [(metric_info, rows)].
 
-        Only ``InvalidMetricCombinationError`` is caught per-metric (the metric
-        is non-sensical and a user-facing message is attached). All other
-        exceptions (connection, timeout, programming bugs) propagate so they
-        surface as real errors instead of being silently masked as per-widget
-        "could not be computed" text.
+        Invalid combinations and explicit read-budget exhaustion are isolated
+        to the affected metric. Programming, compiler, and transport defects
+        still propagate so they cannot masquerade as valid empty charts.
         """
         metrics = builder.metrics
         if not metrics:
@@ -191,6 +193,22 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 return (metric_info, fetch_rows(sql, params))
             except InvalidMetricCombinationError as e:
                 metric_info["error"] = str(e)
+                return (metric_info, [])
+            except Exception as exc:
+                if not is_read_budget_error(exc):
+                    raise
+                logger.warning(
+                    "dashboard_metric_read_budget_exceeded",
+                    metric_name=str(metric_info.get("name") or metric_info.get("id")),
+                )
+                metric_info.update(
+                    {
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "read_budget_exceeded",
+                        "error": "This dashboard metric exceeded its read budget.",
+                    }
+                )
                 return (metric_info, [])
 
         if len(metrics) == 1:
@@ -1953,7 +1971,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         return self._gm.success_response(formatted)
 
     @validated_request(
-        request_serializer=EmptyRequestSerializer,
+        request_serializer=DashboardSampleOptInSerializer,
         responses={
             200: DashboardQueryApiResponseSerializer,
             400: ApiErrorResponseSerializer,
@@ -1970,11 +1988,14 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 return self._gm.bad_request("ClickHouse is not enabled.")
 
             widget = self.get_object()
-            query_config = widget.query_config
-            if not query_config or not query_config.get("metrics"):
+            if not widget.query_config or not widget.query_config.get("metrics"):
                 return self._gm.bad_request(
                     "Widget has no query configuration or metrics defined."
                 )
+            query_config = {
+                **widget.query_config,
+                "allow_sampled": request.validated_data["allow_sampled"],
+            }
 
             return self._execute_ch_query_config(query_config, request.workspace)
         except Exception as exc:
@@ -2011,7 +2032,10 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             if not is_clickhouse_enabled():
                 return self._gm.bad_request("ClickHouse is not enabled.")
 
-            query_config = request.validated_data["query_config"]
+            query_config = {
+                **request.validated_data["query_config"],
+                "allow_sampled": request.validated_data["allow_sampled"],
+            }
 
             return self._execute_ch_query_config(query_config, request.workspace)
         except Exception as exc:

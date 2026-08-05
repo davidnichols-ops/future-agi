@@ -18917,6 +18917,7 @@ export interface DashboardQueryApi {
   metrics: DashboardMetricApi[];
   filters?: DashboardQueryApiFiltersItem[];
   breakdowns?: DashboardBreakdownApi[];
+  allow_sampled?: boolean;
 }
 
 export type DashboardQueryMetricResultApiAggregation = typeof DashboardQueryMetricResultApiAggregation[keyof typeof DashboardQueryMetricResultApiAggregation];
@@ -18955,12 +18956,41 @@ export interface DashboardQuerySeriesApi {
   data: DashboardQuerySeriesPointApi[];
 }
 
+export type DashboardQueryMetricResultApiQueryStatus = typeof DashboardQueryMetricResultApiQueryStatus[keyof typeof DashboardQueryMetricResultApiQueryStatus];
+
+
+export const DashboardQueryMetricResultApiQueryStatus = {
+  complete: 'complete',
+  sampled: 'sampled',
+  degraded: 'degraded',
+} as const;
+
+export type DashboardQueryMetricResultApiQueryErrorCode = typeof DashboardQueryMetricResultApiQueryErrorCode[keyof typeof DashboardQueryMetricResultApiQueryErrorCode];
+
+
+export const DashboardQueryMetricResultApiQueryErrorCode = {
+  sample_limit: 'sample_limit',
+  read_budget_exceeded: 'read_budget_exceeded',
+  query_failed: 'query_failed',
+} as const;
+
 export interface DashboardQueryMetricResultApi {
   id: string;
   name: string;
   aggregation: DashboardQueryMetricResultApiAggregation;
   unit: string;
   series: DashboardQuerySeriesApi[];
+  query_complete?: boolean;
+  query_status?: DashboardQueryMetricResultApiQueryStatus;
+  query_error_code?: DashboardQueryMetricResultApiQueryErrorCode;
+  /** @minLength 1 */
+  query_sampling_strategy?: string;
+  /** @minimum 1 */
+  query_sampling_interval_seconds?: number;
+  /** @minimum 1 */
+  query_sample_limit?: number;
+  /** @minimum 1 */
+  query_sample_per_bucket?: number;
 }
 
 export interface DashboardQueryTimeRangeResultApi {
@@ -19028,6 +19058,11 @@ export interface DashboardWidgetApi {
 
 export interface DashboardPreviewQueryApi {
   query_config: DashboardQueryApi;
+  allow_sampled?: boolean;
+}
+
+export interface DashboardSampleOptInApi {
+  allow_sampled?: boolean;
 }
 
 export interface DashboardDetailApi {

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from tracer.services.clickhouse.query_builders.dashboard import (
     AGGREGATIONS,
     AVERAGING_AGGREGATIONS,
+    DASHBOARD_QUERY_METADATA_FIELDS,
     FILTER_OPERATORS,
     GRANULARITY_TO_CH,
     PRESET_RANGES,
@@ -208,6 +209,9 @@ class DashboardQueryBuilderBase:
             "unit": unit,
             "series": series,
         }
+        for metadata_field in DASHBOARD_QUERY_METADATA_FIELDS:
+            if metadata_field in metric_info:
+                result[metadata_field] = metric_info[metadata_field]
         # Surface a per-metric error (e.g. an invalid metric/aggregation combo)
         # so one bad widget doesn't fail the whole dashboard query.
         if metric_info.get("error"):

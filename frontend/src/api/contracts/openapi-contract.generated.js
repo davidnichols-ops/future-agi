@@ -30721,7 +30721,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "runtimeRequestValidation": true,
         "runtimeResponseValidation": true,
         "requestBody": {
-          "$ref": "#/definitions/EmptyRequest"
+          "$ref": "#/definitions/DashboardSampleOptIn"
         },
         "queryParameters": {},
         "responses": {
@@ -51129,6 +51129,11 @@ export const OPENAPI_CONTRACT = Object.freeze({
       "properties": {
         "query_config": {
           "$ref": "#/definitions/DashboardQuery"
+        },
+        "allow_sampled": {
+          "title": "Allow sampled",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
@@ -51240,6 +51245,11 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "$ref": "#/definitions/DashboardBreakdown"
           },
           "default": []
+        },
+        "allow_sampled": {
+          "title": "Allow sampled",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
@@ -51259,6 +51269,17 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "$ref": "#/definitions/DashboardQueryResult"
         }
       }
+    },
+    "DashboardSampleOptIn": {
+      "type": "object",
+      "properties": {
+        "allow_sampled": {
+          "title": "Allow sampled",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
     },
     "DashboardWidget": {
       "type": "object",
@@ -93407,6 +93428,48 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "items": {
             "$ref": "#/definitions/DashboardQuerySeries"
           }
+        },
+        "query_complete": {
+          "title": "Query complete",
+          "type": "boolean"
+        },
+        "query_status": {
+          "title": "Query status",
+          "type": "string",
+          "enum": [
+            "complete",
+            "sampled",
+            "degraded"
+          ]
+        },
+        "query_error_code": {
+          "title": "Query error code",
+          "type": "string",
+          "enum": [
+            "sample_limit",
+            "read_budget_exceeded",
+            "query_failed"
+          ]
+        },
+        "query_sampling_strategy": {
+          "title": "Query sampling strategy",
+          "type": "string",
+          "minLength": 1
+        },
+        "query_sampling_interval_seconds": {
+          "title": "Query sampling interval seconds",
+          "type": "integer",
+          "minimum": 1
+        },
+        "query_sample_limit": {
+          "title": "Query sample limit",
+          "type": "integer",
+          "minimum": 1
+        },
+        "query_sample_per_bucket": {
+          "title": "Query sample per bucket",
+          "type": "integer",
+          "minimum": 1
         }
       }
     },

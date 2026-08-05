@@ -2,7 +2,11 @@ import React from "react";
 import PropTypes from "prop-types";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  MutationCache,
+  QueryClient,
+  QueryClientProvider,
+} from "@tanstack/react-query";
 
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
@@ -16,10 +20,15 @@ vi.mock("src/utils/axios", () => ({
   endpoints: {
     dashboard: {
       list: "/tracer/dashboard/",
+      query: "/tracer/dashboard/query/",
       filterValues: "/tracer/dashboard/filter_values/",
       widgets: (dashboardId) => `/tracer/dashboard/${dashboardId}/widgets/`,
       widgetDetail: (dashboardId, widgetId) =>
         `/tracer/dashboard/${dashboardId}/widgets/${widgetId}/`,
+      widgetQuery: (dashboardId, widgetId) =>
+        `/tracer/dashboard/${dashboardId}/widgets/${widgetId}/query/`,
+      widgetPreview: (dashboardId) =>
+        `/tracer/dashboard/${dashboardId}/widgets/preview/`,
       widgetReorder: (dashboardId) =>
         `/tracer/dashboard/${dashboardId}/widgets/reorder/`,
       widgetDuplicate: (dashboardId, widgetId) =>
@@ -34,6 +43,9 @@ import {
   useDeleteWidget,
   useReorderWidgets,
   useDuplicateWidget,
+  useDashboardQuery,
+  useWidgetQuery,
+  usePreviewQuery,
   useDashboardFilterValues,
 } from "../useDashboards";
 
@@ -238,4 +250,84 @@ describe("useDashboardFilterValues bounded-read state", () => {
     expect(result.current.data).toEqual([]);
     expect(result.current.queryReadState).toBe("error");
   });
+});
+
+describe("useDashboardQuery error boundary", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("marks rejected dashboard queries as locally handled", async () => {
+    const rawError = {
+      result: "Code: 159 DB::Exception: Timeout exceeded",
+    };
+    let failedMutation;
+    mocks.post.mockRejectedValue(rawError);
+    const queryClient = new QueryClient({
+      mutationCache: new MutationCache({
+        onError: (_error, _variables, _context, mutation) => {
+          failedMutation = mutation;
+        },
+      }),
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const { result } = renderHook(() => useDashboardQuery(), {
+      wrapper: createQueryWrapper(queryClient),
+    });
+
+    result.current.mutate({ metrics: [{ name: "Latency" }] });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(mocks.post).toHaveBeenCalledWith("/tracer/dashboard/query/", {
+      metrics: [{ name: "Latency" }],
+      allow_sampled: true,
+    });
+    expect(failedMutation?.options.meta).toEqual({ errorHandled: true });
+  });
+
+  it.each([
+    [
+      "saved widget",
+      useWidgetQuery,
+      { dashboardId: "dash-1", widgetId: "widget-1" },
+      "/tracer/dashboard/dash-1/widgets/widget-1/query/",
+      { allow_sampled: true },
+    ],
+    [
+      "widget preview",
+      usePreviewQuery,
+      {
+        dashboardId: "dash-1",
+        queryConfig: { metrics: [{ name: "Latency" }] },
+      },
+      "/tracer/dashboard/dash-1/widgets/preview/",
+      {
+        query_config: { metrics: [{ name: "Latency" }] },
+        allow_sampled: true,
+      },
+    ],
+  ])(
+    "marks rejected %s queries as locally handled",
+    async (_, hook, variables, url, body) => {
+      let failedMutation;
+      mocks.post.mockRejectedValue({
+        result: "Code: 159 DB::Exception: Timeout exceeded",
+      });
+      const queryClient = new QueryClient({
+        mutationCache: new MutationCache({
+          onError: (_error, _variables, _context, mutation) => {
+            failedMutation = mutation;
+          },
+        }),
+        defaultOptions: { mutations: { retry: false } },
+      });
+      const { result } = renderHook(() => hook(), {
+        wrapper: createQueryWrapper(queryClient),
+      });
+
+      result.current.mutate(variables);
+
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(mocks.post).toHaveBeenCalledWith(url, body);
+      expect(failedMutation?.options.meta).toEqual({ errorHandled: true });
+    },
+  );
 });

@@ -806,6 +806,81 @@ def _json_map_attribute_plan(
     )
 
 
+def compile_span_attribute_row_predicate(
+    item: dict[str, Any], *, index: int = 0
+) -> tuple[str, dict[str, Any]]:
+    """Compile one canonical span-attribute filter for a physical span row.
+
+    List queries use :class:`LatestFilterPredicate` to replay candidate
+    identities through ``argMax``. Dashboard aggregates already operate on a
+    finite physical-row input, so they need the same type-aware semantics on
+    that row rather than aggregate aliases. Keeping this compiler beside the
+    latest-state compiler prevents text/number/bool and overflow JSON filters
+    from drifting between the two API surfaces.
+    """
+
+    key, config = _parts(item)
+    key = _validate_attribute_key(key)
+    raw_value = config.get("filter_value", config.get("filterValue"))
+    filter_type = normalize_span_attribute_filter_type(
+        str(config.get("filter_type") or config.get("filterType") or ""),
+        raw_value,
+    )
+
+    if filter_type not in {"array", "map"}:
+        plan = _attribute_plan(item, index=index, scope="span")
+        return plan.seed_predicate, dict(plan.params)
+
+    key_param = f"latest_filter_key_{index}"
+    bound_key = f"%({key_param})s"
+    source_exists = (
+        f"JSONHas(span_attributes_raw, {bound_key}) "
+        f"AND toString(JSONType(span_attributes_raw, {bound_key})) = "
+        f"'{('Array' if filter_type == 'array' else 'Object')}'"
+    )
+    params: dict[str, Any] = {key_param: key}
+
+    if filter_type == "array":
+        operation, values = _normalize_json_array_values(config)
+        if operation == "is_null":
+            return f"NOT ({source_exists})", params
+        if operation == "is_not_null":
+            return source_exists, params
+        membership, membership_params = _json_array_membership_predicate(
+            array_expression=f"JSONExtractArrayRaw(span_attributes_raw, {bound_key})",
+            values=values,
+            operation=operation,
+            index=index,
+        )
+        params.update(membership_params)
+        return f"({source_exists}) AND ({membership})", params
+
+    operation, members = _normalize_json_map_values(config)
+    if operation == "is_null":
+        return f"NOT ({source_exists})", params
+    if operation == "is_not_null":
+        return source_exists, params
+
+    object_expression = f"JSONExtractRaw(span_attributes_raw, {bound_key})"
+    member_predicates: list[str] = []
+    for member_index, (member_key, member_value) in enumerate(members.items()):
+        member_predicate, member_params = _json_map_member_predicate(
+            object_expression=object_expression,
+            member_key=member_key,
+            member_value=member_value,
+            index=index,
+            member_index=member_index,
+        )
+        member_predicates.append(f"({member_predicate})")
+        params.update(member_params)
+    containment = " AND ".join(member_predicates)
+    exact = f"JSONLength({object_expression}) = {len(members)} AND {containment}"
+    core = exact if operation in {"equals", "not_equals"} else containment
+    if operation in {"not_equals", "not_contains"}:
+        core = f"NOT ({core})"
+    return f"({source_exists}) AND ({core})", params
+
+
 def _column_plan(
     item: dict[str, Any],
     *,
@@ -1275,6 +1350,7 @@ def targets_span_filter_domain(filters: list[dict[str, Any]]) -> bool:
 __all__ = [
     "LatestFilterPredicate",
     "UnsupportedFilterShapeError",
+    "compile_span_attribute_row_predicate",
     "compile_span_filter_plans",
     "compile_trace_filter_plans",
     "partition_span_filter_plans",

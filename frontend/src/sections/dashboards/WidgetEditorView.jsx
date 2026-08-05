@@ -81,12 +81,14 @@ import {
   fromAxisConfigPayload,
   getAggColumnLabel,
   getAutoDecimals,
+  getDashboardMetricSeriesState,
   getSeriesAverage,
   getSuggestedUnitConfig,
   getUnitRendering,
   getYAxisRangeWarning,
   toAxisConfigPayload,
 } from "./widgetUtils";
+import { getQueryReadMessage } from "src/utils/queryReadState";
 import {
   AGGREGATION_OPTIONS,
   ALL_AGGREGATIONS,
@@ -2104,32 +2106,18 @@ export default function WidgetEditorView() {
   // Chart preview
   // Backend returns: { metrics: [{ name, aggregation, unit, series: [{ name, data: [{ timestamp, value }] }] }] }
   const previewResult = queryMutation.data?.data?.result;
-  const previewSeries = useMemo(() => {
-    if (!previewResult?.metrics) return [];
-    const allSeries = [];
-    for (const metric of previewResult.metrics) {
-      for (const s of metric.series || []) {
-        const isSingleMetric = previewResult.metrics.length === 1;
-        let seriesLabel;
-        if (s.name === "total") {
-          seriesLabel = `${metric.name} (${metric.aggregation})`;
-        } else if (isSingleMetric) {
-          seriesLabel = s.name;
-        } else {
-          seriesLabel = `${metric.name} / ${s.name} (${metric.aggregation})`;
-        }
-        allSeries.push({
-          name: seriesLabel,
-          unit: metric.unit ?? "",
-          data: (s.data || []).map((point) => ({
-            x: new Date(point.timestamp).getTime(),
-            y: point.value != null ? Number(point.value) : null,
-          })),
-        });
-      }
-    }
-    return allSeries;
-  }, [previewResult]);
+  const {
+    renderableMetrics: previewRenderableMetrics,
+    series: previewSeries,
+    hasSampledMetrics: hasSampledPreviewMetrics,
+    hasDegradedMetrics: hasDegradedPreviewMetrics,
+  } = useMemo(
+    () =>
+      getDashboardMetricSeriesState(
+        queryMutation.isError ? [] : previewResult?.metrics,
+      ),
+    [previewResult?.metrics, queryMutation.isError],
+  );
 
   // Auto-select top 10 series when there are more than 10 breakdown series
   const MAX_CHART_SERIES = 10;
@@ -2200,8 +2188,8 @@ export default function WidgetEditorView() {
   );
   const leftAxisFormatConfig = useMemo(() => {
     const leftAxis = axisConfig.leftY || {};
-    const metricUnits = (previewResult?.metrics || []).map(
-      (m) => m?.unit ?? "",
+    const metricUnits = previewRenderableMetrics.map(
+      ({ metric }) => metric?.unit ?? "",
     );
     const isMixedUnits = new Set(metricUnits).size > 1;
     const effectiveUnit = isMixedUnits
@@ -2216,7 +2204,7 @@ export default function WidgetEditorView() {
           "prefix"
         : suggestedLeftAxisUnit.prefixSuffix,
     };
-  }, [axisConfig.leftY, suggestedLeftAxisUnit, previewResult?.metrics]);
+  }, [axisConfig.leftY, suggestedLeftAxisUnit, previewRenderableMetrics]);
 
   useEffect(() => {
     const currentUnit = axisConfig.leftY.unit;
@@ -3366,6 +3354,25 @@ export default function WidgetEditorView() {
               overflow: "hidden",
             }}
           >
+            {!previewLoading &&
+              (hasSampledPreviewMetrics ||
+                hasDegradedPreviewMetrics ||
+                queryMutation.isError) && (
+                <Stack gap={0.5} sx={{ width: "100%", px: 1, pt: 0.5 }}>
+                  {hasSampledPreviewMetrics && (
+                    <Alert severity="warning" sx={{ py: 0 }}>
+                      {getQueryReadMessage("sampled")}
+                    </Alert>
+                  )}
+                  {(hasDegradedPreviewMetrics || queryMutation.isError) && (
+                    <Alert severity="error" sx={{ py: 0 }}>
+                      {getQueryReadMessage(
+                        queryMutation.isError ? "error" : "degraded",
+                      )}
+                    </Alert>
+                  )}
+                </Stack>
+              )}
             {/* Bar chart — horizontal bars (left) + search/checkboxes (right) */}
             {isHorizontal && previewLoading && (
               <Box
@@ -4256,8 +4263,7 @@ export default function WidgetEditorView() {
                           display: "block",
                         }}
                       >
-                        {metrics[idx]?.name || ""} -{" "}
-                        {metrics[idx]?.aggregation || "avg"}
+                        {s.metricName || ""} - {s.aggregation || "avg"}
                       </Typography>
                     </Box>
                   );

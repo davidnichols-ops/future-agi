@@ -26,6 +26,61 @@ describe("queryReadState", () => {
   });
 
   it.each([
+    ["only a completion flag", { query_complete: true }],
+    ["only a status flag", { query_status: "complete" }],
+    [
+      "an error code without a status pair",
+      { query_error_code: "query_failed" },
+    ],
+    [
+      "sampling coverage without a status pair",
+      {
+        query_sampling_strategy: "time_stratified_latest_state",
+        query_sampling_strata: 8,
+        query_sampling_strata_completed: 8,
+      },
+    ],
+    [
+      "a complete status marked incomplete",
+      { query_complete: false, query_status: "complete" },
+    ],
+    [
+      "a degraded status marked complete",
+      { query_complete: true, query_status: "degraded" },
+    ],
+    [
+      "an exact result with an active error code",
+      {
+        query_complete: true,
+        query_status: "complete",
+        query_error_code: "read_budget_exceeded",
+      },
+    ],
+    [
+      "an exact result marked sampled",
+      {
+        query_complete: true,
+        query_status: "complete",
+        query_sampled: true,
+      },
+    ],
+  ])("fails closed for %s", (_, payload) => {
+    expect(getQueryReadState(payload)).toBe("degraded");
+  });
+
+  it("rejects a sampled status that contradicts its completion flag", () => {
+    expect(
+      getQueryReadState({
+        query_complete: true,
+        query_status: "sampled",
+        query_sampling_strategy: "time_stratified_latest_state",
+        query_sampling_strata: 8,
+        query_sampling_strata_completed: 8,
+      }),
+    ).toBe("degraded");
+  });
+
+  it.each([
     { query_complete: false },
     { query_status: "degraded" },
     { result: { query_complete: false, query_status: "degraded" } },
@@ -62,6 +117,88 @@ describe("queryReadState", () => {
     ];
 
     expect(getQueryReadState({ result: series })).toBe("sampled");
+  });
+
+  it("recognizes the bounded dashboard sample contract inside metric results", () => {
+    const payload = {
+      metrics: [
+        {
+          query_complete: false,
+          query_status: "sampled",
+          query_error_code: "sample_limit",
+          query_sampling_strategy: "bounded_physical_rows_per_time_bucket",
+          query_sampling_interval_seconds: 86400,
+          query_sample_limit: 8192,
+          query_sample_per_bucket: 128,
+        },
+      ],
+    };
+
+    expect(getQueryReadState(payload)).toBe("sampled");
+  });
+
+  const validDashboardSample = {
+    query_complete: false,
+    query_status: "sampled",
+    query_error_code: "sample_limit",
+    query_sampling_strategy: "bounded_physical_rows_per_time_bucket",
+    query_sampling_interval_seconds: 86400,
+    query_sample_limit: 8192,
+    query_sample_per_bucket: 128,
+  };
+
+  it.each([
+    ["missing completion flag", { query_complete: undefined }],
+    ["contradictory completion flag", { query_complete: true }],
+    ["missing error code", { query_error_code: undefined }],
+    ["wrong error code", { query_error_code: "query_failed" }],
+    ["wrong strategy", { query_sampling_strategy: "full_scan" }],
+    ["missing interval", { query_sampling_interval_seconds: undefined }],
+    ["zero interval", { query_sampling_interval_seconds: 0 }],
+    ["missing sample limit", { query_sample_limit: undefined }],
+    ["zero sample limit", { query_sample_limit: 0 }],
+    ["missing per-bucket limit", { query_sample_per_bucket: undefined }],
+    ["zero per-bucket limit", { query_sample_per_bucket: 0 }],
+    ["per-bucket above total limit", { query_sample_per_bucket: 8193 }],
+  ])("fails closed for a dashboard sample with %s", (_, invalidFields) => {
+    expect(
+      getQueryReadState({
+        result: {
+          metrics: [{ ...validDashboardSample, ...invalidFields }],
+        },
+      }),
+    ).toBe("degraded");
+  });
+
+  it("applies the strictest state across nested dashboard metrics", () => {
+    const complete = { query_complete: true, query_status: "complete" };
+    const degraded = {
+      query_complete: false,
+      query_status: "degraded",
+      query_error_code: "read_budget_exceeded",
+    };
+
+    expect(
+      getQueryReadState({
+        result: { metrics: [complete, validDashboardSample] },
+      }),
+    ).toBe("sampled");
+    expect(
+      getQueryReadState({
+        result: { metrics: [complete, validDashboardSample, degraded] },
+      }),
+    ).toBe("degraded");
+    expect(
+      getQueryReadState({
+        result: {
+          metrics: [
+            complete,
+            validDashboardSample,
+            { ...validDashboardSample, query_sample_per_bucket: 0 },
+          ],
+        },
+      }),
+    ).toBe("degraded");
   });
 
   it("uses a generic message for request failures", () => {

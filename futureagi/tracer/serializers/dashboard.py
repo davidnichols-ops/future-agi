@@ -296,6 +296,7 @@ class DashboardQuerySerializer(StrictInputSerializer):
     metrics = DashboardMetricSerializer(many=True)
     filters = filter_list_field(required=False, default=list)
     breakdowns = DashboardBreakdownSerializer(many=True, required=False, default=list)
+    allow_sampled = serializers.BooleanField(required=False, default=False)
 
     class Meta:
         swagger_schema_fields = {"additionalProperties": False}
@@ -310,6 +311,14 @@ class DashboardQuerySerializer(StrictInputSerializer):
 
 class DashboardPreviewQuerySerializer(StrictInputSerializer):
     query_config = DashboardQuerySerializer(required=True)
+    allow_sampled = serializers.BooleanField(required=False, default=False)
+
+    class Meta:
+        swagger_schema_fields = {"additionalProperties": False}
+
+
+class DashboardSampleOptInSerializer(StrictInputSerializer):
+    allow_sampled = serializers.BooleanField(required=False, default=False)
 
     class Meta:
         swagger_schema_fields = {"additionalProperties": False}
@@ -331,6 +340,20 @@ class DashboardQueryMetricResultSerializer(serializers.Serializer):
     aggregation = serializers.ChoiceField(choices=DASHBOARD_AGGREGATIONS)
     unit = serializers.CharField(allow_blank=True)
     series = DashboardQuerySeriesSerializer(many=True)
+    query_complete = serializers.BooleanField(required=False)
+    query_status = serializers.ChoiceField(
+        choices=["complete", "sampled", "degraded"], required=False
+    )
+    query_error_code = serializers.ChoiceField(
+        choices=["sample_limit", "read_budget_exceeded", "query_failed"],
+        required=False,
+    )
+    query_sampling_strategy = serializers.CharField(required=False)
+    query_sampling_interval_seconds = serializers.IntegerField(
+        min_value=1, required=False
+    )
+    query_sample_limit = serializers.IntegerField(min_value=1, required=False)
+    query_sample_per_bucket = serializers.IntegerField(min_value=1, required=False)
 
 
 class DashboardQueryTimeRangeResultSerializer(serializers.Serializer):

@@ -308,6 +308,7 @@ import type {
   DashboardPreviewQueryApi,
   DashboardQueryApi,
   DashboardQueryApiResponseApi,
+  DashboardSampleOptInApi,
   DashboardWidgetApi,
   DatasetAddColumnsRequestApi,
   DatasetAddEmptyColumnsRequestApi,
@@ -59118,7 +59119,7 @@ export const getTracerDashboardWidgetsExecuteQueryUrl = (dashboardPk: string,
  */
 export const tracerDashboardWidgetsExecuteQuery = async (dashboardPk: string,
     id: string,
-    emptyRequestApi: EmptyRequestApi, options?: RequestInit): Promise<tracerDashboardWidgetsExecuteQueryResponse> => {
+    dashboardSampleOptInApi: DashboardSampleOptInApi, options?: RequestInit): Promise<tracerDashboardWidgetsExecuteQueryResponse> => {
 
   return apiMutator<tracerDashboardWidgetsExecuteQueryResponse>(getTracerDashboardWidgetsExecuteQueryUrl(dashboardPk,id),
   {
@@ -59126,7 +59127,7 @@ export const tracerDashboardWidgetsExecuteQuery = async (dashboardPk: string,
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     body: JSON.stringify(
-      emptyRequestApi,)
+      dashboardSampleOptInApi,)
   }
 );}
 

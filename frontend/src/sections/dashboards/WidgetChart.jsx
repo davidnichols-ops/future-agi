@@ -12,6 +12,7 @@ import {
   formatValueWithConfig,
   fromAxisConfigPayload,
   getAutoDecimals,
+  getDashboardMetricSeriesState,
   getSeriesAverage,
   getSuggestedUnitConfig,
   getUnitRendering,
@@ -19,6 +20,7 @@ import {
   seriesHasDataPoints,
 } from "./widgetUtils";
 import { toTimeRangePayload } from "./dashboardDateRange";
+import { getQueryReadMessage } from "src/utils/queryReadState";
 
 const CHART_HEIGHT_FALLBACK = 280;
 const NO_DATA_FOR_RANGE_MESSAGE =
@@ -79,6 +81,25 @@ function getApexType(chartType) {
     pie: "pie",
   };
   return map[chartType] || "line";
+}
+
+function QueryReadAlerts({ hasSampledMetrics, hasDegradedMetrics }) {
+  if (!hasSampledMetrics && !hasDegradedMetrics) return null;
+
+  return (
+    <Stack gap={0.5} sx={{ width: "100%", px: 1, pt: 0.5 }}>
+      {hasSampledMetrics && (
+        <Alert severity="warning" sx={{ py: 0 }}>
+          {getQueryReadMessage("sampled")}
+        </Alert>
+      )}
+      {hasDegradedMetrics && (
+        <Alert severity="error" sx={{ py: 0 }}>
+          {getQueryReadMessage("degraded")}
+        </Alert>
+      )}
+    </Stack>
+  );
 }
 
 export default function WidgetChart({ widget, globalDateRange }) {
@@ -142,33 +163,11 @@ export default function WidgetChart({ widget, globalDateRange }) {
   }, [querySignature, queryConfig]);
 
   const result = queryMutation.data?.data?.result;
-  const series = useMemo(() => {
-    const s = [];
-    if (result?.metrics) {
-      for (const metric of result.metrics) {
-        for (const ms of metric.series || []) {
-          const isSingleMetric = result.metrics.length === 1;
-          let label;
-          if (ms.name === "total") {
-            label = `${metric.name} (${metric.aggregation})`;
-          } else if (isSingleMetric) {
-            label = ms.name;
-          } else {
-            label = `${metric.name} / ${ms.name} (${metric.aggregation})`;
-          }
-          s.push({
-            name: label,
-            unit: metric.unit ?? "",
-            data: (ms.data || []).map((point) => ({
-              x: new Date(point.timestamp).getTime(),
-              y: point.value != null ? Number(point.value) : null,
-            })),
-          });
-        }
-      }
-    }
-    return s;
-  }, [result]);
+  const { renderableMetrics, series, hasSampledMetrics, hasDegradedMetrics } =
+    useMemo(
+      () => getDashboardMetricSeriesState(result?.metrics),
+      [result?.metrics],
+    );
 
   // Auto-select top 10 series by total value when there are many breakdown series
   const MAX_CHART_SERIES = 10;
@@ -226,14 +225,12 @@ export default function WidgetChart({ widget, globalDateRange }) {
     [chartSeries],
   );
   const leftAxisFormatConfig = useMemo(() => {
-    const suggested = getSuggestedUnitConfig(result?.metrics || []);
+    const metrics = renderableMetrics.map(({ metric }) => metric);
+    const suggested = getSuggestedUnitConfig(metrics);
     const leftAxis = axisConfig?.leftY || {};
-    const metricUnits = (result?.metrics || [])
-      .map((m) => m?.unit ?? "");
+    const metricUnits = metrics.map((m) => m?.unit ?? "");
     const isMixedUnits = new Set(metricUnits).size > 1;
-    const effectiveUnit = isMixedUnits
-      ? ""
-      : leftAxis.unit || suggested.unit;
+    const effectiveUnit = isMixedUnits ? "" : leftAxis.unit || suggested.unit;
     return {
       ...leftAxis,
       unit: effectiveUnit,
@@ -241,7 +238,7 @@ export default function WidgetChart({ widget, globalDateRange }) {
         ? leftAxis.prefixSuffix || suggested.prefixSuffix || "prefix"
         : suggested.prefixSuffix,
     };
-  }, [axisConfig?.leftY, result?.metrics]);
+  }, [axisConfig?.leftY, renderableMetrics]);
 
   useEffect(() => {
     if (!isPie || !pieValues.length) {
@@ -348,6 +345,7 @@ export default function WidgetChart({ widget, globalDateRange }) {
         ref={containerRef}
         sx={{
           display: "flex",
+          flexDirection: "column",
           justifyContent: "center",
           alignItems: "center",
           width: "100%",
@@ -355,9 +353,15 @@ export default function WidgetChart({ widget, globalDateRange }) {
           minHeight: 0,
         }}
       >
-        <Typography variant="body2" color="text.disabled">
-          No output for the selected inputs.
-        </Typography>
+        <QueryReadAlerts
+          hasSampledMetrics={hasSampledMetrics}
+          hasDegradedMetrics={hasDegradedMetrics}
+        />
+        {!hasDegradedMetrics && (
+          <Typography variant="body2" color="text.disabled">
+            No output for the selected inputs.
+          </Typography>
+        )}
       </Box>
     );
   }
@@ -368,6 +372,7 @@ export default function WidgetChart({ widget, globalDateRange }) {
         ref={containerRef}
         sx={{
           display: "flex",
+          flexDirection: "column",
           justifyContent: "center",
           alignItems: "center",
           width: "100%",
@@ -376,6 +381,10 @@ export default function WidgetChart({ widget, globalDateRange }) {
           px: 2,
         }}
       >
+        <QueryReadAlerts
+          hasSampledMetrics={hasSampledMetrics}
+          hasDegradedMetrics={hasDegradedMetrics}
+        />
         <Typography variant="body2" color="text.disabled">
           {NO_DATA_FOR_RANGE_MESSAGE}
         </Typography>
@@ -386,31 +395,42 @@ export default function WidgetChart({ widget, globalDateRange }) {
   // Metric card
   if (isMetricCard) {
     return (
-      <Stack
+      <Box
         ref={containerRef}
-        direction="row"
-        gap={3}
-        justifyContent="center"
-        alignItems="center"
-        sx={{ width: "100%", height: "100%", minHeight: 0 }}
+        sx={{
+          width: "100%",
+          height: "100%",
+          minHeight: 0,
+          display: "flex",
+          flexDirection: "column",
+        }}
       >
-        {series.map((s, i) => {
-          const avg = getSeriesAverage(s.data);
-          return (
-            <Box key={i} sx={{ textAlign: "center" }}>
-              <Typography
-                variant="h3"
-                sx={{ color: colorFor(s.name) }}
-              >
-                {avg == null ? "—" : formatVal(avg)}
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                {s.name}
-              </Typography>
-            </Box>
-          );
-        })}
-      </Stack>
+        <QueryReadAlerts
+          hasSampledMetrics={hasSampledMetrics}
+          hasDegradedMetrics={hasDegradedMetrics}
+        />
+        <Stack
+          direction="row"
+          gap={3}
+          justifyContent="center"
+          alignItems="center"
+          sx={{ flex: 1, minHeight: 0 }}
+        >
+          {series.map((s, i) => {
+            const avg = getSeriesAverage(s.data);
+            return (
+              <Box key={i} sx={{ textAlign: "center" }}>
+                <Typography variant="h3" sx={{ color: colorFor(s.name) }}>
+                  {avg == null ? "—" : formatVal(avg)}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {s.name}
+                </Typography>
+              </Box>
+            );
+          })}
+        </Stack>
+      </Box>
     );
   }
 
@@ -440,6 +460,10 @@ export default function WidgetChart({ widget, globalDateRange }) {
           minHeight: 0,
         }}
       >
+        <QueryReadAlerts
+          hasSampledMetrics={hasSampledMetrics}
+          hasDegradedMetrics={hasDegradedMetrics}
+        />
         <table
           style={{
             width: "100%",
@@ -656,6 +680,10 @@ export default function WidgetChart({ widget, globalDateRange }) {
           flexDirection: "column",
         }}
       >
+        <QueryReadAlerts
+          hasSampledMetrics={hasSampledMetrics}
+          hasDegradedMetrics={hasDegradedMetrics}
+        />
         {pieLegendNames.length > 1 && (
           <ChartLegend items={pieLegendNames} colors={COLORS} />
         )}
@@ -749,6 +777,10 @@ export default function WidgetChart({ widget, globalDateRange }) {
           overflow: "hidden",
         }}
       >
+        <QueryReadAlerts
+          hasSampledMetrics={hasSampledMetrics}
+          hasDegradedMetrics={hasDegradedMetrics}
+        />
         {/* Legend */}
         <Stack
           direction="row"
@@ -912,6 +944,8 @@ export default function WidgetChart({ widget, globalDateRange }) {
         ref={containerRef}
         sx={{
           display: "flex",
+          flexDirection: "column",
+          gap: 1,
           justifyContent: "center",
           alignItems: "center",
           width: "100%",
@@ -920,6 +954,10 @@ export default function WidgetChart({ widget, globalDateRange }) {
           px: 2,
         }}
       >
+        <QueryReadAlerts
+          hasSampledMetrics={hasSampledMetrics}
+          hasDegradedMetrics={hasDegradedMetrics}
+        />
         <Alert severity="warning" sx={{ width: "100%" }}>
           {outOfRangeWarning}
         </Alert>
@@ -1273,6 +1311,10 @@ export default function WidgetChart({ widget, globalDateRange }) {
         flexDirection: "column",
       }}
     >
+      <QueryReadAlerts
+        hasSampledMetrics={hasSampledMetrics}
+        hasDegradedMetrics={hasDegradedMetrics}
+      />
       {legendNames.length > 1 && (
         <ChartLegend
           items={legendNames}

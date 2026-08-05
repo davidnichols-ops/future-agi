@@ -1,4 +1,58 @@
+import { getQueryReadState } from "src/utils/queryReadState";
+
 export const DEFAULT_DECIMALS = 2;
+
+export const getDashboardMetricSeriesState = (metrics = []) => {
+  const metricReadStates = (Array.isArray(metrics) ? metrics : []).map(
+    (metric) => ({
+      metric,
+      readState: getQueryReadState(metric),
+    }),
+  );
+  const hasSampledMetrics = metricReadStates.some(
+    ({ readState }) => readState === "sampled",
+  );
+  const hasDegradedMetrics = metricReadStates.some(
+    ({ readState }) => readState === "degraded" || readState === "error",
+  );
+  const renderableMetrics = metricReadStates.filter(
+    ({ readState }) => readState === "complete" || readState === "sampled",
+  );
+  const series = [];
+
+  for (const { metric, readState } of renderableMetrics) {
+    for (const metricSeries of metric.series || []) {
+      const isSingleMetric = renderableMetrics.length === 1;
+      let name;
+      if (metricSeries.name === "total") {
+        name = `${metric.name} (${metric.aggregation})`;
+      } else if (isSingleMetric) {
+        name = metricSeries.name;
+      } else {
+        name = `${metric.name} / ${metricSeries.name} (${metric.aggregation})`;
+      }
+      if (readState === "sampled") name = `${name} (sampled)`;
+      series.push({
+        name,
+        metricName: metric.name,
+        aggregation: metric.aggregation,
+        unit: metric.unit ?? "",
+        data: (metricSeries.data || []).map((point) => ({
+          x: new Date(point.timestamp).getTime(),
+          y: point.value != null ? Number(point.value) : null,
+        })),
+      });
+    }
+  }
+
+  return {
+    metricReadStates,
+    renderableMetrics,
+    series,
+    hasSampledMetrics,
+    hasDegradedMetrics,
+  };
+};
 
 const toAxisPayload = ({ prefixSuffix, outOfBounds, ...axis } = {}) => ({
   ...axis,

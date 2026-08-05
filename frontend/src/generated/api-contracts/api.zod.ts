@@ -34437,6 +34437,7 @@ export const tracerDashboardQueryBodyBreakdownsItemSourceDefault = `traces`;
 export const tracerDashboardQueryBodyBreakdownsItemAttributeTypeDefault = `string`;
 export const tracerDashboardQueryBodyBreakdownsItemDataTypeDefault = `string`;
 export const tracerDashboardQueryBodyBreakdownsDefault = [];
+export const tracerDashboardQueryBodyAllowSampledDefault = false;
 
 export const TracerDashboardQueryBody = zod.object({
   "workflow": zod.enum(['observability', 'dataset', 'simulation']).default(tracerDashboardQueryBodyWorkflowDefault),
@@ -34501,10 +34502,15 @@ export const TracerDashboardQueryBody = zod.object({
   "attribute_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardQueryBodyBreakdownsItemAttributeTypeDefault),
   "column_id": zod.string().optional(),
   "data_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardQueryBodyBreakdownsItemDataTypeDefault)
-})).default(tracerDashboardQueryBodyBreakdownsDefault)
+})).default(tracerDashboardQueryBodyBreakdownsDefault),
+  "allow_sampled": zod.boolean().default(tracerDashboardQueryBodyAllowSampledDefault)
 })
 
 export const tracerDashboardQueryResponseStatusDefault = true;
+
+
+
+
 
 
 
@@ -34524,7 +34530,14 @@ export const TracerDashboardQueryResponse = zod.object({
   "timestamp": zod.string().min(1),
   "value": zod.number()
 }))
-}))
+})),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
+  "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
+  "query_sampling_strategy": zod.string().min(1).optional(),
+  "query_sampling_interval_seconds": zod.number().min(1).optional(),
+  "query_sample_limit": zod.number().min(1).optional(),
+  "query_sample_per_bucket": zod.number().min(1).optional()
 })),
   "time_range": zod.object({
   "start": zod.string().min(1),
@@ -34740,6 +34753,8 @@ export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsItemSour
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsItemAttributeTypeDefault = `string`;
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsItemDataTypeDefault = `string`;
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsDefault = [];
+export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigAllowSampledDefault = false;
+export const tracerDashboardWidgetsPreviewQueryBodyAllowSampledDefault = false;
 
 export const TracerDashboardWidgetsPreviewQueryBody = zod.object({
   "query_config": zod.object({
@@ -34805,11 +34820,17 @@ export const TracerDashboardWidgetsPreviewQueryBody = zod.object({
   "attribute_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsItemAttributeTypeDefault),
   "column_id": zod.string().optional(),
   "data_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsItemDataTypeDefault)
-})).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsDefault)
-})
+})).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsDefault),
+  "allow_sampled": zod.boolean().default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigAllowSampledDefault)
+}),
+  "allow_sampled": zod.boolean().default(tracerDashboardWidgetsPreviewQueryBodyAllowSampledDefault)
 })
 
 export const tracerDashboardWidgetsPreviewQueryResponseStatusDefault = true;
+
+
+
+
 
 
 
@@ -34829,7 +34850,14 @@ export const TracerDashboardWidgetsPreviewQueryResponse = zod.object({
   "timestamp": zod.string().min(1),
   "value": zod.number()
 }))
-}))
+})),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
+  "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
+  "query_sampling_strategy": zod.string().min(1).optional(),
+  "query_sampling_interval_seconds": zod.number().min(1).optional(),
+  "query_sample_limit": zod.number().min(1).optional(),
+  "query_sample_per_bucket": zod.number().min(1).optional()
 })),
   "time_range": zod.object({
   "start": zod.string().min(1),
@@ -35090,11 +35118,17 @@ export const TracerDashboardWidgetsExecuteQueryParams = zod.object({
   "id": zod.string()
 })
 
-export const TracerDashboardWidgetsExecuteQueryBody = zod.object({
+export const tracerDashboardWidgetsExecuteQueryBodyAllowSampledDefault = false;
 
+export const TracerDashboardWidgetsExecuteQueryBody = zod.object({
+  "allow_sampled": zod.boolean().default(tracerDashboardWidgetsExecuteQueryBodyAllowSampledDefault)
 })
 
 export const tracerDashboardWidgetsExecuteQueryResponseStatusDefault = true;
+
+
+
+
 
 
 
@@ -35114,7 +35148,14 @@ export const TracerDashboardWidgetsExecuteQueryResponse = zod.object({
   "timestamp": zod.string().min(1),
   "value": zod.number()
 }))
-}))
+})),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
+  "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
+  "query_sampling_strategy": zod.string().min(1).optional(),
+  "query_sampling_interval_seconds": zod.number().min(1).optional(),
+  "query_sample_limit": zod.number().min(1).optional(),
+  "query_sample_per_bucket": zod.number().min(1).optional()
 })),
   "time_range": zod.object({
   "start": zod.string().min(1),
