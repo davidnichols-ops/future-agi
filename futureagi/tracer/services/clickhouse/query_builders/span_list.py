@@ -700,9 +700,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 if self._bounded_anchor_probe
                 else self._plan_uses_indexed_anchor
             )
-            seed_plans = [
-                plan for plan in plans if seed_plan_is_usable(plan)
-            ]
+            seed_plans = [plan for plan in plans if seed_plan_is_usable(plan)]
             seed_predicates = [
                 plan.raw_witness_predicate or plan.seed_predicate for plan in seed_plans
             ]

@@ -832,8 +832,7 @@ def _read_time_distributed_candidates(
                         )
                     except Exception as exc:
                         if not (
-                            is_read_budget_error(exc)
-                            or is_clickhouse_query_error(exc)
+                            is_read_budget_error(exc) or is_clickhouse_query_error(exc)
                         ):
                             raise
                         logger.warning(
