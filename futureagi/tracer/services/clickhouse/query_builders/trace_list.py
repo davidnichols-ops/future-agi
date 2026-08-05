@@ -446,6 +446,31 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         )
         return [plan for _, plan in candidates]
 
+    def _graph_key_witness_plans(self) -> list[LatestFilterPredicate]:
+        """Return positive any-span Map keys for graph-only discovery.
+
+        A trace may satisfy two attribute filters on different child spans, so
+        discovery may retain only one key leaf. The complete latest-state
+        classifier still applies every value/filter leaf to each candidate.
+        """
+
+        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        candidates = [
+            (index, plan)
+            for index, plan in enumerate(plans)
+            if plan.scope == "any" and plan.raw_key_witness_predicate
+        ]
+        candidates.sort(
+            key=lambda item: (
+                item[1].raw_witness_rank is None,
+                item[1].raw_witness_rank
+                if item[1].raw_witness_rank is not None
+                else 1_000_000,
+                item[0],
+            )
+        )
+        return [plan for _, plan in candidates]
+
     def _positive_typed_map_anchor_plan(self) -> LatestFilterPredicate | None:
         """Return the best rank-zero scalar Map equality/IN anchor."""
 
@@ -784,6 +809,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         return bool(self._filter_anchor_plans())
 
+    def supports_graph_key_witness_probe(self) -> bool:
+        """Whether graph discovery can use one cheap typed-Map key leaf."""
+
+        return bool(self._graph_key_witness_plans())
+
     def skip_full_window_filter_anchor_probe(self) -> bool:
         """Avoid the 513-row broad sentinel outside a short trace window.
 
@@ -853,6 +883,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         limit: int,
         slice_start: datetime | None = None,
         slice_end: datetime | None = None,
+        _graph_key_witness: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Return a finite, stable any-span candidate sentinel.
 
@@ -874,11 +905,29 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if not request_start <= anchor_start < anchor_end <= request_end:
             raise ValueError("trace anchor slice must stay inside the request window")
         self.start_date, self.end_date = request_start, request_end
-        anchor_plans = self._filter_anchor_plans()
+        anchor_plans = (
+            self._graph_key_witness_plans()
+            if _graph_key_witness
+            else self._filter_anchor_plans()
+        )
         if not anchor_plans:
             raise ValueError("trace anchor probe requires an indexed any-span filter")
         anchor = anchor_plans[0]
-        anchor_predicate = anchor.raw_witness_predicate or anchor.seed_predicate
+        raw_anchor_predicate = anchor.raw_witness_predicate or anchor.seed_predicate
+        numeric_value_indexed = any(
+            fragment in raw_anchor_predicate
+            for fragment in (
+                "has(mapValues(span_attr_num)",
+                "hasAny(mapValues(span_attr_num)",
+            )
+        )
+        anchor_predicate = (
+            raw_anchor_predicate
+            if not _graph_key_witness or numeric_value_indexed
+            else anchor.raw_key_witness_predicate
+        )
+        if not anchor_predicate:  # pragma: no cover - guarded by plan selection
+            raise ValueError("trace graph key witness predicate is unavailable")
         anchor_params = {
             key: value
             for key, value in anchor.params.items()
@@ -934,6 +983,28 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         LIMIT 1 BY {identity_limit_by}
         LIMIT %(filter_anchor_limit)s
         """
+        return query, params
+
+    def build_filter_graph_key_witness_probe(
+        self,
+        *,
+        limit: int,
+        slice_start: datetime | None = None,
+        slice_end: datetime | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return a finite graph candidate sentinel using key presence only."""
+
+        # Call the v1 implementation directly. On a V2 builder both public
+        # ``build*`` methods are rewrite-wrapped; dispatching through ``self``
+        # here would append every required SETTINGS assignment twice.
+        query, params = TraceListQueryBuilder.build_filter_anchor_probe(
+            self,
+            limit=limit,
+            slice_start=slice_start,
+            slice_end=slice_end,
+            _graph_key_witness=True,
+        )
+        params["filter_graph_key_witness"] = 1
         return query, params
 
     def _candidate_witness_anchor_plan(self) -> LatestFilterPredicate | None:

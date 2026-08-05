@@ -512,6 +512,12 @@ def _read_time_distributed_candidates(
         )
         anchor_support = getattr(stratum_builder, "supports_filter_anchor_probe", None)
         builder_anchor_supported = bool(callable(anchor_support) and anchor_support())
+        graph_key_support = getattr(
+            stratum_builder,
+            "supports_graph_key_witness_probe",
+            None,
+        )
+        graph_key_supported = bool(callable(graph_key_support) and graph_key_support())
         if builder_anchor_supported and not probe_limits_enforced:
             # A locked executor strips the anchor's tight timeout/read caps.
             # The selector would silently suppress that speculative probe and
@@ -525,11 +531,23 @@ def _read_time_distributed_candidates(
             and builder_anchor_supported
             and probe_limits_enforced
         )
-        if mode == "trace" and use_stratum_anchor:
+        # Unselective positive typed-Map values first discover candidates by
+        # key presence across the complete stratum. This avoids both the broad
+        # value comparison and the false-empty five-minute tail observed in
+        # production. The finite sentinel/classifier contract remains graph-
+        # only; resource failure falls back to the existing temporal sample.
+        use_graph_key_witness = bool(
+            not force_temporal_sample
+            and requires_temporal_sample
+            and graph_key_supported
+            and probe_limits_enforced
+        )
+        if mode == "trace" and (use_stratum_anchor or use_graph_key_witness):
             defer_trace_classification = True
         temporal_sample = (
             not synthetic_time_only_seed
             and (force_temporal_sample or requires_temporal_sample)
+            and not use_graph_key_witness
             and stratum_end - stratum_start > GRAPH_UNINDEXED_SAMPLE_SLICE
         )
         if temporal_sample:
@@ -573,6 +591,7 @@ def _read_time_distributed_candidates(
             candidate_count: int,
             classify_size: int,
             defer_classify: bool,
+            graph_key_witness: bool = False,
         ):
             return read_bounded_filter_page(
                 builder=active_builder,
@@ -602,25 +621,30 @@ def _read_time_distributed_candidates(
                 anchor_probe_only=use_anchor,
                 anchor_probe_limit=(candidate_count if use_anchor else None),
                 defer_classification=defer_classify,
+                graph_key_witness_probe=graph_key_witness,
             )
 
         page = None
         anchor_failure: Exception | str | None = None
+        graph_key_failure: Exception | str | None = None
         try:
             page = read_page(
                 active_builder=stratum_builder,
                 active_filters=stratum_filters,
-                use_anchor=use_stratum_anchor,
+                use_anchor=(use_stratum_anchor or use_graph_key_witness),
                 active_remaining_ms=remaining_ms,
                 seed_attempts=max_seed_attempts,
                 query_limit=max_query_count,
                 candidate_count=candidate_limit,
                 classify_size=bounded_classify_batch_size,
                 defer_classify=defer_trace_classification,
+                graph_key_witness=use_graph_key_witness,
             )
         except Exception as exc:
             if use_stratum_anchor and is_read_budget_error(exc):
                 anchor_failure = exc
+            elif use_graph_key_witness and is_read_budget_error(exc):
+                graph_key_failure = exc
             else:
                 # Compiler/programming defects are not degradable. They must reach
                 # the API boundary, where the generic 500 contract hides private
@@ -710,6 +734,13 @@ def _read_time_distributed_candidates(
         ):
             anchor_failure = "read_budget_exceeded"
 
+        if (
+            page is not None
+            and use_graph_key_witness
+            and page.error_code == "read_budget_exceeded"
+        ):
+            graph_key_failure = "read_budget_exceeded"
+
         if anchor_failure is not None:
             # An index may be declared but not materialized on old parts, or a
             # positive key can be common while its value is rare. A 159/241/307
@@ -769,6 +800,75 @@ def _read_time_distributed_candidates(
                     raise
                 logger.warning(
                     "graph candidate temporal fallback degraded",
+                    stratum_index=index,
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
+                public_code = (
+                    "read_budget_exceeded"
+                    if is_read_budget_error(exc)
+                    else "query_failed"
+                )
+                raise BoundedGraphReadError(public_code, retryable=True) from None
+
+        if graph_key_failure is not None:
+            # A full-stratum key probe is optional candidate discovery. If old
+            # parts cannot prune it within the read ceiling, preserve its
+            # accounting and retry the same stratum through the established
+            # five-minute raw sample (and one-minute dense retry below).
+            if page is not None:
+                elapsed_ms += page.elapsed_ms
+                query_count += page.query_count
+                rows_returned += page.rows_returned
+                result_payload_bytes += page.result_payload_bytes
+                total_rows_lower_bound += page.total_rows_lower_bound
+            logger.warning(
+                "graph key witness exceeded budget; using temporal sample",
+                stratum_index=index,
+                error_type=(
+                    type(graph_key_failure).__name__
+                    if isinstance(graph_key_failure, Exception)
+                    else str(graph_key_failure)
+                ),
+                exc_info=isinstance(graph_key_failure, Exception),
+            )
+            force_temporal_sample = True
+            use_graph_key_witness = False
+            temporal_sample = stratum_end - stratum_start > GRAPH_UNINDEXED_SAMPLE_SLICE
+            sample_start = (
+                stratum_end - GRAPH_UNINDEXED_SAMPLE_SLICE
+                if temporal_sample
+                else stratum_start
+            )
+            stratum_filters = _filters_for_window(
+                filters,
+                window_start=sample_start,
+                window_end=stratum_end,
+            )
+            stratum_builder_kwargs["filters"] = stratum_filters
+            stratum_builder = builder_class(**stratum_builder_kwargs)
+            remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
+            if remaining_ms < 25:
+                complete = False
+                sampling_error_code = "read_budget_exceeded"
+                break
+            try:
+                page = read_page(
+                    active_builder=stratum_builder,
+                    active_filters=stratum_filters,
+                    use_anchor=False,
+                    active_remaining_ms=remaining_ms,
+                    seed_attempts=max_seed_attempts,
+                    query_limit=max_query_count,
+                    candidate_count=candidate_limit,
+                    classify_size=bounded_classify_batch_size,
+                    defer_classify=defer_trace_classification,
+                )
+            except Exception as exc:
+                if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+                    raise
+                logger.warning(
+                    "graph key witness temporal fallback degraded",
                     stratum_index=index,
                     error_type=type(exc).__name__,
                     exc_info=True,
@@ -1050,7 +1150,7 @@ def read_graph_candidates(
             ),
             rows_per_stratum=(
                 GRAPH_TRACE_ROWS_PER_STRATUM
-                if mode == "trace"
+                if indexed_trace_sample
                 else GRAPH_ANY_SPAN_ROWS_PER_STRATUM
             ),
             synthetic_time_only_seed=synthetic_time_only_seed,

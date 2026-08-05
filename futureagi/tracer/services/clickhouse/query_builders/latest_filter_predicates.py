@@ -173,6 +173,11 @@ class LatestFilterPredicate:
     # replay those identities and apply ``predicate``; this is only a witness
     # selector, never the source of truth.
     raw_witness_predicate: str | None = None
+    # Cheap typed-Map key-presence superset for graph-only candidate probes.
+    # Unlike ``raw_witness_predicate`` this deliberately never compares the
+    # attribute value; the latest-state classifier still applies the complete
+    # value predicate before a row can become a graph point.
+    raw_key_witness_predicate: str | None = None
     raw_witness_rank: int | None = None
 
 
@@ -416,6 +421,12 @@ def _attribute_plan(
         f"(indexHint(has(mapKeys({map_column}), {bound_key})) AND "
         f"has({map_column}.keys, {bound_key}))"
     )
+    # Negative/is-null shapes need absence semantics and JSON filters do not
+    # reach this compiler. Keep the graph key probe limited to positive value
+    # shapes (including is-not-null) for which key presence is a superset.
+    raw_key_witness_predicate = (
+        key_witness_predicate if operation in positive_witness_operations else None
+    )
     raw_witness_predicate = None
     if operation in positive_witness_operations:
         raw_witness_predicate = key_witness_predicate
@@ -442,6 +453,7 @@ def _attribute_plan(
         params=params,
         scope=scope,
         raw_witness_predicate=raw_witness_predicate,
+        raw_key_witness_predicate=raw_key_witness_predicate,
         raw_witness_rank=(
             {"equals": 0, "in": 0}.get(operation, 10)
             if operation in positive_witness_operations

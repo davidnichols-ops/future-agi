@@ -92,6 +92,12 @@ def test_positive_typed_map_equality_raw_witness_binds_key_and_value(
     assert f"{map_column}[%(latest_filter_key_0)s]" in witness
     assert f" {comparison} %(latest_filter_param_0)s" in witness
 
+    key_witness = plan.raw_key_witness_predicate
+    assert key_witness is not None
+    assert f"has({map_column}.keys, %(latest_filter_key_0)s)" in key_witness
+    assert "latest_filter_param_0" not in key_witness
+    assert f"{map_column}[%(latest_filter_key_0)s]" not in key_witness
+
 
 @pytest.mark.parametrize(
     ("filter_type", "map_column", "operation", "value", "index_expression"),
@@ -210,6 +216,7 @@ def test_other_positive_typed_map_witnesses_remain_key_only(
     assert f"has({map_column}.keys, %(latest_filter_key_0)s)" in witness
     assert "latest_filter_param_0" not in witness
     assert f"{map_column}[%(latest_filter_key_0)s]" not in witness
+    assert plan.raw_key_witness_predicate == witness
 
 
 @pytest.mark.parametrize(
@@ -236,4 +243,5 @@ def test_negative_typed_map_filters_have_no_raw_witness(
     )
 
     assert plan.raw_witness_predicate is None
+    assert plan.raw_key_witness_predicate is None
     assert plan.raw_witness_rank is None

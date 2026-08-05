@@ -41,6 +41,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import re
+from datetime import timedelta
 
 import pytest
 
@@ -239,7 +240,10 @@ class TestListBuilderOutputContract:
             if name in exclude:
                 continue
             method = getattr(builder, name)
-            if name == "build_filter_anchor_probe":
+            if name in {
+                "build_filter_anchor_probe",
+                "build_filter_graph_key_witness_probe",
+            }:
                 # The anchor contract requires an explicit finite sentinel;
                 # there is deliberately no production default or time-only
                 # anchor that a caller could accidentally widen. Exercise it
@@ -272,6 +276,29 @@ class TestListBuilderOutputContract:
             }:
                 start, end = builder.parse_time_range(builder.filters)
                 result = method(slice_start=start, slice_end=end, limit=2)
+            elif name == "build_filter_unindexed_micro_seed_page":
+                original_filters = builder.filters
+                builder.filters = [
+                    *original_filters,
+                    {
+                        "column_id": "call_type",
+                        "filter_config": {
+                            "col_type": "SYSTEM_METRIC",
+                            "filter_type": "text",
+                            "filter_op": "equals",
+                            "filter_value": "inbound",
+                        },
+                    },
+                ]
+                try:
+                    start, end = builder.parse_time_range(builder.filters)
+                    result = method(
+                        slice_start=max(start, end - timedelta(minutes=5)),
+                        slice_end=end,
+                        limit=2,
+                    )
+                finally:
+                    builder.filters = original_filters
             elif name == "build_filter_navigation_seed_page":
                 start, end = builder.parse_time_range(builder.filters)
                 result = method(

@@ -262,6 +262,7 @@ def read_bounded_filter_page(
     anchor_probe_only: bool = False,
     anchor_probe_limit: int | None = None,
     defer_classification: bool = False,
+    graph_key_witness_probe: bool = False,
 ) -> BoundedFilterPage:
     """Return one exact numbered page or an explicit sanitized degradation.
 
@@ -284,6 +285,9 @@ def read_bounded_filter_page(
     returns finite seeds in ``deferred_candidate_rows`` and always leaves public
     ``rows`` empty; the caller must replay the union through the same builder's
     latest-state classifier before exposing any result.
+    ``graph_key_witness_probe`` swaps the optional value predicate for a
+    graph-only typed-Map key-presence superset. It is valid only with the
+    finite page-zero anchor sentinel; exact list/eval callers never enable it.
     """
 
     if page_number < 0 or page_size <= 0 or deadline_ms <= 0:
@@ -309,6 +313,16 @@ def read_bounded_filter_page(
             raise ValueError("anchor_probe_limit exceeds max_candidates")
         if page_size >= anchor_probe_limit:
             raise ValueError("anchor_probe_limit must include a page sentinel")
+    if graph_key_witness_probe and (
+        not anchor_probe_only
+        or anchor_probe_limit is None
+        or page_number != 0
+        or cursor_start_time is not None
+        or not include_incomplete_rows
+    ):
+        raise ValueError(
+            "graph key witness requires a finite graph page-zero anchor probe"
+        )
     if defer_classification:
         bounded_anchor_acquisition = (
             anchor_probe_only and anchor_probe_limit is not None
@@ -477,13 +491,35 @@ def read_bounded_filter_page(
     probe_limits_enforced = bool(
         getattr(analytics, "supports_per_query_read_settings", True)
     )
+    if graph_key_witness_probe and not probe_limits_enforced:
+        raise ValueError("graph key witness requires enforced per-query read limits")
 
     # Resolve the optional anchor plan once, before the numbered-page preflight,
     # and reuse it at execution time.  The probe is speculative: when it reaches
     # its sentinel the ordered seed/classifier path still has to run, so that
     # path must reserve the probe's physical query up front.
-    anchor_builder = getattr(builder, "build_filter_anchor_probe", None)
-    anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
+    anchor_builder = getattr(
+        builder,
+        (
+            "build_filter_graph_key_witness_probe"
+            if graph_key_witness_probe
+            else "build_filter_anchor_probe"
+        ),
+        None,
+    )
+    anchor_support = getattr(
+        builder,
+        (
+            "supports_graph_key_witness_probe"
+            if graph_key_witness_probe
+            else "supports_filter_anchor_probe"
+        ),
+        None,
+    )
+    if graph_key_witness_probe and not (
+        callable(anchor_builder) and callable(anchor_support) and bool(anchor_support())
+    ):
+        raise ValueError("graph key witness probe is unavailable")
     ordered_seed_builder = getattr(builder, "build_filter_ordered_seed_page", None)
     recommended_anchor_limit: int | None = None
     recommended_anchor_timeout_ms: int | None = None
@@ -1352,7 +1388,11 @@ def read_bounded_filter_page(
         )
         micro_width = (
             micro_width_builder()
-            if callable(micro_width_builder) and callable(micro_seed_builder)
+            if (
+                not graph_key_witness_probe
+                and callable(micro_width_builder)
+                and callable(micro_seed_builder)
+            )
             else None
         )
         micro_strata = (

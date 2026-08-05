@@ -309,6 +309,11 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             )
         )
 
+    def supports_graph_key_witness_probe(self) -> bool:
+        """Whether graph discovery has a positive typed-Map key superset."""
+
+        return bool(self._graph_key_witness_plans())
+
     @staticmethod
     def _plan_uses_indexed_anchor(plan: Any) -> bool:
         """Return whether CH25 can prune this raw seed with a deployed index."""
@@ -409,6 +414,26 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             (index, plan)
             for index, plan in enumerate(plans)
             if self._plan_uses_indexed_anchor(plan)
+        ]
+        candidates.sort(
+            key=lambda item: (
+                item[1].raw_witness_rank is None,
+                item[1].raw_witness_rank
+                if item[1].raw_witness_rank is not None
+                else 1_000_000,
+                item[0],
+            )
+        )
+        return [plan for _, plan in candidates]
+
+    def _graph_key_witness_plans(self) -> list[Any]:
+        """Return all positive Map keys required by one matching span."""
+
+        plans, _ = partition_span_filter_plans(self.filters)
+        candidates = [
+            (index, plan)
+            for index, plan in enumerate(plans)
+            if plan.raw_key_witness_predicate
         ]
         candidates.sort(
             key=lambda item: (
@@ -550,6 +575,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         limit: int,
         slice_start: datetime | None = None,
         slice_end: datetime | None = None,
+        _graph_key_witness: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Return at most ``limit`` unordered physical span candidates.
 
@@ -562,7 +588,11 @@ class SpanListQueryBuilder(BaseQueryBuilder):
 
         if limit <= 1:
             raise ValueError("anchor probe limit must include a sentinel")
-        if not self.supports_filter_anchor_probe():
+        if not (
+            self.supports_graph_key_witness_probe()
+            if _graph_key_witness
+            else self.supports_filter_anchor_probe()
+        ):
             raise ValueError("span anchor probe requires a direct span filter")
 
         request_start, request_end = self.parse_time_range(self.filters)
@@ -573,10 +603,29 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         if not request_start <= anchor_start < anchor_end <= request_end:
             raise ValueError("span anchor slice must stay inside request window")
         self.params.update({"start_date": request_start, "end_date": request_end})
-        seeded_plans = self._filter_anchor_plans()
-        seeded_predicates = [
-            plan.raw_witness_predicate or plan.seed_predicate for plan in seeded_plans
-        ]
+        seeded_plans = (
+            self._graph_key_witness_plans()
+            if _graph_key_witness
+            else self._filter_anchor_plans()
+        )
+        seeded_predicates: list[str] = []
+        for plan in seeded_plans:
+            raw_predicate = plan.raw_witness_predicate or plan.seed_predicate
+            numeric_value_indexed = any(
+                fragment in raw_predicate
+                for fragment in (
+                    "has(mapValues(span_attr_num)",
+                    "hasAny(mapValues(span_attr_num)",
+                )
+            )
+            graph_predicate = (
+                raw_predicate
+                if not _graph_key_witness or numeric_value_indexed
+                else plan.raw_key_witness_predicate
+            )
+            if not graph_predicate:  # pragma: no cover - guarded by selection
+                raise ValueError("span graph key witness predicate is unavailable")
+            seeded_predicates.append(graph_predicate)
         params: dict[str, Any] = {
             **self.params,
             "filter_anchor_start": anchor_start,
@@ -647,6 +696,27 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         LIMIT 1 BY project_id, trace_id, id, start_time
         LIMIT %(filter_anchor_limit)s
         """
+        return query, params
+
+    def build_filter_graph_key_witness_probe(
+        self,
+        *,
+        limit: int,
+        slice_start: datetime | None = None,
+        slice_end: datetime | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return a finite graph candidate sentinel using Map keys only."""
+
+        # Bypass V2RewriteMixin's wrapped public anchor method. The outer graph
+        # build wrapper performs the one required v1->v2 rewrite/SETTINGS pass.
+        query, params = SpanListQueryBuilder.build_filter_anchor_probe(
+            self,
+            limit=limit,
+            slice_start=slice_start,
+            slice_end=slice_end,
+            _graph_key_witness=True,
+        )
+        params["filter_graph_key_witness"] = 1
         return query, params
 
     def build_filter_seed_page(

@@ -294,6 +294,83 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.recommended_filter_classify_batch_size() == 100
 
 
+def test_graph_trace_key_witness_is_wide_key_only_and_classifier_stays_exact() -> None:
+    filters = [
+        _time_filter(END - timedelta(days=14), END),
+        _attribute_filter("final_status", ["Rejected"], operation="in"),
+        _attribute_filter("channel", "voice"),
+    ]
+    builder = TraceListQueryBuilder(project_id=PROJECT_ID, filters=filters)
+
+    probe_sql, probe_params = builder.build_filter_graph_key_witness_probe(
+        slice_start=END - timedelta(days=2),
+        slice_end=END,
+        limit=4,
+    )
+    match_sql, match_params = builder.build_filter_match_query(["trace-a"])
+
+    assert builder.supports_graph_key_witness_probe() is True
+    assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in probe_sql
+    assert "latest_filter_key_1" not in probe_sql
+    assert "parent_span_id IS NULL" not in probe_sql
+    assert "lowerUTF8" not in probe_sql
+    assert "span_attr_str[" not in probe_sql
+    assert "latest_filter_param_0" not in probe_sql
+    assert "latest_filter_param_1" not in probe_sql
+    assert probe_params["latest_filter_key_0"] == "final_status"
+    assert "latest_filter_param_0" not in probe_params
+    assert "latest_filter_param_1" not in probe_params
+    assert "latest_attr_exists_0" in match_sql
+    assert "latest_attr_exists_1" in match_sql
+    assert match_params["latest_filter_param_0"] == ("rejected",)
+    assert match_params["latest_filter_param_1"] == "voice"
+
+
+def test_graph_span_key_witness_ands_keys_but_not_text_values() -> None:
+    filters = [
+        _time_filter(END - timedelta(days=14), END),
+        _attribute_filter("final_status", ["Rejected"], operation="in"),
+        _attribute_filter("channel", "voice"),
+    ]
+    builder = SpanListQueryBuilder(project_id=PROJECT_ID, filters=filters)
+
+    probe_sql, probe_params = builder.build_filter_graph_key_witness_probe(
+        slice_start=END - timedelta(days=2),
+        slice_end=END,
+        limit=50,
+    )
+
+    assert builder.supports_graph_key_witness_probe() is True
+    assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in probe_sql
+    assert "has(span_attr_str.keys, %(latest_filter_key_1)s)" in probe_sql
+    assert "lowerUTF8" not in probe_sql
+    assert "span_attr_str[" not in probe_sql
+    assert "latest_filter_param_0" not in probe_sql
+    assert "latest_filter_param_1" not in probe_sql
+    assert probe_params["latest_filter_key_0"] == "final_status"
+    assert probe_params["latest_filter_key_1"] == "channel"
+
+
+def test_graph_numeric_equality_retains_value_indexed_witness() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(days=14), END),
+            _attribute_filter("attempt", 7, filter_type="number"),
+        ],
+    )
+
+    probe_sql, probe_params = builder.build_filter_graph_key_witness_probe(
+        slice_start=END - timedelta(days=2),
+        slice_end=END,
+        limit=4,
+    )
+
+    assert "has(mapValues(span_attr_num), %(latest_filter_param_0)s)" in probe_sql
+    assert "span_attr_num[%(latest_filter_key_0)s]" in probe_sql
+    assert probe_params["latest_filter_param_0"] == 7
+
+
 def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
@@ -4080,6 +4157,24 @@ class _AnchorFakeBuilder(_FakeBuilder):
         return "ordered_seed", params
 
 
+class _GraphKeyWitnessFakeBuilder(_AnchorFakeBuilder):
+    @staticmethod
+    def supports_graph_key_witness_probe() -> bool:
+        return True
+
+    @staticmethod
+    def build_filter_graph_key_witness_probe(
+        *,
+        limit: int,
+        slice_start: datetime | None = None,
+        slice_end: datetime | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        params: dict[str, Any] = {"limit": limit, "graph_key_witness": True}
+        if slice_start is not None and slice_end is not None:
+            params.update(slice_start=slice_start, slice_end=slice_end)
+        return "anchor", params
+
+
 class _SkipFullAnchorFakeBuilder(_AnchorFakeBuilder):
     @staticmethod
     def skip_full_window_filter_anchor_probe() -> bool:
@@ -6084,6 +6179,42 @@ def test_recommended_anchor_skips_when_statement_caps_cannot_be_enforced() -> No
     assert set(call_names) == {"ordered_seed"}
     assert page.complete is True
     assert page.rows == []
+
+
+def test_graph_key_witness_probe_rejects_locked_read_settings_before_query() -> None:
+    row = {"id": "trace-a", "start_time": END - timedelta(days=30)}
+    builder = _GraphKeyWitnessFakeBuilder(
+        [row],
+        start=END - timedelta(days=120),
+        end=END,
+        seed_proves_order=False,
+    )
+    executor = _AnchorFakeExecutor(builder)
+    executor.supports_per_query_read_settings = False
+
+    with pytest.raises(
+        ValueError,
+        match="graph key witness requires enforced per-query read limits",
+    ):
+        read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(start=builder.start, end=builder.end)],
+            key_field="id",
+            page_number=0,
+            page_size=1,
+            deadline_ms=5_000,
+            max_candidates=2,
+            max_seed_attempts=1,
+            max_query_count=2,
+            classify_batch_size=2,
+            include_incomplete_rows=True,
+            anchor_probe_only=True,
+            anchor_probe_limit=2,
+            graph_key_witness_probe=True,
+        )
+
+    assert executor.calls == []
 
 
 def test_any_span_customer_match_set_uses_200_candidate_query_budget() -> None:
