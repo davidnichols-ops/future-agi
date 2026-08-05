@@ -249,6 +249,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # unused imports
 "accounts/services/sos_service.py" = ["TID251"]  # the one audited caller
+"conftest.py" = ["E402"]  # import order is load-bearing: env prep and EE stubs must precede app imports
 
 [tool.mypy]
 python_version = "3.11"
