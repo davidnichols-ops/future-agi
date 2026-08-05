@@ -551,9 +551,7 @@ def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
     assert builder.prefer_filter_candidate_witness_probe_first() is False
 
 
-def test_eval_trace_membership_only_classifier_can_prefilter_typed_map_candidates() -> (
-    None
-):
+def test_eval_trace_membership_only_classifier_stays_on_exact_batches() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[
@@ -568,22 +566,20 @@ def test_eval_trace_membership_only_classifier_can_prefilter_typed_map_candidate
 
     assert builder.recommended_filter_classify_batch_size() == 100
     assert (
-        builder.supports_filter_candidate_witness_prefilter_without_hydration() is True
+        builder.supports_filter_candidate_witness_prefilter_without_hydration() is False
     )
-    assert builder.prefer_filter_candidate_witness_probe_first() is True
-    assert builder.recommended_filter_candidate_witness_probe_strata() == 8
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
+    assert builder.recommended_filter_candidate_witness_probe_strata() is None
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
-        == 20
+        is None
     )
-    probe_sql, probe_params = builder.build_filter_candidate_witness_probe(
+    assert builder.build_filter_candidate_witness_probe(
         [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
+    ) == (
+        "",
+        {},
     )
-    assert "SELECT DISTINCT trace_id" in probe_sql
-    assert "trace_id IN %(filter_candidate_trace_ids)s" in probe_sql
-    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in probe_sql
-    assert "argMax(" not in probe_sql
-    assert probe_params["filter_candidate_trace_ids"] == ("trace-a", "trace-b")
 
 
 @pytest.mark.parametrize(

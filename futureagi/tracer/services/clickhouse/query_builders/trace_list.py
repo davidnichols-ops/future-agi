@@ -816,26 +816,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return anchor
 
     def supports_filter_candidate_witness_prefilter_without_hydration(self) -> bool:
-        """Allow one membership-only historical trace selector optimization.
+        """Keep internal eval selectors on their bounded exact classifier.
 
-        The raw witness probe is safe without page hydration only for the
-        exact internal bulk mode whose classifier already returns its final
-        identity/order projection. Witness-carrying and population proofs keep
-        their established one/two-phase protocols, and graph membership-window
-        scans retain their wider temporal contract.
+        Production qualification showed that the raw positive-witness probe
+        adds work and can cross its speculative read ceiling on dense eval
+        windows, while the exact 100-identity classifier completes faster
+        within its own immutable limits. Hydrated trace lists may still use
+        the bounded witness strata; unhydrated eval selectors must not.
         """
 
-        return bool(
-            self._bounded_internal_scan
-            and self._bounded_identity_only
-            and self._bounded_bulk_scan
-            and not self._bounded_include_filter_witnesses
-            and not self._bounded_population_proof
-            and self._bounded_membership_filters is None
-            and self.project_id is not None
-            and self.project_ids is None
-            and not self.search
-        )
+        return False
 
     def prefer_filter_candidate_witness_probe_first(self) -> bool:
         """Prefer the indexed witness superset before a long-window argMax scan."""
