@@ -19,8 +19,10 @@ def latest_live_trace_projects_sql(
     candidate query. This prevents a project-wide trace aggregation when only
     a small eval slice is relevant. Trace project membership is immutable, so
     applying both project and ID predicates before ``argMax`` is exact and
-    aligned with ``ORDER BY (project_id, id)``. The live predicate remains
-    outside the version collapse so a tombstone cannot resurrect an old row.
+    aligned with ``ORDER BY (project_id, id)``. A trace ID reused across the
+    requested projects is ambiguous and is therefore excluded. The live
+    predicate remains outside the version collapse so a tombstone cannot
+    resurrect an old row.
     """
 
     if not _PARAM_NAME_RE.fullmatch(project_ids_param):
@@ -35,6 +37,7 @@ def latest_live_trace_projects_sql(
         FROM (
             SELECT
                 trace_project_scan.id AS trace_id,
+                uniqExact(trace_project_scan.project_id) AS project_identity_count,
                 argMax(
                     tuple(
                         trace_project_scan.project_id,
@@ -48,7 +51,8 @@ def latest_live_trace_projects_sql(
             PREWHERE trace_project_scan.project_id IN %({project_ids_param})s
             GROUP BY trace_project_scan.id
         ) AS latest_trace_project_state
-        WHERE tupleElement(latest_state, 2) = 0
+        WHERE project_identity_count = 1
+          AND tupleElement(latest_state, 2) = 0
     """
 
 

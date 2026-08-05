@@ -2937,6 +2937,11 @@ class TestDashboardQueryBuilder:
                 in compact_sql
             )
             assert "GROUP BY trace_project_scan.id" in compact_sql
+            assert (
+                "uniqExact(trace_project_scan.project_id) AS project_identity_count"
+                in compact_sql
+            )
+            assert "WHERE project_identity_count = 1" in compact_sql
             assert "toUUIDOrZero(usage_main_latest.eval_trace_id)" in compact_sql
             assert "IN %(project_ids)s" in compact_sql
             assert params["project_ids"] == [project_id]
@@ -4115,6 +4120,30 @@ class TestSerializerValidation:
 
 
 class TestDashboardQueryExecution:
+    def test_invalid_metric_combination_is_explicitly_degraded(self):
+        builder = MagicMock()
+        builder.metrics = [{"id": "unsupported", "name": "unsupported"}]
+        builder.metric_info.return_value = {
+            "id": "unsupported",
+            "name": "unsupported",
+        }
+        builder.build_metric_query.side_effect = InvalidMetricCombinationError(
+            "Unsupported filter combination"
+        )
+
+        results = DashboardViewSet._run_metric_queries(
+            builder,
+            "traces",
+            MagicMock(),
+        )
+
+        metric_info, rows = results[0]
+        assert rows == []
+        assert metric_info["query_complete"] is False
+        assert metric_info["query_status"] == "degraded"
+        assert metric_info["query_error_code"] == "query_failed"
+        assert metric_info["error"] == "Unsupported filter combination"
+
     def test_metric_read_budget_degrades_only_the_affected_metric(self):
         builder = MagicMock()
         builder.metrics = [
@@ -5666,7 +5695,9 @@ class TestFrontendPayloadSimulation:
         assert "annotation_s_filter_0.created_at < %(end_date)s" in compact_sql
         assert "annotation_s_filter_0._peerdb_is_deleted = 0" in compact_sql
         assert "annotation_s_filter_0.deleted = 0" in compact_sql
-        assert "annotation_s_filter_0.trace_id IS NOT NULL" in compact_sql
+        assert "direct_annotation.trace_id IS NOT NULL" in compact_sql
+        assert "observation_span_id AS observation_span_id" in compact_sql
+        assert "SELECT DISTINCT annotation_membership.trace_id" in compact_sql
         assert params["s_ann_org_id_0"] == organization_uuid
         assert params["s_label_id_0"] == label_uuid
         assert params["start_date"] == datetime(2026, 1, 1, tzinfo=UTC)
@@ -6615,7 +6646,12 @@ class TestDashboardV2RewriteRouting:
         assert "argMax(" in compact_sql
         assert "trace_project_scan.is_deleted" in compact_sql
         assert "GROUP BY trace_project_scan.id" in compact_sql
-        assert "WHERE tupleElement(latest_state, 2) = 0" in compact_sql
+        assert (
+            "uniqExact(trace_project_scan.project_id) AS project_identity_count"
+            in compact_sql
+        )
+        assert "WHERE project_identity_count = 1" in compact_sql
+        assert "AND tupleElement(latest_state, 2) = 0" in compact_sql
         assert (
             "LEFT JOIN ( SELECT trace_id, tupleElement(latest_state, 1) AS project_id"
             in compact_sql
@@ -6636,6 +6672,11 @@ class TestDashboardV2RewriteRouting:
             "PREWHERE annotation_span_scan.project_id IN %(project_ids)s" in compact_sql
         )
         assert "WHERE annotation_span_scan.id IN (" in compact_sql
+        assert (
+            "uniqExact( tuple( annotation_span_scan.project_id, "
+            "annotation_span_scan.trace_id ) ) AS identity_count"
+        ) in compact_sql
+        assert "annotation_span_latest.identity_count = 1" in compact_sql
         assert "a.trace_id IN (" not in compact_sql
         assert params["annotation_organization_id"] == config["organization_id"]
 
@@ -6691,9 +6732,12 @@ class TestDashboardV2RewriteRouting:
 
         assert "AS annotation_subject_span" in compact_sql
         assert "AS annotation_subject_candidate" in compact_sql
-        assert "s.project_id IN %(project_ids)s" in compact_sql
+        assert "SELECT DISTINCT s.trace_id FROM spans AS s FINAL" in compact_sql
+        assert "LEFT JOIN ( SELECT * FROM spans AS s FINAL" not in compact_sql
+        assert "FROM spans AS s FINAL" in compact_sql
+        assert "PREWHERE s.project_id IN %(project_ids)s" in compact_sql
         assert "s.trace_id IN (" in compact_sql
-        assert "s.parent_span_id = ''" in compact_sql
+        assert "(s.parent_span_id IS NULL OR s.parent_span_id = '')" in compact_sql
         assert "s.is_deleted = 0" in compact_sql
         assert "mapContains(s.attrs_bool" in compact_sql
         assert "JSONExtractRaw(s.attributes_extra" in compact_sql
@@ -6747,6 +6791,316 @@ class TestDashboardV2RewriteRouting:
         assert "created_at < %(end_date)s" in sql
         assert params["ann_metric_eval_id_0"] == eval_id
         assert params["ann_metric_label_id_1"] == other_label_id
+
+    def test_v1_annotation_system_filter_uses_string_safe_root_expression(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "system_metric",
+                    "metric_name": "session",
+                    "operator": "equal_to",
+                    "value": "customer-session",
+                }
+            ],
+        }
+        config = _single_metric_config(metric)
+
+        sql, params = DashboardQueryBuilder(config).build_metric_query(metric)
+        compact_sql = " ".join(sql.split())
+
+        assert "FROM spans AS s FINAL" in compact_sql
+        assert "toString(s.trace_session_id) = %(_ann_span_filter_0_value)s" in (
+            compact_sql
+        )
+        assert "(s.parent_span_id IS NULL OR s.parent_span_id = '')" in compact_sql
+        assert params["_ann_span_filter_0_value"] == "customer-session"
+
+    def test_v2_annotation_id_remap_filter_fails_closed(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "system_metric",
+                    "metric_name": "session",
+                    "operator": "equal_to",
+                    "value": "customer-session",
+                }
+            ],
+        }
+        config = _single_metric_config(metric)
+
+        with pytest.raises(
+            InvalidMetricCombinationError,
+            match="Resolved user/session filters are not supported",
+        ):
+            DashboardQueryBuilderV2(config).build_metric_query(metric)
+
+    def test_v2_annotation_project_filter_uses_ui_source_and_string_expression(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        project_id = "11111111-1111-4111-8111-111111111111"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "system_metric",
+                    "metric_name": "project",
+                    "operator": "equal_to",
+                    "value": project_id,
+                    "source": "all",
+                }
+            ],
+        }
+        config = _single_metric_config(metric)
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "FROM spans AS s FINAL" in compact_sql
+        assert "toString(s.project_id) = %(_ann_span_filter_0_value)s" in compact_sql
+        assert params["_ann_span_filter_0_value"] == project_id
+
+    def test_annotation_eval_choice_filter_uses_string_output_and_ui_source(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        eval_id = "55555555-5555-4555-8555-555555555555"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+        }
+        config = _single_metric_config(metric)
+        config["filters"] = [
+            {
+                "metric_type": "eval_metric",
+                "metric_name": eval_id,
+                "operator": "equal_to",
+                "value": "Approved",
+                "output_type": "CHOICES",
+                "source": "all",
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "usage_ann_metric_eval_filter_latest_0.eval_output_str =" in sql
+        assert params["ann_metric_0_val"] == "Approved"
+
+    def test_annotation_categorical_membership_filter_uses_string_value(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "annotation_metric",
+                    "metric_name": "66666666-6666-4666-8666-666666666666",
+                    "operator": "equal_to",
+                    "value": "Approved",
+                    "output_type": "categorical",
+                    "source": "both",
+                }
+            ],
+        }
+        config = _single_metric_config(metric)
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert (
+            "notEmpty(JSONExtract(annotation_ann_metric_filter_0.value, 'selected', "
+            "'Array(String)')) AND has(JSONExtract("
+        ) in " ".join(sql.split())
+        assert params["ann_metric_0_val"] == "Approved"
+
+    def test_annotation_text_contains_filter_escapes_like_value(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "annotation_metric",
+                    "metric_name": "66666666-6666-4666-8666-666666666666",
+                    "operator": "str_contains",
+                    "value": "50%_done",
+                    "output_type": "text",
+                    "source": "both",
+                }
+            ],
+        }
+        config = _single_metric_config(metric)
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert (
+            "JSONExtract(annotation_ann_metric_filter_0.value, 'text', "
+            "'Nullable(String)') LIKE %(ann_metric_0_val)s"
+        ) in " ".join(sql.split())
+        assert params["ann_metric_0_val"] == r"%50\%\_done%"
+
+    def test_annotation_categorical_negative_requires_a_stored_selection(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "annotation_metric",
+                    "metric_name": "66666666-6666-4666-8666-666666666666",
+                    "operator": "not_equal_to",
+                    "value": "Rejected",
+                    "output_type": "categorical",
+                    "source": "both",
+                }
+            ],
+        }
+
+        sql, _, _ = DashboardQueryBuilderV2(
+            _single_metric_config(metric)
+        ).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "notEmpty(JSONExtract(" in compact_sql
+        assert "AND NOT has(JSONExtract(" in compact_sql
+
+    def test_annotation_categorical_contains_uses_array_overlap(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "annotation_metric",
+                    "metric_name": "66666666-6666-4666-8666-666666666666",
+                    "operator": "contains",
+                    "value": ["Approved", "Escalated"],
+                    "output_type": "categorical",
+                    "source": "both",
+                }
+            ],
+        }
+
+        sql, params, _ = DashboardQueryBuilderV2(
+            _single_metric_config(metric)
+        ).build_all_queries()[0]
+
+        assert "hasAny(JSONExtract(" in " ".join(sql.split())
+        assert params["ann_metric_0_val"] == ["Approved", "Escalated"]
+
+        metric["filters"][0].update({"operator": "str_contains", "value": "Approved"})
+        exact_sql, exact_params, _ = DashboardQueryBuilderV2(
+            _single_metric_config(metric)
+        ).build_all_queries()[0]
+        compact_exact_sql = " ".join(exact_sql.split())
+        assert "notEmpty(JSONExtract(" in compact_exact_sql
+        assert "AND has(JSONExtract(" in compact_exact_sql
+        assert " LIKE " not in compact_exact_sql
+        assert exact_params["ann_metric_0_val"] == "Approved"
+
+    def test_annotation_thumbs_filter_normalizes_ui_tokens(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "annotation_metric",
+                    "metric_name": "66666666-6666-4666-8666-666666666666",
+                    "operator": "contains",
+                    "value": ["Thumbs Up", "thumbs_down"],
+                    "output_type": "thumbs_up_down",
+                    "source": "both",
+                }
+            ],
+        }
+
+        sql, params, _ = DashboardQueryBuilderV2(
+            _single_metric_config(metric)
+        ).build_all_queries()[0]
+
+        assert (
+            "JSONExtract(annotation_ann_metric_filter_0.value, 'value', "
+            "'Nullable(String)') IN %(ann_metric_0_val)s"
+        ) in " ".join(sql.split())
+        assert params["ann_metric_0_val"] == ["up", "down"]
+
+    def test_annotation_membership_maps_observation_rows_without_fanout(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "annotation_metric",
+                    "metric_name": "66666666-6666-4666-8666-666666666666",
+                    "operator": "equal_to",
+                    "value": "Approved",
+                    "output_type": "categorical",
+                    "source": "both",
+                }
+            ],
+        }
+
+        sql, _, _ = DashboardQueryBuilderV2(
+            _single_metric_config(metric)
+        ).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "WITH annotation_ann_metric_candidates_0 AS" in compact_sql
+        assert "observation_span_id AS observation_span_id" in compact_sql
+        assert "UNION ALL" in compact_sql
+        assert "SELECT DISTINCT annotation_membership.trace_id" in compact_sql
+        assert "annotation_ann_metric_span_filter_latest_0.identity_count = 1" in (
+            compact_sql
+        )
+        assert (
+            "uniqExact(trace_project_scan.project_id) AS project_identity_count"
+            in compact_sql
+        )
+        assert "WHERE project_identity_count = 1" in compact_sql
 
     def test_v1_annotation_metric_preserves_trace_dictionary_scope(self):
         config = _single_metric_config(

@@ -1514,6 +1514,12 @@ class DashboardQueryBuilder:
             FROM (
                 SELECT
                     annotation_span_scan.id AS id,
+                    uniqExact(
+                        tuple(
+                            annotation_span_scan.project_id,
+                            annotation_span_scan.trace_id
+                        )
+                    ) AS identity_count,
                     argMax(
                         tuple(
                             annotation_span_scan.trace_id,
@@ -1527,7 +1533,8 @@ class DashboardQueryBuilder:
                 WHERE annotation_span_scan.id IN ({annotation_span_candidates})
                 GROUP BY annotation_span_scan.id
             ) AS annotation_span_latest
-            WHERE tupleElement(annotation_span_latest.latest_state, 3) = 0
+            WHERE annotation_span_latest.identity_count = 1
+              AND tupleElement(annotation_span_latest.latest_state, 3) = 0
         """
         annotation_span_join = (
             f"LEFT JOIN ({annotation_span_projects}) AS annotation_subject_span "
@@ -1576,7 +1583,7 @@ class DashboardQueryBuilder:
         trace_filters = [
             item
             for item in self.global_filters + per_metric_filters
-            if item.get("source", "traces") in ("traces", "")
+            if item.get("source", "traces") in ("traces", "", "all", "both")
         ]
         span_filters = [
             item
@@ -1597,19 +1604,25 @@ class DashboardQueryBuilder:
 
         joins = [trace_project_join, annotation_span_join]
         if span_filters:
-            spans_joined = self._spans_source(None, per_metric_filters, "s")
-            filtered_spans = f"""(
-                SELECT *
-                FROM {spans_joined}
-                WHERE s.project_id IN %(project_ids)s
-                  AND s.trace_id IN ({annotation_subject_trace_candidates})
-                  AND s.parent_span_id = ''
-                  AND s._peerdb_is_deleted = 0
-            ) AS s"""
-            joins.append(
-                f"LEFT JOIN {filtered_spans} "
-                f"ON s.trace_id = {annotation_subject_trace_id}"
-            )
+            id_resolved_filters = [
+                item
+                for item in span_filters
+                if (item.get("metric_type") or item.get("type")) == "system_metric"
+                and (
+                    item.get("metric_name") or item.get("name") or item.get("id", "")
+                ).lower()
+                in _ID_RESOLVED_NAMES
+            ]
+            if self._direct_end_users_available and id_resolved_filters:
+                raise InvalidMetricCombinationError(
+                    "Resolved user/session filters are not supported for annotation "
+                    "dashboard metrics"
+                )
+
+            span_predicates = [
+                "(s.parent_span_id IS NULL OR s.parent_span_id = '')",
+                "s._peerdb_is_deleted = 0",
+            ]
 
             for filter_index, item in enumerate(span_filters):
                 filter_type = item.get("metric_type") or item.get("type", "")
@@ -1621,7 +1634,7 @@ class DashboardQueryBuilder:
                         canonical_filter,
                         index=filter_index,
                     )
-                    where_parts.append(
+                    span_predicates.append(
                         self._qualify_span_expression(predicate, alias="s")
                     )
                     params.update(predicate_params)
@@ -1637,7 +1650,13 @@ class DashboardQueryBuilder:
                         raise InvalidMetricCombinationError(
                             f"Unsupported annotation dashboard filter: {filter_name}"
                         )
-                    expression = self._system_metric_expression(metric_key, alias="s")
+                    string_expression = self._string_filter_column_expression(
+                        metric_key
+                    )
+                    expression = self._qualify_span_expression(
+                        string_expression or self._system_metric_expression(metric_key),
+                        alias="s",
+                    )
                 else:
                     attribute_key = _sanitize_attr_key(filter_name)
                     attribute_type = item.get("attribute_type", "string")
@@ -1653,7 +1672,9 @@ class DashboardQueryBuilder:
                     "is_numeric",
                     "is_not_numeric",
                 ):
-                    where_parts.append(f"{expression} {FILTER_OPERATORS[operation]}")
+                    span_predicates.append(
+                        f"{expression} {FILTER_OPERATORS[operation]}"
+                    )
                     continue
 
                 value = item.get("value")
@@ -1665,7 +1686,7 @@ class DashboardQueryBuilder:
                     low_key = f"_ann_span_filter_{filter_index}_low"
                     high_key = f"_ann_span_filter_{filter_index}_high"
                     negation = "NOT " if operation == "not_between" else ""
-                    where_parts.append(
+                    span_predicates.append(
                         f"{expression} {negation}BETWEEN %({low_key})s "
                         f"AND %({high_key})s"
                     )
@@ -1679,8 +1700,19 @@ class DashboardQueryBuilder:
                         f"Unsupported annotation dashboard filter operation: {operation}"
                     )
                 value_key = f"_ann_span_filter_{filter_index}_value"
-                where_parts.append(f"{expression} {operator} %({value_key})s")
+                span_predicates.append(f"{expression} {operator} %({value_key})s")
                 params[value_key] = _coerce_filter_value(value, operation)
+
+            filtered_trace_ids = f"""
+                SELECT DISTINCT s.trace_id
+                FROM spans AS s FINAL
+                PREWHERE s.project_id IN %(project_ids)s
+                  AND s.trace_id IN ({annotation_subject_trace_candidates})
+                WHERE {" AND ".join(span_predicates)}
+            """
+            where_parts.append(
+                f"{annotation_subject_trace_id} IN ({filtered_trace_ids})"
+            )
 
         if membership_filters:
             membership_clauses, membership_params = self._build_subquery_filters(
@@ -2388,12 +2420,26 @@ class DashboardQueryBuilder:
                 # collapse row versions. Live/status predicates deliberately
                 # stay outside LIMIT 1 BY so a tombstone cannot resurrect an
                 # older successful version.
-                if output_type == "PASS_FAIL":
-                    eval_col = (
-                        f"if({latest_alias}.eval_output_str = 'Passed', 1.0, 0.0)"
+                if output_type in ("PASS_FAIL", "CHOICE", "CHOICES"):
+                    eval_col = f"{latest_alias}.eval_output_str"
+                    filter_value = (
+                        _coerce_filter_value(val, op)
+                        if op
+                        in (
+                            "contains",
+                            "not_contains",
+                            "str_contains",
+                            "str_not_contains",
+                        )
+                        else val
                     )
-                else:
+                elif output_type == "SCORE":
                     eval_col = f"{latest_alias}.eval_score"
+                    filter_value = _coerce_filter_value(val, op)
+                else:
+                    raise InvalidMetricCombinationError(
+                        f"Unsupported eval filter output type: {output_type}"
+                    )
 
                 subquery = f"""{trace_id_expr} IN (
                     SELECT {latest_alias}.eval_trace_id
@@ -2416,7 +2462,7 @@ class DashboardQueryBuilder:
                 clauses.append(subquery)
                 extra_params[eval_id_key] = eval_template_id
                 extra_params[scope_key] = _sub_scope_val
-                extra_params[val_key] = _coerce_filter_value(val, op)
+                extra_params[val_key] = filter_value
                 idx += 1
 
             elif f_type == "annotation_metric":
@@ -2424,20 +2470,109 @@ class DashboardQueryBuilder:
                 label_id = f.get("metric_name", "")
                 ann_org_key = f"{prefix}ann_org_id_{idx}"
                 annotation_alias = f"annotation_{prefix}filter_{idx}"
+                output_type = (f.get("output_type") or "numeric").lower()
+                if output_type in ("numeric", "number", "score", "star", "rating"):
+                    filter_expr = annotation_numeric_value_expr(
+                        alias=annotation_alias, nullable=True
+                    )
+                    filter_value = _coerce_filter_value(val, op)
+                    filter_condition = (
+                        f"{filter_expr} IS NOT NULL AND "
+                        f"{filter_expr} {op_symbol} %({val_key})s"
+                    )
+                elif output_type in ("categorical", "choice", "choices"):
+                    selected_expr = (
+                        f"JSONExtract({annotation_alias}.value, 'selected', "
+                        "'Array(String)')"
+                    )
+                    if op in (
+                        "equal_to",
+                        "not_equal_to",
+                        "str_contains",
+                        "str_not_contains",
+                    ):
+                        negation = (
+                            "NOT " if op in ("not_equal_to", "str_not_contains") else ""
+                        )
+                        filter_condition = (
+                            f"notEmpty({selected_expr}) AND "
+                            f"{negation}has({selected_expr}, %({val_key})s)"
+                        )
+                        filter_value = val
+                    elif op in ("contains", "not_contains"):
+                        negation = "NOT " if op == "not_contains" else ""
+                        filter_condition = (
+                            f"notEmpty({selected_expr}) AND "
+                            f"{negation}hasAny({selected_expr}, %({val_key})s)"
+                        )
+                        filter_value = _coerce_filter_value(val, op)
+                    else:
+                        raise InvalidMetricCombinationError(
+                            f"Unsupported categorical annotation filter operation: {op}"
+                        )
+                elif output_type in ("thumbs_up_down", "text", "string"):
+                    json_key = "value" if output_type == "thumbs_up_down" else "text"
+                    filter_expr = (
+                        f"JSONExtract({annotation_alias}.value, '{json_key}', "
+                        "'Nullable(String)')"
+                    )
+                    filter_value = (
+                        _coerce_filter_value(val, op)
+                        if op
+                        in (
+                            "contains",
+                            "not_contains",
+                            "str_contains",
+                            "str_not_contains",
+                        )
+                        else val
+                    )
+                    if output_type == "thumbs_up_down":
+                        thumb_tokens = {
+                            "thumbs up": "up",
+                            "thumbs down": "down",
+                            "thumbs_up": "up",
+                            "thumbs_down": "down",
+                            "up": "up",
+                            "down": "down",
+                            "true": "up",
+                            "false": "down",
+                        }
 
-                # Use the nullable extractor so JSON payloads missing
-                # the numeric key compare as NULL (and are excluded by
-                # the filter) instead of evaluating as 0.
-                num_expr = annotation_numeric_value_expr(
-                    alias=annotation_alias, nullable=True
-                )
-                # Keep FINAL for score-table latest/tombstone semantics, but
-                # apply immutable tenant/label/month-partition bounds before
-                # JSON value extraction. This turns the former all-history
-                # merge into the exact dashboard window without a schema
-                # dependency.
-                subquery = f"""{trace_id_expr} IN (
-                    SELECT toString({annotation_alias}.trace_id)
+                        if isinstance(filter_value, list):
+                            normalized_values = []
+                            for thumb_value in filter_value:
+                                if isinstance(thumb_value, bool):
+                                    thumb_value = "up" if thumb_value else "down"
+                                elif isinstance(thumb_value, str):
+                                    thumb_value = thumb_tokens.get(
+                                        thumb_value.strip().lower(), thumb_value
+                                    )
+                                normalized_values.append(thumb_value)
+                            filter_value = normalized_values
+                        elif isinstance(filter_value, bool):
+                            filter_value = "up" if filter_value else "down"
+                        elif isinstance(filter_value, str):
+                            filter_value = thumb_tokens.get(
+                                filter_value.strip().lower(), filter_value
+                            )
+                    filter_condition = (
+                        f"{filter_expr} IS NOT NULL AND "
+                        f"{filter_expr} {op_symbol} %({val_key})s"
+                    )
+                else:
+                    raise InvalidMetricCombinationError(
+                        f"Unsupported annotation filter output type: {output_type}"
+                    )
+                # Keep FINAL for score-table latest/tombstone semantics and
+                # bound the candidate set before JSON extraction. Annotation
+                # rows may attach directly to a trace or only to an observation
+                # span; resolve the latter through a project-scoped, unique,
+                # latest-live span identity and union trace IDs without fanout.
+                filtered_annotations = f"""
+                    SELECT
+                        {annotation_alias}.trace_id AS trace_id,
+                        {annotation_alias}.observation_span_id AS observation_span_id
                     FROM model_hub_score AS {annotation_alias} FINAL
                     PREWHERE {annotation_alias}.label_id =
                                  toUUID(%({label_id_key})s)
@@ -2447,14 +2582,81 @@ class DashboardQueryBuilder:
                       AND {annotation_alias}.created_at < %(end_date)s
                     WHERE {annotation_alias}._peerdb_is_deleted = 0
                       AND {annotation_alias}.deleted = 0
-                      AND {annotation_alias}.trace_id IS NOT NULL
-                      AND {num_expr} IS NOT NULL
-                      AND {num_expr} {op_symbol} %({val_key})s
+                      AND {filter_condition}
+                """
+                span_alias = f"annotation_{prefix}span_filter_scan_{idx}"
+                latest_span_alias = f"annotation_{prefix}span_filter_latest_{idx}"
+                candidate_alias = f"annotation_{prefix}candidates_{idx}"
+                direct_trace_candidates = f"""
+                    SELECT DISTINCT direct_candidate.trace_id AS trace_id
+                    FROM {candidate_alias} AS direct_candidate
+                    WHERE direct_candidate.trace_id IS NOT NULL
+                """
+                if self._direct_trace_project_scope_available:
+                    direct_trace_projects = latest_live_trace_projects_sql(
+                        candidate_trace_ids_sql=direct_trace_candidates
+                    )
+                    direct_trace_branch = f"""
+                        SELECT toString(project_scoped_trace.trace_id) AS trace_id
+                        FROM ({direct_trace_projects}) AS project_scoped_trace
+                    """
+                else:
+                    direct_trace_branch = f"""
+                        SELECT toString(direct_annotation.trace_id) AS trace_id
+                        FROM {candidate_alias} AS direct_annotation
+                        WHERE direct_annotation.trace_id IS NOT NULL
+                          AND dictGet(
+                                  'trace_dict',
+                                  'project_id',
+                                  direct_annotation.trace_id
+                              ) IN %(project_ids)s
+                    """
+                subquery = f"""{trace_id_expr} IN (
+                    WITH {candidate_alias} AS ({filtered_annotations})
+                    SELECT DISTINCT annotation_membership.trace_id
+                    FROM (
+                        {direct_trace_branch}
+                        UNION ALL
+                        SELECT tupleElement(
+                                   {latest_span_alias}.latest_state, 1
+                               ) AS trace_id
+                        FROM (
+                            SELECT
+                                {span_alias}.id AS id,
+                                uniqExact(
+                                    tuple(
+                                        {span_alias}.project_id,
+                                        {span_alias}.trace_id
+                                    )
+                                ) AS identity_count,
+                                argMax(
+                                    tuple(
+                                        {span_alias}.trace_id,
+                                        {span_alias}._peerdb_is_deleted
+                                    ),
+                                    {span_alias}._peerdb_version
+                                ) AS latest_state
+                            FROM spans AS {span_alias}
+                            PREWHERE {span_alias}.project_id IN %(project_ids)s
+                            WHERE {span_alias}.id IN (
+                                SELECT observation_span_id
+                                FROM {candidate_alias}
+                                WHERE observation_span_id IS NOT NULL
+                                  AND observation_span_id != ''
+                            )
+                            GROUP BY {span_alias}.id
+                        ) AS {latest_span_alias}
+                        WHERE {latest_span_alias}.identity_count = 1
+                          AND tupleElement(
+                                  {latest_span_alias}.latest_state, 2
+                              ) = 0
+                    ) AS annotation_membership
+                    WHERE annotation_membership.trace_id != ''
                 )"""
                 clauses.append(subquery)
                 extra_params[label_id_key] = label_id
                 extra_params[ann_org_key] = self.organization_id
-                extra_params[val_key] = _coerce_filter_value(val, op)
+                extra_params[val_key] = filter_value
                 idx += 1
 
         return clauses, extra_params

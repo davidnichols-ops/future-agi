@@ -192,7 +192,14 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 sql, params = builder.build_metric_query(metric)
                 return (metric_info, fetch_rows(sql, params))
             except InvalidMetricCombinationError as e:
-                metric_info["error"] = str(e)
+                metric_info.update(
+                    {
+                        "query_complete": False,
+                        "query_status": "degraded",
+                        "query_error_code": "query_failed",
+                        "error": str(e),
+                    }
+                )
                 return (metric_info, [])
             except Exception as exc:
                 if not is_read_budget_error(exc):
