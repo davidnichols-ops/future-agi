@@ -728,8 +728,20 @@ def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
     )
 
     anchor_sql, anchor_params = builder.build_filter_anchor_probe(limit=513)
+    normalized_anchor_sql = " ".join(anchor_sql.split())
 
     assert builder.supports_filter_anchor_probe() is True
+    assert "SELECT trace_id FROM spans" in normalized_anchor_sql
+    assert "SELECT DISTINCT" not in normalized_anchor_sql
+    assert (
+        "ORDER BY observation_type DESC, service_name DESC, "
+        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
+        "start_time DESC" in normalized_anchor_sql
+    )
+    assert "LIMIT 1 BY trace_id" in normalized_anchor_sql
+    assert normalized_anchor_sql.index("ORDER BY") < normalized_anchor_sql.index(
+        "LIMIT 1 BY trace_id"
+    )
     assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in anchor_sql
     assert "JSONExtract" not in anchor_sql
     assert anchor_params["latest_filter_key_0"] == "final_status"
@@ -915,7 +927,15 @@ def test_org_trace_builder_keeps_project_in_seed_classifier_and_page_keys() -> N
     count_sql, _ = unfiltered.build_count_query()
     attributes_sql, _ = unfiltered.build_span_attributes_query(["shared-trace"])
 
-    assert "SELECT DISTINCT project_id, trace_id" in anchor_sql
+    normalized_anchor_sql = " ".join(anchor_sql.split())
+    assert "SELECT project_id, trace_id FROM spans" in normalized_anchor_sql
+    assert "SELECT DISTINCT" not in normalized_anchor_sql
+    assert (
+        "ORDER BY project_id DESC, observation_type DESC, service_name DESC, "
+        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
+        "start_time DESC" in normalized_anchor_sql
+    )
+    assert "LIMIT 1 BY project_id, trace_id" in normalized_anchor_sql
     assert "SELECT project_id, trace_id, id AS root_span_id" in ordered_sql
     assert (
         "ORDER BY start_time DESC, trace_id DESC, toString(project_id) DESC"

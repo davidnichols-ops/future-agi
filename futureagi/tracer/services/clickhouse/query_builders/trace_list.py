@@ -702,14 +702,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         slice_start: datetime | None = None,
         slice_end: datetime | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Return a finite unordered any-span candidate sentinel.
+        """Return a finite, stable any-span candidate sentinel.
 
-        ``DISTINCT ... LIMIT`` can stop after the sentinel and uses the
-        deployed Map key/value bloom expressions directly. It deliberately
-        does not ``GROUP BY`` or order the full match set: both forms scanned
-        the complete input on production and exceeded the 512 MiB read budget.
-        Every row is only a superset seed; the finite classifier resolves its
-        physical latest state before it can become a result.
+        Follow the ``spans`` sorting-key suffix before de-duplicating trace
+        identities.  This lets ClickHouse stop after the sentinel without a
+        full match-set sort and prevents parallel part scheduling from choosing
+        a different raw trace sample on every replica/run.  Every row remains
+        only a superset seed; the finite classifier resolves its physical
+        latest state before it can become a result.
         """
 
         if limit <= 0 or (limit == 1 and slice_start is None and slice_end is None):
@@ -754,8 +754,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                   cityHash64(%(bounded_sampling_salt)s, toString(trace_id)), 100
               ) < %(bounded_sampling_rate)s
             """
+        identity_projection = (
+            "project_id, trace_id" if self.project_ids is not None else "trace_id"
+        )
+        identity_limit_by = (
+            "project_id, trace_id" if self.project_ids is not None else "trace_id"
+        )
+        project_order_fragment = (
+            "project_id DESC,\n            " if self.project_ids is not None else ""
+        )
         query = f"""
-        SELECT DISTINCT {"project_id, trace_id" if self.project_ids is not None else "trace_id"}
+        SELECT {identity_projection}
         FROM {self.TABLE}
         PREWHERE {self.project_filter_sql()}
           AND is_deleted = 0
@@ -764,6 +773,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
           AND start_time < fromUnixTimestamp64Micro(%(filter_anchor_end_us)s)
         WHERE {anchor_predicate}
           {sampling_fragment}
+        ORDER BY
+            {project_order_fragment}observation_type DESC,
+            service_name DESC,
+            toStartOfHour(start_time) DESC,
+            trace_id DESC,
+            id DESC,
+            start_time DESC
+        LIMIT 1 BY {identity_limit_by}
         LIMIT %(filter_anchor_limit)s
         """
         return query, params

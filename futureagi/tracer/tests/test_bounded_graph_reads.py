@@ -357,7 +357,15 @@ def test_filtered_graph_candidates_are_finite_latest_state_samples(
         call for call in analytics.calls if candidate_param in call[1]
     )
     if observe_type == "trace":
-        assert "SELECT DISTINCT trace_id" in seed_query
+        normalized_seed_query = " ".join(seed_query.split())
+        assert "SELECT trace_id FROM spans" in normalized_seed_query
+        assert "SELECT DISTINCT" not in normalized_seed_query
+        assert (
+            "ORDER BY observation_type DESC, service_name DESC, "
+            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
+            "start_time DESC" in normalized_seed_query
+        )
+        assert "LIMIT 1 BY trace_id" in normalized_seed_query
         assert seed_params["filter_anchor_limit"] == 513
     else:
         assert "LIMIT %(filter_anchor_limit)s" in seed_query
@@ -2713,19 +2721,22 @@ def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
         for query, params, *_ in analytics.calls
         if "filter_anchor_limit" in params
     ]
-    if observe_type == "span":
-        expected_order = (
-            "ORDER BY observation_type DESC, service_name DESC, "
-            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
-            "start_time DESC"
+    expected_order = (
+        "ORDER BY observation_type DESC, service_name DESC, "
+        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
+        "start_time DESC"
+    )
+    assert anchor_queries
+    for query in anchor_queries:
+        normalized = " ".join(query.split())
+        assert expected_order in normalized
+        expected_limit_by = (
+            "LIMIT 1 BY trace_id"
+            if observe_type == "trace"
+            else "LIMIT 1 BY project_id, trace_id, id, start_time"
         )
-        assert anchor_queries
-        for query in anchor_queries:
-            normalized = " ".join(query.split())
-            assert expected_order in normalized
-            assert normalized.index("ORDER BY") < normalized.index("LIMIT 1 BY")
-    else:
-        assert all("ORDER BY" not in query for query in anchor_queries)
+        assert expected_limit_by in normalized
+        assert normalized.index("ORDER BY") < normalized.index(expected_limit_by)
 
 
 @pytest.mark.unit
@@ -2824,15 +2835,18 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
         for query, params, *_ in first_analytics.calls
         if "filter_anchor_limit" in params
     ]
-    if observe_type == "span":
-        assert all(
-            "ORDER BY observation_type DESC, service_name DESC, "
-            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
-            "start_time DESC" in " ".join(query.split())
-            for query in anchor_queries
-        )
-    else:
-        assert all("ORDER BY" not in query for query in anchor_queries)
+    assert all(
+        "ORDER BY observation_type DESC, service_name DESC, "
+        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
+        "start_time DESC" in " ".join(query.split())
+        for query in anchor_queries
+    )
+    expected_limit_by = (
+        "LIMIT 1 BY trace_id"
+        if observe_type == "trace"
+        else "LIMIT 1 BY project_id, trace_id, id, start_time"
+    )
+    assert all(expected_limit_by in query for query in anchor_queries)
     assert len(first_analytics.calls) <= (stratum_count * 2)
     if observe_type == "trace":
         classifier_calls = [
