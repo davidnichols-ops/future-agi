@@ -7376,10 +7376,14 @@ class TestDashboardV2RewriteRouting:
             }
         ]
 
-        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
 
         assert "trace_session_id_remap" in sql
         assert "end_user_id_remap" not in sql
+        assert "AS session_filter_physical_map" in sql
+        assert "sp.trace_session_id IN (" in sql
+        assert "PREWHERE sp.project_id IN %(project_ids)s" in sql
+        assert len(params["direct_session_filter_uuids"]) == 1
 
     def test_combined_user_and_session_query_reads_both_remaps(self):
         config = _single_metric_config(
@@ -7409,6 +7413,56 @@ class TestDashboardV2RewriteRouting:
 
         assert "trace_session_id_remap" in sql
         assert "end_user_id_remap" in sql
+        assert "session_filter_physical_map" in sql
+        assert "user_filter_physical_map" in sql
+
+    def test_invalid_positive_session_filter_short_circuits_physical_scan(self):
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "session",
+                "operator": "equal_to",
+                "value": "not-a-uuid",
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "AND (0)" in sql
+        assert "direct_session_filter_uuids" not in params
+
+    def test_large_session_candidate_set_keeps_exact_outer_plan(self):
+        session_ids = [str(uuid.uuid4()) for _ in range(65)]
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "session",
+                "operator": "contains",
+                "value": session_ids,
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "session_filter_physical_map" not in sql
+        assert "direct_session_filter_uuids" not in params
+        assert params["f_0_val"] == session_ids
 
     def test_user_dimension_identity_is_project_scoped(self):
         config = _single_metric_config(

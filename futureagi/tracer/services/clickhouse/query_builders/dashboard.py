@@ -398,6 +398,7 @@ def _resolved_spans_source(
     *,
     include_end_user_dimension: bool = False,
     physical_end_user_filter: str = "",
+    physical_trace_session_filter: str = "",
     resolve_end_user_id: bool = True,
     resolve_trace_session_id: bool = True,
 ) -> str:
@@ -468,13 +469,18 @@ def _resolved_spans_source(
     # existing project/time primary key and end_user_id bloom/projection. The
     # outer predicate is deliberately retained as a semantic guard.
     inner_scope = ""
-    if physical_end_user_filter:
+    physical_filters = [
+        predicate
+        for predicate in (physical_end_user_filter, physical_trace_session_filter)
+        if predicate
+    ]
+    if physical_filters:
         inner_scope = (
             " PREWHERE sp.project_id IN %(project_ids)s "
             "AND sp.start_time >= %(start_date)s "
             "AND sp.start_time < %(end_date)s "
-            "WHERE sp._peerdb_is_deleted = 0 "
-            f"AND ({physical_end_user_filter})"
+            "WHERE sp._peerdb_is_deleted = 0"
+            + "".join(f" AND ({predicate})" for predicate in physical_filters)
         )
 
     additional_projection = (
@@ -849,6 +855,83 @@ class DashboardQueryBuilder:
         )"""
         return f"({curated_membership} OR {fallback_membership})"
 
+    def _direct_session_physical_span_filter(
+        self,
+        per_metric_filters: list[dict],
+        params: dict[str, Any] | None,
+    ) -> str:
+        """Resolve finite positive session filters to physical span ids.
+
+        The public session value is the remap survivor UUID. Expand that
+        survivor back to every old/new physical id before scanning spans so
+        ClickHouse can use the trace_session_id bloom index. The exact outer
+        predicate remains in place as a semantic guard.
+        """
+
+        if params is None:
+            return ""
+
+        candidate_sets: list[set[str]] = []
+        supported_operations = frozenset({"equal_to", "contains"})
+        for item in self.global_filters + (per_metric_filters or []):
+            if item.get("source", "traces") not in ("traces", ""):
+                continue
+            filter_type = item.get("metric_type") or item.get("type", "")
+            filter_name = (
+                item.get("metric_name") or item.get("name") or item.get("id", "")
+            ).lower()
+            operation = item.get("operator", "")
+            value = item.get("value")
+            if (
+                filter_type != "system_metric"
+                or filter_name != "session"
+                or operation not in supported_operations
+                or value is None
+                or value == ""
+                or value == []
+            ):
+                continue
+
+            raw_values = value if isinstance(value, list) else [value]
+            candidates: set[str] = set()
+            for raw_value in raw_values:
+                if not isinstance(raw_value, str):
+                    continue
+                try:
+                    candidates.add(str(UUID(raw_value)))
+                except ValueError:
+                    continue
+            candidate_sets.append(candidates)
+
+        if not candidate_sets:
+            return ""
+        candidate_uuids = set.intersection(*candidate_sets)
+        if len(candidate_uuids) > 64:
+            return ""
+        if not candidate_uuids:
+            return "0"
+
+        ordered_candidates = tuple(sorted(candidate_uuids))
+        params["direct_session_filter_uuids"] = ordered_candidates
+        literal_param_keys: list[str] = []
+        for candidate_index, candidate_value in enumerate(ordered_candidates):
+            parameter_key = f"direct_session_filter_uuid_{candidate_index}"
+            params[parameter_key] = candidate_value
+            literal_param_keys.append(parameter_key)
+
+        physical_map = survivor_map_subquery("trace_session_id_remap")
+        literal_branches = " UNION ALL ".join(
+            f"SELECT toUUID(%({parameter_key})s) AS physical_trace_session_id"
+            for parameter_key in literal_param_keys
+        )
+        return f"""sp.trace_session_id IN (
+            SELECT any_id AS physical_trace_session_id
+            FROM ({physical_map}) AS session_filter_physical_map
+            WHERE survivor_id IN %(direct_session_filter_uuids)s
+            UNION DISTINCT
+            {literal_branches}
+        )"""
+
     def _spans_source(
         self,
         metric_name: str | None,
@@ -870,6 +953,9 @@ class DashboardQueryBuilder:
             physical_end_user_filter = self._direct_user_physical_span_filter(
                 per_metric_filters, params
             )
+            physical_trace_session_filter = self._direct_session_physical_span_filter(
+                per_metric_filters, params
+            )
             return _resolved_spans_source(
                 None if alias == "spans" else alias,
                 include_end_user_dimension=(
@@ -879,6 +965,7 @@ class DashboardQueryBuilder:
                     )
                 ),
                 physical_end_user_filter=physical_end_user_filter,
+                physical_trace_session_filter=physical_trace_session_filter,
                 resolve_end_user_id=resolve_end_user_id,
                 resolve_trace_session_id=self._query_references_session_dimension(
                     metric_name, per_metric_filters
