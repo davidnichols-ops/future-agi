@@ -2565,15 +2565,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             **self.params,
             "sc_trace_ids": tuple(trace_ids),
         }
+        span_window = self._span_time_window(params)
         query = f"""
         SELECT
             trace_id,
             count() AS span_count,
             countIf(status = 'ERROR') AS error_count
         FROM {self.TABLE}
-        WHERE {self.project_filter_sql()}
+        PREWHERE {self.project_filter_sql()}
           AND trace_id IN %(sc_trace_ids)s
-          AND is_deleted = 0
+          {span_window}
+        WHERE is_deleted = 0
         GROUP BY trace_id
         """
         return query, params

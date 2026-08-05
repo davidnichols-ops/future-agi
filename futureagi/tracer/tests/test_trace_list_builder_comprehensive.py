@@ -249,9 +249,9 @@ class TestBuildSpanCountScoping:
     def test_project_scoping_and_deletion(self, project_id, trace_ids):
         builder = TraceListQueryBuilder(project_id=project_id)
         query, params = builder.build_span_count_query(trace_ids)
-        assert "project_id = %(project_id)s" in query
+        assert "PREWHERE project_id = %(project_id)s" in query
         assert params["project_id"] == project_id
-        assert "is_deleted = 0" in query
+        assert "WHERE is_deleted = 0" in query
         assert "_peerdb_is_deleted" not in query
         assert "trace_id IN %(sc_trace_ids)s" in query
 
@@ -259,8 +259,28 @@ class TestBuildSpanCountScoping:
         pids = [str(uuid.uuid4())]
         builder = TraceListQueryBuilder(project_ids=pids)
         query, params = builder.build_span_count_query(trace_ids)
-        assert "project_id IN %(project_ids)s" in query
+        assert "PREWHERE project_id IN %(project_ids)s" in query
         assert params["project_ids"] == tuple(pids)
+
+    def test_start_time_window_after_build(self, project_id, trace_ids):
+        builder = TraceListQueryBuilder(project_id=project_id)
+        builder.build()
+
+        query, params = builder.build_span_count_query(trace_ids)
+
+        assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in query
+        assert "start_time < %(end_date)s + INTERVAL 1 DAY" in query
+        assert params["start_date"] == builder.start_date
+        assert params["end_date"] == builder.end_date
+
+    def test_no_window_standalone(self, project_id, trace_ids):
+        builder = TraceListQueryBuilder(project_id=project_id)
+
+        query, params = builder.build_span_count_query(trace_ids)
+
+        assert "start_time" not in query
+        assert "start_date" not in params
+        assert "end_date" not in params
 
 
 # ---------------------------------------------------------------------------
