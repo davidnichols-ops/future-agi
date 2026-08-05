@@ -62,9 +62,9 @@ GRAPH_ANY_SPAN_ROWS_PER_STRATUM = 49
 # A long-window trace graph is already an explicitly incomplete temporal sample.
 # Three visible traces plus one sentinel in each of four disjoint strata preserves
 # full-window temporal coverage while bounding the raw union at 16 identities.
-# The union therefore needs one 20-ID full-window classifier, and at most 12
-# proven traces enter final child-span/eval/annotation decoration. Span graphs
-# aggregate in process and retain the established 49-row ceiling.
+# The union therefore needs at most four five-ID full-window classifiers, and
+# at most 12 proven traces enter final child-span/eval/annotation decoration.
+# Span graphs aggregate in process and retain the established 49-row ceiling.
 GRAPH_TRACE_ROWS_PER_STRATUM = 3
 # Trace decoration accepts at most forty identities. Unindexed discovery may
 # inspect the finite raw ceiling below in each stratum, but only the newest five
@@ -1041,9 +1041,9 @@ def _read_time_distributed_candidates(
             if identity_is_valid:
                 rows_by_id[identity] = row
 
-    # Only the latest-state classifier may publish trace rows. One union query
-    # preserves cross-stratum root/child and multi-leaf semantics while removing
-    # the prior eight repeated full-window classifier scans.
+    # Only the latest-state classifier may publish trace rows. One bounded union
+    # replay preserves cross-stratum root/child and multi-leaf semantics while
+    # removing the prior eight repeated large full-window classifier scans.
     if deferred_trace_strata:
         (
             classified_rows_by_id,
