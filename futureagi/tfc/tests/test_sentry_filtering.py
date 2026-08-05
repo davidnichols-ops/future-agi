@@ -16,6 +16,7 @@ from tfc.logging.sentry import (
     _get_before_send,
     _is_sensitive_key,
     _scrub,
+    _scrub_deployment_telemetry_event,
     _scrub_event,
 )
 
@@ -126,3 +127,95 @@ def test_scrub_event_is_resilient_to_unexpected_shapes():
 def test_before_send_handles_unexpected_logentry_shape():
     event = {"logger": "tracer.views.foo", "message": "real error", "logentry": "x"}
     assert before_send(event, {}) is not None
+
+
+def test_scrubs_telemetry_body_when_breadcrumbs_are_a_list():
+    """SDK-normalized events may expose breadcrumb values as a bare list."""
+    event = {
+        "breadcrumbs": [
+            {
+                "category": "httplib",
+                "data": {
+                    "url": "https://api.futureagi.com/telemetry/register/",
+                    "method": "POST",
+                    "body": '{"users":[{"email":"secret@example.com"}]}',
+                },
+            }
+        ],
+        "request": {"url": "https://example.com/unrelated/endpoint"},
+    }
+
+    scrubbed = _scrub_deployment_telemetry_event(event)
+
+    assert "body" not in scrubbed["breadcrumbs"][0]["data"]
+    assert scrubbed["breadcrumbs"][0]["data"]["url"].endswith("/telemetry/register/")
+
+
+def test_scrubber_ignores_unexpected_breadcrumb_shapes():
+    for breadcrumbs in (
+        None,
+        "unexpected",
+        {"values": "unexpected"},
+        [None, "unexpected", {"data": "unexpected"}],
+    ):
+        event = {
+            "breadcrumbs": breadcrumbs,
+            "request": {"url": "https://example.com/unrelated/endpoint"},
+        }
+
+        assert _scrub_deployment_telemetry_event(event) is event
+
+
+def test_scrubber_ignores_unexpected_request_and_exception_shapes():
+    telemetry_url = "https://api.futureagi.com/telemetry/register/"
+    malformed_events = (
+        {"request": "unexpected"},
+        {"request": {"url": telemetry_url}, "exception": "unexpected"},
+        {
+            "request": {"url": telemetry_url},
+            "exception": {"values": "unexpected"},
+        },
+        {
+            "request": {"url": telemetry_url},
+            "exception": {
+                "values": [
+                    None,
+                    "unexpected",
+                    {"stacktrace": "unexpected"},
+                    {"stacktrace": {"frames": "unexpected"}},
+                ]
+            },
+        },
+    )
+
+    for event in malformed_events:
+        assert _scrub_deployment_telemetry_event(event) is event
+
+
+def test_scrubber_removes_telemetry_request_data_and_frame_vars():
+    event = {
+        "request": {
+            "url": "https://api.futureagi.com/telemetry/register/",
+            "data": {"email": "secret@example.com"},
+        },
+        "exception": {
+            "values": [
+                None,
+                {
+                    "stacktrace": {
+                        "frames": [
+                            None,
+                            {"vars": {"token": "secret"}, "function": "register"},
+                        ]
+                    }
+                },
+            ]
+        },
+    }
+
+    scrubbed = _scrub_deployment_telemetry_event(event)
+
+    assert "data" not in scrubbed["request"]
+    frame = scrubbed["exception"]["values"][1]["stacktrace"]["frames"][1]
+    assert "vars" not in frame
+    assert frame["function"] == "register"

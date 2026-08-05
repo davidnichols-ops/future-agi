@@ -156,7 +156,9 @@ describe("GraphSection exact graph boundary", () => {
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
     expect(
-      await screen.findByText("Showing sampled values, not full totals."),
+      await screen.findByText(
+        "Results are incomplete and sample-limited; values are estimates.",
+      ),
     ).toBeInTheDocument();
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
     expect(axios.post).toHaveBeenCalledWith(

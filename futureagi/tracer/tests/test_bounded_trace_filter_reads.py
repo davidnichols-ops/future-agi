@@ -384,10 +384,10 @@ def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
     assert builder.recommended_filter_classify_batch_size() == 100
     assert builder.skip_full_window_filter_anchor_probe() is False
     assert builder.recommended_filter_anchor_probe_limit() == 64
-    assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 900
     assert builder.recommended_filter_anchor_probe_strata() == 4
     assert (
-        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 96 * 1024 * 1024
+        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 192 * 1024 * 1024
     )
     assert builder.recommended_filter_classify_read_settings() is None
 
@@ -727,7 +727,10 @@ def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 20
     assert builder.recommended_filter_anchor_probe_limit() == 64
-    assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 900
+    assert (
+        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 192 * 1024 * 1024
+    )
     assert (
         builder.supports_filter_candidate_witness_prefilter_without_hydration() is False
     )
@@ -4825,6 +4828,320 @@ def _incomplete_empty_page(
         result_payload_bytes=8_192,
         attempts=(),
     )
+
+
+def _observe_trace_request(
+    query_params: dict[str, str] | None = None,
+) -> SimpleNamespace:
+    organization = SimpleNamespace(pk="org-a")
+    return SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(pk="user-a", organization=organization),
+        query_params=query_params or {},
+    )
+
+
+def _call_observe_trace_list_with_bounded_page(
+    *,
+    bounded_page: BoundedFilterPage,
+    validated_data: dict[str, Any],
+    request: SimpleNamespace | None = None,
+    analytics: Any | None = None,
+) -> tuple[Any, mock.MagicMock, Any, SimpleNamespace]:
+    from tracer.views.trace import TraceView
+
+    request = request or _observe_trace_request()
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    analytics = analytics or mock.MagicMock()
+
+    with (
+        mock.patch("tracer.views.trace.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded_page,
+        ) as bounded_reader,
+        mock.patch(
+            "tracer.views.trace.capture_snapshot_version_ceiling", return_value=42
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        response = view._list_traces_of_session_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data=validated_data,
+            analytics=analytics,
+            org_project_ids=None,
+            org=request.organization,
+        )
+
+    return response, bounded_reader, analytics, request
+
+
+def test_observe_trace_opted_in_cursor_page_publishes_terminal_degradation() -> None:
+    from tracer.serializers.trace import TraceObserveListResponseSerializer
+
+    response, bounded_reader, analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=_incomplete_empty_page("query_budget_exceeded"),
+            request=_observe_trace_request({"allow_sampled": "true"}),
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": True,
+                "allow_sampled": True,
+            },
+        )
+    )
+
+    assert response[0] == "ok"
+    payload = response[1]
+    assert payload["table"] == []
+    assert payload["metadata"]["total_rows"] == 0
+    assert payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert "total_rows_exact" not in payload["metadata"]
+    assert payload["metadata"]["query_complete"] is False
+    assert payload["metadata"]["query_status"] == "degraded"
+    assert payload["metadata"]["query_error_code"] == "query_budget_exceeded"
+    assert payload["metadata"]["has_more"] is False
+    assert payload["metadata"]["next_cursor"] is None
+    assert "DB::Exception" not in str(payload)
+    assert "ClickHouse" not in str(payload)
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is True
+    response_serializer = TraceObserveListResponseSerializer(
+        data={"status": True, "result": payload}
+    )
+    assert response_serializer.is_valid(), response_serializer.errors
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_trace_nonempty_partial_is_enriched_ordered_and_terminal() -> None:
+    newer = END - timedelta(minutes=1)
+    older = END - timedelta(minutes=2)
+    bounded_page = BoundedFilterPage(
+        rows=[
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-newer",
+                "root_span_id": "root-newer",
+                "trace_name": "newer",
+                "span_name": "root-newer",
+                "observation_type": "llm",
+                "status": "OK",
+                "start_time": newer,
+                "latency_ms": 12.0,
+                "cost": 0.001,
+            },
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-older",
+                "root_span_id": "root-older",
+                "trace_name": "older",
+                "span_name": "root-older",
+                "observation_type": "llm",
+                "status": "OK",
+                "start_time": older,
+                "latency_ms": 14.0,
+                "cost": 0.002,
+            },
+        ],
+        # The selector found and classified one full page, but could not prove
+        # whether another matching row exists inside its bounded read budget.
+        has_more=True,
+        complete=False,
+        status="degraded",
+        error_code="query_budget_exceeded",
+        total_rows_lower_bound=2,
+        elapsed_ms=4_500.0,
+        query_count=8,
+        rows_returned=400,
+        result_payload_bytes=8_192,
+        attempts=(),
+    )
+
+    class RecordingAnalytics:
+        def __init__(self) -> None:
+            self.calls: list[tuple[dict[str, Any], int, dict[str, Any]]] = []
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.calls.append((params, timeout_ms, settings))
+            if "content_trace_ids" in params:
+                data = [
+                    {
+                        "trace_id": trace_id,
+                        "input": f"input-{trace_id}",
+                        "output": f"output-{trace_id}",
+                        "attrs_string": {},
+                        "attrs_number": {},
+                        "attrs_bool": {},
+                        "attributes_extra": "{}",
+                        "metadata": "{}",
+                        "trace_tags": [],
+                    }
+                    for trace_id in ("trace-newer", "trace-older")
+                ]
+            else:
+                data = []
+            return QueryResult(data, len(data), "clickhouse", 0.0)
+
+    analytics = RecordingAnalytics()
+    view_response, bounded_reader, _analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=bounded_page,
+            request=_observe_trace_request({"allow_sampled": "true"}),
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 2,
+                "cursor_mode": True,
+                "allow_sampled": True,
+            },
+            analytics=analytics,
+        )
+    )
+
+    assert view_response[0] == "ok"
+    payload = view_response[1]
+    assert [row["trace_id"] for row in payload["table"]] == [
+        "trace-newer",
+        "trace-older",
+    ]
+    assert [row["input"] for row in payload["table"]] == [
+        "input-trace-newer",
+        "input-trace-older",
+    ]
+    assert len(payload["table"]) == 2
+    assert payload["metadata"]["total_rows"] == 2
+    assert payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert "total_rows_exact" not in payload["metadata"]
+    assert payload["metadata"]["query_complete"] is False
+    assert payload["metadata"]["query_status"] == "degraded"
+    assert payload["metadata"]["query_error_code"] == "query_budget_exceeded"
+    assert payload["metadata"]["has_more"] is False
+    assert payload["metadata"]["next_cursor"] is None
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is True
+    assert len(analytics.calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("query_params", "validated_allow_sampled"),
+    [({}, None), ({"allow_sampled": "false"}, False)],
+)
+def test_observe_trace_incomplete_page_remains_fail_closed_without_explicit_sample(
+    query_params: dict[str, str],
+    validated_allow_sampled: bool | None,
+) -> None:
+    validated_data: dict[str, Any] = {
+        "filters": [
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        "page_number": 0,
+        "page_size": 25,
+    }
+    if validated_allow_sampled is not None:
+        validated_data["allow_sampled"] = validated_allow_sampled
+
+    response, bounded_reader, analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=_incomplete_empty_page("query_budget_exceeded"),
+            request=_observe_trace_request(query_params),
+            validated_data=validated_data,
+        )
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2] == {"code": "service_unavailable"}
+    assert "DB::Exception" not in str(response)
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_trace_later_page_does_not_publish_an_incomplete_sample() -> None:
+    response, bounded_reader, analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=_incomplete_empty_page("query_budget_exceeded"),
+            request=_observe_trace_request({"allow_sampled": "true"}),
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 1,
+                "page_size": 25,
+                "allow_sampled": True,
+            },
+        )
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2] == {"code": "service_unavailable"}
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_trace_cursor_continuation_does_not_publish_incomplete_sample() -> None:
+    from tracer.services.clickhouse.list_cursor import (
+        cursor_scope_for_request,
+        encode_list_cursor,
+    )
+
+    request = _observe_trace_request({"allow_sampled": "true"})
+    validated_data = {
+        "filters": [
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        "page_number": 0,
+        "page_size": 25,
+        "cursor_mode": True,
+        "allow_sampled": True,
+    }
+    cursor = encode_list_cursor(
+        resource="observe_traces",
+        scope=cursor_scope_for_request(request, project_ids=[PROJECT_ID]),
+        query=validated_data,
+        page_size=25,
+        window_start=START.replace(tzinfo=UTC),
+        window_end=END.replace(tzinfo=UTC),
+        order=(END.replace(tzinfo=UTC), "trace-z"),
+        version_ceiling=42,
+        seen_rows=25,
+    )
+    validated_data["cursor"] = cursor
+    request.query_params["cursor"] = cursor
+
+    response, bounded_reader, analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=_incomplete_empty_page("query_budget_exceeded"),
+            request=request,
+            validated_data=validated_data,
+        )
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2] == {"code": "service_unavailable"}
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    analytics.execute_ch_query.assert_not_called()
 
 
 @override_settings(CLICKHOUSE_V2={"QUERY_TYPES_DISABLED": "VOICE_CALL_LIST"})

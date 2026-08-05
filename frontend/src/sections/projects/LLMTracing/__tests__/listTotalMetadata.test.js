@@ -2,11 +2,77 @@ import { describe, expect, it } from "vitest";
 
 import {
   formatSelectionCount,
+  getListReadMessage,
   getListTotalState,
   getSelectionCountState,
 } from "../listTotalMetadata";
+import {
+  QUERY_READ_BOUNDED_TOTAL_MESSAGE,
+  QUERY_READ_RETRY_MESSAGE,
+  QUERY_READ_SAMPLED_MESSAGE,
+} from "src/utils/queryReadState";
 
 describe("list total metadata", () => {
+  it("labels only the count as estimated when page rows are complete", () => {
+    const payload = {
+      result: {
+        metadata: {
+          query_complete: true,
+          query_status: "complete",
+          total_rows: 26,
+          total_rows_is_lower_bound: true,
+        },
+      },
+    };
+
+    expect(getListReadMessage(payload)).toBe(QUERY_READ_BOUNDED_TOTAL_MESSAGE);
+  });
+
+  it("does not warn when both page rows and the total are exact", () => {
+    expect(
+      getListReadMessage({
+        result: {
+          metadata: {
+            query_complete: true,
+            query_status: "complete",
+            total_rows_is_lower_bound: false,
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("prioritizes an incomplete read over lower-bound count copy", () => {
+    expect(
+      getListReadMessage({
+        result: {
+          metadata: {
+            query_complete: false,
+            query_status: "degraded",
+            total_rows_is_lower_bound: true,
+          },
+        },
+      }),
+    ).toBe(QUERY_READ_RETRY_MESSAGE);
+  });
+
+  it("labels a valid sampled read as incomplete rather than count-only", () => {
+    expect(
+      getListReadMessage({
+        result: {
+          metadata: {
+            query_complete: false,
+            query_status: "sampled",
+            query_sampling_strategy: "time_stratified_latest_state",
+            query_sampling_strata: 8,
+            query_sampling_strata_completed: 8,
+            total_rows_is_lower_bound: true,
+          },
+        },
+      }),
+    ).toBe(QUERY_READ_SAMPLED_MESSAGE);
+  });
+
   it("keeps an exact total available to exact-count consumers", () => {
     expect(
       getListTotalState({

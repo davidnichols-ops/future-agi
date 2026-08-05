@@ -39,11 +39,11 @@ import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
 import {
   failServerSideGridRead,
-  getQueryReadMessage,
   getQueryReadState,
+  QUERY_FAILED_RETRY_MESSAGE,
 } from "src/utils/queryReadState";
 import { createListCursorPagination } from "./listCursorPagination";
-import { getListTotalState } from "./listTotalMetadata";
+import { getListReadMessage, getListTotalState } from "./listTotalMetadata";
 
 const ROWS_LIMIT = 25;
 const EMPTY_EXTRA_FILTERS = [];
@@ -92,9 +92,8 @@ const TraceGrid = React.forwardRef(
     const activeTraceId = traceDetailDrawerOpen?.traceId || null;
     const [openQuickFilter, setOpenQuickFilter] = useState(null);
     const [selectedAll, setSelectedAll] = useState(false);
-    const [readState, setReadState] = useState("complete");
-    const readStateRef = useRef("complete");
-    const readMessage = getQueryReadMessage(readState);
+    const [readMessage, setReadMessage] = useState(null);
+    const readMessageRef = useRef(null);
 
     // Use ref to track latest columns for comparison without triggering dataSource recreation
     const columnsRef = useRef(columns);
@@ -236,8 +235,8 @@ const TraceGrid = React.forwardRef(
               const pageSize = request.endRow - request.startRow;
               pageNumber = Math.floor(request.startRow / pageSize);
               if (pageNumber === 0) {
-                readStateRef.current = "complete";
-                setReadState("complete");
+                readMessageRef.current = null;
+                setReadMessage(null);
               }
 
               const buildParams = (page) =>
@@ -276,8 +275,9 @@ const TraceGrid = React.forwardRef(
               const res = results?.data?.result;
               const nextReadState = getQueryReadState(results?.data);
               if (pageNumber === 0 || nextReadState !== "complete") {
-                readStateRef.current = nextReadState;
-                setReadState(nextReadState);
+                const nextReadMessage = getListReadMessage(results?.data);
+                readMessageRef.current = nextReadMessage;
+                setReadMessage(nextReadMessage);
               }
               const newCols = normalizeConfigKeys(res?.config);
 
@@ -403,8 +403,8 @@ const TraceGrid = React.forwardRef(
                 params.api?.refreshServerSide?.({ purge: true });
                 return;
               }
-              readStateRef.current = "error";
-              setReadState("error");
+              readMessageRef.current = QUERY_FAILED_RETRY_MESSAGE;
+              setReadMessage(QUERY_FAILED_RETRY_MESSAGE);
               failServerSideGridRead(params);
             } finally {
               setLoading(false);
@@ -655,7 +655,7 @@ const TraceGrid = React.forwardRef(
                   color: "text.secondary",
                 }}
               >
-                {getQueryReadMessage(readStateRef.current) ||
+                {readMessageRef.current ||
                   (showErrors ? "No error found" : "No traces found")}
               </Typography>,
             )

@@ -2,7 +2,10 @@ export const QUERY_READ_RETRY_MESSAGE =
   "Results are incomplete. Please retry in a moment.";
 
 export const QUERY_READ_SAMPLED_MESSAGE =
-  "Showing sampled values, not full totals.";
+  "Results are incomplete and sample-limited; values are estimates.";
+
+export const QUERY_READ_BOUNDED_TOTAL_MESSAGE =
+  "Row results are complete; only the total count is estimated.";
 
 export const QUERY_FAILED_RETRY_MESSAGE =
   "We couldn't load this data. Please retry in a moment.";

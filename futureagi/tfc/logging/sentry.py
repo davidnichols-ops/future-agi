@@ -198,20 +198,54 @@ def _scrub_deployment_telemetry_event(event: dict) -> dict:
     # though the inbound branch scrubbed the request body. Walk breadcrumbs
     # unconditionally and strip body fields whose ``url`` points at a telemetry
     # path before running the inbound scrub.
-    for breadcrumb in event.get("breadcrumbs", {}).get("values", []) or []:
-        data = breadcrumb.get("data") or {}
+    breadcrumbs = event.get("breadcrumbs")
+    if isinstance(breadcrumbs, dict):
+        breadcrumb_values = breadcrumbs.get("values")
+    elif isinstance(breadcrumbs, (list, tuple)):
+        # Some Sentry SDK integrations provide the normalized breadcrumb list
+        # directly instead of wrapping it in ``{"values": [...]}``.
+        breadcrumb_values = breadcrumbs
+    else:
+        breadcrumb_values = ()
+    if not isinstance(breadcrumb_values, (list, tuple)):
+        breadcrumb_values = ()
+
+    for breadcrumb in breadcrumb_values or ():
+        if not isinstance(breadcrumb, dict):
+            continue
+        data = breadcrumb.get("data")
+        if not isinstance(data, dict):
+            continue
         if _is_telemetry_url(data.get("url")):
             for key in ("body", "data", "http.request.body", "request_body"):
                 data.pop(key, None)
             breadcrumb["data"] = data
 
-    request = event.get("request") or {}
+    request = event.get("request")
+    if not isinstance(request, dict):
+        return event
     if not _is_telemetry_url(request.get("url")):
         return event
 
     request.pop("data", None)
-    for exception in (event.get("exception") or {}).get("values", []):
-        for frame in (exception.get("stacktrace") or {}).get("frames", []):
+    exception_container = event.get("exception")
+    if not isinstance(exception_container, dict):
+        return event
+    exceptions = exception_container.get("values")
+    if not isinstance(exceptions, (list, tuple)):
+        return event
+    for exception in exceptions:
+        if not isinstance(exception, dict):
+            continue
+        stacktrace = exception.get("stacktrace")
+        if not isinstance(stacktrace, dict):
+            continue
+        frames = stacktrace.get("frames")
+        if not isinstance(frames, (list, tuple)):
+            continue
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
             frame.pop("vars", None)
     return event
 

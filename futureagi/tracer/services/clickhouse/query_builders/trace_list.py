@@ -95,15 +95,15 @@ _STRUCTURED_CLASSIFY_MAX_BLOCK_SIZE = 2_048
 
 # A long-window list gets a small, partitioned sparse-value proof before it
 # enters the ordered-root fallback. Sixty-four is one global exhaustiveness
-# sentinel across four adjacent time strata. Each statement gets only 300 ms
-# and 96 MiB: even if every speculative stratum reaches its byte ceiling, the
-# combined optional work stays comfortably below the normal 512 MiB statement
-# envelope. The selector discards the entire probe set on any sentinel or
-# resource failure, so none of these limits can change membership.
+# sentinel across four adjacent time strata. The four probes share one 900 ms
+# allowance and each statement is capped at 192 MiB. This accommodates the
+# largest observed production granule without approaching the normal 512 MiB
+# statement envelope. The selector discards the entire probe set on any
+# sentinel or resource failure, so none of these limits can change membership.
 _LONG_WINDOW_ANCHOR_SENTINEL = 64
-_LONG_WINDOW_ANCHOR_TIMEOUT_MS = 300
+_LONG_WINDOW_ANCHOR_TIMEOUT_MS = 900
 _LONG_WINDOW_ANCHOR_STRATA = 4
-_LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 96 * 1024 * 1024
+_LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 192 * 1024 * 1024
 _LONG_WINDOW_CANDIDATE_WITNESS_STRATA = 8
 _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH = timedelta(minutes=5)
 _UNINDEXED_POSITIVE_MICRO_SEED_STRATA = 4

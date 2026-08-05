@@ -27425,7 +27425,7 @@ page_size?: number;
 cursor?: string;
 cursor_mode?: boolean;
 /**
- * Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.
+ * Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total. Send true to opt in explicitly to lower-bound totals and, on the first page, a clearly labelled bounded partial result when the full ordered prefix cannot be proven inside the read budget.
  */
 allow_sampled?: boolean;
 interval?: string;

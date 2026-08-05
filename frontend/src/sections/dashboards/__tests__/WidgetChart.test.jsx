@@ -42,7 +42,8 @@ const queryResult = (points) => ({
 });
 
 const NO_DATA_MESSAGE = /No data available for this time period/i;
-const SAMPLED_MESSAGE = /Showing sampled values, not full totals/i;
+const SAMPLED_MESSAGE =
+  /Results are incomplete and sample-limited; values are estimates/i;
 const DEGRADED_MESSAGE = /Results are incomplete. Please retry/i;
 
 describe("WidgetChart — empty time-range state", () => {

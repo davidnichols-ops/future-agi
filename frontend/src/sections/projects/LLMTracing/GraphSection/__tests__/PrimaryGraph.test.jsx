@@ -238,7 +238,9 @@ describe("PrimaryGraph", () => {
     );
 
     expect(
-      await screen.findByText("Showing sampled values, not full totals."),
+      await screen.findByText(
+        "Results are incomplete and sample-limited; values are estimates.",
+      ),
     ).toBeInTheDocument();
     const chart = screen.getByTestId("apex-chart");
     expect(chart).toBeInTheDocument();

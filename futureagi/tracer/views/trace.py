@@ -3994,6 +3994,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             from tracer.selectors.trace_filter_reads import read_bounded_filter_page
             from tracer.services.clickhouse.query_service import QueryResult
 
+            # A first-page caller may explicitly opt in to a bounded, visibly
+            # degraded result when the exact ordered prefix cannot be proven.
+            # The selector publishes only latest-state-classified matches, never
+            # raw candidates. Omitted/false, numbered page N, and cursor
+            # continuations remain fail-closed so an incomplete working set can
+            # never be mistaken for an exact continuation.
+            publish_bounded_partial = bool(
+                validated_data.get("allow_sampled") is True
+                and page_number == 0
+                and cursor_state is None
+            )
             bounded_page = read_bounded_filter_page(
                 builder=builder,
                 analytics=analytics,
@@ -4009,6 +4020,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_order_token if cursor_state is not None else None
                 ),
                 read_settings=page_read_settings,
+                include_incomplete_rows=publish_bounded_partial,
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -4029,11 +4041,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     page_number=page_number,
                     error_code=bounded_page.error_code,
                 )
-                return self._gm.custom_error_response(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "Filtered trace data is temporarily unavailable. Please retry.",
-                    code="service_unavailable",
-                )
+                if not publish_bounded_partial:
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Filtered trace data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
             result = QueryResult(
                 data=bounded_page.rows,
                 row_count=len(bounded_page.rows),
@@ -4549,6 +4562,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         if (
             cursor_enabled
             and bounded_page is not None
+            and bounded_page.complete
             and bounded_page.has_more
             and result.data
             and version_ceiling is not None
@@ -4573,10 +4587,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         metadata = {"total_rows": total_count}
         if bounded_page is not None:
+            published_has_more = bool(bounded_page.complete and bounded_page.has_more)
             metadata.update(
                 {
                     "total_rows_is_lower_bound": True,
-                    "has_more": bounded_page.has_more,
+                    "has_more": published_has_more,
                     "query_complete": bounded_page.complete,
                     "query_status": bounded_page.status,
                     "query_error_code": bounded_page.error_code,
@@ -4586,14 +4601,21 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     "query_result_payload_bytes": query_result_payload_bytes,
                 }
             )
-        metadata.update(
-            cursor_page_metadata(
-                enabled=cursor_enabled,
-                has_more=bool(bounded_page and bounded_page.has_more),
-                seen_rows=cursor_seen_rows,
-                next_cursor=next_cursor,
+        if bounded_page is None or bounded_page.complete:
+            metadata.update(
+                cursor_page_metadata(
+                    enabled=cursor_enabled,
+                    has_more=bool(bounded_page and bounded_page.has_more),
+                    seen_rows=cursor_seen_rows,
+                    next_cursor=next_cursor,
+                )
             )
-        )
+        if bounded_page is not None and not bounded_page.complete:
+            # A cursor-mode first page must not relabel a partial row count as
+            # exact. Publish an explicit terminal cursor contract instead;
+            # clients cannot prefetch or continue an incomplete prefix.
+            metadata["has_more"] = False
+            metadata["next_cursor"] = None
         if metadata.get(
             "total_rows_is_lower_bound"
         ) and exact_total_explicitly_required(request, validated_data):
