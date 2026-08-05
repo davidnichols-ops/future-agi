@@ -1310,6 +1310,37 @@ def test_bounded_resolver_rejects_incomplete_page_without_partial_ids(
         )
 
 
+def test_bounded_resolver_sanitizes_plain_timeout_without_partial_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_read(**_kwargs):
+        raise TimeoutError("private selector timing diagnostic")
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    with pytest.raises(row_resolver.EvalTaskReadBudgetExceeded) as exc_info:
+        row_resolver._resolve_bounded_historical_span_ids(
+            object(),
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "filters": [_attribute_filter("final_status", "Rejected")],
+                "date_range": [START, END],
+            },
+            limit=25,
+            batch_size=256,
+            row_type=RowType.TRACES,
+        )
+
+    assert str(exc_info.value) == row_resolver._SAFE_READ_BUDGET_MESSAGE
+    assert "private selector" not in str(exc_info.value)
+
+
 def test_bounded_span_resolver_rejects_cross_trace_id_collision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

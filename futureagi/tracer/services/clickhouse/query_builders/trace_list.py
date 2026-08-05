@@ -75,10 +75,11 @@ _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE = 20
 
 # Normal trace pages classify identities only and hydrate at most the final
 # public page in a separate bounded statement. Classifying 100 identities per
-# statement halves sparse long-window round trips without widening graph,
-# eval/task, navigation, or other explicitly identity-only consumers. The
-# selector still enforces its independent 256 MiB/512 MiB memory/read caps and
-# fails closed on either limit.
+# statement halves sparse long-window round trips. The witness-free historical
+# eval membership phase independently qualified the same 100-identity envelope;
+# graph, navigation, witness-carrying, and other explicitly identity-only modes
+# keep their separate limits. Every selector still enforces its independent
+# 256 MiB/512 MiB memory/read caps and fails closed on either limit.
 _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE = 100
 
 # A long-window list gets a small, partitioned sparse-value proof before it
@@ -832,16 +833,39 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return anchor
 
     def supports_filter_candidate_witness_prefilter_without_hydration(self) -> bool:
-        """Keep internal eval selectors on their bounded exact classifier.
+        """Allow the exact membership-only historical selector optimization.
 
-        Production qualification showed that the raw positive-witness probe
-        adds work and can cross its speculative read ceiling on dense eval
-        windows, while the exact 100-identity classifier completes faster
-        within its own immutable limits. Hydrated trace lists may still use
-        the bounded witness strata; unhydrated eval selectors must not.
+        The raw witness probe is safe without page hydration only for the
+        one-project internal bulk mode whose classifier already returns its
+        final identity/order projection. Witness-carrying and population proofs
+        keep their established one/two-phase protocols, and graph membership-
+        window scans retain their wider temporal contract.
         """
 
-        return False
+        return bool(
+            self._bounded_internal_scan
+            and self._bounded_identity_only
+            and self._bounded_bulk_scan
+            and not self._bounded_include_filter_witnesses
+            and not self._bounded_population_proof
+            and self._bounded_membership_filters is None
+            and self.project_id is not None
+            and self.project_ids is None
+            and not self.search
+        )
+
+    def use_buffered_identity_filter_classification_without_hydration(self) -> bool:
+        """Amortize sparse eval candidates only when the safe probe can run.
+
+        Unlike normal list identity classification, this path must not reserve
+        or issue presentation hydration. The reader retains only finite seed
+        identities and still publishes exclusively exact classifier rows.
+        """
+
+        return bool(
+            self.supports_filter_candidate_witness_prefilter_without_hydration()
+            and self.prefer_filter_candidate_witness_probe_first()
+        )
 
     def prefer_filter_candidate_witness_probe_first(self) -> bool:
         """Prefer the indexed witness superset before a long-window argMax scan."""
@@ -865,13 +889,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Return the production-safe exact batch behind optional witnesses.
 
         The probe may be unavailable on a locked profile, fail one temporal
-        stratum, or find a broad value. None of those optional outcomes may
-        widen the any-span latest-state classifier beyond its independently
-        qualified 20-trace ceiling.
+        stratum, or find a broad value. Normal hydrated lists retain their
+        independently qualified 20-trace fallback. Membership-only bulk eval
+        already classifies 100 identities safely without witness projections,
+        so optional-probe fallback must preserve that existing envelope.
         """
 
         if self._candidate_witness_anchor_plan() is None:
             return None
+        if self.supports_filter_candidate_witness_prefilter_without_hydration():
+            return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
         return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
 
     def build_filter_candidate_witness_probe(

@@ -331,6 +331,7 @@ def _replay_historical_trace_filter_witnesses(
         except Exception as exc:
             if (
                 not isinstance(exc, ValueError)
+                and not isinstance(exc, TimeoutError)
                 and not is_read_budget_error(exc)
                 and not is_clickhouse_query_error(exc)
             ):
@@ -550,7 +551,11 @@ def _resolve_continuous_rows(
                     settings=_EVAL_TASK_STREAM_READ_SETTINGS,
                 )
             except Exception as exc:
-                if not is_read_budget_error(exc) and not is_clickhouse_query_error(exc):
+                if (
+                    not isinstance(exc, TimeoutError)
+                    and not is_read_budget_error(exc)
+                    and not is_clickhouse_query_error(exc)
+                ):
                     raise
                 raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
             result_key = (
@@ -851,7 +856,9 @@ def _resolve_bounded_historical_span_ids(
             ),
         )
     except Exception as exc:
-        if not is_read_budget_error(exc) and not isinstance(exc, ValueError):
+        if not is_read_budget_error(exc) and not isinstance(
+            exc, (TimeoutError, ValueError)
+        ):
             raise
         raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
 
@@ -932,7 +939,11 @@ def _resolve_buffered_legacy_ids(
     except Exception as exc:
         if isinstance(exc, EvalTaskReadBudgetExceeded):
             raise
-        if not is_read_budget_error(exc) and not is_clickhouse_query_error(exc):
+        if (
+            not isinstance(exc, TimeoutError)
+            and not is_read_budget_error(exc)
+            and not is_clickhouse_query_error(exc)
+        ):
             raise
         raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE) from None
     finally:

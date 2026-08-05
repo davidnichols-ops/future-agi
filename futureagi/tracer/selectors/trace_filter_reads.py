@@ -406,6 +406,11 @@ def read_bounded_filter_page(
         "supports_filter_candidate_witness_prefilter_without_hydration",
         None,
     )
+    unhydrated_buffered_identity_capability = getattr(
+        builder,
+        "use_buffered_identity_filter_classification_without_hydration",
+        None,
+    )
     hydration_identity_builder = getattr(
         builder, "bounded_filter_page_hydration_identity", None
     )
@@ -424,6 +429,19 @@ def read_bounded_filter_page(
         and callable(unhydrated_candidate_witness_capability)
         and unhydrated_candidate_witness_capability()
     )
+    unhydrated_buffered_identity_classification = bool(
+        not include_incomplete_rows
+        and not defer_classification
+        and callable(unhydrated_buffered_identity_capability)
+        and unhydrated_buffered_identity_capability()
+    )
+    if (
+        unhydrated_buffered_identity_classification
+        and not unhydrated_candidate_witness_prefilter
+    ):
+        raise ValueError(
+            "unhydrated identity buffering requires the bounded witness prefilter"
+        )
     candidate_witness_prefilter_allowed = bool(
         identity_only_classification or unhydrated_candidate_witness_prefilter
     )
@@ -1214,7 +1232,11 @@ def read_bounded_filter_page(
 
         Full-presentation span reads and explicit graph/eval/task identity
         consumers normally retain immediate classification. Normal trace pages
-        buffer because they hydrate a final public page separately; the
+        buffer because they hydrate a final public page separately. A narrowly
+        opted-in unhydrated membership selector may share the buffer without
+        enabling hydration: while its optional witness prefilter is active it
+        accumulates at most ``max_candidates``; after optional-probe fallback it
+        flushes only the builder's independently bounded classifier batch. The
         eval-only population proof also buffers so 512-row physical seed pages
         become exact 100-trace witness batches instead of six partial queries.
         Insertion order is newest-first across an ordered seed stream. The
@@ -1222,7 +1244,11 @@ def read_bounded_filter_page(
         a 10k+1 rejection sentinel.
         """
 
-        if not identity_only_classification and not seed_proves_population_bound:
+        if (
+            not identity_only_classification
+            and not unhydrated_buffered_identity_classification
+            and not seed_proves_population_bound
+        ):
             return classify_seed_rows(
                 candidate_rows,
                 active_start=active_start,

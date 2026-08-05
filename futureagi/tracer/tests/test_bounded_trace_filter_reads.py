@@ -551,7 +551,7 @@ def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
     assert builder.prefer_filter_candidate_witness_probe_first() is False
 
 
-def test_eval_trace_membership_only_classifier_stays_on_exact_batches() -> None:
+def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[
@@ -566,20 +566,25 @@ def test_eval_trace_membership_only_classifier_stays_on_exact_batches() -> None:
 
     assert builder.recommended_filter_classify_batch_size() == 100
     assert (
-        builder.supports_filter_candidate_witness_prefilter_without_hydration() is False
+        builder.supports_filter_candidate_witness_prefilter_without_hydration() is True
     )
-    assert builder.prefer_filter_candidate_witness_probe_first() is False
-    assert builder.recommended_filter_candidate_witness_probe_strata() is None
+    assert (
+        builder.use_buffered_identity_filter_classification_without_hydration() is True
+    )
+    assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert builder.recommended_filter_candidate_witness_probe_strata() == 8
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
-        is None
+        == 100
     )
-    assert builder.build_filter_candidate_witness_probe(
+    probe_sql, probe_params = builder.build_filter_candidate_witness_probe(
         [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
-    ) == (
-        "",
-        {},
     )
+    assert "SELECT DISTINCT trace_id" in probe_sql
+    assert "trace_id IN %(filter_candidate_trace_ids)s" in probe_sql
+    assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in probe_sql
+    assert "argMax(" not in probe_sql
+    assert probe_params["filter_candidate_trace_ids"] == ("trace-a", "trace-b")
 
 
 @pytest.mark.parametrize(
@@ -651,6 +656,9 @@ def test_eval_trace_candidate_prefilter_rejects_non_membership_only_shapes(
     )
 
     assert builder.prefer_filter_candidate_witness_probe_first() is False
+    assert (
+        builder.use_buffered_identity_filter_classification_without_hydration() is False
+    )
     assert builder.build_filter_candidate_witness_probe([{"trace_id": "trace-a"}]) == (
         "",
         {},
@@ -3687,6 +3695,10 @@ class _CandidateWitnessUnhydratedFakeBuilder(_FakeBuilder):
         return True
 
     @staticmethod
+    def use_buffered_identity_filter_classification_without_hydration():
+        return True
+
+    @staticmethod
     def prefer_filter_candidate_witness_probe_first():
         return True
 
@@ -6599,6 +6611,63 @@ def test_unhydrated_membership_selector_returns_only_exact_prefilter_survivors()
     ]
 
 
+def test_unhydrated_membership_buffers_sparse_slices_before_prefilter() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - offset,
+        }
+        for index, offset in enumerate(
+            (
+                timedelta(minutes=1),
+                timedelta(minutes=6),
+                timedelta(minutes=16),
+            )
+        )
+    ]
+    builder = _CandidateWitnessUnhydratedFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=20),
+        end=END,
+        # One raw witness is stale; only the exact survivor may be published.
+        match_rows=[rows[0]],
+        recommended_batch_size=100,
+        recommended_seed_batch_size=100,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        witness_ids={"trace-0", "trace-2"},
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.rows == [rows[0]]
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "seed",
+        "seed",
+        "prefilter",
+        "match",
+    ]
+    assert executor.calls[-2][1]["candidate_ids"] == (
+        "trace-0",
+        "trace-1",
+        "trace-2",
+    )
+    assert executor.calls[-1][1]["candidate_ids"] == ("trace-0", "trace-2")
+    assert "hydrate" not in [query for query, _ in executor.calls]
+
+
 def test_unhydrated_membership_prefilter_failure_falls_back_to_exact_classifier() -> (
     None
 ):
@@ -6606,17 +6675,23 @@ def test_unhydrated_membership_prefilter_failure_falls_back_to_exact_classifier(
         {
             "id": f"trace-{index}",
             "root_span_id": f"root-{index}",
-            "start_time": END - timedelta(seconds=index + 1),
+            "start_time": END
+            - timedelta(
+                minutes=(1, 6, 16)[index % 3],
+                microseconds=index,
+            ),
         }
-        for index in range(4)
+        for index in range(205)
     ]
     builder = _CandidateWitnessUnhydratedFakeBuilder(
         rows,
-        start=END - timedelta(minutes=5),
+        start=END - timedelta(minutes=20),
         end=END,
         match_rows=[rows[1]],
-        recommended_batch_size=4,
-        recommended_seed_batch_size=4,
+        # Any-span trace anchors are child-ordered, not public-root ordered.
+        seed_proves_order=False,
+        recommended_batch_size=100,
+        recommended_seed_batch_size=100,
     )
     executor = _CandidateWitnessHydrationFakeExecutor(
         builder,
@@ -6635,9 +6710,26 @@ def test_unhydrated_membership_prefilter_failure_falls_back_to_exact_classifier(
 
     assert page.complete is True
     assert page.rows == [rows[1]]
-    assert [query for query, _ in executor.calls] == ["seed", "prefilter", "match"]
-    assert executor.calls[-1][1]["candidate_ids"] == tuple(row["id"] for row in rows)
-    assert page.attempts[1].error_code == "read_budget_exceeded"
+    assert [query for query, _ in executor.calls] == [
+        "seed",
+        "seed",
+        "seed",
+        "prefilter",
+        "match",
+        "match",
+        "match",
+    ]
+    exact_batches = [
+        params["candidate_ids"] for query, params in executor.calls if query == "match"
+    ]
+    assert [len(batch) for batch in exact_batches] == [100, 100, 5]
+    assert set().union(*(set(batch) for batch in exact_batches)) == {
+        row["id"] for row in rows
+    }
+    prefilter_attempt = next(
+        attempt for attempt in page.attempts if attempt.kind == "prefilter"
+    )
+    assert prefilter_attempt.error_code == "read_budget_exceeded"
 
 
 def test_broad_candidate_witness_prefilter_falls_through_to_exact_classifier() -> None:
