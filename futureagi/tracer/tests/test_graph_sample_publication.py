@@ -91,7 +91,9 @@ def test_project_system_graph_view_fails_closed_without_opt_in(monkeypatch):
         cost=[],
         traffic=[],
     )
-    monkeypatch.setattr(project_view, "get_all_system_metrics", lambda **_kwargs: sample)
+    monkeypatch.setattr(
+        project_view, "get_all_system_metrics", lambda **_kwargs: sample
+    )
     view = project_view.ProjectView()
     monkeypatch.setattr(view, "_get_project_in_scope", lambda _project_id: object())
 
@@ -156,9 +158,7 @@ def test_public_charts_view_fails_closed_without_opt_in(monkeypatch):
     monkeypatch.setattr(
         charts_view.Project.objects,
         "get",
-        lambda **_kwargs: SimpleNamespace(
-            id="11111111-1111-4111-8111-111111111111"
-        ),
+        lambda **_kwargs: SimpleNamespace(id="11111111-1111-4111-8111-111111111111"),
     )
     monkeypatch.setattr(
         charts_view,

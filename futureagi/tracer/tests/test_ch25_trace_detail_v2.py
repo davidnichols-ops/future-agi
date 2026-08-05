@@ -627,9 +627,7 @@ class TestV2InputOutputParsing:
         )
         with ExitStack() as stack:
             _patch_v2_pg(stack, project_accessible=True, pg_trace=None)
-            result = retrieve_trace_detail_ch(
-                MagicMock(), MagicMock(), "T1", analytics
-            )
+            result = retrieve_trace_detail_ch(MagicMock(), MagicMock(), "T1", analytics)
         return result
 
     def test_json_input_output_parsed_to_objects(self):

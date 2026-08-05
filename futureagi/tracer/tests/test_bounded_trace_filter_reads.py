@@ -6866,7 +6866,17 @@ def test_candidate_witness_skips_probe_without_enforced_query_limits() -> None:
     assert executor.prefilter_settings == []
 
 
-def test_candidate_witness_runtime_failure_falls_back_to_exact_classifier() -> None:
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("private guarded-executor resource diagnostic"),
+        TimeoutError("private guarded-executor timeout diagnostic"),
+    ],
+    ids=["runtime", "timeout"],
+)
+def test_candidate_witness_runtime_failure_falls_back_to_exact_classifier(
+    failure: Exception,
+) -> None:
     rows = [
         {
             "id": f"trace-{index}",
@@ -6885,7 +6895,7 @@ def test_candidate_witness_runtime_failure_falls_back_to_exact_classifier() -> N
     )
     executor = _CandidateWitnessHydrationFakeExecutor(
         builder,
-        fail_prefilter=RuntimeError("private guarded-executor resource diagnostic"),
+        fail_prefilter=failure,
     )
 
     page = read_bounded_filter_page(

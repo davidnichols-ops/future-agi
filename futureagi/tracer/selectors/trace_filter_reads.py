@@ -810,7 +810,7 @@ def read_bounded_filter_page(
         except Exception as exc:
             if is_read_budget_error(exc):
                 error_code = "read_budget_exceeded"
-            elif kind == "prefilter" and isinstance(exc, RuntimeError):
+            elif kind == "prefilter" and isinstance(exc, (RuntimeError, TimeoutError)):
                 # The witness probe is an optional optimization. Some guarded
                 # executors report their own statement timeout/resource cap as
                 # a generic RuntimeError, so account and abandon only this

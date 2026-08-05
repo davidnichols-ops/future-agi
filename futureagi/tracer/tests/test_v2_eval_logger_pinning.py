@@ -32,6 +32,8 @@ EVAL_CONFIG_ID = "22222222-2222-2222-2222-222222222222"
 FORBIDDEN_V2_SCHEMA_COLUMNS = frozenset(
     {"status", "skipped_reason", "config_hash", "attempts"}
 )
+
+
 @pytest.fixture(params=("legacy", "v2"))
 def eval_table_shape(request, settings):
     """Exercise the production table shape and the future v2 shape."""
