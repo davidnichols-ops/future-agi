@@ -3154,6 +3154,64 @@ def test_locked_span_graph_retries_dense_temporal_slice_without_skipping_stratum
 
 
 @pytest.mark.unit
+def test_locked_trace_temporal_candidates_use_twenty_id_union_batches() -> None:
+    window_end = datetime(2026, 7, 31, 7)
+    window_start = window_end - timedelta(days=14)
+    window_width = window_end - window_start
+    rows = []
+    for stratum in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA):
+        stratum_end = window_start + (
+            window_width * (stratum + 1) / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        )
+        for index in range(bounded_graph_reads.GRAPH_ANY_SPAN_ROWS_PER_STRATUM + 1):
+            rows.append(
+                {
+                    "trace_id": f"trace-{stratum}-{index:03d}",
+                    "root_span_id": f"root-{stratum}-{index:03d}",
+                    "start_time": stratum_end - timedelta(seconds=index + 1),
+                }
+            )
+
+    analytics = _CandidateAnalytics(observe_type="trace", rows=rows)
+    analytics.supports_per_query_read_settings = False
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="trace",
+    )
+
+    seed_calls = [call for call in analytics.calls if "filter_seed_limit" in call[1]]
+    classifier_calls = [
+        call for call in analytics.calls if "candidate_trace_ids" in call[1]
+    ]
+    classifier_sizes = [
+        len(params["candidate_trace_ids"]) for _, params, *_ in classifier_calls
+    ]
+    assert len(seed_calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert classifier_sizes
+    assert max(classifier_sizes) == (
+        bounded_graph_reads.GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
+    )
+    assert all(
+        size <= bounded_graph_reads.GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
+        for size in classifier_sizes
+    )
+    assert 50 not in classifier_sizes
+    assert all(
+        "filter_witness_" not in query and "argMinIf(" not in query
+        for query, *_ in classifier_calls
+    )
+    assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_DISTRIBUTED_RESULT_LIMIT
+    assert sample.query_status == "sampled"
+    assert sample.sampling_strata_completed == sample.sampling_strata == 8
+    graph_dispatch._require_renderable_sample(sample)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("observe_type", ["trace", "span"])
 @pytest.mark.parametrize("window_days", [180, 365])
 @pytest.mark.parametrize("structured_type", ["map", "json", "call_type"])

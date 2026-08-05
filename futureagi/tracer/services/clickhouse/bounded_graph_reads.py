@@ -473,11 +473,13 @@ def _read_time_distributed_candidates(
         window_end=window_end,
     )
     force_temporal_sample = False
-    # Indexed any-span trace filters acquire every disjoint stratum first, then
-    # replay the de-duplicated <=40-ID union in full-window chunks. If an indexed anchor
-    # times out, the existing five-minute root fallback feeds the same union;
-    # raw anchors/root seeds never enter ``rows_by_id`` directly.
-    defer_trace_classification = False
+    # Every trace path acquires all disjoint strata first, then replays the
+    # de-duplicated finite union in <=20-ID full-window chunks. This includes
+    # the locked-executor five-minute/one-minute temporal lane: classifying 50
+    # roots independently in every stratum made the narrower retry issue the
+    # same 14-day query again and reproduce Code 307. Raw anchors/root seeds
+    # never enter ``rows_by_id`` directly.
+    defer_trace_classification = mode == "trace"
     deferred_trace_strata: list[_DeferredTraceStratum] = []
 
     for index in range(stratum_count):
