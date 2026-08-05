@@ -78,6 +78,12 @@ GRAPH_ANY_SPAN_DISTRIBUTED_AFTER = timedelta(hours=1)
 # JSON/call_type semantics only to the finite latest-state candidates. This is
 # intentionally incomplete and is always published as sampled metadata.
 GRAPH_UNINDEXED_SAMPLE_SLICE = timedelta(minutes=5)
+# A very dense five-minute tail can still cross the server-enforced byte-read
+# ceiling before the finite seed is returned. Retry the same required stratum
+# once with a one-minute tail under the original monotonic request deadline.
+# The graph remains explicitly sampled; a second failure is never counted as
+# temporal coverage and therefore cannot become a renderable partial graph.
+GRAPH_UNINDEXED_SAMPLE_RETRY_SLICE = timedelta(minutes=1)
 
 # Keep every graph-union classifier inside the same finite resource envelope as
 # the shared bounded selector. Production readback showed that one 400-trace
@@ -773,6 +779,78 @@ def _read_time_distributed_candidates(
                     else "query_failed"
                 )
                 raise BoundedGraphReadError(public_code, retryable=True) from None
+
+        if (
+            page is not None
+            and temporal_sample
+            and not page.complete
+            and not page.has_more
+            and _incomplete_error_code(page.error_code) == "read_budget_exceeded"
+        ):
+            # The fixed five-minute tail is already an explicitly incomplete
+            # representation of this long stratum. On unusually dense parts it
+            # can still hit the server's 307/159/241 read ceiling. Preserve the
+            # failed attempt's accounting and retry the *same* stratum with a
+            # deterministic one-minute tail. We do not skip to another stratum
+            # or count this one complete unless the retry is classified.
+            retry_start = max(
+                stratum_start,
+                stratum_end - GRAPH_UNINDEXED_SAMPLE_RETRY_SLICE,
+            )
+            if retry_start > sample_start:
+                remaining_ms = deadline_ms - int(
+                    (monotonic() - distributed_started) * 1000
+                )
+                if remaining_ms >= 25:
+                    elapsed_ms += page.elapsed_ms
+                    query_count += page.query_count
+                    rows_returned += page.rows_returned
+                    result_payload_bytes += page.result_payload_bytes
+                    total_rows_lower_bound += page.total_rows_lower_bound
+                    retry_filters = _filters_for_window(
+                        filters,
+                        window_start=retry_start,
+                        window_end=stratum_end,
+                    )
+                    stratum_builder_kwargs["filters"] = retry_filters
+                    stratum_builder = builder_class(**stratum_builder_kwargs)
+                    logger.warning(
+                        "graph temporal sample exceeded budget; retrying narrower slice",
+                        stratum_index=index,
+                    )
+                    try:
+                        page = read_page(
+                            active_builder=stratum_builder,
+                            active_filters=retry_filters,
+                            use_anchor=False,
+                            active_remaining_ms=remaining_ms,
+                            seed_attempts=max_seed_attempts,
+                            query_limit=max_query_count,
+                            candidate_count=candidate_limit,
+                            classify_size=bounded_classify_batch_size,
+                            defer_classify=defer_trace_classification,
+                        )
+                    except Exception as exc:
+                        if not (
+                            is_read_budget_error(exc)
+                            or is_clickhouse_query_error(exc)
+                        ):
+                            raise
+                        logger.warning(
+                            "graph narrower temporal sample degraded",
+                            stratum_index=index,
+                            error_type=type(exc).__name__,
+                            exc_info=True,
+                        )
+                        public_code = (
+                            "read_budget_exceeded"
+                            if is_read_budget_error(exc)
+                            else "query_failed"
+                        )
+                        raise BoundedGraphReadError(
+                            public_code,
+                            retryable=True,
+                        ) from None
 
         if page is None:  # pragma: no cover - defensive exhaustiveness
             raise BoundedGraphReadError("query_failed")

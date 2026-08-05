@@ -676,10 +676,16 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         self.params.update({"start_date": request_start, "end_date": request_end})
 
         plans, _ = partition_span_filter_plans(self.filters)
-        # Ordered seeds may use indexed scalar leaves as a safe superset, but
-        # unindexed JSON/call_type predicates are deferred to the finite latest-
-        # state classifier.  Parsing them before ORDER BY would scan the entire
-        # slice merely to discover a rare or absent value.
+        # Ordered list seeds may use indexed scalar leaves as a safe superset,
+        # but graph-mode temporal samples retain only genuinely selective
+        # leaves. A common text/boolean Map key can make even a five-minute
+        # slice cross the server byte-read ceiling before ORDER BY returns its
+        # first 50 identities. Graph samples therefore seed a finite raw
+        # identity prefix and replay the complete predicate in the candidate-
+        # scoped latest-state classifier. Exact list behavior is unchanged.
+        # Unindexed JSON/call_type predicates follow the same classifier-only
+        # rule because parsing them before ORDER BY would scan the entire slice
+        # merely to discover a rare or absent value.
         if _unindexed_positive_micro_seed:
             micro_seed_plan = self._unindexed_positive_micro_seed_plan()
             if micro_seed_plan is None:
@@ -689,8 +695,13 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             seed_plans = [micro_seed_plan]
             seed_predicates = [micro_seed_plan.seed_predicate]
         else:
+            seed_plan_is_usable = (
+                self._plan_uses_selective_graph_anchor
+                if self._bounded_anchor_probe
+                else self._plan_uses_indexed_anchor
+            )
             seed_plans = [
-                plan for plan in plans if self._plan_uses_indexed_anchor(plan)
+                plan for plan in plans if seed_plan_is_usable(plan)
             ]
             seed_predicates = [
                 plan.raw_witness_predicate or plan.seed_predicate for plan in seed_plans

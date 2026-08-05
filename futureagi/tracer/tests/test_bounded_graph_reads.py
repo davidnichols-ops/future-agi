@@ -1469,7 +1469,9 @@ def test_failure_in_any_stratum_never_becomes_a_renderable_sample(
     def _page(**kwargs):
         index = len(calls)
         calls.append(kwargs)
-        if index == failure_stratum:
+        # Both the five-minute attempt and its one-minute same-stratum retry
+        # must fail before temporal coverage is considered missing.
+        if index in {failure_stratum, failure_stratum + 1}:
             return BoundedFilterPage(
                 rows=[],
                 has_more=False,
@@ -1515,7 +1517,7 @@ def test_failure_in_any_stratum_never_becomes_a_renderable_sample(
         observe_type="trace",
     )
 
-    assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA + 1
     assert sample.query_complete is False
     assert sample.query_status == "degraded"
     assert sample.query_error_code == "read_budget_exceeded"
@@ -1751,6 +1753,37 @@ def test_span_text_map_anchor_stays_optional_for_lists_but_graphs_sample():
     assert graph_builder.supports_filter_anchor_probe() is True
     assert graph_builder.requires_unindexed_graph_sample_slice() is True
     assert graph_builder.recommended_filter_anchor_probe_limit() is None
+
+    slice_start = END - timedelta(minutes=5)
+    list_seed_query, list_seed_params = list_builder.build_filter_seed_page(
+        slice_start=slice_start,
+        slice_end=END,
+        limit=50,
+    )
+    graph_seed_query, graph_seed_params = graph_builder.build_filter_seed_page(
+        slice_start=slice_start,
+        slice_end=END,
+        limit=50,
+    )
+    assert "attrs_string" in list_seed_query
+    assert list_seed_params["latest_filter_key_0"] == "final_status"
+    assert "attrs_string" not in graph_seed_query
+    assert "latest_filter_key_0" not in graph_seed_params
+
+    graph_match_query, graph_match_params = (
+        graph_builder.build_filter_match_query_from_seed_rows(
+            [
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-1",
+                    "id": "span-1",
+                    "start_time": END - timedelta(minutes=1),
+                }
+            ]
+        )
+    )
+    assert "attrs_string" in graph_match_query
+    assert graph_match_params["latest_filter_key_0"] == "final_status"
 
 
 @pytest.mark.unit
@@ -2873,6 +2906,78 @@ def test_code_307_stratum_anchor_uses_temporal_sample_without_leaking_details(
     )
     assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_STRATA
     assert "private" not in repr(sample)
+
+
+@pytest.mark.unit
+def test_locked_span_graph_retries_dense_temporal_slice_without_skipping_stratum(
+    monkeypatch,
+):
+    window_end = datetime(2026, 7, 31, 7)
+    window_start = window_end - timedelta(days=14)
+    calls = []
+
+    def _page(**kwargs):
+        calls.append(kwargs)
+        slice_start, slice_end = kwargs["builder"].parse_time_range(kwargs["filters"])
+        slice_width = slice_end - slice_start
+        if slice_width == bounded_graph_reads.GRAPH_UNINDEXED_SAMPLE_SLICE:
+            return BoundedFilterPage(
+                rows=[],
+                has_more=False,
+                complete=False,
+                status="degraded",
+                error_code="read_budget_exceeded",
+                total_rows_lower_bound=0,
+                elapsed_ms=1,
+                query_count=1,
+                rows_returned=0,
+                result_payload_bytes=0,
+                attempts=(),
+            )
+        assert slice_width == bounded_graph_reads.GRAPH_UNINDEXED_SAMPLE_RETRY_SLICE
+        index = len(calls) // 2
+        return BoundedFilterPage(
+            rows=[
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": f"trace-{index}",
+                    "id": f"span-{index}",
+                    "start_time": slice_end - timedelta(seconds=1),
+                }
+            ],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=1,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=2,
+            result_payload_bytes=20,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(bounded_graph_reads, "read_bounded_filter_page", _page)
+    analytics = SimpleNamespace(supports_per_query_read_settings=False)
+
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="span",
+    )
+
+    assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA * 2
+    assert all(call["anchor_probe_only"] is False for call in calls)
+    assert sample.query_complete is False
+    assert sample.query_status == "sampled"
+    assert sample.query_error_code == "sample_limit"
+    assert sample.sampling_strata_completed == sample.sampling_strata == 8
+    assert len(sample.rows) == 8
+    graph_dispatch._require_renderable_sample(sample)
 
 
 @pytest.mark.unit
