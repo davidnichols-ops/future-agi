@@ -460,6 +460,13 @@ class SpanListQueryBuilder(BaseQueryBuilder):
           AND start_time < fromUnixTimestamp64Micro(%(filter_anchor_end_us)s)
         WHERE {predicate}{datetime_fragment}
           {sampling_fragment}
+        ORDER BY
+            observation_type DESC,
+            service_name DESC,
+            toStartOfHour(start_time) DESC,
+            trace_id DESC,
+            id DESC,
+            start_time DESC
         LIMIT 1 BY project_id, trace_id, id, start_time
         LIMIT %(filter_anchor_limit)s
         """

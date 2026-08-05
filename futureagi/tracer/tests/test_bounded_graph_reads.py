@@ -2708,11 +2708,24 @@ def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
     assert not any(
         call[1].get("filter_anchor_limit") == 513 for call in analytics.calls
     )
-    assert all(
-        "ORDER BY" not in query
+    anchor_queries = [
+        query
         for query, params, *_ in analytics.calls
         if "filter_anchor_limit" in params
-    )
+    ]
+    if observe_type == "span":
+        expected_order = (
+            "ORDER BY observation_type DESC, service_name DESC, "
+            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
+            "start_time DESC"
+        )
+        assert anchor_queries
+        for query in anchor_queries:
+            normalized = " ".join(query.split())
+            assert expected_order in normalized
+            assert normalized.index("ORDER BY") < normalized.index("LIMIT 1 BY")
+    else:
+        assert all("ORDER BY" not in query for query in anchor_queries)
 
 
 @pytest.mark.unit
@@ -2806,11 +2819,20 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
     assert not any(
         "filter_seed_limit" in params for _, params, *_ in first_analytics.calls
     )
-    assert all(
-        "ORDER BY" not in query
+    anchor_queries = [
+        query
         for query, params, *_ in first_analytics.calls
         if "filter_anchor_limit" in params
-    )
+    ]
+    if observe_type == "span":
+        assert all(
+            "ORDER BY observation_type DESC, service_name DESC, "
+            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
+            "start_time DESC" in " ".join(query.split())
+            for query in anchor_queries
+        )
+    else:
+        assert all("ORDER BY" not in query for query in anchor_queries)
     assert len(first_analytics.calls) <= (stratum_count * 2)
     if observe_type == "trace":
         classifier_calls = [
