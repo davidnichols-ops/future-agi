@@ -38,6 +38,10 @@ import { ShowComponent } from "src/components/show";
 import { useShallowToggleAnnotationsStore } from "../store";
 import NoRowsOverlay from "src/sections/project-detail/CompareDrawer/NoRowsOverlay";
 import { APP_CONSTANTS } from "src/utils/constants";
+import {
+  getQueryReadMessage,
+  getQueryReadState,
+} from "src/utils/queryReadState";
 
 const CELL_HEIGHT_MAP = { Short: 40, Medium: 52, Large: 68, "Extra Large": 88 };
 
@@ -191,7 +195,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     }),
     [],
   );
-  const { data, isLoading, queryKey } = useCallLogs({
+  const { data, isLoading, error, queryKey } = useCallLogs({
     module,
     id: id,
     version: selectedVersion,
@@ -200,12 +204,21 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     params,
     enabled,
   });
+  const readState = useMemo(
+    () => getQueryReadState(data, { isError: Boolean(error) }),
+    [data, error],
+  );
+  const readMessage = getQueryReadMessage(readState);
+  const isCompleteRead = readState === "complete";
 
   useEffect(() => {
     if (!isLoading) {
-      setTotalPages(data?.total_pages || 1);
+      // A lower-bound/incomplete total cannot safely enable numbered-page
+      // navigation. Keep the visible bounded rows, but expose only a disabled
+      // single-page control until an exact response arrives.
+      setTotalPages(isCompleteRead ? data?.total_pages || 1 : 1);
     }
-  }, [data?.total_pages, isLoading]);
+  }, [data?.total_pages, isCompleteRead, isLoading]);
 
   const rows = useMemo(() => {
     if (isLoading) {
@@ -248,7 +261,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
 
   // Prefetch next page so pagination feels instant
   useEffect(() => {
-    if (data?.results?.length > 0 && page < totalPages) {
+    if (isCompleteRead && data?.results?.length > 0 && page < totalPages) {
       prefetchCallLogs(queryClient, {
         module,
         id,
@@ -268,6 +281,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     selectedVersion,
     pageLimit,
     params,
+    isCompleteRead,
   ]);
 
   const configLength = data?.config?.length;
@@ -424,6 +438,22 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
           },
         }}
       >
+        {readMessage && (
+          <Box
+            role="status"
+            sx={{
+              px: 1.5,
+              py: 0.75,
+              fontSize: 12,
+              color: "warning.main",
+              bgcolor: "warning.lighter",
+              borderBottom: "1px solid",
+              borderColor: "warning.light",
+            }}
+          >
+            {readMessage}
+          </Box>
+        )}
         {/* Grid fills available space */}
         <Box sx={{ flex: 1, minHeight: 0 }}>
           <AgGridReact
@@ -467,7 +497,8 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
                     color: "text.secondary",
                   }}
                 >
-                  {showErrors ? "No error found" : "No calls found"}
+                  {readMessage ||
+                    (showErrors ? "No error found" : "No calls found")}
                 </Typography>,
               )
             }
@@ -561,11 +592,12 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
           </Stack>
 
           <Pagination
-            count={totalPages}
+            count={isCompleteRead ? totalPages : 1}
             variant="outlined"
             shape="rounded"
-            page={page}
+            page={isCompleteRead ? page : 1}
             color="primary"
+            disabled={!isCompleteRead}
             onChange={(e, value) => {
               setPage(value);
             }}

@@ -289,7 +289,9 @@ class TraceVoiceCallListQuerySerializer(TraceExportQuerySerializer):
         help_text=(
             "Omit for backward-compatible complete bounded pages, which may "
             "label count as a lower bound. Send false to require an exact "
-            "total, or true to opt in explicitly to lower-bound totals."
+            "total. Send true to opt in explicitly to lower-bound totals and, "
+            "on the first page, a clearly labelled bounded partial result when "
+            "the full ordered prefix cannot be proven inside the read budget."
         ),
     )
 
@@ -305,6 +307,8 @@ class TraceVoiceCallListResponseSerializer(serializers.Serializer):
     config = serializers.ListField(child=serializers.DictField())
     has_more = serializers.BooleanField()
     query_complete = serializers.BooleanField()
+    query_status = serializers.ChoiceField(choices=("complete", "degraded"))
+    query_error_code = serializers.CharField(required=False)
 
 
 class TraceIndexQuerySerializer(StrictInputSerializer):

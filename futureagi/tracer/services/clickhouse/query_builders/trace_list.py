@@ -37,6 +37,7 @@ from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     supports_trace_filters,
     targets_trace_filter_domain,
 )
+from tracer.utils.filter_operators import normalize_span_attribute_filter_type
 
 # On the v2 schema (PARTITION BY toDate(start_time), PK on toStartOfHour(
 # start_time)) start_time prunes partitions and the PK; created_at prunes
@@ -81,6 +82,16 @@ _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE = 20
 # keep their separate limits. Every selector still enforces its independent
 # 256 MiB/512 MiB memory/read caps and fails closed on either limit.
 _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE = 100
+
+# Structured span attributes are decoded from ``span_attributes_raw`` during
+# latest-state replay.  They can also be combined with the native typed Maps,
+# so the normal 100-trace identity batch can make ClickHouse materialize too
+# many ColumnMap/JSON vectors at once.  Keep those classifiers on the existing
+# production-safe twenty-trace envelope and reduce their input block fourfold.
+# This changes only physical query chunking; every candidate still goes through
+# the same exact latest-state predicate before it can enter a public page.
+_STRUCTURED_ANY_SPAN_CLASSIFY_BATCH_SIZE = _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
+_STRUCTURED_CLASSIFY_MAX_BLOCK_SIZE = 2_048
 
 # A long-window list gets a small, partitioned sparse-value proof before it
 # enters the ordered-root fallback. Sixty-four is one global exhaustiveness
@@ -359,6 +370,27 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and (item.get("column_id") or item.get("columnId"))
             not in {"created_at", "start_time"}
         ]
+
+    def _structured_attribute_filter_count(self) -> int:
+        """Count canonical array/object leaves evaluated from JSON overflow."""
+
+        count = 0
+        for item in self._bounded_match_filters():
+            if not isinstance(item, dict):
+                continue
+            key = item.get("column_id") or item.get("columnId")
+            if key in {"created_at", "start_time"}:
+                continue
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            if not isinstance(config, dict):
+                continue
+            filter_type = normalize_span_attribute_filter_type(
+                str(config.get("filter_type") or config.get("filterType") or ""),
+                config.get("filter_value", config.get("filterValue")),
+            )
+            if filter_type in {"array", "map"}:
+                count += 1
+        return count
 
     def bounded_filter_degraded_error_code(self) -> str | None:
         """Explain why a supported filter must not use the broad legacy read."""
@@ -694,6 +726,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Keep the candidate-trace latest-state scan below CH's memory ceiling."""
 
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        if self._structured_attribute_filter_count():
+            # Normal trace pages otherwise widen identity-only classification
+            # to 100. Structured JSON/Map replay must stay on the twenty-trace
+            # envelope even when a scalar leaf supplies an indexed seed.
+            return _STRUCTURED_ANY_SPAN_CLASSIFY_BATCH_SIZE
         if (
             not self._bounded_population_proof
             and self._unindexed_positive_micro_seed_plan() is not None
@@ -732,6 +769,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if not self._bounded_identity_only and not self._bounded_internal_scan:
             return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
         return 50
+
+    def recommended_filter_classify_read_settings(self) -> dict[str, int] | None:
+        """Cap classifier blocks that materialize structured attribute columns."""
+
+        if not self._structured_attribute_filter_count():
+            return None
+        return {"max_block_size": _STRUCTURED_CLASSIFY_MAX_BLOCK_SIZE}
 
     def use_identity_only_filter_classification(self) -> bool:
         """Defer presentation hydration until the exact public page is proven.

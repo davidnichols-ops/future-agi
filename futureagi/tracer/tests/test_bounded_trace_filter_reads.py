@@ -389,6 +389,77 @@ def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
     assert (
         builder.recommended_filter_anchor_probe_max_bytes_to_read() == 96 * 1024 * 1024
     )
+    assert builder.recommended_filter_classify_read_settings() is None
+
+
+@pytest.mark.parametrize(
+    ("filter_type", "operation", "value"),
+    [
+        ("array", "contains", ["urgent", "vip"]),
+        ("map", "equals", {"state": "Rejected"}),
+        ("json", "contains", ["urgent", "vip"]),
+        ("json", "equals", {"state": "Rejected"}),
+    ],
+)
+def test_structured_trace_classifier_uses_memory_safe_batch_and_block(
+    filter_type: str,
+    operation: str,
+    value: object,
+) -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter(
+                "structured",
+                value,
+                filter_type=filter_type,
+                operation=operation,
+            ),
+        ],
+    )
+
+    assert builder.recommended_filter_classify_batch_size() == 20
+    assert builder.recommended_filter_classify_read_settings() == {
+        "max_block_size": 2_048
+    }
+
+
+def test_extreme_structured_multifilter_keeps_scalar_fast_path_independent() -> None:
+    simple_builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("attempt", 7, filter_type="number"),
+            _attribute_filter("reviewed", True, filter_type="boolean"),
+        ],
+    )
+    structured_builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            *simple_builder.filters,
+            _attribute_filter(
+                "labels",
+                ["urgent"],
+                filter_type="array",
+                operation="contains",
+            ),
+            _attribute_filter(
+                "payload",
+                {"state": "Rejected"},
+                filter_type="map",
+                operation="contains",
+            ),
+        ],
+    )
+
+    assert simple_builder.recommended_filter_classify_batch_size() == 100
+    assert simple_builder.recommended_filter_classify_read_settings() is None
+    assert structured_builder.recommended_filter_classify_batch_size() == 20
+    assert structured_builder.recommended_filter_classify_read_settings() == {
+        "max_block_size": 2_048
+    }
 
 
 @pytest.mark.parametrize(
@@ -3726,6 +3797,28 @@ class _FakeExecutor:
 
 
 @dataclass
+class _ClassifierSettingsFakeBuilder(_FakeBuilder):
+    @staticmethod
+    def recommended_filter_classify_read_settings() -> dict[str, int]:
+        return {"max_block_size": 2_048}
+
+
+class _ClassifierSettingsFakeExecutor(_FakeExecutor):
+    def __init__(self, builder: _FakeBuilder):
+        super().__init__(builder)
+        self.settings_by_query: list[tuple[str, dict[str, Any]]] = []
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.settings_by_query.append((query, dict(settings)))
+        return super().execute_ch_query(
+            query,
+            params,
+            timeout_ms=timeout_ms,
+            settings=settings,
+        )
+
+
+@dataclass
 class _IdentityHydrationFakeBuilder(_FakeBuilder):
     @staticmethod
     def use_identity_only_filter_classification() -> bool:
@@ -4684,6 +4777,24 @@ def _complete_empty_page() -> BoundedFilterPage:
     )
 
 
+def _incomplete_empty_page(
+    error_code: str = "scan_budget_exceeded",
+) -> BoundedFilterPage:
+    return BoundedFilterPage(
+        rows=[],
+        has_more=False,
+        complete=False,
+        status="degraded",
+        error_code=error_code,
+        total_rows_lower_bound=0,
+        elapsed_ms=4_500.0,
+        query_count=8,
+        rows_returned=400,
+        result_payload_bytes=8_192,
+        attempts=(),
+    )
+
+
 @override_settings(CLICKHOUSE_V2={"QUERY_TYPES_DISABLED": "VOICE_CALL_LIST"})
 def test_voice_list_uses_v2_builder_when_routing_is_disabled() -> None:
     from tracer.serializers.trace import TraceVoiceCallListResponseSerializer
@@ -4748,6 +4859,8 @@ def test_voice_list_uses_v2_builder_when_routing_is_disabled() -> None:
     assert explicit_false_response.status_code == 503
     assert response.status_code == 200
     assert response.data["current_page"] == 71
+    assert response.data["query_status"] == "complete"
+    assert "query_error_code" not in response.data
     response_serializer = TraceVoiceCallListResponseSerializer(data=response.data)
     assert response_serializer.is_valid(), response_serializer.errors
     assert isinstance(
@@ -4757,6 +4870,249 @@ def test_voice_list_uses_v2_builder_when_routing_is_disabled() -> None:
     assert bounded_reader.call_count == 3
     assert bounded_reader.call_args.kwargs["page_number"] == 70
     assert bounded_reader.call_args.kwargs["page_size"] == 30
+
+
+def test_voice_first_page_explicit_sample_publishes_sanitized_degradation() -> None:
+    from tracer.serializers.trace import TraceVoiceCallListResponseSerializer
+    from tracer.views.trace import TraceView
+
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=_incomplete_empty_page(),
+        ) as bounded_reader,
+    ):
+        response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params={"allow_sampled": "true"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page": 1,
+                "page_size": 15,
+                "allow_sampled": True,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response.status_code == 200
+    assert response.data["results"] == []
+    assert response.data["count"] == 0
+    assert response.data["count_is_lower_bound"] is True
+    assert response.data["query_complete"] is False
+    assert response.data["query_status"] == "degraded"
+    assert response.data["query_error_code"] == "scan_budget_exceeded"
+    assert "DB::Exception" not in str(response.data)
+    assert "ClickHouse" not in str(response.data)
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is True
+    response_serializer = TraceVoiceCallListResponseSerializer(data=response.data)
+    assert response_serializer.is_valid(), response_serializer.errors
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_voice_first_page_explicit_sample_hydrates_only_proven_rows() -> None:
+    from tracer.views.trace import TraceView
+
+    started = END - timedelta(minutes=1)
+    bounded_page = BoundedFilterPage(
+        rows=[
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-a",
+                "root_span_id": "root-a",
+                "span_id": "root-a",
+                "start_time": started,
+                "end_time": started + timedelta(seconds=12),
+                "provider": "vapi",
+            }
+        ],
+        has_more=False,
+        complete=False,
+        status="degraded",
+        error_code="scan_budget_exceeded",
+        total_rows_lower_bound=1,
+        elapsed_ms=4_500.0,
+        query_count=8,
+        rows_returned=400,
+        result_payload_bytes=8_192,
+        attempts=(),
+    )
+    content_result = QueryResult(
+        data=[
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-a",
+                "span_id": "root-a",
+                "start_time": started,
+                "span_attributes": '{"final_status":"Rejected"}',
+                "attrs_string": {},
+                "attrs_number": {},
+                "attrs_bool": {},
+                "provider": "vapi",
+            }
+        ],
+        row_count=1,
+        backend_used="clickhouse",
+        query_time_ms=1.0,
+    )
+    view = TraceView.__new__(TraceView)
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.return_value = content_result
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.views.trace.ObservabilityService.process_raw_logs",
+            return_value={"status": "completed"},
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded_page,
+        ) as bounded_reader,
+    ):
+        response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params={"allow_sampled": "true"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page": 1,
+                "page_size": 15,
+                "allow_sampled": True,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response.status_code == 200
+    assert response.data["count"] == 1
+    assert response.data["query_complete"] is False
+    assert response.data["query_status"] == "degraded"
+    assert response.data["query_error_code"] == "scan_budget_exceeded"
+    assert [row["trace_id"] for row in response.data["results"]] == ["trace-a"]
+    assert response.data["results"][0]["final_status"] == "Rejected"
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is True
+    analytics.execute_ch_query.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("query_params", "validated_allow_sampled"),
+    [({}, None), ({"allow_sampled": "false"}, False)],
+)
+def test_voice_incomplete_page_remains_fail_closed_without_explicit_sample(
+    query_params: dict[str, str],
+    validated_allow_sampled: bool | None,
+) -> None:
+    from tracer.views.trace import TraceView
+
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    analytics = mock.MagicMock()
+    validated_data = {
+        "filters": [_time_filter()],
+        "page": 1,
+        "page_size": 15,
+    }
+    if validated_allow_sampled is not None:
+        validated_data["allow_sampled"] = validated_allow_sampled
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=_incomplete_empty_page(),
+        ) as bounded_reader,
+    ):
+        response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params=query_params),
+            project_id=PROJECT_ID,
+            validated_data=validated_data,
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2] == {"code": "service_unavailable"}
+    assert "DB::Exception" not in str(response)
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_voice_later_page_does_not_publish_an_incomplete_sample() -> None:
+    from tracer.views.trace import TraceView
+
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=_incomplete_empty_page(),
+        ) as bounded_reader,
+    ):
+        response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params={"allow_sampled": "true"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [_time_filter()],
+                "page": 2,
+                "page_size": 15,
+                "allow_sampled": True,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2] == {"code": "service_unavailable"}
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    analytics.execute_ch_query.assert_not_called()
 
 
 def test_voice_first_unsupported_numbered_page_is_typed_422_before_ch() -> None:
@@ -5155,6 +5511,31 @@ def _rows(*minute_offsets: int) -> list[dict[str, Any]]:
         {"id": f"span-{index}", "start_time": END - timedelta(minutes=offset)}
         for index, offset in enumerate(minute_offsets)
     ]
+
+
+def test_classifier_read_setting_caps_only_classifier_statements() -> None:
+    rows = _rows(1, 2)
+    builder = _ClassifierSettingsFakeBuilder(rows)
+    executor = _ClassifierSettingsFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+        deadline_ms=5_000,
+        max_seed_attempts=1,
+        max_candidates=2,
+        max_query_count=2,
+        read_settings={"max_block_size": 4_096},
+    )
+
+    assert [row["id"] for row in page.rows] == ["span-0"]
+    assert [query for query, _ in executor.settings_by_query] == ["seed", "match"]
+    assert executor.settings_by_query[0][1]["max_block_size"] == 4_096
+    assert executor.settings_by_query[1][1]["max_block_size"] == 2_048
 
 
 def test_graph_only_incomplete_rows_do_not_change_exact_list_default() -> None:

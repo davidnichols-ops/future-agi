@@ -42564,12 +42564,13 @@ export const TracerTraceListVoiceCallsQueryParams = zod.object({
   "page": zod.number().min(1).default(tracerTraceListVoiceCallsQueryPageDefault).describe('One-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.'),
   "page_size": zod.number().min(1).max(tracerTraceListVoiceCallsQueryPageSizeMax).default(tracerTraceListVoiceCallsQueryPageSizeDefault),
   "remove_simulation_calls": zod.boolean().default(tracerTraceListVoiceCallsQueryRemoveSimulationCallsDefault),
-  "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label count as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.')
+  "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label count as a lower bound. Send false to require an exact total. Send true to opt in explicitly to lower-bound totals and, on the first page, a clearly labelled bounded partial result when the full ordered prefix cannot be proven inside the read budget.')
 })
 
 export const tracerTraceListVoiceCallsResponseCountMin = 0;
 
 export const tracerTraceListVoiceCallsResponseTotalPagesMin = 0;
+
 
 
 
@@ -42586,7 +42587,9 @@ export const TracerTraceListVoiceCallsResponse = zod.object({
   "results": zod.array(zod.record(zod.string(), zod.string())),
   "config": zod.array(zod.record(zod.string(), zod.string())),
   "has_more": zod.boolean(),
-  "query_complete": zod.boolean()
+  "query_complete": zod.boolean(),
+  "query_status": zod.enum(['complete', 'degraded']),
+  "query_error_code": zod.string().min(1).optional()
 })
 
 

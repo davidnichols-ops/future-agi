@@ -3035,7 +3035,12 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     span_attribute_keys, discovery_metadata
                 )
 
-            cardinality = selector.sample_cardinality([project_id])
+            cardinality = selector.sample_cardinality(
+                [project_id],
+                # Trace pickers only need spans-per-trace and must not pay for
+                # the targeted session lane. Session pickers explicitly opt in.
+                ensure_session_sample=row_type == "sessions",
+            )
             cardinality_has_verified_results = cardinality.max_spans_per_trace > 0 and (
                 row_type != "sessions" or cardinality.max_traces_per_session > 0
             )
@@ -3193,7 +3198,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         """Bounded CH25-only span cardinality sample for legacy callers."""
 
         return (
-            AttributeReadSelector().sample_cardinality([project_id]).max_spans_per_trace
+            AttributeReadSelector()
+            .sample_cardinality([project_id], ensure_session_sample=False)
+            .max_spans_per_trace
         )
 
     def _max_traces_per_session(self, project_id: str) -> int:

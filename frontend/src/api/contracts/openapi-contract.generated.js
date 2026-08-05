@@ -71964,7 +71964,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "results",
         "config",
         "has_more",
-        "query_complete"
+        "query_complete",
+        "query_status"
       ],
       "type": "object",
       "properties": {
@@ -72026,6 +72027,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "query_complete": {
           "title": "Query complete",
           "type": "boolean"
+        },
+        "query_status": {
+          "title": "Query status",
+          "type": "string",
+          "enum": [
+            "complete",
+            "degraded"
+          ]
+        },
+        "query_error_code": {
+          "title": "Query error code",
+          "type": "string",
+          "minLength": 1
         }
       }
     },

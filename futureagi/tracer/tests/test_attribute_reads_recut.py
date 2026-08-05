@@ -458,6 +458,113 @@ def test_latest_cardinality_replay_has_one_grouping_clause():
     )
 
 
+def test_cardinality_uses_targeted_session_lane_when_dense_generic_sample_has_none():
+    generic_candidates = [
+        _candidate(
+            PROJECT_A,
+            f"generic-{index}",
+            trace_id="generic-trace",
+            start_time=NOW - timedelta(minutes=index + 1),
+        )
+        for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+    ]
+    targeted_candidates = [
+        _candidate(
+            PROJECT_A,
+            f"session-{index}",
+            trace_id=f"session-trace-{index}",
+            start_time=NOW - timedelta(hours=1, minutes=index),
+        )
+        for index in range(2)
+    ]
+
+    def respond(call, call_number):
+        if call_number == 1:
+            return generic_candidates
+        if call_number == 2:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    span_id,
+                    trace_id="generic-trace",
+                    start_time=next(
+                        row["start_time"]
+                        for row in generic_candidates
+                        if row["id"] == span_id
+                    ),
+                )
+                for span_id in call.params["candidate_ids_0"]
+            ]
+        if call_number == 3:
+            assert "isNotNull(trace_session_id)" in call.sql
+            assert "trace_session_id != toUUID" in call.sql
+            assert call.settings.get("use_skip_indexes", 1) == 1
+            return targeted_candidates
+        if call_number == 4:
+            rows = []
+            for candidate in targeted_candidates:
+                row = _target_row(
+                    PROJECT_A,
+                    candidate["id"],
+                    trace_id=candidate["trace_id"],
+                    start_time=candidate["start_time"],
+                )
+                row["trace_session_id"] = "25e06345-d983-4041-b991-720bd1a437bd"
+                rows.append(row)
+            return rows
+        pytest.fail(f"unexpected cardinality query {call_number}")
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).sample_cardinality([PROJECT_A])
+
+    assert read.max_spans_per_trace == ATTRIBUTE_READ_CANDIDATE_LIMIT
+    assert read.max_traces_per_session == 2
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
+    assert read.metadata.query_count == 4
+
+
+def test_trace_only_cardinality_does_not_run_targeted_session_lane():
+    generic_candidates = [
+        _candidate(
+            PROJECT_A,
+            f"generic-{index}",
+            trace_id="generic-trace",
+            start_time=NOW - timedelta(minutes=index + 1),
+        )
+        for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+    ]
+
+    def respond(call, call_number):
+        if call_number == 1:
+            return generic_candidates
+        if call_number == 2:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    span_id,
+                    trace_id="generic-trace",
+                    start_time=next(
+                        row["start_time"]
+                        for row in generic_candidates
+                        if row["id"] == span_id
+                    ),
+                )
+                for span_id in call.params["candidate_ids_0"]
+            ]
+        pytest.fail("trace-only cardinality unexpectedly queried the session lane")
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).sample_cardinality(
+        [PROJECT_A], ensure_session_sample=False
+    )
+
+    assert read.max_spans_per_trace == ATTRIBUTE_READ_CANDIDATE_LIMIT
+    assert read.max_traces_per_session == 0
+    assert read.metadata.query_count == 2
+
+
 def test_v2_executor_reuses_the_process_singleton_ch25_pool(monkeypatch):
     class FakeClient:
         def execute_read(self, query, params, *, timeout_ms, settings):
@@ -3493,7 +3600,7 @@ def test_eval_picker_uses_selector_for_keys_and_cardinality_without_pg_fallback(
     monkeypatch.setattr(
         AttributeReadSelector,
         "sample_cardinality",
-        lambda self, project_ids: AttributeCardinalityRead(1, 1, _metadata()),
+        lambda self, project_ids, **kwargs: AttributeCardinalityRead(1, 1, _metadata()),
     )
     monkeypatch.setattr(
         "tracer.views.observation_span.ObservationSpanView._get_span_attribute_keys",

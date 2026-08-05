@@ -4682,6 +4682,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         from tracer.selectors.trace_filter_reads import read_bounded_filter_page
         from tracer.services.clickhouse.query_service import QueryResult
 
+        # A caller must opt in explicitly before an incomplete prefix can be
+        # published. The bounded selector exposes only fully classified matches,
+        # never raw candidates, and permits this contract only for page zero.
+        # Omitted/false remain fail-closed so existing clients cannot silently
+        # reinterpret a partial page as an exact ordered result.
+        publish_bounded_partial = bool(
+            validated_data.get("allow_sampled") is True and page_number == 0
+        )
         bounded_page = read_bounded_filter_page(
             builder=builder,
             analytics=analytics,
@@ -4690,6 +4698,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             page_number=page_number,
             page_size=page_size,
             deadline_ms=4500,
+            include_incomplete_rows=publish_bounded_partial,
         )
         if not bounded_page.complete:
             if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -4710,11 +4719,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 page_number=page_number,
                 error_code=bounded_page.error_code,
             )
-            return self._gm.custom_error_response(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "Voice call data is temporarily unavailable. Please retry.",
-                code="service_unavailable",
-            )
+            if not publish_bounded_partial:
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Voice call data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
         result = QueryResult(
             data=bounded_page.rows,
             row_count=len(bounded_page.rows),
@@ -5122,7 +5132,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             "config": column_config,
             "has_more": bounded_page.has_more,
             "query_complete": bounded_page.complete,
+            "query_status": bounded_page.status,
         }
+        if bounded_page.error_code:
+            response_data["query_error_code"] = bounded_page.error_code
         if response_data["count_is_lower_bound"] and exact_total_explicitly_required(
             request, validated_data
         ):

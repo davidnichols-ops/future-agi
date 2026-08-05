@@ -134,6 +134,15 @@ _TYPE_PRIORITY: dict[AttributeType, int] = {
     "json": 4,
 }
 
+_NIL_UUID = "00000000-0000-0000-0000-000000000000"
+# The storage-order generic cardinality sample can be full of non-session spans
+# on a dense project even when the same project has session data.  This
+# predicate gives session pickers a separate, indexed candidate lane instead of
+# treating that unrelated sample as evidence that sessions do not exist.
+_SESSION_CARDINALITY_CANDIDATE_PREDICATE = (
+    f"isNotNull(trace_session_id) AND trace_session_id != toUUID('{_NIL_UUID}')"
+)
+
 
 class InvalidAttributeKey(ValueError):
     """A requested attribute key is not safe for the public picker API."""
@@ -2585,8 +2594,18 @@ class AttributeReadSelector:
         project_ids: Iterable[Any],
         *,
         horizon_days: int = 30,
+        ensure_session_sample: bool = True,
     ) -> AttributeCardinalityRead:
-        """Sample nested picker dimensions from CH only under one operation budget."""
+        """Sample nested picker dimensions from CH only under one operation budget.
+
+        A generic storage-order sample is sufficient for trace span slots, but
+        it is not evidence that a dense project has no session-bearing spans.
+        When session dimensions are required, an empty generic session sample
+        therefore gets one independently bounded lane whose raw candidates are
+        restricted by the indexed ``trace_session_id`` column.  Every candidate
+        still goes through the same latest-state replay before it can affect the
+        public cardinality.
+        """
 
         self._begin_operation()
         projects = self._project_ids(project_ids)
@@ -2646,6 +2665,55 @@ class AttributeReadSelector:
             if segment_truncated:
                 break
 
+        def row_has_session(row: dict[str, Any]) -> bool:
+            session_id = str(row.get("trace_session_id") or "")
+            return bool(session_id and session_id != _NIL_UUID)
+
+        # A truncated generic sample with no session-bearing rows used to make
+        # the session eval picker return a false 503.  Probe the session index
+        # directly instead.  Empty *complete* segments continue into the older
+        # adjacent bands; the first verified live session sample is sufficient
+        # because cardinality is intentionally a labelled finite sample.
+        if ensure_session_sample and not any(
+            row_has_session(row) for row in latest_rows.values()
+        ):
+            for segment in windows:
+                try:
+                    candidate_ids, segment_truncated, _ = self._candidate_ids(
+                        projects,
+                        segment,
+                        predicate=_SESSION_CARDINALITY_CANDIDATE_PREDICATE,
+                        attribute_key=None,
+                        candidate_limit=ATTRIBUTE_READ_CANDIDATE_LIMIT,
+                    )
+                    rows = self._verify_latest(
+                        sql=_LATEST_CARDINALITY_SQL,
+                        project_ids=projects,
+                        candidate_ids=candidate_ids,
+                    )
+                except Exception as exc:
+                    if not latest_rows or not is_read_budget_error(exc):
+                        raise
+                    budget_exceeded = True
+                    self._warn_partial_budget("sample_cardinality_session")
+                    break
+
+                covered_start = min(covered_start, segment[0])
+                truncated = truncated or segment_truncated
+                verified_session_found = False
+                for row in rows:
+                    identity = self._physical_identity(row)
+                    if self._row_is_active_in_window(row, overall_start, overall_end):
+                        latest_rows[identity] = row
+                        verified_session_found = (
+                            verified_session_found or row_has_session(row)
+                        )
+                    else:
+                        latest_rows.pop(identity, None)
+
+                if verified_session_found:
+                    break
+
         spans_by_trace: Counter[tuple[str, str]] = Counter()
         traces_by_session: dict[tuple[str, str], set[str]] = defaultdict(set)
         for row in latest_rows.values():
@@ -2655,7 +2723,7 @@ class AttributeReadSelector:
             if not trace_id:
                 continue
             spans_by_trace[(project_id, trace_id)] += 1
-            if session_id and session_id != "00000000-0000-0000-0000-000000000000":
+            if session_id and session_id != _NIL_UUID:
                 traces_by_session[(project_id, session_id)].add(trace_id)
         return AttributeCardinalityRead(
             max(spans_by_trace.values(), default=0),

@@ -358,6 +358,30 @@ def read_bounded_filter_page(
     if not 1 <= classify_batch_size <= max_candidates:
         raise ValueError("classify_batch_size exceeds max_candidates")
 
+    classify_read_settings: dict[str, int] = {}
+    classify_settings_recommendation = getattr(
+        builder, "recommended_filter_classify_read_settings", None
+    )
+    if callable(classify_settings_recommendation):
+        raw_classify_read_settings = classify_settings_recommendation()
+        if raw_classify_read_settings is not None:
+            if not isinstance(raw_classify_read_settings, dict):
+                raise ValueError("recommended classify read settings must be a dict")
+            unsupported_settings = set(raw_classify_read_settings) - {"max_block_size"}
+            if unsupported_settings:
+                raise ValueError("unsupported recommended classify read setting")
+            for setting_name, raw_value in raw_classify_read_settings.items():
+                if isinstance(raw_value, bool):
+                    raise ValueError(
+                        "recommended classify read settings must be positive integers"
+                    )
+                setting_value = int(raw_value)
+                if setting_value <= 0:
+                    raise ValueError(
+                        "recommended classify read settings must be positive integers"
+                    )
+                classify_read_settings[setting_name] = setting_value
+
     started = monotonic()
     deadline = started + (deadline_ms / 1000)
     seed_order_proof = getattr(builder, "filter_seed_proves_result_order", None)
@@ -837,6 +861,12 @@ def read_bounded_filter_page(
                 **(read_settings or {}),
                 "max_result_rows": result_limit,
             }
+            if kind == "classify":
+                for setting_name, setting_cap in classify_read_settings.items():
+                    settings[setting_name] = min(
+                        int(settings.get(setting_name, setting_cap)),
+                        setting_cap,
+                    )
             if max_bytes_to_read_cap is not None:
                 if max_bytes_to_read_cap <= 0:
                     raise ValueError("query byte cap must be positive")

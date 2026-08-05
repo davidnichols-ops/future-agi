@@ -21747,6 +21747,14 @@ export type TraceVoiceCallListResponseApiResultsItem = {[key: string]: string};
 
 export type TraceVoiceCallListResponseApiConfigItem = {[key: string]: string};
 
+export type TraceVoiceCallListResponseApiQueryStatus = typeof TraceVoiceCallListResponseApiQueryStatus[keyof typeof TraceVoiceCallListResponseApiQueryStatus];
+
+
+export const TraceVoiceCallListResponseApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
 export interface TraceVoiceCallListResponseApi {
   /** @minimum 0 */
   count: number;
@@ -21763,6 +21771,9 @@ export interface TraceVoiceCallListResponseApi {
   config: TraceVoiceCallListResponseApiConfigItem[];
   has_more: boolean;
   query_complete: boolean;
+  query_status: TraceVoiceCallListResponseApiQueryStatus;
+  /** @minLength 1 */
+  query_error_code?: string;
 }
 
 export type TraceDetailResultApiTrace = { [key: string]: unknown };
@@ -27438,7 +27449,7 @@ page?: number;
 page_size?: number;
 remove_simulation_calls?: boolean;
 /**
- * Omit for backward-compatible complete bounded pages, which may label count as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.
+ * Omit for backward-compatible complete bounded pages, which may label count as a lower bound. Send false to require an exact total. Send true to opt in explicitly to lower-bound totals and, on the first page, a clearly labelled bounded partial result when the full ordered prefix cannot be proven inside the read budget.
  */
 allow_sampled?: boolean;
 };
