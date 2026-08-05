@@ -90,6 +90,7 @@ from tracer.services.clickhouse.graph_dispatch import (
     enforce_exact_graph_data_contract,
     graph_payload_is_publishable,
 )
+from tracer.services.clickhouse.list_cursor import exact_total_explicitly_required
 from tracer.services.clickhouse.query_builders.base import NIL_UUID, BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.eval_status import (
     non_terminal_eval_marker,
@@ -2855,9 +2856,9 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     "query_error_code": bounded_page.error_code,
                 }
             )
-        if metadata.get("total_rows_is_lower_bound") and not validated_data.get(
-            "allow_sampled", False
-        ):
+        if metadata.get(
+            "total_rows_is_lower_bound"
+        ) and exact_total_explicitly_required(request, validated_data):
             return self._gm.custom_error_response(
                 drf_status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Session data is temporarily unavailable. Please retry.",

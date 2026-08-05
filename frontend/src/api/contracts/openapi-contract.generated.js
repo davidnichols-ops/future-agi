@@ -35324,8 +35324,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "allow_sampled": {
             "required": false,
             "schema": {
-              "type": "boolean",
-              "default": false
+              "type": "boolean"
             }
           }
         },
@@ -36268,8 +36267,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "allow_sampled": {
             "required": false,
             "schema": {
-              "type": "boolean",
-              "default": false
+              "type": "boolean"
             }
           }
         },

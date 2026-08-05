@@ -146,7 +146,7 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
             return_value=[],
         ),
     ):
-        legacy_response = TraceSessionView._list_sessions_clickhouse(
+        omitted_status, omitted_payload = TraceSessionView._list_sessions_clickhouse(
             view,
             request,
             project_id=project_id,
@@ -159,6 +159,22 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
                 "page_size": 1,
             },
         )
+        request.query_params = {"allow_sampled": "false"}
+        explicit_false_response = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=project_id,
+            project=None,
+            analytics=analytics,
+            validated_data={
+                "filters": filters,
+                "sort_params": [],
+                "page_number": 4,
+                "page_size": 1,
+                "allow_sampled": False,
+            },
+        )
+        request.query_params = {"allow_sampled": "true"}
         status, payload = TraceSessionView._list_sessions_clickhouse(
             view,
             request,
@@ -174,8 +190,10 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
             },
         )
 
-    assert legacy_response[0] == "error"
-    assert legacy_response[1] == 503
+    assert omitted_status == "ok"
+    assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert explicit_false_response[0] == "error"
+    assert explicit_false_response[1] == 503
     assert status == "ok"
     assert payload["metadata"] == {
         "total_rows": 6,
@@ -187,7 +205,7 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
     }
     assert payload["table"][0]["first_message"] == "first"
     assert payload["table"][0]["last_message"] == "last"
-    assert bounded_read.call_count == 2
+    assert bounded_read.call_count == 3
     bounded_kwargs = bounded_read.call_args.kwargs
     assert bounded_kwargs["key_field"] == "session_id"
     assert bounded_kwargs["page_number"] == 4
@@ -196,9 +214,9 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
     assert bounded_kwargs["classify_batch_size"] == 50
     builder.build_candidate_page_query.assert_not_called()
     builder.build.assert_not_called()
-    assert builder.build_page_metrics_query.call_count == 2
-    assert builder.build_content_query.call_count == 2
-    assert builder.build_span_attributes_query.call_count == 2
+    assert builder.build_page_metrics_query.call_count == 3
+    assert builder.build_content_query.call_count == 3
+    assert builder.build_span_attributes_query.call_count == 3
 
 
 @pytest.mark.unit

@@ -102,10 +102,10 @@ class TraceSessionListQuerySerializer(StrictInputSerializer):
     interval = serializers.CharField(required=False, allow_blank=True)
     allow_sampled = serializers.BooleanField(
         required=False,
-        default=False,
         help_text=(
-            "Explicitly opt in to lower-bound list totals. Clients that set "
-            "this must not present the count as an exact total."
+            "Omit for backward-compatible complete bounded pages, which may "
+            "label total_rows as a lower bound. Send false to require an exact "
+            "total, or true to opt in explicitly to lower-bound totals."
         ),
     )
 

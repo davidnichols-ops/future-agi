@@ -41685,7 +41685,7 @@ export const tracerTraceSessionListSessionsQueryPageNumberMin = 0;
 export const tracerTraceSessionListSessionsQueryPageSizeDefault = 30;
 export const tracerTraceSessionListSessionsQueryPageSizeMax = 500;
 
-export const tracerTraceSessionListSessionsQueryAllowSampledDefault = false;
+
 
 export const TracerTraceSessionListSessionsQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -41698,7 +41698,7 @@ export const TracerTraceSessionListSessionsQueryParams = zod.object({
   "page_number": zod.number().min(tracerTraceSessionListSessionsQueryPageNumberMin).default(tracerTraceSessionListSessionsQueryPageNumberDefault).describe('Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range.'),
   "page_size": zod.number().min(1).max(tracerTraceSessionListSessionsQueryPageSizeMax).default(tracerTraceSessionListSessionsQueryPageSizeDefault),
   "interval": zod.string().optional(),
-  "allow_sampled": zod.boolean().default(tracerTraceSessionListSessionsQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.')
+  "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.')
 })
 
 
@@ -42557,7 +42557,6 @@ export const tracerTraceListVoiceCallsQueryPageSizeDefault = 30;
 export const tracerTraceListVoiceCallsQueryPageSizeMax = 500;
 
 export const tracerTraceListVoiceCallsQueryRemoveSimulationCallsDefault = false;
-export const tracerTraceListVoiceCallsQueryAllowSampledDefault = false;
 
 export const TracerTraceListVoiceCallsQueryParams = zod.object({
   "project_id": zod.string().uuid(),
@@ -42565,7 +42564,7 @@ export const TracerTraceListVoiceCallsQueryParams = zod.object({
   "page": zod.number().min(1).default(tracerTraceListVoiceCallsQueryPageDefault).describe('One-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.'),
   "page_size": zod.number().min(1).max(tracerTraceListVoiceCallsQueryPageSizeMax).default(tracerTraceListVoiceCallsQueryPageSizeDefault),
   "remove_simulation_calls": zod.boolean().default(tracerTraceListVoiceCallsQueryRemoveSimulationCallsDefault),
-  "allow_sampled": zod.boolean().default(tracerTraceListVoiceCallsQueryAllowSampledDefault).describe('Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.')
+  "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label count as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.')
 })
 
 export const tracerTraceListVoiceCallsResponseCountMin = 0;

@@ -27183,7 +27183,7 @@ page_number?: number;
 page_size?: number;
 interval?: string;
 /**
- * Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.
+ * Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.
  */
 allow_sampled?: boolean;
 };
@@ -27438,7 +27438,7 @@ page?: number;
 page_size?: number;
 remove_simulation_calls?: boolean;
 /**
- * Explicitly opt in to lower-bound list totals. Clients that set this must not present the count as an exact total.
+ * Omit for backward-compatible complete bounded pages, which may label count as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.
  */
 allow_sampled?: boolean;
 };

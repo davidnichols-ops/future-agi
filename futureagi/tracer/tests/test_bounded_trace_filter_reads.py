@@ -4707,8 +4707,8 @@ def test_voice_list_uses_v2_builder_when_routing_is_disabled() -> None:
             return_value=_complete_empty_page(),
         ) as bounded_reader,
     ):
-        legacy_response = view._list_voice_calls_clickhouse(
-            SimpleNamespace(),
+        omitted_response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params={}),
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [_time_filter()],
@@ -4718,8 +4718,20 @@ def test_voice_list_uses_v2_builder_when_routing_is_disabled() -> None:
             remove_simulation_calls=False,
             analytics=analytics,
         )
+        explicit_false_response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params={"allow_sampled": "false"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [_time_filter()],
+                "page": 71,
+                "page_size": 30,
+                "allow_sampled": False,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
         response = view._list_voice_calls_clickhouse(
-            SimpleNamespace(),
+            SimpleNamespace(query_params={"allow_sampled": "true"}),
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [_time_filter()],
@@ -4731,7 +4743,9 @@ def test_voice_list_uses_v2_builder_when_routing_is_disabled() -> None:
             analytics=analytics,
         )
 
-    assert legacy_response.status_code == 503
+    assert omitted_response.status_code == 200
+    assert omitted_response.data["count_is_lower_bound"] is True
+    assert explicit_false_response.status_code == 503
     assert response.status_code == 200
     assert response.data["current_page"] == 71
     response_serializer = TraceVoiceCallListResponseSerializer(data=response.data)
@@ -4740,6 +4754,7 @@ def test_voice_list_uses_v2_builder_when_routing_is_disabled() -> None:
         bounded_reader.call_args.kwargs["builder"], VoiceCallListQueryBuilderV2
     )
     assert bounded_reader.call_args.kwargs["analytics"] is analytics
+    assert bounded_reader.call_count == 3
     assert bounded_reader.call_args.kwargs["page_number"] == 70
     assert bounded_reader.call_args.kwargs["page_size"] == 30
 

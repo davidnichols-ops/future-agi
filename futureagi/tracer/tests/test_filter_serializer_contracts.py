@@ -728,6 +728,11 @@ class TestFilterSerializerContracts:
             (SpanListQuerySerializer, {"project_version_id": project_version_id}),
             (TraceObserveListQuerySerializer, {}),
             (SpanObserveListQuerySerializer, {}),
+            (
+                TraceVoiceCallListQuerySerializer,
+                {"project_id": project_version_id},
+            ),
+            (TraceSessionListQuerySerializer, {}),
         )
         for serializer_class, base_data in serializers_and_base_data:
             omitted = serializer_class(data=base_data)

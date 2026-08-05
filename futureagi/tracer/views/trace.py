@@ -5123,8 +5123,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             "has_more": bounded_page.has_more,
             "query_complete": bounded_page.complete,
         }
-        if response_data["count_is_lower_bound"] and not validated_data.get(
-            "allow_sampled", False
+        if response_data["count_is_lower_bound"] and exact_total_explicitly_required(
+            request, validated_data
         ):
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
