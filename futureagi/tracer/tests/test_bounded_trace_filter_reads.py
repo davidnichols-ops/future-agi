@@ -463,6 +463,38 @@ def test_extreme_structured_multifilter_keeps_scalar_fast_path_independent() -> 
 
 
 @pytest.mark.parametrize(
+    ("include_filter_witnesses", "population_proof"),
+    [(False, False), (True, True)],
+    ids=["normal", "population-proof"],
+)
+def test_structured_eval_bulk_retains_population_proof_batch_and_block_cap(
+    include_filter_witnesses: bool,
+    population_proof: bool,
+) -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter(
+                "payload",
+                {"state": "Rejected"},
+                filter_type="map",
+            ),
+        ],
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=include_filter_witnesses,
+        bounded_population_proof=population_proof,
+    )
+
+    assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_classify_read_settings() == {
+        "max_block_size": 2_048
+    }
+
+
+@pytest.mark.parametrize(
     ("filter_type", "operation", "value", "map_column"),
     [
         ("text", "equals", "Rejected", "span_attr_str"),

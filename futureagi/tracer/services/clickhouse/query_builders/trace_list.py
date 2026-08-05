@@ -726,10 +726,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Keep the candidate-trace latest-state scan below CH's memory ceiling."""
 
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
-        if self._structured_attribute_filter_count():
-            # Normal trace pages otherwise widen identity-only classification
-            # to 100. Structured JSON/Map replay must stay on the twenty-trace
-            # envelope even when a scalar leaf supplies an indexed seed.
+        if self._structured_attribute_filter_count() and not self._bounded_bulk_scan:
+            # Interactive trace lists and graphs otherwise widen identity-only
+            # classification to 100. Structured JSON/Map replay must stay on
+            # the twenty-trace envelope even when a scalar leaf supplies an
+            # indexed seed. Internal eval/task bulk scans retain their
+            # separately qualified 100-identity population-proof envelope so
+            # a complete 10k+sentinel proof still fits under 128 queries.
             return _STRUCTURED_ANY_SPAN_CLASSIFY_BATCH_SIZE
         if (
             not self._bounded_population_proof

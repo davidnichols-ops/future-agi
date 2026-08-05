@@ -2672,12 +2672,25 @@ class AttributeReadSelector:
         # A truncated generic sample with no session-bearing rows used to make
         # the session eval picker return a false 503.  Probe the session index
         # directly instead.  Empty *complete* segments continue into the older
-        # adjacent bands; the first verified live session sample is sufficient
-        # because cardinality is intentionally a labelled finite sample.
+        # adjacent bands.  A truncated page whose latest-state replay contains
+        # only tombstoned/session-cleared rows restarts in deterministic order
+        # and keyset-pages inside that same segment; the unordered storage-order
+        # page is deliberately never reused as an ordered cursor.  The global
+        # targeted-page/query/deadline ceilings keep this lane finite, and the
+        # first verified live session sample is sufficient because cardinality
+        # is intentionally a labelled finite sample.
         if ensure_session_sample and not any(
             row_has_session(row) for row in latest_rows.values()
         ):
+            targeted_candidate_pages = 0
+            targeted_lane_halted = False
             for segment in windows:
+                if (
+                    targeted_candidate_pages
+                    >= ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
+                ):
+                    truncated = True
+                    break
                 try:
                     candidate_ids, segment_truncated, _ = self._candidate_ids(
                         projects,
@@ -2691,10 +2704,12 @@ class AttributeReadSelector:
                         project_ids=projects,
                         candidate_ids=candidate_ids,
                     )
+                    targeted_candidate_pages += 1
                 except Exception as exc:
                     if not latest_rows or not is_read_budget_error(exc):
                         raise
                     budget_exceeded = True
+                    targeted_lane_halted = True
                     self._warn_partial_budget("sample_cardinality_session")
                     break
 
@@ -2712,6 +2727,74 @@ class AttributeReadSelector:
                         latest_rows.pop(identity, None)
 
                 if verified_session_found:
+                    break
+                if not segment_truncated:
+                    continue
+
+                # The first candidate page follows storage order, so it cannot
+                # supply a cursor for the globally ordered query.  Restart at
+                # ordered page one, then derive every subsequent cursor only
+                # from the preceding page in that same order.
+                before_identity: PhysicalSpanIdentity | None = None
+                segment_complete = False
+                while (
+                    targeted_candidate_pages
+                    < ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT
+                ):
+                    try:
+                        (
+                            candidate_ids,
+                            continuation_truncated,
+                            _,
+                        ) = self._candidate_ids(
+                            projects,
+                            segment,
+                            predicate=_SESSION_CARDINALITY_CANDIDATE_PREDICATE,
+                            attribute_key=None,
+                            ordered=True,
+                            before_identity=before_identity,
+                            candidate_limit=ATTRIBUTE_READ_CANDIDATE_LIMIT,
+                        )
+                        rows = self._verify_latest(
+                            sql=_LATEST_CARDINALITY_SQL,
+                            project_ids=projects,
+                            candidate_ids=candidate_ids,
+                        )
+                        targeted_candidate_pages += 1
+                    except Exception as exc:
+                        if not latest_rows or not is_read_budget_error(exc):
+                            raise
+                        budget_exceeded = True
+                        targeted_lane_halted = True
+                        self._warn_partial_budget("sample_cardinality_session")
+                        break
+
+                    verified_session_found = False
+                    for row in rows:
+                        identity = self._physical_identity(row)
+                        if self._row_is_active_in_window(
+                            row, overall_start, overall_end
+                        ):
+                            latest_rows[identity] = row
+                            verified_session_found = (
+                                verified_session_found or row_has_session(row)
+                            )
+                        else:
+                            latest_rows.pop(identity, None)
+
+                    if verified_session_found:
+                        break
+                    if not continuation_truncated or not candidate_ids:
+                        segment_complete = True
+                        break
+                    before_identity = candidate_ids[-1]
+
+                if verified_session_found or targeted_lane_halted:
+                    break
+                if not segment_complete:
+                    # The segment still has raw session-bearing candidates,
+                    # but the finite targeted-page ceiling was exhausted.
+                    truncated = True
                     break
 
         spans_by_trace: Counter[tuple[str, str]] = Counter()

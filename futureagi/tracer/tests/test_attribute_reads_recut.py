@@ -525,6 +525,119 @@ def test_cardinality_uses_targeted_session_lane_when_dense_generic_sample_has_no
     assert read.metadata.query_count == 4
 
 
+def test_cardinality_keyset_pages_past_cleared_targeted_session_rows():
+    generic_candidates = [
+        _candidate(
+            PROJECT_A,
+            f"generic-{index}",
+            trace_id="generic-trace",
+            start_time=NOW - timedelta(minutes=index + 1),
+        )
+        for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+    ]
+    stale_session_candidates = [
+        _candidate(
+            PROJECT_A,
+            f"stale-session-{index:03d}",
+            trace_id=f"stale-session-trace-{index:03d}",
+            start_time=NOW - timedelta(hours=2, seconds=index),
+        )
+        for index in range(ATTRIBUTE_READ_CANDIDATE_LIMIT + 1)
+    ]
+    live_session_candidate = _candidate(
+        PROJECT_A,
+        "live-session",
+        trace_id="live-session-trace",
+        start_time=NOW - timedelta(hours=3),
+    )
+    stale_by_id = {row["id"]: row for row in stale_session_candidates}
+
+    def stale_latest_rows(call):
+        rows = []
+        for index, span_id in enumerate(call.params["candidate_ids_0"]):
+            candidate = stale_by_id[span_id]
+            rows.append(
+                _target_row(
+                    PROJECT_A,
+                    span_id,
+                    trace_id=candidate["trace_id"],
+                    start_time=candidate["start_time"],
+                    # Alternate tombstones with live rows whose latest version
+                    # cleared the raw candidate's former session id.
+                    is_deleted=index % 2,
+                )
+            )
+        return rows
+
+    def respond(call, call_number):
+        if call_number == 1:
+            return generic_candidates
+        if call_number == 2:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    span_id,
+                    trace_id="generic-trace",
+                    start_time=next(
+                        row["start_time"]
+                        for row in generic_candidates
+                        if row["id"] == span_id
+                    ),
+                )
+                for span_id in call.params["candidate_ids_0"]
+            ]
+        if call_number == 3:
+            assert "isNotNull(trace_session_id)" in call.sql
+            assert "candidate_before_start_us" not in call.params
+            assert call.settings["optimize_read_in_order"] == 1
+            return stale_session_candidates
+        if call_number == 4:
+            return stale_latest_rows(call)
+        if call_number == 5:
+            # An unordered storage-order sample is not a valid cursor for the
+            # deterministic latest-first query, so continuation restarts at
+            # ordered page one.
+            assert "ORDER BY\n        start_time DESC" in call.sql
+            assert "candidate_before_start_us" not in call.params
+            assert "optimize_read_in_order" not in call.settings
+            return stale_session_candidates
+        if call_number == 6:
+            return stale_latest_rows(call)
+        if call_number == 7:
+            ordered_cursor = stale_session_candidates[
+                ATTRIBUTE_READ_CANDIDATE_LIMIT - 1
+            ]
+            assert call.params["candidate_before_start_us"] == _unix_microseconds(
+                ordered_cursor["start_time"]
+            )
+            assert call.params["candidate_before_id"] == ordered_cursor["id"]
+            assert (
+                call.params["candidate_before_trace_id"] == ordered_cursor["trace_id"]
+            )
+            assert call.params["candidate_before_project_id"] == PROJECT_A
+            return [live_session_candidate]
+        if call_number == 8:
+            row = _target_row(
+                PROJECT_A,
+                live_session_candidate["id"],
+                trace_id=live_session_candidate["trace_id"],
+                start_time=live_session_candidate["start_time"],
+            )
+            row["trace_session_id"] = "25e06345-d983-4041-b991-720bd1a437bd"
+            return [row]
+        pytest.fail(f"unexpected cardinality query {call_number}")
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).sample_cardinality([PROJECT_A])
+
+    assert read.max_spans_per_trace == ATTRIBUTE_READ_CANDIDATE_LIMIT
+    assert read.max_traces_per_session == 1
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_status == "sampled"
+    assert read.metadata.query_error_code == "sample_limit"
+    assert read.metadata.query_count == 8
+
+
 def test_trace_only_cardinality_does_not_run_targeted_session_lane():
     generic_candidates = [
         _candidate(
