@@ -362,8 +362,8 @@ def test_filtered_graph_candidates_are_finite_latest_state_samples(
         assert "SELECT DISTINCT" not in normalized_seed_query
         assert (
             "ORDER BY observation_type DESC, service_name DESC, "
-            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
-            "start_time DESC" in normalized_seed_query
+            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC"
+            in normalized_seed_query
         )
         assert "LIMIT 1 BY trace_id" in normalized_seed_query
         assert seed_params["filter_anchor_limit"] == 513
@@ -2722,9 +2722,16 @@ def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
         if "filter_anchor_limit" in params
     ]
     expected_order = (
-        "ORDER BY observation_type DESC, service_name DESC, "
-        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
-        "start_time DESC"
+        (
+            "ORDER BY observation_type DESC, service_name DESC, "
+            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC"
+        )
+        if observe_type == "trace"
+        else (
+            "ORDER BY observation_type DESC, service_name DESC, "
+            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
+            "start_time DESC"
+        )
     )
     assert anchor_queries
     for query in anchor_queries:
@@ -2835,11 +2842,20 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
         for query, params, *_ in first_analytics.calls
         if "filter_anchor_limit" in params
     ]
+    expected_anchor_order = (
+        (
+            "ORDER BY observation_type DESC, service_name DESC, "
+            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC"
+        )
+        if observe_type == "trace"
+        else (
+            "ORDER BY observation_type DESC, service_name DESC, "
+            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
+            "start_time DESC"
+        )
+    )
     assert all(
-        "ORDER BY observation_type DESC, service_name DESC, "
-        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
-        "start_time DESC" in " ".join(query.split())
-        for query in anchor_queries
+        expected_anchor_order in " ".join(query.split()) for query in anchor_queries
     )
     expected_limit_by = (
         "LIMIT 1 BY trace_id"

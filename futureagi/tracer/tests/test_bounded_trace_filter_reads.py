@@ -735,8 +735,8 @@ def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
     assert "SELECT DISTINCT" not in normalized_anchor_sql
     assert (
         "ORDER BY observation_type DESC, service_name DESC, "
-        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
-        "start_time DESC" in normalized_anchor_sql
+        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC"
+        in normalized_anchor_sql
     )
     assert "LIMIT 1 BY trace_id" in normalized_anchor_sql
     assert normalized_anchor_sql.index("ORDER BY") < normalized_anchor_sql.index(
@@ -932,8 +932,8 @@ def test_org_trace_builder_keeps_project_in_seed_classifier_and_page_keys() -> N
     assert "SELECT DISTINCT" not in normalized_anchor_sql
     assert (
         "ORDER BY project_id DESC, observation_type DESC, service_name DESC, "
-        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
-        "start_time DESC" in normalized_anchor_sql
+        "toStartOfHour(start_time) DESC, trace_id DESC, id DESC"
+        in normalized_anchor_sql
     )
     assert "LIMIT 1 BY project_id, trace_id" in normalized_anchor_sql
     assert "SELECT project_id, trace_id, id AS root_span_id" in ordered_sql

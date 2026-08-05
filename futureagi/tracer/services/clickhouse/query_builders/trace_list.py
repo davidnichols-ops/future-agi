@@ -778,8 +778,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             service_name DESC,
             toStartOfHour(start_time) DESC,
             trace_id DESC,
-            id DESC,
-            start_time DESC
+            id DESC
         LIMIT 1 BY {identity_limit_by}
         LIMIT %(filter_anchor_limit)s
         """
