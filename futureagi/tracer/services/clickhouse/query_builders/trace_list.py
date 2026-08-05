@@ -92,6 +92,7 @@ _LONG_WINDOW_ANCHOR_SENTINEL = 64
 _LONG_WINDOW_ANCHOR_TIMEOUT_MS = 300
 _LONG_WINDOW_ANCHOR_STRATA = 4
 _LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 96 * 1024 * 1024
+_LONG_WINDOW_CANDIDATE_WITNESS_STRATA = 8
 
 
 def _unix_microseconds(value: datetime) -> int:
@@ -845,9 +846,34 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and self._candidate_witness_anchor_plan() is not None
         )
 
+    def recommended_filter_candidate_witness_probe_strata(self) -> int | None:
+        """Split a long-window raw witness superset into finite time strata."""
+
+        if not self.prefer_filter_candidate_witness_probe_first():
+            return None
+        return _LONG_WINDOW_CANDIDATE_WITNESS_STRATA
+
+    def recommended_filter_candidate_witness_fallback_classify_batch_size(
+        self,
+    ) -> int | None:
+        """Return the production-safe exact batch behind optional witnesses.
+
+        The probe may be unavailable on a locked profile, fail one temporal
+        stratum, or find a broad value. None of those optional outcomes may
+        widen the any-span latest-state classifier beyond its independently
+        qualified 20-trace ceiling.
+        """
+
+        if self._candidate_witness_anchor_plan() is None:
+            return None
+        return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
+
     def build_filter_candidate_witness_probe(
         self,
         seed_rows: list[dict[str, Any]],
+        *,
+        slice_start: datetime | None = None,
+        slice_end: datetime | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Return raw positive-Map witnesses for a finite trace batch.
 
@@ -915,6 +941,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         request_start, request_end = self._bounded_request_window
         if request_start >= request_end:
             return "", {}
+        if (slice_start is None) != (slice_end is None):
+            raise ValueError("candidate witness slice values must be provided together")
+        probe_start = request_start if slice_start is None else slice_start
+        probe_end = request_end if slice_end is None else slice_end
+        if not request_start <= probe_start < probe_end <= request_end:
+            raise ValueError(
+                "candidate witness slice must stay inside the request window"
+            )
         anchor_params = {
             key: value
             for key, value in anchor.params.items()
@@ -924,8 +958,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             **self.params,
             **anchor_params,
             **candidate_params,
-            "filter_candidate_start_us": _unix_microseconds(request_start),
-            "filter_candidate_end_us": _unix_microseconds(request_end),
+            "filter_candidate_start_us": _unix_microseconds(probe_start),
+            "filter_candidate_end_us": _unix_microseconds(probe_end),
             "filter_candidate_witness_limit": candidate_count,
         }
         project_version_fragment = ""

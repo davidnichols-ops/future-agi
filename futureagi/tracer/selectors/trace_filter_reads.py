@@ -28,6 +28,9 @@ _MAX_OPTIONAL_ANCHOR_STRATA = 4
 _QUERY_TIMEOUT_MS = 1_500
 _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS = 250
 _CANDIDATE_WITNESS_PREFILTER_MAX_BYTES = 96 * 1024 * 1024
+_CANDIDATE_WITNESS_PREFILTER_STRATA = 8
+_CANDIDATE_WITNESS_PREFILTER_MAX_ATTEMPTS = 32
+_CANDIDATE_WITNESS_PREFILTER_TOTAL_MS = 2_000
 _CANDIDATE_WITNESS_EXACT_RESERVE_MS = 1_000
 # Trace/span list queries fetch one additional page-sized de-duplication
 # margin; 5,000 is also the existing server-side result ceiling used by those
@@ -388,6 +391,16 @@ def read_bounded_filter_page(
         "prefer_filter_candidate_witness_probe_first",
         None,
     )
+    candidate_witness_probe_strata_builder = getattr(
+        builder,
+        "recommended_filter_candidate_witness_probe_strata",
+        None,
+    )
+    candidate_witness_fallback_batch_builder = getattr(
+        builder,
+        "recommended_filter_candidate_witness_fallback_classify_batch_size",
+        None,
+    )
     unhydrated_candidate_witness_capability = getattr(
         builder,
         "supports_filter_candidate_witness_prefilter_without_hydration",
@@ -414,6 +427,17 @@ def read_bounded_filter_page(
     candidate_witness_prefilter_allowed = bool(
         identity_only_classification or unhydrated_candidate_witness_prefilter
     )
+    candidate_witness_fallback_batch_size = classify_batch_size
+    if candidate_witness_prefilter_allowed and callable(
+        candidate_witness_fallback_batch_builder
+    ):
+        raw_fallback_batch_size = candidate_witness_fallback_batch_builder()
+        if raw_fallback_batch_size is not None:
+            candidate_witness_fallback_batch_size = int(raw_fallback_batch_size)
+            if not 1 <= candidate_witness_fallback_batch_size <= classify_batch_size:
+                raise ValueError(
+                    "candidate witness fallback batch size exceeds classifier batch"
+                )
     if identity_only_classification and not (
         callable(identity_match_builder)
         and callable(page_hydration_builder)
@@ -583,7 +607,11 @@ def read_bounded_filter_page(
         "max_seed_attempts": max_seed_attempts,
         "max_candidates": max_candidates,
         "max_query_count": max_query_count,
-        "classify_batch_size": classify_batch_size,
+        # The optional witness probe may be unavailable, broad, or fail its
+        # own read ceiling. Reserve the exact classifier's safe fallback shape
+        # up front so speculation can never crowd correctness out of the
+        # request's finite query budget.
+        "classify_batch_size": candidate_witness_fallback_batch_size,
         "seed_batch_size": candidate_floor,
     }
     if bounded_numbered_page_depth_exceeded(
@@ -652,7 +680,28 @@ def read_bounded_filter_page(
         and callable(candidate_witness_probe_preference)
         and candidate_witness_probe_preference()
     )
+    candidate_witness_probe_strata = 1
+    if candidate_witness_probe_enabled and callable(
+        candidate_witness_probe_strata_builder
+    ):
+        raw_candidate_witness_probe_strata = candidate_witness_probe_strata_builder()
+        if raw_candidate_witness_probe_strata is not None:
+            candidate_witness_probe_strata = int(raw_candidate_witness_probe_strata)
+            if not (
+                1
+                <= candidate_witness_probe_strata
+                <= _CANDIDATE_WITNESS_PREFILTER_STRATA
+            ):
+                raise ValueError(
+                    "candidate witness probe strata exceeds bounded contract"
+                )
     candidate_witness_probe_abandoned = not probe_limits_enforced
+    candidate_witness_probe_attempt_count = 0
+    candidate_witness_probe_attempt_limit = min(
+        _CANDIDATE_WITNESS_PREFILTER_MAX_ATTEMPTS,
+        max(1, max_query_count // 4),
+    )
+    candidate_witness_probe_started: float | None = None
     if cursor_key is not None and cursor_key[0] < request_start:
         return BoundedFilterPage(
             rows=[],
@@ -857,7 +906,10 @@ def read_bounded_filter_page(
             seen_candidate_ids.add(candidate_identity)
             candidate_seed_rows[candidate_identity] = row
 
-        nonlocal candidate_witness_probe_abandoned, candidate_witness_probe_enabled
+        nonlocal candidate_witness_probe_abandoned
+        nonlocal candidate_witness_probe_attempt_count
+        nonlocal candidate_witness_probe_enabled
+        nonlocal candidate_witness_probe_started
 
         candidate_identities = list(candidate_seed_rows)
         if defer_classification:
@@ -869,15 +921,18 @@ def read_bounded_filter_page(
         probe_classified_tail: Hashable | None = None
         prefilter_query_reserve = (
             1
-            + ceil(len(candidate_identities) / classify_batch_size)
+            + ceil(len(candidate_identities) / candidate_witness_fallback_batch_size)
             + reserved_hydration_queries
         )
         prefilter_time_reserve_ms = (
-            _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS
-            + _CANDIDATE_WITNESS_EXACT_RESERVE_MS
-        )
+            _CANDIDATE_WITNESS_PREFILTER_TOTAL_MS
+            if candidate_witness_probe_strata > 1
+            else _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS
+        ) + _CANDIDATE_WITNESS_EXACT_RESERVE_MS
         if candidate_witness_probe_enabled and (
-            len(attempts) + prefilter_query_reserve > max_query_count
+            candidate_witness_probe_attempt_count + candidate_witness_probe_strata
+            > candidate_witness_probe_attempt_limit
+            or len(attempts) + prefilter_query_reserve > max_query_count
             or int((classification_deadline - monotonic()) * 1000)
             < prefilter_time_reserve_ms
         ):
@@ -888,53 +943,170 @@ def read_bounded_filter_page(
             and candidate_witness_probe_enabled
             and callable(candidate_witness_probe_builder)
         ):
-            probe_query, probe_params = candidate_witness_probe_builder(
-                [candidate_seed_rows[identity] for identity in candidate_identities]
+            probe_candidates = candidate_identities
+            witness_identities: set[Hashable] = set()
+            duration = request_end - request_start
+            duration_us = (
+                duration.days * 86_400_000_000
+                + duration.seconds * 1_000_000
+                + duration.microseconds
             )
-            if probe_query:
+            boundaries = [
+                request_start
+                + timedelta(
+                    microseconds=(duration_us * index) // candidate_witness_probe_strata
+                )
+                for index in range(candidate_witness_probe_strata + 1)
+            ]
+            boundaries[0], boundaries[-1] = request_start, request_end
+            probe_slices = [
+                (slice_start, slice_end, 0)
+                for slice_start, slice_end in reversed(
+                    list(zip(boundaries[:-1], boundaries[1:], strict=False))
+                )
+                if slice_start < slice_end
+            ]
+            probe_complete = bool(probe_slices)
+            if candidate_witness_probe_started is None:
+                candidate_witness_probe_started = monotonic()
+
+            while probe_slices and len(witness_identities) < len(probe_candidates):
+                probe_start, probe_end, probe_depth = probe_slices.pop(0)
+                remaining_exact_queries = (
+                    ceil(len(probe_candidates) / candidate_witness_fallback_batch_size)
+                    + reserved_hydration_queries
+                )
+                total_probe_elapsed_ms = int(
+                    (monotonic() - candidate_witness_probe_started) * 1000
+                )
+                total_probe_remaining_ms = (
+                    _CANDIDATE_WITNESS_PREFILTER_TOTAL_MS - total_probe_elapsed_ms
+                )
+                if (
+                    candidate_witness_probe_attempt_count
+                    >= candidate_witness_probe_attempt_limit
+                    or len(attempts) + 1 + remaining_exact_queries > max_query_count
+                    or total_probe_remaining_ms < 25
+                ):
+                    probe_complete = False
+                    break
+
+                remaining_probe_identities = [
+                    identity
+                    for identity in probe_candidates
+                    if identity not in witness_identities
+                ]
+                probe_rows = [
+                    candidate_seed_rows[identity]
+                    for identity in remaining_probe_identities
+                ]
+                if candidate_witness_probe_strata > 1:
+                    probe_query, probe_params = candidate_witness_probe_builder(
+                        probe_rows,
+                        slice_start=probe_start,
+                        slice_end=probe_end,
+                    )
+                else:
+                    probe_query, probe_params = candidate_witness_probe_builder(
+                        probe_rows
+                    )
+                if not probe_query:
+                    probe_complete = False
+                    break
+
+                candidate_witness_probe_attempt_count += 1
                 try:
                     probe_result = execute(
                         kind="prefilter",
                         query=probe_query,
                         params=probe_params,
-                        active_start=active_start,
-                        active_end=active_end,
-                        result_limit=len(candidate_identities),
-                        timeout_cap_ms=_CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS,
+                        active_start=probe_start,
+                        active_end=probe_end,
+                        result_limit=len(remaining_probe_identities),
+                        timeout_cap_ms=min(
+                            _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS,
+                            total_probe_remaining_ms,
+                        ),
                         max_bytes_to_read_cap=(_CANDIDATE_WITNESS_PREFILTER_MAX_BYTES),
                     )
-                except _BudgetExceeded:
-                    # The probe is optional. A resource failure proves
-                    # nothing, so permanently fall back to the unchanged
-                    # exact classifier for this request.
+                except _BudgetExceeded as exc:
+                    probe_duration_us = (
+                        (probe_end - probe_start).days * 86_400_000_000
+                        + (probe_end - probe_start).seconds * 1_000_000
+                        + (probe_end - probe_start).microseconds
+                    )
+                    can_split = bool(
+                        candidate_witness_probe_strata > 1
+                        and exc.error_code
+                        in {"read_budget_exceeded", "prefilter_unavailable"}
+                        and probe_depth < 2
+                        and probe_duration_us > 1
+                        and candidate_witness_probe_attempt_count + 2
+                        <= candidate_witness_probe_attempt_limit
+                    )
+                    if can_split:
+                        midpoint = probe_start + timedelta(
+                            microseconds=probe_duration_us // 2
+                        )
+                        # Newest-first is only a latency optimization. Both
+                        # half-open children must succeed before raw absence is
+                        # allowed to remove an exact-classifier candidate.
+                        probe_slices[0:0] = [
+                            (midpoint, probe_end, probe_depth + 1),
+                            (probe_start, midpoint, probe_depth + 1),
+                        ]
+                        continue
+                    probe_complete = False
+                    break
+
+                returned_witness_identities = {
+                    row_identity(row) for row in probe_result.data or []
+                }
+                if not returned_witness_identities.issubset(
+                    set(remaining_probe_identities)
+                ):
+                    # A raw prefilter is allowed to remove candidates, never
+                    # invent them. An out-of-batch identity invalidates the
+                    # entire optional proof; otherwise an extra identity could
+                    # mask one missing candidate and trigger an unsafe early
+                    # stop by cardinality alone.
+                    probe_complete = False
+                    break
+                witness_identities.update(returned_witness_identities)
+
+            if probe_complete and (
+                not probe_slices or len(witness_identities) == len(probe_candidates)
+            ):
+                candidate_identities = [
+                    identity
+                    for identity in probe_candidates
+                    if identity in witness_identities
+                ]
+                # The union covered the entire half-open request window (or
+                # every candidate already has a positive witness). Only now is
+                # raw absence a valid exact-classifier prefilter.
+                probe_classified_tail = probe_candidates[-1]
+                if len(candidate_identities) * 4 >= len(probe_candidates) * 3:
+                    # A broad raw superset cannot amortize another speculative
+                    # batch. The exact 20-identity fallback remains bounded.
                     candidate_witness_probe_enabled = False
                     candidate_witness_probe_abandoned = True
-                else:
-                    probe_candidates = candidate_identities
-                    witness_identities = {
-                        row_identity(row) for row in probe_result.data or []
-                    }
-                    candidate_identities = [
-                        identity
-                        for identity in probe_candidates
-                        if identity in witness_identities
-                    ]
-                    # The finite raw probe proves every omitted identity cannot
-                    # match. Preserve the original ordered tail for the page
-                    # cutoff proof even though only witnesses need argMax.
-                    probe_classified_tail = probe_candidates[-1]
-                    if len(candidate_identities) * 4 >= len(probe_candidates) * 3:
-                        # A broad raw superset cannot amortize its own read;
-                        # keep this batch exact and stop speculating.
-                        candidate_witness_probe_enabled = False
-                        candidate_witness_probe_abandoned = True
             else:
+                # Partial temporal coverage proves no negative. Keep every
+                # original identity and permanently use the exact fallback.
                 candidate_witness_probe_enabled = False
                 candidate_witness_probe_abandoned = True
 
-        for batch_offset in range(0, len(candidate_identities), classify_batch_size):
+        active_classify_batch_size = (
+            candidate_witness_fallback_batch_size
+            if candidate_witness_probe_abandoned
+            else classify_batch_size
+        )
+        for batch_offset in range(
+            0, len(candidate_identities), active_classify_batch_size
+        ):
             identity_batch = candidate_identities[
-                batch_offset : batch_offset + classify_batch_size
+                batch_offset : batch_offset + active_classify_batch_size
             ]
             classified_identity_batch = identity_batch
             candidate_batch = [

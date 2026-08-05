@@ -360,6 +360,33 @@ def test_trace_candidate_witness_probe_is_finite_typed_map_superset(
     assert params["filter_candidate_end_us"] == 1_767_225_600_000_000
     assert params["latest_filter_key_0"] == "final_status"
     assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert builder.recommended_filter_candidate_witness_probe_strata() == 8
+    assert (
+        builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
+        == 20
+    )
+
+    slice_start = START + timedelta(days=100)
+    slice_end = START + timedelta(days=110)
+    _slice_sql, slice_params = builder.build_filter_candidate_witness_probe(
+        [{"trace_id": "trace-a"}],
+        slice_start=slice_start,
+        slice_end=slice_end,
+    )
+    assert slice_params["filter_candidate_start_us"] == 1_744_329_600_000_000
+    assert slice_params["filter_candidate_end_us"] == 1_745_193_600_000_000
+
+    with pytest.raises(ValueError, match="provided together"):
+        builder.build_filter_candidate_witness_probe(
+            [{"trace_id": "trace-a"}],
+            slice_start=slice_start,
+        )
+    with pytest.raises(ValueError, match="inside the request window"):
+        builder.build_filter_candidate_witness_probe(
+            [{"trace_id": "trace-a"}],
+            slice_start=START - timedelta(microseconds=1),
+            slice_end=slice_end,
+        )
 
 
 def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
@@ -457,6 +484,11 @@ def test_trace_candidate_witness_probe_is_unavailable_for_unsafe_shapes(
     builder: TraceListQueryBuilder,
 ) -> None:
     assert builder.prefer_filter_candidate_witness_probe_first() is False
+    assert builder.recommended_filter_candidate_witness_probe_strata() is None
+    assert (
+        builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
+        is None
+    )
     assert builder.build_filter_candidate_witness_probe([{"trace_id": "trace-a"}]) == (
         "",
         {},
@@ -539,6 +571,11 @@ def test_eval_trace_membership_only_classifier_can_prefilter_typed_map_candidate
         builder.supports_filter_candidate_witness_prefilter_without_hydration() is True
     )
     assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert builder.recommended_filter_candidate_witness_probe_strata() == 8
+    assert (
+        builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
+        == 20
+    )
     probe_sql, probe_params = builder.build_filter_candidate_witness_probe(
         [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
     )
@@ -3642,6 +3679,30 @@ class _CandidateWitnessUnhydratedFakeBuilder(_FakeBuilder):
         return "prefilter", {"candidate_ids": tuple(row["id"] for row in rows)}
 
 
+@dataclass
+class _StratifiedCandidateWitnessFakeBuilder(_CandidateWitnessUnhydratedFakeBuilder):
+    @staticmethod
+    def recommended_filter_candidate_witness_probe_strata():
+        return 8
+
+    @staticmethod
+    def recommended_filter_candidate_witness_fallback_classify_batch_size():
+        return 2
+
+    @staticmethod
+    def build_filter_candidate_witness_probe(
+        rows,
+        *,
+        slice_start=None,
+        slice_end=None,
+    ):
+        return "prefilter", {
+            "candidate_ids": tuple(row["id"] for row in rows),
+            "slice_start": slice_start,
+            "slice_end": slice_end,
+        }
+
+
 class _CandidateWitnessHydrationFakeExecutor(_IdentityHydrationFakeExecutor):
     def __init__(
         self,
@@ -3676,6 +3737,50 @@ class _CandidateWitnessHydrationFakeExecutor(_IdentityHydrationFakeExecutor):
             for candidate_id in params["candidate_ids"]
             if candidate_id in self.witness_ids
         ]
+        return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+
+class _StratifiedCandidateWitnessFakeExecutor(_CandidateWitnessHydrationFakeExecutor):
+    def __init__(
+        self,
+        builder,
+        *,
+        witness_times=None,
+        blocked_instant=None,
+        extra_identity=None,
+        **kwargs,
+    ):
+        super().__init__(builder, **kwargs)
+        self.witness_times = dict(witness_times or {})
+        self.blocked_instant = blocked_instant
+        self.extra_identity = extra_identity
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        if query != "prefilter":
+            return super().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+        self.calls.append((query, params))
+        self.timeouts.append((query, timeout_ms))
+        self.prefilter_settings.append(dict(settings))
+        slice_start = params["slice_start"]
+        slice_end = params["slice_end"]
+        if (
+            self.blocked_instant is not None
+            and slice_start <= self.blocked_instant < slice_end
+        ):
+            raise ReadDeadlineExceeded("candidate witness stratum budget")
+        rows = [
+            {"id": candidate_id}
+            for candidate_id in params["candidate_ids"]
+            if candidate_id in self.witness_times
+            and slice_start <= self.witness_times[candidate_id] < slice_end
+        ]
+        if self.extra_identity is not None:
+            rows.append({"id": self.extra_identity})
         return QueryResult(rows, len(rows), "clickhouse", 1.0)
 
 
@@ -6699,6 +6804,271 @@ def test_candidate_witness_runtime_failure_falls_back_to_exact_classifier() -> N
     ]
     assert page.attempts[1].error_code == "prefilter_unavailable"
     assert "private guarded-executor" not in repr(page)
+
+
+def _stratified_witness_rows(window_end: datetime) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": window_end - timedelta(seconds=index + 1),
+        }
+        for index in range(4)
+    ]
+
+
+def test_candidate_witness_strata_cover_boundaries_before_excluding() -> None:
+    window_start = END - timedelta(hours=8)
+    rows = _stratified_witness_rows(END)
+    builder = _StratifiedCandidateWitnessFakeBuilder(
+        rows,
+        start=window_start,
+        end=END,
+        match_rows=[rows[0], rows[1]],
+        recommended_batch_size=4,
+        recommended_seed_batch_size=4,
+    )
+    executor = _StratifiedCandidateWitnessFakeExecutor(
+        builder,
+        witness_times={
+            # One newest-stratum witness and one exactly on an adjacent
+            # half-open boundary; two candidates have no raw witness at all.
+            "trace-0": END - timedelta(minutes=30),
+            "trace-1": END - timedelta(hours=4),
+        },
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=3,
+        deadline_ms=5_000,
+        max_query_count=32,
+    )
+
+    prefilters = [params for query, params in executor.calls if query == "prefilter"]
+    assert len(prefilters) == 8
+    assert prefilters[0]["slice_start"] == END - timedelta(hours=1)
+    assert prefilters[0]["slice_end"] == END
+    assert prefilters[-1]["slice_start"] == window_start
+    assert all(
+        newer["slice_start"] == older["slice_end"]
+        for newer, older in zip(prefilters, prefilters[1:], strict=False)
+    )
+    assert (
+        sum(
+            params["slice_start"] <= END - timedelta(hours=4) < params["slice_end"]
+            for params in prefilters
+        )
+        == 1
+    )
+    exact = [params for query, params in executor.calls if query == "match"]
+    assert exact == [{"candidate_ids": ("trace-0", "trace-1")}]
+    assert page.complete is True
+
+
+def test_candidate_witness_stratum_failure_discards_every_partial_negative() -> None:
+    window_start = END - timedelta(hours=8)
+    rows = _stratified_witness_rows(END)
+    builder = _StratifiedCandidateWitnessFakeBuilder(
+        rows,
+        start=window_start,
+        end=END,
+        match_rows=rows,
+        recommended_batch_size=4,
+        recommended_seed_batch_size=4,
+    )
+    executor = _StratifiedCandidateWitnessFakeExecutor(
+        builder,
+        witness_times={"trace-0": END - timedelta(minutes=30)},
+        # The oldest stratum and both adaptive descendants fail. Successful
+        # newer strata are therefore only partial evidence and must not remove
+        # trace-1/2/3 from exact classification.
+        blocked_instant=window_start + timedelta(minutes=15),
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=3,
+        deadline_ms=5_000,
+        max_query_count=64,
+    )
+
+    exact_batches = [
+        params["candidate_ids"] for query, params in executor.calls if query == "match"
+    ]
+    assert exact_batches == [("trace-0", "trace-1"), ("trace-2", "trace-3")]
+    assert any(attempt.error_code for attempt in page.attempts)
+    prefilters = [params for query, params in executor.calls if query == "prefilter"]
+    assert len(prefilters) == 11
+    assert any(
+        params["slice_end"] - params["slice_start"] == timedelta(minutes=30)
+        for params in prefilters
+    )
+    assert any(
+        params["slice_end"] - params["slice_start"] == timedelta(minutes=15)
+        for params in prefilters
+    )
+    assert page.complete is True
+
+
+def test_candidate_witness_extra_identity_invalidates_optional_proof() -> None:
+    window_start = END - timedelta(hours=8)
+    rows = _stratified_witness_rows(END)
+    builder = _StratifiedCandidateWitnessFakeBuilder(
+        rows,
+        start=window_start,
+        end=END,
+        match_rows=rows,
+        recommended_batch_size=4,
+        recommended_seed_batch_size=4,
+    )
+    executor = _StratifiedCandidateWitnessFakeExecutor(
+        builder,
+        witness_times={
+            "trace-0": END - timedelta(minutes=30),
+            "trace-1": END - timedelta(minutes=30),
+            "trace-2": END - timedelta(minutes=30),
+        },
+        # Without strict subset validation, this extra identity plus one
+        # missing candidate could satisfy the cardinality early-stop and
+        # falsely exclude trace-3.
+        extra_identity="foreign-trace",
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=3,
+        deadline_ms=5_000,
+        max_query_count=32,
+    )
+
+    assert len([query for query, _ in executor.calls if query == "prefilter"]) == 1
+    assert [
+        params["candidate_ids"] for query, params in executor.calls if query == "match"
+    ] == [("trace-0", "trace-1"), ("trace-2", "trace-3")]
+    assert page.complete is True
+
+
+def test_candidate_witness_no_match_multi_seed_preserves_exact_query_budget() -> None:
+    class TwentyIdentityFallbackBuilder(_StratifiedCandidateWitnessFakeBuilder):
+        @staticmethod
+        def recommended_filter_candidate_witness_fallback_classify_batch_size():
+            return 20
+
+    window_start = END - timedelta(hours=8)
+    rows = [
+        {
+            "id": f"trace-{index:04d}",
+            "root_span_id": f"root-{index:04d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+        }
+        for index in range(600)
+    ]
+    builder = TwentyIdentityFallbackBuilder(
+        rows,
+        start=window_start,
+        end=END,
+        match_rows=[],
+        recommended_batch_size=100,
+        recommended_seed_batch_size=200,
+    )
+    executor = _StratifiedCandidateWitnessFakeExecutor(builder, witness_times={})
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        max_query_count=48,
+    )
+
+    prefilters = [params for query, params in executor.calls if query == "prefilter"]
+    exact_batches = [
+        params["candidate_ids"] for query, params in executor.calls if query == "match"
+    ]
+    # A second eight-stratum batch would cross the relative 12-attempt cap, so
+    # it skips speculation up front instead of running a partial proof.
+    assert len(prefilters) == 8
+    assert all(len(batch) <= 20 for batch in exact_batches)
+    assert page.rows == []
+    assert page.complete is True
+    assert page.query_count <= 48
+
+
+@pytest.mark.parametrize(
+    "probe_mode", ["broad", "locked", "query-reserved", "relative-cap"]
+)
+def test_candidate_witness_unsafe_optional_outcomes_use_exact_twenty_shape(
+    probe_mode: str,
+) -> None:
+    window_start = END - timedelta(hours=8)
+    rows = _stratified_witness_rows(END)
+    builder = _StratifiedCandidateWitnessFakeBuilder(
+        rows,
+        start=window_start,
+        end=END,
+        match_rows=rows,
+        recommended_batch_size=4,
+        recommended_seed_batch_size=4,
+    )
+    executor = _StratifiedCandidateWitnessFakeExecutor(
+        builder,
+        witness_times=(
+            {row["id"]: END - timedelta(minutes=30) for row in rows}
+            if probe_mode == "broad"
+            else {}
+        ),
+    )
+    if probe_mode == "locked":
+        executor.supports_per_query_read_settings = False
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=3,
+        deadline_ms=5_000,
+        max_query_count=(
+            3
+            if probe_mode == "query-reserved"
+            else 24
+            if probe_mode == "relative-cap"
+            else 32
+        ),
+    )
+
+    prefilter_count = len(
+        [query for query, _ in executor.calls if query == "prefilter"]
+    )
+    assert prefilter_count == (1 if probe_mode == "broad" else 0)
+    assert [
+        params["candidate_ids"] for query, params in executor.calls if query == "match"
+    ] == [("trace-0", "trace-1"), ("trace-2", "trace-3")]
+    assert page.query_count <= (
+        3
+        if probe_mode == "query-reserved"
+        else 24
+        if probe_mode == "relative-cap"
+        else 32
+    )
+    assert page.complete is True
 
 
 def test_identity_hydration_keeps_same_text_org_traces_distinct() -> None:
