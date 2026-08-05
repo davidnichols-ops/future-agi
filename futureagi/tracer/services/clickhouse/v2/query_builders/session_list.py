@@ -45,7 +45,25 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
         if len(ids) > 200:
             raise ValueError("attribute session page exceeds bounded limit")
 
-        params = {**self.params, "attr_session_ids": ids}
+        # The bounded endpoint does not call ``build`` before page hydration.
+        # Bind its exact request window here and apply it to both candidate
+        # acquisition and the authoritative four-field latest-state replay.
+        attr_start_date, attr_end_date = self.parse_time_range(self.filters)
+        params = {
+            **self.params,
+            "attr_session_ids": ids,
+            "attr_start_date": attr_start_date,
+            "attr_end_date": attr_end_date,
+        }
+        attr_exclusion, attr_exclusion_params = self.bounded_datetime_exclusion_sql(
+            self.filters,
+            column="start_time",
+            param_prefix="session_attr_v2_time_exclusion",
+        )
+        params.update(attr_exclusion_params)
+        attr_exclusion_fragment = (
+            f"\n              AND {attr_exclusion}" if attr_exclusion else ""
+        )
         ts_map = survivor_map_subquery("trace_session_id_remap")
         resolved_ts = resolved_id_expr("latest_trace_session_id", "ts_remap")
         sql = f"""
@@ -55,6 +73,10 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
             SELECT DISTINCT project_id, trace_id, id, start_time
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
+              AND toDate(start_time) BETWEEN
+                  toDate(%(attr_start_date)s) AND toDate(%(attr_end_date)s)
+              AND start_time >= %(attr_start_date)s
+              AND start_time < %(attr_end_date)s{attr_exclusion_fragment}
               AND (
                   trace_session_id IN %(attr_session_ids)s
                   OR trace_session_id IN (
@@ -79,6 +101,10 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
                 argMax(is_deleted, _version) AS latest_is_deleted
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
+              AND toDate(start_time) BETWEEN
+                  toDate(%(attr_start_date)s) AND toDate(%(attr_end_date)s)
+              AND start_time >= %(attr_start_date)s
+              AND start_time < %(attr_end_date)s{attr_exclusion_fragment}
               AND (project_id, trace_id, id, start_time) IN (
                   SELECT project_id, trace_id, id, start_time
                   FROM candidate_root_identities

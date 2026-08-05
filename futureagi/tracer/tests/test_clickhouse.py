@@ -3171,17 +3171,35 @@ class TestSessionListQueryBuilder:
                             "2026-01-31T23:59:59Z",
                         ],
                     },
-                }
+                },
+                {
+                    "column_id": "start_time",
+                    "filter_config": {
+                        "filter_type": "datetime",
+                        "filter_op": "not_equals",
+                        "filter_value": "2026-01-15T12:00:00.123456Z",
+                    },
+                },
             ],
             page_number=0,
             page_size=10,
         )
-        builder.build()
+        expected_start, expected_end = builder.parse_time_range(builder.filters)
 
         query, params = builder.build_content_query(["session-1"])
 
         assert "trace_session_id IN %(content_session_ids)s" in query
+        assert query.count("toDate(%(content_start_date)s)") == 2
+        assert query.count("toDate(%(content_end_date)s)") == 2
+        assert query.count("start_time >= %(content_start_date)s") == 2
+        assert query.count("start_time < %(content_end_date)s") == 2
+        assert query.count("session_content_time_exclusion_0_start") == 2
+        assert query.count("session_content_time_exclusion_0_end") == 2
         assert params["content_session_ids"] == ("session-1",)
+        assert params["content_start_date"] == expected_start
+        assert params["content_end_date"] == expected_end
+        assert "session_content_time_exclusion_0_start" in params
+        assert "session_content_time_exclusion_0_end" in params
 
     def test_span_attributes_query_reuses_session_time_window(self):
         from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
@@ -3199,17 +3217,37 @@ class TestSessionListQueryBuilder:
                             "2026-02-28T23:59:59Z",
                         ],
                     },
-                }
+                },
+                {
+                    "column_id": "start_time",
+                    "filter_config": {
+                        "filter_type": "datetime",
+                        "filter_op": "not_between",
+                        "filter_value": [
+                            "2026-02-10T00:00:00Z",
+                            "2026-02-12T00:00:00Z",
+                        ],
+                    },
+                },
             ],
             page_number=0,
             page_size=10,
         )
-        builder.build()
+        expected_start, expected_end = builder.parse_time_range(builder.filters)
 
         query, params = builder.build_span_attributes_query(["session-1"])
 
         assert "s.trace_session_id IN %(attr_session_ids)s" in query
+        assert "toDate(s.start_time) BETWEEN" in query
+        assert "s.start_time >= %(attr_start_date)s" in query
+        assert "s.start_time < %(attr_end_date)s" in query
+        assert "s.start_time < fromUnixTimestamp64Micro(" in query
+        assert "s.start_time >= fromUnixTimestamp64Micro(" in query
         assert params["attr_session_ids"] == ("session-1",)
+        assert params["attr_start_date"] == expected_start
+        assert params["attr_end_date"] == expected_end
+        assert "session_attr_time_exclusion_0_start" in params
+        assert "session_attr_time_exclusion_0_end" in params
 
     def test_v2_span_attributes_query_reuses_session_time_window(self):
         from tracer.services.clickhouse.v2.query_builders.session_list import (
@@ -3229,19 +3267,37 @@ class TestSessionListQueryBuilder:
                             "2026-03-31T23:59:59Z",
                         ],
                     },
-                }
+                },
+                {
+                    "column_id": "start_time",
+                    "filter_config": {
+                        "filter_type": "datetime",
+                        "filter_op": "not_equals",
+                        "filter_value": "2026-03-15T12:00:00.654321Z",
+                    },
+                },
             ],
             page_number=0,
             page_size=10,
         )
-        builder.build()
+        expected_start, expected_end = builder.parse_time_range(builder.filters)
 
         query, params = builder.build_span_attributes_query(["session-1"])
 
         assert "trace_session_id IN %(attr_session_ids)s" in query
+        assert query.count("toDate(%(attr_start_date)s)") == 2
+        assert query.count("toDate(%(attr_end_date)s)") == 2
+        assert query.count("start_time >= %(attr_start_date)s") == 2
+        assert query.count("start_time < %(attr_end_date)s") == 2
+        assert query.count("session_attr_v2_time_exclusion_0_start") == 2
+        assert query.count("session_attr_v2_time_exclusion_0_end") == 2
         assert "argMax(is_deleted, _version) AS latest_is_deleted" in query
         assert "latest_is_deleted = 0" in query
         assert params["attr_session_ids"] == ("session-1",)
+        assert params["attr_start_date"] == expected_start
+        assert params["attr_end_date"] == expected_end
+        assert "session_attr_v2_time_exclusion_0_start" in params
+        assert "session_attr_v2_time_exclusion_0_end" in params
 
     def test_build_uses_uniq_not_uniqExact(self):
         """build() should use approximate uniq() instead of expensive uniqExact()."""

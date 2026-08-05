@@ -1343,7 +1343,27 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             return "", {}
         if len(ids) > 200:
             raise ValueError("content session page exceeds bounded limit")
-        params = {**self.params, "content_session_ids": ids}
+        # The bounded endpoint calls this method without calling ``build`` first.
+        # Derive its exact request window here so both the raw candidate read and
+        # four-field latest-state replay can prune the start_time partitions.
+        content_start_date, content_end_date = self.parse_time_range(self.filters)
+        params = {
+            **self.params,
+            "content_session_ids": ids,
+            "content_start_date": content_start_date,
+            "content_end_date": content_end_date,
+        }
+        content_exclusion, content_exclusion_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="session_content_time_exclusion",
+            )
+        )
+        params.update(content_exclusion_params)
+        content_exclusion_fragment = (
+            f"\n              AND {content_exclusion}" if content_exclusion else ""
+        )
         # The page contains at most 200 canonical session IDs.  Building the
         # global survivor map here scans ``trace_session_id_remap`` twice even
         # though hydration can only return those finite sessions.  Expand only
@@ -1361,6 +1381,10 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             SELECT DISTINCT project_id, trace_id, id, start_time
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
+              AND toDate(start_time) BETWEEN
+                  toDate(%(content_start_date)s) AND toDate(%(content_end_date)s)
+              AND start_time >= %(content_start_date)s
+              AND start_time < %(content_end_date)s{content_exclusion_fragment}
               AND (
                   trace_session_id IN %(content_session_ids)s
                   OR trace_session_id IN (
@@ -1383,6 +1407,10 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
+              AND toDate(start_time) BETWEEN
+                  toDate(%(content_start_date)s) AND toDate(%(content_end_date)s)
+              AND start_time >= %(content_start_date)s
+              AND start_time < %(content_end_date)s{content_exclusion_fragment}
               AND (project_id, trace_id, id, start_time) IN (
                   SELECT project_id, trace_id, id, start_time
                   FROM candidate_root_identities
@@ -1556,7 +1584,27 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         if not session_ids:
             return "", {}
 
-        params = {**self.params, "attr_session_ids": tuple(session_ids)}
+        # Preserve the raw session-ID prefilter while adding the list request's
+        # finite partition window; this legacy method does not replay versions.
+        attr_start_date, attr_end_date = self.parse_time_range(self.filters)
+        params = {
+            **self.params,
+            "attr_session_ids": tuple(session_ids),
+            "attr_start_date": attr_start_date,
+            "attr_end_date": attr_end_date,
+        }
+        attr_exclusion, attr_exclusion_params = (
+            BaseQueryBuilder.bounded_datetime_exclusion_sql(
+                self.filters,
+                column="start_time",
+                param_prefix="session_attr_time_exclusion",
+            )
+        )
+        params.update(attr_exclusion_params)
+        attr_exclusion = attr_exclusion.replace("start_time", "s.start_time")
+        attr_exclusion_fragment = (
+            f"\n          AND {attr_exclusion}" if attr_exclusion else ""
+        )
         # P3b step1.5 (DESIGN §3 / id_remap_sql): `session_ids` are OLD curated ids
         # from the resolved browse; resolve each span's `trace_session_id` new→old
         # so a straddler's NEW-id spans' attributes attach to the OLD session id
@@ -1585,6 +1633,10 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         {ts_join}
         WHERE {self.project_filter_sql()}
           AND is_deleted = 0
+          AND toDate(s.start_time) BETWEEN
+              toDate(%(attr_start_date)s) AND toDate(%(attr_end_date)s)
+          AND s.start_time >= %(attr_start_date)s
+          AND s.start_time < %(attr_end_date)s{attr_exclusion_fragment}
           AND (parent_span_id IS NULL OR parent_span_id = '')
           AND s.trace_session_id IN %(attr_session_ids)s
           AND (

@@ -932,7 +932,7 @@ def test_candidate_reads_on_ch25_preserve_remap_and_tombstone_semantics():
 
     The old physical root is tombstoned after insert; the live root carries the
     deterministic ids. All APIs must return the one canonical old session/user,
-    and deleted content/attributes must stay absent.
+    and deleted or out-of-window content/attributes must stay absent.
     """
 
     client = _ch25_client()
@@ -1059,9 +1059,21 @@ def test_candidate_reads_on_ch25_preserve_remap_and_tombstone_semantics():
         0,
         1,
     )
+    outside_start = now - timedelta(days=2)
+    outside_row = list(live_row)
+    outside_row[3] = outside_start
+    outside_row[4] = str(uuid.uuid4())
+    outside_row[5] = "candidate-root-outside-window"
+    outside_row[7] = "outside-window-root"
+    outside_row[8] = outside_start + timedelta(seconds=4)
+    outside_row[13] = old_session_id
+    outside_row[19] = {"outside_key": "must-not-hydrate"}
+    outside_row[22] = '{"outside_key":"must-not-hydrate"}'
+    outside_row[23] = "outside-window-message"
+    outside_row[24] = "outside-window-output"
     client.execute(
         f"INSERT INTO spans ({', '.join(columns)}) VALUES",
-        [old_row, live_row],
+        [old_row, live_row, tuple(outside_row)],
         types_check=True,
     )
     tombstone = list(old_row)
@@ -1328,11 +1340,13 @@ def test_candidate_reads_on_ch25_preserve_remap_and_tombstone_semantics():
     assert results["metrics"][0]["traces_count"] == 1
     assert results["content"][0]["first_message"] == "live-message"
     assert results["content"][0]["last_message"] == "live-message"
+    assert len(results["attributes"]) == 1
     assert results["attributes"][0]["attrs_string"] == {
         "live_key": "yes",
         "final_status": "Rejected",
     }
     assert "deleted_key" not in results["attributes"][0]["span_attributes_raw"]
+    assert "outside_key" not in results["attributes"][0]["span_attributes_raw"]
 
     # Generous CI ceilings; local disposable runs are normally <1s for Users
     # and <100ms per Session phase. Production A/B remains a separate sealed
