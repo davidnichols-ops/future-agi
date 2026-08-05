@@ -2725,6 +2725,37 @@ class TestDashboardQueryBuilder:
         assert "eval_output_str" in sql
         assert "eval_score" in sql
 
+    def test_eval_string_output_filter_uses_string_operator_coercion(self):
+        eval_id = str(uuid.uuid4())
+        config = {
+            "project_ids": ["proj1"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": "pass-rate-filtered",
+                    "name": "pass_rate",
+                    "type": "eval_metric",
+                    "config_id": eval_id,
+                    "output_type": "PASS_FAIL",
+                    "aggregation": "avg",
+                    "filters": [
+                        {
+                            "metric_type": "eval_metric",
+                            "metric_name": eval_id,
+                            "operator": "str_contains",
+                            "value": 0,
+                            "output_type": "PASS_FAIL",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        _, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert params["_evf_0_val"] == "%0%"
+
     def test_eval_metric_compiles_typed_canonical_span_filters(self):
         canonical_filters = [
             {
@@ -2810,6 +2841,68 @@ class TestDashboardQueryBuilder:
         assert "s.attrs_bool['is_final'] = %(_evf_0_val)s" in sql
         assert "s.attrs_string['is_final']" not in sql
         assert params["_evf_0_val"] is True
+
+    def test_eval_metric_string_dimension_keeps_numeric_looking_value_as_string(self):
+        config = {
+            "project_ids": ["proj1"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": "numeric-looking-user-eval-filter",
+                    "name": "quality",
+                    "type": "eval_metric",
+                    "config_id": str(uuid.uuid4()),
+                    "output_type": "SCORE",
+                    "aggregation": "avg",
+                }
+            ],
+            "filters": [
+                {
+                    "metric_type": "system_metric",
+                    "metric_name": "user",
+                    "operator": "equal_to",
+                    "value": "123",
+                }
+            ],
+        }
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "if(s.user_id = '', toString(s.end_user_id), s.user_id) =" in sql
+        assert params["_evf_0_val"] == "123"
+        assert isinstance(params["_evf_0_val"], str)
+
+    def test_eval_metric_legacy_string_attribute_keeps_numeric_value_as_string(self):
+        config = {
+            "project_ids": ["proj1"],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [
+                {
+                    "id": "numeric-looking-attribute-eval-filter",
+                    "name": "quality",
+                    "type": "eval_metric",
+                    "config_id": str(uuid.uuid4()),
+                    "output_type": "SCORE",
+                    "aggregation": "avg",
+                }
+            ],
+            "filters": [
+                {
+                    "metric_type": "custom_attribute",
+                    "metric_name": "external_code",
+                    "operator": "equal_to",
+                    "value": "123",
+                    "attribute_type": "string",
+                }
+            ],
+        }
+
+        _, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert params["_evf_0_val"] == "123"
+        assert isinstance(params["_evf_0_val"], str)
 
     def test_eval_metric_sum_uses_output_string_fallback(self):
         config = {
@@ -6746,6 +6839,33 @@ class TestDashboardV2RewriteRouting:
         assert params["latest_filter_key_0"] == "is_final"
         assert params["latest_filter_key_1"] == "routing"
 
+    def test_annotation_system_string_filter_keeps_numeric_value_as_string(self):
+        label_id = "44444444-4444-4444-4444-444444444444"
+        metric = {
+            "id": label_id,
+            "name": "quality",
+            "type": "annotation_metric",
+            "label_id": label_id,
+            "output_type": "text",
+            "aggregation": "count",
+            "filters": [
+                {
+                    "metric_type": "system_metric",
+                    "metric_name": "status",
+                    "operator": "equal_to",
+                    "value": "123",
+                }
+            ],
+        }
+
+        sql, params, _ = DashboardQueryBuilderV2(
+            _single_metric_config(metric)
+        ).build_all_queries()[0]
+
+        assert "s.status = %(_ann_span_filter_0_value)s" in sql
+        assert params["_ann_span_filter_0_value"] == "123"
+        assert isinstance(params["_ann_span_filter_0_value"], str)
+
     def test_annotation_metric_applies_bounded_eval_and_annotation_filters(self):
         label_id = "44444444-4444-4444-4444-444444444444"
         eval_id = "55555555-5555-4555-8555-555555555555"
@@ -7236,6 +7356,59 @@ class TestDashboardV2RewriteRouting:
         assert "sp.start_time >= %(start_date)s" in compact_sql
         assert "sp.start_time < %(end_date)s" in compact_sql
         assert "WHERE sp.is_deleted = 0" in compact_sql
+        assert "trace_session_id_remap" not in compact_sql
+
+    def test_session_only_query_does_not_read_end_user_remap(self):
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "session",
+                "operator": "equal_to",
+                "value": str(uuid.uuid4()),
+            }
+        ]
+
+        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "trace_session_id_remap" in sql
+        assert "end_user_id_remap" not in sql
+
+    def test_combined_user_and_session_query_reads_both_remaps(self):
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "equal_to",
+                "value": "customer@example.com",
+            },
+            {
+                "metric_type": "system_metric",
+                "metric_name": "session",
+                "operator": "equal_to",
+                "value": str(uuid.uuid4()),
+            },
+        ]
+
+        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "trace_session_id_remap" in sql
+        assert "end_user_id_remap" in sql
 
     def test_user_dimension_identity_is_project_scoped(self):
         config = _single_metric_config(
@@ -7314,6 +7487,85 @@ class TestDashboardV2RewriteRouting:
             "second@example.com",
         ]
         assert params["direct_user_filter_1_val"] == "customer@example.com"
+
+    def test_numeric_looking_user_ids_remain_string_typed(self):
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "contains",
+                "value": ["123", 456],
+            },
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "equal_to",
+                "value": "123",
+            },
+        ]
+
+        _, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert params["direct_user_filter_0_val"] == ["123", "456"]
+        assert params["direct_user_filter_1_val"] == "123"
+        assert params["f_0_val"] == ["123", "456"]
+        assert params["f_1_val"] == "123"
+
+    def test_string_contains_preserves_zero_value(self):
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "status",
+                "operator": "str_contains",
+                "value": 0,
+            }
+        ]
+
+        _, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert params["f_0_val"] == "%0%"
+
+    @pytest.mark.parametrize(
+        "metric_name", ("trace_count", "span_count", "session_count", "user_count")
+    )
+    def test_identifier_count_filters_keep_numeric_value_as_string(self, metric_name):
+        config = _single_metric_config(
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "aggregation": "avg",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": metric_name,
+                "operator": "equal_to",
+                "value": "123",
+            }
+        ]
+
+        _, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert params["f_0_val"] == "123"
+        assert isinstance(params["f_0_val"], str)
 
     def test_uuid_user_filter_preserves_missing_dimension_fallback(self):
         fallback_user_id = str(uuid.uuid4())

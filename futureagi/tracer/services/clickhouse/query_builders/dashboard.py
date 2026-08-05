@@ -385,6 +385,7 @@ _ID_RESOLVED_NAMES = frozenset(
 )
 
 _USER_DIMENSION_NAMES = frozenset({"user_count", "user", "user_id_type"})
+_SESSION_DIMENSION_NAMES = frozenset({"session_count", "session"})
 
 
 # ClickHouse omits materialized columns from sp.*. The current dashboard
@@ -397,6 +398,8 @@ def _resolved_spans_source(
     *,
     include_end_user_dimension: bool = False,
     physical_end_user_filter: str = "",
+    resolve_end_user_id: bool = True,
+    resolve_trace_session_id: bool = True,
 ) -> str:
     """Return a spans source with user/session ids resolved through id-remap.
 
@@ -407,15 +410,29 @@ def _resolved_spans_source(
     for spans collapses pre/post-cutover ids without fan-out.
     """
     out_alias = alias or "spans"
-    eu_join = remap_left_join("sp.end_user_id", "end_user_id_remap", "eu_remap")
-    ts_join = remap_left_join(
-        "sp.trace_session_id", "trace_session_id_remap", "ts_remap"
-    )
-    resolved_eu = resolved_id_expr("sp.end_user_id", "eu_remap")
-    resolved_ts = resolved_id_expr("sp.trace_session_id", "ts_remap")
-    materialized = "".join(f"sp.{c} AS {c}, " for c in _MATERIALIZED_DASHBOARD_COLS)
+    eu_join = ""
+    resolved_eu = "sp.end_user_id"
+    if resolve_end_user_id:
+        eu_join = remap_left_join("sp.end_user_id", "end_user_id_remap", "eu_remap")
+        resolved_eu = resolved_id_expr("sp.end_user_id", "eu_remap")
 
-    dimension_projection = ""
+    ts_join = ""
+    resolved_ts = "sp.trace_session_id"
+    if resolve_trace_session_id:
+        ts_join = remap_left_join(
+            "sp.trace_session_id", "trace_session_id_remap", "ts_remap"
+        )
+        resolved_ts = resolved_id_expr("sp.trace_session_id", "ts_remap")
+
+    excluded_columns = ["project_id"]
+    projected_columns = [f"sp.{c} AS {c}" for c in _MATERIALIZED_DASHBOARD_COLS]
+    if resolve_end_user_id:
+        excluded_columns.append("end_user_id")
+        projected_columns.append(f"{resolved_eu} AS end_user_id")
+    if resolve_trace_session_id:
+        excluded_columns.append("trace_session_id")
+        projected_columns.append(f"{resolved_ts} AS trace_session_id")
+
     dimension_join = ""
     if include_end_user_dimension:
         curated_map = survivor_map_subquery("end_user_id_remap")
@@ -438,9 +455,11 @@ def _resolved_spans_source(
             "ON sp.project_id = eu_dimension.project_id "
             f"AND {resolved_eu} = eu_dimension.resolved_end_user_id"
         )
-        dimension_projection = (
-            ", ifNull(eu_dimension.user_id, '') AS user_id, "
-            "ifNull(eu_dimension.user_id_type, '') AS user_id_type"
+        projected_columns.extend(
+            (
+                "ifNull(eu_dimension.user_id, '') AS user_id",
+                "ifNull(eu_dimension.user_id_type, '') AS user_id_type",
+            )
         )
 
     # A positive curated-user filter can be resolved to a finite set of raw
@@ -458,13 +477,13 @@ def _resolved_spans_source(
             f"AND ({physical_end_user_filter})"
         )
 
+    additional_projection = (
+        f", {', '.join(projected_columns)}" if projected_columns else ""
+    )
     return (
         "(SELECT sp.project_id AS project_id, "
-        "sp.* EXCEPT (project_id, end_user_id, trace_session_id), "
-        f"{materialized}"
-        f"{resolved_eu} AS end_user_id, "
-        f"{resolved_ts} AS trace_session_id"
-        f"{dimension_projection} "
+        f"sp.* EXCEPT ({', '.join(excluded_columns)})"
+        f"{additional_projection} "
         f"FROM spans AS sp {eu_join} {ts_join} {dimension_join}"
         f"{inner_scope}) AS {out_alias}"
     )
@@ -658,6 +677,35 @@ class DashboardQueryBuilder:
                 return True
         return False
 
+    def _query_references_session_dimension(
+        self, metric_name: str | None, per_metric_filters: list[dict]
+    ) -> bool:
+        """Whether this query needs remap resolution for a session id."""
+
+        def is_session_dimension(*names: str | None) -> bool:
+            return any(
+                (name or "").lower() in _SESSION_DIMENSION_NAMES
+                for name in names
+                if name is not None
+            )
+
+        if is_session_dimension(metric_name):
+            return True
+        for breakdown in self.breakdowns:
+            if breakdown.get("type", "system_metric") != "system_metric":
+                continue
+            if is_session_dimension(breakdown.get("name"), breakdown.get("id")):
+                return True
+        for item in self.global_filters + (per_metric_filters or []):
+            filter_type = item.get("metric_type") or item.get("type", "")
+            if filter_type and filter_type != "system_metric":
+                continue
+            if is_session_dimension(
+                item.get("metric_name"), item.get("name"), item.get("id")
+            ):
+                return True
+        return False
+
     def _direct_user_physical_span_filter(
         self,
         per_metric_filters: list[dict],
@@ -705,7 +753,7 @@ class DashboardQueryBuilder:
             operator = _get_operator_symbol(operation)
             if not operator:
                 continue
-            params[parameter_key] = _coerce_filter_value(value, operation)
+            params[parameter_key] = _coerce_string_filter_value(value, operation)
             match_conditions.append(
                 "if(curated_user_id = '', toString(resolved_end_user_id), "
                 "curated_user_id) "
@@ -816,6 +864,9 @@ class DashboardQueryBuilder:
         table is aliased back to ``spans``) or ``"s"`` for the JOINed shapes.
         """
         if self._query_references_id(metric_name, per_metric_filters):
+            resolve_end_user_id = self._query_references_user_dimension(
+                metric_name, per_metric_filters
+            )
             physical_end_user_filter = self._direct_user_physical_span_filter(
                 per_metric_filters, params
             )
@@ -828,6 +879,10 @@ class DashboardQueryBuilder:
                     )
                 ),
                 physical_end_user_filter=physical_end_user_filter,
+                resolve_end_user_id=resolve_end_user_id,
+                resolve_trace_session_id=self._query_references_session_dimension(
+                    metric_name, per_metric_filters
+                ),
             )
         return "spans" if alias == "spans" else f"spans AS {alias}"
 
@@ -898,6 +953,8 @@ class DashboardQueryBuilder:
         return self._BREAKDOWN_COL_MAP.get(breakdown_name)
 
     def _string_filter_column_expression(self, filter_name: str) -> str | None:
+        if self._direct_end_users_available and filter_name == "user_count":
+            return self._DIRECT_USER_METRIC_EXPRESSIONS["user_count"]
         if (
             self._direct_end_users_available
             and filter_name in self._DIRECT_USER_BREAKDOWN_EXPRESSIONS
@@ -1413,9 +1470,19 @@ class DashboardQueryBuilder:
             if f_type == "system_metric" and f_name.lower() in SYSTEM_METRICS:
                 # Trace dimension filter → JOIN spans
                 need_spans_join = True
-                span_expr = self._system_metric_expression(f_name.lower(), alias="s")
+                metric_key = f_name.lower()
+                string_expression = self._string_filter_column_expression(metric_key)
+                span_expr = (
+                    self._qualify_span_expression(string_expression, alias="s")
+                    if string_expression is not None
+                    else self._system_metric_expression(metric_key, alias="s")
+                )
                 where_parts.append(f"{span_expr} {op_symbol} %({val_key})s")
-                params[val_key] = _coerce_filter_value(val, op)
+                params[val_key] = (
+                    _coerce_string_filter_value(val, op)
+                    if string_expression is not None
+                    else _coerce_filter_value(val, op)
+                )
 
             elif f_type == "eval_metric":
                 ev_tid = f_name
@@ -1429,7 +1496,7 @@ class DashboardQueryBuilder:
                         where_parts.append(
                             f"e.eval_output_str {op_symbol} %({val_key})s"
                         )
-                        params[val_key] = val
+                        params[val_key] = _coerce_string_filter_value(val, op)
                     else:
                         where_parts.append(f"e.eval_score {op_symbol} %({val_key})s")
                         params[val_key] = _coerce_filter_value(val, op)
@@ -1441,7 +1508,7 @@ class DashboardQueryBuilder:
                     if f_out_type in ("PASS_FAIL", "CHOICE", "CHOICES"):
                         ev_col = f"{ev_alias}.eval_output_str"
                         where_parts.append(f"{ev_col} {op_symbol} %({val_key})s")
-                        params[val_key] = val
+                        params[val_key] = _coerce_string_filter_value(val, op)
                     else:
                         ev_col = f"{ev_alias}.eval_score"
                         where_parts.append(f"{ev_col} {op_symbol} %({val_key})s")
@@ -1460,7 +1527,11 @@ class DashboardQueryBuilder:
                 where_parts.append(
                     f"s.{attr_map}['{attr_key}'] {op_symbol} %({val_key})s"
                 )
-                params[val_key] = _coerce_filter_value(val, op)
+                params[val_key] = (
+                    _coerce_string_filter_value(val, op)
+                    if attr_type not in ("number", "boolean")
+                    else _coerce_filter_value(val, op)
+                )
 
         if need_spans_join:
             spans_joined = self._spans_source(None, per_metric_filters, "s")
@@ -1836,6 +1907,7 @@ class DashboardQueryBuilder:
                         string_expression or self._system_metric_expression(metric_key),
                         alias="s",
                     )
+                    is_string_filter = string_expression is not None
                 else:
                     attribute_key = _sanitize_attr_key(filter_name)
                     attribute_type = item.get("attribute_type", "string")
@@ -1844,6 +1916,7 @@ class DashboardQueryBuilder:
                         "boolean": "span_attr_bool",
                     }.get(attribute_type, "span_attr_str")
                     expression = f"s.{attribute_map}['{attribute_key}']"
+                    is_string_filter = attribute_type not in ("number", "boolean")
 
                 if operation in (
                     "is_set",
@@ -1869,8 +1942,13 @@ class DashboardQueryBuilder:
                         f"{expression} {negation}BETWEEN %({low_key})s "
                         f"AND %({high_key})s"
                     )
-                    params[low_key] = _coerce_filter_value(value[0], "equal_to")
-                    params[high_key] = _coerce_filter_value(value[1], "equal_to")
+                    coerce = (
+                        _coerce_string_filter_value
+                        if is_string_filter
+                        else _coerce_filter_value
+                    )
+                    params[low_key] = coerce(value[0], "equal_to")
+                    params[high_key] = coerce(value[1], "equal_to")
                     continue
 
                 operator = _get_operator_symbol(operation)
@@ -1880,7 +1958,11 @@ class DashboardQueryBuilder:
                     )
                 value_key = f"_ann_span_filter_{filter_index}_value"
                 span_predicates.append(f"{expression} {operator} %({value_key})s")
-                params[value_key] = _coerce_filter_value(value, operation)
+                params[value_key] = (
+                    _coerce_string_filter_value(value, operation)
+                    if is_string_filter
+                    else _coerce_filter_value(value, operation)
+                )
 
             filtered_trace_ids = f"""
                 SELECT DISTINCT s.trace_id
@@ -2197,6 +2279,13 @@ class DashboardQueryBuilder:
 
     _STRING_FILTER_COL = {
         "project": "toString(project_id)",
+        "trace_count": "trace_id",
+        "span_count": "id",
+        "session_count": (
+            "toString(nullIf(trace_session_id, "
+            "toUUID('00000000-0000-0000-0000-000000000000')))"
+        ),
+        "user_count": SYSTEM_METRICS["user_count"][1],
         "status": "status",
         "model": "model",
         "service_name": "service_name",
@@ -2451,6 +2540,7 @@ class DashboardQueryBuilder:
                 val = f.get("value")
                 # Use string-safe column for non-numeric metrics
                 string_filter_col = self._string_filter_column_expression(f_name)
+                is_string_filter = string_filter_col is not None
                 if string_filter_col is not None:
                     col = string_filter_col
                 elif f_name in SYSTEM_METRICS:
@@ -2476,8 +2566,13 @@ class DashboardQueryBuilder:
                     if isinstance(val, list) and len(val) == 2:
                         lo_key = f"f_{idx}_lo"
                         hi_key = f"f_{idx}_hi"
-                        params[lo_key] = _coerce_filter_value(val[0], "equal_to")
-                        params[hi_key] = _coerce_filter_value(val[1], "equal_to")
+                        coerce = (
+                            _coerce_string_filter_value
+                            if is_string_filter
+                            else _coerce_filter_value
+                        )
+                        params[lo_key] = coerce(val[0], "equal_to")
+                        params[hi_key] = coerce(val[1], "equal_to")
                         neg = "NOT " if op == "not_between" else ""
                         clauses.append(
                             f"{col} {neg}BETWEEN %({lo_key})s AND %({hi_key})s"
@@ -2489,7 +2584,11 @@ class DashboardQueryBuilder:
                 if op_tpl:
                     param_key = f"f_{idx}_val"
                     clause = f"{col} {op_tpl.format(prefix='f_', idx=idx)}"
-                    params[param_key] = _coerce_filter_value(val, op)
+                    params[param_key] = (
+                        _coerce_string_filter_value(val, op)
+                        if is_string_filter
+                        else _coerce_filter_value(val, op)
+                    )
                     clauses.append(clause)
                     idx += 1
             elif f_type == "custom_attribute":
@@ -2528,8 +2627,13 @@ class DashboardQueryBuilder:
                     if isinstance(val, list) and len(val) == 2:
                         lo_key = f"f_{idx}_lo"
                         hi_key = f"f_{idx}_hi"
-                        params[lo_key] = _coerce_filter_value(val[0], "equal_to")
-                        params[hi_key] = _coerce_filter_value(val[1], "equal_to")
+                        coerce = (
+                            _coerce_string_filter_value
+                            if attr_type not in ("number", "boolean")
+                            else _coerce_filter_value
+                        )
+                        params[lo_key] = coerce(val[0], "equal_to")
+                        params[hi_key] = coerce(val[1], "equal_to")
                         neg = "NOT " if op == "not_between" else ""
                         clauses.append(
                             f"{col} {neg}BETWEEN %({lo_key})s AND %({hi_key})s"
@@ -2541,7 +2645,11 @@ class DashboardQueryBuilder:
                 if op_tpl:
                     param_key = f"f_{idx}_val"
                     clause = f"{col} {op_tpl.format(prefix='f_', idx=idx)}"
-                    params[param_key] = _coerce_filter_value(val, op)
+                    params[param_key] = (
+                        _coerce_string_filter_value(val, op)
+                        if attr_type not in ("number", "boolean")
+                        else _coerce_filter_value(val, op)
+                    )
                     clauses.append(clause)
                     idx += 1
 
@@ -2601,17 +2709,7 @@ class DashboardQueryBuilder:
                 # older successful version.
                 if output_type in ("PASS_FAIL", "CHOICE", "CHOICES"):
                     eval_col = f"{latest_alias}.eval_output_str"
-                    filter_value = (
-                        _coerce_filter_value(val, op)
-                        if op
-                        in (
-                            "contains",
-                            "not_contains",
-                            "str_contains",
-                            "str_not_contains",
-                        )
-                        else val
-                    )
+                    filter_value = _coerce_string_filter_value(val, op)
                 elif output_type == "SCORE":
                     eval_col = f"{latest_alias}.eval_score"
                     filter_value = _coerce_filter_value(val, op)
@@ -2677,14 +2775,17 @@ class DashboardQueryBuilder:
                             f"notEmpty({selected_expr}) AND "
                             f"{negation}has({selected_expr}, %({val_key})s)"
                         )
-                        filter_value = val
+                        # Categorical membership uses has(Array(String),
+                        # String); even the legacy str_contains spelling is
+                        # exact array membership rather than SQL LIKE.
+                        filter_value = str(val)
                     elif op in ("contains", "not_contains"):
                         negation = "NOT " if op == "not_contains" else ""
                         filter_condition = (
                             f"notEmpty({selected_expr}) AND "
                             f"{negation}hasAny({selected_expr}, %({val_key})s)"
                         )
-                        filter_value = _coerce_filter_value(val, op)
+                        filter_value = _coerce_string_filter_value(val, op)
                     else:
                         raise InvalidMetricCombinationError(
                             f"Unsupported categorical annotation filter operation: {op}"
@@ -2695,17 +2796,7 @@ class DashboardQueryBuilder:
                         f"JSONExtract({annotation_alias}.value, '{json_key}', "
                         "'Nullable(String)')"
                     )
-                    filter_value = (
-                        _coerce_filter_value(val, op)
-                        if op
-                        in (
-                            "contains",
-                            "not_contains",
-                            "str_contains",
-                            "str_not_contains",
-                        )
-                        else val
-                    )
+                    filter_value = _coerce_string_filter_value(val, op)
                     if output_type == "thumbs_up_down":
                         thumb_tokens = {
                             "thumbs up": "up",
@@ -2966,3 +3057,21 @@ def _coerce_filter_value(val: Any, operator: str) -> Any:
         except ValueError:
             return val
     return val
+
+
+def _coerce_string_filter_value(val: Any, operator: str) -> Any:
+    """Keep identifier/dimension filters typed as String.
+
+    Numeric-looking external ids (for example a curated user id of ``"123"``)
+    must not be converted to Float64: ClickHouse cannot compare that parameter
+    with the String expression used by user/session/model filters.
+    """
+
+    if operator in ("contains", "not_contains"):
+        values = val if isinstance(val, list) else [val]
+        return [str(value) for value in values]
+    if operator in ("str_contains", "str_not_contains"):
+        value = str(val) if val is not None else ""
+        value = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"%{value}%"
+    return str(val)
