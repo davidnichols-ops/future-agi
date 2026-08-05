@@ -670,7 +670,10 @@ def test_trace_multi_child_filters_match_across_separate_temporal_strata():
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rejected"),
+            # Keep one genuinely selective value-index companion so this test
+            # exercises cross-stratum membership rather than the deliberately
+            # sampled text/boolean graph lane.
+            _attribute_filter("score", 0.5, filter_type="number"),
             _attribute_filter(
                 "customer.context",
                 {"tier": "vip"},
@@ -779,7 +782,7 @@ def test_cross_stratum_trace_sample_is_full_coverage_and_never_marked_exact():
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
             _attribute_filter(
                 "customer.context",
                 {"tier": "vip"},
@@ -1248,7 +1251,7 @@ def test_stratum_anchor_timeout_uses_sanitized_temporal_sample(monkeypatch):
         project_id=PROJECT_ID,
         filters=[
             _date_filter(START, START + timedelta(days=7)),
-            _attribute_filter("customer.final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type="trace",
     )
@@ -1331,7 +1334,7 @@ def test_sparse_old_and_new_matches_are_exact_across_stratum_anchors(window_days
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type="trace",
     )
@@ -1387,7 +1390,7 @@ def test_long_window_scalar_datetime_bounds_are_preserved_by_stratum_anchors(
     filters = [
         _date_bound_filter(lower_op, window_start),
         _date_bound_filter(upper_op, window_end),
-        _attribute_filter("final_status", "Rejected"),
+        _attribute_filter("score", 0.5, filter_type="number"),
     ]
 
     sample = read_graph_candidates(
@@ -1438,7 +1441,7 @@ def test_empty_long_window_is_exact_and_not_mislabeled_as_sampled(window_days):
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type="trace",
     )
@@ -1512,13 +1515,13 @@ def test_failure_in_any_stratum_never_becomes_a_renderable_sample(
         observe_type="trace",
     )
 
-    assert len(calls) == bounded_graph_reads.GRAPH_TRACE_STRATA
+    assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
     assert sample.query_complete is False
     assert sample.query_status == "degraded"
     assert sample.query_error_code == "read_budget_exceeded"
-    assert sample.sampling_strata == bounded_graph_reads.GRAPH_TRACE_STRATA
+    assert sample.sampling_strata == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
     assert sample.sampling_strata_completed == (
-        bounded_graph_reads.GRAPH_TRACE_STRATA - 1
+        bounded_graph_reads.GRAPH_ANY_SPAN_STRATA - 1
     )
     with pytest.raises(BoundedGraphReadError) as caught:
         graph_dispatch._require_renderable_sample(sample)
@@ -1582,7 +1585,7 @@ def test_sparse_span_anchor_replays_trace_scoped_ids_and_latest_tombstones():
         project_id=PROJECT_ID,
         filters=[
             _date_filter(START, window_end),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type="span",
     )
@@ -1640,7 +1643,7 @@ def test_long_sparse_anchor_and_strata_timeout_becomes_degraded_empty(monkeypatc
         project_id=PROJECT_ID,
         filters=[
             _date_filter(START, START + timedelta(days=7)),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type="span",
     )
@@ -1706,7 +1709,7 @@ def test_stale_saturated_span_anchor_uses_bounded_ordered_fallback(monkeypatch):
         project_id=PROJECT_ID,
         filters=[
             _date_filter(START, START + timedelta(days=14)),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type="span",
     )
@@ -1721,7 +1724,7 @@ def test_stale_saturated_span_anchor_uses_bounded_ordered_fallback(monkeypatch):
 
 
 @pytest.mark.unit
-def test_span_typed_map_anchor_is_bounded_for_lists_and_graphs():
+def test_span_text_map_anchor_stays_optional_for_lists_but_graphs_sample():
     from tracer.services.clickhouse.v2.query_builders.span_list import (
         SpanListQueryBuilderV2,
     )
@@ -1746,6 +1749,7 @@ def test_span_typed_map_anchor_is_bounded_for_lists_and_graphs():
         == 96 * 1024 * 1024
     )
     assert graph_builder.supports_filter_anchor_probe() is True
+    assert graph_builder.requires_unindexed_graph_sample_slice() is True
     assert graph_builder.recommended_filter_anchor_probe_limit() is None
 
 
@@ -1823,7 +1827,7 @@ def test_span_mixed_structured_anchor_uses_only_the_indexed_typed_map_leaf():
     )
 
     assert builder.supports_filter_anchor_probe() is True
-    assert builder.requires_unindexed_graph_sample_slice() is False
+    assert builder.requires_unindexed_graph_sample_slice() is True
     anchor_query, anchor_params = builder.build_filter_anchor_probe(limit=50)
     assert (
         "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))" in anchor_query
@@ -1887,7 +1891,7 @@ def test_wrapped_system_text_predicates_never_claim_an_indexed_graph_anchor(
         ("in", ["Rejected", "Approved"]),
     ],
 )
-def test_typed_map_key_subcolumn_remains_a_safe_graph_anchor(
+def test_text_map_key_subcolumn_is_only_an_optional_list_anchor(
     builder_kind,
     filter_op,
     value,
@@ -1918,7 +1922,7 @@ def test_typed_map_key_subcolumn_remains_a_safe_graph_anchor(
     )
 
     assert builder.supports_filter_anchor_probe() is True
-    assert builder.requires_unindexed_graph_sample_slice() is False
+    assert builder.requires_unindexed_graph_sample_slice() is True
     anchor_query, anchor_params = builder.build_filter_anchor_probe(limit=50)
     assert (
         "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))" in anchor_query
@@ -1934,6 +1938,156 @@ def test_typed_map_key_subcolumn_remains_a_safe_graph_anchor(
     assert "latest_filter_index_0_1" not in anchor_params
     assert "Rejected" not in anchor_params.values()
     assert "Approved" not in anchor_params.values()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("builder_kind", ["trace", "span"])
+@pytest.mark.parametrize(
+    ("filter_type", "filter_op", "value"),
+    [
+        ("text", "contains", "ject"),
+        ("text", "starts_with", "Rej"),
+        ("text", "ends_with", "cted"),
+        ("text", "is_not_null", None),
+        ("boolean", "equals", True),
+        ("boolean", "is_not_null", None),
+        ("number", "greater_than", 0.5),
+    ],
+)
+def test_key_only_typed_map_shapes_use_the_graph_sample_lane(
+    builder_kind,
+    filter_type,
+    filter_op,
+    value,
+) -> None:
+    from tracer.services.clickhouse.v2.query_builders.span_list import (
+        SpanListQueryBuilderV2,
+    )
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
+
+    filters = [
+        _date_filter(START - timedelta(days=180), END),
+        _attribute_filter(
+            "custom_value",
+            value,
+            filter_type=filter_type,
+            filter_op=filter_op,
+        ),
+    ]
+    builder = (
+        TraceListQueryBuilderV2(
+            project_id=PROJECT_ID,
+            filters=filters,
+            bounded_identity_only=True,
+        )
+        if builder_kind == "trace"
+        else SpanListQueryBuilderV2(
+            project_id=PROJECT_ID,
+            filters=filters,
+            bounded_anchor_probe=True,
+        )
+    )
+
+    assert builder.requires_unindexed_graph_sample_slice() is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("builder_kind", ["trace", "span"])
+@pytest.mark.parametrize(
+    ("filter_op", "value"),
+    [("equals", 0.5), ("in", [0.5, 0.75])],
+)
+def test_numeric_value_index_remains_a_selective_graph_anchor(
+    builder_kind,
+    filter_op,
+    value,
+) -> None:
+    from tracer.services.clickhouse.v2.query_builders.span_list import (
+        SpanListQueryBuilderV2,
+    )
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
+
+    filters = [
+        _date_filter(START - timedelta(days=180), END),
+        _attribute_filter(
+            "score",
+            value,
+            filter_type="number",
+            filter_op=filter_op,
+        ),
+    ]
+    builder = (
+        TraceListQueryBuilderV2(
+            project_id=PROJECT_ID,
+            filters=filters,
+            bounded_identity_only=True,
+        )
+        if builder_kind == "trace"
+        else SpanListQueryBuilderV2(
+            project_id=PROJECT_ID,
+            filters=filters,
+            bounded_anchor_probe=True,
+        )
+    )
+
+    assert builder.supports_filter_anchor_probe() is True
+    assert builder.requires_unindexed_graph_sample_slice() is False
+    anchor_query, _ = builder.build_filter_anchor_probe(limit=50)
+    assert (
+        "has(mapValues(attrs_number)" in anchor_query
+        or "hasAny(mapValues(attrs_number)" in anchor_query
+    )
+
+
+@pytest.mark.unit
+def test_locked_executor_routes_numeric_trace_graph_to_eight_micro_strata(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def _page(**kwargs):
+        calls.append(kwargs)
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            elapsed_ms=1,
+            query_count=1,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(bounded_graph_reads, "read_bounded_filter_page", _page)
+    analytics = SimpleNamespace(supports_per_query_read_settings=False)
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(START, START + timedelta(days=14)),
+            _attribute_filter("score", 0.5, filter_type="number"),
+        ],
+        observe_type="trace",
+    )
+
+    assert sample.query_status == "sampled"
+    assert sample.sampling_strata == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert all(call["anchor_probe_only"] is False for call in calls)
+    assert all(call["anchor_probe_limit"] is None for call in calls)
+    assert all(
+        call["builder"].parse_time_range(call["filters"])[1]
+        - call["builder"].parse_time_range(call["filters"])[0]
+        == bounded_graph_reads.GRAPH_UNINDEXED_SAMPLE_SLICE
+        for call in calls
+    )
 
 
 @pytest.mark.unit
@@ -2534,7 +2688,7 @@ def test_trace_classifier_failure_is_atomic_and_sanitized() -> None:
             project_id=PROJECT_ID,
             filters=[
                 _date_filter(window_start, window_end),
-                _attribute_filter("final_status", "Rejected"),
+                _attribute_filter("score", 0.5, filter_type="number"),
             ],
             observe_type="trace",
         )
@@ -2584,7 +2738,7 @@ def test_distributed_sample_uses_one_shared_deadline_instead_of_equal_slices(
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type="trace",
     )
@@ -2701,7 +2855,7 @@ def test_code_307_stratum_anchor_uses_temporal_sample_without_leaking_details(
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type="trace",
     )
@@ -2733,11 +2887,7 @@ def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
     window_end = datetime(2026, 7, 31, 7)
     window_start = window_end - timedelta(days=window_days)
     window_width = window_end - window_start
-    stratum_count = (
-        bounded_graph_reads.GRAPH_TRACE_STRATA
-        if observe_type == "trace"
-        else bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
-    )
+    stratum_count = bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
     rows = []
     for stratum in range(stratum_count):
         stratum_start = window_start + (window_width * stratum / stratum_count)
@@ -2746,8 +2896,12 @@ def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
             row = {
                 "trace_id": f"trace-{stratum}-{index:03d}",
                 "root_span_id": f"root-{stratum}-{index:03d}",
-                "start_time": stratum_start + (stratum_width * index / 60),
-                "matches_latest": index == 0,
+                "start_time": (
+                    stratum_start + stratum_width - timedelta(minutes=1)
+                    if index == 59
+                    else stratum_start + (stratum_width * index / 60)
+                ),
+                "matches_latest": index == 59,
             }
             if observe_type == "span":
                 row["id"] = f"span-{stratum}-{index:03d}"
@@ -2798,34 +2952,17 @@ def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
     assert not any(
         call[1].get("filter_anchor_limit") == 513 for call in analytics.calls
     )
-    anchor_queries = [
-        query
-        for query, params, *_ in analytics.calls
-        if "filter_anchor_limit" in params
+    assert not any("filter_anchor_limit" in params for _, params, *_ in analytics.calls)
+    seed_ranges = [
+        (params["filter_slice_start"], params["filter_slice_end"])
+        for _, params, *_ in analytics.calls
+        if "filter_seed_limit" in params
     ]
-    expected_order = (
-        (
-            "ORDER BY observation_type DESC, service_name DESC, "
-            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC"
-        )
-        if observe_type == "trace"
-        else (
-            "ORDER BY observation_type DESC, service_name DESC, "
-            "toStartOfHour(start_time) DESC, trace_id DESC, id DESC, "
-            "start_time DESC"
-        )
+    assert len(seed_ranges) == stratum_count
+    assert all(
+        end - start == bounded_graph_reads.GRAPH_UNINDEXED_SAMPLE_SLICE
+        for start, end in seed_ranges
     )
-    assert anchor_queries
-    for query in anchor_queries:
-        normalized = " ".join(query.split())
-        assert expected_order in normalized
-        expected_limit_by = (
-            "LIMIT 1 BY trace_id"
-            if observe_type == "trace"
-            else "LIMIT 1 BY project_id, trace_id, id, start_time"
-        )
-        assert expected_limit_by in normalized
-        assert normalized.index("ORDER BY") < normalized.index(expected_limit_by)
 
 
 @pytest.mark.unit
@@ -2856,7 +2993,7 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
             project_id=PROJECT_ID,
             filters=[
                 _date_filter(window_start, window_end),
-                _attribute_filter("final_status", "Rejected"),
+                _attribute_filter("score", 0.5, filter_type="number"),
             ],
             observe_type=observe_type,
         )
@@ -2896,7 +3033,7 @@ def test_bounded_high_cardinality_long_window_is_sampled_and_distributed(
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type=observe_type,
     )
@@ -3006,7 +3143,7 @@ def test_dense_long_window_stratum_overflow_remains_explicitly_incomplete(
         project_id=PROJECT_ID,
         filters=[
             _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("score", 0.5, filter_type="number"),
         ],
         observe_type=observe_type,
     )

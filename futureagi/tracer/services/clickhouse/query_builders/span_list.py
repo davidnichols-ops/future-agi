@@ -377,6 +377,32 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             for column in _INDEXED_SPAN_ANCHOR_COLUMNS
         )
 
+    @classmethod
+    def _plan_uses_selective_graph_anchor(cls, plan: Any) -> bool:
+        """Return whether a graph may probe an entire temporal stratum.
+
+        The Map-key bloom safely bounds optional list probes, but common text
+        and boolean keys do not prune their value comparisons enough for a
+        mandatory graph probe. Numeric equality/IN has a separate value-index
+        companion; numeric ranges use the temporal sample lane.
+        """
+
+        if not cls._plan_uses_indexed_anchor(plan):
+            return False
+        predicate = " ".join(
+            str(plan.raw_witness_predicate or plan.seed_predicate or "").split()
+        )
+        typed_map_kinds = set(re.findall(r"\bspan_attr_(str|num|bool)\b", predicate))
+        if typed_map_kinds:
+            return typed_map_kinds == {"num"} and any(
+                fragment in predicate
+                for fragment in (
+                    "has(mapValues(span_attr_num)",
+                    "hasAny(mapValues(span_attr_num)",
+                )
+            )
+        return True
+
     def _filter_anchor_plans(self) -> list[Any]:
         plans, _ = partition_span_filter_plans(self.filters)
         candidates = [
@@ -448,8 +474,9 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         negative/null predicate.
         """
 
-        return bool(self._active_non_time_filters()) and not bool(
-            self._filter_anchor_plans()
+        plans, _ = partition_span_filter_plans(self.filters)
+        return bool(self._active_non_time_filters()) and not any(
+            self._plan_uses_selective_graph_anchor(plan) for plan in plans
         )
 
     def _unindexed_positive_micro_seed_plan(self) -> Any | None:

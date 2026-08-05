@@ -438,6 +438,9 @@ def _read_time_distributed_candidates(
     total_rows_lower_bound = 0
     sampling_strata_completed = 0
     sampling_error_code: str | None = None
+    probe_limits_enforced = bool(
+        getattr(analytics, "supports_per_query_read_settings", True)
+    )
     # Freeze the outer request window into an explicit positive time leaf.
     # When the caller omits a date filter, each builder otherwise derives its
     # own ``now - 30 days`` default a few microseconds apart.  Passing the raw
@@ -493,29 +496,34 @@ def _read_time_distributed_candidates(
             # in the stratum just to obtain the first 49 candidate identities.
             stratum_builder_kwargs["bounded_anchor_probe"] = True
         stratum_builder = builder_class(**stratum_builder_kwargs)
-        anchor_support = getattr(stratum_builder, "supports_filter_anchor_probe", None)
-        use_stratum_anchor = (
-            not force_temporal_sample
-            and callable(anchor_support)
-            and bool(anchor_support())
-        )
-        if mode == "trace" and use_stratum_anchor:
-            defer_trace_classification = True
         unindexed_sample_support = getattr(
             stratum_builder,
             "requires_unindexed_graph_sample_slice",
             None,
         )
+        requires_temporal_sample = bool(
+            callable(unindexed_sample_support) and unindexed_sample_support()
+        )
+        anchor_support = getattr(stratum_builder, "supports_filter_anchor_probe", None)
+        builder_anchor_supported = bool(callable(anchor_support) and anchor_support())
+        if builder_anchor_supported and not probe_limits_enforced:
+            # A locked executor strips the anchor's tight timeout/read caps.
+            # The selector would silently suppress that speculative probe and
+            # enter the full-stratum ordered seed, which reproduced the US
+            # production Code 158 failure. Route it to the same explicit
+            # five-minute temporal sample as an unselective predicate instead.
+            requires_temporal_sample = True
+        use_stratum_anchor = (
+            not force_temporal_sample
+            and not requires_temporal_sample
+            and builder_anchor_supported
+            and probe_limits_enforced
+        )
+        if mode == "trace" and use_stratum_anchor:
+            defer_trace_classification = True
         temporal_sample = (
             not synthetic_time_only_seed
-            and (
-                force_temporal_sample
-                or (
-                    not use_stratum_anchor
-                    and callable(unindexed_sample_support)
-                    and bool(unindexed_sample_support())
-                )
-            )
+            and (force_temporal_sample or requires_temporal_sample)
             and stratum_end - stratum_start > GRAPH_UNINDEXED_SAMPLE_SLICE
         )
         if temporal_sample:
@@ -932,9 +940,23 @@ def read_graph_candidates(
     window_start, window_end = builder.parse_time_range(effective_filters)
     classify_batch_size = builder.recommended_filter_classify_batch_size()
     if window_end - window_start > GRAPH_ANY_SPAN_DISTRIBUTED_AFTER:
+        probe_limits_enforced = bool(
+            getattr(analytics, "supports_per_query_read_settings", True)
+        )
         anchor_support = getattr(builder, "supports_filter_anchor_probe", None)
+        unindexed_sample_support = getattr(
+            builder,
+            "requires_unindexed_graph_sample_slice",
+            None,
+        )
         indexed_trace_sample = (
-            mode == "trace" and callable(anchor_support) and bool(anchor_support())
+            mode == "trace"
+            and probe_limits_enforced
+            and callable(anchor_support)
+            and bool(anchor_support())
+            and not (
+                callable(unindexed_sample_support) and bool(unindexed_sample_support())
+            )
         )
         return _read_time_distributed_candidates(
             analytics=analytics,

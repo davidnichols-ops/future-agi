@@ -516,6 +516,33 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             for column in _INDEXED_TRACE_ANY_SPAN_ANCHOR_COLUMNS
         )
 
+    @classmethod
+    def _plan_uses_selective_graph_anchor(cls, plan: LatestFilterPredicate) -> bool:
+        """Return whether a graph may probe an entire temporal stratum.
+
+        A Map-key bloom is useful for the list endpoint's tightly capped,
+        optional sparse probe. It is not selective when a common text/boolean
+        key still requires value evaluation across a large graph stratum.
+        Numeric equality/IN retains its separate value-index companion; numeric
+        ranges use the bounded temporal sample lane as well.
+        """
+
+        if not cls._plan_uses_indexed_anchor(plan):
+            return False
+        predicate = " ".join(
+            str(plan.raw_witness_predicate or plan.seed_predicate or "").split()
+        )
+        typed_map_kinds = set(re.findall(r"\bspan_attr_(str|num|bool)\b", predicate))
+        if typed_map_kinds:
+            return typed_map_kinds == {"num"} and any(
+                fragment in predicate
+                for fragment in (
+                    "has(mapValues(span_attr_num)",
+                    "hasAny(mapValues(span_attr_num)",
+                )
+            )
+        return True
+
     def _has_unindexed_any_span_filter(self) -> bool:
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
         return any(
@@ -534,7 +561,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         plans, _ = partition_trace_filter_plans(self._bounded_filters())
         return bool(plans) and not any(
-            self._plan_uses_indexed_anchor(plan) for plan in plans
+            self._plan_uses_selective_graph_anchor(plan) for plan in plans
         )
 
     def _unindexed_positive_micro_seed_plan(self) -> LatestFilterPredicate | None:
