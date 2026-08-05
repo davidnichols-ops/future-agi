@@ -7161,9 +7161,10 @@ class TestDashboardV2RewriteRouting:
         assert (
             "AS eu_dimension_remap ON eu.end_user_id = eu_dimension_remap.any_id"
         ) in compact_sql
-        assert "GROUP BY resolved_end_user_id" in compact_sql
+        assert "GROUP BY project_id, resolved_end_user_id" in compact_sql
         assert (
-            "ON if(eu_remap.survivor_id IS NULL OR "
+            "ON sp.project_id = eu_dimension.project_id AND "
+            "if(eu_remap.survivor_id IS NULL OR "
             "eu_remap.survivor_id = toUUID(" in compact_sql
         )
         # Prefer an exact survivor row; fall back to the newest live member of
@@ -7219,6 +7220,198 @@ class TestDashboardV2RewriteRouting:
         assert "FROM end_users AS eu FINAL" in sql
         assert "if(user_id = '', toString(end_user_id), user_id)" in sql
         assert params["f_0_val"] == "customer@example.com"
+        assert params["direct_user_filter_0_val"] == "customer@example.com"
+        compact_sql = " ".join(sql.split())
+        assert "(sp.project_id, sp.end_user_id) IN (" in compact_sql
+        assert "FROM end_users AS filtered_eu FINAL" in compact_sql
+        assert "filtered_eu.project_id IN %(project_ids)s" in compact_sql
+        assert "filtered_eu.is_deleted = 0" in compact_sql
+        assert (
+            "GROUP BY project_id, resolved_end_user_id HAVING "
+            "if(curated_user_id = ''" in compact_sql
+        )
+        assert "matched_user.project_id AS project_id" in compact_sql
+        assert "AS user_filter_physical_map" in compact_sql
+        assert "PREWHERE sp.project_id IN %(project_ids)s" in compact_sql
+        assert "sp.start_time >= %(start_date)s" in compact_sql
+        assert "sp.start_time < %(end_date)s" in compact_sql
+        assert "WHERE sp.is_deleted = 0" in compact_sql
+
+    def test_user_dimension_identity_is_project_scoped(self):
+        config = _single_metric_config(
+            {
+                "id": "user_count",
+                "name": "user_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["project_ids"] = [str(uuid.uuid4()), str(uuid.uuid4())]
+
+        sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "eu.project_id AS project_id" in compact_sql
+        assert "GROUP BY project_id, resolved_end_user_id" in compact_sql
+        assert "ON sp.project_id = eu_dimension.project_id" in compact_sql
+
+    def test_negative_user_filter_keeps_exact_enrichment_without_broad_prefilter(self):
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "not_contains",
+                "value": ["customer@example.com"],
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "user_filter_physical_map" not in sql
+        assert "direct_user_filter_0_val" not in params
+        assert params["f_0_val"] == ["customer@example.com"]
+
+    def test_multiple_positive_user_filters_share_a_finite_physical_candidate_set(self):
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "contains",
+                "value": ["customer@example.com", "second@example.com"],
+            },
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "equal_to",
+                "value": "customer@example.com",
+            },
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert compact_sql.count("AS user_filter_physical_map") == 1
+        assert "curated_user_id) IN %(direct_user_filter_0_val)s" in compact_sql
+        assert "curated_user_id) = %(direct_user_filter_1_val)s" in compact_sql
+        assert params["direct_user_filter_0_val"] == [
+            "customer@example.com",
+            "second@example.com",
+        ]
+        assert params["direct_user_filter_1_val"] == "customer@example.com"
+
+    def test_uuid_user_filter_preserves_missing_dimension_fallback(self):
+        fallback_user_id = str(uuid.uuid4())
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "contains",
+                "value": [fallback_user_id],
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+        compact_sql = " ".join(sql.split())
+
+        assert "OR sp.end_user_id IN (" in compact_sql
+        assert "AS fallback_user_physical_map" in compact_sql
+        assert "WHERE survivor_id IN %(direct_user_fallback_uuids)s" in compact_sql
+        assert params["direct_user_fallback_uuids"] == (fallback_user_id,)
+        assert params["direct_user_fallback_uuid_0"] == fallback_user_id
+
+    def test_partial_user_filter_does_not_use_membership_prefilter(self):
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "str_contains",
+                "value": "customer",
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "user_filter_physical_map" not in sql
+        assert "direct_user_filter_0_val" not in params
+
+    def test_untyped_user_filter_does_not_become_inner_only(self):
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_name": "user",
+                "operator": "equal_to",
+                "value": "customer@example.com",
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "user_filter_physical_map" not in sql
+        assert "direct_user_filter_0_val" not in params
+
+    def test_large_uuid_user_set_disables_partial_prefilter(self):
+        user_ids = [str(uuid.uuid4()) for _ in range(65)]
+        config = _single_metric_config(
+            {
+                "id": "trace_count",
+                "name": "trace_count",
+                "type": "system_metric",
+                "aggregation": "count_distinct",
+            }
+        )
+        config["filters"] = [
+            {
+                "metric_type": "system_metric",
+                "metric_name": "user",
+                "operator": "contains",
+                "value": user_ids,
+            }
+        ]
+
+        sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
+
+        assert "user_filter_physical_map" not in sql
+        assert "direct_user_filter_0_val" not in params
+        assert params["f_0_val"] == user_ids
 
     def test_eval_metric_keeps_legacy_columns(self):
         config = _single_metric_config(

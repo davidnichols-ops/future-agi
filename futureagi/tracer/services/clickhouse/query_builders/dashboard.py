@@ -17,6 +17,7 @@ import logging
 import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 from tracer.services.clickhouse.query_builders.expressions import (
     annotation_numeric_value_expr,
@@ -28,6 +29,7 @@ from tracer.services.clickhouse.trace_project_scope import (
     latest_live_trace_projects_sql,
 )
 from tracer.services.clickhouse.v2.id_remap_sql import (
+    NIL_UUID,
     remap_left_join,
     resolved_id_expr,
     survivor_map_subquery,
@@ -391,7 +393,10 @@ _MATERIALIZED_DASHBOARD_COLS: tuple[str, ...] = ()
 
 
 def _resolved_spans_source(
-    alias: str | None = None, *, include_end_user_dimension: bool = False
+    alias: str | None = None,
+    *,
+    include_end_user_dimension: bool = False,
+    physical_end_user_filter: str = "",
 ) -> str:
     """Return a spans source with user/session ids resolved through id-remap.
 
@@ -419,6 +424,7 @@ def _resolved_spans_source(
         dimension_join = (
             "LEFT JOIN ("
             "SELECT "
+            "eu.project_id AS project_id, "
             f"{resolved_curated_eu} AS resolved_end_user_id, "
             f"argMax(eu.user_id, {exact_or_latest}) AS user_id, "
             f"argMax(tuple(eu.user_id_type), {exact_or_latest}).1 AS user_id_type "
@@ -427,22 +433,40 @@ def _resolved_spans_source(
             "ON eu.end_user_id = eu_dimension_remap.any_id "
             "WHERE eu.project_id IN %(project_ids)s "
             "AND eu.is_deleted = 0 "
-            "GROUP BY resolved_end_user_id"
+            "GROUP BY project_id, resolved_end_user_id"
             ") AS eu_dimension "
-            f"ON {resolved_eu} = eu_dimension.resolved_end_user_id"
+            "ON sp.project_id = eu_dimension.project_id "
+            f"AND {resolved_eu} = eu_dimension.resolved_end_user_id"
         )
         dimension_projection = (
             ", ifNull(eu_dimension.user_id, '') AS user_id, "
             "ifNull(eu_dimension.user_id_type, '') AS user_id_type"
         )
 
+    # A positive curated-user filter can be resolved to a finite set of raw
+    # span end_user_id values before the wide span row is enriched. Keeping
+    # this predicate inside the derived source lets ClickHouse use the
+    # existing project/time primary key and end_user_id bloom/projection. The
+    # outer predicate is deliberately retained as a semantic guard.
+    inner_scope = ""
+    if physical_end_user_filter:
+        inner_scope = (
+            " PREWHERE sp.project_id IN %(project_ids)s "
+            "AND sp.start_time >= %(start_date)s "
+            "AND sp.start_time < %(end_date)s "
+            "WHERE sp._peerdb_is_deleted = 0 "
+            f"AND ({physical_end_user_filter})"
+        )
+
     return (
-        "(SELECT sp.* EXCEPT (end_user_id, trace_session_id), "
+        "(SELECT sp.project_id AS project_id, "
+        "sp.* EXCEPT (project_id, end_user_id, trace_session_id), "
         f"{materialized}"
         f"{resolved_eu} AS end_user_id, "
         f"{resolved_ts} AS trace_session_id"
         f"{dimension_projection} "
-        f"FROM spans AS sp {eu_join} {ts_join} {dimension_join}) AS {out_alias}"
+        f"FROM spans AS sp {eu_join} {ts_join} {dimension_join}"
+        f"{inner_scope}) AS {out_alias}"
     )
 
 
@@ -634,8 +658,155 @@ class DashboardQueryBuilder:
                 return True
         return False
 
+    def _direct_user_physical_span_filter(
+        self,
+        per_metric_filters: list[dict],
+        params: dict[str, Any] | None,
+    ) -> str:
+        """Resolve positive curated-user filters before scanning ``spans``.
+
+        The public ``user`` dimension is an external label when a current live
+        ``end_users`` row exists, otherwise the remap survivor UUID string.
+        Resolve that exact value on the small project-scoped dimension first,
+        expand every matched survivor to all old/new physical ids, and return
+        a raw ``sp.end_user_id`` membership predicate. Negative/set filters
+        retain the existing exact enrichment path because their candidate set
+        can be effectively the whole tenant.
+        """
+
+        if not self._direct_end_users_available or params is None:
+            return ""
+
+        match_conditions: list[str] = []
+        fallback_uuid_sets: list[set[str]] = []
+        supported_operations = frozenset({"equal_to", "contains"})
+        for filter_index, item in enumerate(
+            self.global_filters + (per_metric_filters or [])
+        ):
+            if item.get("source", "traces") not in ("traces", ""):
+                continue
+            filter_type = item.get("metric_type") or item.get("type", "")
+            filter_name = (
+                item.get("metric_name") or item.get("name") or item.get("id", "")
+            ).lower()
+            operation = item.get("operator", "")
+            value = item.get("value")
+            if (
+                filter_type != "system_metric"
+                or filter_name != "user"
+                or operation not in supported_operations
+                or value is None
+                or value == ""
+                or value == []
+            ):
+                continue
+
+            parameter_key = f"direct_user_filter_{filter_index}_val"
+            operator = _get_operator_symbol(operation)
+            if not operator:
+                continue
+            params[parameter_key] = _coerce_filter_value(value, operation)
+            match_conditions.append(
+                "if(curated_user_id = '', toString(resolved_end_user_id), "
+                "curated_user_id) "
+                f"{operator} %({parameter_key})s"
+            )
+            raw_values = value if isinstance(value, list) else [value]
+            fallback_values: set[str] = set()
+            for raw_value in raw_values:
+                if not isinstance(raw_value, str):
+                    continue
+                try:
+                    fallback_values.add(str(UUID(raw_value)))
+                except ValueError:
+                    continue
+            fallback_uuid_sets.append(fallback_values)
+
+        if not match_conditions:
+            return ""
+
+        dimension_remap = survivor_map_subquery("end_user_id_remap")
+        resolved_dimension_id = resolved_id_expr(
+            "filtered_eu.end_user_id", "filtered_eu_remap"
+        )
+        exact_or_latest = (
+            "tuple(filtered_eu.end_user_id = "
+            f"{resolved_dimension_id}, filtered_eu.version)"
+        )
+        filtered_dimension = f"""
+            SELECT
+                filtered_eu.project_id AS project_id,
+                {resolved_dimension_id} AS resolved_end_user_id,
+                argMax(filtered_eu.user_id, {exact_or_latest}) AS curated_user_id
+            FROM end_users AS filtered_eu FINAL
+            LEFT JOIN ({dimension_remap}) AS filtered_eu_remap
+              ON filtered_eu.end_user_id = filtered_eu_remap.any_id
+            WHERE filtered_eu.project_id IN %(project_ids)s
+              AND filtered_eu.is_deleted = 0
+            GROUP BY project_id, resolved_end_user_id
+            HAVING {" AND ".join(match_conditions)}
+        """
+        physical_map = survivor_map_subquery("end_user_id_remap")
+        physical_id = (
+            "if(user_filter_physical_map.any_id IS NULL "
+            f"OR user_filter_physical_map.any_id = toUUID('{NIL_UUID}'), "
+            "matched_user.resolved_end_user_id, user_filter_physical_map.any_id)"
+        )
+        curated_membership = f"""(sp.project_id, sp.end_user_id) IN (
+            SELECT DISTINCT
+                matched_user.project_id AS project_id,
+                {physical_id} AS physical_end_user_id
+            FROM ({filtered_dimension}) AS matched_user
+            LEFT JOIN ({physical_map}) AS user_filter_physical_map
+              ON user_filter_physical_map.survivor_id =
+                 matched_user.resolved_end_user_id
+        )"""
+
+        # A missing curated row falls back to the *resolved survivor UUID*
+        # string. Membership operators can preserve that contract without a
+        # broad span scan: intersect UUID literals across multiple filters,
+        # expand each surviving survivor through the remap, then let the outer
+        # exact predicate reject any over-inclusive physical candidate.
+        fallback_uuid_values = (
+            set.intersection(*fallback_uuid_sets) if fallback_uuid_sets else set()
+        )
+        if len(fallback_uuid_values) > 64:
+            # A large UUID candidate set is not safe to partially optimize:
+            # omitting missing/tombstoned dimension rows would change public
+            # fallback semantics. Keep the original exact outer plan instead.
+            for parameter_key in tuple(params):
+                if parameter_key.startswith("direct_user_filter_"):
+                    params.pop(parameter_key)
+            return ""
+        if not fallback_uuid_values:
+            return curated_membership
+
+        fallback_param_keys: list[str] = []
+        for fallback_index, fallback_value in enumerate(sorted(fallback_uuid_values)):
+            fallback_key = f"direct_user_fallback_uuid_{fallback_index}"
+            params[fallback_key] = fallback_value
+            fallback_param_keys.append(fallback_key)
+        fallback_tuple = tuple(sorted(fallback_uuid_values))
+        params["direct_user_fallback_uuids"] = fallback_tuple
+        literal_branches = " UNION ALL ".join(
+            f"SELECT toUUID(%({parameter_key})s) AS physical_end_user_id"
+            for parameter_key in fallback_param_keys
+        )
+        fallback_membership = f"""sp.end_user_id IN (
+            SELECT any_id AS physical_end_user_id
+            FROM ({physical_map}) AS fallback_user_physical_map
+            WHERE survivor_id IN %(direct_user_fallback_uuids)s
+            UNION DISTINCT
+            {literal_branches}
+        )"""
+        return f"({curated_membership} OR {fallback_membership})"
+
     def _spans_source(
-        self, metric_name: str | None, per_metric_filters: list[dict], alias: str
+        self,
+        metric_name: str | None,
+        per_metric_filters: list[dict],
+        alias: str,
+        params: dict[str, Any] | None = None,
     ) -> str:
         """Return the spans FROM/JOIN source for the given alias — the id-remap
         resolved derived table when the query references an id, else the bare
@@ -645,6 +816,9 @@ class DashboardQueryBuilder:
         table is aliased back to ``spans``) or ``"s"`` for the JOINed shapes.
         """
         if self._query_references_id(metric_name, per_metric_filters):
+            physical_end_user_filter = self._direct_user_physical_span_filter(
+                per_metric_filters, params
+            )
             return _resolved_spans_source(
                 None if alias == "spans" else alias,
                 include_end_user_dimension=(
@@ -653,6 +827,7 @@ class DashboardQueryBuilder:
                         metric_name, per_metric_filters
                     )
                 ),
+                physical_end_user_filter=physical_end_user_filter,
             )
         return "spans" if alias == "spans" else f"spans AS {alias}"
 
@@ -860,8 +1035,12 @@ class DashboardQueryBuilder:
         if subquery_clauses[0]:
             all_where += subquery_clauses[0]
 
-        spans_flat = self._spans_source(metric_name, per_metric_filters, "spans")
-        spans_joined = self._spans_source(metric_name, per_metric_filters, "s")
+        spans_flat = self._spans_source(
+            metric_name, per_metric_filters, "spans", params=params
+        )
+        spans_joined = self._spans_source(
+            metric_name, per_metric_filters, "s", params=params
+        )
 
         bd_infos = self._resolve_all_breakdowns(params)
         has_annotation_bd = any(b["type"] == "annotation" for b in bd_infos)
