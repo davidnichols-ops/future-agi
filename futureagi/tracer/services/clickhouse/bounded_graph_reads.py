@@ -66,6 +66,12 @@ GRAPH_ANY_SPAN_ROWS_PER_STRATUM = 49
 # proven traces enter final child-span/eval/annotation decoration. Span graphs
 # aggregate in process and retain the established 49-row ceiling.
 GRAPH_TRACE_ROWS_PER_STRATUM = 3
+# Trace decoration accepts at most forty identities. Unindexed discovery may
+# inspect forty-nine key-bearing candidates per stratum, but only the newest
+# five exact matches from each of eight strata may cross the candidate boundary.
+# This preserves temporal coverage instead of letting the later global guard
+# collapse an honest eight-stratum sample into the newest forty rows.
+GRAPH_TRACE_DISTRIBUTED_RESULT_LIMIT = 40
 # A long-window sparse-anchor sentinel distinguishes a common predicate before
 # the ordered stratum reads begin. Common predicates deliberately switch to a
 # small representative ceiling: replaying 512 identities in each of eight
@@ -262,7 +268,8 @@ def _classify_deferred_trace_strata(
     strata: list[_DeferredTraceStratum],
     distributed_started: float,
     deadline_ms: int,
-    rows_per_stratum: int,
+    candidate_rows_per_stratum: int,
+    visible_rows_per_stratum: int,
 ) -> tuple[dict[Hashable, dict[str, Any]], float, int, int, int, int]:
     """Classify a de-duplicated trace union in bounded full-window chunks.
 
@@ -282,7 +289,7 @@ def _classify_deferred_trace_strata(
     if not union_by_id:
         return {}, 0.0, 0, 0, 0, 0
 
-    absolute_ceiling = len(strata) * (rows_per_stratum + 1)
+    absolute_ceiling = len(strata) * (candidate_rows_per_stratum + 1)
     if len(union_by_id) > absolute_ceiling:
         raise AssertionError("trace graph union exceeds its finite identity ceiling")
 
@@ -382,7 +389,7 @@ def _classify_deferred_trace_strata(
             reverse=True,
         )
         total_rows_lower_bound += len(stratum_matches)
-        for row in stratum_matches[:rows_per_stratum]:
+        for row in stratum_matches[:visible_rows_per_stratum]:
             trace_id = str(row.get("trace_id") or "")
             if trace_id:
                 visible_by_id[trace_id] = row
@@ -432,6 +439,12 @@ def _read_time_distributed_candidates(
         stratum_ceiling,
         max(1, deadline_ms // 250),
     )
+    visible_rows_per_stratum = rows_per_stratum
+    if mode == "trace":
+        visible_rows_per_stratum = min(
+            rows_per_stratum,
+            max(1, GRAPH_TRACE_DISTRIBUTED_RESULT_LIMIT // stratum_count),
+        )
     distributed_started = monotonic()
     window_width = window_end - window_start
     key_field = "trace_id" if mode == "trace" else "id"
@@ -987,7 +1000,14 @@ def _read_time_distributed_candidates(
                     candidate_rows=page.deferred_candidate_rows,
                 )
             )
-        for row in page.rows:
+        visible_page_rows = page.rows
+        if mode == "trace":
+            visible_page_rows = sorted(
+                page.rows,
+                key=lambda row: _candidate_row_key(row, key_field=key_field),
+                reverse=True,
+            )[:visible_rows_per_stratum]
+        for row in visible_page_rows:
             if mode == "trace":
                 identity: Hashable = str(row.get("trace_id") or "")
             else:
@@ -1016,7 +1036,8 @@ def _read_time_distributed_candidates(
             strata=deferred_trace_strata,
             distributed_started=distributed_started,
             deadline_ms=deadline_ms,
-            rows_per_stratum=rows_per_stratum,
+            candidate_rows_per_stratum=rows_per_stratum,
+            visible_rows_per_stratum=visible_rows_per_stratum,
         )
         rows_by_id.update(classified_rows_by_id)
         elapsed_ms += classifier_elapsed_ms

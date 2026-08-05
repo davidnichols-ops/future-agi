@@ -2192,6 +2192,49 @@ def test_text_trace_graph_uses_wide_key_witness_strata(monkeypatch) -> None:
 
 
 @pytest.mark.unit
+def test_text_trace_key_witness_keeps_five_exact_matches_per_stratum() -> None:
+    window_end = datetime(2026, 7, 31, 7)
+    window_start = window_end - timedelta(days=14)
+    window_width = window_end - window_start
+    rows = []
+    for stratum in range(bounded_graph_reads.GRAPH_ANY_SPAN_STRATA):
+        stratum_start = window_start + (
+            window_width * stratum / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        )
+        stratum_width = window_width / bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+        for index in range(60):
+            rows.append(
+                {
+                    "trace_id": f"trace-{stratum}-{index:03d}",
+                    "root_span_id": f"root-{stratum}-{index:03d}",
+                    "start_time": stratum_start + (stratum_width * index / 60),
+                }
+            )
+
+    sample = read_graph_candidates(
+        analytics=_CandidateAnalytics(observe_type="trace", rows=rows),
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(window_start, window_end),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="trace",
+    )
+
+    assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_DISTRIBUTED_RESULT_LIMIT
+    assert sample.sampling_strata_completed == sample.sampling_strata == 8
+    assert graph_dispatch._bounded_trace_decoration_sample(sample) is sample
+    represented_strata = {
+        min(
+            7,
+            int((row["start_time"] - window_start) / (window_width / 8)),
+        )
+        for row in sample.rows
+    }
+    assert represented_strata == set(range(8))
+
+
+@pytest.mark.unit
 def test_wide_graph_key_budget_failure_falls_back_to_temporal_sample(
     monkeypatch,
 ) -> None:
