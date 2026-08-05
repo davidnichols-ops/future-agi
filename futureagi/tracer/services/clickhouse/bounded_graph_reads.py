@@ -67,17 +67,25 @@ GRAPH_ANY_SPAN_ROWS_PER_STRATUM = 49
 # aggregate in process and retain the established 49-row ceiling.
 GRAPH_TRACE_ROWS_PER_STRATUM = 3
 # Trace decoration accepts at most forty identities. Unindexed discovery may
-# inspect forty-nine key-bearing candidates per stratum, but only the newest
-# five exact matches from each of eight strata may cross the candidate boundary.
+# inspect the finite raw ceiling below in each stratum, but only the newest five
+# exact matches from each of eight strata may cross the candidate boundary.
 # This preserves temporal coverage instead of letting the later global guard
 # collapse an honest eight-stratum sample into the newest forty rows.
 GRAPH_TRACE_DISTRIBUTED_RESULT_LIMIT = 40
+# Unindexed trace acquisition is only a candidate sample: at most five exact
+# matches per stratum can become visible. Read five raw roots plus one sentinel:
+# the sixth row proves sampling instead of being silently trimmed from an exact
+# stratum. The subsequent full-window replay then stays inside a worst-case
+# 32-query endpoint contract even when one optional wide probe fails, every
+# five-minute seed needs its one-minute retry, and decoration uses five reads.
+GRAPH_TRACE_ACQUISITION_ROWS_PER_STRATUM = 5
 # A long-window sparse-anchor sentinel distinguishes a common predicate before
 # the ordered stratum reads begin. Common predicates deliberately switch to a
 # small representative ceiling: replaying 512 identities in each of eight
 # strata consumed the whole graph deadline in production before the first
-# stratum completed. Forty-nine identities still provide representative temporal
-# coverage while keeping every latest-state classifier safely bounded.
+# stratum completed. Span discovery retains forty-nine candidates; trace
+# discovery applies the smaller resource-skew ceiling above before its
+# full-window latest-state replay.
 GRAPH_ANY_SPAN_DISTRIBUTED_AFTER = timedelta(hours=1)
 # Unindexed structured predicates are never evaluated over an entire long
 # stratum. Sample one fixed tail slice from each temporal stratum, then apply
@@ -92,12 +100,14 @@ GRAPH_UNINDEXED_SAMPLE_SLICE = timedelta(minutes=5)
 GRAPH_UNINDEXED_SAMPLE_RETRY_SLICE = timedelta(minutes=1)
 
 # Keep every graph-union classifier inside the same finite resource envelope as
-# the shared bounded selector. Production readback showed that one 400-trace
-# classifier still read 4.29 GiB. The trace-specific sample above bounds the
-# union at 40, and whole-trace 20-ID chunks preserve full-window multi-filter
-# semantics in at most two classifier statements.
+# the shared bounded selector. Production readback showed four 20-trace chunks
+# at 206-294 MiB, followed by one data-skewed chunk that crossed the 512 MiB
+# server ceiling. Five-ID chunks leave headroom for that skew. Together with
+# the six-candidate per-stratum sentinel above, one failed wide probe, eight
+# seeds, eight possible narrow retries, ten classifiers, and five decoration
+# reads fit the 32-query endpoint ceiling.
 GRAPH_TRACE_UNION_QUERY_TIMEOUT_MS = 750
-GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE = 20
+GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE = 5
 GRAPH_TRACE_UNION_MAX_QUERY_COUNT = 32
 GRAPH_TRACE_UNION_READ_SETTINGS = {
     "max_threads": 1,
@@ -268,6 +278,7 @@ def _classify_deferred_trace_strata(
     strata: list[_DeferredTraceStratum],
     distributed_started: float,
     deadline_ms: int,
+    acquisition_query_count: int,
     candidate_rows_per_stratum: int,
     visible_rows_per_stratum: int,
 ) -> tuple[dict[Hashable, dict[str, Any]], float, int, int, int, int]:
@@ -297,7 +308,10 @@ def _classify_deferred_trace_strata(
     classifier_query_count = (
         len(union_rows) + GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE - 1
     ) // GRAPH_TRACE_UNION_CLASSIFY_BATCH_SIZE
-    if len(strata) + classifier_query_count > GRAPH_TRACE_UNION_MAX_QUERY_COUNT:
+    if (
+        acquisition_query_count + classifier_query_count
+        > GRAPH_TRACE_UNION_MAX_QUERY_COUNT
+    ):
         raise AssertionError("trace graph union exceeds its finite query ceiling")
 
     classifier_builder = strata[0].builder
@@ -439,10 +453,15 @@ def _read_time_distributed_candidates(
         stratum_ceiling,
         max(1, deadline_ms // 250),
     )
+    acquisition_rows_per_stratum = rows_per_stratum
     visible_rows_per_stratum = rows_per_stratum
     if mode == "trace":
-        visible_rows_per_stratum = min(
+        acquisition_rows_per_stratum = min(
             rows_per_stratum,
+            GRAPH_TRACE_ACQUISITION_ROWS_PER_STRATUM,
+        )
+        visible_rows_per_stratum = min(
+            acquisition_rows_per_stratum,
             max(1, GRAPH_TRACE_DISTRIBUTED_RESULT_LIMIT // stratum_count),
         )
     distributed_started = monotonic()
@@ -474,7 +493,7 @@ def _read_time_distributed_candidates(
     )
     force_temporal_sample = False
     # Every trace path acquires all disjoint strata first, then replays the
-    # de-duplicated finite union in <=20-ID full-window chunks. This includes
+    # de-duplicated finite union in <=5-ID full-window chunks. This includes
     # the locked-executor five-minute/one-minute temporal lane: classifying 50
     # roots independently in every stratum made the narrower retry issue the
     # same 14-day query again and reproduce Code 307. Raw anchors/root seeds
@@ -502,7 +521,7 @@ def _read_time_distributed_candidates(
         stratum_builder_kwargs: dict[str, Any] = {
             "project_id": project_id,
             "page_number": 0,
-            "page_size": rows_per_stratum,
+            "page_size": acquisition_rows_per_stratum,
             "filters": stratum_filters,
         }
         if mode == "trace":
@@ -582,9 +601,9 @@ def _read_time_distributed_candidates(
         # One extra identity is the finite has-more sentinel. Keeping the
         # stratum working set at the caller-specific sample ceiling avoids the
         # oversized classifier that exceeded the production graph deadline.
-        candidate_limit = rows_per_stratum + 1
+        candidate_limit = acquisition_rows_per_stratum + 1
         max_seed_attempts = (
-            rows_per_stratum + 1 + candidate_limit - 1
+            acquisition_rows_per_stratum + 1 + candidate_limit - 1
         ) // candidate_limit
         bounded_classify_batch_size = min(
             classify_batch_size,
@@ -614,7 +633,7 @@ def _read_time_distributed_candidates(
                 filters=active_filters,
                 key_field=key_field,
                 page_number=0,
-                page_size=rows_per_stratum,
+                page_size=acquisition_rows_per_stratum,
                 # Share one monotonic deadline across the complete stratified
                 # read instead of assigning one eighth up front. Per-query
                 # caps in the selector still bound a slow ClickHouse read, but
@@ -1038,7 +1057,8 @@ def _read_time_distributed_candidates(
             strata=deferred_trace_strata,
             distributed_started=distributed_started,
             deadline_ms=deadline_ms,
-            candidate_rows_per_stratum=rows_per_stratum,
+            acquisition_query_count=query_count,
+            candidate_rows_per_stratum=acquisition_rows_per_stratum,
             visible_rows_per_stratum=visible_rows_per_stratum,
         )
         rows_by_id.update(classified_rows_by_id)
