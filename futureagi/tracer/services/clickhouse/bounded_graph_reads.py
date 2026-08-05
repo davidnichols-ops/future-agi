@@ -629,6 +629,63 @@ def _read_time_distributed_candidates(
 
         if (
             page is not None
+            and mode == "span"
+            and use_stratum_anchor
+            and page.error_code == "sample_limit"
+            and not page.rows
+        ):
+            # A full raw anchor sentinel can consist entirely of stale physical
+            # versions. The latest-state classifier must discard those rows,
+            # but an empty classified sentinel is not evidence that the
+            # stratum has no live matches. Preserve the cheap probe accounting
+            # and use the existing bounded ordered seed/classifier path for
+            # this stratum only. This closes the false-empty case without a
+            # broad scan or weakening the shared monotonic deadline.
+            elapsed_ms += page.elapsed_ms
+            query_count += page.query_count
+            rows_returned += page.rows_returned
+            result_payload_bytes += page.result_payload_bytes
+            total_rows_lower_bound += page.total_rows_lower_bound
+            logger.info(
+                "graph span anchor contained no live matches; using ordered fallback",
+                stratum_index=index,
+            )
+            use_stratum_anchor = False
+            remaining_ms = deadline_ms - int((monotonic() - distributed_started) * 1000)
+            if remaining_ms < 25:
+                complete = False
+                sampling_error_code = "read_budget_exceeded"
+                break
+            try:
+                page = read_page(
+                    active_builder=stratum_builder,
+                    active_filters=stratum_filters,
+                    use_anchor=False,
+                    active_remaining_ms=remaining_ms,
+                    seed_attempts=max_seed_attempts,
+                    query_limit=max_query_count,
+                    candidate_count=candidate_limit,
+                    classify_size=bounded_classify_batch_size,
+                    defer_classify=False,
+                )
+            except Exception as exc:
+                if not (is_read_budget_error(exc) or is_clickhouse_query_error(exc)):
+                    raise
+                logger.warning(
+                    "graph candidate ordered fallback degraded",
+                    stratum_index=index,
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
+                public_code = (
+                    "read_budget_exceeded"
+                    if is_read_budget_error(exc)
+                    else "query_failed"
+                )
+                raise BoundedGraphReadError(public_code, retryable=True) from None
+
+        if (
+            page is not None
             and use_stratum_anchor
             and page.error_code == "read_budget_exceeded"
             and any(

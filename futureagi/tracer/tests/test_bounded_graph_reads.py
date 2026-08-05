@@ -1658,6 +1658,69 @@ def test_long_sparse_anchor_and_strata_timeout_becomes_degraded_empty(monkeypatc
 
 
 @pytest.mark.unit
+def test_stale_saturated_span_anchor_uses_bounded_ordered_fallback(monkeypatch):
+    calls = []
+
+    def _page(**kwargs):
+        calls.append(kwargs)
+        stratum_index = (len(calls) - 1) // 2
+        if kwargs.get("anchor_probe_only"):
+            return BoundedFilterPage(
+                rows=[],
+                has_more=False,
+                complete=False,
+                status="degraded",
+                error_code="sample_limit",
+                total_rows_lower_bound=0,
+                elapsed_ms=1,
+                query_count=2,
+                rows_returned=50,
+                result_payload_bytes=500,
+                attempts=(),
+            )
+        return BoundedFilterPage(
+            rows=[
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": f"trace-live-{stratum_index}",
+                    "id": f"span-live-{stratum_index}",
+                    "start_time": START + timedelta(hours=stratum_index),
+                }
+            ],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=1,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=2,
+            result_payload_bytes=20,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(bounded_graph_reads, "read_bounded_filter_page", _page)
+
+    sample = read_graph_candidates(
+        analytics=object(),
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(START, START + timedelta(days=14)),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        observe_type="span",
+    )
+
+    assert sample.query_complete is True
+    assert len(sample.rows) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
+    assert len(calls) == bounded_graph_reads.GRAPH_ANY_SPAN_STRATA * 2
+    assert all(call["anchor_probe_only"] is True for call in calls[::2])
+    assert all(call["anchor_probe_only"] is False for call in calls[1::2])
+    assert all(call["max_seed_attempts"] == 1 for call in calls[1::2])
+    assert all(call["max_candidates"] == 50 for call in calls[1::2])
+
+
+@pytest.mark.unit
 def test_span_anchor_probe_is_graph_opt_in_not_a_list_behavior_change():
     from tracer.services.clickhouse.v2.query_builders.span_list import (
         SpanListQueryBuilderV2,
