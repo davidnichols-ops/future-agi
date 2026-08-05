@@ -71,6 +71,47 @@ def _view_and_request():
 
 
 @pytest.mark.unit
+def test_session_export_context_reaches_clickhouse_list_path():
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    project_id = str(uuid.uuid4())
+    request.query_params = {"project_id": project_id}
+    request.method = "GET"
+    request.data = {}
+    view.request = request
+    project = SimpleNamespace(id=project_id, source="observe")
+    project_queryset = mock.MagicMock()
+    project_queryset.get.return_value = project
+    expected = object()
+
+    with (
+        mock.patch(
+            "tracer.views.trace_session._project_queryset_for_request",
+            return_value=project_queryset,
+        ),
+        mock.patch(
+            "tracer.views.trace_session.V2AnalyticsQueryService",
+            return_value=mock.MagicMock(),
+        ),
+        mock.patch.object(
+            view,
+            "_build_bookmark_filter",
+            return_value=None,
+        ),
+        mock.patch.object(
+            view,
+            "_list_sessions_clickhouse",
+            return_value=expected,
+        ) as list_clickhouse,
+    ):
+        response = TraceSessionView.list_sessions(view, request, export=True)
+
+    assert response is expected
+    assert list_clickhouse.call_args.kwargs["export"] is True
+
+
+@pytest.mark.unit
 def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration():
     from tracer.views.trace_session import TraceSessionView
 
@@ -189,11 +230,32 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
                 "allow_sampled": True,
             },
         )
+        request.query_params = {}
+        export_response = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=project_id,
+            project=None,
+            analytics=analytics,
+            validated_data={
+                "filters": filters,
+                "sort_params": [],
+                "page_number": 4,
+                "page_size": 1,
+            },
+            export=True,
+        )
 
     assert omitted_status == "ok"
     assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is True
     assert explicit_false_response[0] == "error"
     assert explicit_false_response[1] == 503
+    assert export_response == (
+        "error",
+        503,
+        "A complete session export is temporarily unavailable. Narrow the filters and retry.",
+        "service_unavailable",
+    )
     assert status == "ok"
     assert payload["metadata"] == {
         "total_rows": 6,
@@ -205,7 +267,7 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
     }
     assert payload["table"][0]["first_message"] == "first"
     assert payload["table"][0]["last_message"] == "last"
-    assert bounded_read.call_count == 3
+    assert bounded_read.call_count == 4
     bounded_kwargs = bounded_read.call_args.kwargs
     assert bounded_kwargs["key_field"] == "session_id"
     assert bounded_kwargs["page_number"] == 4
@@ -214,9 +276,9 @@ def test_attribute_session_list_uses_bounded_protocol_and_page_scoped_hydration(
     assert bounded_kwargs["classify_batch_size"] == 50
     builder.build_candidate_page_query.assert_not_called()
     builder.build.assert_not_called()
-    assert builder.build_page_metrics_query.call_count == 3
-    assert builder.build_content_query.call_count == 3
-    assert builder.build_span_attributes_query.call_count == 3
+    assert builder.build_page_metrics_query.call_count == 4
+    assert builder.build_content_query.call_count == 4
+    assert builder.build_span_attributes_query.call_count == 4
 
 
 @pytest.mark.unit
@@ -271,6 +333,93 @@ def test_candidate_first_session_list_keeps_exact_metadata():
     bounded_read.assert_not_called()
     builder.build_candidate_page_query.assert_called_once_with()
     builder.build_candidate_count_query.assert_called_once_with()
+
+
+@pytest.mark.unit
+def test_session_export_rejects_truncated_exact_first_page():
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    project_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    start_time = datetime(2026, 7, 31, 12, 0)
+    builder = mock.MagicMock()
+    builder.supports_candidate_first_page.return_value = True
+    builder.build_candidate_page_query.return_value = ("candidate page", {})
+    builder.build_page_metrics_query.return_value = ("page metrics", {})
+    builder.build_content_query.return_value = ("page content", {})
+    builder.build_span_attributes_query.return_value = ("page attributes", {})
+    builder.format_sessions.side_effect = lambda rows, columns: [
+        dict(zip(columns, row, strict=True)) for row in rows
+    ]
+    analytics = mock.MagicMock()
+
+    def _execute(query, _params, **_kwargs):
+        if query == "candidate page":
+            return SimpleNamespace(data=[{"session_id": session_id, "total_count": 2}])
+        if query == "page metrics":
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": session_id,
+                        "session_start": start_time,
+                        "session_end": start_time,
+                        "duration": 0,
+                        "total_cost": 0,
+                        "total_tokens": 0,
+                        "traces_count": 1,
+                    }
+                ]
+            )
+        if query == "page content":
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": session_id,
+                        "first_message": "first",
+                        "last_message": "last",
+                    }
+                ]
+            )
+        if query == "page attributes":
+            return SimpleNamespace(data=[])
+        raise AssertionError(f"unexpected ClickHouse query: {query}")
+
+    analytics.execute_ch_query.side_effect = _execute
+    view._fetch_session_names = mock.MagicMock(return_value={})
+    view._fetch_end_user_info = mock.MagicMock(return_value={})
+
+    with (
+        mock.patch(
+            "tracer.views.trace_session.SessionListQueryBuilderV2",
+            return_value=builder,
+        ),
+        mock.patch(
+            "tracer.views.trace_session.AnnotationsLabels.objects.filter",
+            return_value=[],
+        ),
+    ):
+        response = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=project_id,
+            project=None,
+            analytics=analytics,
+            validated_data={
+                "filters": [],
+                "sort_params": [],
+                "page_number": 0,
+                "page_size": 1,
+            },
+            export=True,
+        )
+
+    assert response == (
+        "error",
+        503,
+        "A complete session export is temporarily unavailable. Narrow the filters and retry.",
+        "service_unavailable",
+    )
 
 
 @pytest.mark.unit

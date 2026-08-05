@@ -1462,6 +1462,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     org_project_ids=org_project_ids,
                     bookmark_filter=bookmark_filter,
                     read_deadline=read_deadline,
+                    export=export,
                 )
             except UnsupportedFilterShapeError:
                 raise
@@ -2317,6 +2318,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         org_project_ids=None,
         bookmark_filter=None,
         read_deadline: ReadDeadline | None = None,
+        export: bool = False,
     ):
         """List sessions using ClickHouse backend.
 
@@ -2328,6 +2330,10 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         IN/NOT-IN filter (built by ``_build_bookmark_filter`` from the PG
         ``TraceSessionOverlay``) that implements the three-state ``bookmarked``
         flag against the CH path (DESIGN §5.2). ``None`` ⇒ no bookmark filtering.
+
+        Export responses must be complete. A numbered or lower-bound page is
+        therefore rejected instead of being serialized as a silently truncated
+        CSV file.
         """
         if read_deadline is None:
             read_deadline = ReadDeadline.start(SESSION_LIST_WALL_DEADLINE_MS)
@@ -2855,6 +2861,16 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     "query_status": bounded_page.status,
                     "query_error_code": bounded_page.error_code,
                 }
+            )
+        if export and (
+            page_number != 0
+            or metadata.get("total_rows_is_lower_bound")
+            or total_count != len(formatted)
+        ):
+            return self._gm.custom_error_response(
+                drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                "A complete session export is temporarily unavailable. Narrow the filters and retry.",
+                code="service_unavailable",
             )
         if metadata.get(
             "total_rows_is_lower_bound"
