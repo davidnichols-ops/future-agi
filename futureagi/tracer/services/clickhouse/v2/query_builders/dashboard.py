@@ -82,6 +82,11 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
     # table. The locked production read-only identity has no dictionary grants.
     _direct_trace_project_scope_available: bool = True
 
+    # CH25 spans is partitioned by toDate(start_time). Do not inherit the
+    # legacy created_at partition hint: it is redundant for correctness and
+    # makes root metric queries ineligible for proj_root_spans.
+    _spans_partitioned_by_created_at: bool = False
+
     _v2_rewrite_exclude = frozenset({"build_metric_query", "build_all_queries"})
 
     def build_metric_query(self, metric: dict) -> tuple[str, dict]:

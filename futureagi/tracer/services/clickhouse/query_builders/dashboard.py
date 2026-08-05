@@ -454,6 +454,13 @@ class DashboardQueryBuilder:
     # ``traces`` table so a locked read-only role needs no dictionary grants.
     _direct_trace_project_scope_available: bool = False
 
+    # The legacy spans table is partitioned by created_at, so event-time
+    # dashboard reads need a redundant created_at lower bound to prune old
+    # partitions. The CH25 subclass disables this: its spans table is
+    # partitioned by start_time, and retaining the legacy predicate prevents
+    # eligible queries from reading the root-span projection.
+    _spans_partitioned_by_created_at: bool = True
+
     _DIRECT_USER_METRIC_EXPRESSIONS = {
         # Preserve the dictionary path's missing-label fallback: a live span
         # with an unresolved curated row still counts by its stable user UUID.
@@ -1925,7 +1932,7 @@ class DashboardQueryBuilder:
         # filtered on start_time, so bound created_at too — otherwise no
         # partitions prune and the scan covers all history. Lower bound only
         # (created_at >= start_time always holds), so no in-window row drops.
-        if time_col != "created_at":
+        if time_col != "created_at" and self._spans_partitioned_by_created_at:
             clauses.append("created_at >= %(start_date)s - INTERVAL 1 DAY")
 
         # Apply global + per-metric system_metric filters directly

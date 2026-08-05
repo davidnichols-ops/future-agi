@@ -1746,7 +1746,12 @@ def test_span_mixed_structured_anchor_uses_only_the_indexed_typed_map_leaf():
     assert builder.supports_filter_anchor_probe() is True
     assert builder.requires_unindexed_graph_sample_slice() is False
     anchor_query, anchor_params = builder.build_filter_anchor_probe(limit=50)
-    assert "mapContains(attrs_string" in anchor_query
+    assert (
+        "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))" in anchor_query
+    )
+    assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in anchor_query
+    assert anchor_params["latest_filter_key_0"] == "final_status"
+    assert "mapValues(attrs_string)" not in anchor_query
     assert "JSONExtract" not in anchor_query
     assert "inbound" not in anchor_params.values()
 
@@ -1792,17 +1797,16 @@ def test_wrapped_system_text_predicates_never_claim_an_indexed_graph_anchor(
 @pytest.mark.unit
 @pytest.mark.parametrize("builder_kind", ["trace", "span"])
 @pytest.mark.parametrize(
-    ("filter_op", "value", "index_function"),
+    ("filter_op", "value"),
     [
-        ("equals", "Rejected", "has("),
-        ("in", ["Rejected", "Approved"], "hasAny("),
+        ("equals", "Rejected"),
+        ("in", ["Rejected", "Approved"]),
     ],
 )
-def test_ascii_typed_map_value_companion_remains_a_safe_graph_anchor(
+def test_typed_map_key_subcolumn_remains_a_safe_graph_anchor(
     builder_kind,
     filter_op,
     value,
-    index_function,
 ) -> None:
     from tracer.services.clickhouse.v2.query_builders.span_list import (
         SpanListQueryBuilderV2,
@@ -1831,9 +1835,15 @@ def test_ascii_typed_map_value_companion_remains_a_safe_graph_anchor(
 
     assert builder.supports_filter_anchor_probe() is True
     assert builder.requires_unindexed_graph_sample_slice() is False
-    anchor_query, _ = builder.build_filter_anchor_probe(limit=50)
-    assert index_function in anchor_query
-    assert "arrayMap(x -> lower(x), mapValues(attrs_string))" in anchor_query
+    anchor_query, anchor_params = builder.build_filter_anchor_probe(limit=50)
+    assert (
+        "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))" in anchor_query
+    )
+    assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in anchor_query
+    assert anchor_params["latest_filter_key_0"] == "final_status"
+    assert "mapValues(attrs_string)" not in anchor_query
+    assert "Rejected" not in anchor_params.values()
+    assert "Approved" not in anchor_params.values()
 
 
 @pytest.mark.unit
@@ -1941,6 +1951,37 @@ def test_session_uuid_equality_uses_the_raw_bloom_indexed_seed(
     span_anchor, _ = span_builder.build_filter_anchor_probe(limit=50)
     assert f"trace_session_id {operator} %(latest_filter_param_0)s" in span_anchor
     assert "lowerUTF8(toString(trace_session_id))" not in span_anchor
+
+
+@pytest.mark.unit
+def test_identity_only_session_classifier_projects_the_proven_session_id() -> None:
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
+
+    session_filter = {
+        "column_id": "trace_session_id",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "text",
+            "filter_op": "is_not_null",
+            "filter_value": None,
+        },
+    }
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_date_filter(), session_filter],
+        bounded_identity_only=True,
+    )
+
+    query, _ = builder.build_filter_match_query(["trace-1"])
+
+    # The latest-state session value is already required to classify the
+    # filter. Reusing that alias keeps candidate discovery identity-only;
+    # metric graphs may then hydrate only those proven canonical roots.
+    assert "latest_column_value_0 AS trace_session_id" in query
+    assert query.count("argMax(tuple(trace_session_id), _version).1") == 1
+    assert "latest_trace_name" not in query
 
 
 @pytest.mark.unit

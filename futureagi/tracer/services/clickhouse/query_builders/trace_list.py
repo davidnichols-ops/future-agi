@@ -1577,6 +1577,27 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             if candidate_identity_only is None
             else bool(candidate_identity_only)
         )
+        # Session graphs deliberately use the identity-only trace classifier,
+        # but their reducer still needs the canonical root's session identity.
+        # A session filter has already computed that latest-state value as one
+        # of the root-plan aggregates, so expose the existing alias instead of
+        # hydrating presentation columns or issuing another ClickHouse query.
+        identity_session_alias = None
+        if identity_only:
+            identity_session_alias = next(
+                (
+                    aggregate.rsplit(" AS ", 1)[1].strip()
+                    for plan in root_plans
+                    for aggregate in plan.aggregates
+                    if "trace_session_id" in aggregate
+                ),
+                None,
+            )
+        identity_session_public_fragment = (
+            f", {identity_session_alias} AS trace_session_id"
+            if identity_session_alias
+            else ""
+        )
         if self._bounded_identity_only and include_filter_witnesses:
             for witness_index, plan in enumerate(any_span_plans):
                 witness_alias = f"filter_witness_{witness_index}"
@@ -1728,11 +1749,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 ) AS canonical_root_identity{witness_select_fragment}"""
             public_select_fragment = (
                 "project_id, trace_id, canonical_root_identity.1 AS root_span_id, "
-                f"canonical_root_identity.2 AS start_time{witness_public_fragment}"
+                "canonical_root_identity.2 AS start_time"
+                f"{identity_session_public_fragment}{witness_public_fragment}"
                 if org_scope
                 else (
                     "trace_id, canonical_root_identity.1 AS root_span_id, "
-                    f"canonical_root_identity.2 AS start_time{witness_public_fragment}"
+                    "canonical_root_identity.2 AS start_time"
+                    f"{identity_session_public_fragment}{witness_public_fragment}"
                 )
             )
             hydrate_root_aggregate_fragment = ""

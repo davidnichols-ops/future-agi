@@ -592,12 +592,15 @@ class TestTraceSessionGraphAPI:
     def test_session_system_graph_groups_only_proven_latest_trace_candidates(self):
         window_start = datetime(2026, 1, 1, tzinfo=UTC)
         window_end = window_start + timedelta(days=1)
+        project_id = str(uuid.uuid4())
         survivor = "10000000-0000-0000-0000-000000000000"
         duplicate_old = "20000000-0000-0000-0000-000000000000"
         consolidated_new = "30000000-0000-0000-0000-000000000000"
         other_session = "40000000-0000-0000-0000-000000000000"
         rows = (
             {
+                "project_id": project_id,
+                "root_span_id": "root-corrected",
                 "trace_id": "trace-corrected",
                 "trace_session_id": consolidated_new,
                 "start_time": window_start + timedelta(hours=1),
@@ -610,6 +613,8 @@ class TestTraceSessionGraphAPI:
                 "status": "OK",
             },
             {
+                "project_id": project_id,
+                "root_span_id": "root-same-session",
                 "trace_id": "trace-same-session",
                 "trace_session_id": duplicate_old,
                 "start_time": window_start + timedelta(hours=2),
@@ -622,6 +627,8 @@ class TestTraceSessionGraphAPI:
                 "status": "ERROR",
             },
             {
+                "project_id": project_id,
+                "root_span_id": "root-other-session",
                 "trace_id": "trace-other-session",
                 "trace_session_id": other_session,
                 "start_time": window_start + timedelta(hours=3),
@@ -648,13 +655,16 @@ class TestTraceSessionGraphAPI:
             total_rows_lower_bound=3,
         )
         analytics = mock.Mock()
-        analytics.execute_ch_query.return_value = mock.Mock(
-            data=[
-                {"old_id": survivor, "new_id": consolidated_new},
-                {"old_id": duplicate_old, "new_id": consolidated_new},
-            ],
-            columns=["old_id", "new_id"],
-        )
+        analytics.execute_ch_query.side_effect = [
+            mock.Mock(data=list(rows), columns=[]),
+            mock.Mock(
+                data=[
+                    {"old_id": survivor, "new_id": consolidated_new},
+                    {"old_id": duplicate_old, "new_id": consolidated_new},
+                ],
+                columns=["old_id", "new_id"],
+            ),
+        ]
 
         with mock.patch(
             "tracer.services.clickhouse.session_graph.read_graph_candidates",
@@ -662,7 +672,7 @@ class TestTraceSessionGraphAPI:
         ) as candidate_read:
             graph = fetch_session_graph_ch(
                 analytics=analytics,
-                project_id=str(uuid.uuid4()),
+                project_id=project_id,
                 filters=[],
                 interval="day",
                 req_data_config={"id": "cost", "type": "SYSTEM_METRIC"},
@@ -680,6 +690,130 @@ class TestTraceSessionGraphAPI:
         remap_sql = analytics.execute_ch_query.call_args.args[0]
         assert "trace_session_id_remap FINAL" in remap_sql
         assert "relevant_new_ids" in remap_sql
+
+    @pytest.mark.parametrize("sampled", [False, True], ids=["exact", "sampled"])
+    @pytest.mark.parametrize(
+        ("metric_id", "expected_value"),
+        [
+            ("latency", 20),
+            ("cost", 5),
+            ("tokens", 30),
+            ("error_rate", 100),
+            ("avg_duration", 3_608),
+        ],
+    )
+    def test_session_system_graph_hydrates_exact_and_sampled_candidate_metrics(
+        self,
+        sampled,
+        metric_id,
+        expected_value,
+    ):
+        window_start = datetime(2026, 1, 1, tzinfo=UTC)
+        window_end = window_start + timedelta(days=1)
+        project_id = str(uuid.uuid4())
+        session_id = "003b76f1-2b4a-4af5-b0dc-224d687374d4"
+        candidate_rows = (
+            {
+                "root_span_id": "root-first",
+                "trace_id": "trace-first",
+                "trace_session_id": session_id,
+                "start_time": window_start + timedelta(hours=1),
+            },
+            {
+                "root_span_id": "root-second",
+                "trace_id": "trace-second",
+                "trace_session_id": session_id,
+                "start_time": window_start + timedelta(hours=2),
+            },
+        )
+        hydrated_rows = (
+            {
+                **candidate_rows[0],
+                "project_id": project_id,
+                "end_time": window_start + timedelta(hours=1, seconds=4),
+                "latency_ms": 10,
+                "cost": 2,
+                "total_tokens": 10,
+                "prompt_tokens": 6,
+                "completion_tokens": 4,
+                "status": "OK",
+            },
+            {
+                **candidate_rows[1],
+                "project_id": project_id,
+                "end_time": window_start + timedelta(hours=2, seconds=8),
+                "latency_ms": 30,
+                "cost": 3,
+                "total_tokens": 20,
+                "prompt_tokens": 12,
+                "completion_tokens": 8,
+                "status": "ERROR",
+            },
+        )
+        sample = GraphCandidateSample(
+            rows=candidate_rows,
+            query_complete=not sampled,
+            query_status="sampled" if sampled else "complete",
+            query_error_code="sample_limit" if sampled else None,
+            window_start=window_start,
+            window_end=window_end,
+            elapsed_ms=1,
+            query_count=4 if sampled else 2,
+            rows_returned=2,
+            result_payload_bytes=100,
+            total_rows_lower_bound=2,
+            sampling_strategy=("time_stratified_latest_state" if sampled else None),
+            sampling_strata=4 if sampled else 0,
+            sampling_strata_completed=4 if sampled else 0,
+        )
+        analytics = mock.Mock()
+        analytics.execute_ch_query.side_effect = [
+            mock.Mock(data=list(hydrated_rows), columns=[]),
+            mock.Mock(data=[], columns=[]),
+        ]
+
+        with mock.patch(
+            "tracer.services.clickhouse.session_graph.read_graph_candidates",
+            return_value=sample,
+        ):
+            graph = fetch_session_graph_ch(
+                analytics=analytics,
+                project_id=project_id,
+                filters=[],
+                interval="day",
+                req_data_config={"id": metric_id, "type": "SYSTEM_METRIC"},
+            )
+
+        populated_point = next(
+            point for point in graph["data"] if point["primary_traffic"]
+        )
+        assert populated_point["value"] == pytest.approx(expected_value)
+        assert graph["query_complete"] is (not sampled)
+        assert graph["query_status"] == ("sampled" if sampled else "complete")
+        assert graph["query_sampled"] is sampled
+        assert graph["query_count"] == sample.query_count + 2
+        assert graph["query_rows_returned"] == sample.rows_returned + 2
+        assert graph["query_result_bytes"] > sample.result_payload_bytes
+        if sampled:
+            assert graph["query_error_code"] == "sample_limit"
+            assert graph["query_sampling_strategy"] == ("time_stratified_latest_state")
+            assert graph["query_sampling_strata_completed"] == 4
+
+        assert analytics.execute_ch_query.call_count == 2
+        hydration_call = analytics.execute_ch_query.call_args_list[0]
+        hydration_sql = hydration_call.args[0]
+        hydration_params = hydration_call.args[1]
+        assert "page_hydration_root_identities" in hydration_sql
+        assert "latest_is_deleted = 0" in hydration_sql
+        assert "latest_parent_span_id IS NULL" in hydration_sql
+        assert hydration_params["page_hydration_trace_ids"] == (
+            "trace-first",
+            "trace-second",
+        )
+        assert len(hydration_params["page_hydration_root_identities"]) == 2
+        assert hydration_call.kwargs["settings"]["max_result_rows"] == 2
+        remap_sql = analytics.execute_ch_query.call_args_list[1].args[0]
+        assert "trace_session_id_remap FINAL" in remap_sql
 
     def test_session_system_candidate_sql_replays_v2_updates_and_tombstones(self):
         builder = TraceListQueryBuilderV2(

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from datetime import datetime
 from time import monotonic
 from typing import Any
 
 from tracer.services.clickhouse.bounded_graph_reads import (
+    GRAPH_CANDIDATE_LIMIT,
     GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
     BoundedGraphReadError,
     GraphCandidateSample,
@@ -19,11 +21,22 @@ from tracer.services.clickhouse.graph_dispatch import (
 )
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_service import QueryExecutor, QueryResult
-from tracer.services.clickhouse.read_budget import ReadDeadline
+from tracer.services.clickhouse.read_budget import (
+    ReadDeadline,
+    is_clickhouse_query_error,
+    is_read_budget_error,
+)
+from tracer.services.clickhouse.v2.query_builders.trace_list import (
+    TraceListQueryBuilderV2,
+)
 
 SESSION_GRAPH_WALL_DEADLINE_MS = 4_400
 SESSION_GRAPH_QUERY_TIMEOUT_MS = 1_200
 SESSION_GRAPH_RESULT_BYTES = 32 * 1024 * 1024
+SESSION_GRAPH_HYDRATION_BATCH_SIZE = 512
+SESSION_GRAPH_MAX_HYDRATION_QUERIES = (
+    GRAPH_CANDIDATE_LIMIT + SESSION_GRAPH_HYDRATION_BATCH_SIZE - 1
+) // SESSION_GRAPH_HYDRATION_BATCH_SIZE
 SESSION_SYSTEM_METRICS = frozenset(
     {
         "latency",
@@ -41,6 +54,9 @@ SESSION_SYSTEM_METRICS = frozenset(
         "avg_traces_per_session",
         "total_cost",
     }
+)
+_SESSION_IDENTITY_ONLY_METRICS = frozenset(
+    {"traffic", "session_count", "avg_traces_per_session"}
 )
 
 _SESSION_GRAPH_READ_CAPS = {
@@ -103,11 +119,11 @@ def _canonical_session_ids(
     *,
     analytics: QueryExecutor,
     session_ids: tuple[str, ...],
-) -> tuple[dict[str, str], int]:
+) -> tuple[dict[str, str], int, int]:
     """Resolve a finite set of old/new session IDs without a global remap join."""
 
     if not session_ids:
-        return {}, 0
+        return {}, 0, 0
     # Resolve the complete consolidation group for every requested old or new
     # ID. This is the finite equivalent of survivor_map_subquery: every old and
     # its shared new ID map to the lexicographically-smallest old ID.
@@ -145,7 +161,118 @@ def _canonical_session_ids(
         survivor = min(old_ids)
         resolved[new_id] = survivor
         resolved.update(dict.fromkeys(old_ids, survivor))
-    return resolved, len(rows)
+    return resolved, len(rows), _result_payload_bytes(rows)
+
+
+def _result_payload_bytes(rows: list[dict[str, Any]]) -> int:
+    return len(
+        json.dumps(rows, default=str, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+
+def _hydrate_session_trace_candidates(
+    *,
+    analytics: QueryExecutor,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    rows: tuple[dict[str, Any], ...],
+) -> tuple[tuple[dict[str, Any], ...], int, int, int]:
+    """Hydrate metrics for only the finite, proven canonical trace roots.
+
+    Graph candidate discovery intentionally classifies trace identities without
+    presentation columns. Session reducers need the canonical roots' metrics,
+    so replay those exact ``(project, trace, root, start_time)`` identities in
+    bounded batches. Missing, duplicated, or session-drifted rows fail closed;
+    a classifier result is never silently replaced with a different root.
+    """
+
+    if not rows:
+        return rows, 0, 0, 0
+    if len(rows) > GRAPH_CANDIDATE_LIMIT:
+        raise BoundedGraphReadError("sample_limit")
+
+    builder = TraceListQueryBuilderV2(
+        project_id=project_id,
+        filters=filters,
+        bounded_identity_only=True,
+    )
+    try:
+        expected_by_identity = {
+            builder.bounded_filter_page_hydration_identity(row): row for row in rows
+        }
+    except (KeyError, TypeError, ValueError):
+        raise BoundedGraphReadError("query_failed") from None
+    if len(expected_by_identity) != len(rows):
+        raise BoundedGraphReadError("query_failed")
+
+    hydrated_by_identity: dict[tuple[str, str, str, Any], dict[str, Any]] = {}
+    query_count = 0
+    rows_returned = 0
+    result_payload_bytes = 0
+    ordered_identities = tuple(expected_by_identity)
+    for offset in range(0, len(rows), SESSION_GRAPH_HYDRATION_BATCH_SIZE):
+        batch_identities = ordered_identities[
+            offset : offset + SESSION_GRAPH_HYDRATION_BATCH_SIZE
+        ]
+        batch_rows = [expected_by_identity[identity] for identity in batch_identities]
+        try:
+            query, params = builder.build_filter_page_hydration_query(batch_rows)
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=SESSION_GRAPH_QUERY_TIMEOUT_MS,
+                settings={"max_result_rows": len(batch_rows)},
+            )
+        except BoundedGraphReadError:
+            raise
+        except Exception as exc:
+            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
+                error_code = (
+                    "read_budget_exceeded"
+                    if is_read_budget_error(exc)
+                    else "query_failed"
+                )
+                raise BoundedGraphReadError(error_code, retryable=True) from None
+            raise
+
+        hydrated_rows = list(result.data or [])
+        batch_identity_set = set(batch_identities)
+        for hydrated_row in hydrated_rows:
+            try:
+                identity = builder.bounded_filter_page_hydration_identity(hydrated_row)
+            except (KeyError, TypeError, ValueError):
+                raise BoundedGraphReadError("query_failed") from None
+            if identity not in batch_identity_set or identity in hydrated_by_identity:
+                raise BoundedGraphReadError("query_failed")
+            hydrated_by_identity[identity] = hydrated_row
+        if not batch_identity_set.issubset(hydrated_by_identity):
+            raise BoundedGraphReadError("query_failed")
+        query_count += 1
+        if query_count > SESSION_GRAPH_MAX_HYDRATION_QUERIES:
+            raise BoundedGraphReadError("sample_limit")
+        rows_returned += len(hydrated_rows)
+        result_payload_bytes += _result_payload_bytes(hydrated_rows)
+        if result_payload_bytes > SESSION_GRAPH_RESULT_BYTES:
+            raise BoundedGraphReadError("sample_limit")
+
+    if set(hydrated_by_identity) != set(expected_by_identity):
+        raise BoundedGraphReadError("query_failed")
+    for identity, candidate_row in expected_by_identity.items():
+        candidate_session_id = str(candidate_row.get("trace_session_id") or "")
+        hydrated_session_id = str(
+            hydrated_by_identity[identity].get("trace_session_id") or ""
+        )
+        if not candidate_session_id or hydrated_session_id != candidate_session_id:
+            raise BoundedGraphReadError("query_failed")
+
+    return (
+        tuple(hydrated_by_identity[identity] for identity in ordered_identities),
+        query_count,
+        rows_returned,
+        result_payload_bytes,
+    )
 
 
 def _number(value: Any) -> float:
@@ -191,6 +318,7 @@ def _aggregate_session_candidates(
     started: float,
     extra_query_count: int,
     extra_rows_returned: int,
+    extra_result_payload_bytes: int,
 ) -> dict[str, Any]:
     def response_metadata() -> dict[str, Any]:
         metadata = sample.metadata()
@@ -199,6 +327,9 @@ def _aggregate_session_candidates(
                 "query_count": sample.query_count + extra_query_count,
                 "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
                 "query_rows_returned": sample.rows_returned + extra_rows_returned,
+                "query_result_bytes": (
+                    sample.result_payload_bytes + extra_result_payload_bytes
+                ),
             }
         )
         return metadata
@@ -348,6 +479,21 @@ def _fetch_system_metric_graph(
     ):
         raise BoundedGraphReadError(sample.query_error_code or "sample_limit")
     rows = tuple(sample.rows)
+    hydration_query_count = 0
+    hydration_rows_returned = 0
+    hydration_result_payload_bytes = 0
+    if metric_id not in _SESSION_IDENTITY_ONLY_METRICS:
+        (
+            rows,
+            hydration_query_count,
+            hydration_rows_returned,
+            hydration_result_payload_bytes,
+        ) = _hydrate_session_trace_candidates(
+            analytics=analytics,
+            project_id=project_id,
+            filters=session_filters,
+            rows=rows,
+        )
     raw_session_ids = tuple(
         dict.fromkeys(
             str(row.get("trace_session_id"))
@@ -357,9 +503,11 @@ def _fetch_system_metric_graph(
     )
     if rows and len(raw_session_ids) == 0:
         raise BoundedGraphReadError("query_failed")
-    session_id_map, remap_rows_returned = _canonical_session_ids(
-        analytics=analytics,
-        session_ids=raw_session_ids,
+    session_id_map, remap_rows_returned, remap_result_payload_bytes = (
+        _canonical_session_ids(
+            analytics=analytics,
+            session_ids=raw_session_ids,
+        )
     )
     return _aggregate_session_candidates(
         sample=sample,
@@ -368,8 +516,11 @@ def _fetch_system_metric_graph(
         interval=interval,
         metric_id=metric_id,
         started=started,
-        extra_query_count=1 if raw_session_ids else 0,
-        extra_rows_returned=remap_rows_returned,
+        extra_query_count=(hydration_query_count + (1 if raw_session_ids else 0)),
+        extra_rows_returned=hydration_rows_returned + remap_rows_returned,
+        extra_result_payload_bytes=(
+            hydration_result_payload_bytes + remap_result_payload_bytes
+        ),
     )
 
 

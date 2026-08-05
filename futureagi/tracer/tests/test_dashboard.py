@@ -2109,6 +2109,77 @@ class TestDashboardQueryBuilder:
         assert "start_time >= %(start_date)s" in sql
         assert "start_time < %(end_date)s" in sql
 
+    def test_v2_root_latency_uses_ch25_start_time_partition_and_projection_shape(
+        self, sample_query_config
+    ):
+        """CH25 must not retain the legacy created_at partition hint.
+
+        The v2 table is partitioned by start_time and proj_root_spans does not
+        project created_at. Keeping that redundant predicate forces this common
+        root-latency metric back to the base table.
+        """
+        builder = DashboardQueryBuilderV2(sample_query_config)
+        sql, _, _ = builder.build_all_queries()[0]
+
+        assert "created_at >=" not in sql
+        assert "start_time >= %(start_date)s" in sql
+        assert "start_time < %(end_date)s" in sql
+        assert "project_id IN %(project_ids)s" in sql
+        assert "is_deleted = 0" in sql
+        assert "(parent_span_id IS NULL OR parent_span_id = '')" in sql
+        assert "avg(latency_ms) AS value" in sql
+        assert "optimize_use_projections = 1" in sql
+        assert "optimize_aggregation_in_order = 1" in sql
+
+    def test_v2_raw_attribute_dashboard_paths_use_ch25_start_time_partition(
+        self, sample_query_config, settings
+    ):
+        """Custom metrics and raw attribute breakdowns share the v2 bound."""
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+
+        custom_metric_config = {
+            **sample_query_config,
+            "metrics": [
+                {
+                    "id": "final_status",
+                    "name": "final_status",
+                    "type": "custom_attribute",
+                    "attribute_key": "final_status",
+                    "attribute_type": "string",
+                    "aggregation": "count_distinct",
+                }
+            ],
+        }
+        custom_sql, _, _ = DashboardQueryBuilderV2(
+            custom_metric_config
+        ).build_all_queries()[0]
+
+        breakdown_config = {
+            **sample_query_config,
+            "breakdowns": [
+                {
+                    "type": "custom_attribute",
+                    "name": "final_status",
+                    "source": "traces",
+                    "attribute_type": "string",
+                }
+            ],
+        }
+        breakdown_sql, _, _ = DashboardQueryBuilderV2(
+            breakdown_config
+        ).build_all_queries()[0]
+
+        for sql in (custom_sql, breakdown_sql):
+            assert "created_at >=" not in sql
+            assert "start_time >= %(start_date)s" in sql
+            assert "start_time < %(end_date)s" in sql
+            assert "project_id IN %(project_ids)s" in sql
+            assert "is_deleted = 0" in sql
+            assert "mapContains(attrs_string" in sql
+
+        assert "uniq(attrs_string" in custom_sql
+        assert "(parent_span_id IS NULL OR parent_span_id = '')" in breakdown_sql
+
     def test_breakdown_query_prunes_partitions(self):
         """A latency average broken down by a custom span attribute must emit
         the created_at partition-prune bound while preserving the start_time
@@ -5775,7 +5846,7 @@ class TestDashboardV2RewriteRouting:
         assert sql.count("use_skip_indexes_if_final") == 1
         assert sql.count("SETTINGS") == 1
 
-    def test_annotation_breakdown_qualifies_spans_created_at(self):
+    def test_annotation_breakdown_uses_ch25_spans_start_time_partition(self):
         config = _single_metric_config(
             {
                 "id": "latency",
@@ -5795,7 +5866,9 @@ class TestDashboardV2RewriteRouting:
         sql, _, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
 
         assert "LEFT JOIN model_hub_score AS ann0" in sql
-        assert "s.created_at >= %(start_date)s - INTERVAL 1 DAY" in sql
+        assert "s.start_time >= %(start_date)s" in sql
+        assert "s.start_time < %(end_date)s" in sql
+        assert "s.created_at >=" not in sql
         assert " AND created_at >= %(start_date)s" not in sql
         assert "ann0._peerdb_is_deleted = 0" in sql
         assert "ann0.is_deleted = 0" not in sql
