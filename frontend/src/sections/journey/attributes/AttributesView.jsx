@@ -1,6 +1,7 @@
 import { useState, useMemo } from "react";
 import { Box, Typography, CircularProgress, Button } from "@mui/material";
 import { useInfiniteQuery } from "@tanstack/react-query";
+import { LoadingScreen } from "src/components/loading-screen";
 import axios, { endpoints } from "src/utils/axios";
 import { useParams } from "react-router-dom";
 import AttributeGroupList from "./AttributeGroupList";
@@ -63,18 +64,7 @@ const AttributesView = () => {
   }, [selectedGroup, groups, attributeKeys]);
 
   if (isLoading) {
-    return (
-      <Box
-        sx={{
-          display: "flex",
-          justifyContent: "center",
-          alignItems: "center",
-          height: "calc(100vh - 180px)",
-        }}
-      >
-        <CircularProgress />
-      </Box>
-    );
+    return <LoadingScreen sx={{ height: "calc(100vh - 180px)" }} />;
   }
 
   if (attributeKeys.length === 0 && hasNextPage) {
