@@ -17,6 +17,23 @@ class SpanAttributeProjectQuerySerializer(serializers.Serializer):
         allow_blank=False,
         max_length=512,
     )
+    page_size = serializers.IntegerField(required=False, min_value=1, max_value=50)
+    cursor = serializers.CharField(
+        required=False,
+        allow_blank=False,
+        max_length=16_384,
+    )
+
+    def validate(self, attrs):
+        if attrs.get("cursor") and "page_size" not in attrs:
+            raise serializers.ValidationError(
+                {"page_size": "page_size is required with cursor"}
+            )
+        if attrs.get("q") and (attrs.get("cursor") or "page_size" in attrs):
+            raise serializers.ValidationError(
+                {"q": "Exact key lookup cannot be combined with pagination"}
+            )
+        return attrs
 
     def validate_q(self, value):
         try:
@@ -75,6 +92,12 @@ class SpanAttributeKeysResponseSerializer(serializers.Serializer):
     )
     query_window_start = serializers.DateTimeField()
     query_window_end = serializers.DateTimeField()
+    has_more = serializers.BooleanField(required=False)
+    next_cursor = serializers.CharField(
+        required=False,
+        allow_null=True,
+        allow_blank=False,
+    )
 
 
 class SpanAttributeValueSerializer(serializers.Serializer):

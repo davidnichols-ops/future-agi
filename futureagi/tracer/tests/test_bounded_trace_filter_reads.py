@@ -5020,7 +5020,17 @@ def test_observe_trace_empty_cursor_page_without_checkpoint_fails_closed() -> No
     analytics.execute_ch_query.assert_not_called()
 
 
-def test_observe_trace_nonempty_partial_is_enriched_ordered_and_continuable() -> None:
+@pytest.mark.parametrize(
+    ("query_params", "validated_allow_sampled"),
+    [
+        ({"cursor_mode": "true"}, None),
+        ({"cursor_mode": "true", "allow_sampled": "false"}, False),
+    ],
+)
+def test_observe_trace_exact_cursor_chunk_is_enriched_ordered_and_continuable(
+    query_params: dict[str, str],
+    validated_allow_sampled: bool | None,
+) -> None:
     newer = END - timedelta(minutes=1)
     older = END - timedelta(minutes=2)
     bounded_page = BoundedFilterPage(
@@ -5090,20 +5100,23 @@ def test_observe_trace_nonempty_partial_is_enriched_ordered_and_continuable() ->
             return QueryResult(data, len(data), "clickhouse", 0.0)
 
     analytics = RecordingAnalytics()
+    validated_data: dict[str, Any] = {
+        "filters": [
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        "page_number": 0,
+        "page_size": 2,
+        "cursor_mode": True,
+    }
+    if validated_allow_sampled is not None:
+        validated_data["allow_sampled"] = validated_allow_sampled
+
     view_response, bounded_reader, _analytics, _request = (
         _call_observe_trace_list_with_bounded_page(
             bounded_page=bounded_page,
-            request=_observe_trace_request({"allow_sampled": "true"}),
-            validated_data={
-                "filters": [
-                    _time_filter(),
-                    _attribute_filter("final_status", "Rejected"),
-                ],
-                "page_number": 0,
-                "page_size": 2,
-                "cursor_mode": True,
-                "allow_sampled": True,
-            },
+            request=_observe_trace_request(query_params),
+            validated_data=validated_data,
             analytics=analytics,
         )
     )
@@ -5122,9 +5135,9 @@ def test_observe_trace_nonempty_partial_is_enriched_ordered_and_continuable() ->
     assert payload["metadata"]["total_rows"] == 3
     assert payload["metadata"]["total_rows_is_lower_bound"] is True
     assert payload["metadata"]["total_rows_exact"] is None
-    assert payload["metadata"]["query_complete"] is False
-    assert payload["metadata"]["query_status"] == "degraded"
-    assert payload["metadata"]["query_error_code"] == "query_budget_exceeded"
+    assert payload["metadata"]["query_complete"] is True
+    assert payload["metadata"]["query_status"] == "complete"
+    assert payload["metadata"]["query_error_code"] is None
     assert payload["metadata"]["has_more"] is True
     assert isinstance(payload["metadata"]["next_cursor"], str)
     assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is True

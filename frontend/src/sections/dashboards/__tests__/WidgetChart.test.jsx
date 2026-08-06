@@ -143,6 +143,24 @@ describe("WidgetChart — queued exact refresh", () => {
 
   afterEach(() => vi.useRealTimers());
 
+  it("never presents the pre-request frame as a completed empty widget", () => {
+    h.query.mutate.mockImplementation(() => {});
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+      />,
+    );
+
+    expect(screen.getByText(PREPARING_MESSAGE)).toBeInTheDocument();
+    expect(
+      screen.queryByText("No output for the selected inputs."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(NO_DATA_MESSAGE)).not.toBeInTheDocument();
+  });
+
   it("polls a cold pending read without refresh and settles only on exact completion", async () => {
     vi.useFakeTimers();
     const pendingResponse = {

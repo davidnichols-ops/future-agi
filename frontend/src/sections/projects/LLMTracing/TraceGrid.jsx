@@ -97,6 +97,9 @@ const TraceGrid = React.forwardRef(
     const [selectedAll, setSelectedAll] = useState(false);
     const [readMessage, setReadMessage] = useState(null);
     const readMessageRef = useRef(null);
+    const [gridLoading, setGridLoading] = useState(enabled);
+    const firstPageRequestRef = useRef(0);
+    const preserveRowsDuringNextRefreshRef = useRef(false);
 
     // Use ref to track latest columns for comparison without triggering dataSource recreation
     const columnsRef = useRef(columns);
@@ -112,11 +115,16 @@ const TraceGrid = React.forwardRef(
         showMetricsIds: state.showMetricsIds,
         reset: state.reset,
       }));
-    const refreshGrid = useCallback(() => {
-      prefetchCache.current.clear();
-      cursorPagination.current.reset();
-      gridRef?.current?.api?.refreshServerSide({ purge: true });
-    }, [gridRef]);
+    const refreshGrid = useCallback(
+      (purge = true) => {
+        prefetchCache.current.clear();
+        cursorPagination.current.reset();
+        preserveRowsDuringNextRefreshRef.current = !purge;
+        if (purge) setGridLoading(enabled);
+        gridRef?.current?.api?.refreshServerSide({ purge });
+      },
+      [enabled, gridRef],
+    );
     const filterRequestKey = useMemo(
       () =>
         JSON.stringify({
@@ -143,14 +151,18 @@ const TraceGrid = React.forwardRef(
     useEffect(() => {
       if (previousFilterRequestKeyRef.current === filterRequestKey) return;
       previousFilterRequestKeyRef.current = filterRequestKey;
+      setGridLoading(enabled);
       prefetchCache.current.clear();
       cursorPagination.current.reset();
-      refreshGrid();
-    }, [filterRequestKey, refreshGrid]);
+      refreshGrid(true);
+    }, [enabled, filterRequestKey, refreshGrid]);
 
     // Listen for refresh events from the header reload button
     useEffect(() => {
-      const handler = () => refreshGrid();
+      // A same-query manual refresh keeps the last exact rows visible until
+      // their replacement is complete. Filter/range changes still purge so
+      // rows from a different query are never presented as current.
+      const handler = () => refreshGrid(false);
       window.addEventListener("observe-refresh", handler);
       return () => window.removeEventListener("observe-refresh", handler);
     }, [refreshGrid]);
@@ -225,19 +237,29 @@ const TraceGrid = React.forwardRef(
         return {
           getRows: async (params) => {
             if (!enabled) {
-              params.success({ rowData: [], rowCount: 0 });
+              // Disabled/unresolved is not an exact empty response. Reporting
+              // success here makes AG Grid publish "No traces" without ever
+              // calling the list API.
+              params.fail();
               return;
             }
             let pageNumber = 0;
+            let firstPageRequestId = null;
+            let requestGeneration = null;
             try {
               setLoading(true);
               params.api?.hideOverlay();
               const { request } = params;
-              const requestGeneration = cursorPagination.current.generation();
+              requestGeneration = cursorPagination.current.generation();
 
               const pageSize = request.endRow - request.startRow;
               pageNumber = Math.floor(request.startRow / pageSize);
               if (pageNumber === 0) {
+                firstPageRequestId = ++firstPageRequestRef.current;
+                const preserveExistingRows =
+                  preserveRowsDuringNextRefreshRef.current;
+                preserveRowsDuringNextRefreshRef.current = false;
+                if (!preserveExistingRows) setGridLoading(true);
                 readMessageRef.current = null;
                 setReadMessage(null);
               }
@@ -288,7 +310,9 @@ const TraceGrid = React.forwardRef(
                   }),
               });
               if (!cursorPagination.current.isCurrent(requestGeneration)) {
-                failServerSideGridRead(params);
+                // A newer filter/range owns the grid now. Do not let this stale
+                // response replace its loading state with an empty overlay.
+                params.fail();
                 return;
               }
 
@@ -427,6 +451,13 @@ const TraceGrid = React.forwardRef(
               setReadMessage(QUERY_FAILED_RETRY_MESSAGE);
               failServerSideGridRead(params);
             } finally {
+              if (
+                firstPageRequestId !== null &&
+                firstPageRequestId === firstPageRequestRef.current &&
+                cursorPagination.current.isCurrent(requestGeneration)
+              ) {
+                setGridLoading(false);
+              }
               setLoading(false);
             }
           },
@@ -666,6 +697,10 @@ const TraceGrid = React.forwardRef(
           suppressServerSideFullWidthLoadingRow={true}
           rowModelType="serverSide"
           serverSideDatasource={dataSource}
+          loading={
+            gridLoading ||
+            previousFilterRequestKeyRef.current !== filterRequestKey
+          }
           noRowsOverlayComponent={() =>
             NoRowsOverlay(
               <Typography

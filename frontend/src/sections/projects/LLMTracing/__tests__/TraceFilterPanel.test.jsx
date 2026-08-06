@@ -17,6 +17,7 @@ import {
 
 const parseQueryMock = vi.fn();
 const dashboardFilterValuesMock = vi.hoisted(() => vi.fn());
+const exactAttributePropertiesMock = vi.hoisted(() => vi.fn());
 
 const defaultDashboardFilterValues = () => ({
   data: [],
@@ -31,6 +32,15 @@ const defaultDashboardFilterValues = () => ({
 
 beforeEach(() => {
   dashboardFilterValuesMock.mockReturnValue(defaultDashboardFilterValues());
+  exactAttributePropertiesMock.mockReturnValue({
+    data: [],
+    isFetching: false,
+    fetchNextPage: vi.fn(),
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    queryReadState: "complete",
+    debouncedSearch: "",
+  });
 });
 
 describe("JSON array picker value identity", () => {
@@ -66,6 +76,10 @@ vi.mock("src/hooks/use-ai-filter", () => ({
 
 vi.mock("src/hooks/useDashboards", () => ({
   useDashboardFilterValues: dashboardFilterValuesMock,
+}));
+
+vi.mock("../useExactTraceAttributeProperties", () => ({
+  useExactTraceAttributeProperties: exactAttributePropertiesMock,
 }));
 
 function renderPanel({
@@ -420,6 +434,45 @@ describe("voice-call property search aliases", () => {
       }),
     );
   });
+
+  it("shows provider status aliases once under their canonical row status", () => {
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [
+        { value: "ended", label: "ended" },
+        { value: "DONE", label: "DONE" },
+        { value: "completed", label: "completed" },
+      ],
+    });
+    const { anchorEl } = renderPanel({
+      properties,
+      currentFilters: [
+        {
+          field: "call_status",
+          fieldName: "Status",
+          fieldCategory: "system",
+          fieldType: "string",
+          apiColType: "SYSTEM_METRIC",
+          operator: "in",
+          value: ["ended"],
+        },
+      ],
+    });
+
+    fireEvent.click(
+      document.querySelector('[data-filter-value-trigger="call_status"]'),
+    );
+
+    expect(
+      document.querySelectorAll('[data-filter-value-option="completed"]'),
+    ).toHaveLength(1);
+    expect(
+      document.querySelector('[data-filter-value-option="ended"]'),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByText("completed").length).toBeGreaterThan(0);
+
+    document.body.removeChild(anchorEl);
+  });
 });
 
 describe("exact manual attribute fallback", () => {
@@ -489,6 +542,45 @@ describe("exact manual attribute fallback", () => {
         hasCategorySidebar: false,
       }),
     ).toBeNull();
+  });
+
+  it("loads the next recent attribute page when the property list is scrolled", () => {
+    const fetchNextPage = vi.fn();
+    exactAttributePropertiesMock.mockReturnValue({
+      data: Array.from({ length: 10 }, (_, index) => ({
+        id: `recent_${index}`,
+        name: `recent_${index}`,
+        category: "attribute",
+        rawCategory: "custom_attribute",
+        type: "string",
+        apiColType: "SPAN_ATTRIBUTE",
+      })),
+      isFetching: false,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      queryReadState: "sampled",
+      debouncedSearch: "",
+    });
+    const { anchorEl } = renderPanel({ properties: [] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    const propertyList = document.querySelector(
+      "[data-filter-property-options-list]",
+    );
+    expect(propertyList).toBeTruthy();
+    Object.defineProperties(propertyList, {
+      scrollTop: { configurable: true, value: 180 },
+      clientHeight: { configurable: true, value: 220 },
+      scrollHeight: { configurable: true, value: 400 },
+    });
+    fireEvent.scroll(propertyList);
+
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+    expect(
+      screen.queryByText(/results are incomplete/i),
+    ).not.toBeInTheDocument();
+    document.body.removeChild(anchorEl);
   });
 });
 

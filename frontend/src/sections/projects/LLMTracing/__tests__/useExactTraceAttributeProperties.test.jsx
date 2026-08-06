@@ -37,6 +37,77 @@ function createWrapper() {
 describe("useExactTraceAttributeProperties", () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it("loads ten recent keys first and de-duplicates cursor pages", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: [
+            { key: "call.status", type: "string", count: 3 },
+            { key: "final_status", type: "string", count: 2 },
+          ],
+          query_complete: false,
+          query_status: "sampled",
+          query_error_code: "sample_limit",
+          has_more: true,
+          next_cursor: "signed-page-2",
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: [
+            { key: "final_status", type: "string", count: 1 },
+            { key: "cost_cents", type: "number", count: 1 },
+          ],
+          query_complete: false,
+          query_status: "sampled",
+          query_error_code: "sample_limit",
+          has_more: false,
+          next_cursor: null,
+        },
+      });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mocks.get).toHaveBeenNthCalledWith(
+      1,
+      "/api/traces/span-attribute-keys/",
+      expect.objectContaining({
+        params: {
+          project_id: "project-synthetic",
+          page_size: 10,
+        },
+      }),
+    );
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+    expect(mocks.get).toHaveBeenNthCalledWith(
+      2,
+      "/api/traces/span-attribute-keys/",
+      expect.objectContaining({
+        params: {
+          project_id: "project-synthetic",
+          page_size: 10,
+          cursor: "signed-page-2",
+        },
+      }),
+    );
+    expect(result.current.data.map((item) => item.id)).toEqual([
+      "call.status",
+      "final_status",
+      "cost_cents",
+    ]);
+    expect(result.current.hasNextPage).toBe(false);
+  });
+
   it("keeps degraded exact matches scoped to the selected project and source", async () => {
     mocks.get.mockResolvedValue({
       data: {

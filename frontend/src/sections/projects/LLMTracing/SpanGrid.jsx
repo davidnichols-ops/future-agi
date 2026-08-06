@@ -220,6 +220,9 @@ const SpanGrid = React.forwardRef(
     const [readState, setReadState] = useState("complete");
     const readStateRef = useRef("complete");
     const readMessage = getQueryReadMessage(readState);
+    const [gridLoading, setGridLoading] = useState(enabled);
+    const firstPageRequestRef = useRef(0);
+    const preserveRowsDuringNextRefreshRef = useRef(false);
 
     // Use ref to track latest columns for comparison without triggering dataSource recreation
     const columnsRef = useRef(columns);
@@ -231,11 +234,16 @@ const SpanGrid = React.forwardRef(
     const prefetchCache = useRef(new Map());
     const cursorPagination = useRef(createListCursorPagination());
 
-    const refreshGrid = useCallback(() => {
-      prefetchCache.current.clear();
-      cursorPagination.current.reset();
-      gridRef?.current?.api?.refreshServerSide({ purge: true });
-    }, [gridRef]);
+    const refreshGrid = useCallback(
+      (purge = true) => {
+        prefetchCache.current.clear();
+        cursorPagination.current.reset();
+        preserveRowsDuringNextRefreshRef.current = !purge;
+        if (purge) setGridLoading(enabled);
+        gridRef?.current?.api?.refreshServerSide({ purge });
+      },
+      [enabled, gridRef],
+    );
     const filterRequestKey = useMemo(
       () =>
         JSON.stringify({
@@ -253,10 +261,19 @@ const SpanGrid = React.forwardRef(
     useEffect(() => {
       if (previousFilterRequestKeyRef.current === filterRequestKey) return;
       previousFilterRequestKeyRef.current = filterRequestKey;
+      setGridLoading(enabled);
       prefetchCache.current.clear();
       cursorPagination.current.reset();
-      refreshGrid();
-    }, [filterRequestKey, refreshGrid]);
+      refreshGrid(true);
+    }, [enabled, filterRequestKey, refreshGrid]);
+
+    // Keep the last exact same-query rows during a manual refresh. A query-key
+    // change uses the purge path above and shows a neutral loading state.
+    useEffect(() => {
+      const handler = () => refreshGrid(false);
+      window.addEventListener("observe-refresh", handler);
+      return () => window.removeEventListener("observe-refresh", handler);
+    }, [refreshGrid]);
 
     // Clear AG Grid's internal selection when the project changes — the
     // zustand reset handled in the header only clears our mirror, not AG
@@ -407,18 +424,28 @@ const SpanGrid = React.forwardRef(
         return {
           getRows: async (params) => {
             if (!enabled) {
-              params.success({ rowData: [], rowCount: 0 });
+              // Disabled/unresolved is not an exact empty response. Reporting
+              // success here makes AG Grid publish "No spans" without ever
+              // calling the list API.
+              params.fail();
               return;
             }
             let pageNumber = 0;
+            let firstPageRequestId = null;
+            let requestGeneration = null;
             try {
               setLoading(true);
               const { request } = params;
-              const requestGeneration = cursorPagination.current.generation();
+              requestGeneration = cursorPagination.current.generation();
 
               const pageSize = request.endRow - request.startRow;
               pageNumber = Math.floor(request.startRow / pageSize);
               if (pageNumber === 0) {
+                firstPageRequestId = ++firstPageRequestRef.current;
+                const preserveExistingRows =
+                  preserveRowsDuringNextRefreshRef.current;
+                preserveRowsDuringNextRefreshRef.current = false;
+                if (!preserveExistingRows) setGridLoading(true);
                 readStateRef.current = "complete";
                 setReadState("complete");
               }
@@ -467,7 +494,9 @@ const SpanGrid = React.forwardRef(
                   }),
               });
               if (!cursorPagination.current.isCurrent(requestGeneration)) {
-                failServerSideGridRead(params);
+                // A newer filter/range owns the grid now. Do not let this stale
+                // response replace its loading state with an empty overlay.
+                params.fail();
                 return;
               }
 
@@ -593,6 +622,13 @@ const SpanGrid = React.forwardRef(
               setReadState("error");
               failServerSideGridRead(params);
             } finally {
+              if (
+                firstPageRequestId !== null &&
+                firstPageRequestId === firstPageRequestRef.current &&
+                cursorPagination.current.isCurrent(requestGeneration)
+              ) {
+                setGridLoading(false);
+              }
               setLoading(false);
             }
           },
@@ -771,6 +807,10 @@ const SpanGrid = React.forwardRef(
           tooltipHideDelay={2000}
           tooltipInteraction={true}
           serverSideDatasource={dataSource}
+          loading={
+            gridLoading ||
+            previousFilterRequestKeyRef.current !== filterRequestKey
+          }
           suppressServerSideFullWidthLoadingRow={true}
           noRowsOverlayComponent={() =>
             NoRowsOverlay(

@@ -200,4 +200,58 @@ describe("useEvalUsageLogs response mapping", () => {
     expect(result.current.data.table).toHaveLength(1);
     expect(result.current.data.pagination).toEqual({ total: 5, page: 0 });
   });
+
+  it("polls the logs identity independently until its exact page is ready", async () => {
+    vi.useFakeTimers();
+    const exactRows = Array.from({ length: 24 }, (_, index) => ({
+      row_id: `row-${index}`,
+    }));
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            table: [],
+            logs: { total: 0, page: 0 },
+            query_complete: false,
+            query_status: "pending",
+            query_sampled: false,
+            query_refreshing: true,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: exactResult({
+            table: exactRows,
+            logs: { total: 24, page: 0 },
+          }),
+        },
+      });
+
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () =>
+        useEvalUsageLogs("t1", {
+          page: 0,
+          pageSize: 25,
+          dateOption: "30D",
+        }),
+      { wrapper },
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(result.current.data?.queryPending).toBe(true);
+    expect(result.current.data?.table).toHaveLength(0);
+    expect(mocks.get).toHaveBeenCalledOnce();
+    expect(mocks.get.mock.calls[0][1].params.page_size).toBe(25);
+
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.get.mock.calls[1][1].params).not.toHaveProperty("refresh");
+    expect(result.current.data?.queryPending).toBe(false);
+    expect(result.current.data?.table).toHaveLength(24);
+    expect(result.current.data?.pagination.total).toBe(24);
+  });
 });

@@ -71,7 +71,11 @@ def test_system_filter_value_cap_produces_a_labelled_sample():
         (
             "call_status",
             "completed",
-            ("multiIf(", "'ended', 'completed', 'in-progress'", "attrs_string"),
+            (
+                "multiIf(",
+                "('ended', 'done', 'complete', 'completed'",
+                "attrs_string",
+            ),
         ),
         (
             "cost_cents",

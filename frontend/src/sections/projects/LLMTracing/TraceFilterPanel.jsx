@@ -59,7 +59,10 @@ import {
   getQueryReadMessage,
 } from "src/utils/queryReadState";
 import { useExactTraceAttributeProperties } from "./useExactTraceAttributeProperties";
-import { VOICE_CALL_FILTER_FIELDS } from "./voiceCallFilterFields";
+import {
+  normalizeVoiceCallStatus,
+  VOICE_CALL_FILTER_FIELDS,
+} from "./voiceCallFilterFields";
 
 // ---------------------------------------------------------------------------
 // Trace filter fields (for Query tab via shared FilterPanel)
@@ -562,7 +565,7 @@ const EXCLUDED_METRICS = new Set([
   // duplicate of node_type — both map to observation_type
   "span_kind",
 ]);
-const PROPERTY_PICKER_RENDER_LIMIT = 250;
+const PROPERTY_PICKER_RENDER_LIMIT = 500;
 
 const normalizePropertySearchText = (value) =>
   String(value || "")
@@ -810,6 +813,9 @@ function PropertyPicker({
   const {
     data: exactAttributeProperties,
     isFetching: exactAttributeLoading,
+    fetchNextPage: fetchNextAttributePage,
+    hasNextPage: hasNextAttributePage,
+    isFetchingNextPage: isFetchingNextAttributePage,
     queryReadState: exactAttributeReadState,
     debouncedSearch,
   } = useExactTraceAttributeProperties({
@@ -821,13 +827,23 @@ function PropertyPicker({
   });
 
   const propertiesWithExactAttribute = useMemo(() => {
-    const byId = new Map(
-      (properties || []).map((property) => [property.id, property]),
+    const catalog = properties || [];
+    const nonAttributes = catalog.filter(
+      (property) => property.category !== "attribute",
     );
-    for (const property of exactAttributeProperties) {
-      if (!byId.has(property.id)) byId.set(property.id, property);
-    }
-    return Array.from(byId.values());
+    const reservedIds = new Set(nonAttributes.map((property) => property.id));
+    const recentAttributes = exactAttributeProperties.filter(
+      (property) => !reservedIds.has(property.id),
+    );
+    const exactIds = new Set(recentAttributes.map((property) => property.id));
+    return [
+      ...nonAttributes,
+      ...recentAttributes,
+      ...catalog.filter(
+        (property) =>
+          property.category === "attribute" && !exactIds.has(property.id),
+      ),
+    ];
   }, [properties, exactAttributeProperties]);
 
   const filtered = useMemo(
@@ -875,6 +891,19 @@ function PropertyPicker({
   );
 
   const paperWidth = hasCategorySidebar ? 480 : 320;
+  const handlePropertyScroll = useCallback(
+    (event) => {
+      const { scrollTop, clientHeight, scrollHeight } = event.currentTarget;
+      if (
+        scrollHeight - scrollTop - clientHeight <= 40 &&
+        hasNextAttributePage &&
+        !isFetchingNextAttributePage
+      ) {
+        fetchNextAttributePage();
+      }
+    },
+    [fetchNextAttributePage, hasNextAttributePage, isFetchingNextAttributePage],
+  );
 
   return (
     <Popper
@@ -1015,7 +1044,11 @@ function PropertyPicker({
                 ))}
               </Box>
             )}
-            <Box sx={{ flex: 1, overflow: "auto", maxHeight: 280 }}>
+            <Box
+              data-filter-property-options-list
+              onScroll={handlePropertyScroll}
+              sx={{ flex: 1, overflow: "auto", maxHeight: 280 }}
+            >
               {filtered.length === 0 &&
                 !manualAttributeProperty &&
                 !exactAttributeLoading && (
@@ -1134,6 +1167,11 @@ function PropertyPicker({
                     label="text"
                     sx={{ height: 16, fontSize: 9, flexShrink: 0 }}
                   />
+                </Box>
+              )}
+              {isFetchingNextAttributePage && (
+                <Box sx={{ display: "flex", justifyContent: "center", py: 1 }}>
+                  <CircularProgress size={14} />
                 </Box>
               )}
               {hiddenCount > 0 && (
@@ -1269,11 +1307,27 @@ function ValuePicker({
   });
 
   // Source: static choices > session endpoint > dashboard API
-  const options = hasStaticChoices
+  const rawOptions = hasStaticChoices
     ? property.choices
     : isSessionField
       ? sessionOptions
       : dashboardOptions;
+  // Keep the picker on the same canonical vocabulary as the rendered voice
+  // rows even while an older backend is rolling out. Provider values such as
+  // `ended` and `done` must appear once as `completed`, never as raw aliases.
+  const options = useMemo(() => {
+    if (propertyId !== "call_status") return rawOptions;
+    const seen = new Set();
+    return rawOptions.flatMap((option) => {
+      const canonical = normalizeVoiceCallStatus(getPickerOptionValue(option));
+      if (canonical === "" || canonical == null || seen.has(canonical)) {
+        return [];
+      }
+      seen.add(canonical);
+      if (typeof option === "string") return [canonical];
+      return [{ ...option, value: canonical, label: canonical }];
+    });
+  }, [propertyId, rawOptions]);
   const isLoading = hasStaticChoices
     ? false
     : isSessionField
@@ -1316,7 +1370,12 @@ function ValuePicker({
     );
   }, [options, search, isSessionField, isIdOnlyField]);
 
-  const selectedValues = useMemo(() => normalizePickerValues(value), [value]);
+  const selectedValues = useMemo(() => {
+    const normalized = normalizePickerValues(value);
+    return propertyId === "call_status"
+      ? normalizeVoiceCallStatus(normalized)
+      : normalized;
+  }, [propertyId, value]);
 
   const toggleValue = useCallback(
     (val) => {

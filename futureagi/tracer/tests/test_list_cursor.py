@@ -42,6 +42,16 @@ def _request(*, user_id="u1", org_id="o1", workspace_id="w1", auth_id="a1"):
     [
         ({}, {}, False),
         ({"allow_sampled": "false"}, {"allow_sampled": False}, True),
+        (
+            {"allow_sampled": "false", "cursor_mode": "true"},
+            {"allow_sampled": False, "cursor_mode": True},
+            False,
+        ),
+        (
+            {"allow_sampled": "false", "cursor": "opaque"},
+            {"allow_sampled": False, "cursor": "opaque"},
+            False,
+        ),
         ({"allow_sampled": "true"}, {"allow_sampled": True}, False),
     ],
 )

@@ -169,4 +169,30 @@ describe("GraphSection exact graph boundary", () => {
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
     expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
   });
+
+  it("renders a completed exact response without waiting for snapshot persistence", async () => {
+    axios.post.mockResolvedValue({
+      data: {
+        result: {
+          metric_name: "latency",
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 12,
+              primary_traffic: 1,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+
+    renderGraph();
+    fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+
+    expect(await screen.findByTestId("apex-chart")).toBeInTheDocument();
+    expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
+  });
 });

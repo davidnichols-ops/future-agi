@@ -148,6 +148,7 @@ import axios, { endpoints } from "src/utils/axios";
 
 import { PROJECT_SOURCE } from "src/utils/constants";
 import { useLLMTracingFilters } from "./useLLMTracingFilters";
+import { isTraceListProjectReady } from "./projectSourceMode";
 import {
   generateObserveTraceFilterDefinition,
   generateSpanObserveFilterDefinition,
@@ -1038,6 +1039,11 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   const projectSource = isUserMode
     ? PROJECT_SOURCE.OBSERVE
     : projectDetail?.source;
+  const traceListProjectReady = isTraceListProjectReady({
+    projectId: observeId,
+    projectSource,
+    allowOrgScope: isUserMode,
+  });
 
   const effectiveViewMode =
     projectSource === PROJECT_SOURCE.SIMULATOR && viewMode !== "graph"
@@ -4593,7 +4599,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
               <SelectAllBanner
                 visible={
                   selectedTab === "trace" &&
-                  projectSource !== PROJECT_SOURCE.SIMULATOR &&
+                  traceListProjectReady &&
                   allTracesSelected &&
                   !filterSelectionMode
                 }
@@ -4615,7 +4621,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                   display:
                     selectedTab === "trace" &&
                     selectedGraph === "primary" &&
-                    projectSource !== PROJECT_SOURCE.SIMULATOR
+                    traceListProjectReady
                       ? "block"
                       : "none",
                 }}
@@ -4641,12 +4647,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     pendingCustomColumnsRef={primaryTracePendingRef}
                     canonicalOrderRef={canonicalTraceOrderRef}
                     showErrors={showErrors}
-                    enabled={
-                      [
-                        PROJECT_SOURCE.PROTOTYPE,
-                        PROJECT_SOURCE.OBSERVE,
-                      ].includes(projectSource) && selectedTab === "trace"
-                    }
+                    enabled={traceListProjectReady && selectedTab === "trace"}
                   />
                 </Suspense>
               </Box>
@@ -4655,7 +4656,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                   display:
                     selectedTab === "trace" &&
                     selectedGraph === "compare" &&
-                    projectSource !== PROJECT_SOURCE.SIMULATOR
+                    traceListProjectReady
                       ? "block"
                       : "none",
                 }}
@@ -4682,10 +4683,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     projectId={observeId}
                     showErrors={showErrors}
                     enabled={
-                      [
-                        PROJECT_SOURCE.PROTOTYPE,
-                        PROJECT_SOURCE.OBSERVE,
-                      ].includes(projectSource) &&
+                      traceListProjectReady &&
                       selectedTab === "trace" &&
                       selectedGraph === "compare"
                     }
@@ -4695,8 +4693,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
               <Box
                 sx={{
                   display:
-                    selectedTab === "spans" &&
-                    projectSource !== PROJECT_SOURCE.SIMULATOR
+                    selectedTab === "spans" && traceListProjectReady
                       ? "block"
                       : "none",
                 }}
@@ -4704,7 +4701,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                 <SelectAllBanner
                   visible={
                     selectedTab === "spans" &&
-                    projectSource !== PROJECT_SOURCE.SIMULATOR &&
+                    traceListProjectReady &&
                     allSpansSelected &&
                     !spanFilterSelectionMode
                   }
@@ -4727,7 +4724,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                   display:
                     selectedTab === "spans" &&
                     selectedGraph === "primary" &&
-                    projectSource !== PROJECT_SOURCE.SIMULATOR
+                    traceListProjectReady
                       ? "block"
                       : "none",
                 }}
@@ -4751,12 +4748,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     setFilterOpen={setIsPrimaryFilterOpen}
                     setLoading={setLoadingEnhanced}
                     compareType="primary"
-                    enabled={
-                      [
-                        PROJECT_SOURCE.PROTOTYPE,
-                        PROJECT_SOURCE.OBSERVE,
-                      ].includes(projectSource) && selectedTab === "spans"
-                    }
+                    enabled={traceListProjectReady && selectedTab === "spans"}
                   />
                 </Suspense>
               </Box>
@@ -4765,7 +4757,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                   display:
                     selectedTab === "spans" &&
                     selectedGraph === "compare" &&
-                    projectSource !== PROJECT_SOURCE.SIMULATOR
+                    traceListProjectReady
                       ? "block"
                       : "none",
                 }}
@@ -4790,10 +4782,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     setLoading={setLoadingEnhanced}
                     compareType="compare"
                     enabled={
-                      [
-                        PROJECT_SOURCE.PROTOTYPE,
-                        PROJECT_SOURCE.OBSERVE,
-                      ].includes(projectSource) &&
+                      traceListProjectReady &&
                       selectedTab === "spans" &&
                       selectedGraph === "compare"
                     }

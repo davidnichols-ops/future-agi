@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
@@ -13,7 +13,7 @@ export function useExactTraceAttributeProperties({
   const debouncedSearch = useDebounce(String(search || "").trim(), 350);
   const supportedSource = source === "traces" || source === "spans";
 
-  const query = useQuery({
+  const query = useInfiniteQuery({
     queryKey: [
       "trace-attribute-exact",
       projectId,
@@ -21,33 +21,27 @@ export function useExactTraceAttributeProperties({
       contextKey,
       debouncedSearch,
     ],
-    queryFn: ({ signal }) =>
-      axios.get(endpoints.project.spanAttributeKeys(), {
-        signal,
-        params: {
-          project_id: projectId,
-          q: debouncedSearch,
-        },
-      }),
-    select: ({ data }) => {
-      const attributes = Array.isArray(data?.result) ? data.result : [];
-      return {
-        properties: attributes.map(({ key, type }) => ({
-          id: key,
-          name: key,
-          category: "attribute",
-          rawCategory: "custom_attribute",
-          type,
-          apiColType: "SPAN_ATTRIBUTE",
-        })),
-        queryReadState: getQueryReadState(data),
-      };
-    },
-    enabled:
-      enabled &&
-      supportedSource &&
-      Boolean(projectId) &&
-      Boolean(debouncedSearch),
+    queryFn: ({ signal, pageParam }) =>
+      axios
+        .get(endpoints.project.spanAttributeKeys(), {
+          signal,
+          params: {
+            project_id: projectId,
+            ...(debouncedSearch
+              ? { q: debouncedSearch }
+              : {
+                  page_size: 10,
+                  ...(pageParam ? { cursor: pageParam } : {}),
+                }),
+          },
+        })
+        .then(({ data }) => data || {}),
+    initialPageParam: null,
+    getNextPageParam: (lastPage) =>
+      !debouncedSearch && lastPage?.has_more && lastPage?.next_cursor
+        ? lastPage.next_cursor
+        : undefined,
+    enabled: enabled && supportedSource && Boolean(projectId),
     retry: false,
     staleTime: 60_000,
     gcTime: 5 * 60_000,
@@ -56,12 +50,39 @@ export function useExactTraceAttributeProperties({
     meta: { errorHandled: true },
   });
 
+  const pages = query.data?.pages || [];
+  const seenKeys = new Set();
+  const properties = pages.flatMap((page) =>
+    (Array.isArray(page?.result) ? page.result : []).flatMap(
+      ({ key, type }) => {
+        if (!key || seenKeys.has(key)) return [];
+        seenKeys.add(key);
+        return [
+          {
+            id: key,
+            name: key,
+            category: "attribute",
+            rawCategory: "custom_attribute",
+            type,
+            apiColType: "SPAN_ATTRIBUTE",
+          },
+        ];
+      },
+    ),
+  );
+  const pageReadStates = pages.map((page) => getQueryReadState(page));
+  const queryReadState = query.isError
+    ? "error"
+    : pageReadStates.includes("degraded")
+      ? "degraded"
+      : pageReadStates.includes("sampled")
+        ? "sampled"
+        : "complete";
+
   return {
     ...query,
-    data: query.data?.properties || [],
-    queryReadState: query.isError
-      ? "error"
-      : query.data?.queryReadState || "complete",
+    data: properties,
+    queryReadState,
     debouncedSearch,
   };
 }

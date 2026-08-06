@@ -196,7 +196,9 @@ const GraphSection = ({
       return response;
     },
     enabled: selectedTab === "trace" && Boolean(selectedGraphConfig?.id),
-    select: (data) => data.data?.result,
+    // Preserve wrapper-level exactness and refresh metadata. Dropping this
+    // envelope turns a legitimate queued read into an apparent empty result.
+    select: (data) => data.data,
     staleTime: Infinity,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
@@ -270,7 +272,9 @@ const GraphSection = ({
       return response;
     },
     enabled: selectedTab === "spans" && Boolean(selectedGraphConfig?.id),
-    select: (data) => data.data?.result,
+    // Preserve wrapper-level exactness and refresh metadata. Dropping this
+    // envelope turns a legitimate queued read into an apparent empty result.
+    select: (data) => data.data,
     staleTime: Infinity,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
@@ -438,14 +442,23 @@ const GraphSection = ({
     }
   }, [apiGraphData, apiGraphError, notifyAggregationRefresh]);
 
+  const currentExactSnapshot =
+    apiGraphData && apiGraphReadState === "complete"
+      ? {
+          key: graphSnapshotKey,
+          data: apiGraphData,
+          updatedAt: getQueryCompletedAt(apiGraphData),
+        }
+      : null;
   const exactSnapshot =
-    lastExactSnapshot?.key === graphSnapshotKey ? lastExactSnapshot : null;
+    currentExactSnapshot ||
+    (lastExactSnapshot?.key === graphSnapshotKey ? lastExactSnapshot : null);
   const exactGraphData = exactSnapshot?.data;
-  const apiGraphReadMessage = refreshUnavailable
-    ? exactSnapshot
-      ? null
-      : AGGREGATION_PREPARING_MESSAGE
-    : null;
+  const apiGraphReadMessage =
+    !exactSnapshot &&
+    (refreshUnavailable || apiGraphError || apiGraphReadState !== "complete")
+      ? AGGREGATION_PREPARING_MESSAGE
+      : null;
 
   const chartData = useMemo(() => {
     const primaryData = [];

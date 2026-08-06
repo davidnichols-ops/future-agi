@@ -302,7 +302,13 @@ export default function WidgetChart({
     () => getDashboardMetricSeriesState(result?.metrics),
     [result?.metrics],
   );
+  const hasRunnableQuery = Boolean(queryConfig?.metrics?.length);
+  // Until an exact snapshot exists, the query is unresolved—not empty. This
+  // also covers the first paint before the mutation effect starts and the
+  // render between changing a widget query and receiving its new response.
+  const awaitingFirstExactResult = hasRunnableQuery && !exactSnapshot;
   const readUnavailable =
+    awaitingFirstExactResult ||
     (latestOutcome.signature === querySignature && latestOutcome.unavailable) ||
     (queryMutation.isError && !queryMutation.isPending);
 

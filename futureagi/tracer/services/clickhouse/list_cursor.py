@@ -143,7 +143,11 @@ def exact_total_explicitly_required(
     older clients omit it.  A complete bounded page is safe to return to those
     clients as long as its lower-bound total is labelled truthfully.  Clients
     that explicitly send ``allow_sampled=false`` retain the strict exact-total
-    contract.  Incomplete pages are rejected before this compatibility check.
+    contract on legacy numbered reads.  Cursor mode is itself an explicit
+    lower-bound-total contract: every returned row is exact and ordered, while
+    the signed continuation proves where the still-unscanned suffix begins.
+    ``allow_sampled=false`` must therefore reject sampled rows, not that exact
+    cursor pagination model.
     """
 
     query_params = getattr(request, "query_params", None)
@@ -151,6 +155,8 @@ def exact_total_explicitly_required(
         query_params is not None
         and "allow_sampled" in query_params
         and validated_data.get("allow_sampled") is False
+        and not validated_data.get("cursor_mode")
+        and not validated_data.get("cursor")
     )
 
 

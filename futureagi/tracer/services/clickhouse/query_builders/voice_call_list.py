@@ -128,6 +128,16 @@ _VOICE_RAW_STATUS = (
     "if(mapContains(span_attr_str, 'call.status'), "
     "nullIf(span_attr_str['call.status'], ''), null)"
 )
+_VOICE_CANONICAL_RAW_STATUS = (
+    "multiIf("
+    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
+    "('ended', 'done', 'complete', 'completed', 'success', 'succeeded'), "
+    "'completed', "
+    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
+    "('in-progress', 'in_progress', 'ongoing', 'started', 'ringing', "
+    "'queued', 'pending'), 'in-progress', "
+    f"lowerUTF8(toString({_VOICE_RAW_STATUS})))"
+)
 _VOICE_HAS_RAW_LOG = (
     "(JSONHas(span_attributes_raw, 'raw_log') OR mapContains(span_attr_str, 'raw_log'))"
 )
@@ -138,16 +148,18 @@ _VOICE_IS_TWILIO = _raw_log_has_key("sid")
 _VOICE_IS_VAPI = f"({_raw_log_has_key('startedAt')} OR {_raw_log_has_key('createdAt')})"
 _VOICE_CALL_STATUS_EXPR = (
     "multiIf("
-    f"NOT {_VOICE_HAS_RAW_LOG}, coalesce({_VOICE_RAW_STATUS}, 'completed'), "
+    f"NOT {_VOICE_HAS_RAW_LOG}, "
+    f"coalesce({_VOICE_CANONICAL_RAW_STATUS}, 'completed'), "
     f"({_VOICE_IS_RETELL} OR {_VOICE_IS_VAPI} "
     f"OR {_VOICE_PROVIDER} IN ('retell', 'vapi')), "
-    f"if({_VOICE_RAW_STATUS} = 'ended', 'completed', 'in-progress'), "
+    f"if({_VOICE_CANONICAL_RAW_STATUS} = 'completed', "
+    f"'completed', 'in-progress'), "
     f"({_VOICE_IS_ELEVEN_LABS} OR {_VOICE_PROVIDER} = 'eleven_labs'), "
-    f"if({_VOICE_RAW_STATUS} IN ('done', 'ended'), "
-    f"'completed', {_VOICE_RAW_STATUS}), "
+    f"{_VOICE_CANONICAL_RAW_STATUS}, "
     f"({_VOICE_IS_BLAND} OR {_VOICE_IS_TWILIO} "
-    f"OR {_VOICE_PROVIDER} IN ('bland', 'twilio')), {_VOICE_RAW_STATUS}, "
-    f"{_VOICE_RAW_STATUS})"
+    f"OR {_VOICE_PROVIDER} IN ('bland', 'twilio')), "
+    f"{_VOICE_CANONICAL_RAW_STATUS}, "
+    f"{_VOICE_CANONICAL_RAW_STATUS})"
 )
 
 # Public, code-owned expressions used by the voice list and its filter-value

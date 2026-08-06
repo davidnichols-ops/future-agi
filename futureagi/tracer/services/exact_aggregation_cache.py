@@ -27,6 +27,13 @@ logger = structlog.get_logger(__name__)
 _CACHE_VERSION = 1
 _DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60
 _DEFAULT_REFRESH_LOCK_SECONDS = 60 * 60
+# A refresh claim starts as a short dispatch lease.  The activity promotes it
+# to the long running lease before it touches ClickHouse.  This matters during
+# rolling deploys: an older Temporal worker can accept the generic workflow but
+# reject a newly-registered activity type before our activity function runs.
+# Such a terminal workflow failure has no ``finally`` block in this process, so
+# a one-hour pre-start claim would otherwise leave every poll falsely pending.
+_DEFAULT_REFRESH_DISPATCH_SECONDS = 30
 _DEFAULT_REFRESH_FAILURE_SECONDS = 5 * 60
 _CACHE_FENCE_FALLBACK_LOCK = RLock()
 
@@ -55,6 +62,15 @@ else
     redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[4])
 end
 redis.call('DEL', KEYS[1])
+return 1
+"""
+
+_REDIS_FENCED_ACTIVATE_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[2])
 return 1
 """
 
@@ -142,6 +158,22 @@ def _refresh_lock_seconds() -> int:
                 "EXACT_AGGREGATION_REFRESH_LOCK_SECONDS",
                 _DEFAULT_REFRESH_LOCK_SECONDS,
             )
+        ),
+    )
+
+
+def _refresh_dispatch_seconds() -> int:
+    return max(
+        5,
+        min(
+            _refresh_lock_seconds(),
+            int(
+                getattr(
+                    settings,
+                    "EXACT_AGGREGATION_REFRESH_DISPATCH_SECONDS",
+                    _DEFAULT_REFRESH_DISPATCH_SECONDS,
+                )
+            ),
         ),
     )
 
@@ -404,21 +436,27 @@ def exact_refresh_state(namespace: str, identity: Any) -> str | None:
 
 
 def begin_exact_refresh(namespace: str, identity: Any) -> str | None:
-    """Atomically claim one background refresh for a normalized query."""
+    """Atomically claim the short pre-activity dispatch lease for a query.
+
+    The worker must call :func:`activate_exact_refresh` before doing any work.
+    If no compatible Temporal worker starts the activity, both keys expire and
+    the next ordinary poll can safely enqueue a fresh, uniquely fenced claim.
+    """
 
     token = uuid4().hex
+    dispatch_seconds = _refresh_dispatch_seconds()
     try:
         claimed = cache.add(
             _refresh_lock_key(namespace, identity),
             token,
-            timeout=_refresh_lock_seconds(),
+            timeout=dispatch_seconds,
         )
         if not claimed:
             return None
         cache.set(
             _refresh_state_key(namespace, identity),
             {"status": "running", "token": token},
-            timeout=_refresh_lock_seconds(),
+            timeout=dispatch_seconds,
         )
         return token
     except Exception:
@@ -428,6 +466,51 @@ def begin_exact_refresh(namespace: str, identity: Any) -> str | None:
             exc_info=True,
         )
         return None
+
+
+def activate_exact_refresh(namespace: str, identity: Any, token: str) -> bool:
+    """Promote a current dispatch lease to the long running-query lease.
+
+    Promotion is token-fenced and atomic on Redis.  An activity delivered after
+    its dispatch lease expired therefore exits before querying ClickHouse, even
+    if a later poll has already claimed and queued a replacement refresh.
+    """
+
+    if not token:
+        return False
+    try:
+        lock_key = _refresh_lock_key(namespace, identity)
+        state_key = _refresh_state_key(namespace, identity)
+        running_state = {"status": "running", "token": token}
+        running_seconds = _refresh_lock_seconds()
+        redis_client = _redis_cache_client()
+        if redis_client is None:
+            with _CACHE_FENCE_FALLBACK_LOCK:
+                if cache.get(lock_key) != token:
+                    return False
+                cache.set(lock_key, token, timeout=running_seconds)
+                cache.set(state_key, running_state, timeout=running_seconds)
+                return True
+
+        raw_client = redis_client.get_client(write=True)
+        return bool(
+            raw_client.eval(
+                _REDIS_FENCED_ACTIVATE_SCRIPT,
+                2,
+                redis_client.make_key(lock_key),
+                redis_client.make_key(state_key),
+                redis_client.encode(token),
+                running_seconds * 1000,
+                redis_client.encode(running_state),
+            )
+        )
+    except Exception:
+        logger.warning(
+            "exact_aggregation_refresh_activation_failed",
+            namespace=namespace,
+            exc_info=True,
+        )
+        return False
 
 
 def finish_exact_refresh(
@@ -580,6 +663,7 @@ def read_or_schedule_exact_snapshot(
 
 
 __all__ = [
+    "activate_exact_refresh",
     "begin_exact_refresh",
     "exact_refresh_state",
     "exact_payload_is_complete",

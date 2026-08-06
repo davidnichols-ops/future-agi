@@ -129,6 +129,30 @@ describe("EvalUsageTab exact read states", () => {
     expect(h.refetchLogs).toHaveBeenCalledTimes(2);
   });
 
+  it("does not publish empty chart or table states before the first response", () => {
+    h.chart = {
+      data: undefined,
+      isLoading: false,
+      isFetching: false,
+      isError: false,
+      refresh: h.refetchChart,
+    };
+    h.logs = {
+      data: undefined,
+      isLoading: false,
+      isFetching: false,
+      isError: false,
+      refresh: h.refetchLogs,
+    };
+
+    render(<EvalUsageTab templateId="eval-1" />);
+
+    expect(screen.getAllByText("Preparing exact data…")).toHaveLength(2);
+    expect(screen.queryByText(/No data to show/i)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("usage-table")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Runs: 0/i)).not.toBeInTheDocument();
+  });
+
   it("keeps the genuine successful-empty state distinct", () => {
     h.chart = {
       data: {
@@ -230,6 +254,62 @@ describe("EvalUsageTab exact read states", () => {
     expect(screen.getByTestId("usage-table")).toBeInTheDocument();
     expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Refreshing" })).toBeDisabled();
+  });
+
+  it("preserves the prior exact chart and log page when polling returns pending", () => {
+    h.chart = {
+      data: {
+        stats: { runs_period: 4 },
+        chart: [{ timestamp: "2026-08-03T00:00:00Z", calls: 4 }],
+        queryCompletedAt: "2026-08-03T02:00:00Z",
+        queryPending: false,
+      },
+      isLoading: false,
+      isFetching: false,
+      isError: false,
+      refresh: h.refetchChart,
+    };
+    h.logs = {
+      data: {
+        table: [{ id: "row-1" }],
+        pagination: { total: 1 },
+        queryPending: false,
+      },
+      isLoading: false,
+      isFetching: false,
+      isError: false,
+      refresh: h.refetchLogs,
+    };
+
+    const view = render(<EvalUsageTab templateId="eval-1" />);
+    expect(screen.getByTestId("usage-chart")).toBeInTheDocument();
+    expect(screen.getByText(/Runs: 4/i)).toBeInTheDocument();
+
+    h.chart = {
+      ...h.chart,
+      data: {
+        stats: {},
+        chart: [],
+        queryPending: true,
+        queryRefreshing: true,
+      },
+    };
+    h.logs = {
+      ...h.logs,
+      data: {
+        table: [],
+        pagination: { total: 0 },
+        queryPending: true,
+        queryRefreshing: true,
+      },
+    };
+    view.rerender(<EvalUsageTab templateId="eval-1" />);
+
+    expect(screen.getByTestId("usage-chart")).toBeInTheDocument();
+    expect(screen.getByTestId("usage-table")).toBeInTheDocument();
+    expect(screen.getByText(/Runs: 4/i)).toBeInTheDocument();
+    expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Runs: 0/i)).not.toBeInTheDocument();
   });
 
   it("treats a cold pending response as preparation rather than exact empty data", () => {

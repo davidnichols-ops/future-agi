@@ -121,8 +121,8 @@ def test_voice_call_status_alias_matches_normalized_list_semantics_only():
     )
 
     assert "multiIf(" in where
-    assert "'ended', 'completed', 'in-progress'" in where
-    assert "IN ('done', 'ended')" in where
+    assert "('ended', 'done', 'complete', 'completed'" in where
+    assert "('in-progress', 'in_progress', 'ongoing'" in where
     assert "coalesce(" in where
 
     generic_where, _ = ClickHouseFilterBuilder().translate(
@@ -177,8 +177,8 @@ def test_voice_normalized_aliases_rewrite_to_ch25_columns():
         (
             _system_filter("call_status", "text", "equals", "completed"),
             (
-                "'ended', 'completed', 'in-progress'",
-                "'done', 'ended'",
+                "('ended', 'done', 'complete', 'completed'",
+                "('in-progress', 'in_progress', 'ongoing'",
                 "'retell', 'vapi'",
                 "'bland', 'twilio'",
             ),
@@ -219,7 +219,7 @@ def test_bounded_voice_match_combines_normalized_status_and_cost():
         _system_filter("cost_cents", "number", "greater_than", 5),
     ).build_filter_match_query(["trace-a", "trace-b"])
 
-    assert "'ended', 'completed', 'in-progress'" in query
+    assert "('ended', 'done', 'complete', 'completed'" in query
     assert "'call_cost', 'combined_cost'" in query
     assert "'metadata', 'cost'" in query
     assert "'cost_breakdown.total'" in query

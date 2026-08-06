@@ -84,7 +84,7 @@ describe("TaskFilterBar voice-call filter contract", () => {
           fieldType: "string",
           apiColType: "SYSTEM_METRIC",
           operator: "in",
-          value: ["completed"],
+          value: ["ended"],
         },
       ],
       { rowType: "voiceCalls" },
@@ -190,7 +190,7 @@ describe("TaskFilterBar voice-call filter contract", () => {
         filterConfig: {
           filterType: "text",
           filterOp: "in",
-          filterValue: ["completed"],
+          filterValue: ["ended", "DONE"],
         },
       },
     ];
@@ -200,6 +200,7 @@ describe("TaskFilterBar voice-call filter contract", () => {
         field: "call_status",
         fieldCategory: "system",
         apiColType: "SYSTEM_METRIC",
+        value: ["completed"],
       },
     );
     expect(convertOldToNew(legacy, { rowType: "traces" })[0]).toMatchObject({

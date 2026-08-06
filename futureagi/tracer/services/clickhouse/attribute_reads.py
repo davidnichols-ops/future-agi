@@ -110,6 +110,17 @@ ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 15
 # line. The picker remains explicitly sample-labelled at this finite ceiling.
 ATTRIBUTE_VALUE_CURSOR_MAX_SEEN = 192
 
+# Attribute-key browse cursors use the same frozen newest-first physical walk
+# as value cursors, but carry only compact key digests.  The higher ceiling is
+# still small enough for the signed/compressed cursor to remain below the
+# public query-parameter limit while covering projects with a few hundred
+# distinct telemetry attributes without repeating options across pages.
+ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE = 50
+ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT = 64
+ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES = 15
+ATTRIBUTE_KEY_CURSOR_MAX_SEEN = 384
+ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES = 11
+
 _MIB = 1024 * 1024
 ATTRIBUTE_READ_SETTINGS: dict[str, Any] = {
     "max_threads": 1,
@@ -242,6 +253,20 @@ class AttributeValueCursorPageRead:
     next_resume_identity: PhysicalSpanIdentity | None
     next_resume_member_offset: int
     seen_value_digests: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AttributeKeyCursorPageRead:
+    """One verified, newest-first page of distinct attribute keys."""
+
+    rows: tuple[AttributeKeyRow, ...]
+    metadata: AttributeReadMetadata
+    has_more: bool
+    next_segment_end: datetime
+    next_before_identity: PhysicalSpanIdentity | None
+    next_resume_identity: PhysicalSpanIdentity | None
+    next_resume_key_offset: int
+    seen_key_digests: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -2603,6 +2628,251 @@ class AttributeReadSelector:
             ),
         )
 
+    def read_key_cursor_page(
+        self,
+        project_ids: Iterable[Any],
+        *,
+        page_size: int,
+        window_start: datetime,
+        window_end: datetime,
+        segment_end: datetime | None = None,
+        before_identity: PhysicalSpanIdentity | None = None,
+        resume_identity: PhysicalSpanIdentity | None = None,
+        resume_key_offset: int = 0,
+        seen_key_digests: Iterable[str] = (),
+    ) -> AttributeKeyCursorPageRead:
+        """Return a bounded newest-first page of verified unique keys.
+
+        The public cursor freezes the one-year browse window and advances over
+        physical spans, not an offset into a changing ``DISTINCT`` result. Each
+        candidate is replayed through latest state before a key is emitted. A
+        cursor also records compact digests of keys already returned, so keys
+        repeated on older spans do not reappear on later pages. Exact manual
+        key lookup remains the separate ``discover_keys(exact_key=...)`` path.
+        """
+
+        self._begin_operation()
+        projects = self._project_ids(project_ids)
+        page_size = int(page_size)
+        if not 1 <= page_size <= ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE:
+            raise ValueError("attribute-key page_size is out of range")
+        start = _utc(window_start)
+        end = _utc(window_end)
+        current_segment_end = _utc(segment_end or end)
+        if start >= end or not start < current_segment_end <= end:
+            raise ValueError("invalid attribute-key cursor window")
+        if not projects:
+            return AttributeKeyCursorPageRead(
+                (),
+                self._metadata(
+                    complete=True,
+                    error_code=None,
+                    window_start=start,
+                    window_end=end,
+                    query_count=self._query_count,
+                ),
+                False,
+                start,
+                None,
+                None,
+                0,
+                (),
+            )
+
+        def normalize_identity(
+            identity: PhysicalSpanIdentity | None,
+            *,
+            label: str,
+        ) -> PhysicalSpanIdentity | None:
+            if identity is None:
+                return None
+            normalized = (
+                str(identity[0]),
+                str(identity[1]),
+                str(identity[2]),
+                _utc(identity[3]),
+            )
+            if (
+                normalized[0] not in projects
+                or not start <= normalized[3] < current_segment_end
+            ):
+                raise ValueError(f"invalid attribute-key {label} cursor")
+            return normalized
+
+        before_identity = normalize_identity(before_identity, label="physical")
+        resume_identity = normalize_identity(resume_identity, label="resume")
+        resume_key_offset = int(resume_key_offset)
+        if resume_key_offset < 0:
+            raise ValueError("invalid attribute-key resume offset")
+        if resume_identity is None and resume_key_offset != 0:
+            raise ValueError("key offset requires a resume identity")
+
+        seen = tuple(dict.fromkeys(str(value) for value in seen_key_digests))
+        if len(seen) > ATTRIBUTE_KEY_CURSOR_MAX_SEEN or any(
+            len(value) != ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES * 2
+            or any(char not in "0123456789abcdef" for char in value)
+            for value in seen
+        ):
+            raise ValueError("invalid attribute-key seen state")
+        seen_set = set(seen)
+        emitted_digests: list[str] = []
+        emitted: dict[str, AttributeKeyRow] = {}
+        candidate_pages = 0
+        cursor_before = before_identity
+        next_resume_identity: PhysicalSpanIdentity | None = None
+        next_resume_key_offset = 0
+
+        def row_keys(row: dict[str, Any]) -> tuple[tuple[str, AttributeType], ...]:
+            keys, _unsupported = self._browse_row_keys(
+                row,
+                json_attribute_mode=self._json_attribute_mode,
+            )
+            return tuple(
+                sorted(
+                    keys.items(),
+                    key=lambda item: (item[0].casefold(), item[0], item[1]),
+                )
+            )
+
+        def consume_keys(
+            keys: tuple[tuple[str, AttributeType], ...],
+            *,
+            key_offset: int = 0,
+        ) -> tuple[bool, int]:
+            if key_offset > len(keys):
+                raise ValueError("invalid attribute-key resume offset")
+            for index in range(key_offset, len(keys)):
+                key, attr_type = keys[index]
+                digest = attribute_key_cursor_digest(key)
+                if digest in seen_set:
+                    continue
+                prior = emitted.get(digest)
+                if prior is not None:
+                    emitted[digest] = AttributeKeyRow(
+                        prior.key,
+                        prior.type,
+                        prior.count + 1,
+                    )
+                    continue
+                emitted[digest] = AttributeKeyRow(key, attr_type, 1)
+                emitted_digests.append(digest)
+                if len(emitted) >= page_size:
+                    next_offset = index + 1
+                    return next_offset >= len(keys), next_offset
+            return True, len(keys)
+
+        if resume_identity is not None:
+            resume_rows = self._verify_latest(
+                sql=_LATEST_BROWSE_SQL,
+                project_ids=projects,
+                candidate_ids=(resume_identity,),
+            )
+            resume_row = resume_rows[0] if resume_rows else None
+            if resume_row is not None and self._row_is_active_in_window(
+                resume_row, start, end
+            ):
+                fully_consumed, next_offset = consume_keys(
+                    row_keys(resume_row),
+                    key_offset=resume_key_offset,
+                )
+                if not fully_consumed:
+                    next_resume_identity = resume_identity
+                    next_resume_key_offset = next_offset
+                else:
+                    cursor_before = resume_identity
+            else:
+                cursor_before = resume_identity
+
+        browse_predicate = (
+            "length(attrs_string.keys) > 0 "
+            "OR length(attrs_number.keys) > 0 "
+            "OR length(attrs_bool.keys) > 0"
+        )
+        if self._reads_json_overflow:
+            browse_predicate = (
+                f"({browse_predicate}) OR attributes_extra NOT IN ('', '{{}}', 'null')"
+            )
+
+        while (
+            current_segment_end > start
+            and len(emitted) < page_size
+            and next_resume_identity is None
+            and candidate_pages < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
+            and len(seen_set) + len(emitted) < ATTRIBUTE_KEY_CURSOR_MAX_SEEN
+            # Every walk iteration issues one candidate query and one
+            # latest-state verification query.  A resumed wide row consumes
+            # one query before this loop, so leave room for the pair instead
+            # of crossing the selector's global per-operation ceiling.
+            and self._query_count + 2 <= ATTRIBUTE_READ_MAX_QUERY_COUNT
+        ):
+            segment_start = max(
+                start, current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
+            )
+            segment = (segment_start, current_segment_end)
+            candidate_ids, segment_truncated, _ = self._candidate_ids(
+                projects,
+                segment,
+                predicate=browse_predicate,
+                attribute_key=None,
+                ordered=True,
+                before_identity=cursor_before,
+                candidate_limit=ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT,
+                candidate_query_settings={"use_skip_indexes": 0},
+            )
+            candidate_pages += 1
+            rows = self._verify_latest(
+                sql=_LATEST_BROWSE_SQL,
+                project_ids=projects,
+                candidate_ids=candidate_ids,
+            )
+            rows_by_identity = {self._physical_identity(row): row for row in rows}
+            fully_processed_identity = cursor_before
+            for identity in candidate_ids:
+                row = rows_by_identity.get(identity)
+                if row is None or not self._row_is_active_in_window(row, start, end):
+                    fully_processed_identity = identity
+                    continue
+                fully_consumed, next_offset = consume_keys(row_keys(row))
+                if not fully_consumed:
+                    next_resume_identity = identity
+                    next_resume_key_offset = next_offset
+                    break
+                fully_processed_identity = identity
+                if len(emitted) >= page_size:
+                    break
+
+            cursor_before = fully_processed_identity
+            if next_resume_identity is not None or len(emitted) >= page_size:
+                break
+            if segment_truncated and candidate_ids:
+                cursor_before = candidate_ids[-1]
+                continue
+            current_segment_end = segment_start
+            cursor_before = None
+
+        exhausted = current_segment_end <= start and next_resume_identity is None
+        seen_after = (*seen, *emitted_digests)
+        capped = len(seen_after) >= ATTRIBUTE_KEY_CURSOR_MAX_SEEN
+        has_more = not exhausted and not capped
+        metadata = self._metadata(
+            complete=False,
+            error_code="sample_limit",
+            sampled=True,
+            window_start=start,
+            window_end=end,
+            query_count=self._query_count,
+        )
+        return AttributeKeyCursorPageRead(
+            tuple(emitted[digest] for digest in emitted_digests),
+            metadata,
+            has_more,
+            current_segment_end,
+            cursor_before,
+            next_resume_identity,
+            next_resume_key_offset,
+            seen_after,
+        )
+
     def read_value_cursor_page(
         self,
         project_ids: Iterable[Any],
@@ -3162,6 +3432,19 @@ def attribute_value_cursor_digest(attr_type: AttributeType, value: Any) -> str:
     return hashlib.blake2s(canonical, digest_size=16).hexdigest()
 
 
+def attribute_key_cursor_digest(key: str) -> str:
+    """Return the opaque identity used to de-duplicate key browse pages."""
+
+    # 80 bits keeps the complete 384-key signed continuation URL below the
+    # common 8 KiB request-line ceiling. At this bounded cardinality the
+    # birthday-collision probability is below 2^-71, while the signature—not
+    # this digest—provides cursor integrity.
+    return hashlib.blake2s(
+        str(key).encode("utf-8"),
+        digest_size=ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES,
+    ).hexdigest()
+
+
 def _value_search_text(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -3209,10 +3492,14 @@ def merge_read_metadata(
 
 
 __all__ = [
+    "ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES",
+    "ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE",
+    "ATTRIBUTE_KEY_CURSOR_MAX_SEEN",
     "ATTRIBUTE_READ_HORIZON_DAYS",
     "ATTRIBUTE_READ_MAX_PROJECTS",
     "ATTRIBUTE_READ_SETTINGS",
     "AttributeCardinalityRead",
+    "AttributeKeyCursorPageRead",
     "AttributeKeyInventory",
     "AttributeKeyRead",
     "AttributeKeyRow",
@@ -3220,12 +3507,15 @@ __all__ = [
     "AttributeReadMetadata",
     "AttributeReadSelector",
     "AttributeValueRead",
+    "AttributeValueCursorPageRead",
     "AttributeValueRow",
     "IncompleteLatestStateReplay",
     "InvalidAttributeKey",
     "InvalidAttributeSearch",
     "V2AttributeQueryExecutor",
     "adaptive_attribute_windows",
+    "attribute_key_cursor_digest",
+    "attribute_value_cursor_digest",
     "merge_read_metadata",
     "validate_attribute_key",
     "validate_attribute_search",

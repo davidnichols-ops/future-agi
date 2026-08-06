@@ -8,6 +8,7 @@ Endpoints:
 """
 
 from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from rest_framework.permissions import IsAuthenticated
@@ -29,6 +30,12 @@ from tracer.services.clickhouse.attribute_reads import (
     AttributeDetailRead,
     AttributeReadMetadata,
     AttributeReadSelector,
+)
+from tracer.services.clickhouse.list_cursor import (
+    ListCursorError,
+    cursor_scope_for_request,
+    decode_list_cursor,
+    encode_list_cursor,
 )
 from tracer.services.clickhouse.read_budget import (
     is_clickhouse_query_error,
@@ -72,12 +79,13 @@ def _is_expected_attribute_read_failure(exc: Exception) -> bool:
 
 class SpanAttributeKeysView(APIView):
     """
-    Discover all span attribute keys for a project.
+    Discover span attribute keys for a project.
 
-    Returns every distinct key across the string, number, and boolean attribute
-    maps together with its inferred type and occurrence count.
+    Cursor mode returns recent distinct keys newest-first in bounded pages;
+    exact ``q`` lookup remains available for keys outside that recent browse.
+    The no-page-size form is retained for older clients.
 
-    GET /api/traces/span-attribute-keys/?project_id=<uuid>
+    GET /api/traces/span-attribute-keys/?project_id=<uuid>&page_size=10
     """
 
     permission_classes = [IsAuthenticated]
@@ -92,13 +100,128 @@ class SpanAttributeKeysView(APIView):
         selector: AttributeReadSelector | None = None
         try:
             project_id = str(request.validated_query_data["project_id"])
-            exact_key = request.validated_query_data.get("q")
+            query_params = request.validated_query_data
+            exact_key = query_params.get("q")
+            page_size = query_params.get("page_size")
+            cursor_token = query_params.get("cursor")
             selector = AttributeReadSelector(
                 typed_only=True,
                 json_attribute_mode="structured",
             )
             if not _project_is_in_request_scope(request, project_id):
                 return self._gm.not_found("Project not found")
+
+            if page_size is not None:
+                page_size = int(page_size)
+                project_ids = [project_id]
+                cursor_scope = cursor_scope_for_request(
+                    request,
+                    project_ids=project_ids,
+                )
+                cursor_query = {
+                    "project_id": project_id,
+                    "mode": "recent_attribute_keys",
+                }
+                if cursor_token:
+                    cursor_state = decode_list_cursor(
+                        cursor_token,
+                        resource="span_attribute_keys",
+                        scope=cursor_scope,
+                        query=cursor_query,
+                        page_size=page_size,
+                    )
+                    if len(cursor_state.order) != 5:
+                        raise ListCursorError(
+                            "invalid_cursor",
+                            "The continuation cursor is invalid.",
+                        )
+                    (
+                        segment_end,
+                        raw_before_identity,
+                        raw_resume_identity,
+                        resume_key_offset,
+                        seen_digests,
+                    ) = cursor_state.order
+                    if (
+                        not isinstance(segment_end, datetime)
+                        or not isinstance(raw_before_identity, tuple)
+                        or len(raw_before_identity) not in {0, 4}
+                        or not isinstance(raw_resume_identity, tuple)
+                        or len(raw_resume_identity) not in {0, 4}
+                        or not isinstance(resume_key_offset, int)
+                        or resume_key_offset < 0
+                        or not isinstance(seen_digests, tuple)
+                        or cursor_state.seen_rows != len(seen_digests)
+                    ):
+                        raise ListCursorError(
+                            "invalid_cursor",
+                            "The continuation cursor is invalid.",
+                        )
+
+                    def restore_identity(raw_identity):
+                        if not raw_identity:
+                            return None
+                        if not all(
+                            isinstance(value, str) for value in raw_identity[:3]
+                        ) or not isinstance(raw_identity[3], datetime):
+                            raise ListCursorError(
+                                "invalid_cursor",
+                                "The continuation cursor is invalid.",
+                            )
+                        return raw_identity
+
+                    before_identity = restore_identity(raw_before_identity)
+                    resume_identity = restore_identity(raw_resume_identity)
+                    window_start = cursor_state.window_start
+                    window_end = cursor_state.window_end
+                else:
+                    window_end = datetime.now(UTC)
+                    window_start = window_end - timedelta(days=365)
+                    segment_end = window_end
+                    before_identity = None
+                    resume_identity = None
+                    resume_key_offset = 0
+                    seen_digests = ()
+
+                page_read = selector.read_key_cursor_page(
+                    project_ids,
+                    page_size=page_size,
+                    window_start=window_start,
+                    window_end=window_end,
+                    segment_end=segment_end,
+                    before_identity=before_identity,
+                    resume_identity=resume_identity,
+                    resume_key_offset=resume_key_offset,
+                    seen_key_digests=seen_digests,
+                )
+                next_cursor = None
+                if page_read.has_more:
+                    next_cursor = encode_list_cursor(
+                        resource="span_attribute_keys",
+                        scope=cursor_scope,
+                        query=cursor_query,
+                        page_size=page_size,
+                        window_start=window_start,
+                        window_end=window_end,
+                        order=(
+                            page_read.next_segment_end,
+                            page_read.next_before_identity or (),
+                            page_read.next_resume_identity or (),
+                            page_read.next_resume_key_offset,
+                            page_read.seen_key_digests,
+                        ),
+                        seen_rows=len(page_read.seen_key_digests),
+                    )
+                return Response(
+                    {
+                        "result": [asdict(row) for row in page_read.rows],
+                        **page_read.metadata.public_payload(),
+                        "has_more": page_read.has_more,
+                        "next_cursor": next_cursor,
+                    },
+                    status=200,
+                )
+
             read = selector.discover_keys([project_id], exact_key=exact_key)
             return Response(
                 {
@@ -106,6 +229,12 @@ class SpanAttributeKeysView(APIView):
                     **read.metadata.public_payload(),
                 },
                 status=200,
+            )
+        except ListCursorError as exc:
+            return self._gm.custom_error_response(
+                400,
+                str(exc),
+                code=exc.code,
             )
         except Exception as exc:
             if not _is_expected_attribute_read_failure(exc):

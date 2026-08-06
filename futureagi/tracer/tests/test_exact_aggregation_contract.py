@@ -1,3 +1,4 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
@@ -34,6 +35,7 @@ from tracer.services.exact_aggregation_cache import (
     exact_payload_is_complete,
     exact_refresh_state,
     finish_exact_refresh,
+    normalized_snapshot_identity,
     publish_exact_snapshot,
     publish_exact_snapshot_for_refresh,
     read_exact_snapshot,
@@ -278,6 +280,361 @@ def test_cold_miss_is_pending_poll_dedupes_then_exact_publish_becomes_visible():
 
 
 @pytest.mark.unit
+def test_observe_snapshot_survives_temporal_json_round_trip_and_poll_with_rows():
+    """The worker's JSON identity must address the caller's original key.
+
+    HTTP validation can leave datetime objects in graph filters, while the
+    Temporal boundary carries the normalized identity as JSON strings.  A
+    completed worker payload must therefore be visible to an ordinary poll
+    made with the original typed request, including every graph point.
+    """
+
+    cache.clear()
+    identity = {
+        "project_id": "22222222-2222-4222-8222-222222222222",
+        "filters": [
+            _time_filter(
+                datetime.fromisoformat("2026-07-01T00:00:00+00:00"),
+                datetime.fromisoformat("2026-08-01T00:00:00+00:00"),
+            )
+        ],
+        "interval": "day",
+        "metric_id": "latency",
+        "observe_type": "trace",
+    }
+    pending = {
+        "metric_name": "latency",
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+
+    with patch(
+        "tracer.tasks.exact_aggregation.refresh_exact_aggregation_snapshot.apply_async"
+    ) as enqueue:
+        first = read_or_schedule_exact_snapshot(
+            "observe-system-graph",
+            identity,
+            refresh=False,
+            pending_payload=pending,
+        )
+
+    task_kwargs = enqueue.call_args.kwargs["kwargs"]
+    wire_identity = json.loads(json.dumps(task_kwargs["identity"]))
+    assert wire_identity == normalized_snapshot_identity(identity)
+    assert snapshot_cache_key("observe-system-graph", identity) == snapshot_cache_key(
+        "observe-system-graph", wire_identity
+    )
+    assert first["query_status"] == "pending"
+
+    points = [
+        {
+            "timestamp": "2026-07-31T00:00:00+00:00",
+            "value": 1085.25,
+            "primary_traffic": 14,
+        }
+    ]
+    published = publish_exact_snapshot_for_refresh(
+        "observe-system-graph",
+        wire_identity,
+        {
+            "metric_name": "latency",
+            "data": points,
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+        },
+        task_kwargs["refresh_token"],
+    )
+    assert published is not None
+
+    polled = read_or_schedule_exact_snapshot(
+        "observe-system-graph",
+        identity,
+        refresh=False,
+        pending_payload=pending,
+    )
+
+    assert polled["data"] == points
+    assert polled["query_complete"] is True
+    assert polled["query_status"] == "complete"
+    assert polled["query_sampled"] is False
+    assert polled["query_cached"] is True
+    assert polled["query_refreshing"] is False
+
+
+@pytest.mark.unit
+def test_exact_system_graph_formats_nonempty_clickhouse_rows_without_loss():
+    bucket = datetime.fromisoformat("2026-07-31T00:00:00+00:00")
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(_query, _params, *, timeout_ms, settings):
+            assert timeout_ms > 0
+            assert settings["max_result_rows"] > 0
+            return SimpleNamespace(
+                data=[
+                    {
+                        "time_bucket": bucket,
+                        "avg_latency": 1085.25,
+                        "total_tokens": 42,
+                        "avg_cost": 0.02,
+                        "traffic_count": 14,
+                        "prompt_tokens": 24,
+                        "completion_tokens": 18,
+                        "error_rate": 0,
+                    }
+                ],
+                columns=[
+                    "time_bucket",
+                    "avg_latency",
+                    "total_tokens",
+                    "avg_cost",
+                    "traffic_count",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "error_rate",
+                ],
+            )
+
+    payload = read_exact_system_graph(
+        analytics=Analytics(),
+        project_id="22222222-2222-4222-8222-222222222222",
+        filters=[
+            _time_filter(
+                datetime.fromisoformat("2026-07-30T00:00:00+00:00"),
+                datetime.fromisoformat("2026-08-01T00:00:00+00:00"),
+            )
+        ],
+        interval="day",
+        metric_id="latency",
+        observe_type="trace",
+    )
+
+    observed = next(point for point in payload["data"] if point["value"])
+    assert observed == {
+        "timestamp": bucket.replace(tzinfo=None).isoformat(),
+        "value": 1085.25,
+        "primary_traffic": 14,
+    }
+    assert payload["query_rows_returned"] == 1
+    assert payload["query_complete"] is True
+    assert payload["query_sampled"] is False
+
+
+@pytest.mark.unit
+def test_dashboard_snapshot_poll_preserves_nested_metric_series_rows():
+    """Snapshot decoration must not strip dashboard metric/series data."""
+
+    cache.clear()
+    identity = {
+        "workspace_id": "33333333-3333-4333-8333-333333333333",
+        "query_config": {
+            "project_ids": ["22222222-2222-4222-8222-222222222222"],
+            "granularity": "day",
+            "time_range": {"preset": "30D"},
+            "metrics": [
+                {
+                    "id": "latency",
+                    "name": "latency",
+                    "type": "system_metric",
+                    "source": "traces",
+                    "aggregation": "avg",
+                }
+            ],
+        },
+    }
+    pending = {
+        "metrics": [],
+        "time_range": {
+            "start": "2026-07-01T00:00:00+00:00",
+            "end": "2026-08-01T00:00:00+00:00",
+        },
+        "granularity": "day",
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+
+    with patch(
+        "tracer.tasks.exact_aggregation.refresh_exact_aggregation_snapshot.apply_async"
+    ) as enqueue:
+        read_or_schedule_exact_snapshot(
+            "dashboard-query",
+            identity,
+            refresh=False,
+            pending_payload=pending,
+        )
+    task_kwargs = enqueue.call_args.kwargs["kwargs"]
+    point = {"timestamp": "2026-07-31T00:00:00+00:00", "value": 1085.25}
+    metric = {
+        "id": "latency",
+        "name": "Latency",
+        "aggregation": "avg",
+        "unit": "ms",
+        "series": [{"name": "total", "data": [point]}],
+        "query_complete": True,
+        "query_status": "complete",
+        "query_sampled": False,
+    }
+    published = publish_exact_snapshot_for_refresh(
+        "dashboard-query",
+        task_kwargs["identity"],
+        {
+            "metrics": [metric],
+            "time_range": pending["time_range"],
+            "granularity": "day",
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+        },
+        task_kwargs["refresh_token"],
+    )
+    assert published is not None
+
+    polled = read_or_schedule_exact_snapshot(
+        "dashboard-query",
+        identity,
+        refresh=False,
+        pending_payload=pending,
+    )
+
+    assert polled["metrics"] == [metric]
+    assert polled["metrics"][0]["series"][0]["data"] == [point]
+    assert polled["query_complete"] is True
+    assert polled["query_cached"] is True
+
+
+@pytest.mark.unit
+def test_eval_usage_chart_and_logs_pages_publish_and_poll_independently():
+    """A chart probe must never satisfy a differently-sized logs page.
+
+    Eval Usage returns aggregates and one requested table page in the same
+    envelope.  ``page`` and ``page_size`` are consequently stable semantic
+    identity fields, not incidental polling fields.
+    """
+
+    cache.clear()
+    common = {
+        "organization_id": "11111111-1111-4111-8111-111111111111",
+        "workspace_id": "33333333-3333-4333-8333-333333333333",
+        "template_id": "44444444-4444-4444-8444-444444444444",
+        "period": "30d",
+        "start_date": None,
+        "end_date": None,
+    }
+    chart_identity = {**common, "page": 0, "page_size": 1}
+    logs_identity = {**common, "page": 0, "page_size": 25}
+
+    def pending(identity):
+        return {
+            "template_id": identity["template_id"],
+            "is_composite": False,
+            "completeness": "pending",
+            "unavailable_fields": [],
+            "stats": {
+                "total_runs": 0,
+                "runs_period": 0,
+                "success_count": 0,
+                "error_count": 0,
+                "pass_rate": 0.0,
+            },
+            "chart": [],
+            "table": [],
+            "logs": {
+                "total": 0,
+                "page": identity["page"],
+                "page_size": identity["page_size"],
+            },
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+        }
+
+    with patch(
+        "tracer.tasks.exact_aggregation.refresh_exact_aggregation_snapshot.apply_async"
+    ) as enqueue:
+        read_or_schedule_exact_snapshot(
+            "eval-usage",
+            chart_identity,
+            refresh=False,
+            pending_payload=pending(chart_identity),
+        )
+        read_or_schedule_exact_snapshot(
+            "eval-usage",
+            logs_identity,
+            refresh=False,
+            pending_payload=pending(logs_identity),
+        )
+
+    assert enqueue.call_count == 2
+    chart_task = enqueue.call_args_list[0].kwargs["kwargs"]
+    logs_task = enqueue.call_args_list[1].kwargs["kwargs"]
+    assert snapshot_cache_key(
+        "eval-usage", chart_task["identity"]
+    ) != snapshot_cache_key("eval-usage", logs_task["identity"])
+
+    def complete(identity, table):
+        return {
+            **pending(identity),
+            "completeness": "complete",
+            "stats": {
+                "total_runs": 24,
+                "runs_period": 24,
+                "success_count": 24,
+                "error_count": 0,
+                "pass_rate": 100.0,
+            },
+            "chart": [{"timestamp": "2026-07-31T00:00:00+00:00", "calls": 24}],
+            "table": table,
+            "logs": {
+                "total": 24,
+                "page": identity["page"],
+                "page_size": identity["page_size"],
+            },
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+        }
+
+    chart_row = {"row_id": "chart-probe-row"}
+    log_rows = [{"row_id": f"log-row-{index}"} for index in range(24)]
+    assert publish_exact_snapshot_for_refresh(
+        "eval-usage",
+        chart_task["identity"],
+        complete(chart_identity, [chart_row]),
+        chart_task["refresh_token"],
+    )
+    assert publish_exact_snapshot_for_refresh(
+        "eval-usage",
+        logs_task["identity"],
+        complete(logs_identity, log_rows),
+        logs_task["refresh_token"],
+    )
+
+    chart_poll = read_or_schedule_exact_snapshot(
+        "eval-usage",
+        chart_identity,
+        refresh=False,
+        pending_payload=pending(chart_identity),
+    )
+    logs_poll = read_or_schedule_exact_snapshot(
+        "eval-usage",
+        logs_identity,
+        refresh=False,
+        pending_payload=pending(logs_identity),
+    )
+
+    assert chart_poll["table"] == [chart_row]
+    assert chart_poll["logs"] == {"total": 24, "page": 0, "page_size": 1}
+    assert logs_poll["table"] == log_rows
+    assert logs_poll["logs"] == {"total": 24, "page": 0, "page_size": 25}
+    assert chart_poll["stats"] == logs_poll["stats"]
+    assert chart_poll["chart"] == logs_poll["chart"]
+
+
+@pytest.mark.unit
 def test_concurrent_cold_requests_enqueue_only_one_refresh():
     cache.clear()
     identity = {"project": "p", "metric": "cost"}
@@ -308,6 +665,112 @@ def test_concurrent_cold_requests_enqueue_only_one_refresh():
     assert enqueue.call_count == 1
     assert all(result["query_status"] == "pending" for result in results)
     assert all(result["query_refreshing"] is True for result in results)
+
+
+@pytest.mark.unit
+def test_refresh_claim_uses_short_dispatch_lease_then_activity_promotes_it(
+    monkeypatch,
+):
+    """Only an activity that actually starts may hold the one-hour lease."""
+
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    class RecordingCache:
+        def __init__(self):
+            self.values = {}
+            self.timeouts = []
+
+        def add(self, key, value, *, timeout):
+            if key in self.values:
+                return False
+            self.values[key] = value
+            self.timeouts.append(("add", key, timeout))
+            return True
+
+        def set(self, key, value, *, timeout):
+            self.values[key] = value
+            self.timeouts.append(("set", key, timeout))
+
+        def get(self, key):
+            return self.values.get(key)
+
+    recording_cache = RecordingCache()
+    monkeypatch.setattr(cache_module, "cache", recording_cache)
+    monkeypatch.setattr(cache_module, "_refresh_dispatch_seconds", lambda: 30)
+    monkeypatch.setattr(cache_module, "_refresh_lock_seconds", lambda: 3600)
+    identity = {"project": "p", "metric": "latency"}
+
+    token = cache_module.begin_exact_refresh("observe-lease-test", identity)
+
+    assert token
+    assert [timeout for _op, _key, timeout in recording_cache.timeouts] == [30, 30]
+    assert cache_module.activate_exact_refresh("observe-lease-test", identity, token)
+    assert [timeout for _op, _key, timeout in recording_cache.timeouts[-2:]] == [
+        3600,
+        3600,
+    ]
+
+
+@pytest.mark.unit
+def test_expired_unstarted_dispatch_is_reclaimed_by_an_ordinary_poll(monkeypatch):
+    """A Temporal pre-activity failure must not leave a one-hour pending UI."""
+
+    from tracer.services import exact_aggregation_cache as cache_module
+    from tracer.tasks import exact_aggregation as task_module
+
+    cache.clear()
+    namespace = "observe-unstarted-reclaim"
+    identity = {"project": "p", "metric": "traffic"}
+    pending = {
+        "metric_name": "traffic",
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+    with patch(
+        "tracer.tasks.exact_aggregation.refresh_exact_aggregation_snapshot.apply_async"
+    ) as enqueue:
+        first = read_or_schedule_exact_snapshot(
+            namespace,
+            identity,
+            refresh=False,
+            pending_payload=pending,
+        )
+        first_task = enqueue.call_args
+
+        # Model the short dispatch lease expiring because a mixed-version
+        # worker rejected the unknown activity before this function ran.
+        cache.delete(cache_module._refresh_lock_key(namespace, identity))
+        cache.delete(cache_module._refresh_state_key(namespace, identity))
+
+        second = read_or_schedule_exact_snapshot(
+            namespace,
+            identity,
+            refresh=False,
+            pending_payload=pending,
+        )
+        second_task = enqueue.call_args
+
+    first_token = first_task.kwargs["kwargs"]["refresh_token"]
+    second_token = second_task.kwargs["kwargs"]["refresh_token"]
+    assert enqueue.call_count == 2
+    assert first_token != second_token
+    assert first_task.kwargs["task_id"] != second_task.kwargs["task_id"]
+    assert first["query_refreshing"] is True
+    assert second["query_refreshing"] is True
+
+    monkeypatch.setattr(
+        task_module,
+        "_load_exact_payload",
+        lambda *_args: pytest.fail("expired activity must not query ClickHouse"),
+    )
+    task_module.refresh_exact_aggregation_snapshot.run_sync(
+        namespace=namespace,
+        identity=identity,
+        refresh_token=first_token,
+    )
+    assert refresh_claim_is_current(namespace, identity, second_token) is True
 
 
 @pytest.mark.unit
@@ -579,6 +1042,14 @@ def test_redis_lua_fence_rejects_old_token_and_atomically_publishes_new(monkeypa
                     self.values[state_key] = failed_state
                 self.values.pop(lock_key, None)
                 return 1
+            if script == cache_module._REDIS_FENCED_ACTIVATE_SCRIPT:
+                lock_key, state_key = keys
+                token, _ttl_ms, running_state = args
+                if self.values.get(lock_key) != token:
+                    return 0
+                self.values[lock_key] = token
+                self.values[state_key] = running_state
+                return 1
             raise AssertionError("unexpected Redis script")
 
     class FakeRedisAdapter:
@@ -638,6 +1109,9 @@ def test_redis_lua_fence_rejects_old_token_and_atomically_publishes_new(monkeypa
     assert adapter.raw.values[lock_key] == adapter.encode(new_token)
     assert snapshot_key not in adapter.raw.values
 
+    assert cache_module.activate_exact_refresh(namespace, identity, old_token) is False
+    assert cache_module.activate_exact_refresh(namespace, identity, new_token) is True
+
     published = cache_module.publish_exact_snapshot_for_refresh(
         namespace,
         identity,
@@ -652,6 +1126,8 @@ def test_redis_lua_fence_rejects_old_token_and_atomically_publishes_new(monkeypa
     assert [call[0] for call in adapter.raw.calls] == [
         cache_module._REDIS_FENCED_PUBLISH_SCRIPT,
         cache_module._REDIS_FENCED_FINISH_SCRIPT,
+        cache_module._REDIS_FENCED_ACTIVATE_SCRIPT,
+        cache_module._REDIS_FENCED_ACTIVATE_SCRIPT,
         cache_module._REDIS_FENCED_PUBLISH_SCRIPT,
     ]
 

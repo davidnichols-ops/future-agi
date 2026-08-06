@@ -82,14 +82,12 @@ const EvalUsageTab = ({
     data: chartData,
     isLoading: chartLoading,
     isFetching: chartFetching,
-    isError: chartError,
     refresh: refreshChart,
   } = useEvalUsageChart(templateId, period, dateOption, dateFilter);
   const {
     data: logsData,
     isLoading: logsLoading,
     isFetching: logsFetching,
-    isError: logsError,
     refresh: refreshLogs,
   } = useEvalUsageLogs(templateId, {
     page,
@@ -99,15 +97,55 @@ const EvalUsageTab = ({
     dateFilter,
   });
 
-  const displayChartData = chartData?.queryPending ? undefined : chartData;
-  const displayLogsData = logsData?.queryPending ? undefined : logsData;
+  const chartSnapshotKey = useMemo(
+    () => JSON.stringify([templateId, period, dateOption, dateFilter]),
+    [dateFilter, dateOption, period, templateId],
+  );
+  const logsSnapshotKey = useMemo(
+    () =>
+      JSON.stringify([
+        templateId,
+        period,
+        dateOption,
+        dateFilter,
+        page,
+        pageSize,
+      ]),
+    [dateFilter, dateOption, page, pageSize, period, templateId],
+  );
+  const [lastExactChart, setLastExactChart] = useState(null);
+  const [lastExactLogs, setLastExactLogs] = useState(null);
+  const currentExactChart =
+    chartData && !chartData.queryPending ? chartData : undefined;
+  const currentExactLogs =
+    logsData && !logsData.queryPending ? logsData : undefined;
+
+  React.useEffect(() => {
+    if (!currentExactChart) return;
+    setLastExactChart({ key: chartSnapshotKey, data: currentExactChart });
+  }, [chartSnapshotKey, currentExactChart]);
+
+  React.useEffect(() => {
+    if (!currentExactLogs) return;
+    setLastExactLogs({ key: logsSnapshotKey, data: currentExactLogs });
+  }, [currentExactLogs, logsSnapshotKey]);
+
+  const displayChartData =
+    currentExactChart ||
+    (lastExactChart?.key === chartSnapshotKey
+      ? lastExactChart.data
+      : undefined);
+  const displayLogsData =
+    currentExactLogs ||
+    (lastExactLogs?.key === logsSnapshotKey ? lastExactLogs.data : undefined);
   const stats = displayChartData?.stats || {};
   const chart = displayChartData?.chart || [];
   const totalLogs = displayLogsData?.pagination?.total || 0;
-  const chartUnavailable =
-    (chartError || chartData?.queryPending) && !displayChartData;
-  const logsUnavailable =
-    (logsError || logsData?.queryPending) && !displayLogsData;
+  // Empty/zero states are valid only after a complete exact response. Missing,
+  // pending, and failed responses remain neutral preparation states; a prior
+  // exact snapshot for the same query stays visible during refresh/polling.
+  const chartUnavailable = !displayChartData;
+  const logsUnavailable = !displayLogsData;
   const isRefreshing =
     chartFetching ||
     logsFetching ||

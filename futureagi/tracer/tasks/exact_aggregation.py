@@ -15,6 +15,7 @@ import structlog
 
 from tfc.temporal import temporal_activity
 from tracer.services.exact_aggregation_cache import (
+    activate_exact_refresh,
     exact_payload_is_complete,
     finish_exact_refresh,
     publish_exact_snapshot_for_refresh,
@@ -174,9 +175,11 @@ def refresh_exact_aggregation_snapshot(
 
     succeeded = False
     try:
-        # A redelivered activity, or an activity that sat in the queue beyond
-        # the refresh lock, must not publish over a newer refresh.
-        if not refresh_claim_is_current(
+        # A workflow accepted by an old/misconfigured worker can fail before
+        # this function is called.  Claims therefore begin as short dispatch
+        # leases and are promoted here, before ClickHouse is touched.  A late
+        # delivery after lease expiry is fenced out by a newer poll's token.
+        if not activate_exact_refresh(
             namespace,
             identity,
             refresh_token,

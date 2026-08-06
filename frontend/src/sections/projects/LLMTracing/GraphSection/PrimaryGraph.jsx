@@ -382,12 +382,10 @@ const PrimaryGraph = ({
       if (!pollingRef.current) pollAttemptRef.current = 0;
       return response;
     },
-    select: (d) => ({
-      ...(d.data?.result || {}),
-      queryReadState: getExactAggregationReadState(d.data),
-      query_completed_at:
-        d.data?.result?.query_completed_at ?? d.data?.query_completed_at,
-    }),
+    // Keep the response envelope. The exactness/refresh contract can be
+    // published either on `result` or on its wrapper, and stripping the
+    // wrapper makes a queued response look like an ordinary empty graph.
+    select: (d) => d.data,
     enabled: !!effectiveObserveId && !!metricDef.id,
     staleTime: Infinity,
     refetchOnWindowFocus: false,
@@ -538,14 +536,26 @@ const PrimaryGraph = ({
     }
   }, [graphData, graphError, notifyAggregationRefresh]);
 
+  // A completed response is already safe to render in this render pass. Do
+  // not wait for the persistence effect below: that one-frame gap used to
+  // advertise "No data" even when the exact response contained points.
+  const currentExactSnapshot =
+    graphData && graphReadState === "complete"
+      ? {
+          key: snapshotKey,
+          data: graphData,
+          updatedAt: getQueryCompletedAt(graphData),
+        }
+      : null;
   const exactSnapshot =
-    lastExactSnapshot?.key === snapshotKey ? lastExactSnapshot : null;
+    currentExactSnapshot ||
+    (lastExactSnapshot?.key === snapshotKey ? lastExactSnapshot : null);
   const displayGraphData = exactSnapshot?.data;
-  const graphStatusMessage = refreshUnavailable
-    ? exactSnapshot
-      ? null
-      : AGGREGATION_PREPARING_MESSAGE
-    : null;
+  const graphStatusMessage =
+    !exactSnapshot &&
+    (refreshUnavailable || graphError || graphReadState !== "complete")
+      ? AGGREGATION_PREPARING_MESSAGE
+      : null;
 
   // Parse API data → [{timestamp, value, primary_traffic}, ...]
   const { metricData, trafficData } = useMemo(() => {

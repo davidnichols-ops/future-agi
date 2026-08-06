@@ -150,8 +150,38 @@ const scaleValue = (value, scale) => {
   return Number((numeric * scale).toPrecision(15));
 };
 
+const COMPLETED_STATUS_ALIASES = new Set([
+  "ended",
+  "done",
+  "complete",
+  "completed",
+  "success",
+  "succeeded",
+]);
+const IN_PROGRESS_STATUS_ALIASES = new Set([
+  "in-progress",
+  "in_progress",
+  "ongoing",
+  "started",
+  "ringing",
+  "queued",
+  "pending",
+]);
+
+export const normalizeVoiceCallStatus = (value) => {
+  if (Array.isArray(value)) {
+    return [...new Set(value.map(normalizeVoiceCallStatus))];
+  }
+  if (typeof value !== "string") return value;
+  const normalized = value.trim().toLowerCase();
+  if (COMPLETED_STATUS_ALIASES.has(normalized)) return "completed";
+  if (IN_PROGRESS_STATUS_ALIASES.has(normalized)) return "in-progress";
+  return normalized;
+};
+
 export const toVoiceCallApiValue = (fieldId, value) => {
   const field = getVoiceCallFilterField(fieldId);
+  if (field?.value === "call_status") return normalizeVoiceCallStatus(value);
   const scale =
     field?.apiValueScale ||
     (field?.legacyWireValues?.includes(fieldId)
@@ -162,6 +192,7 @@ export const toVoiceCallApiValue = (fieldId, value) => {
 
 export const fromVoiceCallApiValue = (fieldId, value) => {
   const field = getVoiceCallFilterField(fieldId);
+  if (field?.value === "call_status") return normalizeVoiceCallStatus(value);
   const scale =
     field?.apiValueScale ||
     (field?.legacyWireValues?.includes(fieldId)

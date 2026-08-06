@@ -28,6 +28,7 @@ from tracer.serializers.span_attributes import (
 from tracer.services.clickhouse.attribute_reads import (
     _LATEST_CARDINALITY_SQL,
     _STRATIFIED_CANDIDATE_SQL,
+    ATTRIBUTE_KEY_CURSOR_MAX_SEEN,
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_MAX_PROJECTS,
     ATTRIBUTE_READ_MAX_QUERY_COUNT,
@@ -39,6 +40,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_VALUE_CURSOR_MAX_SEEN,
     AttributeCardinalityRead,
     AttributeDetailRead,
+    AttributeKeyCursorPageRead,
     AttributeKeyRead,
     AttributeKeyRow,
     AttributeQueryPage,
@@ -51,6 +53,7 @@ from tracer.services.clickhouse.attribute_reads import (
     V2AttributeQueryExecutor,
     _unix_microseconds,
     adaptive_attribute_windows,
+    attribute_key_cursor_digest,
     attribute_value_cursor_digest,
     merge_read_metadata,
     validate_attribute_key,
@@ -3846,6 +3849,163 @@ def test_span_attribute_keys_contract_accepts_exact_probe_and_read_state():
         "query_window_start",
         "query_window_end",
     } <= set(SpanAttributeKeysResponseSerializer().fields)
+
+
+def test_span_attribute_key_cursor_pages_resume_wide_rows_without_duplicates(
+    monkeypatch,
+):
+    identity = (PROJECT_A, "trace-1", "span-1", NOW - timedelta(hours=1))
+    row = {
+        "project_id": PROJECT_A,
+        "trace_id": "trace-1",
+        "id": "span-1",
+        "start_time": identity[3],
+        "is_deleted": 0,
+        "string_keys": ["alpha", "beta"],
+        "number_keys": ["alpha"],
+        "boolean_keys": [],
+        "attributes_extra": "{}",
+    }
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    monkeypatch.setattr(
+        selector,
+        "_candidate_ids",
+        lambda *_args, **_kwargs: ((identity,), False, {}),
+    )
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **_kwargs: [row],
+    )
+
+    first = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=1,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+    )
+    second = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=1,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        before_identity=first.next_before_identity,
+        resume_identity=first.next_resume_identity,
+        resume_key_offset=first.next_resume_key_offset,
+        seen_key_digests=first.seen_key_digests,
+    )
+
+    assert [(item.key, item.type) for item in first.rows] == [("alpha", "string")]
+    assert [(item.key, item.type) for item in second.rows] == [("beta", "string")]
+    assert second.seen_key_digests == (
+        attribute_key_cursor_digest("alpha"),
+        attribute_key_cursor_digest("beta"),
+    )
+    assert len(second.seen_key_digests) < ATTRIBUTE_KEY_CURSOR_MAX_SEEN
+
+
+def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypatch):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    identity = (PROJECT_A, "trace-1", "span-1", NOW - timedelta(hours=1))
+    seen = (attribute_key_cursor_digest("alpha"),)
+    calls = []
+
+    def read_page(self, project_ids, **kwargs):
+        calls.append((project_ids, kwargs))
+        if len(calls) == 1:
+            return AttributeKeyCursorPageRead(
+                (AttributeKeyRow("alpha", "string", 1),),
+                _metadata(complete=False, error_code="sample_limit", sampled=True),
+                True,
+                kwargs["window_end"],
+                identity,
+                None,
+                0,
+                seen,
+            )
+        return AttributeKeyCursorPageRead(
+            (AttributeKeyRow("beta", "number", 1),),
+            _metadata(complete=False, error_code="sample_limit", sampled=True),
+            False,
+            kwargs["window_start"],
+            None,
+            None,
+            0,
+            (*seen, attribute_key_cursor_digest("beta")),
+        )
+
+    monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
+    first_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"project_id": PROJECT_A, "page_size": 10},
+    )
+    first_response = SpanAttributeKeysView.as_view()(first_request)
+
+    assert first_response.status_code == 200
+    assert first_response.data["result"][0]["key"] == "alpha"
+    assert first_response.data["has_more"] is True
+    cursor = first_response.data["next_cursor"]
+    assert cursor
+
+    second_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"project_id": PROJECT_A, "page_size": 10, "cursor": cursor},
+    )
+    second_response = SpanAttributeKeysView.as_view()(second_request)
+
+    assert second_response.status_code == 200
+    assert second_response.data["result"][0]["key"] == "beta"
+    assert calls[1][1]["before_identity"] == identity
+    assert calls[1][1]["seen_key_digests"] == seen
+
+    mismatched_request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"project_id": PROJECT_B, "page_size": 10, "cursor": cursor},
+    )
+    mismatched_response = SpanAttributeKeysView.as_view()(mismatched_request)
+    assert mismatched_response.status_code == 400
+    assert len(calls) == 2
+
+
+def test_span_attribute_key_cursor_full_url_stays_below_request_line_limit():
+    digests = tuple(
+        attribute_key_cursor_digest(f"attribute-{index}")
+        for index in range(ATTRIBUTE_KEY_CURSOR_MAX_SEEN)
+    )
+    scope = {
+        "principal_id": "00000000-0000-4000-8000-000000000001",
+        "auth_type": "TokenAuthentication",
+        "auth_id": "00000000-0000-4000-8000-000000000002",
+        "organization_id": "00000000-0000-4000-8000-000000000003",
+        "workspace_id": "00000000-0000-4000-8000-000000000004",
+        "project_ids": [PROJECT_A],
+    }
+    cursor = encode_list_cursor(
+        resource="span_attribute_keys",
+        scope=scope,
+        query={"project_id": PROJECT_A, "mode": "recent_attribute_keys"},
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        order=(NOW, (), (), 0, digests),
+        seen_rows=len(digests),
+    )
+    full_url = "https://api.futureagi.com/api/traces/span-attribute-keys/?" + urlencode(
+        {"project_id": PROJECT_A, "page_size": 10, "cursor": cursor}
+    )
+
+    assert len(full_url.encode("utf-8")) < 8 * 1024
 
 
 def test_span_attribute_detail_contract_validates_key_and_exposes_read_state():

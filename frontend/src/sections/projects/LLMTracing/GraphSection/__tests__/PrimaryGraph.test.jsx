@@ -405,4 +405,33 @@ describe("PrimaryGraph", () => {
       exactCompletion,
     );
   });
+
+  it("renders a completed exact response without an intermediate empty label", async () => {
+    axios.post.mockResolvedValue({
+      data: {
+        result: {
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 12,
+              primary_traffic: 1,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+
+    renderWithQueryClient(
+      <PrimaryGraph observeIdOverride="project-override" />,
+    );
+
+    expect(await screen.findByTestId("apex-chart")).toBeInTheDocument();
+    expect(
+      screen.queryByText("No data available for this time range"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
+  });
 });

@@ -4684,13 +4684,26 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             published_has_more = (
                 bool(bounded_page.complete and bounded_page.has_more) or cursor_has_more
             )
+            # ``bounded_page.complete`` describes whether this one transport
+            # read exhausted/proved the whole requested window.  A signed
+            # cursor checkpoint is a different, exact public contract: every
+            # returned row was latest-state classified in canonical order and
+            # the token resumes at the first unclassified position.  Reporting
+            # that safe chunk as ``degraded`` made the UI show a query failure
+            # even though no sampled or unproven row was exposed.  Totals stay
+            # explicitly lower-bound until the cursor chain is exhausted.
+            public_chunk_complete = bounded_page.complete or cursor_has_more
             metadata.update(
                 {
                     "total_rows_is_lower_bound": True,
                     "has_more": published_has_more,
-                    "query_complete": bounded_page.complete,
-                    "query_status": bounded_page.status,
-                    "query_error_code": bounded_page.error_code,
+                    "query_complete": public_chunk_complete,
+                    "query_status": (
+                        "complete" if public_chunk_complete else bounded_page.status
+                    ),
+                    "query_error_code": (
+                        None if public_chunk_complete else bounded_page.error_code
+                    ),
                     "query_elapsed_ms": round(read_deadline.elapsed_ms(), 3),
                     "query_count": query_count,
                     "query_rows_returned": query_rows_returned,
@@ -5318,16 +5331,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         next_cursor = None
         cursor_seen_rows = cursor_seen_before + len(page_rows)
         cursor_has_more = False
-        if (
-            cursor_enabled
-            and (
-                (bounded_page.complete and bounded_page.has_more)
-                or (
-                    not bounded_page.complete
-                    and (
-                        bounded_page.has_more
-                        or bounded_page.continuation_slice_end is not None
-                    )
+        if cursor_enabled and (
+            (bounded_page.complete and bounded_page.has_more)
+            or (
+                not bounded_page.complete
+                and (
+                    bounded_page.has_more
+                    or bounded_page.continuation_slice_end is not None
                 )
             )
         ):
