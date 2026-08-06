@@ -21,7 +21,7 @@ class SpanAttributeProjectQuerySerializer(serializers.Serializer):
     cursor = serializers.CharField(
         required=False,
         allow_blank=False,
-        max_length=16_384,
+        max_length=8_192,
     )
 
     def validate(self, attrs):
@@ -97,7 +97,19 @@ class SpanAttributeKeysResponseSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
         allow_blank=False,
+        max_length=8_192,
     )
+    browse_mode = serializers.ChoiceField(
+        choices=["recent_suggestions"],
+        required=False,
+    )
+    browse_status = serializers.ChoiceField(
+        choices=["continuation", "exhausted", "limit_reached"],
+        required=False,
+    )
+    browse_limit = serializers.IntegerField(required=False, min_value=1)
+    lookup_mode = serializers.ChoiceField(choices=["exact"], required=False)
+    exact_match = serializers.BooleanField(required=False)
 
 
 class SpanAttributeValueSerializer(serializers.Serializer):

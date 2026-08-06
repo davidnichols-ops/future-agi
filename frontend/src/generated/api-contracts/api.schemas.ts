@@ -3858,6 +3858,29 @@ export const SpanAttributeKeysResponseApiQueryErrorCode = {
   query_failed: 'query_failed',
 } as const;
 
+export type SpanAttributeKeysResponseApiBrowseMode = typeof SpanAttributeKeysResponseApiBrowseMode[keyof typeof SpanAttributeKeysResponseApiBrowseMode];
+
+
+export const SpanAttributeKeysResponseApiBrowseMode = {
+  recent_suggestions: 'recent_suggestions',
+} as const;
+
+export type SpanAttributeKeysResponseApiBrowseStatus = typeof SpanAttributeKeysResponseApiBrowseStatus[keyof typeof SpanAttributeKeysResponseApiBrowseStatus];
+
+
+export const SpanAttributeKeysResponseApiBrowseStatus = {
+  continuation: 'continuation',
+  exhausted: 'exhausted',
+  limit_reached: 'limit_reached',
+} as const;
+
+export type SpanAttributeKeysResponseApiLookupMode = typeof SpanAttributeKeysResponseApiLookupMode[keyof typeof SpanAttributeKeysResponseApiLookupMode];
+
+
+export const SpanAttributeKeysResponseApiLookupMode = {
+  exact: 'exact',
+} as const;
+
 export type SpanAttributeKeyApiType = typeof SpanAttributeKeyApiType[keyof typeof SpanAttributeKeyApiType];
 
 
@@ -3883,6 +3906,18 @@ export interface SpanAttributeKeysResponseApi {
   query_error_code?: SpanAttributeKeysResponseApiQueryErrorCode;
   query_window_start: string;
   query_window_end: string;
+  has_more?: boolean;
+  /**
+     * @minLength 1
+     * @maxLength 8192
+     */
+  next_cursor?: string;
+  browse_mode?: SpanAttributeKeysResponseApiBrowseMode;
+  browse_status?: SpanAttributeKeysResponseApiBrowseStatus;
+  /** @minimum 1 */
+  browse_limit?: number;
+  lookup_mode?: SpanAttributeKeysResponseApiLookupMode;
+  exact_match?: boolean;
 }
 
 export type SpanAttributeValuesResponseApiQueryStatus = typeof SpanAttributeValuesResponseApiQueryStatus[keyof typeof SpanAttributeValuesResponseApiQueryStatus];
@@ -24505,6 +24540,16 @@ project_id: string;
  * @maxLength 512
  */
 q?: string;
+/**
+ * @minimum 1
+ * @maximum 50
+ */
+page_size?: number;
+/**
+ * @minLength 1
+ * @maxLength 8192
+ */
+cursor?: string;
 };
 
 export type ApiTracesSpanAttributeValuesListParams = {

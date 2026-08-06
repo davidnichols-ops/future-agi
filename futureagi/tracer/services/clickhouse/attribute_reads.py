@@ -42,6 +42,7 @@ logger = structlog.get_logger(__name__)
 AttributeType = Literal["string", "number", "boolean", "array", "map", "json"]
 JsonAttributeMode = Literal["none", "scalars", "arrays", "structured", "all"]
 QueryStatus = Literal["complete", "sampled", "degraded"]
+AttributeKeyBrowseStatus = Literal["continuation", "exhausted", "limit_reached"]
 PhysicalSpanIdentity = tuple[str, str, str, datetime]
 JsonScalar = str | int | float | bool
 AttributeValue = str | int | float | bool | tuple[JsonScalar, ...]
@@ -111,15 +112,20 @@ ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 15
 ATTRIBUTE_VALUE_CURSOR_MAX_SEEN = 192
 
 # Attribute-key browse cursors use the same frozen newest-first physical walk
-# as value cursors, but carry only compact key digests.  The higher ceiling is
-# still small enough for the signed/compressed cursor to remain below the
-# public query-parameter limit while covering projects with a few hundred
-# distinct telemetry attributes without repeating options across pages.
+# as value cursors. Keep full 128-bit key identities and a lower suggestion cap
+# so the worst reachable continuation (including one 255-byte trace id and one
+# 255-byte span id) stays below common 8 KiB request-line limits. This is a
+# recent-suggestion vocabulary; exact key lookup is a separate endpoint mode.
 ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE = 50
 ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT = 64
 ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES = 15
-ATTRIBUTE_KEY_CURSOR_MAX_SEEN = 384
-ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES = 11
+ATTRIBUTE_KEY_CURSOR_MAX_SEEN = 224
+ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES = 16
+# The absolute returned-token guard covers unexpected high-entropy identity
+# shapes as well as the modeled 255-byte trace/span maximum. The endpoint adds
+# roughly 130 URL-encoded bytes around this token, leaving ample space below an
+# 8 KiB request line.
+ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES = 7_500
 
 _MIB = 1024 * 1024
 ATTRIBUTE_READ_SETTINGS: dict[str, Any] = {
@@ -262,6 +268,7 @@ class AttributeKeyCursorPageRead:
     rows: tuple[AttributeKeyRow, ...]
     metadata: AttributeReadMetadata
     has_more: bool
+    browse_status: AttributeKeyBrowseStatus
     next_segment_end: datetime
     next_before_identity: PhysicalSpanIdentity | None
     next_resume_identity: PhysicalSpanIdentity | None
@@ -2672,6 +2679,7 @@ class AttributeReadSelector:
                     query_count=self._query_count,
                 ),
                 False,
+                "exhausted",
                 start,
                 None,
                 None,
@@ -2701,6 +2709,8 @@ class AttributeReadSelector:
 
         before_identity = normalize_identity(before_identity, label="physical")
         resume_identity = normalize_identity(resume_identity, label="resume")
+        if before_identity is not None and resume_identity is not None:
+            raise ValueError("attribute-key cursor checkpoints are mutually exclusive")
         resume_key_offset = int(resume_key_offset)
         if resume_key_offset < 0:
             raise ValueError("invalid attribute-key resume offset")
@@ -2754,6 +2764,8 @@ class AttributeReadSelector:
                         prior.count + 1,
                     )
                     continue
+                if len(seen_set) + len(emitted) >= ATTRIBUTE_KEY_CURSOR_MAX_SEEN:
+                    return False, index
                 emitted[digest] = AttributeKeyRow(key, attr_type, 1)
                 emitted_digests.append(digest)
                 if len(emitted) >= page_size:
@@ -2853,11 +2865,18 @@ class AttributeReadSelector:
         exhausted = current_segment_end <= start and next_resume_identity is None
         seen_after = (*seen, *emitted_digests)
         capped = len(seen_after) >= ATTRIBUTE_KEY_CURSOR_MAX_SEEN
-        has_more = not exhausted and not capped
+        browse_status: AttributeKeyBrowseStatus = (
+            "limit_reached" if capped else "exhausted" if exhausted else "continuation"
+        )
+        has_more = browse_status == "continuation"
+        # A successful cursor page is a complete request, not a sampled
+        # aggregate. Endpoint-specific browse_status communicates whether the
+        # recent-suggestion walk can continue, exhausted its frozen window, or
+        # reached the published vocabulary cap without manufacturing a generic
+        # sample-limit error.
         metadata = self._metadata(
-            complete=False,
-            error_code="sample_limit",
-            sampled=True,
+            complete=True,
+            error_code=None,
             window_start=start,
             window_end=end,
             query_count=self._query_count,
@@ -2866,8 +2885,9 @@ class AttributeReadSelector:
             tuple(emitted[digest] for digest in emitted_digests),
             metadata,
             has_more,
+            browse_status,
             current_segment_end,
-            cursor_before,
+            None if next_resume_identity is not None else cursor_before,
             next_resume_identity,
             next_resume_key_offset,
             seen_after,
@@ -3435,10 +3455,9 @@ def attribute_value_cursor_digest(attr_type: AttributeType, value: Any) -> str:
 def attribute_key_cursor_digest(key: str) -> str:
     """Return the opaque identity used to de-duplicate key browse pages."""
 
-    # 80 bits keeps the complete 384-key signed continuation URL below the
-    # common 8 KiB request-line ceiling. At this bounded cardinality the
-    # birthday-collision probability is below 2^-71, while the signature—not
-    # this digest—provides cursor integrity.
+    # Preserve a full 128-bit identity. The bounded suggestion count and
+    # mutually-exclusive physical checkpoint—not weaker hashing—keep the
+    # signed continuation below the request-line ceiling.
     return hashlib.blake2s(
         str(key).encode("utf-8"),
         digest_size=ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES,

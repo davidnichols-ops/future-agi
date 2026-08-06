@@ -45,12 +45,12 @@ def _request(*, user_id="u1", org_id="o1", workspace_id="w1", auth_id="a1"):
         (
             {"allow_sampled": "false", "cursor_mode": "true"},
             {"allow_sampled": False, "cursor_mode": True},
-            False,
+            True,
         ),
         (
             {"allow_sampled": "false", "cursor": "opaque"},
             {"allow_sampled": False, "cursor": "opaque"},
-            False,
+            True,
         ),
         ({"allow_sampled": "true"}, {"allow_sampled": True}, False),
     ],
@@ -63,6 +63,28 @@ def test_exact_total_is_required_only_by_explicit_false(
     request = SimpleNamespace(query_params=query_params)
 
     assert exact_total_explicitly_required(request, validated_data) is expected
+
+
+@pytest.mark.parametrize(
+    "validated_data",
+    [
+        {"allow_sampled": False, "cursor_mode": True},
+        {"allow_sampled": False, "cursor": "opaque"},
+    ],
+)
+def test_trace_cursor_contract_can_explicitly_accept_an_exact_lower_bound_total(
+    validated_data,
+):
+    request = SimpleNamespace(query_params={"allow_sampled": "false"})
+
+    assert (
+        exact_total_explicitly_required(
+            request,
+            validated_data,
+            allow_exact_cursor_lower_bound=True,
+        )
+        is False
+    )
 
 
 def _token(**overrides):

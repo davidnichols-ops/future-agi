@@ -17513,11 +17513,12 @@ export const getApiTracesSpanAttributeKeysListUrl = (params: ApiTracesSpanAttrib
 }
 
 /**
- * Returns every distinct key across the string, number, and boolean attribute
-maps together with its inferred type and occurrence count.
+ * Cursor mode returns recent distinct keys newest-first in bounded pages;
+exact ``q`` lookup remains available for keys outside that recent browse.
+The no-page-size form is retained for older clients.
 
-GET /api/traces/span-attribute-keys/?project_id=<uuid>
- * @summary Discover all span attribute keys for a project.
+GET /api/traces/span-attribute-keys/?project_id=<uuid>&page_size=10
+ * @summary Discover span attribute keys for a project.
  */
 export const apiTracesSpanAttributeKeysList = async (params: ApiTracesSpanAttributeKeysListParams, options?: RequestInit): Promise<apiTracesSpanAttributeKeysListResponse> => {
 

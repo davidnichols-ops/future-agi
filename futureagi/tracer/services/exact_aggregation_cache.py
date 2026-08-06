@@ -33,7 +33,9 @@ _DEFAULT_REFRESH_LOCK_SECONDS = 60 * 60
 # reject a newly-registered activity type before our activity function runs.
 # Such a terminal workflow failure has no ``finally`` block in this process, so
 # a one-hour pre-start claim would otherwise leave every poll falsely pending.
-_DEFAULT_REFRESH_DISPATCH_SECONDS = 30
+_DEFAULT_REFRESH_DISPATCH_SECONDS = 10 * 60
+_DEFAULT_REFRESH_RECONCILE_SECONDS = 5
+_DEFAULT_REFRESH_STATUS_TIMEOUT_SECONDS = 0.5
 _DEFAULT_REFRESH_FAILURE_SECONDS = 5 * 60
 _CACHE_FENCE_FALLBACK_LOCK = RLock()
 
@@ -71,6 +73,30 @@ if redis.call('GET', KEYS[1]) ~= ARGV[1] then
 end
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
 redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[2])
+return 1
+"""
+
+_REDIS_FENCED_RECORD_DISPATCH_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+if redis.call('GET', KEYS[2]) ~= ARGV[2] then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[4])
+redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[4])
+return 1
+"""
+
+_REDIS_FENCED_RELEASE_DISPATCH_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+if redis.call('GET', KEYS[2]) ~= ARGV[2] then
+    return 0
+end
+redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[1])
 return 1
 """
 
@@ -138,6 +164,10 @@ def _refresh_state_key(namespace: str, identity: Any) -> str:
     return f"{snapshot_cache_key(namespace, identity)}:refresh-state"
 
 
+def _refresh_reconcile_key(namespace: str, identity: Any) -> str:
+    return f"{snapshot_cache_key(namespace, identity)}:refresh-reconcile"
+
+
 def _ttl_seconds() -> int | None:
     configured = getattr(
         settings,
@@ -189,6 +219,31 @@ def _refresh_failure_seconds() -> int:
             )
         ),
     )
+
+
+def _refresh_reconcile_seconds() -> int:
+    return max(
+        1,
+        int(
+            getattr(
+                settings,
+                "EXACT_AGGREGATION_REFRESH_RECONCILE_SECONDS",
+                _DEFAULT_REFRESH_RECONCILE_SECONDS,
+            )
+        ),
+    )
+
+
+def _refresh_status_timeout_seconds() -> float:
+    configured = float(
+        getattr(
+            settings,
+            "EXACT_AGGREGATION_REFRESH_STATUS_TIMEOUT_SECONDS",
+            _DEFAULT_REFRESH_STATUS_TIMEOUT_SECONDS,
+        )
+    )
+    # Reconciliation runs on an HTTP poll. Keep Temporal impairment bounded.
+    return min(2.0, max(0.05, configured))
 
 
 def _decorate(snapshot: ExactAggregationSnapshot) -> Any:
@@ -418,9 +473,10 @@ def _decorate_refresh_state(payload: Any, status: str | None) -> Any:
     return copied
 
 
-def exact_refresh_state(namespace: str, identity: Any) -> str | None:
-    """Return the public refresh state without exposing task or cache details."""
-
+def _exact_refresh_state_record(
+    namespace: str,
+    identity: Any,
+) -> dict[str, Any] | None:
     try:
         state = cache.get(_refresh_state_key(namespace, identity))
     except Exception:
@@ -430,7 +486,14 @@ def exact_refresh_state(namespace: str, identity: Any) -> str | None:
             exc_info=True,
         )
         return None
-    if isinstance(state, dict) and state.get("status") in {"running", "failed"}:
+    return state if isinstance(state, dict) else None
+
+
+def exact_refresh_state(namespace: str, identity: Any) -> str | None:
+    """Return the public refresh state without exposing task or cache details."""
+
+    state = _exact_refresh_state_record(namespace, identity)
+    if state is not None and state.get("status") in {"running", "failed"}:
         return str(state["status"])
     return None
 
@@ -455,7 +518,7 @@ def begin_exact_refresh(namespace: str, identity: Any) -> str | None:
             return None
         cache.set(
             _refresh_state_key(namespace, identity),
-            {"status": "running", "token": token},
+            {"status": "running", "token": token, "phase": "dispatch"},
             timeout=dispatch_seconds,
         )
         return token
@@ -466,6 +529,64 @@ def begin_exact_refresh(namespace: str, identity: Any) -> str | None:
             exc_info=True,
         )
         return None
+
+
+def record_exact_refresh_dispatch(
+    namespace: str,
+    identity: Any,
+    token: str,
+    workflow_id: str,
+) -> bool:
+    """Attach Temporal lifecycle evidence to a current dispatch claim.
+
+    The compare-and-set deliberately accepts only the initial dispatch state.
+    An exceptionally fast activity may already have promoted or finished the
+    claim by the time ``apply_async`` returns; in that case this must not move
+    the state backwards or resurrect its lease.
+    """
+
+    if not token or not isinstance(workflow_id, str) or not workflow_id:
+        return False
+    dispatch_seconds = _refresh_dispatch_seconds()
+    initial_state = {"status": "running", "token": token, "phase": "dispatch"}
+    recorded_state = {
+        **initial_state,
+        "workflow_id": workflow_id,
+    }
+    try:
+        lock_key = _refresh_lock_key(namespace, identity)
+        state_key = _refresh_state_key(namespace, identity)
+        redis_client = _redis_cache_client()
+        if redis_client is None:
+            with _CACHE_FENCE_FALLBACK_LOCK:
+                if cache.get(lock_key) != token:
+                    return False
+                if cache.get(state_key) != initial_state:
+                    return False
+                cache.set(lock_key, token, timeout=dispatch_seconds)
+                cache.set(state_key, recorded_state, timeout=dispatch_seconds)
+                return True
+
+        raw_client = redis_client.get_client(write=True)
+        return bool(
+            raw_client.eval(
+                _REDIS_FENCED_RECORD_DISPATCH_SCRIPT,
+                2,
+                redis_client.make_key(lock_key),
+                redis_client.make_key(state_key),
+                redis_client.encode(token),
+                redis_client.encode(initial_state),
+                redis_client.encode(recorded_state),
+                dispatch_seconds * 1000,
+            )
+        )
+    except Exception:
+        logger.warning(
+            "exact_aggregation_refresh_dispatch_record_failed",
+            namespace=namespace,
+            exc_info=True,
+        )
+        return False
 
 
 def activate_exact_refresh(namespace: str, identity: Any, token: str) -> bool:
@@ -481,7 +602,7 @@ def activate_exact_refresh(namespace: str, identity: Any, token: str) -> bool:
     try:
         lock_key = _refresh_lock_key(namespace, identity)
         state_key = _refresh_state_key(namespace, identity)
-        running_state = {"status": "running", "token": token}
+        running_state = {"status": "running", "token": token, "phase": "running"}
         running_seconds = _refresh_lock_seconds()
         redis_client = _redis_cache_client()
         if redis_client is None:
@@ -584,6 +705,118 @@ def _exact_refresh_workflow_task_id(refresh_token: str) -> str:
     return f"exact-aggregation-{digest}"
 
 
+_TERMINAL_WORKFLOW_STATUSES = {
+    "CANCELED",
+    "COMPLETED",
+    "FAILED",
+    "TERMINATED",
+    "TIMED_OUT",
+}
+
+
+def _release_exact_refresh_dispatch(
+    namespace: str,
+    identity: Any,
+    token: str,
+    expected_state: dict[str, Any],
+) -> bool:
+    """Atomically release only the exact dispatch phase that was inspected."""
+
+    try:
+        lock_key = _refresh_lock_key(namespace, identity)
+        state_key = _refresh_state_key(namespace, identity)
+        redis_client = _redis_cache_client()
+        if redis_client is None:
+            with _CACHE_FENCE_FALLBACK_LOCK:
+                if cache.get(lock_key) != token:
+                    return False
+                if cache.get(state_key) != expected_state:
+                    return False
+                cache.delete(state_key)
+                cache.delete(lock_key)
+                return True
+
+        raw_client = redis_client.get_client(write=True)
+        return bool(
+            raw_client.eval(
+                _REDIS_FENCED_RELEASE_DISPATCH_SCRIPT,
+                2,
+                redis_client.make_key(lock_key),
+                redis_client.make_key(state_key),
+                redis_client.encode(token),
+                redis_client.encode(expected_state),
+            )
+        )
+    except Exception:
+        logger.warning(
+            "exact_aggregation_terminal_dispatch_release_failed",
+            namespace=namespace,
+            exc_info=True,
+        )
+        return False
+
+
+def _release_terminal_dispatch_claim(namespace: str, identity: Any) -> bool:
+    """Release a pre-activity claim only after Temporal proves it is terminal."""
+
+    state = _exact_refresh_state_record(namespace, identity)
+    if (
+        state is None
+        or state.get("status") != "running"
+        or state.get("phase") != "dispatch"
+    ):
+        return False
+    token = state.get("token")
+    workflow_id = state.get("workflow_id")
+    if not isinstance(token, str) or not isinstance(workflow_id, str):
+        return False
+    try:
+        if not cache.add(
+            _refresh_reconcile_key(namespace, identity),
+            token,
+            timeout=_refresh_reconcile_seconds(),
+        ):
+            return False
+
+        from tfc.temporal.common.client import get_workflow_status_sync
+
+        workflow_status = get_workflow_status_sync(
+            workflow_id,
+            timeout_seconds=_refresh_status_timeout_seconds(),
+        )
+        status_name = (
+            workflow_status.get("status_name")
+            if isinstance(workflow_status, dict)
+            else None
+        )
+        if status_name not in _TERMINAL_WORKFLOW_STATUSES:
+            return False
+
+        # Compare both token and the complete dispatch state. A status result
+        # that races with activity promotion/publication therefore cannot clear
+        # that running lease or enqueue a redundant replacement.
+        released = _release_exact_refresh_dispatch(
+            namespace,
+            identity,
+            token,
+            state,
+        )
+        if released:
+            logger.info(
+                "exact_aggregation_terminal_dispatch_released",
+                namespace=namespace,
+                workflow_status=status_name,
+            )
+        return released
+    except Exception:
+        logger.warning(
+            "exact_aggregation_refresh_reconcile_failed",
+            namespace=namespace,
+            exc_info=True,
+        )
+        return False
+
+
 def read_or_schedule_exact_snapshot(
     namespace: str,
     identity: Any,
@@ -607,6 +840,9 @@ def read_or_schedule_exact_snapshot(
         return _decorate_refresh_state(pending_payload, state)
 
     token = begin_exact_refresh(namespace, normalized_identity)
+    if token is None and state == "running":
+        if _release_terminal_dispatch_claim(namespace, normalized_identity):
+            token = begin_exact_refresh(namespace, normalized_identity)
     refresh_enqueued = False
     if token is not None:
         try:
@@ -616,7 +852,7 @@ def read_or_schedule_exact_snapshot(
                 refresh_exact_aggregation_snapshot,
             )
 
-            refresh_exact_aggregation_snapshot.apply_async(
+            enqueue_result = refresh_exact_aggregation_snapshot.apply_async(
                 kwargs={
                     "namespace": namespace,
                     "identity": normalized_identity,
@@ -631,6 +867,14 @@ def read_or_schedule_exact_snapshot(
                 dispatch_timeout_seconds=2.0,
             )
             refresh_enqueued = True
+            workflow_id = getattr(enqueue_result, "id", None)
+            if isinstance(workflow_id, str):
+                record_exact_refresh_dispatch(
+                    namespace,
+                    normalized_identity,
+                    token,
+                    workflow_id,
+                )
         except Exception:
             logger.warning(
                 "exact_aggregation_refresh_enqueue_failed",
@@ -672,6 +916,7 @@ __all__ = [
     "normalized_snapshot_identity",
     "publish_exact_snapshot",
     "publish_exact_snapshot_for_refresh",
+    "record_exact_refresh_dispatch",
     "refresh_claim_is_current",
     "read_or_schedule_exact_snapshot",
     "read_exact_snapshot",

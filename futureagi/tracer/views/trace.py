@@ -4733,7 +4733,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             metadata["next_cursor"] = None
         if metadata.get(
             "total_rows_is_lower_bound"
-        ) and exact_total_explicitly_required(request, validated_data):
+        ) and exact_total_explicitly_required(
+            request,
+            validated_data,
+            allow_exact_cursor_lower_bound=True,
+        ):
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Trace data is temporarily unavailable. Please retry.",

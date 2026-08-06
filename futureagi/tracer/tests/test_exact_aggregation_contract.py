@@ -696,19 +696,292 @@ def test_refresh_claim_uses_short_dispatch_lease_then_activity_promotes_it(
 
     recording_cache = RecordingCache()
     monkeypatch.setattr(cache_module, "cache", recording_cache)
-    monkeypatch.setattr(cache_module, "_refresh_dispatch_seconds", lambda: 30)
+    monkeypatch.setattr(cache_module, "_refresh_dispatch_seconds", lambda: 600)
     monkeypatch.setattr(cache_module, "_refresh_lock_seconds", lambda: 3600)
     identity = {"project": "p", "metric": "latency"}
 
     token = cache_module.begin_exact_refresh("observe-lease-test", identity)
 
     assert token
-    assert [timeout for _op, _key, timeout in recording_cache.timeouts] == [30, 30]
+    assert [timeout for _op, _key, timeout in recording_cache.timeouts] == [600, 600]
     assert cache_module.activate_exact_refresh("observe-lease-test", identity, token)
     assert [timeout for _op, _key, timeout in recording_cache.timeouts[-2:]] == [
         3600,
         3600,
     ]
+
+
+@pytest.mark.unit
+def test_dispatch_lease_survives_queue_delay_then_promotes_to_running(monkeypatch):
+    """A healthy tasks_xl backlog must not expire the pre-start claim."""
+
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    class ExpiringCache:
+        def __init__(self):
+            self.now = 0
+            self.values = {}
+
+        def _live_value(self, key):
+            stored = self.values.get(key)
+            if stored is None:
+                return None
+            value, expires_at = stored
+            if expires_at is not None and expires_at <= self.now:
+                self.values.pop(key, None)
+                return None
+            return value
+
+        def add(self, key, value, *, timeout):
+            if self._live_value(key) is not None:
+                return False
+            self.set(key, value, timeout=timeout)
+            return True
+
+        def set(self, key, value, *, timeout):
+            expires_at = None if timeout is None else self.now + timeout
+            self.values[key] = (value, expires_at)
+
+        def get(self, key):
+            return self._live_value(key)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    expiring_cache = ExpiringCache()
+    monkeypatch.setattr(cache_module, "cache", expiring_cache)
+    monkeypatch.setattr(cache_module, "_refresh_dispatch_seconds", lambda: 600)
+    monkeypatch.setattr(cache_module, "_refresh_lock_seconds", lambda: 3600)
+    namespace = "observe-delayed-start"
+    identity = {"project": "p", "metric": "latency"}
+
+    token = cache_module.begin_exact_refresh(namespace, identity)
+    assert token
+    assert cache_module.record_exact_refresh_dispatch(
+        namespace,
+        identity,
+        token,
+        "task-exact-delayed",
+    )
+
+    expiring_cache.advance(9 * 60)
+    assert cache_module.activate_exact_refresh(namespace, identity, token)
+
+    # We are now past the original dispatch deadline, but activity promotion
+    # owns an independent one-hour lease.
+    expiring_cache.advance(2 * 60)
+    assert cache_module.refresh_claim_is_current(namespace, identity, token)
+
+
+@pytest.mark.unit
+def test_expired_dispatch_replacement_fences_the_delayed_old_activity(monkeypatch):
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    class ExpiringCache:
+        def __init__(self):
+            self.now = 0
+            self.values = {}
+
+        def _live_value(self, key):
+            stored = self.values.get(key)
+            if stored is None:
+                return None
+            value, expires_at = stored
+            if expires_at <= self.now:
+                self.values.pop(key, None)
+                return None
+            return value
+
+        def add(self, key, value, *, timeout):
+            if self._live_value(key) is not None:
+                return False
+            self.set(key, value, timeout=timeout)
+            return True
+
+        def set(self, key, value, *, timeout):
+            self.values[key] = (value, self.now + timeout)
+
+        def get(self, key):
+            return self._live_value(key)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    expiring_cache = ExpiringCache()
+    monkeypatch.setattr(cache_module, "cache", expiring_cache)
+    monkeypatch.setattr(cache_module, "_refresh_dispatch_seconds", lambda: 600)
+    monkeypatch.setattr(cache_module, "_refresh_lock_seconds", lambda: 3600)
+    namespace = "observe-expired-fence"
+    identity = {"project": "p", "metric": "traffic"}
+
+    old_token = cache_module.begin_exact_refresh(namespace, identity)
+    assert old_token
+    expiring_cache.advance(601)
+    new_token = cache_module.begin_exact_refresh(namespace, identity)
+
+    assert new_token and new_token != old_token
+    assert cache_module.activate_exact_refresh(namespace, identity, old_token) is False
+    assert cache_module.activate_exact_refresh(namespace, identity, new_token) is True
+    assert cache_module.refresh_claim_is_current(namespace, identity, new_token)
+
+
+@pytest.mark.unit
+def test_terminal_dispatch_is_replaced_immediately_from_temporal_evidence():
+    """An incompatible worker failure need not wait for lease expiry."""
+
+    from tracer.tasks.exact_aggregation import refresh_exact_aggregation_snapshot
+
+    cache.clear()
+    namespace = "observe-terminal-dispatch"
+    identity = {"project": "p", "metric": "traffic"}
+    pending = {
+        "metric_name": "traffic",
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+    with (
+        patch.object(
+            refresh_exact_aggregation_snapshot,
+            "apply_async",
+            side_effect=[
+                SimpleNamespace(id="task-exact-old"),
+                SimpleNamespace(id="task-exact-new"),
+            ],
+        ) as enqueue,
+        patch(
+            "tfc.temporal.common.client.get_workflow_status_sync",
+            return_value={"status": "3", "status_name": "FAILED"},
+        ) as workflow_status,
+    ):
+        first = read_or_schedule_exact_snapshot(
+            namespace,
+            identity,
+            refresh=False,
+            pending_payload=pending,
+        )
+        first_token = enqueue.call_args.kwargs["kwargs"]["refresh_token"]
+        second = read_or_schedule_exact_snapshot(
+            namespace,
+            identity,
+            refresh=False,
+            pending_payload=pending,
+        )
+        second_token = enqueue.call_args.kwargs["kwargs"]["refresh_token"]
+
+    assert first["query_refreshing"] is True
+    assert second["query_refreshing"] is True
+    assert enqueue.call_count == 2
+    assert first_token != second_token
+    workflow_status.assert_called_once_with(
+        "task-exact-old",
+        timeout_seconds=0.5,
+    )
+    assert refresh_claim_is_current(namespace, identity, first_token) is False
+    assert refresh_claim_is_current(namespace, identity, second_token) is True
+
+
+@pytest.mark.unit
+def test_running_dispatch_is_not_replaced_by_poll_reconciliation():
+    from tracer.tasks.exact_aggregation import refresh_exact_aggregation_snapshot
+
+    cache.clear()
+    namespace = "observe-running-dispatch"
+    identity = {"project": "p", "metric": "traffic"}
+    pending = {
+        "metric_name": "traffic",
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+    with (
+        patch.object(
+            refresh_exact_aggregation_snapshot,
+            "apply_async",
+            return_value=SimpleNamespace(id="task-exact-running"),
+        ) as enqueue,
+        patch(
+            "tfc.temporal.common.client.get_workflow_status_sync",
+            return_value={"status": "1", "status_name": "RUNNING"},
+        ) as workflow_status,
+    ):
+        read_or_schedule_exact_snapshot(
+            namespace,
+            identity,
+            refresh=False,
+            pending_payload=pending,
+        )
+        token = enqueue.call_args.kwargs["kwargs"]["refresh_token"]
+        polled = read_or_schedule_exact_snapshot(
+            namespace,
+            identity,
+            refresh=False,
+            pending_payload=pending,
+        )
+
+    assert enqueue.call_count == 1
+    workflow_status.assert_called_once_with(
+        "task-exact-running",
+        timeout_seconds=0.5,
+    )
+    assert polled["query_refreshing"] is True
+    assert refresh_claim_is_current(namespace, identity, token) is True
+
+
+@pytest.mark.unit
+def test_terminal_status_racing_with_activity_promotion_cannot_clear_running_claim():
+    from tracer.services import exact_aggregation_cache as cache_module
+    from tracer.tasks.exact_aggregation import refresh_exact_aggregation_snapshot
+
+    cache.clear()
+    namespace = "observe-promotion-race"
+    identity = {"project": "p", "metric": "traffic"}
+    pending = {
+        "metric_name": "traffic",
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+    with patch.object(
+        refresh_exact_aggregation_snapshot,
+        "apply_async",
+        return_value=SimpleNamespace(id="task-exact-race"),
+    ) as enqueue:
+        read_or_schedule_exact_snapshot(
+            namespace,
+            identity,
+            refresh=False,
+            pending_payload=pending,
+        )
+        token = enqueue.call_args.kwargs["kwargs"]["refresh_token"]
+
+        def promote_then_report_terminal(*_args, **_kwargs):
+            assert cache_module.activate_exact_refresh(namespace, identity, token)
+            return {"status": "2", "status_name": "COMPLETED"}
+
+        with patch(
+            "tfc.temporal.common.client.get_workflow_status_sync",
+            side_effect=promote_then_report_terminal,
+        ):
+            polled = read_or_schedule_exact_snapshot(
+                namespace,
+                identity,
+                refresh=False,
+                pending_payload=pending,
+            )
+
+    assert enqueue.call_count == 1
+    assert polled["query_refreshing"] is True
+    assert refresh_claim_is_current(namespace, identity, token) is True
 
 
 @pytest.mark.unit
@@ -1764,7 +2037,40 @@ def test_exact_graph_budget_failure_does_not_stitch_cross_query_partitions():
     assert "attrs_string" in query and "attrs_number" in query
     assert "snapshot_version_ceiling" not in params
     assert "additional_table_filters" not in settings
-    assert timeout == 300_000
+    assert timeout == 1_200_000
+
+
+@pytest.mark.unit
+def test_public_graph_poll_never_runs_long_exact_query_inline():
+    from tracer.services.clickhouse import graph_dispatch
+
+    cache.clear()
+
+    class InlineQueryForbidden:
+        @staticmethod
+        def execute_ch_query(*_args, **_kwargs):
+            pytest.fail("the HTTP graph poll must not execute ClickHouse inline")
+
+    start = datetime(2026, 8, 1, 0, 0)
+    end = datetime(2026, 8, 8, 0, 0)
+    with patch(
+        "tracer.tasks.exact_aggregation.refresh_exact_aggregation_snapshot.apply_async"
+    ) as enqueue:
+        result = graph_dispatch.fetch_system_metric_graph_ch(
+            analytics=InlineQueryForbidden(),
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(start, end),
+            interval="day",
+            metric_id="traffic",
+            observe_type="trace",
+            # The public timeout remains irrelevant: exact CH work belongs to
+            # the background activity and is governed by its own ceiling.
+            timeout_ms=1,
+        )
+
+    assert result["query_status"] == "pending"
+    assert result["query_complete"] is False
+    assert enqueue.call_count == 1
 
 
 @pytest.mark.unit
@@ -1943,7 +2249,7 @@ def test_entity_system_graph_does_not_stitch_budget_failed_statements(
     assert len(analytics.main_calls) == 1
     _query, params, timeout_ms, settings = analytics.main_calls[0]
     assert (params["start_date"], params["end_date"]) == (start, end)
-    assert timeout_ms == 300_000
+    assert timeout_ms == 1_200_000
     assert "additional_table_filters" not in settings
 
 
@@ -1969,7 +2275,7 @@ def test_entity_system_graph_indivisible_budget_failure_is_fail_closed(
             read_exact_user_system_graph(**common, metric_id="active_users")
 
     assert len(analytics.main_calls) == 1
-    assert analytics.main_calls[0][2] == 300_000
+    assert analytics.main_calls[0][2] == 1_200_000
 
 
 @pytest.mark.unit
@@ -2361,7 +2667,7 @@ def test_entity_eval_graph_does_not_stitch_budget_failed_statements(
     assert "candidate_eval.created_at >= %(start_date)s" in query
     assert "candidate_eval.created_at < %(end_date)s" in query
     assert "SELECT DISTINCT toString(candidate_member.trace_id) AS trace_id" in query
-    assert timeout_ms == 300_000
+    assert timeout_ms == 1_200_000
     assert "additional_table_filters" not in settings
 
 

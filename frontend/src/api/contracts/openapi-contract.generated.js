@@ -8761,6 +8761,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "minLength": 1,
               "maxLength": 512
             }
+          },
+          "page_size": {
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            }
+          },
+          "cursor": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            }
           }
         },
         "responses": {
@@ -70070,6 +70086,49 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Query window end",
           "type": "string",
           "format": "date-time"
+        },
+        "has_more": {
+          "title": "Has more",
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "title": "Next cursor",
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "browse_mode": {
+          "title": "Browse mode",
+          "type": "string",
+          "enum": [
+            "recent_suggestions"
+          ]
+        },
+        "browse_status": {
+          "title": "Browse status",
+          "type": "string",
+          "enum": [
+            "continuation",
+            "exhausted",
+            "limit_reached"
+          ]
+        },
+        "browse_limit": {
+          "title": "Browse limit",
+          "type": "integer",
+          "minimum": 1
+        },
+        "lookup_mode": {
+          "title": "Lookup mode",
+          "type": "string",
+          "enum": [
+            "exact"
+          ]
+        },
+        "exact_match": {
+          "title": "Exact match",
+          "type": "boolean"
         }
       }
     },

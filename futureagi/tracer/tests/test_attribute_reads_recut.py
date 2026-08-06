@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, replace
@@ -29,6 +31,7 @@ from tracer.services.clickhouse.attribute_reads import (
     _LATEST_CARDINALITY_SQL,
     _STRATIFIED_CANDIDATE_SQL,
     ATTRIBUTE_KEY_CURSOR_MAX_SEEN,
+    ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES,
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_MAX_PROJECTS,
     ATTRIBUTE_READ_MAX_QUERY_COUNT,
@@ -3848,6 +3851,13 @@ def test_span_attribute_keys_contract_accepts_exact_probe_and_read_state():
         "query_error_code",
         "query_window_start",
         "query_window_end",
+        "has_more",
+        "next_cursor",
+        "browse_mode",
+        "browse_status",
+        "browse_limit",
+        "lookup_mode",
+        "exact_match",
     } <= set(SpanAttributeKeysResponseSerializer().fields)
 
 
@@ -3907,7 +3917,73 @@ def test_span_attribute_key_cursor_pages_resume_wide_rows_without_duplicates(
         attribute_key_cursor_digest("alpha"),
         attribute_key_cursor_digest("beta"),
     )
+    assert first.next_before_identity is None
+    assert first.next_resume_identity == identity
+    assert first.browse_status == "continuation"
+    assert first.metadata.query_status == "complete"
+    assert first.metadata.query_error_code is None
     assert len(second.seen_key_digests) < ATTRIBUTE_KEY_CURSOR_MAX_SEEN
+
+
+def test_span_attribute_key_cursor_reports_truthful_suggestion_cap(monkeypatch):
+    identity = (PROJECT_A, "trace-cap", "span-cap", NOW - timedelta(hours=1))
+    row = {
+        "project_id": PROJECT_A,
+        "trace_id": identity[1],
+        "id": identity[2],
+        "start_time": identity[3],
+        "is_deleted": 0,
+        "string_keys": ["last_recent_key"],
+        "number_keys": [],
+        "boolean_keys": [],
+        "attributes_extra": "{}",
+    }
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    monkeypatch.setattr(
+        selector,
+        "_candidate_ids",
+        lambda *_args, **_kwargs: ((identity,), False, {}),
+    )
+    monkeypatch.setattr(selector, "_verify_latest", lambda *_args, **_kwargs: [row])
+    seen = tuple(
+        attribute_key_cursor_digest(f"prior-{index}")
+        for index in range(ATTRIBUTE_KEY_CURSOR_MAX_SEEN - 1)
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        seen_key_digests=seen,
+    )
+
+    assert [item.key for item in page.rows] == ["last_recent_key"]
+    assert len(page.seen_key_digests) == ATTRIBUTE_KEY_CURSOR_MAX_SEEN
+    assert page.has_more is False
+    assert page.browse_status == "limit_reached"
+    assert page.metadata.query_complete is True
+    assert page.metadata.query_status == "complete"
+    assert page.metadata.query_error_code is None
+
+
+def test_span_attribute_key_cursor_rejects_dual_physical_checkpoints():
+    identity = (PROJECT_A, "trace-a", "span-a", NOW - timedelta(hours=1))
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        AttributeReadSelector(RecordingExecutor(), now=NOW).read_key_cursor_page(
+            [PROJECT_A],
+            page_size=10,
+            window_start=NOW - timedelta(days=365),
+            window_end=NOW,
+            before_identity=identity,
+            resume_identity=identity,
+        )
 
 
 def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypatch):
@@ -3922,8 +3998,9 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
         if len(calls) == 1:
             return AttributeKeyCursorPageRead(
                 (AttributeKeyRow("alpha", "string", 1),),
-                _metadata(complete=False, error_code="sample_limit", sampled=True),
+                _metadata(),
                 True,
+                "continuation",
                 kwargs["window_end"],
                 identity,
                 None,
@@ -3932,8 +4009,9 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
             )
         return AttributeKeyCursorPageRead(
             (AttributeKeyRow("beta", "number", 1),),
-            _metadata(complete=False, error_code="sample_limit", sampled=True),
+            _metadata(),
             False,
+            "exhausted",
             kwargs["window_start"],
             None,
             None,
@@ -3955,6 +4033,13 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     assert first_response.status_code == 200
     assert first_response.data["result"][0]["key"] == "alpha"
     assert first_response.data["has_more"] is True
+    assert first_response.data["query_status"] == "complete"
+    assert "query_error_code" not in first_response.data
+    assert first_response.data["browse_mode"] == "recent_suggestions"
+    assert first_response.data["browse_status"] == "continuation"
+    assert first_response.data["browse_limit"] == ATTRIBUTE_KEY_CURSOR_MAX_SEEN
+    contract = SpanAttributeKeysResponseSerializer(data=first_response.data)
+    assert contract.is_valid(), contract.errors
     cursor = first_response.data["next_cursor"]
     assert cursor
 
@@ -3978,10 +4063,22 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     assert len(calls) == 2
 
 
-def test_span_attribute_key_cursor_full_url_stays_below_request_line_limit():
+def _max_entropy_physical_id(label: str, length: int = 255) -> str:
+    encoded = ""
+    index = 0
+    while len(encoded) < length:
+        encoded += base64.urlsafe_b64encode(
+            hashlib.sha512(f"{label}-{index}".encode()).digest()
+        ).decode()
+        index += 1
+    return encoded[:length]
+
+
+@pytest.mark.parametrize("checkpoint", ["before", "resume"])
+def test_span_attribute_key_cursor_reachable_full_url_stays_below_limit(checkpoint):
     digests = tuple(
         attribute_key_cursor_digest(f"attribute-{index}")
-        for index in range(ATTRIBUTE_KEY_CURSOR_MAX_SEEN)
+        for index in range(ATTRIBUTE_KEY_CURSOR_MAX_SEEN - 1)
     )
     scope = {
         "principal_id": "00000000-0000-4000-8000-000000000001",
@@ -3991,21 +4088,81 @@ def test_span_attribute_key_cursor_full_url_stays_below_request_line_limit():
         "workspace_id": "00000000-0000-4000-8000-000000000004",
         "project_ids": [PROJECT_A],
     }
+    identity = (
+        PROJECT_A,
+        _max_entropy_physical_id(f"{checkpoint}-trace"),
+        _max_entropy_physical_id(f"{checkpoint}-span"),
+        NOW - timedelta(microseconds=1),
+    )
+    before_identity = identity if checkpoint == "before" else ()
+    resume_identity = identity if checkpoint == "resume" else ()
     cursor = encode_list_cursor(
         resource="span_attribute_keys",
         scope=scope,
         query={"project_id": PROJECT_A, "mode": "recent_attribute_keys"},
-        page_size=10,
+        page_size=50,
         window_start=NOW - timedelta(days=365),
         window_end=NOW,
-        order=(NOW, (), (), 0, digests),
+        order=(
+            NOW,
+            before_identity,
+            resume_identity,
+            9_223_372_036_854_775_807 if checkpoint == "resume" else 0,
+            digests,
+        ),
         seen_rows=len(digests),
     )
     full_url = "https://api.futureagi.com/api/traces/span-attribute-keys/?" + urlencode(
-        {"project_id": PROJECT_A, "page_size": 10, "cursor": cursor}
+        {"project_id": PROJECT_A, "page_size": 50, "cursor": cursor}
     )
 
+    assert len(cursor.encode("utf-8")) <= ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES
     assert len(full_url.encode("utf-8")) < 8 * 1024
+
+
+def test_span_attribute_key_api_stops_before_publishing_oversized_cursor(monkeypatch):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    oversized_identity = (
+        PROJECT_A,
+        _max_entropy_physical_id("oversized-trace", 8_000),
+        _max_entropy_physical_id("oversized-span", 8_000),
+        NOW - timedelta(microseconds=1),
+    )
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "read_key_cursor_page",
+        lambda _self, _project_ids, **kwargs: AttributeKeyCursorPageRead(
+            (AttributeKeyRow("recent_key", "string", 1),),
+            _metadata(),
+            True,
+            "continuation",
+            kwargs["window_end"],
+            oversized_identity,
+            None,
+            0,
+            (attribute_key_cursor_digest("recent_key"),),
+        ),
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
+    request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"project_id": PROJECT_A, "page_size": 10},
+    )
+
+    response = SpanAttributeKeysView.as_view()(request)
+
+    assert response.status_code == 200
+    assert response.data["result"][0]["key"] == "recent_key"
+    assert response.data["has_more"] is False
+    assert response.data["next_cursor"] is None
+    assert response.data["browse_status"] == "limit_reached"
+    assert response.data["query_status"] == "complete"
+    assert "query_error_code" not in response.data
 
 
 def test_span_attribute_detail_contract_validates_key_and_exposes_read_state():
@@ -5151,6 +5308,9 @@ def test_span_attribute_keys_use_v2_when_legacy_clickhouse_is_disabled(monkeypat
     assert response.data["result"] == [
         {"key": "json_choices", "type": "array", "count": 1}
     ]
+    assert response.data["lookup_mode"] == "exact"
+    assert response.data["exact_match"] is True
+    assert "browse_status" not in response.data
     contract = SpanAttributeKeysResponseSerializer(data=response.data)
     assert contract.is_valid(), contract.errors
     assert captured == {

@@ -27,6 +27,8 @@ from tracer.serializers.span_attributes import (
     SpanAttributeValuesResponseSerializer,
 )
 from tracer.services.clickhouse.attribute_reads import (
+    ATTRIBUTE_KEY_CURSOR_MAX_SEEN,
+    ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES,
     AttributeDetailRead,
     AttributeReadMetadata,
     AttributeReadSelector,
@@ -148,6 +150,7 @@ class SpanAttributeKeysView(APIView):
                         or len(raw_before_identity) not in {0, 4}
                         or not isinstance(raw_resume_identity, tuple)
                         or len(raw_resume_identity) not in {0, 4}
+                        or (raw_before_identity and raw_resume_identity)
                         or not isinstance(resume_key_offset, int)
                         or resume_key_offset < 0
                         or not isinstance(seen_digests, tuple)
@@ -195,7 +198,9 @@ class SpanAttributeKeysView(APIView):
                     seen_key_digests=seen_digests,
                 )
                 next_cursor = None
-                if page_read.has_more:
+                published_has_more = page_read.has_more
+                published_browse_status = page_read.browse_status
+                if published_has_more:
                     next_cursor = encode_list_cursor(
                         resource="span_attribute_keys",
                         scope=cursor_scope,
@@ -212,12 +217,25 @@ class SpanAttributeKeysView(APIView):
                         ),
                         seen_rows=len(page_read.seen_key_digests),
                     )
+                    if len(next_cursor.encode("utf-8")) > (
+                        ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES
+                    ):
+                        # Never hand the browser a continuation that can be
+                        # rejected by a common 8 KiB request-line ceiling.
+                        # Exact q lookup remains available outside the bounded
+                        # recent-suggestion vocabulary.
+                        next_cursor = None
+                        published_has_more = False
+                        published_browse_status = "limit_reached"
                 return Response(
                     {
                         "result": [asdict(row) for row in page_read.rows],
                         **page_read.metadata.public_payload(),
-                        "has_more": page_read.has_more,
+                        "has_more": published_has_more,
                         "next_cursor": next_cursor,
+                        "browse_mode": "recent_suggestions",
+                        "browse_status": published_browse_status,
+                        "browse_limit": ATTRIBUTE_KEY_CURSOR_MAX_SEEN,
                     },
                     status=200,
                 )
@@ -227,6 +245,16 @@ class SpanAttributeKeysView(APIView):
                 {
                     "result": [asdict(row) for row in read.rows],
                     **read.metadata.public_payload(),
+                    **(
+                        {
+                            "lookup_mode": "exact",
+                            "exact_match": any(
+                                row.key == exact_key for row in read.rows
+                            ),
+                        }
+                        if exact_key is not None
+                        else {}
+                    ),
                 },
                 status=200,
             )

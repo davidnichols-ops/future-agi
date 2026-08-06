@@ -9493,20 +9493,30 @@ export const ApiTracesSpanAttributeDetailListResponse = zod.object({
 
 
 /**
- * Returns every distinct key across the string, number, and boolean attribute
-maps together with its inferred type and occurrence count.
+ * Cursor mode returns recent distinct keys newest-first in bounded pages;
+exact ``q`` lookup remains available for keys outside that recent browse.
+The no-page-size form is retained for older clients.
 
-GET /api/traces/span-attribute-keys/?project_id=<uuid>
- * @summary Discover all span attribute keys for a project.
+GET /api/traces/span-attribute-keys/?project_id=<uuid>&page_size=10
+ * @summary Discover span attribute keys for a project.
  */
 export const apiTracesSpanAttributeKeysListQueryQMax = 512;
+
+export const apiTracesSpanAttributeKeysListQueryPageSizeMax = 50;
+
+export const apiTracesSpanAttributeKeysListQueryCursorMax = 8192;
 
 
 
 export const ApiTracesSpanAttributeKeysListQueryParams = zod.object({
   "project_id": zod.string().uuid(),
-  "q": zod.string().min(1).max(apiTracesSpanAttributeKeysListQueryQMax).optional()
+  "q": zod.string().min(1).max(apiTracesSpanAttributeKeysListQueryQMax).optional(),
+  "page_size": zod.number().min(1).max(apiTracesSpanAttributeKeysListQueryPageSizeMax).optional(),
+  "cursor": zod.string().min(1).max(apiTracesSpanAttributeKeysListQueryCursorMax).optional()
 })
+
+
+export const apiTracesSpanAttributeKeysListResponseNextCursorMax = 8192;
 
 
 
@@ -9521,7 +9531,14 @@ export const ApiTracesSpanAttributeKeysListResponse = zod.object({
   "query_status": zod.enum(['complete', 'sampled', 'degraded']),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().datetime({"offset":true}),
-  "query_window_end": zod.string().datetime({"offset":true})
+  "query_window_end": zod.string().datetime({"offset":true}),
+  "has_more": zod.boolean().optional(),
+  "next_cursor": zod.string().min(1).max(apiTracesSpanAttributeKeysListResponseNextCursorMax).optional(),
+  "browse_mode": zod.enum(['recent_suggestions']).optional(),
+  "browse_status": zod.enum(['continuation', 'exhausted', 'limit_reached']).optional(),
+  "browse_limit": zod.number().min(1).optional(),
+  "lookup_mode": zod.enum(['exact']).optional(),
+  "exact_match": zod.boolean().optional()
 })
 
 

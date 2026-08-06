@@ -20,6 +20,8 @@ from tracer.services.clickhouse.server_readonly import (
 
 logger = structlog.get_logger(__name__)
 
+_QUERY_TRANSPORT_GRACE_SECONDS = 5.0
+
 # Try to import clickhouse-driver, gracefully handle if not installed
 try:
     from clickhouse_driver import Client as CHDriver
@@ -99,7 +101,11 @@ class ClickHouseClient:
         """Check if ClickHouse connection is configured."""
         return bool(self.host)
 
-    def _create_client(self) -> CHDriver:
+    def _create_client(
+        self,
+        *,
+        send_receive_timeout_seconds: float | None = None,
+    ) -> CHDriver:
         """Create a new ClickHouse driver connection."""
         if not CLICKHOUSE_AVAILABLE:
             raise RuntimeError(
@@ -122,7 +128,11 @@ class ClickHouseClient:
             password=self.password,
             database=self.database,
             connect_timeout=self.connect_timeout,
-            send_receive_timeout=max(self.send_timeout, self.receive_timeout),
+            send_receive_timeout=(
+                max(self.send_timeout, self.receive_timeout)
+                if send_receive_timeout_seconds is None
+                else send_receive_timeout_seconds
+            ),
             settings=driver_settings,
         )
 
@@ -280,7 +290,28 @@ class ClickHouseClient:
                 # max_execution_time is in seconds
                 query_settings["max_execution_time"] = max(timeout_ms / 1000.0, 0.001)
 
-        client = self._get_client()
+        configured_transport_timeout = float(
+            max(self.send_timeout, self.receive_timeout)
+        )
+        requested_transport_timeout = configured_transport_timeout
+        if timeout_ms is not None:
+            requested_transport_timeout = max(
+                configured_transport_timeout,
+                (timeout_ms / 1000.0) + _QUERY_TRANSPORT_GRACE_SECONDS,
+            )
+        # Pooled connections are created with the ordinary application
+        # transport timeout. A long background exact query needs a matching
+        # native socket envelope, but widening a pooled connection would leak
+        # that policy into later API reads. Use and retire one dedicated
+        # connection only when the requested query deadline exceeds the pool.
+        dedicated_client = requested_transport_timeout > configured_transport_timeout
+        client = (
+            self._create_client(
+                send_receive_timeout_seconds=requested_transport_timeout,
+            )
+            if dedicated_client
+            else self._get_client()
+        )
         t_start = time.monotonic()
 
         try:
@@ -321,7 +352,13 @@ class ClickHouseClient:
             )
             raise
         finally:
-            self._return_client(client)
+            if dedicated_client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+            else:
+                self._return_client(client)
 
     def execute_iter(
         self,

@@ -136,6 +136,8 @@ def normalize_cursor_query(query: dict[str, Any]) -> dict[str, Any]:
 def exact_total_explicitly_required(
     request: Any,
     validated_data: dict[str, Any],
+    *,
+    allow_exact_cursor_lower_bound: bool = False,
 ) -> bool:
     """Return whether the client explicitly rejected a bounded total.
 
@@ -143,11 +145,10 @@ def exact_total_explicitly_required(
     older clients omit it.  A complete bounded page is safe to return to those
     clients as long as its lower-bound total is labelled truthfully.  Clients
     that explicitly send ``allow_sampled=false`` retain the strict exact-total
-    contract on legacy numbered reads.  Cursor mode is itself an explicit
-    lower-bound-total contract: every returned row is exact and ordered, while
-    the signed continuation proves where the still-unscanned suffix begins.
-    ``allow_sampled=false`` must therefore reject sampled rows, not that exact
-    cursor pagination model.
+    contract. Trace cursor reads may opt into a lower-bound total because every
+    returned row is still exact and ordered and the signed continuation proves
+    where the unscanned suffix begins. Other resources remain strict until they
+    explicitly implement and expose the same continuation contract.
     """
 
     query_params = getattr(request, "query_params", None)
@@ -155,8 +156,10 @@ def exact_total_explicitly_required(
         query_params is not None
         and "allow_sampled" in query_params
         and validated_data.get("allow_sampled") is False
-        and not validated_data.get("cursor_mode")
-        and not validated_data.get("cursor")
+        and not (
+            allow_exact_cursor_lower_bound
+            and (validated_data.get("cursor_mode") or validated_data.get("cursor"))
+        )
     )
 
 

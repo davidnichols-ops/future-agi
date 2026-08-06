@@ -3,6 +3,29 @@ import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
 
+const ATTRIBUTE_BROWSE_STATUSES = new Set([
+  "continuation",
+  "exhausted",
+  "limit_reached",
+]);
+
+export function getAttributeKeyPageReadState(page, { exact = false } = {}) {
+  if (exact && page?.lookup_mode === "exact" && page?.exact_match === true) {
+    // A typed latest-state row verified the requested key. The surrounding
+    // one-year absence proof may be bounded, but the positive exact match is
+    // authoritative and must not inherit browse-sampling UI.
+    return "complete";
+  }
+  if (page?.browse_mode === "recent_suggestions") {
+    return page?.query_complete === true &&
+      page?.query_status === "complete" &&
+      ATTRIBUTE_BROWSE_STATUSES.has(page?.browse_status)
+      ? "complete"
+      : "degraded";
+  }
+  return getQueryReadState(page);
+}
+
 export function useExactTraceAttributeProperties({
   projectId,
   search,
@@ -70,7 +93,9 @@ export function useExactTraceAttributeProperties({
       },
     ),
   );
-  const pageReadStates = pages.map((page) => getQueryReadState(page));
+  const pageReadStates = pages.map((page) =>
+    getAttributeKeyPageReadState(page, { exact: Boolean(debouncedSearch) }),
+  );
   const queryReadState = query.isError
     ? "error"
     : pageReadStates.includes("degraded")
@@ -78,11 +103,16 @@ export function useExactTraceAttributeProperties({
       : pageReadStates.includes("sampled")
         ? "sampled"
         : "complete";
+  const lastPage = pages.at(-1);
+  const browseStatus = !debouncedSearch ? lastPage?.browse_status : undefined;
 
   return {
     ...query,
     data: properties,
     queryReadState,
+    browseStatus,
+    browseLimit: !debouncedSearch ? lastPage?.browse_limit : undefined,
+    browseLimitReached: browseStatus === "limit_reached",
     debouncedSearch,
   };
 }

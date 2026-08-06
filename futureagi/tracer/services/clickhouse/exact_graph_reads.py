@@ -51,7 +51,16 @@ from tracer.utils.helper import get_annotation_labels_for_project
 
 logger = structlog.get_logger(__name__)
 
-EXACT_GRAPH_QUERY_TIMEOUT_MS = 300_000
+# Exact graphs run only in the deduplicated ``tasks_xl`` refresh activity; the
+# HTTP request schedules that work and polls the last complete snapshot.  The
+# production qualification set contains valid exact queries with p95 958s and
+# a 1032.479s ceiling, so the old five-minute ClickHouse deadline rejected
+# healthy work.  Twenty minutes leaves about 16% observed headroom while
+# remaining well inside the activity's independent 60-minute hard limit.
+EXACT_GRAPH_QUERY_TIMEOUT_MS = 1_200_000
+# This partition size belongs to the PostgreSQL-backed annotation membership
+# reader below.  System graphs deliberately remain one ClickHouse statement so
+# CH25.3 cannot stitch independently changing ReplacingMergeTree snapshots.
 EXACT_GRAPH_MAX_BUCKETS_PER_PARTITION = 31
 EXACT_GRAPH_MEMBERSHIP_BATCH_SIZE = 1_000
 EXACT_GRAPH_READ_SETTINGS = {

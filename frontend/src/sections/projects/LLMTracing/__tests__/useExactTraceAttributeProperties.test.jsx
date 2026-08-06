@@ -19,7 +19,10 @@ vi.mock("src/utils/axios", () => ({
   },
 }));
 
-import { useExactTraceAttributeProperties } from "../useExactTraceAttributeProperties";
+import {
+  getAttributeKeyPageReadState,
+  useExactTraceAttributeProperties,
+} from "../useExactTraceAttributeProperties";
 
 function createWrapper() {
   const queryClient = new QueryClient({
@@ -45,9 +48,11 @@ describe("useExactTraceAttributeProperties", () => {
             { key: "call.status", type: "string", count: 3 },
             { key: "final_status", type: "string", count: 2 },
           ],
-          query_complete: false,
-          query_status: "sampled",
-          query_error_code: "sample_limit",
+          query_complete: true,
+          query_status: "complete",
+          browse_mode: "recent_suggestions",
+          browse_status: "continuation",
+          browse_limit: 224,
           has_more: true,
           next_cursor: "signed-page-2",
         },
@@ -58,9 +63,11 @@ describe("useExactTraceAttributeProperties", () => {
             { key: "final_status", type: "string", count: 1 },
             { key: "cost_cents", type: "number", count: 1 },
           ],
-          query_complete: false,
-          query_status: "sampled",
-          query_error_code: "sample_limit",
+          query_complete: true,
+          query_status: "complete",
+          browse_mode: "recent_suggestions",
+          browse_status: "exhausted",
+          browse_limit: 224,
           has_more: false,
           next_cursor: null,
         },
@@ -106,6 +113,45 @@ describe("useExactTraceAttributeProperties", () => {
       "cost_cents",
     ]);
     expect(result.current.hasNextPage).toBe(false);
+    expect(result.current.queryReadState).toBe("complete");
+    expect(result.current.browseStatus).toBe("exhausted");
+    expect(result.current.browseLimit).toBe(224);
+    expect(result.current.browseLimitReached).toBe(false);
+  });
+
+  it("uses endpoint-specific browse state instead of generic sampling state", () => {
+    expect(
+      getAttributeKeyPageReadState({
+        query_complete: true,
+        query_status: "complete",
+        browse_mode: "recent_suggestions",
+        browse_status: "limit_reached",
+      }),
+    ).toBe("complete");
+    expect(
+      getAttributeKeyPageReadState({
+        query_complete: false,
+        query_status: "degraded",
+        browse_mode: "recent_suggestions",
+        browse_status: "continuation",
+      }),
+    ).toBe("degraded");
+  });
+
+  it("treats a verified positive exact lookup as authoritative beyond browse", () => {
+    expect(
+      getAttributeKeyPageReadState(
+        {
+          result: [{ key: "older_exact_key", type: "string", count: 1 }],
+          query_complete: false,
+          query_status: "sampled",
+          query_error_code: "sample_limit",
+          lookup_mode: "exact",
+          exact_match: true,
+        },
+        { exact: true },
+      ),
+    ).toBe("complete");
   });
 
   it("keeps degraded exact matches scoped to the selected project and source", async () => {

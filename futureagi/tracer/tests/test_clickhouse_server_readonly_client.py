@@ -75,6 +75,27 @@ def test_regular_read_keeps_client_side_guardrails(monkeypatch):
     }
 
 
+def test_long_read_uses_matching_disposable_native_transport(monkeypatch):
+    native = Mock()
+    native.execute.return_value = ([], [])
+    driver = Mock(return_value=native)
+    monkeypatch.setattr(client_module, "CHDriver", driver)
+    monkeypatch.setattr(client_module, "CLICKHOUSE_AVAILABLE", True)
+    client = _client(server_enforced_readonly=False)
+    get_pooled_client = Mock()
+    monkeypatch.setattr(client, "_get_client", get_pooled_client)
+    return_pooled_client = Mock()
+    monkeypatch.setattr(client, "_return_client", return_pooled_client)
+
+    client.execute_read("SELECT 1", timeout_ms=1_200_000)
+
+    get_pooled_client.assert_not_called()
+    return_pooled_client.assert_not_called()
+    assert driver.call_args.kwargs["send_receive_timeout"] == 1_205.0
+    assert native.execute.call_args.kwargs["settings"]["max_execution_time"] == 1200
+    native.disconnect.assert_called_once_with()
+
+
 def test_query_settings_stripper_preserves_nested_literals_and_format():
     sql = """SELECT 'SETTINGS max_threads = 9' AS value,
        (SELECT settings FROM config WHERE settings = 1) AS nested
