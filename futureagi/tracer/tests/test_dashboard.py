@@ -62,6 +62,7 @@ from tracer.services.exact_aggregation_cache import snapshot_cache_key
 from tracer.views.dashboard import (
     _DASHBOARD_TRACE_READ_SETTINGS,
     DashboardViewSet,
+    DashboardWidgetViewSet,
     _fetch_exact_dashboard_rows,
     _materialize_dashboard_query_scope,
     _normalize_dashboard_query_filters,
@@ -114,69 +115,66 @@ def _attribute_value_cursor_page(
     )
 
 
-class _DashboardPartitionAnalytics:
-    def __init__(self, *, failing_leaf_hours=()):
-        self.failing_leaf_hours = set(failing_leaf_hours)
+class _DashboardFullWindowAnalytics:
+    def __init__(self, *, failure=None):
+        self.failure = failure
         self.calls = []
 
     def execute_ch_query(self, query, params, *, timeout_ms, settings):
         copied_params = dict(params)
         self.calls.append((query, copied_params, timeout_ms, dict(settings)))
-        duration = params["end_date"] - params["start_date"]
-        if duration > timedelta(hours=1):
-            raise ServerException("private read budget detail", code=159)
-        if params["start_date"].hour in self.failing_leaf_hours:
-            raise ServerException("private leaf budget detail", code=159)
+        if self.failure is not None:
+            raise self.failure
         return SimpleNamespace(
             data=[{"time_bucket": params["start_date"], "value": 1}],
             columns=["time_bucket", "value"],
         )
 
 
-def _dashboard_partition_params(*, hours):
+def _dashboard_full_window_params(*, days):
     return {
         "start_date": datetime(2026, 8, 1, 0, 0),
-        "end_date": datetime(2026, 8, 1, hours, 0),
+        "end_date": datetime(2026, 8, 1, 0, 0) + timedelta(days=days),
         "filter_identity": ("final_status", "Rechazado", 0.8, True),
     }
 
 
 @pytest.mark.unit
-def test_dashboard_exact_rows_adaptively_split_with_frozen_filter_and_ceiling():
-    analytics = _DashboardPartitionAnalytics()
-    settings = {
-        **_DASHBOARD_TRACE_READ_SETTINGS,
-        "additional_table_filters": {"spans": "_version < 900"},
-    }
+def test_dashboard_exact_rows_use_one_full_12m_current_state_statement():
+    analytics = _DashboardFullWindowAnalytics()
+    settings = dict(_DASHBOARD_TRACE_READ_SETTINGS)
+    params = _dashboard_full_window_params(days=365)
 
     rows = _fetch_exact_dashboard_rows(
         analytics=analytics,
         sql="SELECT exact dashboard metric",
-        params=_dashboard_partition_params(hours=4),
-        granularity="hour",
+        params=params,
         timeout_ms=300_000,
         settings=settings,
     )
 
-    assert [row["time_bucket"].hour for row in rows] == [0, 1, 2, 3]
-    assert {call[2] for call in analytics.calls} == {30_000, 300_000}
-    assert all(
-        params["filter_identity"] == ("final_status", "Rechazado", 0.8, True)
-        and call_settings["additional_table_filters"]["spans"] == "_version < 900"
-        for _query, params, _timeout, call_settings in analytics.calls
-    )
+    assert rows == [{"time_bucket": params["start_date"], "value": 1}]
+    assert len(analytics.calls) == 1
+    query, observed_params, timeout_ms, observed_settings = analytics.calls[0]
+    assert query == "SELECT exact dashboard metric"
+    assert observed_params == params
+    assert timeout_ms == 300_000
+    assert observed_settings == settings
+    assert "additional_table_filters" not in observed_settings
+    assert "snapshot_version_ceiling" not in observed_params
 
 
 @pytest.mark.unit
-def test_dashboard_indivisible_bucket_budget_failure_fails_closed():
-    analytics = _DashboardPartitionAnalytics(failing_leaf_hours={0})
+def test_dashboard_full_window_budget_failure_is_not_split():
+    analytics = _DashboardFullWindowAnalytics(
+        failure=ServerException("private read budget detail", code=159)
+    )
 
     with pytest.raises(ServerException):
         _fetch_exact_dashboard_rows(
             analytics=analytics,
             sql="SELECT exact dashboard metric",
-            params=_dashboard_partition_params(hours=1),
-            granularity="hour",
+            params=_dashboard_full_window_params(days=365),
             timeout_ms=300_000,
             settings=_DASHBOARD_TRACE_READ_SETTINGS,
         )
@@ -186,25 +184,140 @@ def test_dashboard_indivisible_bucket_budget_failure_fails_closed():
 
 
 @pytest.mark.unit
-def test_dashboard_partition_failure_never_returns_partial_rows_to_publisher():
-    analytics = _DashboardPartitionAnalytics(failing_leaf_hours={1})
+def test_dashboard_full_window_failure_returns_no_partial_rows_to_publisher():
+    analytics = _DashboardFullWindowAnalytics(
+        failure=ServerException("private read budget detail", code=159)
+    )
     published = []
 
     with pytest.raises(ServerException):
         rows = _fetch_exact_dashboard_rows(
             analytics=analytics,
             sql="SELECT exact dashboard metric",
-            params=_dashboard_partition_params(hours=2),
-            granularity="hour",
+            params=_dashboard_full_window_params(days=30),
             timeout_ms=300_000,
             settings=_DASHBOARD_TRACE_READ_SETTINGS,
         )
         published.extend(rows)
 
-    # The first leaf did complete, but the executor raised before returning its
-    # private accumulator. The snapshot publisher therefore receives nothing.
     assert published == []
-    assert [call[1]["start_date"].hour for call in analytics.calls] == [0, 0, 1]
+    assert len(analytics.calls) == 1
+
+
+@pytest.mark.unit
+def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadata():
+    start = datetime(2025, 8, 1, tzinfo=UTC)
+    end = datetime(2026, 8, 1, tzinfo=UTC)
+    project_id = "00000000-0000-0000-0000-000000000010"
+    workspace = SimpleNamespace(
+        id="00000000-0000-0000-0000-000000000020",
+        organization_id="00000000-0000-0000-0000-000000000030",
+    )
+    query_config = {
+        "project_ids": [project_id],
+        "granularity": "day",
+        "time_range": {
+            "custom_start": start.isoformat(),
+            "custom_end": end.isoformat(),
+        },
+        "metrics": [
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "aggregation": "avg",
+                "source": "traces",
+            },
+            {
+                "id": "traffic",
+                "name": "traffic",
+                "type": "system_metric",
+                "aggregation": "count",
+                "source": "traces",
+            },
+        ],
+        "filters": [],
+        "breakdowns": [],
+    }
+
+    class FakeTraceBuilder:
+        def __init__(self, config):
+            self.config = config
+            self.metrics = config["metrics"]
+
+        def build_metric_query(self, metric):
+            window = self.config["time_range"]
+            return (
+                f"SELECT {metric['id']} FROM spans FINAL",
+                {
+                    "start_date": datetime.fromisoformat(window["custom_start"]),
+                    "end_date": datetime.fromisoformat(window["custom_end"]),
+                },
+            )
+
+        @staticmethod
+        def metric_info(metric):
+            return dict(metric)
+
+        def format_results(self, metric_results, **_kwargs):
+            return {
+                "metrics": [metric_info for metric_info, _rows in metric_results],
+                "time_range": self.config["time_range"],
+                "granularity": self.config["granularity"],
+            }
+
+    analytics = _DashboardFullWindowAnalytics()
+    project_queryset = MagicMock()
+    project_queryset.count.return_value = 1
+    project_queryset.values_list.return_value = []
+
+    with (
+        patch(
+            "tracer.views.dashboard._materialize_dashboard_query_scope",
+            side_effect=lambda config, *_args, **_kwargs: config,
+        ),
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard.Project.objects.filter",
+            return_value=project_queryset,
+        ),
+        patch(
+            "tracer.views.dashboard.DashboardQueryBuilderV2",
+            FakeTraceBuilder,
+        ),
+        patch(
+            "tracer.views.dashboard.V2AnalyticsQueryService",
+            return_value=analytics,
+        ),
+    ):
+        response = DashboardWidgetViewSet()._execute_ch_query_config(
+            query_config,
+            workspace,
+            _exact_worker=True,
+            cache_identity_override={
+                "workspace_id": workspace.id,
+                "query_config": query_config,
+            },
+        )
+
+    assert len(analytics.calls) == 2
+    assert {call[0] for call in analytics.calls} == {
+        "SELECT latency FROM spans FINAL",
+        "SELECT traffic FROM spans FINAL",
+    }
+    assert all(
+        call_params["start_date"] == start
+        and call_params["end_date"] == end
+        and "snapshot_version_ceiling" not in call_params
+        and "additional_table_filters" not in call_settings
+        for _query, call_params, _timeout, call_settings in analytics.calls
+    )
+    result = response.data["result"]
+    assert result["query_complete"] is True
+    assert result["query_sampled"] is False
+    assert "query_snapshot_version_ceiling" not in result
+    assert "query_snapshot_capture_count" not in result
+    assert "query_snapshot_relation_count" not in result
 
 
 def test_join_alias_prefixing_never_rewrites_quoted_customer_data():
@@ -1637,15 +1750,10 @@ class TestMetricsEndpoint:
         assert payload["query_error_code"] == "sample_limit"
 
     @pytest.mark.django_db
-    @patch(
-        "tracer.views.dashboard.capture_snapshot_version_ceiling",
-        return_value=123456,
-    )
     @patch("tracer.views.dashboard.AttributeReadSelector")
     def test_filter_values_custom_attribute_cursor_pages_are_opaque_and_unique(
         self,
         mock_selector_cls,
-        mock_capture_ceiling,
         auth_client,
         observe_project,
     ):
@@ -1724,18 +1832,11 @@ class TestMetricsEndpoint:
             completed_digest,
             failed_digest,
         )
-        mock_capture_ceiling.assert_called_once()
-
     @pytest.mark.django_db
-    @patch(
-        "tracer.views.dashboard.capture_snapshot_version_ceiling",
-        return_value=123456,
-    )
     @patch("tracer.views.dashboard.AttributeReadSelector")
     def test_filter_values_cursor_is_bound_to_search_and_rejects_mismatch(
         self,
         mock_selector_cls,
-        _mock_capture_ceiling,
         auth_client,
         observe_project,
     ):

@@ -579,25 +579,10 @@ def test_tampered_session_cursor_fails_closed_before_clickhouse_read():
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("membership_filter", "relation_version_ceilings"),
-    [
-        (
-            _attribute_filter(),
-            {"spans": 42, "trace_session_id_remap": 84},
-        ),
-        (
-            _has_eval_filter(False),
-            {
-                "spans": 42,
-                "trace_session_id_remap": 84,
-                "tracer_eval_logger_v2": 126,
-            },
-        ),
-    ],
+    "membership_filter", [_attribute_filter(), _has_eval_filter(False)]
 )
 def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
     membership_filter,
-    relation_version_ceilings,
 ):
     from tracer.views.trace_session import TraceSessionView
 
@@ -678,13 +663,6 @@ def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
             return_value=builder,
         ),
         mock.patch(
-            "tracer.views.trace_session.capture_list_relation_snapshot",
-            return_value=(
-                {},
-                relation_version_ceilings,
-            ),
-        ) as capture_snapshot,
-        mock.patch(
             "tracer.views.trace_session.read_bounded_filter_page",
             side_effect=[first_page, second_page],
         ) as bounded_read,
@@ -722,8 +700,11 @@ def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
     assert second_payload["metadata"]["has_more"] is False
     assert second_payload["metadata"]["next_cursor"] is None
     assert second_payload["metadata"]["total_rows_exact"] == 1
-    assert capture_snapshot.call_count == 1
     assert bounded_read.call_count == 2
+    assert all(
+        "additional_table_filters" not in call.kwargs["read_settings"]
+        for call in bounded_read.call_args_list
+    )
     continuation = bounded_read.call_args_list[1].kwargs
     assert continuation["page_number"] == 0
     assert continuation["bounded_continuation"] is True

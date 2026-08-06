@@ -868,6 +868,9 @@ export const useCallLogs = ({
       }),
     enabled: condition && enabled,
     select: (data) => data?.data,
+    // CallLogsGrid owns a concise retry/empty state. Never let a failed
+    // ClickHouse-backed list request reach the global raw-error snackbar.
+    meta: { errorHandled: true },
   });
   return { queryKey, data, isLoading, error };
 };
@@ -899,6 +902,9 @@ export const prefetchCallLogs = (
               ...params,
             },
       }),
+    // A speculative next-page failure must stay silent; the foreground read
+    // renders the normal retry state if the user advances to that page.
+    meta: { errorHandled: true },
   });
 };
 

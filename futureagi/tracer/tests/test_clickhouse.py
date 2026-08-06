@@ -2640,15 +2640,20 @@ class TestTimeSeriesQueryBuilder:
             start_date=datetime(2026, 7, 1, tzinfo=UTC),
             end_date=datetime(2026, 8, 1, tzinfo=UTC),
         )
-        query, _ = builder.build()
+        query, params = builder.build()
 
-        assert "FROM spans FINAL" in query
+        assert query.count("FROM spans") == 1
+        assert "FROM spans FINAL" not in query
+        assert "argMax(" in query
+        assert "AS latest_spans" not in query
+        assert "snapshot_version_ceiling" not in query
+        assert "snapshot_version_ceiling" not in params
         assert "SELECT DISTINCT trace_id" not in query
-        assert query.count("FROM spans FINAL") == 1
+        assert "AS graph_physical_versions" in query
 
     def test_exact_filtered_trace_graph_keeps_full_window_membership(self):
         """A non-time trace predicate still selects complete trace membership."""
-        from datetime import UTC, datetime
+        from datetime import UTC, datetime, timedelta
 
         from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
 
@@ -2671,12 +2676,136 @@ class TestTimeSeriesQueryBuilder:
             start_date=datetime(2026, 7, 1, tzinfo=UTC),
             end_date=datetime(2026, 8, 1, tzinfo=UTC),
         )
+        query, params = builder.build()
+
+        assert query.count("FROM spans") == 1
+        assert "FROM spans FINAL" not in query
+        assert "argMax(" in query
+        assert "trace_id IN" not in query
+        assert "SELECT DISTINCT trace_id" not in query
+        assert "max(toUInt8(ifNull" in query
+        assert "OVER (PARTITION BY trace_id) AS graph_match_0" not in query
+        assert "AS graph_bucket_match_0" in query
+        assert "max(graph_bucket_match_0) AS graph_match_0" in query
+        assert "graph_match_0 = 1" in query
+        assert "graph_in_output_window = 1" in query
+        assert "groupArrayIf(" in query
+        assert params["graph_witness_start_date"] == datetime(
+            2026, 7, 1, tzinfo=UTC
+        ) - timedelta(days=1)
+        assert params["graph_witness_end_date"] == datetime(
+            2026, 8, 1, tzinfo=UTC
+        ) + timedelta(days=1)
+
+    def test_exact_trace_graph_keeps_structured_witnesses_in_output_window(self):
+        """Scalar witnesses are adjacent; array/map witnesses stay exact-window."""
+        from datetime import UTC, datetime
+
+        from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
+
+        builder = TimeSeriesQueryBuilder(
+            project_id="test-project-id",
+            filters=[
+                {
+                    "column_id": "final_status",
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "Rechazado",
+                        "col_type": "SPAN_ATTRIBUTE",
+                    },
+                },
+                {
+                    "column_id": "tags",
+                    "filter_config": {
+                        "filter_type": "array",
+                        "filter_op": "contains",
+                        "filter_value": ["vip"],
+                        "col_type": "SPAN_ATTRIBUTE",
+                    },
+                },
+            ],
+            interval="day",
+            exact_snapshot=True,
+            observe_type="trace",
+            start_date=datetime(2026, 7, 1, tzinfo=UTC),
+            end_date=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+
         query, _ = builder.build()
 
-        assert "trace_id IN" in query
-        assert "SELECT DISTINCT trace_id" in query
-        assert "snapshot_start_date" in query
-        assert "snapshot_end_date" in query
+        output_window = "start_time >= %(start_date)s AND start_time < %(end_date)s"
+        assert query.count("FROM spans") == 1
+        assert "FROM spans FINAL" not in query
+        assert "argMax(" in query
+        structured_flag = query.split("AS graph_bucket_match_0", 1)[1].split(
+            "AS graph_bucket_match_1", 1
+        )[0]
+        assert "graph_row_match_1 = 1" in structured_flag
+        assert output_window in structured_flag
+        collapse_suffix = query.split(") AS graph_physical_versions", 1)[1]
+        assert "attributes_extra" not in collapse_suffix
+        assert "graph_in_output_window = 1" in query
+        assert "OVER (PARTITION BY trace_id) AS graph_match_" not in query
+        assert query.count("AS graph_bucket_match_") == 2
+        assert query.count("max(graph_bucket_match_") == 2
+
+    @pytest.mark.parametrize(
+        ("column_id", "filter_type", "filter_value", "expects_root_witness"),
+        [
+            ("latency", "number", 1, True),
+            ("total_tokens", "number", 1, True),
+            ("name", "text", "root-name", True),
+            ("model", "text", "gpt-4", False),
+            ("status", "text", "ok", False),
+            ("span_name", "text", "child-name", False),
+        ],
+    )
+    def test_exact_trace_graph_preserves_root_only_metric_boundary(
+        self,
+        column_id,
+        filter_type,
+        filter_value,
+        expects_root_witness,
+    ):
+        from datetime import UTC, datetime
+
+        from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
+
+        builder = TimeSeriesQueryBuilder(
+            project_id="test-project-id",
+            filters=[
+                {
+                    "column_id": column_id,
+                    "filter_config": {
+                        "filter_type": filter_type,
+                        "filter_op": (
+                            "greater_than_or_equal"
+                            if filter_type == "number"
+                            else "equals"
+                        ),
+                        "filter_value": filter_value,
+                        "col_type": "SYSTEM_METRIC",
+                    },
+                }
+            ],
+            interval="day",
+            exact_snapshot=True,
+            observe_type="trace",
+            start_date=datetime(2026, 7, 1, tzinfo=UTC),
+            end_date=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+
+        query, _ = builder.build()
+
+        root_clause = "(parent_span_id IS NULL OR parent_span_id = '')"
+        assert (root_clause in query) is expects_root_witness
+        assert query.count("FROM spans") == 1
+        assert "FROM spans FINAL" not in query
+        assert "argMax(" in query
+        assert "OVER (PARTITION BY trace_id) AS graph_match_" not in query
+        assert query.count("AS graph_bucket_match_") == 1
+        assert query.count("max(graph_bucket_match_") == 1
 
 
 @pytest.mark.unit

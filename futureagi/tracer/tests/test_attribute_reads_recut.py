@@ -2408,7 +2408,6 @@ def test_filter_value_cursor_page_is_newest_first_and_dedupes_across_pages():
         [PROJECT_A],
         "call.status",
         page_size=2,
-        version_ceiling=123456,
         window_start=NOW - timedelta(days=1),
         window_end=NOW,
     )
@@ -2430,7 +2429,6 @@ def test_filter_value_cursor_page_is_newest_first_and_dedupes_across_pages():
         [PROJECT_A],
         "call.status",
         page_size=2,
-        version_ceiling=123456,
         window_start=NOW - timedelta(days=1),
         window_end=NOW,
         segment_end=first.next_segment_end,
@@ -2439,8 +2437,7 @@ def test_filter_value_cursor_page_is_newest_first_and_dedupes_across_pages():
     )
 
     assert [row.value for row in second.rows] == ["queued"]
-    assert "attribute_version_ceiling" in second_executor.calls[0].params
-    assert second_executor.calls[0].params["attribute_version_ceiling"] == 123456
+    assert "attribute_version_ceiling" not in second_executor.calls[0].params
     assert all(row.value != "completed" for row in second.rows)
 
 
@@ -2486,7 +2483,6 @@ def test_filter_value_cursor_page_caps_raw_candidate_batches_and_marks_sample():
         [PROJECT_A],
         "call.status",
         page_size=10,
-        version_ceiling=123456,
         window_start=NOW - timedelta(days=1),
         window_end=NOW,
     )
@@ -2533,7 +2529,6 @@ def test_filter_value_cursor_candidate_budget_failure_propagates_fail_closed():
             [PROJECT_A],
             "final_status",
             page_size=10,
-            version_ceiling=123456,
             window_start=NOW - timedelta(days=1),
             window_end=NOW,
         )
@@ -2560,7 +2555,6 @@ def test_filter_value_cursor_verify_budget_failure_propagates_fail_closed():
             [PROJECT_A],
             "final_status",
             page_size=10,
-            version_ceiling=123456,
             window_start=NOW - timedelta(days=1),
             window_end=NOW,
         )
@@ -2584,7 +2578,6 @@ def test_filter_value_cursor_resume_budget_failure_never_advances_cursor():
             [PROJECT_A],
             "final_status",
             page_size=10,
-            version_ceiling=123456,
             window_start=NOW - timedelta(days=1),
             window_end=NOW,
             resume_identity=resume_identity,
@@ -2625,7 +2618,6 @@ def test_filter_value_cursor_full_url_stays_below_common_request_line_limit():
         window_start=NOW - timedelta(days=365),
         window_end=NOW,
         order=(NOW, (), (), 0, digests),
-        version_ceiling=1_785_000_000_000_000_000,
         seen_rows=len(digests),
     )
     full_url = "https://api.futureagi.com/tracer/dashboard/filter_values/?" + urlencode(
@@ -2678,7 +2670,6 @@ def test_filter_value_cursor_resumes_mid_array_without_skipping_members():
         [PROJECT_A],
         "final_status",
         page_size=2,
-        version_ceiling=123456,
         window_start=NOW - timedelta(hours=6),
         window_end=NOW,
     )
@@ -2697,7 +2688,6 @@ def test_filter_value_cursor_resumes_mid_array_without_skipping_members():
         [PROJECT_A],
         "final_status",
         page_size=2,
-        version_ceiling=123456,
         window_start=NOW - timedelta(hours=6),
         window_end=NOW,
         segment_end=first.next_segment_end,
@@ -2715,7 +2705,6 @@ def test_filter_value_cursor_resumes_mid_array_without_skipping_members():
         [PROJECT_A],
         "final_status",
         page_size=2,
-        version_ceiling=123456,
         window_start=NOW - timedelta(hours=6),
         window_end=NOW,
         segment_end=second.next_segment_end,
@@ -4115,13 +4104,10 @@ def test_dashboard_cursor_budget_failure_returns_503_without_values_or_cursor(
     def fail(self, *args, **kwargs):
         nonlocal calls
         calls += 1
+        assert "version_ceiling" not in kwargs
         raise ReadDeadlineExceeded("private cursor deadline")
 
     monkeypatch.setattr(AttributeReadSelector, "read_value_cursor_page", fail)
-    monkeypatch.setattr(
-        "tracer.views.dashboard.capture_snapshot_version_ceiling",
-        lambda _analytics: 123456,
-    )
     monkeypatch.setattr(
         "tracer.views.dashboard.project_queryset_for_request",
         lambda _request: _ProjectScope([PROJECT_A]),

@@ -1,14 +1,15 @@
-"""Exact, partitioned aggregation reads for public Observe graphs.
+"""Exact current-state aggregation reads for public Observe graphs.
 
-Every refresh freezes the direct-write spans version ceiling plus every mutable
-eval, annotation, end-user, or remap relation referenced by that query, then
-partitions on output-bucket boundaries. A partition failure raises; callers
-publish through ``exact_aggregation_cache`` only after every partition succeeds.
+ClickHouse 25.3 cannot share a snapshot across separately executed statements,
+and a version predicate on ``ReplacingMergeTree`` is not time travel after a
+background merge.  Aggregate readers therefore execute each ClickHouse metric
+as one full-window statement, use ``FINAL`` in the query builders, and publish
+only a complete result through ``exact_aggregation_cache``.
 """
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from time import monotonic
@@ -20,14 +21,7 @@ from django.db import connection, transaction
 from model_hub.models.choices import AnnotationTypeChoices
 from model_hub.models.score import Score
 from tracer.models.custom_eval_config import CustomEvalConfig
-from tracer.services.clickhouse.eval_logger_table import (
-    eval_logger_source,
-    eval_logger_version_column,
-)
-from tracer.services.clickhouse.list_cursor import (
-    capture_snapshot_version_ceiling,
-    snapshot_read_settings,
-)
+from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
@@ -39,7 +33,6 @@ from tracer.services.clickhouse.query_builders.session_filters import (
     build_session_id_filter_clause,
 )
 from tracer.services.clickhouse.query_builders.user_list import UserListQueryBuilder
-from tracer.services.clickhouse.read_budget import is_read_budget_error
 from tracer.services.clickhouse.v2.id_remap_sql import (
     resolved_id_expr,
     survivor_map_subquery,
@@ -59,14 +52,47 @@ from tracer.utils.helper import get_annotation_labels_for_project
 logger = structlog.get_logger(__name__)
 
 EXACT_GRAPH_QUERY_TIMEOUT_MS = 300_000
-EXACT_GRAPH_PARTITION_PROBE_TIMEOUT_MS = 30_000
 EXACT_GRAPH_MAX_BUCKETS_PER_PARTITION = 31
 EXACT_GRAPH_MEMBERSHIP_BATCH_SIZE = 1_000
 EXACT_GRAPH_READ_SETTINGS = {
-    "max_threads": 2,
-    "max_rows_to_read": 30_000_000,
-    "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
-    "max_memory_usage": 512 * 1024 * 1024,
+    "max_threads": 1,
+    # Attribute maps are several KiB per row on the heaviest tenants.  Smaller
+    # source blocks keep decompression below the fixed query-memory envelope
+    # while the in-order latest-row reducer consumes them.
+    "max_block_size": 512,
+    "preferred_block_size_bytes": 4 * 1024 * 1024,
+    # Map columns can dominate a block even when the row-count limit is low.
+    # This CH25 setting asks the reader to split once any single wide column
+    # reaches the same byte envelope.
+    "preferred_max_column_in_block_size_bytes": 4 * 1024 * 1024,
+    # The direct-write table is ordered by the complete physical span
+    # identity.  The exact builder resolves ReplacingMergeTree winners with an
+    # argMax aggregation in that order, so ClickHouse can retire each logical
+    # row instead of retaining every wide span in a hash table.
+    "optimize_aggregation_in_order": 1,
+    # Later trace/bucket reductions are not ordered by the physical primary
+    # key.  Spill those compact scalar states before they threaten the worker
+    # memory ceiling; no raw attribute Map/JSON value crosses the first stage.
+    "max_bytes_before_external_group_by": 32 * 1024 * 1024,
+    "max_bytes_before_external_sort": 32 * 1024 * 1024,
+    # Exact reads collapse ReplacingMergeTree versions before applying mutable
+    # value predicates.  Keep these defenses explicit for the related exact
+    # readers that still use FINAL; the argMax spans source itself exposes only
+    # immutable project/time predicates to PREWHERE.
+    "optimize_move_to_prewhere_if_final": 0,
+    "use_skip_indexes_if_final": 0,
+    # A valid seven-day Colectia attribute graph reads about 2.43M physical
+    # rows / 10.1 GiB uncompressed.  The previous 8-GiB ceiling rejected that
+    # request independently of SQL efficiency.  Keep finite guards sized for
+    # long-window exact background refreshes; atomic caching and refresh locks
+    # prevent the HTTP path from multiplying this work.
+    "max_rows_to_read": 100_000_000,
+    "max_bytes_to_read": 64 * 1024 * 1024 * 1024,
+    # The heaviest physical Map read plus compact trace aggregation reached
+    # 768.8 MiB after reducing 4.27M rows and spilling 4.14 GiB.  Keep finite
+    # headroom for the next allocation while remaining at half the old FINAL
+    # query's 2-GiB failure point.
+    "max_memory_usage": 1024 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": 10_001,
     "max_result_bytes": 32 * 1024 * 1024,
@@ -117,102 +143,18 @@ def _snapshot_window(
 def _metadata(
     *,
     started: float,
-    version_ceiling: int,
     query_count: int,
     rows_returned: int,
 ) -> dict[str, Any]:
-    return {
+    metadata = {
         "query_complete": True,
         "query_status": "complete",
         "query_sampled": False,
-        "query_snapshot_version_ceiling": version_ceiling,
         "query_count": query_count,
         "query_rows_returned": rows_returned,
         "query_elapsed_ms": round((monotonic() - started) * 1000, 3),
     }
-
-
-def execute_exact_output_partitions(
-    *,
-    analytics: Any,
-    query: str,
-    params: dict[str, Any],
-    partitions: tuple[tuple[datetime, datetime], ...],
-    settings: dict[str, Any],
-    interval: str | None = None,
-    leaf_timeout_ms: int = EXACT_GRAPH_QUERY_TIMEOUT_MS,
-    probe_timeout_ms: int = EXACT_GRAPH_PARTITION_PROBE_TIMEOUT_MS,
-) -> tuple[list[Any], list[str], int]:
-    """Run exact ranges and bisect only budget-exhausted bucket groups.
-
-    Every retry reuses the caller's frozen snapshot settings and immutable
-    base params. A result is returned only after every queued range succeeds;
-    non-budget errors and a budget failure for one indivisible output bucket
-    fail the whole refresh.
-    """
-
-    if leaf_timeout_ms < 1 or probe_timeout_ms < 1:
-        raise ValueError("partition query timeouts must be positive")
-    all_rows: list[Any] = []
-    columns: list[str] = []
-    pending = deque(partitions)
-    query_count = 0
-    while pending:
-        partition_start, partition_end = pending.popleft()
-        split_boundary = (
-            _partition_split_boundary(partition_start, partition_end, interval)
-            if interval is not None
-            else None
-        )
-        partition_params = {
-            **params,
-            "start_date": partition_start,
-            "end_date": partition_end,
-        }
-        query_count += 1
-        try:
-            result = analytics.execute_ch_query(
-                query,
-                partition_params,
-                timeout_ms=(
-                    probe_timeout_ms if split_boundary is not None else leaf_timeout_ms
-                ),
-                settings=settings,
-            )
-        except Exception as exc:
-            if split_boundary is None or not is_read_budget_error(exc):
-                raise
-            # Preserve chronological processing. Successful siblings remain
-            # private to this worker until the full refresh is published.
-            pending.appendleft((split_boundary, partition_end))
-            pending.appendleft((partition_start, split_boundary))
-            continue
-        rows = list(result.data or [])
-        if not columns:
-            columns = list(result.columns or [])
-        all_rows.extend(rows)
-    return all_rows, columns, query_count
-
-
-def _partition_split_boundary(
-    start_date: datetime,
-    end_date: datetime,
-    interval: str | None,
-) -> datetime | None:
-    """Return a balanced interior output-bucket boundary, if one exists."""
-
-    if interval is None:
-        return None
-    interior = []
-    for boundary in BaseQueryBuilder._generate_timestamp_range(
-        start_date, end_date, interval
-    ):
-        aligned = _align_partition_boundary_timezone(boundary, start_date)
-        if start_date < aligned < end_date:
-            interior.append(aligned)
-    if not interior:
-        return None
-    return interior[len(interior) // 2]
+    return metadata
 
 
 def _align_partition_boundary_timezone(
@@ -225,44 +167,6 @@ def _align_partition_boundary_timezone(
     if reference.tzinfo is None and boundary.tzinfo is not None:
         return boundary.replace(tzinfo=None)
     return boundary
-
-
-def _capture_datetime64_version_ceiling(
-    *,
-    analytics: Any,
-    table: str,
-    version_column: str = "version",
-    timeout_ms: int = EXACT_GRAPH_QUERY_TIMEOUT_MS,
-) -> int:
-    """Freeze a ReplacingMergeTree DateTime64 version as an integer boundary."""
-
-    if (
-        not table.replace("_", "").isalnum()
-        or not version_column.replace("_", "").isalnum()
-    ):
-        raise ValueError("invalid snapshot table or version column")
-    result = analytics.execute_ch_query(
-        f"""
-        SELECT coalesce(max(toUnixTimestamp64Micro({version_column})), 0) + 1
-            AS version_ceiling
-        FROM {table}
-        """,
-        {},
-        timeout_ms=min(EXACT_GRAPH_QUERY_TIMEOUT_MS, max(1, int(timeout_ms))),
-        settings={"max_threads": 1, "max_result_rows": 1},
-    )
-    if not result.data:
-        raise ExactGraphReadError(f"{table} snapshot ceiling is unavailable")
-    ceiling = int(
-        _row_value(
-            result.data[0],
-            list(result.columns or []),
-            "version_ceiling",
-            0,
-        )
-        or 0
-    )
-    return max(ceiling, 1)
 
 
 def _system_metric_payload(
@@ -306,6 +210,27 @@ def read_exact_system_graph(
 ) -> dict[str, Any]:
     started = monotonic()
     start_date, end_date, empty = _snapshot_window(filters)
+    if empty:
+        builder = TimeSeriesQueryBuilder(
+            project_id=str(project_id),
+            filters=filters,
+            interval=interval,
+            exact_snapshot=True,
+            observe_type=observe_type,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        metrics = builder.format_result([], [])
+        return _system_metric_payload(
+            metrics,
+            metric_id,
+            _metadata(
+                started=started,
+                query_count=0,
+                rows_returned=0,
+            ),
+        )
+
     builder = TimeSeriesQueryBuilder(
         project_id=str(project_id),
         filters=filters,
@@ -315,54 +240,23 @@ def read_exact_system_graph(
         start_date=start_date,
         end_date=end_date,
     )
-    if empty:
-        metrics = builder.format_result([], [])
-        return _system_metric_payload(
-            metrics,
-            metric_id,
-            _metadata(
-                started=started,
-                version_ceiling=1,
-                query_count=0,
-                rows_returned=0,
-            ),
-        )
-
     query, params = builder.build()
-    version_ceiling = capture_snapshot_version_ceiling(
-        analytics, timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS
+    result = analytics.execute_ch_query(
+        query,
+        params,
+        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+        settings=EXACT_GRAPH_READ_SETTINGS,
     )
-    # snapshot_read_settings applies the ceiling to every physical ``spans``
-    # occurrence, including trace-membership subqueries and the outer source.
-    settings = snapshot_read_settings(
-        EXACT_GRAPH_READ_SETTINGS,
-        builder=builder,
-        version_ceiling=version_ceiling,
-    )
-    settings, relation_snapshot_queries = _apply_filter_relation_snapshot_plan(
-        analytics=analytics,
-        filters=filters,
-        spans_version_ceiling=version_ceiling,
-        base_settings=settings,
-    )
-    partitions = output_bucket_partitions(start_date, end_date, interval)
-    rows, columns, query_count = execute_exact_output_partitions(
-        analytics=analytics,
-        query=query,
-        params=params,
-        partitions=partitions,
-        settings=settings,
-        interval=interval,
-    )
+    rows = list(result.data or [])
+    columns = list(result.columns or [])
     metrics = builder.format_result(rows, columns)
     return _system_metric_payload(
         metrics,
         metric_id,
         _metadata(
             started=started,
-            version_ceiling=version_ceiling,
-            query_count=query_count + 1 + relation_snapshot_queries,
-            rows_returned=len(rows) + 1 + relation_snapshot_queries,
+            query_count=1,
+            rows_returned=len(rows),
         ),
     )
 
@@ -376,6 +270,24 @@ def read_exact_all_system_metrics(
 ) -> dict[str, Any]:
     started = monotonic()
     start_date, end_date, empty = _snapshot_window(filters)
+    if empty:
+        builder = TimeSeriesQueryBuilder(
+            project_id=str(project_id),
+            filters=filters,
+            interval=interval,
+            exact_snapshot=True,
+            observe_type="span",
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return {
+            **builder.format_result([], []),
+            **_metadata(
+                started=started,
+                query_count=0,
+                rows_returned=0,
+            ),
+        }
     builder = TimeSeriesQueryBuilder(
         project_id=str(project_id),
         filters=filters,
@@ -385,46 +297,21 @@ def read_exact_all_system_metrics(
         start_date=start_date,
         end_date=end_date,
     )
-    if empty:
-        return {
-            **builder.format_result([], []),
-            **_metadata(
-                started=started,
-                version_ceiling=1,
-                query_count=0,
-                rows_returned=0,
-            ),
-        }
     query, params = builder.build()
-    version_ceiling = capture_snapshot_version_ceiling(
-        analytics, timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS
+    result = analytics.execute_ch_query(
+        query,
+        params,
+        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+        settings=EXACT_GRAPH_READ_SETTINGS,
     )
-    settings = snapshot_read_settings(
-        EXACT_GRAPH_READ_SETTINGS,
-        builder=builder,
-        version_ceiling=version_ceiling,
-    )
-    settings, relation_snapshot_queries = _apply_filter_relation_snapshot_plan(
-        analytics=analytics,
-        filters=filters,
-        spans_version_ceiling=version_ceiling,
-        base_settings=settings,
-    )
-    rows, columns, query_count = execute_exact_output_partitions(
-        analytics=analytics,
-        query=query,
-        params=params,
-        partitions=output_bucket_partitions(start_date, end_date, interval),
-        settings=settings,
-        interval=interval,
-    )
+    rows = list(result.data or [])
+    columns = list(result.columns or [])
     return {
         **builder.format_result(rows, columns),
         **_metadata(
             started=started,
-            version_ceiling=version_ceiling,
-            query_count=query_count + 1 + relation_snapshot_queries,
-            rows_returned=len(rows) + 1 + relation_snapshot_queries,
+            query_count=1,
+            rows_returned=len(rows),
         ),
     }
 
@@ -467,21 +354,19 @@ def _add_primary_traffic(
     return copied
 
 
-_SCORE_TABLE = "model_hub_score"
-_SCORE_VERSION_COLUMN = "_peerdb_version"
 _EVAL_FILTER_COLUMN_IDS = frozenset({"has_eval"})
 _ANNOTATION_FILTER_COLUMN_IDS = frozenset(
-    {
-        "annotator",
-        "has_annotation",
-        "my_annotations",
-    }
+    {"annotator", "has_annotation", "my_annotations"}
 )
 
 
 @dataclass(frozen=True)
 class _FilterRelationRequirements:
-    """Mutable ClickHouse relations consulted by ordinary graph filters."""
+    """Relations consulted by a graph filter payload.
+
+    This describes query topology only.  It must never be used to construct a
+    ReplacingMergeTree version ceiling on ClickHouse 25.3.
+    """
 
     eval_logger: bool = False
     score: bool = False
@@ -491,25 +376,16 @@ class _FilterRelationRequirements:
 def _filter_relation_requirements(
     filters: list[dict[str, Any]],
 ) -> _FilterRelationRequirements:
-    """Detect independently mutable relations used by a filter payload.
-
-    The filter compiler supports both snake_case and camelCase payloads.  Keep
-    relation discovery at the same boundary so a combined eval + annotation
-    filter cannot freeze only whichever relation happened to be seen first.
-    """
-
     needs_eval = False
     needs_score = False
     needs_end_users = False
     for item in filters or []:
         if not isinstance(item, dict):
-            # The serializer/compiler will reject the malformed filter.  This
-            # planner must not guess that it is relation-free.
-            raise ExactGraphReadError("graph filter snapshot plan is invalid")
+            raise ExactGraphReadError("graph filter plan is invalid")
         column_id = item.get("column_id") or item.get("columnId")
         config = item.get("filter_config") or item.get("filterConfig") or {}
         if not isinstance(config, dict):
-            raise ExactGraphReadError("graph filter snapshot plan is invalid")
+            raise ExactGraphReadError("graph filter plan is invalid")
         column_type = str(config.get("col_type") or config.get("colType") or "").upper()
         needs_eval = needs_eval or (
             column_type == ClickHouseFilterBuilderV2.EVAL_METRIC
@@ -530,181 +406,11 @@ def _filter_relation_requirements(
     )
 
 
-def _capture_integer_version_ceiling(
-    *,
-    analytics: Any,
-    table: str,
-    version_column: str,
-    timeout_ms: int = EXACT_GRAPH_QUERY_TIMEOUT_MS,
-) -> int:
-    """Freeze an integer-versioned ReplacingMergeTree or fail closed."""
-
-    if (
-        not table.replace("_", "").isalnum()
-        or not version_column.replace("_", "").isalnum()
-    ):
-        raise ExactGraphReadError("graph relation snapshot topology is invalid")
-    result = analytics.execute_ch_query(
-        f"SELECT coalesce(max({version_column}), 0) + 1 AS version_ceiling "
-        f"FROM {table}",
-        {},
-        timeout_ms=min(EXACT_GRAPH_QUERY_TIMEOUT_MS, max(1, int(timeout_ms))),
-        settings={"max_threads": 1, "max_result_rows": 1},
-    )
-    if not result.data:
-        raise ExactGraphReadError(f"{table} snapshot ceiling is unavailable")
-    try:
-        ceiling = int(
-            _row_value(
-                result.data[0],
-                list(result.columns or []),
-                "version_ceiling",
-                0,
-            )
-        )
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ExactGraphReadError(f"{table} snapshot ceiling is unavailable") from exc
-    if ceiling <= 0:
-        raise ExactGraphReadError(f"{table} snapshot ceiling is unavailable")
-    return ceiling
-
-
-def _install_relation_ceiling(
-    additional_filters: dict[str, str],
-    *,
-    table: str,
-    predicate: str,
-) -> bool:
-    """Install one table ceiling, rejecting conflicting snapshot plans."""
-
-    existing = additional_filters.get(table)
-    if existing is not None and existing != predicate:
-        raise ExactGraphReadError(f"conflicting snapshot ceiling for {table}")
-    additional_filters[table] = predicate
-    return existing is None
-
-
-def _require_existing_relation_ceiling(
-    additional_filters: dict[str, str],
-    *,
-    table: str,
-    prefix: str,
-) -> bool:
-    """Validate a ceiling installed by an earlier step in this refresh."""
-
-    existing = additional_filters.get(table)
-    if existing is None:
-        return False
-    suffix = existing.removeprefix(prefix)
-    if suffix == existing or not suffix.isdigit() or int(suffix) <= 0:
-        raise ExactGraphReadError(f"invalid snapshot ceiling for {table}")
-    return True
-
-
-def _apply_filter_relation_snapshot_plan(
-    *,
-    analytics: Any,
-    filters: list[dict[str, Any]],
-    spans_version_ceiling: int,
-    base_settings: dict[str, Any] | None = None,
-    force_eval: bool = False,
-) -> tuple[dict[str, Any], int]:
-    """Freeze every mutable CH relation used by exact graph membership.
-
-    ``spans_version_ceiling`` is a ClickHouse server epoch-nanosecond ceiling.
-    Direct-write eval rows use that same version domain.  The deployed legacy
-    eval and Score tables use independent PeerDB integer versions, while the
-    curated EndUser dimension uses a DateTime64 version. Each gets one
-    table-specific capture per refresh. The returned
-    ``additional_table_filters`` map is reused unchanged for every output
-    partition and annotation membership batch.
-    """
-
-    if spans_version_ceiling <= 0:
-        raise ExactGraphReadError("spans snapshot ceiling is unavailable")
-    requirements = _filter_relation_requirements(filters)
-    settings = {**(base_settings or EXACT_GRAPH_READ_SETTINGS)}
-    additional_filters = dict(settings.get("additional_table_filters") or {})
-    _install_relation_ceiling(
-        additional_filters,
-        table="spans",
-        predicate=f"_version < {int(spans_version_ceiling)}",
-    )
-    snapshot_queries = 0
-
-    if force_eval or requirements.eval_logger:
-        eval_table, _live = eval_logger_source()
-        eval_version_column = eval_logger_version_column(eval_table)
-        if eval_version_column == "_version":
-            eval_ceiling = int(spans_version_ceiling)
-        elif eval_version_column == "_peerdb_version":
-            if _require_existing_relation_ceiling(
-                additional_filters,
-                table=eval_table,
-                prefix=f"{eval_version_column} < ",
-            ):
-                eval_ceiling = None
-            else:
-                eval_ceiling = _capture_integer_version_ceiling(
-                    analytics=analytics,
-                    table=eval_table,
-                    version_column=eval_version_column,
-                )
-                snapshot_queries += 1
-        else:
-            raise ExactGraphReadError("eval snapshot topology is unsupported")
-        if eval_ceiling is not None:
-            _install_relation_ceiling(
-                additional_filters,
-                table=eval_table,
-                predicate=f"{eval_version_column} < {eval_ceiling}",
-            )
-
-    score_is_frozen = _require_existing_relation_ceiling(
-        additional_filters,
-        table=_SCORE_TABLE,
-        prefix=f"{_SCORE_VERSION_COLUMN} < ",
-    )
-    if requirements.score and not score_is_frozen:
-        score_ceiling = _capture_integer_version_ceiling(
-            analytics=analytics,
-            table=_SCORE_TABLE,
-            version_column=_SCORE_VERSION_COLUMN,
-        )
-        snapshot_queries += 1
-        _install_relation_ceiling(
-            additional_filters,
-            table=_SCORE_TABLE,
-            predicate=f"{_SCORE_VERSION_COLUMN} < {score_ceiling}",
-        )
-
-    end_users_is_frozen = _require_existing_relation_ceiling(
-        additional_filters,
-        table="end_users",
-        prefix="toUnixTimestamp64Micro(version) < ",
-    )
-    if requirements.end_users and not end_users_is_frozen:
-        end_users_ceiling = _capture_datetime64_version_ceiling(
-            analytics=analytics,
-            table="end_users",
-        )
-        snapshot_queries += 1
-        _install_relation_ceiling(
-            additional_filters,
-            table="end_users",
-            predicate=(f"toUnixTimestamp64Micro(version) < {end_users_ceiling}"),
-        )
-
-    settings["additional_table_filters"] = additional_filters
-    return settings, snapshot_queries
-
-
 def _eval_partition_trace_ids_sql() -> str:
     """Return exact trace candidates for the current eval output partition.
 
     The enclosing executor replaces ``start_date``/``end_date`` for every
-    output partition and adaptive retry.  Mutable eval rows are held at the
-    same request-wide relation ceiling through ``additional_table_filters``.
+    output window.
     """
 
     eval_table, eval_live = eval_logger_source(
@@ -809,68 +515,26 @@ def read_exact_eval_graph(
         series = formatted if isinstance(formatted, list) else [formatted]
         metadata = _metadata(
             started=started,
-            version_ceiling=1,
             query_count=0,
             rows_returned=0,
         )
     else:
         query, params = builder.build()
-        version_ceiling = capture_snapshot_version_ceiling(
-            analytics, timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS
+        result = analytics.execute_ch_query(
+            query,
+            params,
+            timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+            settings=EXACT_GRAPH_READ_SETTINGS,
         )
-        settings, relation_snapshot_queries = _apply_filter_relation_snapshot_plan(
-            analytics=analytics,
-            filters=filters,
-            spans_version_ceiling=version_ceiling,
-            force_eval=True,
-        )
-        snapshot_query_count = 1 + relation_snapshot_queries
-        if aggregation_context == "session":
-            remap_ceiling = _capture_datetime64_version_ceiling(
-                analytics=analytics,
-                table="trace_session_id_remap",
-            )
-            settings = {
-                **settings,
-                "additional_table_filters": {
-                    **settings.get("additional_table_filters", {}),
-                    "trace_session_id_remap": (
-                        f"toUnixTimestamp64Micro(version) < {remap_ceiling}"
-                    ),
-                },
-            }
-            snapshot_query_count += 1
-        elif aggregation_context == "user":
-            settings, user_snapshot_queries = _user_membership_settings(
-                analytics=analytics,
-                spans_version_ceiling=version_ceiling,
-                filters=filters,
-                # EvalMetrics already froze its authoritative eval source.
-                needs_eval=False,
-                base_settings=settings,
-            )
-            snapshot_query_count += user_snapshot_queries
-        rows, columns, query_count = execute_exact_output_partitions(
-            analytics=analytics,
-            query=query,
-            params=params,
-            # Aggregate membership still hydrates each candidate entity over
-            # the complete frozen request window.  The candidate set itself is
-            # limited to trace IDs with eval rows in this output partition, so
-            # eval rows remain disjoint and a budget failure can safely split
-            # on output-bucket boundaries without sampling or double counting.
-            partitions=output_bucket_partitions(start_date, end_date, interval),
-            settings=settings,
-            interval=interval,
-        )
+        rows = list(result.data or [])
+        columns = list(result.columns or [])
         formatted = builder.format_result(rows, columns)
         raw_series = formatted if isinstance(formatted, list) else [formatted]
         series = [_add_primary_traffic(item, rows, columns) for item in raw_series]
         metadata = _metadata(
             started=started,
-            version_ceiling=version_ceiling,
-            query_count=query_count + snapshot_query_count,
-            rows_returned=len(rows) + snapshot_query_count,
+            query_count=1,
+            rows_returned=len(rows),
         )
     exact_series = [{**item, "metric_name": config_id, **metadata} for item in series]
     if all_series:
@@ -1073,26 +737,12 @@ def read_exact_annotation_graph(
             "data": [],
             **_metadata(
                 started=started,
-                version_ceiling=1,
                 query_count=0,
                 rows_returned=0,
             ),
         }
 
-    version_ceiling = capture_snapshot_version_ceiling(
-        analytics, timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS
-    )
-    settings: dict[str, Any] = {
-        **EXACT_GRAPH_READ_SETTINGS,
-        "additional_table_filters": {"spans": f"_version < {int(version_ceiling)}"},
-    }
-    settings, relation_snapshot_queries = _apply_filter_relation_snapshot_plan(
-        analytics=analytics,
-        filters=filters,
-        spans_version_ceiling=version_ceiling,
-        base_settings=settings,
-    )
-    snapshot_query_count = 1 + relation_snapshot_queries
+    settings: dict[str, Any] = {**EXACT_GRAPH_READ_SETTINGS}
     if aggregation_context == "session":
         session_trace_sql, session_trace_params = _session_trace_membership_sql(
             project_id=str(project_id),
@@ -1115,14 +765,6 @@ def read_exact_annotation_graph(
         )
         span_predicate = f"trace_id IN ({session_span_sql})"
         span_params = session_span_params
-        remap_ceiling = _capture_datetime64_version_ceiling(
-            analytics=analytics,
-            table="trace_session_id_remap",
-        )
-        settings["additional_table_filters"]["trace_session_id_remap"] = (
-            f"toUnixTimestamp64Micro(version) < {remap_ceiling}"
-        )
-        snapshot_query_count += 1
     elif aggregation_context == "user":
         user_trace_sql, user_trace_params, needs_eval = _user_trace_membership_sql(
             project_id=str(project_id),
@@ -1145,14 +787,6 @@ def read_exact_annotation_graph(
             raise ExactGraphReadError("user annotation membership plan is inconsistent")
         span_predicate = f"trace_id IN ({user_span_sql})"
         span_params = user_span_params
-        settings, user_snapshot_queries = _user_membership_settings(
-            analytics=analytics,
-            spans_version_ceiling=version_ceiling,
-            filters=filters,
-            needs_eval=needs_eval,
-            base_settings=settings,
-        )
-        snapshot_query_count += user_snapshot_queries
     else:
         trace_predicate, trace_params = _compile_membership_filter(
             project_id=project_id,
@@ -1165,8 +799,8 @@ def read_exact_annotation_graph(
             observe_type="span",
         )
     bucket_values: dict[datetime, list[float]] = defaultdict(list)
-    query_count = snapshot_query_count
-    rows_returned = snapshot_query_count
+    query_count = 0
+    rows_returned = 0
 
     # PostgreSQL is authoritative for Score. Hold one repeatable-read snapshot
     # while CH checks only those finite annotated identities. Any membership
@@ -1301,7 +935,6 @@ def read_exact_annotation_graph(
         "data": points,
         **_metadata(
             started=started,
-            version_ceiling=version_ceiling,
             query_count=query_count,
             rows_returned=rows_returned,
         ),
@@ -2087,53 +1720,6 @@ def _user_trace_membership_sql(
     )
 
 
-def _user_membership_settings(
-    *,
-    analytics: Any,
-    spans_version_ceiling: int,
-    filters: list[dict[str, Any]],
-    needs_eval: bool,
-    base_settings: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], int]:
-    """Freeze every mutable table read by the shared user selector."""
-
-    settings = {**(base_settings or EXACT_GRAPH_READ_SETTINGS)}
-    additional_filters = dict(settings.get("additional_table_filters") or {})
-    _install_relation_ceiling(
-        additional_filters,
-        table="spans",
-        predicate=f"_version < {int(spans_version_ceiling)}",
-    )
-    snapshot_queries = 0
-    for table in ("end_user_id_remap", "trace_session_id_remap", "end_users"):
-        if _require_existing_relation_ceiling(
-            additional_filters,
-            table=table,
-            prefix="toUnixTimestamp64Micro(version) < ",
-        ):
-            continue
-        ceiling = _capture_datetime64_version_ceiling(
-            analytics=analytics,
-            table=table,
-        )
-        _install_relation_ceiling(
-            additional_filters,
-            table=table,
-            predicate=f"toUnixTimestamp64Micro(version) < {ceiling}",
-        )
-        snapshot_queries += 1
-
-    settings["additional_table_filters"] = additional_filters
-    settings, relation_snapshot_queries = _apply_filter_relation_snapshot_plan(
-        analytics=analytics,
-        filters=filters,
-        spans_version_ceiling=spans_version_ceiling,
-        base_settings=settings,
-        force_eval=needs_eval,
-    )
-    return settings, snapshot_queries + relation_snapshot_queries
-
-
 def read_exact_user_system_graph(
     *,
     analytics: Any,
@@ -2161,20 +1747,18 @@ def read_exact_user_system_graph(
             "data": formatted.get(metric_key, []),
             **_metadata(
                 started=started,
-                version_ceiling=1,
                 query_count=0,
                 rows_returned=0,
             ),
         }
 
-    user_membership_sql, user_membership_params, needs_eval = _user_id_membership_sql(
+    user_membership_sql, user_membership_params, _needs_eval = _user_id_membership_sql(
         project_id=str(project_id),
         filters=filters,
         start_date=start_date,
         end_date=end_date,
-        # UserTimeSeriesQueryBuilderV2 defines this request-partition CTE. The
-        # membership selector hydrates the complete frozen history only for
-        # users owning one of those disjoint, trace-start-anchored candidates.
+        # UserTimeSeriesQueryBuilderV2 defines this request-window CTE. The
+        # membership selector hydrates users owning one of those candidates.
         candidate_trace_ids_sql=("SELECT toString(trace_id) FROM candidate_trace_ids"),
     )
     builder = UserTimeSeriesQueryBuilderV2(
@@ -2187,27 +1771,14 @@ def read_exact_user_system_graph(
         exact_snapshot_end=end_date,
     )
     query, params = builder.build()
-    version_ceiling = capture_snapshot_version_ceiling(
-        analytics, timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS
+    result = analytics.execute_ch_query(
+        query,
+        params,
+        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+        settings=EXACT_GRAPH_READ_SETTINGS,
     )
-    settings, membership_snapshot_queries = _user_membership_settings(
-        analytics=analytics,
-        spans_version_ceiling=version_ceiling,
-        filters=filters,
-        needs_eval=needs_eval,
-    )
-    rows, columns, query_count = execute_exact_output_partitions(
-        analytics=analytics,
-        query=query,
-        params=params,
-        # Each partition anchors a trace by its earliest latest-live span, then
-        # hydrates that trace and its candidate user's complete frozen window.
-        # A trace can therefore contribute to exactly one partition even when
-        # it crosses an output boundary.
-        partitions=output_bucket_partitions(start_date, end_date, interval),
-        settings=settings,
-        interval=interval,
-    )
+    rows = list(result.data or [])
+    columns = list(result.columns or [])
     formatted = builder.format_result(rows, columns)
     metric_key = metric_id if metric_id in formatted else "active_users"
     traffic = {
@@ -2226,9 +1797,8 @@ def read_exact_user_system_graph(
         ],
         **_metadata(
             started=started,
-            version_ceiling=version_ceiling,
-            query_count=query_count + 1 + membership_snapshot_queries,
-            rows_returned=len(rows) + 1 + membership_snapshot_queries,
+            query_count=1,
+            rows_returned=len(rows),
         ),
     }
 
@@ -2249,7 +1819,6 @@ def read_exact_session_system_graph(
             "data": [],
             **_metadata(
                 started=started,
-                version_ceiling=1,
                 query_count=0,
                 rows_returned=0,
             ),
@@ -2281,6 +1850,11 @@ def read_exact_session_system_graph(
         include_trace_ids=False,
         anchor_by_session_start=True,
     )
+    query_params = {
+        **query_params,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
     query = f"""
     SELECT
         {bucket_fn}(session_start) AS time_bucket,
@@ -2292,39 +1866,14 @@ def read_exact_session_system_graph(
     GROUP BY time_bucket
     ORDER BY time_bucket
     """
-    version_ceiling = capture_snapshot_version_ceiling(
-        analytics, timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS
+    result = analytics.execute_ch_query(
+        query,
+        query_params,
+        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+        settings=EXACT_GRAPH_READ_SETTINGS,
     )
-    remap_ceiling = _capture_datetime64_version_ceiling(
-        analytics=analytics,
-        table="trace_session_id_remap",
-    )
-    settings = {
-        **EXACT_GRAPH_READ_SETTINGS,
-        "additional_table_filters": {
-            "spans": f"_version < {int(version_ceiling)}",
-            "trace_session_id_remap": (
-                f"toUnixTimestamp64Micro(version) < {remap_ceiling}"
-            ),
-        },
-    }
-    settings, relation_snapshot_queries = _apply_filter_relation_snapshot_plan(
-        analytics=analytics,
-        filters=filters,
-        spans_version_ceiling=version_ceiling,
-        base_settings=settings,
-    )
-    rows, columns, query_count = execute_exact_output_partitions(
-        analytics=analytics,
-        query=query,
-        params=query_params,
-        # Candidate sessions are anchored by their true filtered session_start
-        # in exactly one output partition, while the source hydrates the whole
-        # session from the immutable snapshot bounds.
-        partitions=output_bucket_partitions(start_date, end_date, interval),
-        settings=settings,
-        interval=interval,
-    )
+    rows = list(result.data or [])
+    columns = list(result.columns or [])
     values: dict[str, tuple[float, int]] = {}
     for row in rows:
         timestamp = _row_value(row, columns, "time_bucket", None)
@@ -2354,9 +1903,8 @@ def read_exact_session_system_graph(
         "data": points,
         **_metadata(
             started=started,
-            version_ceiling=version_ceiling,
-            query_count=query_count + 2 + relation_snapshot_queries,
-            rows_returned=len(rows) + 2 + relation_snapshot_queries,
+            query_count=1,
+            rows_returned=len(rows),
         ),
     }
 
@@ -2364,7 +1912,6 @@ def read_exact_session_system_graph(
 __all__ = [
     "EXACT_GRAPH_MAX_BUCKETS_PER_PARTITION",
     "ExactGraphReadError",
-    "execute_exact_output_partitions",
     "output_bucket_partitions",
     "read_exact_all_system_metrics",
     "read_exact_annotation_graph",

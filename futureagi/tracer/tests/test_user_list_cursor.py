@@ -127,14 +127,6 @@ def test_cursor_page_publishes_only_fully_hydrated_matching_rows():
     with (
         patch.object(
             manager,
-            "_capture_cursor_snapshot",
-            return_value=(
-                {"additional_table_filters": {"spans": "_version < 10"}},
-                {"spans": 10},
-            ),
-        ),
-        patch.object(
-            manager,
             "_read_dimension_candidates",
             return_value=candidates,
         ),
@@ -168,14 +160,6 @@ def test_cursor_checkpoint_survives_later_deadline_without_inventing_match():
     with (
         patch.object(
             manager,
-            "_capture_cursor_snapshot",
-            return_value=(
-                {"additional_table_filters": {"spans": "_version < 10"}},
-                {"spans": 10},
-            ),
-        ),
-        patch.object(
-            manager,
             "_read_dimension_candidates",
             side_effect=[candidates, ReadDeadlineExceeded("deadline")],
         ),
@@ -200,7 +184,7 @@ def test_cursor_checkpoint_survives_later_deadline_without_inventing_match():
     )
 
 
-def test_cursor_resume_reuses_frozen_window_and_relation_snapshot():
+def test_cursor_resume_reuses_frozen_window_and_keyset():
     now = datetime(2026, 8, 5, 12, tzinfo=UTC)
     candidate = _candidate(3, now=now)
     manager = _manager()
@@ -208,27 +192,14 @@ def test_cursor_resume_reuses_frozen_window_and_relation_snapshot():
         window_start=now - timedelta(days=30),
         window_end=now,
         order=(candidate["first_seen"], candidate["end_user_id"]),
-        version_ceiling=10,
         seen_rows=7,
-        relation_version_ceilings={
-            "spans": 10,
-            "end_users": 11,
-            "end_user_id_remap": 12,
-        },
     )
 
-    with (
-        patch.object(
-            manager,
-            "_capture_cursor_snapshot",
-            side_effect=AssertionError("resume must not recapture"),
-        ),
-        patch.object(
-            manager,
-            "_read_dimension_candidates",
-            return_value=[],
-        ) as read_candidates,
-    ):
+    with patch.object(
+        manager,
+        "_read_dimension_candidates",
+        return_value=[],
+    ) as read_candidates:
         result = manager.list_cursor_payload(page_size=25, cursor=cursor)
 
     assert result.window_start == cursor.window_start
@@ -238,9 +209,7 @@ def test_cursor_resume_reuses_frozen_window_and_relation_snapshot():
     kwargs = read_candidates.call_args.kwargs
     assert kwargs["before_first_seen"] == candidate["first_seen"]
     assert kwargs["before_end_user_id"] == candidate["end_user_id"]
-    assert kwargs["snapshot_settings"]["additional_table_filters"]["spans"] == (
-        "_version < 10"
-    )
+    assert "snapshot_settings" not in kwargs
 
 
 @pytest.mark.parametrize(

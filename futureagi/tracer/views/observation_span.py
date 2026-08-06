@@ -110,18 +110,13 @@ from tracer.services.clickhouse.graph_dispatch import (
 )
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
-    capture_list_relation_snapshot,
-    capture_snapshot_version_ceiling,
     cursor_page_metadata,
-    cursor_requires_relation_snapshot,
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
     exact_total_explicitly_required,
     frozen_window_filter,
-    relation_snapshot_read_settings,
     snapshot_cursor_supported,
-    snapshot_read_settings,
 )
 from tracer.services.clickhouse.page_dedup import paginate_deduped
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
@@ -1582,10 +1577,10 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.success_response(
                 {"message": "Action type submitted successfully"}
             )
-        except Exception as e:
-            logger.exception(f"Error in submitting the feedback action type: {str(e)}")
+        except Exception:
+            logger.exception("Error in submitting the feedback action type")
             return self._gm.bad_request(
-                f"Error submitting feedback action type: {str(e)}"
+                "Unable to submit feedback action. Please try again."
             )
 
     @validated_request(
@@ -1857,47 +1852,10 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 )
             cursor_enabled = False
             builder._bounded_internal_scan = False
-        relation_version_ceilings: dict[str, int] | None = None
-        version_ceiling = None
-        if cursor_enabled:
-            if cursor_state is not None:
-                version_ceiling = cursor_state.version_ceiling
-                relation_version_ceilings = cursor_state.relation_version_ceilings
-                page_read_settings = (
-                    relation_snapshot_read_settings(
-                        SPAN_LIST_READ_SETTINGS,
-                        version_ceilings=relation_version_ceilings,
-                    )
-                    if relation_version_ceilings
-                    else snapshot_read_settings(
-                        SPAN_LIST_READ_SETTINGS,
-                        builder=builder,
-                        version_ceiling=version_ceiling,
-                    )
-                )
-            else:
-                if cursor_requires_relation_snapshot(filters, resource="observe_spans"):
-                    page_read_settings, relation_version_ceilings = (
-                        capture_list_relation_snapshot(
-                            analytics=analytics,
-                            builder=builder,
-                            base_settings=SPAN_LIST_READ_SETTINGS,
-                            timeout_ms=read_deadline.remaining_ms(1_000),
-                        )
-                    )
-                    version_ceiling = relation_version_ceilings["spans"]
-                else:
-                    version_ceiling = capture_snapshot_version_ceiling(
-                        analytics,
-                        timeout_ms=read_deadline.remaining_ms(250),
-                    )
-                    page_read_settings = snapshot_read_settings(
-                        SPAN_LIST_READ_SETTINGS,
-                        builder=builder,
-                        version_ceiling=version_ceiling,
-                    )
-        else:
-            page_read_settings = SPAN_LIST_READ_SETTINGS
+        # Freeze the finite request window and keyset, not mutable physical
+        # versions. ReplacingMergeTree merges can discard the old version a
+        # ceiling needs, so each page resolves current latest state instead.
+        page_read_settings = SPAN_LIST_READ_SETTINGS
 
         # Phase 1: Paginated spans (light columns — no input/output).
         bounded_page = None
@@ -2475,7 +2433,6 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         cursor_has_more = False
         if (
             cursor_enabled
-            and version_ceiling is not None
             and (
                 (bounded_page is None and has_more)
                 or (
@@ -2506,9 +2463,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     bounded_page=bounded_page,
                     cursor_state=cursor_state,
                 ),
-                version_ceiling=version_ceiling,
                 seen_rows=cursor_seen_rows,
-                relation_version_ceilings=relation_version_ceilings,
                 scan_slice_end=(
                     bounded_page.continuation_slice_end
                     if bounded_page is not None and not bounded_page.has_more
@@ -3881,8 +3836,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
         except AnnotationsLabels.DoesNotExist:
             return self._gm.bad_request("Annotation label not found")
-        except Exception as e:
-            return self._gm.bad_request(f"error deleting the annotation label {str(e)}")
+        except Exception:
+            logger.exception("Error deleting annotation label")
+            return self._gm.bad_request(
+                "Unable to delete the annotation label. Please try again."
+            )
 
     def _bounded_span_navigation_response(
         self,

@@ -4,6 +4,7 @@ import {
   getAggColumnLabel,
   getExactDashboardResult,
   getDashboardMetricSeriesState,
+  getPlottedChartSeries,
   getYAxisRangeWarning,
   seriesHasDataPoints,
   toAxisConfigPayload,
@@ -76,6 +77,31 @@ describe("seriesHasDataPoints", () => {
       ]),
     ).toBe(true);
     expect(seriesHasDataPoints([null, undefined])).toBe(false);
+  });
+});
+
+describe("getPlottedChartSeries", () => {
+  it("connects the widget editor line preview across null buckets without changing zeroes or source data", () => {
+    const source = [
+      {
+        name: "Latency (avg)",
+        data: [
+          { x: 1, y: 12 },
+          { x: 2, y: null },
+          { x: 3, y: 0 },
+          { x: 4, y: 18 },
+        ],
+      },
+    ];
+
+    expect(getPlottedChartSeries(source, true)[0].data).toEqual([
+      { x: 1, y: 12 },
+      { x: 3, y: 0 },
+      { x: 4, y: 18 },
+    ]);
+    expect(source[0].data).toHaveLength(4);
+    expect(source[0].data[1].y).toBeNull();
+    expect(getPlottedChartSeries(source, false)).toBe(source);
   });
 });
 

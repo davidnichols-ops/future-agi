@@ -11,6 +11,7 @@ from django.core.cache import cache
 from tracer.services.clickhouse.exact_graph_reads import (
     _filter_relation_requirements,
     output_bucket_partitions,
+    read_exact_all_system_metrics,
     read_exact_annotation_graph,
     read_exact_eval_graph,
     read_exact_session_system_graph,
@@ -953,19 +954,25 @@ def test_filter_relation_snapshot_plan_detects_every_relational_filter(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("observe_type", ["trace", "span"])
-def test_combined_eval_annotation_filters_freeze_once_and_reuse_every_partition(
+def test_exact_system_graph_compiles_relations_in_one_project_scoped_statement(
     monkeypatch,
     observe_type,
 ):
-    from tracer.services.clickhouse import exact_graph_reads as exact_module
+    from tracer.models.custom_eval_config import CustomEvalConfig
 
     analytics = _RelationSnapshotAnalytics()
     start = datetime(2026, 1, 1)
     end = datetime(2026, 4, 15)
+
+    class _ProjectConfigs:
+        @staticmethod
+        def values_list(*_args, **_kwargs):
+            return ("33333333-3333-4333-8333-333333333333",)
+
     monkeypatch.setattr(
-        exact_module,
-        "eval_logger_source",
-        lambda *_args, **_kwargs: ("tracer_eval_logger", "deleted = 0"),
+        CustomEvalConfig.objects,
+        "filter",
+        lambda **_kwargs: _ProjectConfigs(),
     )
 
     result = read_exact_system_graph(
@@ -977,29 +984,28 @@ def test_combined_eval_annotation_filters_freeze_once_and_reuse_every_partition(
         observe_type=observe_type,
     )
 
-    assert analytics.capture_calls == [
-        "spans",
-        "tracer_eval_logger",
-        "model_hub_score",
-        "end_users",
-    ]
-    assert len(analytics.main_calls) > 1
-    assert all(
-        call_settings["additional_table_filters"]
-        == {
-            "spans": "_version < 900",
-            "tracer_eval_logger": "_peerdb_version < 701",
-            "model_hub_score": "_peerdb_version < 801",
-            "end_users": "toUnixTimestamp64Micro(version) < 901",
-        }
-        for _query, _params, call_settings in analytics.main_calls
+    assert analytics.capture_calls == []
+    assert len(analytics.main_calls) == 1
+    query, params, settings = analytics.main_calls[0]
+    assert query.count("FROM spans") == 1
+    assert "FROM spans FINAL" not in query
+    assert "argMax(" in query
+    assert "FROM tracer_eval_logger" in query
+    assert "AS eval_scan" in query
+    assert "FROM model_hub_score AS s FINAL" in query
+    assert "FROM end_users AS eu FINAL" in query
+    assert "tracer_project_id = toUUID(" in query
+    assert "eu.project_id = toUUID(" in query
+    assert "additional_table_filters" not in settings
+    assert params["graph_filter_1_project_eval_config_ids"] == (
+        "33333333-3333-4333-8333-333333333333",
     )
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
 
 @pytest.mark.unit
-def test_user_id_filter_alone_freezes_curated_end_users_once():
+def test_user_id_relation_filter_uses_one_spans_source_and_curated_remap():
     analytics = _RelationSnapshotAnalytics()
     start = datetime(2026, 1, 1)
     end = datetime(2026, 4, 15)
@@ -1014,48 +1020,48 @@ def test_user_id_filter_alone_freezes_curated_end_users_once():
         observe_type="trace",
     )
 
-    assert analytics.capture_calls == ["spans", "end_users"]
-    assert len(analytics.main_calls) > 1
-    assert all(
-        call_settings["additional_table_filters"]
-        == {
-            "spans": "_version < 900",
-            "end_users": "toUnixTimestamp64Micro(version) < 901",
-        }
-        for _query, _params, call_settings in analytics.main_calls
-    )
+    assert analytics.capture_calls == []
+    assert len(analytics.main_calls) == 1
+    query, _params, _settings = analytics.main_calls[0]
+    assert query.count("FROM spans") == 1
+    assert "FROM spans FINAL" not in query
+    assert "argMax(" in query
+    assert query.count("FROM end_users AS eu FINAL") == 1
+    assert query.count("FROM end_user_id_remap FINAL") == 1
+    assert "graph_relation_end_user_id" in query
     assert result["query_complete"] is True
 
 
 @pytest.mark.unit
-def test_relation_ceiling_capture_failure_prevents_complete_graph(monkeypatch):
-    from tracer.services.clickhouse import exact_graph_reads as exact_module
+def test_system_graph_does_not_issue_separate_relation_snapshot_queries(
+    monkeypatch,
+):
+    from tracer.models.custom_eval_config import CustomEvalConfig
 
     analytics = _RelationSnapshotAnalytics(fail_table="model_hub_score")
+
+    class _ProjectConfigs:
+        @staticmethod
+        def values_list(*_args, **_kwargs):
+            return ("33333333-3333-4333-8333-333333333333",)
+
     monkeypatch.setattr(
-        exact_module,
-        "eval_logger_source",
-        lambda *_args, **_kwargs: ("tracer_eval_logger", "deleted = 0"),
+        CustomEvalConfig.objects,
+        "filter",
+        lambda **_kwargs: _ProjectConfigs(),
     )
 
-    with pytest.raises(RuntimeError, match="score ceiling unavailable"):
-        read_exact_system_graph(
-            analytics=analytics,
-            project_id="11111111-1111-4111-8111-111111111111",
-            filters=_combined_relation_filters(
-                datetime(2026, 1, 1), datetime(2026, 4, 15)
-            ),
-            interval="day",
-            metric_id="traffic",
-            observe_type="trace",
-        )
+    read_exact_system_graph(
+        analytics=analytics,
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_combined_relation_filters(datetime(2026, 1, 1), datetime(2026, 4, 15)),
+        interval="day",
+        metric_id="traffic",
+        observe_type="trace",
+    )
 
-    assert analytics.capture_calls == [
-        "spans",
-        "tracer_eval_logger",
-        "model_hub_score",
-    ]
-    assert analytics.main_calls == []
+    assert analytics.capture_calls == []
+    assert len(analytics.main_calls) == 1
 
 
 @pytest.mark.unit
@@ -1080,16 +1086,138 @@ def test_exact_system_graph_combines_scalar_array_map_and_legacy_json(observe_ty
     assert "JSONExtractArrayRaw(attributes_extra" in query
     assert "JSONExtractRaw(attributes_extra" in query
     assert "toString(JSONType(attributes_extra" in query
-    assert params["snapshot_start_date"] == start
-    assert params["snapshot_end_date"] == end
-    assert params["latest_filter_key_2"] == "tags"
-    assert params["latest_filter_key_3"] == "profile"
-    assert params["latest_filter_key_4"] == "legacy_payload"
-    assert settings["additional_table_filters"]["spans"] == "_version < 900"
-    structured_memberships = query.count(
-        "SELECT DISTINCT trace_id\n                FROM spans FINAL"
+    assert params["start_date"] == start
+    assert params["end_date"] == end
+    assert params["graph_filter_2_latest_filter_key_2"] == "tags"
+    assert params["graph_filter_3_latest_filter_key_3"] == "profile"
+    assert params["graph_filter_4_latest_filter_key_4"] == "legacy_payload"
+    assert "additional_table_filters" not in settings
+    assert query.count("FROM spans") == 1
+    assert "FROM spans FINAL" not in query
+    assert "argMax(" in query
+    assert "PREWHERE project_id = %(project_id)s" in query
+    prewhere = query.split("PREWHERE", 1)[1].split("GROUP BY", 1)[0]
+    assert "project_id" in prewhere
+    assert "start_time" in prewhere
+    assert "attrs_" not in prewhere
+    assert "is_deleted" not in prewhere
+    assert "snapshot_version_ceiling" not in params
+    assert "AS latest_spans" not in query
+    assert "SELECT DISTINCT trace_id" not in query
+    assert "OVER (PARTITION BY trace_id) AS graph_match_" not in query
+    if observe_type == "trace":
+        assert query.count("AS graph_bucket_match_") == 4
+        assert query.count("max(graph_bucket_match_") == 4
+        assert "groupArrayIf(" in query
+        compact_suffix = query.split(") AS graph_physical_versions", 1)[1]
+        assert "attrs_string" not in compact_suffix
+        assert "attrs_number" not in compact_suffix
+        assert "attrs_bool" not in compact_suffix
+        assert "attributes_extra" not in compact_suffix
+    else:
+        assert "graph_bucket_match_" not in query
+    assert result["query_complete"] is True
+    assert result["query_sampled"] is False
+
+
+@pytest.mark.unit
+def test_exact_trace_graph_routes_every_span_read_through_one_statement_source():
+    analytics = _ConcurrentArrivalAnalytics()
+    start = datetime(2026, 8, 1)
+    end = datetime(2026, 8, 5)
+
+    result = read_exact_system_graph(
+        analytics=analytics,
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(start, end),
+        interval="day",
+        metric_id="traffic",
+        observe_type="trace",
     )
-    assert structured_memberships == (3 if observe_type == "trace" else 0)
+
+    query, params, settings = analytics.partition_calls[0]
+    # Every outer contribution and scalar predicate is evaluated on one
+    # physical latest-state row stream inside one ClickHouse statement.
+    assert query.count("FROM spans") == 1
+    assert "FROM spans FINAL" not in query
+    assert "argMax(" in query
+    assert "AS latest_spans" not in query
+    assert "SELECT DISTINCT trace_id" not in query
+    assert "JOIN spans" not in query
+    assert "PREWHERE project_id = %(project_id)s" in query
+    assert "snapshot_version_ceiling" not in params
+    assert "additional_table_filters" not in settings
+    assert settings["optimize_move_to_prewhere_if_final"] == 0
+    assert settings["use_skip_indexes_if_final"] == 0
+    # Separate bucket flags let two sibling spans independently satisfy
+    # final_status and confidence; the compact trace aggregate retains every
+    # exact additive output-bucket state without buffering raw Map columns.
+    assert "OVER (PARTITION BY trace_id) AS graph_match_" not in query
+    assert query.count("AS graph_bucket_match_") == 2
+    assert query.count("max(graph_bucket_match_") == 2
+    assert "graph_match_0 = 1" in query
+    assert "graph_match_1 = 1" in query
+    assert "groupArrayIf(" in query
+    assert len(analytics.partition_calls) == 1
+    assert result["query_count"] == 1
+    assert "query_snapshot_version_ceiling" not in result
+    assert result["query_complete"] is True
+    assert result["query_sampled"] is False
+
+
+@pytest.mark.unit
+def test_exact_all_system_metrics_uses_one_readonly_statement():
+    analytics = _ConcurrentArrivalAnalytics()
+    start = datetime(2026, 8, 1)
+    end = datetime(2026, 8, 5)
+
+    result = read_exact_all_system_metrics(
+        analytics=analytics,
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(start, end),
+        interval="day",
+    )
+
+    query, params, settings = analytics.partition_calls[0]
+    assert query.count("FROM spans") == 1
+    assert "FROM spans FINAL" not in query
+    assert "argMax(" in query
+    assert "AS latest_spans" not in query
+    assert "OVER (PARTITION BY trace_id)" not in query
+    assert "attrs_string" in query and "attrs_number" in query
+    assert "snapshot_version_ceiling" not in params
+    assert "additional_table_filters" not in settings
+    assert len(analytics.partition_calls) == 1
+    assert result["query_count"] == 1
+    assert "query_snapshot_version_ceiling" not in result
+    assert result["query_complete"] is True
+    assert result["query_sampled"] is False
+
+
+@pytest.mark.unit
+def test_exact_system_graph_empty_datetime_domain_issues_no_clickhouse_query():
+    analytics = _ConcurrentArrivalAnalytics()
+
+    result = read_exact_system_graph(
+        analytics=analytics,
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=[
+            {
+                "column_id": "start_time",
+                "filter_config": {
+                    "filter_type": "datetime",
+                    "filter_op": "is_null",
+                    "filter_value": None,
+                },
+            }
+        ],
+        interval="day",
+        metric_id="traffic",
+        observe_type="trace",
+    )
+
+    assert analytics.partition_calls == []
+    assert result["query_count"] == 0
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
@@ -1139,46 +1267,28 @@ def test_exact_structured_null_domain_covers_missing_null_and_type_mismatch(
 
 
 @pytest.mark.unit
-def test_exact_graph_budget_retry_splits_only_buckets_and_keeps_multi_filters():
+def test_exact_graph_budget_failure_does_not_stitch_cross_query_partitions():
     analytics = _BudgetSplittingAnalytics()
     start = datetime(2026, 8, 1, 0, 0)
     end = datetime(2026, 8, 1, 4, 0)
 
-    result = read_exact_system_graph(
-        analytics=analytics,
-        project_id="11111111-1111-4111-8111-111111111111",
-        filters=_exact_multi_filters(start, end),
-        interval="hour",
-        metric_id="traffic",
-        observe_type="trace",
-    )
+    with pytest.raises(ServerException):
+        read_exact_system_graph(
+            analytics=analytics,
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(start, end),
+            interval="hour",
+            metric_id="traffic",
+            observe_type="trace",
+        )
 
-    # The 4h probe, then each 2h probe, fail under the bounded profile. Four
-    # indivisible output buckets complete exactly; the snapshot query is the
-    # eighth and final query counted in the response metadata.
-    assert result["query_count"] == 8
-    assert result["query_complete"] is True
-    assert result["query_sampled"] is False
-    successful_ranges = [
-        (params["start_date"], params["end_date"])
-        for _query, params, _timeout, _settings in analytics.partition_calls
-        if (params["end_date"] - params["start_date"]).total_seconds() <= 3600
-    ]
-    assert successful_ranges == [
-        (datetime(2026, 8, 1, hour), datetime(2026, 8, 1, hour + 1))
-        for hour in range(4)
-    ]
-    assert {
-        timeout for _query, _params, timeout, _settings in analytics.partition_calls
-    } == {30_000, 300_000}
-    assert all(
-        params["snapshot_start_date"] == start
-        and params["snapshot_end_date"] == end
-        and "attrs_string" in query
-        and "attrs_number" in query
-        and settings["additional_table_filters"]["spans"] == "_version < 900"
-        for query, params, _timeout, settings in analytics.partition_calls
-    )
+    assert len(analytics.partition_calls) == 1
+    query, params, timeout, settings = analytics.partition_calls[0]
+    assert (params["start_date"], params["end_date"]) == (start, end)
+    assert "attrs_string" in query and "attrs_number" in query
+    assert "snapshot_version_ceiling" not in params
+    assert "additional_table_filters" not in settings
+    assert timeout == 300_000
 
 
 @pytest.mark.unit
@@ -1202,7 +1312,7 @@ def test_exact_graph_does_not_retry_programming_errors():
 
 
 @pytest.mark.unit
-def test_partitioned_exact_read_reuses_one_version_ceiling():
+def test_long_exact_system_window_remains_one_statement():
     analytics = _ConcurrentArrivalAnalytics()
     start = datetime(2026, 1, 1)
     end = datetime(2026, 4, 15)
@@ -1227,26 +1337,20 @@ def test_partitioned_exact_read_reuses_one_version_ceiling():
         observe_type="trace",
     )
 
-    assert len(analytics.partition_calls) > 1
-    assert {
-        call_settings["additional_table_filters"]["spans"]
-        for _query, _params, call_settings in analytics.partition_calls
-    } == {"_version < 900"}
-    assert all(
-        "trace_id IN" in query
-        and params["snapshot_start_date"] == start
-        and params["snapshot_end_date"] == end
-        for query, params, _settings in analytics.partition_calls
-    )
-    assert (
-        len(
-            {
-                (params["start_date"], params["end_date"])
-                for _query, params, _settings in analytics.partition_calls
-            }
-        )
-        > 1
-    )
+    assert len(analytics.partition_calls) == 1
+    query, params, settings = analytics.partition_calls[0]
+    assert "additional_table_filters" not in settings
+    assert "snapshot_version_ceiling" not in params
+    assert "trace_id IN" not in query
+    assert query.count("FROM spans") == 1
+    assert "FROM spans FINAL" not in query
+    assert "argMax(" in query
+    assert "OVER (PARTITION BY trace_id) AS graph_match_" not in query
+    assert query.count("AS graph_bucket_match_") == 1
+    assert query.count("max(graph_bucket_match_") == 1
+    assert (params["start_date"], params["end_date"]) == (start, end)
+    assert result["query_count"] == 1
+    assert "query_snapshot_version_ceiling" not in result
     assert result["query_complete"] is True
     assert result["query_status"] == "complete"
     assert result["query_sampled"] is False
@@ -1328,28 +1432,20 @@ class _EntityBudgetSplittingAnalytics:
 
 
 def _assert_entity_output_partitions(calls, start, end):
-    """Assert chronological, gap-free partitions with one frozen entity window."""
+    """Assert one current-state statement covers the complete entity window."""
 
-    assert len(calls) > 1
-    ranges = [
-        (params["start_date"], params["end_date"])
-        for _query, params, _settings in calls
-    ]
-    assert ranges[0][0] == start
-    assert ranges[-1][1] == end
-    assert all(
-        left[1] == right[0] for left, right in zip(ranges, ranges[1:], strict=False)
-    )
-    assert all(left < right for left, right in ranges)
-    assert all(
-        params["snapshot_start_date"] == start and params["snapshot_end_date"] == end
-        for _query, params, _settings in calls
-    )
+    assert len(calls) == 1
+    _query, params, settings = calls[0]
+    assert params["start_date"] == start
+    assert params["end_date"] == end
+    assert params["snapshot_start_date"] == start
+    assert params["snapshot_end_date"] == end
+    assert "additional_table_filters" not in settings
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("aggregation_context", ["session", "user"])
-def test_entity_system_graph_adaptively_splits_without_bisecting_entities(
+def test_entity_system_graph_does_not_stitch_budget_failed_statements(
     aggregation_context,
 ):
     analytics = _EntityBudgetSplittingAnalytics()
@@ -1362,41 +1458,17 @@ def test_entity_system_graph_adaptively_splits_without_bisecting_entities(
         "interval": "hour",
     }
 
-    if aggregation_context == "session":
-        result = read_exact_session_system_graph(
-            **common,
-            metric_id="session_count",
-        )
-        expected_shape = "WITH candidate_sessions AS"
-    else:
-        result = read_exact_user_system_graph(
-            **common,
-            metric_id="active_users",
-        )
-        expected_shape = "candidate_trace_ids AS"
+    with pytest.raises(ServerException, match="private budget detail"):
+        if aggregation_context == "session":
+            read_exact_session_system_graph(**common, metric_id="session_count")
+        else:
+            read_exact_user_system_graph(**common, metric_id="active_users")
 
-    # 4h and both 2h probes fail; the four one-hour entity-safe leaves pass.
-    assert len(analytics.main_calls) == 7
-    successful = [
-        call
-        for call in analytics.main_calls
-        if (call[1]["end_date"] - call[1]["start_date"]).total_seconds() == 3600
-    ]
-    assert len(successful) == 4
-    assert [call[1]["start_date"].hour for call in successful] == [0, 1, 2, 3]
-    assert all(
-        call_params["snapshot_start_date"] == start
-        and call_params["snapshot_end_date"] == end
-        and expected_shape in query
-        and settings["additional_table_filters"]["spans"] == "_version < 900"
-        for query, call_params, _timeout, settings in analytics.main_calls
-    )
-    assert {call[2] for call in analytics.main_calls} == {30_000, 300_000}
-    assert sum(point["value"] for point in result["data"]) == 4
-    assert sum(point["primary_traffic"] for point in result["data"]) == 4
-    assert sum(point["value"] == 1 for point in result["data"]) == 4
-    assert result["query_complete"] is True
-    assert result["query_sampled"] is False
+    assert len(analytics.main_calls) == 1
+    _query, params, timeout_ms, settings = analytics.main_calls[0]
+    assert (params["start_date"], params["end_date"]) == (start, end)
+    assert timeout_ms == 300_000
+    assert "additional_table_filters" not in settings
 
 
 @pytest.mark.unit
@@ -1493,12 +1565,11 @@ def test_exact_session_graph_combines_native_session_and_aggregate_filters():
         metric_id="session_count",
     )
 
-    # A >31-bucket range is safely partitioned: each query discovers sessions
-    # anchored in its output range and hydrates them over the full snapshot.
+    # The full exact range is evaluated by one current-state statement.
     _assert_entity_output_partitions(analytics.main_calls, start, end)
     query, params, _settings = analytics.main_calls[0]
     assert params["start_date"] == start
-    assert params["end_date"] < end
+    assert params["end_date"] == end
     assert params["exact_session_id_1"] == (session_id,)
     assert params["session_having_1"] == 5
     assert params["session_having_2"] == 10
@@ -1539,7 +1610,7 @@ def test_exact_session_system_graph_supports_array_map_and_legacy_json_filters()
     assert "JSONExtractRaw(attributes_extra" in query
     assert params["snapshot_start_date"] == start
     assert params["snapshot_end_date"] == end
-    assert settings["additional_table_filters"]["spans"] == "_version < 900"
+    assert "additional_table_filters" not in settings
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
@@ -1565,26 +1636,9 @@ def test_exact_session_graph_freezes_combined_filter_relations(monkeypatch):
         metric_id="session_count",
     )
 
-    assert analytics.capture_calls == [
-        "spans",
-        "trace_session_id_remap",
-        "tracer_eval_logger",
-        "model_hub_score",
-        "end_users",
-    ]
+    assert analytics.capture_calls == []
     _assert_entity_output_partitions(analytics.main_calls, start, end)
-    settings = analytics.main_calls[0][2]["additional_table_filters"]
-    assert all(
-        call_settings["additional_table_filters"] == settings
-        for _query, _params, call_settings in analytics.main_calls
-    )
-    assert settings == {
-        "spans": "_version < 900",
-        "trace_session_id_remap": "toUnixTimestamp64Micro(version) < 901",
-        "tracer_eval_logger": "_peerdb_version < 701",
-        "model_hub_score": "_peerdb_version < 801",
-        "end_users": "toUnixTimestamp64Micro(version) < 901",
-    }
+    assert "additional_table_filters" not in analytics.main_calls[0][2]
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
@@ -1783,25 +1837,17 @@ def test_session_eval_graph_partitions_candidates_and_hydrates_full_sessions(
     assert "JSONExtractArrayRaw(attributes_extra" in query
     assert "JSONExtractRaw(attributes_extra" in query
     assert params["start_date"] == start
-    assert params["end_date"] < end
+    assert params["end_date"] == end
     assert "candidate_eval.created_at >= %(start_date)s" in query
     assert "candidate_eval.created_at < %(end_date)s" in query
-    assert settings["additional_table_filters"]["spans"] == "_version < 900"
-    assert (
-        settings["additional_table_filters"]["tracer_eval_logger_v2"]
-        == "_version < 900"
-    )
-    assert (
-        settings["additional_table_filters"]["trace_session_id_remap"]
-        == "toUnixTimestamp64Micro(version) < 901"
-    )
+    assert "additional_table_filters" not in settings
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("aggregation_context", ["session", "user"])
-def test_entity_eval_graph_adaptively_splits_candidate_eval_partitions(
+def test_entity_eval_graph_does_not_stitch_budget_failed_statements(
     monkeypatch,
     aggregation_context,
 ):
@@ -1822,36 +1868,25 @@ def test_entity_eval_graph_adaptively_splits_candidate_eval_partitions(
         lambda *_args: config_qs,
     )
 
-    result = read_exact_eval_graph(
-        analytics=analytics,
-        project_id="22222222-2222-4222-8222-222222222222",
-        filters=[_time_filter(start, end)],
-        interval="hour",
-        req_data_config={"id": eval_config_id, "output_type": "SCORE"},
-        observe_type="trace",
-        aggregation_context=aggregation_context,
-    )
+    with pytest.raises(ServerException, match="private budget detail"):
+        read_exact_eval_graph(
+            analytics=analytics,
+            project_id="22222222-2222-4222-8222-222222222222",
+            filters=[_time_filter(start, end)],
+            interval="hour",
+            req_data_config={"id": eval_config_id, "output_type": "SCORE"},
+            observe_type="trace",
+            aggregation_context=aggregation_context,
+        )
 
-    assert len(analytics.main_calls) == 7
-    assert all(
-        params["snapshot_start_date"] == start
-        and params["snapshot_end_date"] == end
-        and "candidate_eval.created_at >= %(start_date)s" in query
-        and "candidate_eval.created_at < %(end_date)s" in query
-        and "SELECT DISTINCT toString(candidate_member.trace_id) AS trace_id" in query
-        for query, params, _timeout, _settings in analytics.main_calls
-    )
-    successful = [
-        params
-        for _query, params, _timeout, _settings in analytics.main_calls
-        if (params["end_date"] - params["start_date"]).total_seconds() == 3600
-    ]
-    assert [params["start_date"].hour for params in successful] == [0, 1, 2, 3]
-    assert sum(point["value"] for point in result["data"]) == 4
-    assert sum(point["primary_traffic"] for point in result["data"]) == 4
-    assert sum(point["value"] == 1 for point in result["data"]) == 4
-    assert result["query_complete"] is True
-    assert result["query_sampled"] is False
+    assert len(analytics.main_calls) == 1
+    query, params, timeout_ms, settings = analytics.main_calls[0]
+    assert (params["start_date"], params["end_date"]) == (start, end)
+    assert "candidate_eval.created_at >= %(start_date)s" in query
+    assert "candidate_eval.created_at < %(end_date)s" in query
+    assert "SELECT DISTINCT toString(candidate_member.trace_id) AS trace_id" in query
+    assert timeout_ms == 300_000
+    assert "additional_table_filters" not in settings
 
 
 @pytest.mark.unit
@@ -1897,18 +1932,14 @@ def test_exact_eval_graph_supports_combined_structured_filters(
     assert "JSONExtractRaw(attributes_extra" in query
     assert params["snapshot_start_date"] == start
     assert params["snapshot_end_date"] == end
-    assert settings["additional_table_filters"]["spans"] == "_version < 900"
-    assert (
-        settings["additional_table_filters"]["tracer_eval_logger_v2"]
-        == "_version < 900"
-    )
+    assert "additional_table_filters" not in settings
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("observe_type", ["trace", "span"])
-def test_exact_eval_reader_reuses_combined_relation_ceilings(
+def test_exact_eval_reader_uses_one_current_state_statement(
     monkeypatch,
     observe_type,
 ):
@@ -1943,23 +1974,9 @@ def test_exact_eval_reader_reuses_combined_relation_ceilings(
         observe_type=observe_type,
     )
 
-    assert analytics.capture_calls == [
-        "spans",
-        "tracer_eval_logger",
-        "model_hub_score",
-        "end_users",
-    ]
-    assert len(analytics.main_calls) > 1
-    expected_filters = {
-        "spans": "_version < 900",
-        "tracer_eval_logger": "_peerdb_version < 701",
-        "model_hub_score": "_peerdb_version < 801",
-        "end_users": "toUnixTimestamp64Micro(version) < 901",
-    }
-    assert all(
-        call_settings["additional_table_filters"] == expected_filters
-        for _query, _params, call_settings in analytics.main_calls
-    )
+    assert analytics.capture_calls == []
+    assert len(analytics.main_calls) == 1
+    assert "additional_table_filters" not in analytics.main_calls[0][2]
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
@@ -2011,7 +2028,7 @@ class _ScoreListManager:
 
 @pytest.mark.unit
 @pytest.mark.parametrize("observe_type", ["trace", "span"])
-def test_annotation_membership_batches_reuse_combined_relation_ceilings(
+def test_annotation_membership_batches_use_current_state_without_ceilings(
     monkeypatch,
     observe_type,
 ):
@@ -2066,21 +2083,10 @@ def test_annotation_membership_batches_reuse_combined_relation_ceilings(
         observe_type=observe_type,
     )
 
-    assert analytics.capture_calls == [
-        "spans",
-        "tracer_eval_logger",
-        "model_hub_score",
-        "end_users",
-    ]
+    assert analytics.capture_calls == []
     assert len(analytics.main_calls) == 2
-    expected_filters = {
-        "spans": "_version < 900",
-        "tracer_eval_logger": "_peerdb_version < 701",
-        "model_hub_score": "_peerdb_version < 801",
-        "end_users": "toUnixTimestamp64Micro(version) < 901",
-    }
     assert all(
-        call_settings["additional_table_filters"] == expected_filters
+        "additional_table_filters" not in call_settings
         for _query, _params, call_settings in analytics.main_calls
     )
     assert result["query_complete"] is True
@@ -2145,11 +2151,7 @@ def test_session_annotation_graph_uses_full_window_session_membership(monkeypatc
     assert "JSONExtractArrayRaw(attributes_extra" in query
     assert "JSONExtractRaw(attributes_extra" in query
     assert params["candidate_trace_ids"] == (trace_id,)
-    assert settings["additional_table_filters"]["spans"] == "_version < 900"
-    assert (
-        settings["additional_table_filters"]["trace_session_id_remap"]
-        == "toUnixTimestamp64Micro(version) < 901"
-    )
+    assert "additional_table_filters" not in settings
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
@@ -2349,7 +2351,7 @@ def test_exact_worker_forwards_session_context_to_eval_annotation_reader(
 
 
 @pytest.mark.unit
-def test_exact_user_graph_partitions_on_trace_anchor_and_hydrates_full_entities():
+def test_exact_user_graph_uses_one_full_window_current_state_statement():
     analytics = _ExactEntityAnalytics()
     start = datetime(2026, 1, 1)
     end = datetime(2026, 3, 15)
@@ -2365,20 +2367,14 @@ def test_exact_user_graph_partitions_on_trace_anchor_and_hydrates_full_entities(
     _assert_entity_output_partitions(analytics.main_calls, start, end)
     query, params, settings = analytics.main_calls[0]
     assert params["start_date"] == start
-    assert params["end_date"] < end
+    assert params["end_date"] == end
     assert "candidate_trace_ids AS" in query
     assert "HAVING min(start_time) >= %(start_date)s" in query
     assert "start_time >= %(snapshot_start_date)s" in query
     assert "SELECT toString(trace_id) FROM candidate_trace_ids" in query
     assert "GROUP BY end_user_id, trace_id" in query
     assert "FROM user_rows" in query
-    assert settings["additional_table_filters"]["spans"] == "_version < 900"
-    assert set(settings["additional_table_filters"]) >= {
-        "spans",
-        "end_user_id_remap",
-        "trace_session_id_remap",
-        "end_users",
-    }
+    assert "additional_table_filters" not in settings
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
@@ -2453,7 +2449,7 @@ def test_exact_user_graph_applies_entity_filters_after_full_window_aggregation()
 
 
 @pytest.mark.unit
-def test_exact_user_graph_freezes_combined_relations_without_duplicate_capture(
+def test_exact_user_graph_does_not_apply_unsafe_relation_ceilings(
     monkeypatch,
 ):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
@@ -2475,28 +2471,9 @@ def test_exact_user_graph_freezes_combined_relations_without_duplicate_capture(
         metric_id="active_users",
     )
 
-    assert analytics.capture_calls == [
-        "spans",
-        "end_user_id_remap",
-        "trace_session_id_remap",
-        "end_users",
-        "tracer_eval_logger",
-        "model_hub_score",
-    ]
+    assert analytics.capture_calls == []
     _assert_entity_output_partitions(analytics.main_calls, start, end)
-    settings = analytics.main_calls[0][2]["additional_table_filters"]
-    assert all(
-        call_settings["additional_table_filters"] == settings
-        for _query, _params, call_settings in analytics.main_calls
-    )
-    assert settings == {
-        "spans": "_version < 900",
-        "end_user_id_remap": "toUnixTimestamp64Micro(version) < 901",
-        "trace_session_id_remap": "toUnixTimestamp64Micro(version) < 901",
-        "end_users": "toUnixTimestamp64Micro(version) < 901",
-        "tracer_eval_logger": "_peerdb_version < 701",
-        "model_hub_score": "_peerdb_version < 801",
-    }
+    assert "additional_table_filters" not in analytics.main_calls[0][2]
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
@@ -2566,12 +2543,6 @@ def test_user_eval_filter_is_full_window_membership_not_raw_span_attribute(monke
     assert "span_attr_num['eval_score']" not in query
     assert params["snapshot_start_date"] == start
     assert params["snapshot_end_date"] == end
-    assert set(settings["additional_table_filters"]) >= {
-        "spans",
-        "tracer_eval_logger_v2",
-        "end_user_id_remap",
-        "trace_session_id_remap",
-        "end_users",
-    }
+    assert "additional_table_filters" not in settings
     assert result["query_complete"] is True
     assert result["query_sampled"] is False

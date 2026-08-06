@@ -12,16 +12,13 @@ from tracer.serializers.trace import (
 )
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
-    capture_snapshot_version_ceiling,
     cursor_page_metadata,
-    cursor_requires_relation_snapshot,
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
     exact_total_explicitly_required,
     normalize_cursor_query,
     snapshot_cursor_supported,
-    snapshot_read_settings,
 )
 
 
@@ -80,7 +77,6 @@ def _token(**overrides):
         "window_start": datetime(2026, 1, 1, tzinfo=UTC),
         "window_end": datetime(2026, 8, 1, tzinfo=UTC),
         "order": (datetime(2026, 7, 1, tzinfo=UTC), "trace-2"),
-        "version_ceiling": 1_785_742_808_330_811_452,
         "seen_rows": 25,
     }
     values.update(overrides)
@@ -99,16 +95,11 @@ def test_cursor_round_trip_preserves_datetime_and_complete_order_tuple():
     assert cursor.window_start == values["window_start"]
     assert cursor.window_end == values["window_end"]
     assert cursor.order == values["order"]
-    assert cursor.version_ceiling == values["version_ceiling"]
     assert cursor.seen_rows == 25
 
 
-def test_cursor_round_trip_preserves_relation_snapshot_and_scan_checkpoint():
+def test_cursor_round_trip_preserves_scan_checkpoint_without_version_state():
     token, values = _token(
-        relation_version_ceilings={
-            "spans": 1_785_742_808_330_811_452,
-            "model_hub_score": 918,
-        },
         scan_slice_end=datetime(2026, 6, 30, 12, tzinfo=UTC),
         scan_before_start_time=datetime(2026, 6, 30, 11, 59, tzinfo=UTC),
         scan_before_id="candidate-9",
@@ -122,10 +113,6 @@ def test_cursor_round_trip_preserves_relation_snapshot_and_scan_checkpoint():
         page_size=values["page_size"],
     )
 
-    assert cursor.relation_version_ceilings == {
-        "spans": values["version_ceiling"],
-        "model_hub_score": 918,
-    }
     assert cursor.scan_slice_end == datetime(2026, 6, 30, 12, tzinfo=UTC)
     assert cursor.scan_before_start_time == datetime(2026, 6, 30, 11, 59, tzinfo=UTC)
     assert cursor.scan_before_id == "candidate-9"
@@ -394,7 +381,7 @@ def _filter(column_id, *, col_type="SPAN_ATTRIBUTE", filter_type="text"):
 
 
 @pytest.mark.parametrize("resource", ["observe_traces", "observe_spans"])
-def test_snapshot_cursor_accepts_span_local_scalar_map_and_json_filters(resource):
+def test_keyset_cursor_accepts_span_local_scalar_map_and_json_filters(resource):
     filters = [
         _filter("final_status"),
         _filter("customer_map", filter_type="map"),
@@ -402,7 +389,6 @@ def test_snapshot_cursor_accepts_span_local_scalar_map_and_json_filters(resource
     ]
 
     assert snapshot_cursor_supported(filters, resource=resource) is True
-    assert cursor_requires_relation_snapshot(filters, resource=resource) is False
 
 
 @pytest.mark.parametrize("resource", ["observe_traces", "observe_spans"])
@@ -414,9 +400,8 @@ def test_snapshot_cursor_accepts_span_local_scalar_map_and_json_filters(resource
         _filter("user_id", col_type="TRACE_END_USER"),
     ],
 )
-def test_snapshot_cursor_freezes_independently_mutable_relations(resource, filter_item):
+def test_keyset_cursor_supports_independently_mutable_relations(resource, filter_item):
     assert snapshot_cursor_supported([filter_item], resource=resource) is True
-    assert cursor_requires_relation_snapshot([filter_item], resource=resource) is True
 
 
 def test_legacy_fallback_omits_cursor_metadata_even_when_more_rows_exist():
@@ -479,62 +464,54 @@ def test_terminal_cursor_metadata_reports_the_exact_seen_total():
     }
 
 
-def test_snapshot_settings_use_direct_write_version_and_preserve_existing_filters():
-    builder_cls = type(
-        "TraceListQueryBuilderV2",
-        (),
-        {
-            "__module__": "tracer.services.clickhouse.v2.query_builders.trace_list",
-            "TABLE": "spans",
-        },
+def test_cursor_payload_has_no_merge_unstable_version_state():
+    from django.conf import settings
+    from django.core import signing
+
+    token, _values = _token()
+    payload = signing.loads(
+        token,
+        key=settings.SECRET_KEY,
+        salt="tracer.clickhouse-list-cursor.v3",
     )
 
-    result = snapshot_read_settings(
-        {"max_threads": 2, "additional_table_filters": {"other": "x = 1"}},
-        builder=builder_cls(),
-        version_ceiling=42,
-    )
+    assert payload["v"] == 3
+    assert "version_ceiling" not in payload
+    assert "relation_version_ceilings" not in payload
 
-    assert result["max_threads"] == 2
-    assert result["additional_table_filters"] == {
-        "other": "x = 1",
-        "spans": "_version < 42",
+
+def test_v2_snapshot_cursor_is_rejected_after_contract_bump():
+    from django.conf import settings
+    from django.core import signing
+
+    token, values = _token()
+    current_payload = signing.loads(
+        token,
+        key=settings.SECRET_KEY,
+        salt="tracer.clickhouse-list-cursor.v3",
+    )
+    old_payload = {
+        **current_payload,
+        "v": 2,
+        "version_ceiling": 123,
+        "relation_version_ceilings": {"spans": 123},
     }
-
-
-def test_snapshot_settings_keep_legacy_version_column_for_legacy_builder():
-    builder_cls = type(
-        "TraceListQueryBuilder",
-        (),
-        {
-            "__module__": "tracer.services.clickhouse.query_builders.trace_list",
-            "TABLE": "spans",
-        },
+    old_token = signing.dumps(
+        old_payload,
+        key=settings.SECRET_KEY,
+        salt="tracer.clickhouse-list-cursor.v2",
+        compress=True,
     )
 
-    result = snapshot_read_settings({}, builder=builder_cls(), version_ceiling=42)
-
-    assert result["additional_table_filters"] == {"spans": "_peerdb_version < 42"}
-
-
-def test_snapshot_ceiling_comes_from_clickhouse_server_time():
-    class Analytics:
-        def __init__(self):
-            self.calls = []
-
-        def execute_ch_query(self, query, params, *, timeout_ms, settings):
-            self.calls.append((query, params, timeout_ms, settings))
-            return SimpleNamespace(data=[{"version_ceiling": 123456789}])
-
-    analytics = Analytics()
-
-    assert capture_snapshot_version_ceiling(analytics, timeout_ms=175) == 123456789
-    assert len(analytics.calls) == 1
-    query, params, timeout_ms, settings = analytics.calls[0]
-    assert "now64(9, 'UTC')" in query
-    assert params == {}
-    assert timeout_ms == 175
-    assert settings == {"max_threads": 1, "max_result_rows": 1}
+    with pytest.raises(ListCursorError) as exc_info:
+        decode_list_cursor(
+            old_token,
+            resource=values["resource"],
+            scope=values["scope"],
+            query=values["query"],
+            page_size=values["page_size"],
+        )
+    assert exc_info.value.code == "invalid_cursor"
 
 
 def test_cursor_datetime_precision_matches_canonical_ch25_schema():

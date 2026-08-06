@@ -43,21 +43,12 @@ from tracer.services.clickhouse.client import (
     get_clickhouse_client,
     is_clickhouse_enabled,
 )
-from tracer.services.clickhouse.dashboard_snapshot import (
-    DashboardRelationSnapshotError,
-    capture_dashboard_relation_snapshot,
-)
-from tracer.services.clickhouse.exact_graph_reads import (
-    execute_exact_output_partitions,
-    output_bucket_partitions,
-)
 from tracer.services.clickhouse.filter_value_reads import (
     SYSTEM_FILTER_VALUE_METRICS,
     read_span_system_filter_values,
 )
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
-    capture_snapshot_version_ceiling,
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
@@ -177,7 +168,6 @@ _DASHBOARD_TRACE_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
 }
 _DASHBOARD_TRACE_MAX_CONCURRENT_METRICS = 2
-_DASHBOARD_TRACE_MAX_BUCKETS_PER_PARTITION = 7
 
 
 def _fetch_exact_dashboard_rows(
@@ -185,28 +175,18 @@ def _fetch_exact_dashboard_rows(
     analytics,
     sql,
     params,
-    granularity,
     timeout_ms,
     settings,
 ):
-    """Run one exact dashboard metric with bucket-boundary budget retries."""
+    """Run one exact, current-state dashboard metric for the full window."""
 
-    rows, _columns, _query_count = execute_exact_output_partitions(
-        analytics=analytics,
-        query=sql,
+    result = analytics.execute_ch_query(
+        sql,
         params=params,
-        partitions=output_bucket_partitions(
-            params["start_date"],
-            params["end_date"],
-            granularity,
-            max_buckets=_DASHBOARD_TRACE_MAX_BUCKETS_PER_PARTITION,
-        ),
+        timeout_ms=timeout_ms,
         settings=settings,
-        interval=granularity,
-        leaf_timeout_ms=timeout_ms,
-        probe_timeout_ms=min(timeout_ms, 30_000),
     )
-    return rows
+    return list(result.data or [])
 
 
 def _pending_dashboard_payload(query_config):
@@ -398,7 +378,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
 
     @staticmethod
     def _prepare_metric_queries(builder):
-        """Freeze generated SQL/params before capturing relation ceilings."""
+        """Build each metric once before concurrent full-window execution."""
 
         prepared = []
         for metric in builder.metrics:
@@ -1435,7 +1415,6 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 resume_identity = raw_resume_identity
                             window_start = cursor_state.window_start
                             window_end = cursor_state.window_end
-                            version_ceiling = cursor_state.version_ceiling
                         else:
                             window_end = datetime.now(UTC)
                             window_start = window_end - timedelta(days=365)
@@ -1444,15 +1423,11 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             resume_identity = None
                             resume_member_offset = 0
                             seen_digests = ()
-                            version_ceiling = capture_snapshot_version_ceiling(
-                                analytics
-                            )
 
                         page_read = selector.read_value_cursor_page(
                             project_ids,
                             metric_name,
                             page_size=page_size,
-                            version_ceiling=version_ceiling,
                             window_start=window_start,
                             window_end=window_end,
                             segment_end=segment_end,
@@ -1492,7 +1467,6 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                     page_read.next_resume_member_offset,
                                     page_read.seen_value_digests,
                                 ),
-                                version_ceiling=version_ceiling,
                                 seen_rows=len(page_read.seen_value_digests),
                             )
                         return self._gm.success_response(
@@ -2111,9 +2085,6 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         ch_client = None
         legacy_analytics = None
         metric_results = []
-        trace_version_ceiling = None
-        snapshot_query_count = 0
-        snapshot_tables: set[str] = set()
         trace_analytics = None
         trace_builder = None
         trace_prepared = ()
@@ -2127,6 +2098,8 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             trace_config = {
                 **query_config,
                 "metrics": trace_metrics,
+                # Force raw latest-state spans instead of the independently
+                # refreshed attribute rollup for customer-visible exact totals.
                 "require_versioned_snapshot": True,
             }
             project_ids = trace_config.get("project_ids", [])
@@ -2175,41 +2148,11 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 simulation_builder
             )
 
-        snapshot_settings = dict(_DASHBOARD_TRACE_READ_SETTINGS)
-        try:
-            if trace_prepared:
-                trace_snapshot = capture_dashboard_relation_snapshot(
-                    analytics=trace_analytics,
-                    sql_statements=[sql for _metric, sql, _params in trace_prepared],
-                    base_settings=snapshot_settings,
-                    timeout_ms=query_timeout,
-                )
-                snapshot_settings = trace_snapshot.settings
-                trace_version_ceiling = trace_snapshot.version_ceilings.get("spans")
-                snapshot_query_count += trace_snapshot.snapshot_query_count
-                snapshot_tables.update(trace_snapshot.tables)
-
-            legacy_prepared = (*dataset_prepared, *simulation_prepared)
-            if legacy_prepared:
-                # Dataset/simulation tables may be on the still-unmigrated
-                # ClickHouse connection. Capture those ceilings through the
-                # same client that will execute their metric statements.
-                ch_client = get_clickhouse_client()
-                legacy_analytics = AnalyticsQueryService()
-                legacy_analytics._ch_client = ch_client
-                legacy_snapshot = capture_dashboard_relation_snapshot(
-                    analytics=legacy_analytics,
-                    sql_statements=[sql for _metric, sql, _params in legacy_prepared],
-                    base_settings=snapshot_settings,
-                    timeout_ms=query_timeout,
-                )
-                snapshot_settings = legacy_snapshot.settings
-                snapshot_query_count += legacy_snapshot.snapshot_query_count
-                snapshot_tables.update(legacy_snapshot.tables)
-        except DashboardRelationSnapshotError as exc:
-            raise DashboardExactReadError(
-                "dashboard relation snapshot could not be captured"
-            ) from exc
+        read_settings = dict(_DASHBOARD_TRACE_READ_SETTINGS)
+        if dataset_prepared or simulation_prepared:
+            ch_client = get_clickhouse_client()
+            legacy_analytics = AnalyticsQueryService()
+            legacy_analytics._ch_client = ch_client
 
         if trace_prepared:
 
@@ -2218,9 +2161,8 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     analytics=trace_analytics,
                     sql=sql,
                     params=params,
-                    granularity=query_config["granularity"],
                     timeout_ms=query_timeout,
-                    settings=snapshot_settings,
+                    settings=read_settings,
                 )
 
             metric_results.extend(
@@ -2236,7 +2178,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         if dataset_prepared:
             if legacy_analytics is None:
                 raise DashboardExactReadError(
-                    "dataset snapshot executor is unavailable"
+                    "dataset query executor is unavailable"
                 )
 
             def _fetch_ds_rows(sql, params):
@@ -2244,9 +2186,8 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     analytics=legacy_analytics,
                     sql=sql,
                     params=params,
-                    granularity=query_config["granularity"],
                     timeout_ms=query_timeout,
-                    settings=snapshot_settings,
+                    settings=read_settings,
                 )
 
             metric_results.extend(
@@ -2261,7 +2202,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         if simulation_prepared:
             if legacy_analytics is None:
                 raise DashboardExactReadError(
-                    "simulation snapshot executor is unavailable"
+                    "simulation query executor is unavailable"
                 )
 
             def _fetch_simulation_rows(sql, params):
@@ -2269,9 +2210,8 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     analytics=legacy_analytics,
                     sql=sql,
                     params=params,
-                    granularity=query_config["granularity"],
                     timeout_ms=query_timeout,
-                    settings=snapshot_settings,
+                    settings=read_settings,
                 )
 
             metric_results.extend(
@@ -2319,12 +2259,8 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "query_complete": True,
                 "query_status": "complete",
                 "query_sampled": False,
-                "query_snapshot_capture_count": snapshot_query_count,
-                "query_snapshot_relation_count": len(snapshot_tables),
             }
         )
-        if trace_version_ceiling is not None:
-            formatted["query_snapshot_version_ceiling"] = trace_version_ceiling
         if _exact_worker:
             return self._gm.success_response(formatted)
         published = publish_exact_snapshot(

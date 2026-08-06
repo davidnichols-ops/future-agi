@@ -1101,7 +1101,6 @@ class AttributeReadSelector:
         query_timeout_ms: int | None = None,
         candidate_query_settings: dict[str, Any] | None = None,
         include_versions: bool = False,
-        version_ceiling: int | None = None,
     ) -> tuple[
         tuple[PhysicalSpanIdentity, ...],
         bool,
@@ -1116,11 +1115,6 @@ class AttributeReadSelector:
         }
         if attribute_key is not None:
             params["attribute_key"] = attribute_key
-        if version_ceiling is not None:
-            if int(version_ceiling) <= 0:
-                raise ValueError("version_ceiling must be positive")
-            params["attribute_version_ceiling"] = int(version_ceiling)
-            predicate = f"({predicate}) AND _version < %(attribute_version_ceiling)s"
         ordered = ordered or before_identity is not None
         candidate_sql = _ORDERED_CANDIDATE_SQL if ordered else _CANDIDATE_SQL
         query_settings = dict(candidate_query_settings or {})
@@ -1236,7 +1230,6 @@ class AttributeReadSelector:
         candidate_ids: tuple[PhysicalSpanIdentity, ...],
         attribute_key: str | None = None,
         query_timeout_ms: int | None = None,
-        version_ceiling: int | None = None,
     ) -> list[dict[str, Any]]:
         if not candidate_ids:
             return []
@@ -1249,13 +1242,6 @@ class AttributeReadSelector:
         }
         if attribute_key is not None:
             params["attribute_key"] = attribute_key
-        if version_ceiling is not None:
-            if int(version_ceiling) <= 0:
-                raise ValueError("version_ceiling must be positive")
-            params["attribute_version_ceiling"] = int(version_ceiling)
-            candidate_predicate = (
-                f"({candidate_predicate}) AND _version < %(attribute_version_ceiling)s"
-            )
         replay_sql = self._single_project_scope_sql(
             sql.format(candidate_predicate=candidate_predicate),
             project_ids,
@@ -1282,7 +1268,6 @@ class AttributeReadSelector:
         candidate_versions: dict[PhysicalSpanIdentity, int],
         attribute_key: str,
         query_timeout_ms: int | None = None,
-        version_ceiling: int | None = None,
     ) -> list[dict[str, Any]]:
         """Hydrate only key-bearing candidate rows certified latest and live."""
 
@@ -1295,7 +1280,6 @@ class AttributeReadSelector:
             project_ids=project_ids,
             candidate_ids=candidate_ids,
             query_timeout_ms=query_timeout_ms,
-            version_ceiling=version_ceiling,
         )
         active_ids = tuple(
             self._physical_identity(row)
@@ -1312,7 +1296,6 @@ class AttributeReadSelector:
             candidate_ids=active_ids,
             attribute_key=attribute_key,
             query_timeout_ms=query_timeout_ms,
-            version_ceiling=version_ceiling,
         )
 
     @staticmethod
@@ -2626,7 +2609,6 @@ class AttributeReadSelector:
         key: str,
         *,
         page_size: int,
-        version_ceiling: int,
         window_start: datetime,
         window_end: datetime,
         segment_end: datetime | None = None,
@@ -2640,10 +2622,12 @@ class AttributeReadSelector:
 
         Cursor mode deliberately walks narrow physical-span batches instead of
         running an unbounded ``DISTINCT`` across a year of Map/JSON data.  Each
-        selected identity is replayed through ``argMax(_version)`` below the
-        frozen snapshot ceiling before its value can be published.  A signed
-        API cursor carries the next physical key and digests of values already
-        emitted, so later pages neither repeat options nor trust client state.
+        selected identity is replayed through ``argMax(_version)`` so only its
+        current latest state can publish a value. A signed API cursor carries
+        the next physical key and digests of values already emitted, so later
+        pages neither repeat options nor trust client state. Each page resolves
+        current state independently because ClickHouse 25.3 cannot preserve a
+        historical ReplacingMergeTree snapshot after background merges.
 
         The result remains explicitly sampled even when a particular request
         exhausts its finite page budget.  Returned option values are exact;
@@ -2657,9 +2641,6 @@ class AttributeReadSelector:
         page_size = int(page_size)
         if not 1 <= page_size <= ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE:
             raise ValueError("filter-value page_size is out of range")
-        if int(version_ceiling) <= 0:
-            raise ValueError("version_ceiling must be positive")
-
         start = _utc(window_start)
         end = _utc(window_end)
         current_segment_end = _utc(segment_end or end)
@@ -2769,7 +2750,6 @@ class AttributeReadSelector:
                 project_ids=projects,
                 candidate_ids=(resume_identity,),
                 attribute_key=key,
-                version_ceiling=version_ceiling,
             )
             resume_row = resume_rows[0] if resume_rows else None
             decoded = (
@@ -2815,7 +2795,6 @@ class AttributeReadSelector:
                 ordered=True,
                 before_identity=cursor_before,
                 candidate_limit=ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
-                version_ceiling=version_ceiling,
             )
             candidate_pages += 1
             rows = self._verify_latest(
@@ -2823,7 +2802,6 @@ class AttributeReadSelector:
                 project_ids=projects,
                 candidate_ids=candidate_ids,
                 attribute_key=key,
-                version_ceiling=version_ceiling,
             )
 
             rows_by_identity = {self._physical_identity(row): row for row in rows}

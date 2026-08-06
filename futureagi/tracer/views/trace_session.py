@@ -92,14 +92,12 @@ from tracer.services.clickhouse.graph_dispatch import (
 )
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
-    capture_list_relation_snapshot,
     cursor_page_metadata,
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
     exact_total_explicitly_required,
     frozen_window_filter,
-    relation_snapshot_read_settings,
 )
 from tracer.services.clickhouse.query_builders.base import NIL_UUID, BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.eval_status import (
@@ -2601,31 +2599,10 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             cursor_enabled = False
             builder._bounded_internal_scan = False
 
-        relation_version_ceilings = None
-        if cursor_enabled:
-            if cursor_state is not None:
-                relation_version_ceilings = cursor_state.relation_version_ceilings
-                if not relation_version_ceilings:
-                    raise ListCursorError(
-                        "invalid_cursor",
-                        "The continuation cursor is invalid.",
-                    )
-            else:
-                _, relation_version_ceilings = capture_list_relation_snapshot(
-                    analytics=analytics,
-                    builder=builder,
-                    base_settings=_session_read_settings(max_result_rows=200),
-                    timeout_ms=read_deadline.remaining_ms(600),
-                )
-
         def _page_read_settings(max_result_rows):
-            settings = _session_read_settings(max_result_rows=max_result_rows)
-            if relation_version_ceilings:
-                return relation_snapshot_read_settings(
-                    settings,
-                    version_ceilings=relation_version_ceilings,
-                )
-            return settings
+            # The cursor freezes window/keyset progress only. Each finite read
+            # resolves current latest state without a merge-unstable ceiling.
+            return _session_read_settings(max_result_rows=max_result_rows)
 
         # Phase 1: select the exact page identities before hydrating cost/token,
         # content, and attributes. Default/session-level shapes use the narrow
@@ -3019,7 +2996,6 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         if (
             cursor_enabled
             and bounded_page is not None
-            and relation_version_ceilings
             and (
                 (bounded_page.complete and bounded_page.has_more)
                 or (
@@ -3044,9 +3020,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     bounded_page=bounded_page,
                     cursor_state=cursor_state,
                 ),
-                version_ceiling=relation_version_ceilings["spans"],
                 seen_rows=cursor_seen_rows,
-                relation_version_ceilings=relation_version_ceilings,
                 scan_slice_end=(
                     bounded_page.continuation_slice_end
                     if not bounded_page.has_more

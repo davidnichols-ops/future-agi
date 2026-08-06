@@ -13,6 +13,7 @@ import {
   getAutoDecimals,
   getExactDashboardResult,
   getDashboardMetricSeriesState,
+  getPlottedChartSeries,
   getSeriesAverage,
   getSuggestedUnitConfig,
   getUnitRendering,
@@ -331,20 +332,8 @@ export default function WidgetChart({
     return series.filter((_, i) => visibleSeries.has(i));
   }, [series, visibleSeries]);
 
-  // A missing aggregate bucket is not a zero. Keep the exact response intact,
-  // but omit null points from line rendering so Apex connects the neighbouring
-  // observed points instead of drawing a misleading broken series. Tables and
-  // every non-line chart continue to receive the original sparse buckets.
   const plottedChartSeries = useMemo(
-    () =>
-      isLineChart
-        ? chartSeries.map((chartSeriesItem) => ({
-            ...chartSeriesItem,
-            data: (chartSeriesItem.data || []).filter(
-              (point) => point?.y != null,
-            ),
-          }))
-        : chartSeries,
+    () => getPlottedChartSeries(chartSeries, isLineChart),
     [chartSeries, isLineChart],
   );
 

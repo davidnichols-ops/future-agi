@@ -83,6 +83,7 @@ import {
   getAutoDecimals,
   getExactDashboardResult,
   getDashboardMetricSeriesState,
+  getPlottedChartSeries,
   getSeriesAverage,
   getSuggestedUnitConfig,
   getUnitRendering,
@@ -2313,6 +2314,13 @@ export default function WidgetEditorView() {
     return previewSeries.filter((_, i) => visibleSeries.has(i));
   }, [previewSeries, visibleSeries]);
 
+  // Match the saved-dashboard renderer: null means an absent aggregate
+  // bucket, not zero, so line previews connect the neighbouring exact points.
+  const plottedChartSeries = useMemo(
+    () => getPlottedChartSeries(chartSeries, isLineChart),
+    [chartSeries, isLineChart],
+  );
+
   const outOfRangeWarning = useMemo(
     () => getYAxisRangeWarning(chartSeries, axisConfig),
     [chartSeries, axisConfig],
@@ -4212,7 +4220,7 @@ export default function WidgetEditorView() {
                           <ReactApexChart
                             key={`${axisConfig.leftY.unit}-${axisConfig.leftY.prefixSuffix}-${axisConfig.leftY.abbreviation}-${axisConfig.leftY.decimals}-${axisConfig.leftY.outOfBounds}-${axisConfig.rightY.unit}-${axisConfig.rightY.prefixSuffix}-${axisConfig.rightY.abbreviation}-${axisConfig.rightY.decimals}-${axisConfig.rightY.outOfBounds}-${JSON.stringify(axisConfig.seriesAxis)}-${axisConfig.rightY.visible}`}
                             options={chartOptions}
-                            series={chartSeries}
+                            series={plottedChartSeries}
                             type={apexType}
                             height="100%"
                           />

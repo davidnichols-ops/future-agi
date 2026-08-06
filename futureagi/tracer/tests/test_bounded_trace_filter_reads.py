@@ -2975,9 +2975,6 @@ def test_org_trace_content_same_trace_id_is_merged_by_project_identity() -> None
             "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
             return_value=bounded,
         ),
-        mock.patch(
-            "tracer.views.trace.capture_snapshot_version_ceiling", return_value=42
-        ),
     ):
         eval_config.objects.filter.return_value.select_related.return_value = [
             config_a,
@@ -4567,43 +4564,6 @@ class _ProductionTimedAnchorFakeExecutor(_TimedAnchorFakeExecutor):
         return result
 
 
-class _VersionedFakeExecutor(_FakeExecutor):
-    """Apply the same raw-version table filter used by CH cursor reads."""
-
-    def execute_ch_query(
-        self,
-        query: str,
-        params: dict[str, Any],
-        *,
-        timeout_ms: int,
-        settings: dict[str, Any],
-    ) -> QueryResult:
-        expression = (settings.get("additional_table_filters") or {}).get("spans")
-        ceiling = int(expression.rsplit(" ", 1)[-1]) if expression else None
-        original_rows = self.builder.rows
-        original_match_rows = self.builder.match_rows
-        try:
-            if ceiling is not None:
-                self.builder.rows = [
-                    row for row in original_rows if row.get("_version", 0) < ceiling
-                ]
-                if original_match_rows is not None:
-                    self.builder.match_rows = [
-                        row
-                        for row in original_match_rows
-                        if row.get("_version", 0) < ceiling
-                    ]
-            return super().execute_ch_query(
-                query,
-                params,
-                timeout_ms=timeout_ms,
-                settings=settings,
-            )
-        finally:
-            self.builder.rows = original_rows
-            self.builder.match_rows = original_match_rows
-
-
 class _PhysicalCursorFakeBuilder(_FakeBuilder):
     """Model the full direct-write span identity and public order tuple."""
 
@@ -5019,9 +4979,6 @@ def _call_observe_trace_list_with_bounded_page(
             "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
             return_value=bounded_page,
         ) as bounded_reader,
-        mock.patch(
-            "tracer.views.trace.capture_snapshot_version_ceiling", return_value=42
-        ),
     ):
         eval_config.objects.filter.return_value.select_related.return_value = []
         response = view._list_traces_of_session_clickhouse(
@@ -5260,7 +5217,6 @@ def test_observe_trace_cursor_continuation_without_safe_checkpoint_fails_closed(
         window_start=START.replace(tzinfo=UTC),
         window_end=END.replace(tzinfo=UTC),
         order=(END.replace(tzinfo=UTC), "trace-z"),
-        version_ceiling=42,
         seen_rows=25,
     )
     validated_data["cursor"] = cursor
@@ -5432,9 +5388,6 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order() -> None:
             return_value={"status": "completed"},
         ),
         mock.patch(
-            "tracer.views.trace.capture_snapshot_version_ceiling", return_value=42
-        ) as capture_ceiling,
-        mock.patch(
             "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
             side_effect=[first_page, terminal_page],
         ) as bounded_reader,
@@ -5470,7 +5423,6 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order() -> None:
         )
 
     assert first_response.status_code == 200
-    assert decoded.version_ceiling == 42
     assert decoded.order == (first_started.replace(tzinfo=UTC), "trace-b")
     assert decoded.seen_rows == 1
     assert first_response.data["count"] == 2
@@ -5481,14 +5433,11 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order() -> None:
     assert second_response.data["count"] == 2
     assert second_response.data["count_is_lower_bound"] is False
     assert second_response.data["next_cursor"] is None
-    capture_ceiling.assert_called_once_with(analytics, timeout_ms=250)
     continuation_call = bounded_reader.call_args_list[1].kwargs
     assert continuation_call["page_number"] == 0
     assert continuation_call["cursor_start_time"] == first_started.replace(tzinfo=UTC)
     assert continuation_call["cursor_order_token"] == "trace-b"
-    assert continuation_call["read_settings"]["additional_table_filters"] == {
-        "spans": "_version < 42"
-    }
+    assert "additional_table_filters" not in continuation_call["read_settings"]
 
 
 def test_voice_first_page_explicit_sample_publishes_sanitized_degradation() -> None:
@@ -6993,9 +6942,7 @@ def test_cursor_keyset_preserves_same_identity_rows_one_microsecond_apart() -> N
     assert second.has_more is False
 
 
-def test_cursor_version_ceiling_excludes_concurrent_inserts_and_equal_boundary() -> (
-    None
-):
+def test_live_keyset_cursor_excludes_newer_insert_and_includes_current_tail() -> None:
     rows = [
         {
             "id": f"span-{row_id}",
@@ -7005,19 +6952,17 @@ def test_cursor_version_ceiling_excludes_concurrent_inserts_and_equal_boundary()
         for row_id, offset in (("d", 1), ("c", 2), ("b", 3), ("a", 4))
     ]
     builder = _FakeBuilder(rows)
-    settings = {"additional_table_filters": {"spans": "_version < 10"}}
-
     first = read_bounded_filter_page(
         builder=builder,
-        analytics=_VersionedFakeExecutor(builder),
+        analytics=_FakeExecutor(builder),
         filters=[_time_filter()],
         key_field="id",
         page_number=0,
         page_size=2,
-        read_settings=settings,
     )
-    # Simulate live inserts after page one. One is newer than the cursor and
-    # one belongs in the remaining tail; neither is in the frozen version set.
+    # A live keyset continuation does not replay rows newer than page one's
+    # checkpoint, while a newly visible row in the remaining tail participates
+    # in the current-latest continuation.
     builder.rows.extend(
         [
             {
@@ -7034,19 +6979,18 @@ def test_cursor_version_ceiling_excludes_concurrent_inserts_and_equal_boundary()
     )
     second = read_bounded_filter_page(
         builder=builder,
-        analytics=_VersionedFakeExecutor(builder),
+        analytics=_FakeExecutor(builder),
         filters=[_time_filter()],
         key_field="id",
         page_number=0,
         page_size=2,
         cursor_start_time=first.rows[-1]["start_time"],
         cursor_order_token=first.rows[-1]["id"],
-        read_settings=settings,
     )
 
     assert [row["id"] for row in first.rows] == ["span-d", "span-c"]
-    assert [row["id"] for row in second.rows] == ["span-b", "span-a"]
-    assert "span-live-tail" not in {row["id"] for row in second.rows}
+    assert [row["id"] for row in second.rows] == ["span-b", "span-live-tail"]
+    assert "span-live-new" not in {row["id"] for row in second.rows}
 
 
 def test_bounded_reader_crosses_sparse_tail_with_adjacent_slices() -> None:

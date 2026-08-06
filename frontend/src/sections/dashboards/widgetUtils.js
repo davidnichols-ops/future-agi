@@ -60,6 +60,19 @@ export const getDashboardMetricSeriesState = (metrics = []) => {
 };
 
 /**
+ * A missing aggregate bucket is not a zero. For line charts, omit null points
+ * so Apex connects the neighbouring observed points without mutating the exact
+ * response used by table and non-line renderers.
+ */
+export const getPlottedChartSeries = (series = [], isLineChart = false) =>
+  isLineChart
+    ? series.map((item) => ({
+        ...item,
+        data: (item?.data || []).filter((point) => point?.y != null),
+      }))
+    : series;
+
+/**
  * Dashboard responses are all-or-nothing aggregates. A single sampled,
  * degraded, or failed metric makes the payload non-renderable.
  */

@@ -351,6 +351,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     enabled: !!projectId,
     refetchOnWindowFocus: false,
     staleTime: 10000,
+    // Live Preview renders its own generic failure state; suppress backend
+    // query text (including ClickHouse exception details) globally.
+    meta: { errorHandled: true },
   });
 
   const rows = listData?.rows || [];
@@ -466,6 +469,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     enabled: !!currentRow,
     refetchOnWindowFocus: false,
     staleTime: 10000,
+    meta: { errorHandled: true },
   });
 
   // Reset test results whenever the row or eval set changes

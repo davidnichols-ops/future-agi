@@ -238,11 +238,12 @@ class DatasetQueryBuilder(DashboardQueryBuilderBase):
 
     @staticmethod
     def _replace_dictionary_dimensions(query: str) -> str:
-        """Read mutable dataset dimensions directly under query ceilings.
+        """Read mutable dataset dimensions directly in the metric statement.
 
         ClickHouse dictionaries refresh independently and cannot participate in
-        ``additional_table_filters``. Exact dashboard workers therefore replace
-        every dictionary lookup with an explicitly joined, versioned CDC table.
+        statement-level latest-state resolution. Exact dashboard workers replace
+        every dictionary lookup with an explicitly joined CDC table read using
+        ``FINAL`` so facts and dimensions resolve together.
         """
 
         needs_dataset = "'dataset_dict'" in query

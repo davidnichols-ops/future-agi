@@ -18,13 +18,7 @@ from typing import Any
 
 import structlog
 
-from tracer.services.clickhouse.dashboard_snapshot import (
-    capture_dashboard_relation_snapshot,
-)
-from tracer.services.clickhouse.list_cursor import (
-    ListCursor,
-    relation_snapshot_read_settings,
-)
+from tracer.services.clickhouse.list_cursor import ListCursor
 from tracer.services.clickhouse.read_budget import (
     ReadDeadline,
     ReadDeadlineExceeded,
@@ -77,7 +71,6 @@ USER_LIST_PRESENCE_TIMEOUT_MS = 1_500
 USER_LIST_QUERY_TIMEOUT_MS = 8_000
 USER_LIST_ENRICHMENT_TIMEOUT_MS = 5_000
 USER_EXPORT_WALL_DEADLINE_MS = 30_000
-USER_LIST_SNAPSHOT_TIMEOUT_MS = 1_500
 USER_LIST_CANDIDATE_BATCH_SIZE = 100
 USER_LIST_MAX_CANDIDATE_BATCHES = 8
 
@@ -107,7 +100,6 @@ class UserCursorRead:
     window_start: datetime
     window_end: datetime
     checkpoint_order: tuple[Any, ...] | None
-    relation_version_ceilings: dict[str, int]
     seen_rows: int
     has_more: bool
     unseen_row_proven: bool
@@ -126,20 +118,10 @@ def _read_settings(*, max_result_rows: int) -> dict[str, int | str]:
     }
 
 
-def _snapshot_read_settings(
-    snapshot_settings: dict[str, Any] | None,
-    *,
-    max_result_rows: int,
-) -> dict[str, Any]:
-    """Combine immutable-relation filters with one query's result ceiling."""
+def _page_read_settings(*, max_result_rows: int) -> dict[str, Any]:
+    """Return finite settings for one current-latest user-list statement."""
 
-    settings: dict[str, Any] = _read_settings(max_result_rows=max_result_rows)
-    if snapshot_settings:
-        settings.update(snapshot_settings)
-        settings["max_result_rows"] = int(max_result_rows)
-        settings["max_result_bytes"] = _USER_LIST_RESULT_BYTES
-        settings["result_overflow_mode"] = "throw"
-    return settings
+    return _read_settings(max_result_rows=max_result_rows)
 
 
 def _log_user_read_failure(event: str, exc: Exception, **context: object) -> None:
@@ -347,7 +329,6 @@ class UsersListManager:
         deadline: ReadDeadline,
         *,
         timeout_cap_ms: int | None = USER_LIST_ENRICHMENT_TIMEOUT_MS,
-        snapshot_settings: dict[str, Any] | None = None,
     ) -> dict[str, dict]:
         """Return latest-row raw metrics for the already finite user page."""
 
@@ -362,10 +343,7 @@ class UsersListManager:
             query,
             params,
             timeout_ms=deadline.remaining_ms(timeout_cap_ms),
-            settings=_snapshot_read_settings(
-                snapshot_settings,
-                max_result_rows=max(1, len(end_user_ids)),
-            ),
+            settings=_page_read_settings(max_result_rows=max(1, len(end_user_ids))),
         )
         return {str(row.get("end_user_id", "")): row for row in result.data}
 
@@ -392,7 +370,6 @@ class UsersListManager:
         *,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
-        snapshot_settings: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, object]]:
         """Return page-user attributes under the request-owned wall deadline."""
 
@@ -411,10 +388,7 @@ class UsersListManager:
             attr_query,
             attr_params,
             timeout_ms=deadline.remaining_ms(USER_LIST_ENRICHMENT_TIMEOUT_MS),
-            settings=_snapshot_read_settings(
-                snapshot_settings,
-                max_result_rows=_USER_LIST_ATTR_RESULT_ROWS,
-            ),
+            settings=_page_read_settings(max_result_rows=_USER_LIST_ATTR_RESULT_ROWS),
         )
         user_attrs: dict[str, dict[str, object]] = {}
         for attr_row in attr_result.data:
@@ -508,8 +482,6 @@ class UsersListManager:
         rows: list[dict],
         builder: UserListQueryBuilderV2,
         deadline: ReadDeadline,
-        *,
-        snapshot_settings: dict[str, Any] | None = None,
     ) -> dict[str, dict]:
         """Return page-user eval metrics under the shared request deadline."""
 
@@ -526,10 +498,7 @@ class UsersListManager:
             eval_query,
             eval_params,
             timeout_ms=deadline.remaining_ms(USER_LIST_ENRICHMENT_TIMEOUT_MS),
-            settings=_snapshot_read_settings(
-                snapshot_settings,
-                max_result_rows=max(1, len(end_user_ids)),
-            ),
+            settings=_page_read_settings(max_result_rows=max(1, len(end_user_ids))),
         )
         return {str(row.get("end_user_id", "")): row for row in eval_result.data}
 
@@ -564,59 +533,6 @@ class UsersListManager:
             },
         ]
 
-    def _capture_cursor_snapshot(
-        self,
-        *,
-        deadline: ReadDeadline,
-        frozen_filters: list[dict],
-    ) -> tuple[dict[str, Any], dict[str, int]]:
-        """Freeze every mutable relation used by the bounded Users page."""
-
-        dummy_id = "00000000-0000-0000-0000-000000000000"
-        candidate_builder = UserListQueryBuilderV2(
-            organization_id=self.organization_id,
-            project_ids=self.scoped_project_ids,
-            filters=frozen_filters,
-            empty_scope=self.empty_scope,
-        )
-        candidate_sql, _ = candidate_builder.build_dimension_candidate_query(limit=1)
-        finite_builder = UserListQueryBuilderV2(
-            organization_id=self.organization_id,
-            project_ids=self.scoped_project_ids,
-            filters=[
-                item
-                for item in frozen_filters
-                if UserListQueryBuilderV2._is_date_filter(item)
-            ],
-            limit=1,
-            offset=0,
-            candidate_end_user_ids=[dummy_id],
-            empty_scope=self.empty_scope,
-        )
-        page_sql, _ = finite_builder.build_candidate_page_query()
-        metric_sql, _ = finite_builder.build_page_metrics_query([dummy_id])
-        eval_sql, _ = finite_builder.build_eval_query([dummy_id])
-        start_date, end_date = finite_builder.parse_time_range(finite_builder.filters)
-        attr_sql, _ = _users_attr_enrichment_query(
-            project_id=self.project_id,
-            project_ids=self.scoped_project_ids,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        snapshot = capture_dashboard_relation_snapshot(
-            analytics=V2AnalyticsQueryService(),
-            sql_statements=[
-                candidate_sql,
-                page_sql,
-                metric_sql,
-                eval_sql,
-                attr_sql,
-            ],
-            base_settings=_read_settings(max_result_rows=1),
-            timeout_ms=deadline.remaining_ms(USER_LIST_SNAPSHOT_TIMEOUT_MS),
-        )
-        return snapshot.settings, dict(snapshot.version_ceilings)
-
     def _read_dimension_candidates(
         self,
         *,
@@ -624,7 +540,6 @@ class UsersListManager:
         limit: int,
         before_first_seen: datetime | None,
         before_end_user_id: str | None,
-        snapshot_settings: dict[str, Any],
     ) -> list[dict]:
         builder = UserListQueryBuilderV2(
             organization_id=self.organization_id,
@@ -641,10 +556,7 @@ class UsersListManager:
             query,
             params,
             timeout_ms=deadline.remaining_ms(USER_LIST_QUERY_TIMEOUT_MS),
-            settings=_snapshot_read_settings(
-                snapshot_settings,
-                max_result_rows=limit,
-            ),
+            settings=_page_read_settings(max_result_rows=limit),
         )
         return list(result.data or [])
 
@@ -656,7 +568,6 @@ class UsersListManager:
         window_start: datetime,
         window_end: datetime,
         deadline: ReadDeadline,
-        snapshot_settings: dict[str, Any],
     ) -> list[dict]:
         if not candidate_ids:
             return []
@@ -679,10 +590,7 @@ class UsersListManager:
             query,
             params,
             timeout_ms=deadline.remaining_ms(USER_LIST_QUERY_TIMEOUT_MS),
-            settings=_snapshot_read_settings(
-                snapshot_settings,
-                max_result_rows=max(1, len(candidate_ids)),
-            ),
+            settings=_page_read_settings(max_result_rows=max(1, len(candidate_ids))),
         )
         rows = builder.format_rows(result.data)["table"]
         if not rows:
@@ -695,7 +603,6 @@ class UsersListManager:
                 rows,
                 builder,
                 deadline,
-                snapshot_settings=snapshot_settings,
             ): "metrics",
             pool.submit(
                 self._read_span_attributes,
@@ -703,14 +610,12 @@ class UsersListManager:
                 deadline,
                 start_date=window_start,
                 end_date=window_end,
-                snapshot_settings=snapshot_settings,
             ): "attributes",
             pool.submit(
                 self._read_evals,
                 rows,
                 builder,
                 deadline,
-                snapshot_settings=snapshot_settings,
             ): "evals",
         }
         completed: dict[str, dict] = {}
@@ -884,12 +789,6 @@ class UsersListManager:
                 window_start=window_start,
                 window_end=window_end,
             )
-            snapshot_settings, relation_version_ceilings = (
-                self._capture_cursor_snapshot(
-                    deadline=deadline,
-                    frozen_filters=frozen_filters,
-                )
-            )
             seen_before = 0
             before_first_seen = None
             before_end_user_id = None
@@ -899,12 +798,6 @@ class UsersListManager:
                 self.filters,
                 window_start=window_start,
                 window_end=window_end,
-            )
-            if not cursor.relation_version_ceilings:
-                raise ValueError("user list cursor relation snapshot is unavailable")
-            relation_version_ceilings = dict(cursor.relation_version_ceilings)
-            snapshot_settings = relation_snapshot_read_settings(
-                {}, version_ceilings=relation_version_ceilings
             )
             seen_before = cursor.seen_rows
             if len(cursor.order) != 2:
@@ -924,7 +817,6 @@ class UsersListManager:
                     limit=USER_LIST_CANDIDATE_BATCH_SIZE + 1,
                     before_first_seen=before_first_seen,
                     before_end_user_id=before_end_user_id,
-                    snapshot_settings=snapshot_settings,
                 )
                 if not candidate_rows:
                     has_more = False
@@ -939,7 +831,6 @@ class UsersListManager:
                     window_start=window_start,
                     window_end=window_end,
                     deadline=deadline,
-                    snapshot_settings=snapshot_settings,
                 )
                 exact_by_id = {
                     str(row.get("end_user_id")): row
@@ -1021,7 +912,6 @@ class UsersListManager:
             window_start=window_start,
             window_end=window_end,
             checkpoint_order=checkpoint,
-            relation_version_ceilings=relation_version_ceilings,
             seen_rows=seen_rows,
             has_more=has_more,
             unseen_row_proven=unseen_row_proven,

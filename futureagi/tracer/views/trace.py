@@ -92,18 +92,13 @@ from tracer.services.clickhouse.graph_dispatch import (
 )
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
-    capture_list_relation_snapshot,
-    capture_snapshot_version_ceiling,
     cursor_page_metadata,
-    cursor_requires_relation_snapshot,
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
     exact_total_explicitly_required,
     frozen_window_filter,
-    relation_snapshot_read_settings,
     snapshot_cursor_supported,
-    snapshot_read_settings,
 )
 from tracer.services.clickhouse.page_dedup import paginate_deduped
 from tracer.services.clickhouse.query_builders.base import NIL_UUID
@@ -4038,49 +4033,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             eval_config_ids=eval_config_ids,
             annotation_label_ids=annotation_label_ids,
         )
-        relation_version_ceilings: dict[str, int] | None = None
-        version_ceiling = None
-        if cursor_enabled:
-            if cursor_state is not None:
-                version_ceiling = cursor_state.version_ceiling
-                relation_version_ceilings = cursor_state.relation_version_ceilings
-                page_read_settings = (
-                    relation_snapshot_read_settings(
-                        TRACE_LIST_READ_SETTINGS,
-                        version_ceilings=relation_version_ceilings,
-                    )
-                    if relation_version_ceilings
-                    else snapshot_read_settings(
-                        TRACE_LIST_READ_SETTINGS,
-                        builder=builder,
-                        version_ceiling=version_ceiling,
-                    )
-                )
-            else:
-                if cursor_requires_relation_snapshot(
-                    filters, resource="observe_traces"
-                ):
-                    page_read_settings, relation_version_ceilings = (
-                        capture_list_relation_snapshot(
-                            analytics=analytics,
-                            builder=builder,
-                            base_settings=TRACE_LIST_READ_SETTINGS,
-                            timeout_ms=read_deadline.remaining_ms(1_000),
-                        )
-                    )
-                    version_ceiling = relation_version_ceilings["spans"]
-                else:
-                    version_ceiling = capture_snapshot_version_ceiling(
-                        analytics,
-                        timeout_ms=read_deadline.remaining_ms(250),
-                    )
-                    page_read_settings = snapshot_read_settings(
-                        TRACE_LIST_READ_SETTINGS,
-                        builder=builder,
-                        version_ceiling=version_ceiling,
-                    )
-        else:
-            page_read_settings = TRACE_LIST_READ_SETTINGS
+        # Continuations freeze only the request window and ordered scan
+        # checkpoint. ReplacingMergeTree version predicates are not snapshots:
+        # background merges may remove the older row they depend on. Every
+        # page therefore classifies current latest state under the same finite
+        # read settings.
+        page_read_settings = TRACE_LIST_READ_SETTINGS
 
         # Phase 1: Paginated traces (light columns only — no input/output)
         bounded_page = None
@@ -4676,7 +4634,6 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         if (
             cursor_enabled
             and bounded_page is not None
-            and version_ceiling is not None
             and (
                 (bounded_page.complete and bounded_page.has_more)
                 or (
@@ -4703,9 +4660,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 window_start=window_start,
                 window_end=window_end,
                 order=cursor_order,
-                version_ceiling=version_ceiling,
                 seen_rows=cursor_seen_rows,
-                relation_version_ceilings=relation_version_ceilings,
                 scan_slice_end=(
                     bounded_page.continuation_slice_end
                     if not bounded_page.has_more
@@ -4876,45 +4831,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             remove_simulation_calls=sim_flag,
             annotation_label_ids=annotation_label_ids,
         )
-        relation_version_ceilings: dict[str, int] | None = None
-        version_ceiling = None
-        if cursor_enabled:
-            if cursor_state is not None:
-                version_ceiling = cursor_state.version_ceiling
-                relation_version_ceilings = cursor_state.relation_version_ceilings
-                page_read_settings = (
-                    relation_snapshot_read_settings(
-                        TRACE_LIST_READ_SETTINGS,
-                        version_ceilings=relation_version_ceilings,
-                    )
-                    if relation_version_ceilings
-                    else snapshot_read_settings(
-                        TRACE_LIST_READ_SETTINGS,
-                        builder=builder,
-                        version_ceiling=version_ceiling,
-                    )
-                )
-            elif cursor_requires_relation_snapshot(filters, resource="observe_traces"):
-                page_read_settings, relation_version_ceilings = (
-                    capture_list_relation_snapshot(
-                        analytics=analytics,
-                        builder=builder,
-                        base_settings=TRACE_LIST_READ_SETTINGS,
-                        timeout_ms=read_deadline.remaining_ms(1_000),
-                    )
-                )
-                version_ceiling = relation_version_ceilings["spans"]
-            else:
-                version_ceiling = capture_snapshot_version_ceiling(
-                    analytics, timeout_ms=read_deadline.remaining_ms(250)
-                )
-                page_read_settings = snapshot_read_settings(
-                    TRACE_LIST_READ_SETTINGS,
-                    builder=builder,
-                    version_ceiling=version_ceiling,
-                )
-        else:
-            page_read_settings = TRACE_LIST_READ_SETTINGS
+        # The signed cursor carries the immutable window and keyset progress;
+        # each page resolves current latest state. A raw version ceiling cannot
+        # survive ReplacingMergeTree background merges.
+        page_read_settings = TRACE_LIST_READ_SETTINGS
 
         # Phase 1: bounded, newest-first latest-state voice roots. This is used
         # for the healthy path too: the previous raw count scanned the complete
@@ -5400,7 +5320,6 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         cursor_has_more = False
         if (
             cursor_enabled
-            and version_ceiling is not None
             and (
                 (bounded_page.complete and bounded_page.has_more)
                 or (
@@ -5426,9 +5345,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_state=cursor_state,
                     org_scope=False,
                 ),
-                version_ceiling=version_ceiling,
                 seen_rows=cursor_seen_rows,
-                relation_version_ceilings=relation_version_ceilings,
                 scan_slice_end=(
                     bounded_page.continuation_slice_end
                     if not bounded_page.has_more
@@ -6136,11 +6053,6 @@ class UsersView(APIView):
                         raise RuntimeError(
                             "user cursor page omitted its scan checkpoint"
                         )
-                    spans_ceiling = cursor_read.relation_version_ceilings.get("spans")
-                    if not spans_ceiling:
-                        raise RuntimeError(
-                            "user cursor page omitted its spans snapshot"
-                        )
                     next_cursor = encode_list_cursor(
                         resource="observe_users",
                         scope=cursor_scope,
@@ -6149,11 +6061,7 @@ class UsersView(APIView):
                         window_start=cursor_read.window_start,
                         window_end=cursor_read.window_end,
                         order=cursor_read.checkpoint_order,
-                        version_ceiling=spans_ceiling,
                         seen_rows=cursor_read.seen_rows,
-                        relation_version_ceilings=(
-                            cursor_read.relation_version_ceilings
-                        ),
                     )
                 payload = dict(cursor_read.payload)
                 payload["next_cursor"] = next_cursor
