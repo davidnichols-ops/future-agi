@@ -514,6 +514,10 @@ class DashboardFilterValuesQuerySerializer(serializers.Serializer):
         allow_blank=False,
         max_length=16_384,
     )
+    attribute_type = serializers.ChoiceField(
+        choices=["string", "number", "boolean", "array", "map", "json"],
+        required=False,
+    )
 
     def validate(self, attrs):
         if attrs.get("cursor") and "page_size" not in attrs:
@@ -577,6 +581,10 @@ class DashboardFilterValuesResultSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
         allow_blank=False,
+    )
+    attribute_type = serializers.ChoiceField(
+        choices=["string", "number", "boolean", "array", "map", "json"],
+        required=False,
     )
 
 

@@ -2037,7 +2037,7 @@ def test_exact_graph_budget_failure_does_not_stitch_cross_query_partitions():
     assert "attrs_string" in query and "attrs_number" in query
     assert "snapshot_version_ceiling" not in params
     assert "additional_table_filters" not in settings
-    assert timeout == 1_200_000
+    assert timeout == 3_300_000
 
 
 @pytest.mark.unit
@@ -2249,7 +2249,7 @@ def test_entity_system_graph_does_not_stitch_budget_failed_statements(
     assert len(analytics.main_calls) == 1
     _query, params, timeout_ms, settings = analytics.main_calls[0]
     assert (params["start_date"], params["end_date"]) == (start, end)
-    assert timeout_ms == 1_200_000
+    assert timeout_ms == 3_300_000
     assert "additional_table_filters" not in settings
 
 
@@ -2275,7 +2275,7 @@ def test_entity_system_graph_indivisible_budget_failure_is_fail_closed(
             read_exact_user_system_graph(**common, metric_id="active_users")
 
     assert len(analytics.main_calls) == 1
-    assert analytics.main_calls[0][2] == 1_200_000
+    assert analytics.main_calls[0][2] == 3_300_000
 
 
 @pytest.mark.unit
@@ -2667,7 +2667,7 @@ def test_entity_eval_graph_does_not_stitch_budget_failed_statements(
     assert "candidate_eval.created_at >= %(start_date)s" in query
     assert "candidate_eval.created_at < %(end_date)s" in query
     assert "SELECT DISTINCT toString(candidate_member.trace_id) AS trace_id" in query
-    assert timeout_ms == 1_200_000
+    assert timeout_ms == 3_300_000
     assert "additional_table_filters" not in settings
 
 

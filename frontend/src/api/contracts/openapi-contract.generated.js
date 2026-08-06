@@ -8716,6 +8716,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "minLength": 1,
               "maxLength": 512
             }
+          },
+          "refresh": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "responses": {
@@ -30415,6 +30422,20 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "type": "string",
               "minLength": 1,
               "maxLength": 16384
+            }
+          },
+          "attribute_type": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "string",
+                "number",
+                "boolean",
+                "array",
+                "map",
+                "json"
+              ]
             }
           }
         },
@@ -69946,8 +69967,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "count",
         "query_complete",
         "query_status",
-        "query_window_start",
-        "query_window_end"
+        "query_sampled"
       ],
       "type": "object",
       "properties": {
@@ -69963,8 +69983,11 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "string",
             "number",
             "boolean",
-            "array"
-          ]
+            "array",
+            "map",
+            "json"
+          ],
+          "x-nullable": true
         },
         "count": {
           "title": "Count",
@@ -70005,6 +70028,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "number",
           "x-nullable": true
         },
+        "stats": {
+          "$ref": "#/definitions/SpanAttributeNumericStats"
+        },
         "query_complete": {
           "title": "Query complete",
           "type": "boolean"
@@ -70014,9 +70040,14 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
+            "pending",
             "sampled",
             "degraded"
           ]
+        },
+        "query_sampled": {
+          "title": "Query sampled",
+          "type": "boolean"
         },
         "query_error_code": {
           "title": "Query error code",
@@ -70036,6 +70067,33 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Query window end",
           "type": "string",
           "format": "date-time"
+        },
+        "query_count": {
+          "title": "Query count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_elapsed_ms": {
+          "title": "Query elapsed ms",
+          "type": "number",
+          "minimum": 0
+        },
+        "query_completed_at": {
+          "title": "Query completed at",
+          "type": "string",
+          "format": "date-time"
+        },
+        "query_cached": {
+          "title": "Query cached",
+          "type": "boolean"
+        },
+        "query_refreshing": {
+          "title": "Query refreshing",
+          "type": "boolean"
+        },
+        "query_refresh_failed": {
+          "title": "Query refresh failed",
+          "type": "boolean"
         }
       }
     },
@@ -79252,6 +79310,18 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "minLength": 1,
           "x-nullable": true
+        },
+        "attribute_type": {
+          "title": "Attribute type",
+          "type": "string",
+          "enum": [
+            "string",
+            "number",
+            "boolean",
+            "array",
+            "map",
+            "json"
+          ]
         }
       }
     },
@@ -90330,6 +90400,36 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "SpanAttributeNumericStats": {
+      "type": "object",
+      "properties": {
+        "min": {
+          "title": "Min",
+          "type": "number",
+          "x-nullable": true
+        },
+        "max": {
+          "title": "Max",
+          "type": "number",
+          "x-nullable": true
+        },
+        "avg": {
+          "title": "Avg",
+          "type": "number",
+          "x-nullable": true
+        },
+        "p50": {
+          "title": "P50",
+          "type": "number",
+          "x-nullable": true
+        },
+        "p95": {
+          "title": "P95",
+          "type": "number",
+          "x-nullable": true
+        }
+      }
+    },
     "SpanAttributeTopValue": {
       "required": [
         "value",
@@ -90376,7 +90476,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "number",
             "boolean",
             "array",
-            "map"
+            "map",
+            "json"
           ]
         },
         "count": {
@@ -90410,7 +90511,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "string",
             "number",
             "boolean",
-            "array"
+            "array",
+            "map",
+            "json"
           ]
         }
       }

@@ -1,18 +1,22 @@
-"""Direct-write CH25 agent-graph query builder."""
+"""Direct-write CH25 Agent Graph/Path query builder."""
 
 from tracer.services.clickhouse.query_builders.agent_graph import (
     AgentGraphQueryBuilder,
 )
-from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
-from tracer.services.clickhouse.v2.query_builders.filters import (
-    ClickHouseFilterBuilderV2,
-)
 
 
-class AgentGraphQueryBuilderV2(V2RewriteMixin, AgentGraphQueryBuilder):
-    """Compile graph topology and attribute filters for the CH25 schema."""
+class AgentGraphQueryBuilderV2(AgentGraphQueryBuilder):
+    """Physical direct-write specialization.
 
-    _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
+    The base query is already native CH25 SQL.  Deliberately avoid the generic
+    v1 rewrite mixin: applying it to this statement can wrap JSON expressions a
+    second time and, more importantly, hides which physical version/tombstone
+    fields define the latest-state boundary.
+    """
+
+    TABLE = "spans"
+    VERSION_COLUMN = "_version"
+    DELETED_COLUMN = "is_deleted"
 
 
 __all__ = ["AgentGraphQueryBuilderV2"]

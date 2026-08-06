@@ -3781,6 +3781,8 @@ export const SpanAttributeDetailResponseApiType = {
   number: 'number',
   boolean: 'boolean',
   array: 'array',
+  map: 'map',
+  json: 'json',
 } as const;
 
 export type SpanAttributeDetailResponseApiQueryStatus = typeof SpanAttributeDetailResponseApiQueryStatus[keyof typeof SpanAttributeDetailResponseApiQueryStatus];
@@ -3788,6 +3790,7 @@ export type SpanAttributeDetailResponseApiQueryStatus = typeof SpanAttributeDeta
 
 export const SpanAttributeDetailResponseApiQueryStatus = {
   complete: 'complete',
+  pending: 'pending',
   sampled: 'sampled',
   degraded: 'degraded',
 } as const;
@@ -3821,6 +3824,14 @@ export interface SpanAttributeTopValueApi {
   percentage: number;
 }
 
+export interface SpanAttributeNumericStatsApi {
+  min?: number;
+  max?: number;
+  avg?: number;
+  p50?: number;
+  p95?: number;
+}
+
 export interface SpanAttributeDetailResponseApi {
   /** @minLength 1 */
   key: string;
@@ -3833,11 +3844,21 @@ export interface SpanAttributeDetailResponseApi {
   avg?: number;
   p50?: number;
   p95?: number;
+  stats?: SpanAttributeNumericStatsApi;
   query_complete: boolean;
   query_status: SpanAttributeDetailResponseApiQueryStatus;
+  query_sampled: boolean;
   query_error_code?: SpanAttributeDetailResponseApiQueryErrorCode;
-  query_window_start: string;
-  query_window_end: string;
+  query_window_start?: string;
+  query_window_end?: string;
+  /** @minimum 0 */
+  query_count?: number;
+  /** @minimum 0 */
+  query_elapsed_ms?: number;
+  query_completed_at?: string;
+  query_cached?: boolean;
+  query_refreshing?: boolean;
+  query_refresh_failed?: boolean;
 }
 
 export type SpanAttributeKeysResponseApiQueryStatus = typeof SpanAttributeKeysResponseApiQueryStatus[keyof typeof SpanAttributeKeysResponseApiQueryStatus];
@@ -3890,6 +3911,7 @@ export const SpanAttributeKeyApiType = {
   boolean: 'boolean',
   array: 'array',
   map: 'map',
+  json: 'json',
 } as const;
 
 export interface SpanAttributeKeyApi {
@@ -3946,6 +3968,8 @@ export const SpanAttributeValueApiType = {
   number: 'number',
   boolean: 'boolean',
   array: 'array',
+  map: 'map',
+  json: 'json',
 } as const;
 
 /**
@@ -18674,6 +18698,18 @@ export const DashboardFilterValuesResultApiQueryErrorCode = {
   query_failed: 'query_failed',
 } as const;
 
+export type DashboardFilterValuesResultApiAttributeType = typeof DashboardFilterValuesResultApiAttributeType[keyof typeof DashboardFilterValuesResultApiAttributeType];
+
+
+export const DashboardFilterValuesResultApiAttributeType = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+  array: 'array',
+  map: 'map',
+  json: 'json',
+} as const;
+
 export interface DashboardFilterValuesResultApi {
   values: DashboardFilterValueOptionApi[];
   query_complete?: boolean;
@@ -18684,6 +18720,7 @@ export interface DashboardFilterValuesResultApi {
   has_more?: boolean;
   /** @minLength 1 */
   next_cursor?: string;
+  attribute_type?: DashboardFilterValuesResultApiAttributeType;
 }
 
 export interface DashboardFilterValuesResponseApi {
@@ -24531,6 +24568,7 @@ project_id: string;
  * @maxLength 512
  */
 key: string;
+refresh?: boolean;
 };
 
 export type ApiTracesSpanAttributeKeysListParams = {
@@ -26327,6 +26365,7 @@ page_size?: number;
  * @maxLength 16384
  */
 cursor?: string;
+attribute_type?: TracerDashboardFilterValuesAttributeType;
 };
 
 export type TracerDashboardFilterValuesMetricType = typeof TracerDashboardFilterValuesMetricType[keyof typeof TracerDashboardFilterValuesMetricType];
@@ -26349,6 +26388,18 @@ export const TracerDashboardFilterValuesSource = {
   datasets: 'datasets',
   dataset_column: 'dataset_column',
   simulation: 'simulation',
+} as const;
+
+export type TracerDashboardFilterValuesAttributeType = typeof TracerDashboardFilterValuesAttributeType[keyof typeof TracerDashboardFilterValuesAttributeType];
+
+
+export const TracerDashboardFilterValuesAttributeType = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+  array: 'array',
+  map: 'map',
+  json: 'json',
 } as const;
 
 export type TracerDashboardMetricsParams = {

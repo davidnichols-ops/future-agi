@@ -26,13 +26,12 @@ from tracer.serializers.span_attributes import (
     SpanAttributeValuesQuerySerializer,
     SpanAttributeValuesResponseSerializer,
 )
-from tracer.services.clickhouse.attribute_reads import (
-    ATTRIBUTE_KEY_CURSOR_MAX_SEEN,
-    ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES,
-    AttributeDetailRead,
-    AttributeReadMetadata,
-    AttributeReadSelector,
+from tracer.services.clickhouse.attribute_cursor_state import (
+    AttributeCursorStateError,
+    load_attribute_cursor_seen_state,
+    persist_attribute_cursor_seen_state,
 )
+from tracer.services.clickhouse.attribute_reads import AttributeReadSelector
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
     cursor_scope_for_request,
@@ -43,11 +42,10 @@ from tracer.services.clickhouse.read_budget import (
     is_clickhouse_query_error,
     is_read_budget_error,
 )
+from tracer.services.exact_aggregation_cache import read_or_schedule_exact_snapshot
 from tracer.utils.workspace_scope import project_queryset_for_request
 
 logger = structlog.get_logger(__name__)
-
-_DETAIL_TOP_VALUES = 100
 
 ERROR_RESPONSES = {
     400: ApiTextErrorResponseSerializer,
@@ -142,7 +140,7 @@ class SpanAttributeKeysView(APIView):
                         raw_before_identity,
                         raw_resume_identity,
                         resume_key_offset,
-                        seen_digests,
+                        seen_reference,
                     ) = cursor_state.order
                     if (
                         not isinstance(segment_end, datetime)
@@ -153,8 +151,6 @@ class SpanAttributeKeysView(APIView):
                         or (raw_before_identity and raw_resume_identity)
                         or not isinstance(resume_key_offset, int)
                         or resume_key_offset < 0
-                        or not isinstance(seen_digests, tuple)
-                        or cursor_state.seen_rows != len(seen_digests)
                     ):
                         raise ListCursorError(
                             "invalid_cursor",
@@ -184,7 +180,29 @@ class SpanAttributeKeysView(APIView):
                     before_identity = None
                     resume_identity = None
                     resume_key_offset = 0
-                    seen_digests = ()
+                    seen_reference = ()
+
+                state_binding = {
+                    "scope": cursor_scope,
+                    "query": cursor_query,
+                    "page_size": page_size,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                }
+                seen_state = load_attribute_cursor_seen_state(
+                    seen_reference,
+                    resource="span_attribute_keys",
+                    binding=state_binding,
+                    validate_digest=lambda value: (
+                        len(value) == 32
+                        and all(char in "0123456789abcdef" for char in value)
+                    ),
+                )
+                if cursor_token and cursor_state.seen_rows != len(seen_state.digests):
+                    raise ListCursorError(
+                        "invalid_cursor",
+                        "The continuation cursor is invalid.",
+                    )
 
                 page_read = selector.read_key_cursor_page(
                     project_ids,
@@ -195,12 +213,25 @@ class SpanAttributeKeysView(APIView):
                     before_identity=before_identity,
                     resume_identity=resume_identity,
                     resume_key_offset=resume_key_offset,
-                    seen_key_digests=seen_digests,
+                    seen_key_digests=seen_state.digests,
                 )
                 next_cursor = None
                 published_has_more = page_read.has_more
                 published_browse_status = page_read.browse_status
                 if published_has_more:
+                    appended_digests = page_read.seen_key_digests[
+                        len(seen_state.digests) :
+                    ]
+                    seen_reference = persist_attribute_cursor_seen_state(
+                        seen_state,
+                        appended_digests,
+                        resource="span_attribute_keys",
+                        binding=state_binding,
+                        validate_digest=lambda value: (
+                            len(value) == 32
+                            and all(char in "0123456789abcdef" for char in value)
+                        ),
+                    )
                     next_cursor = encode_list_cursor(
                         resource="span_attribute_keys",
                         scope=cursor_scope,
@@ -213,20 +244,10 @@ class SpanAttributeKeysView(APIView):
                             page_read.next_before_identity or (),
                             page_read.next_resume_identity or (),
                             page_read.next_resume_key_offset,
-                            page_read.seen_key_digests,
+                            seen_reference,
                         ),
                         seen_rows=len(page_read.seen_key_digests),
                     )
-                    if len(next_cursor.encode("utf-8")) > (
-                        ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES
-                    ):
-                        # Never hand the browser a continuation that can be
-                        # rejected by a common 8 KiB request-line ceiling.
-                        # Exact q lookup remains available outside the bounded
-                        # recent-suggestion vocabulary.
-                        next_cursor = None
-                        published_has_more = False
-                        published_browse_status = "limit_reached"
                 return Response(
                     {
                         "result": [asdict(row) for row in page_read.rows],
@@ -235,7 +256,6 @@ class SpanAttributeKeysView(APIView):
                         "next_cursor": next_cursor,
                         "browse_mode": "recent_suggestions",
                         "browse_status": published_browse_status,
-                        "browse_limit": ATTRIBUTE_KEY_CURSOR_MAX_SEEN,
                     },
                     status=200,
                 )
@@ -258,6 +278,14 @@ class SpanAttributeKeysView(APIView):
                 },
                 status=200,
             )
+        except AttributeCursorStateError as exc:
+            if exc.code == "cursor_state_unavailable":
+                return self._gm.custom_error_response(
+                    503,
+                    str(exc),
+                    code="service_unavailable",
+                )
+            return self._gm.custom_error_response(400, str(exc), code=exc.code)
         except ListCursorError as exc:
             return self._gm.custom_error_response(
                 400,
@@ -384,13 +412,7 @@ class SpanAttributeValuesView(APIView):
 
 class SpanAttributeDetailView(APIView):
     """
-    Full detail for a specific span attribute key.
-
-    Determines the attribute type by probing which map contains the key, then
-    returns type-appropriate statistics:
-      - string: top values with percentages
-      - number: min, max, avg, p50, p95
-      - boolean: true/false distribution
+    Serve the last complete exact attribute snapshot and refresh out of band.
 
     GET /api/traces/span-attribute-detail/?project_id=<uuid>&key=<attr_key>
     """
@@ -405,150 +427,42 @@ class SpanAttributeDetailView(APIView):
     def get(self, request, *args, **kwargs):
         project_id = ""
         key = ""
-        selector: AttributeReadSelector | None = None
         try:
             query_params = request.validated_query_data
             project_id = str(query_params["project_id"])
             key = query_params["key"]
-            selector = AttributeReadSelector(
-                typed_only=True,
-                json_attribute_mode="arrays",
-            )
             if not _project_is_in_request_scope(request, project_id):
                 return self._gm.not_found("Project not found")
-            read = selector.read_detail([project_id], key)
-            if read.attribute_type is None and read.metadata.query_complete:
-                return self._gm.not_found(f"Attribute key '{key}' not found in project")
-            if read.attribute_type is None:
-                return Response(
-                    self._empty_degraded_payload(key, read.metadata),
-                    status=200,
-                )
-            return Response(self._detail_payload(key, read), status=200)
+
+            identity = {
+                "workspace_id": str(request.workspace.id),
+                "project_id": project_id,
+                "attribute_key": key,
+                "horizon_days": 365,
+            }
+            payload = read_or_schedule_exact_snapshot(
+                "attribute-detail",
+                identity,
+                refresh=bool(query_params.get("refresh", False)),
+                pending_payload={
+                    "key": key,
+                    "type": None,
+                    "count": 0,
+                    "unique_values": 0,
+                    "top_values": [],
+                    "query_complete": False,
+                    "query_status": "pending",
+                    "query_sampled": False,
+                },
+            )
+            return Response(payload, status=200)
         except Exception as exc:
-            if not _is_expected_attribute_read_failure(exc):
-                logger.exception(
-                    "span_attribute_detail_programming_error",
-                    project_id=project_id,
-                    key=key,
-                    error_type=type(exc).__name__,
-                )
-                return self._gm.internal_server_error_response(
-                    "Span attribute details could not be loaded"
-                )
-            if selector is None:
-                logger.warning(
-                    "span_attribute_detail_unavailable",
-                    project_id=project_id,
-                    key=key,
-                    error_type=type(exc).__name__,
-                )
-                return self._gm.custom_error_response(
-                    503,
-                    "Span attribute details are temporarily unavailable. Please retry.",
-                    code="service_unavailable",
-                )
-            logger.warning(
-                "span_attribute_detail_failed",
+            logger.exception(
+                "span_attribute_detail_programming_error",
                 project_id=project_id,
                 key=key,
                 error_type=type(exc).__name__,
             )
-            return Response(
-                self._empty_degraded_payload(
-                    key,
-                    selector.degraded_metadata(_attribute_error_code(exc)),
-                ),
-                status=200,
+            return self._gm.internal_server_error_response(
+                "Span attribute details could not be loaded"
             )
-
-    @staticmethod
-    def _empty_degraded_payload(
-        key: str,
-        metadata: AttributeReadMetadata,
-    ) -> dict:
-        """Keep required legacy fields while making incompleteness explicit."""
-
-        return {
-            "key": key,
-            # The established response requires a concrete scalar type. No
-            # type claim is actionable while query_complete is false; string
-            # preserves the old response shape for existing clients.
-            "type": "string",
-            "count": 0,
-            "unique_values": 0,
-            "top_values": [],
-            **metadata.public_payload(),
-        }
-
-    @staticmethod
-    def _weighted_quantile(
-        values: list[tuple[float, int]],
-        quantile: float,
-    ) -> float | None:
-        total = sum(count for _, count in values)
-        if total <= 0:
-            return None
-        target = max(1, int(total * quantile + 0.999999999))
-        cumulative = 0
-        for value, count in sorted(values):
-            cumulative += count
-            if cumulative >= target:
-                return value
-        return max(value for value, _ in values)
-
-    @classmethod
-    def _detail_payload(cls, key: str, read: AttributeDetailRead) -> dict:
-        attribute_type = read.attribute_type
-        assert attribute_type is not None
-        total_count = sum(row.count for row in read.rows)
-        payload: dict = {
-            "key": key,
-            "type": attribute_type,
-            "count": total_count,
-            **read.metadata.public_payload(),
-        }
-        if attribute_type == "number":
-            weighted_values = [
-                (float(row.value), row.count)
-                for row in read.rows
-                if isinstance(row.value, (int, float))
-                and not isinstance(row.value, bool)
-            ]
-            weighted_sum = sum(value * count for value, count in weighted_values)
-            payload.update(
-                {
-                    "min": min((value for value, _ in weighted_values), default=None),
-                    "max": max((value for value, _ in weighted_values), default=None),
-                    "avg": (
-                        round(weighted_sum / total_count, 4)
-                        if total_count > 0
-                        else None
-                    ),
-                    "p50": cls._rounded_quantile(weighted_values, 0.50),
-                    "p95": cls._rounded_quantile(weighted_values, 0.95),
-                }
-            )
-            return payload
-
-        payload["unique_values"] = len(read.rows)
-        payload["top_values"] = [
-            {
-                "value": row.value,
-                "count": row.count,
-                "percentage": (
-                    round(row.count / total_count * 100, 1) if total_count > 0 else 0
-                ),
-            }
-            for row in read.rows[:_DETAIL_TOP_VALUES]
-        ]
-        return payload
-
-    @classmethod
-    def _rounded_quantile(
-        cls,
-        values: list[tuple[float, int]],
-        quantile: float,
-    ) -> float | None:
-        value = cls._weighted_quantile(values, quantile)
-        return round(value, 4) if value is not None else None

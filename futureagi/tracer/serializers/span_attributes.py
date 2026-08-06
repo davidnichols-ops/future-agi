@@ -6,8 +6,8 @@ from tracer.services.clickhouse.attribute_reads import (
     validate_attribute_search,
 )
 
-SPAN_ATTRIBUTE_TYPES = ("string", "number", "boolean", "array")
-SPAN_ATTRIBUTE_KEY_TYPES = (*SPAN_ATTRIBUTE_TYPES, "map")
+SPAN_ATTRIBUTE_TYPES = ("string", "number", "boolean", "array", "map", "json")
+SPAN_ATTRIBUTE_KEY_TYPES = SPAN_ATTRIBUTE_TYPES
 
 
 class SpanAttributeProjectQuerySerializer(serializers.Serializer):
@@ -68,6 +68,7 @@ class SpanAttributeValuesQuerySerializer(serializers.Serializer):
 class SpanAttributeDetailQuerySerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
     key = serializers.CharField(max_length=512)
+    refresh = serializers.BooleanField(required=False, default=False)
 
     def validate_key(self, value):
         try:
@@ -136,9 +137,17 @@ class SpanAttributeTopValueSerializer(serializers.Serializer):
     percentage = serializers.FloatField()
 
 
+class SpanAttributeNumericStatsSerializer(serializers.Serializer):
+    min = serializers.FloatField(allow_null=True, required=False)
+    max = serializers.FloatField(allow_null=True, required=False)
+    avg = serializers.FloatField(allow_null=True, required=False)
+    p50 = serializers.FloatField(allow_null=True, required=False)
+    p95 = serializers.FloatField(allow_null=True, required=False)
+
+
 class SpanAttributeDetailResponseSerializer(serializers.Serializer):
     key = serializers.CharField()
-    type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_TYPES)
+    type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_TYPES, allow_null=True)
     count = serializers.IntegerField()
     unique_values = serializers.IntegerField(required=False)
     top_values = SpanAttributeTopValueSerializer(many=True, required=False)
@@ -147,11 +156,21 @@ class SpanAttributeDetailResponseSerializer(serializers.Serializer):
     avg = serializers.FloatField(required=False, allow_null=True)
     p50 = serializers.FloatField(required=False, allow_null=True)
     p95 = serializers.FloatField(required=False, allow_null=True)
+    stats = SpanAttributeNumericStatsSerializer(required=False)
     query_complete = serializers.BooleanField()
-    query_status = serializers.ChoiceField(choices=["complete", "sampled", "degraded"])
+    query_status = serializers.ChoiceField(
+        choices=["complete", "pending", "sampled", "degraded"]
+    )
+    query_sampled = serializers.BooleanField()
     query_error_code = serializers.ChoiceField(
         choices=["sample_limit", "read_budget_exceeded", "query_failed"],
         required=False,
     )
-    query_window_start = serializers.DateTimeField()
-    query_window_end = serializers.DateTimeField()
+    query_window_start = serializers.DateTimeField(required=False)
+    query_window_end = serializers.DateTimeField(required=False)
+    query_count = serializers.IntegerField(required=False, min_value=0)
+    query_elapsed_ms = serializers.FloatField(required=False, min_value=0)
+    query_completed_at = serializers.DateTimeField(required=False)
+    query_cached = serializers.BooleanField(required=False)
+    query_refreshing = serializers.BooleanField(required=False)
+    query_refresh_failed = serializers.BooleanField(required=False)

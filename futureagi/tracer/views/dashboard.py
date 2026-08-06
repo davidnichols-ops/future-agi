@@ -35,6 +35,11 @@ from tracer.serializers.dashboard import (
     DashboardWidgetSerializer,
 )
 from tracer.services.annotation_label_source import AnnotationScoreReadUnavailable
+from tracer.services.clickhouse.attribute_cursor_state import (
+    AttributeCursorStateError,
+    load_attribute_cursor_seen_state,
+    persist_attribute_cursor_seen_state,
+)
 from tracer.services.clickhouse.attribute_reads import (
     AttributeReadSelector,
     InvalidAttributeKey,
@@ -1343,6 +1348,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 try:
                     page_size = query_params.get("page_size")
                     cursor_token = query_params.get("cursor")
+                    attribute_type = query_params.get("attribute_type")
                     if page_size is not None:
                         page_size = int(page_size)
                         cursor_scope = cursor_scope_for_request(
@@ -1355,6 +1361,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             "source": source,
                             "project_ids": sorted(str(value) for value in project_ids),
                             "search": search,
+                            "attribute_type": attribute_type,
                         }
                         if cursor_token:
                             cursor_state = decode_list_cursor(
@@ -1374,7 +1381,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 raw_before_identity,
                                 raw_resume_identity,
                                 resume_member_offset,
-                                seen_digests,
+                                seen_reference,
                             ) = cursor_state.order
                             if (
                                 not isinstance(segment_end, datetime)
@@ -1382,10 +1389,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 or len(raw_before_identity) not in {0, 4}
                                 or not isinstance(raw_resume_identity, tuple)
                                 or len(raw_resume_identity) not in {0, 4}
+                                or (raw_before_identity and raw_resume_identity)
                                 or not isinstance(resume_member_offset, int)
                                 or resume_member_offset < 0
-                                or not isinstance(seen_digests, tuple)
-                                or cursor_state.seen_rows != len(seen_digests)
                             ):
                                 raise ListCursorError(
                                     "invalid_cursor",
@@ -1422,7 +1428,31 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             before_identity = None
                             resume_identity = None
                             resume_member_offset = 0
-                            seen_digests = ()
+                            seen_reference = ()
+
+                        state_binding = {
+                            "scope": cursor_scope,
+                            "query": cursor_query,
+                            "page_size": page_size,
+                            "window_start": window_start,
+                            "window_end": window_end,
+                        }
+                        seen_state = load_attribute_cursor_seen_state(
+                            seen_reference,
+                            resource="dashboard_filter_values",
+                            binding=state_binding,
+                            validate_digest=lambda value: (
+                                len(value) == 32
+                                and all(char in "0123456789abcdef" for char in value)
+                            ),
+                        )
+                        if cursor_token and cursor_state.seen_rows != len(
+                            seen_state.digests
+                        ):
+                            raise ListCursorError(
+                                "invalid_cursor",
+                                "The continuation cursor is invalid.",
+                            )
 
                         page_read = selector.read_value_cursor_page(
                             project_ids,
@@ -1434,8 +1464,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             before_identity=before_identity,
                             resume_identity=resume_identity,
                             resume_member_offset=resume_member_offset,
-                            seen_value_digests=seen_digests,
+                            seen_value_digests=seen_state.digests,
                             search=search,
+                            attribute_type=attribute_type,
                         )
                         values = [
                             {
@@ -1453,6 +1484,21 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         ]
                         next_cursor = None
                         if page_read.has_more:
+                            appended_digests = page_read.seen_value_digests[
+                                len(seen_state.digests) :
+                            ]
+                            seen_reference = persist_attribute_cursor_seen_state(
+                                seen_state,
+                                appended_digests,
+                                resource="dashboard_filter_values",
+                                binding=state_binding,
+                                validate_digest=lambda value: (
+                                    len(value) == 32
+                                    and all(
+                                        char in "0123456789abcdef" for char in value
+                                    )
+                                ),
+                            )
                             next_cursor = encode_list_cursor(
                                 resource="dashboard_filter_values",
                                 scope=cursor_scope,
@@ -1465,7 +1511,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                     page_read.next_before_identity or (),
                                     page_read.next_resume_identity or (),
                                     page_read.next_resume_member_offset,
-                                    page_read.seen_value_digests,
+                                    seen_reference,
                                 ),
                                 seen_rows=len(page_read.seen_value_digests),
                             )
@@ -1475,6 +1521,11 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 **page_read.metadata.public_payload(),
                                 "has_more": page_read.has_more,
                                 "next_cursor": next_cursor,
+                                **(
+                                    {"attribute_type": attribute_type}
+                                    if attribute_type
+                                    else {}
+                                ),
                             }
                         )
 
@@ -1524,6 +1575,18 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             "values": values,
                             **metadata,
                         }
+                    )
+                except AttributeCursorStateError as exc:
+                    if exc.code == "cursor_state_unavailable":
+                        return self._gm.custom_error_response(
+                            status.HTTP_503_SERVICE_UNAVAILABLE,
+                            str(exc),
+                            code="service_unavailable",
+                        )
+                    return self._gm.custom_error_response(
+                        status.HTTP_400_BAD_REQUEST,
+                        str(exc),
+                        code=exc.code,
                     )
                 except ListCursorError as exc:
                     return self._gm.custom_error_response(
@@ -2177,9 +2240,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
 
         if dataset_prepared:
             if legacy_analytics is None:
-                raise DashboardExactReadError(
-                    "dataset query executor is unavailable"
-                )
+                raise DashboardExactReadError("dataset query executor is unavailable")
 
             def _fetch_ds_rows(sql, params):
                 return _fetch_exact_dashboard_rows(

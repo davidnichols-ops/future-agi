@@ -89,6 +89,7 @@ def test_eval_list_charts_accepts_over_budget_request_and_explicitly_degrades(
         "charts": {},
         "query_complete": False,
         "query_status": "degraded",
+        "query_sampled": False,
         "query_error_code": "template_limit_exceeded",
         "data_stale": False,
     }
@@ -129,6 +130,7 @@ def test_eval_list_charts_uses_one_bounded_materialized_clickhouse_aggregate(
     assert result["charts"][str(template_id)]["run_count"] == 4
     assert result["charts"][str(template_id)]["error_rate"][-1]["value"] == 25.0
     assert result["query_status"] == "complete"
+    assert result["query_sampled"] is False
     assert len(client.calls) == 1
     call = client.calls[0]
     assert call["timeout_ms"] == 2_000
@@ -174,6 +176,7 @@ def test_eval_list_charts_returns_stale_result_when_clickhouse_exceeds_budget(
         "charts": stale,
         "query_complete": False,
         "query_status": "stale",
+        "query_sampled": False,
         "data_stale": True,
         "query_error_code": "read_budget_exceeded",
     }
@@ -203,6 +206,7 @@ def test_eval_list_charts_marks_cold_budget_failure_degraded(monkeypatch):
         "charts": result["charts"],
         "query_complete": False,
         "query_status": "degraded",
+        "query_sampled": False,
         "data_stale": False,
         "query_error_code": "read_budget_exceeded",
     }
@@ -261,6 +265,7 @@ def test_eval_list_charts_degrades_without_clickhouse_configuration(
         "charts": result["charts"],
         "query_complete": False,
         "query_status": "degraded",
+        "query_sampled": False,
         "data_stale": False,
         "query_error_code": "query_failed",
     }
@@ -277,6 +282,7 @@ def test_eval_list_charts_response_contract_accepts_sanitized_query_failure():
             "charts": {},
             "query_complete": False,
             "query_status": "degraded",
+            "query_sampled": False,
             "query_error_code": "query_failed",
             "data_stale": False,
         }

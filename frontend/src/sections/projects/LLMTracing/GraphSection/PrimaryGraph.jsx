@@ -50,7 +50,7 @@ import { formatDate } from "src/utils/report-utils";
 import { toBackendFilters } from "../common";
 import { combineGraphFilters } from "./graphFilterUtils";
 import {
-  AGGREGATION_PREPARING_MESSAGE,
+  GRAPH_LOADING_MESSAGE,
   getAggregationPollDelay,
   getAggregationRefreshState,
   getExactAggregationReadState,
@@ -554,7 +554,7 @@ const PrimaryGraph = ({
   const graphStatusMessage =
     !exactSnapshot &&
     (refreshUnavailable || graphError || graphReadState !== "complete")
-      ? AGGREGATION_PREPARING_MESSAGE
+      ? GRAPH_LOADING_MESSAGE
       : null;
 
   // Parse API data → [{timestamp, value, primary_traffic}, ...]

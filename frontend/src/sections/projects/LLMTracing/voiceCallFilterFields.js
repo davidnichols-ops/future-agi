@@ -157,6 +157,7 @@ const COMPLETED_STATUS_ALIASES = new Set([
   "completed",
   "success",
   "succeeded",
+  "ok",
 ]);
 const IN_PROGRESS_STATUS_ALIASES = new Set([
   "in-progress",
@@ -167,6 +168,28 @@ const IN_PROGRESS_STATUS_ALIASES = new Set([
   "queued",
   "pending",
 ]);
+const FAILED_STATUS_ALIASES = new Set([
+  "failed",
+  "failure",
+  "error",
+  "errored",
+]);
+const DROPPED_STATUS_ALIASES = new Set([
+  "dropped",
+  "cancelled",
+  "canceled",
+  "aborted",
+  "hung-up",
+  "hung_up",
+]);
+const NOT_CONNECTED_STATUS_ALIASES = new Set([
+  "not-connected",
+  "not_connected",
+  "no-answer",
+  "no_answer",
+  "unanswered",
+  "busy",
+]);
 
 export const normalizeVoiceCallStatus = (value) => {
   if (Array.isArray(value)) {
@@ -176,6 +199,9 @@ export const normalizeVoiceCallStatus = (value) => {
   const normalized = value.trim().toLowerCase();
   if (COMPLETED_STATUS_ALIASES.has(normalized)) return "completed";
   if (IN_PROGRESS_STATUS_ALIASES.has(normalized)) return "in-progress";
+  if (FAILED_STATUS_ALIASES.has(normalized)) return "failed";
+  if (DROPPED_STATUS_ALIASES.has(normalized)) return "dropped";
+  if (NOT_CONNECTED_STATUS_ALIASES.has(normalized)) return "not-connected";
   return normalized;
 };
 

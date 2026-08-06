@@ -95,7 +95,15 @@ export const computeNaturalSize = (layout) => {
 };
 
 export const computeSankeyLayout = (graphData) => {
-  if (!graphData?.nodes?.length || !graphData?.edges?.length) return null;
+  if (!graphData?.nodes?.length) return null;
+
+  // Agent Graph and Agent Path intentionally expose different relationships.
+  // Topology edges are parent -> child; path_edges are chronological adjacent
+  // transitions within each trace. Falling back keeps compatibility with an
+  // older cached payload during a rolling deploy, but an explicit empty path
+  // stays empty (it must not silently turn back into topology).
+  const graphEdges =
+    graphData.path_edges ?? graphData.pathEdges ?? graphData.edges ?? [];
 
   const nodeMap = new Map();
   graphData.nodes.forEach((n) => {
@@ -104,8 +112,8 @@ export const computeSankeyLayout = (graphData) => {
 
   const outEdges = new Map();
   const targetSet = new Set();
-  graphData.edges.forEach((e) => {
-    if (e.isSelfLoop) return;
+  graphEdges.forEach((e) => {
+    if (e.is_self_loop || e.isSelfLoop) return;
     if (!nodeMap.has(e.source) || !nodeMap.has(e.target)) return;
     if (!outEdges.has(e.source)) outEdges.set(e.source, []);
     outEdges.get(e.source).push({ target: e.target });
@@ -168,13 +176,13 @@ export const computeSankeyLayout = (graphData) => {
   }));
 
   const flows = [];
-  graphData.edges.forEach((e) => {
-    if (e.isSelfLoop) return;
+  graphEdges.forEach((e) => {
+    if (e.is_self_loop || e.isSelfLoop) return;
     if (!nodeMap.has(e.source) || !nodeMap.has(e.target)) return;
     flows.push({
       source: e.source,
       target: e.target,
-      count: e.transitionCount || 1,
+      count: e.transition_count ?? e.transitionCount ?? 1,
       sourceColor: getColor(nodeMap.get(e.source)?.type),
       targetColor: getColor(nodeMap.get(e.target)?.type),
     });

@@ -209,6 +209,29 @@ describe("TaskFilterBar voice-call filter contract", () => {
       apiColType: "SYSTEM_METRIC",
     });
   });
+
+  it("normalizes provider failure and connection aliases deterministically", () => {
+    const aliases = ["ERROR", "cancelled", "no_answer", "ok"];
+    const rows = convertNewToOld(
+      [
+        {
+          field: "call_status",
+          fieldCategory: "system",
+          fieldType: "string",
+          operator: "in",
+          value: aliases,
+        },
+      ],
+      { rowType: "voiceCalls" },
+    );
+
+    expect(rows[0].filterConfig.filterValue).toEqual([
+      "failed",
+      "dropped",
+      "not-connected",
+      "completed",
+    ]);
+  });
 });
 
 describe("TaskFilterBar structured and mixed filter contract", () => {

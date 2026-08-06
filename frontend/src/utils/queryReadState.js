@@ -20,6 +20,8 @@ export const QUERY_FAILED_RETRY_MESSAGE =
 
 export const AGGREGATION_PREPARING_MESSAGE = "Preparing exact data…";
 
+export const GRAPH_LOADING_MESSAGE = "Loading graph data…";
+
 const payloadCandidates = (payload) => {
   const responseData =
     payload?.data && !Array.isArray(payload.data) ? payload.data : null;

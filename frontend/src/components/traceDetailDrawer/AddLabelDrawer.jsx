@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
+  Alert,
   Box,
   Button,
   Checkbox,
@@ -16,6 +17,7 @@ import {
   annotationLabelKeys,
 } from "src/api/annotation-labels/annotation-labels";
 import {
+  extractErrorMessage,
   useGetOrCreateDefaultQueue,
   useAddLabelToQueue,
   useRemoveLabelFromQueue,
@@ -24,8 +26,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import PropTypes from "prop-types";
 import CreateLabelDrawer from "src/sections/annotations/labels/create-label-drawer";
 import LabelTypeChip from "src/components/label-type-chip/LabelTypeChip";
-
-
 
 const AddLabelDrawerContent = ({
   projectId,
@@ -39,6 +39,7 @@ const AddLabelDrawerContent = ({
   const [queueLabelIds, setQueueLabelIds] = useState(new Set());
   const [saving, setSaving] = useState(false);
   const [createLabelOpen, setCreateLabelOpen] = useState(false);
+  const [queueError, setQueueError] = useState("");
   const queryClient = useQueryClient();
 
   const { data: labelsData } = useAnnotationLabelsList({
@@ -47,7 +48,10 @@ const AddLabelDrawerContent = ({
   });
   const allLabels = labelsData?.results || [];
 
-  const getOrCreateDefault = useGetOrCreateDefaultQueue();
+  const { mutate: getOrCreateDefault, isPending: isDefaultQueuePending } =
+    useGetOrCreateDefaultQueue({
+      notifyOnError: false,
+    });
   const addLabelMutation = useAddLabelToQueue();
   const removeLabelMutation = useRemoveLabelFromQueue();
 
@@ -58,10 +62,11 @@ const AddLabelDrawerContent = ({
   useEffect(() => {
     if (scopeId && !defaultQueue && !hasFetchedRef.current) {
       hasFetchedRef.current = true;
-      getOrCreateDefault.mutate(
+      getOrCreateDefault(
         { projectId, datasetId, agentDefinitionId },
         {
           onSuccess: (response) => {
+            setQueueError("");
             const result = response.data?.result || response.data;
             const queue = result?.queue;
             if (queue) setDefaultQueue(queue);
@@ -70,10 +75,24 @@ const AddLabelDrawerContent = ({
             );
             setQueueLabelIds(existingIds);
           },
+          onError: (error) => {
+            setDefaultQueue(null);
+            setQueueLabelIds(new Set());
+            setQueueError(
+              extractErrorMessage(error, "Failed to get default queue"),
+            );
+          },
         },
       );
     }
-  }, [scopeId, defaultQueue, projectId, datasetId, agentDefinitionId]);
+  }, [
+    scopeId,
+    defaultQueue,
+    projectId,
+    datasetId,
+    agentDefinitionId,
+    getOrCreateDefault,
+  ]);
 
   const filteredLabels = search
     ? allLabels.filter((l) =>
@@ -154,6 +173,8 @@ const AddLabelDrawerContent = ({
           can annotate using these labels.
         </Typography>
 
+        {queueError && <Alert severity="error">{queueError}</Alert>}
+
         {/* Selected labels */}
         {selectedLabels.length > 0 && (
           <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
@@ -198,7 +219,7 @@ const AddLabelDrawerContent = ({
             borderRadius: 1,
           }}
         >
-          {getOrCreateDefault.isPending ? (
+          {isDefaultQueuePending ? (
             <Typography
               variant="body2"
               color="text.secondary"
@@ -210,14 +231,21 @@ const AddLabelDrawerContent = ({
             filteredLabels.map((label) => (
               <Box
                 key={label.id}
-                onClick={() => !saving && handleToggle(label.id)}
+                onClick={() =>
+                  !saving && defaultQueue?.id && handleToggle(label.id)
+                }
                 sx={{
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "space-between",
                   px: 1,
                   py: 0.5,
-                  cursor: saving ? "wait" : "pointer",
+                  cursor: saving
+                    ? "wait"
+                    : defaultQueue?.id
+                      ? "pointer"
+                      : "not-allowed",
+                  opacity: defaultQueue?.id ? 1 : 0.6,
                   borderBottom: "1px solid",
                   borderColor: "divider",
                   "&:last-child": { borderBottom: 0 },
@@ -234,6 +262,7 @@ const AddLabelDrawerContent = ({
                 >
                   <Checkbox
                     checked={queueLabelIds.has(label.id)}
+                    disabled={!defaultQueue?.id || saving}
                     size="small"
                     sx={{ p: 0.5 }}
                   />
@@ -261,6 +290,7 @@ const AddLabelDrawerContent = ({
           size="small"
           startIcon={<Iconify icon="mingcute:add-line" width={16} />}
           onClick={() => setCreateLabelOpen(true)}
+          disabled={!defaultQueue?.id}
           sx={{ alignSelf: "flex-start", fontSize: 12 }}
         >
           Create new label

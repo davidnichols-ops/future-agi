@@ -1,10 +1,18 @@
 import { useState } from "react";
 import PropTypes from "prop-types";
 import { Autocomplete, TextField, CircularProgress } from "@mui/material";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import { useDebounce } from "src/hooks/use-debounce";
 import { useParams } from "react-router-dom";
+
+const LOAD_MORE_OPTION = Object.freeze({ __loadMore: true });
+
+const normalizeAttributeType = (type) => {
+  if (type === "text") return "string";
+  if (["float", "integer"].includes(type)) return "number";
+  return type;
+};
 
 const AutocompleteTextValueSelector = ({
   definition,
@@ -17,39 +25,106 @@ const AutocompleteTextValueSelector = ({
   const debouncedInput = useDebounce(inputValue, 300);
   const { id: projectId } = useParams();
 
-  const { data: options = [], isLoading } = useQuery({
-    queryKey: [
-      "span-attribute-values",
-      projectId,
-      definition?.propertyId,
-      debouncedInput,
-    ],
-    queryFn: () =>
-      axios.get(endpoints.project.spanAttributeValues(), {
-        params: {
-          project_id: projectId,
-          key: definition?.propertyId,
-          q: debouncedInput,
-          limit: 20,
-        },
-      }),
-    select: (data) => data.data?.result?.map((item) => item.value) || [],
-    enabled: Boolean(projectId) && Boolean(definition?.propertyId),
-    staleTime: 30000,
-  });
+  const { data, isLoading, hasNextPage, fetchNextPage, isFetchingNextPage } =
+    useInfiniteQuery({
+      queryKey: [
+        "span-attribute-values",
+        projectId,
+        definition?.propertyId,
+        debouncedInput,
+      ],
+      queryFn: ({ signal, pageParam }) =>
+        axios.get(endpoints.dashboard.filterValues, {
+          signal,
+          params: {
+            project_ids: projectId,
+            metric_name: definition?.propertyId,
+            metric_type: "custom_attribute",
+            source: "traces",
+            search: debouncedInput,
+            page_size: 10,
+            ...(definition?.type
+              ? { attribute_type: normalizeAttributeType(definition.type) }
+              : {}),
+            ...(pageParam ? { cursor: pageParam } : {}),
+          },
+        }),
+      initialPageParam: null,
+      getNextPageParam: (lastPage) =>
+        lastPage?.data?.result?.has_more && lastPage?.data?.result?.next_cursor
+          ? lastPage.data.result.next_cursor
+          : undefined,
+      enabled: Boolean(projectId) && Boolean(definition?.propertyId),
+      staleTime: 30000,
+      retry: false,
+      meta: { errorHandled: true },
+    });
+  const seen = new Set();
+  const options = (data?.pages || []).flatMap((page) =>
+    (page?.data?.result?.values || []).flatMap((item) => {
+      const value = item?.value ?? item;
+      const key = `${typeof value}:${JSON.stringify(value)}`;
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [value];
+    }),
+  );
+  const pickerOptions = hasNextPage ? [...options, LOAD_MORE_OPTION] : options;
 
   return (
     <Autocomplete
       freeSolo
       size="small"
-      options={options}
+      options={pickerOptions}
+      filterOptions={(availableOptions) => availableOptions}
+      getOptionLabel={(option) => {
+        if (option === LOAD_MORE_OPTION) return "Load more values";
+        if (typeof option === "string") return option;
+        return JSON.stringify(option);
+      }}
+      renderOption={(props, option) =>
+        option === LOAD_MORE_OPTION ? (
+          <li
+            {...props}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (!isFetchingNextPage) fetchNextPage();
+            }}
+          >
+            {isFetchingNextPage ? "Loading more values…" : "Load more values"}
+          </li>
+        ) : (
+          <li {...props}>
+            {typeof option === "string" ? option : JSON.stringify(option)}
+          </li>
+        )
+      }
       loading={isLoading}
+      ListboxProps={{
+        onScroll: (event) => {
+          const list = event.currentTarget;
+          if (
+            hasNextPage &&
+            !isFetchingNextPage &&
+            list.scrollTop + list.clientHeight >= list.scrollHeight - 24
+          ) {
+            fetchNextPage();
+          }
+        },
+      }}
       inputValue={inputValue}
-      onInputChange={(_, newInputValue) => {
+      onInputChange={(_, newInputValue, reason) => {
+        if (reason === "reset" && newInputValue === "Load more values") return;
         setInputValue(newInputValue);
       }}
       value={filter?.filter_config?.filter_value || ""}
       onChange={(_, newValue) => {
+        if (newValue === LOAD_MORE_OPTION) {
+          if (!isFetchingNextPage) fetchNextPage();
+          return;
+        }
         updateFilter({
           ...filter,
           filter_config: {
@@ -80,7 +155,7 @@ const AutocompleteTextValueSelector = ({
             ...params.InputProps,
             endAdornment: (
               <>
-                {isLoading ? (
+                {isLoading || isFetchingNextPage ? (
                   <CircularProgress color="inherit" size={16} />
                 ) : null}
                 {params.InputProps.endAdornment}
@@ -97,6 +172,7 @@ const AutocompleteTextValueSelector = ({
 AutocompleteTextValueSelector.propTypes = {
   definition: PropTypes.shape({
     propertyId: PropTypes.string,
+    type: PropTypes.string,
   }),
   filter: PropTypes.shape({
     filter_config: PropTypes.shape({

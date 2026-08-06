@@ -838,6 +838,37 @@ def fetch_system_metric_graph_ch(
     )
 
 
+def fetch_agent_graph_ch(
+    *,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Read or schedule one exact Agent Graph/Path snapshot.
+
+    Agent topology is an aggregation, not a list.  A cold request therefore
+    returns an explicit non-renderable pending envelope; a manual refresh keeps
+    the last fully exact snapshot visible until its atomic replacement lands.
+    """
+
+    project_id = _validated_project_id(project_id)
+    normalized_filters = list(filters or [])
+    return _read_or_refresh_exact_graph(
+        namespace="observe-agent-graph",
+        identity={"project_id": project_id, "filters": normalized_filters},
+        refresh=bool(refresh),
+        pending_payload={
+            "nodes": [],
+            "edges": [],
+            "path_edges": [],
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+            "query_refreshing": True,
+        },
+    )
+
+
 def fetch_all_system_metrics_ch(
     *,
     analytics: Any,
@@ -1497,6 +1528,7 @@ __all__ = [
     "enforce_exact_graph_data_contract",
     "graph_payload_is_publishable",
     "fetch_all_system_metrics_ch",
+    "fetch_agent_graph_ch",
     "fetch_annotation_graph_ch",
     "fetch_eval_chart_series_ch",
     "fetch_eval_graph_ch",

@@ -1344,6 +1344,7 @@ export const useDeleteAutomationRule = () => {
 export const useEvaluateRule = () => {
   const queryClient = useQueryClient();
   return useMutation({
+    meta: { errorHandled: true },
     mutationFn: ({ queueId, ruleId }) =>
       axios.post(
         annotationQueueEndpoints.automationRuleEvaluate(queueId, ruleId),
@@ -1397,7 +1398,9 @@ export const useEvaluateRule = () => {
         });
         return;
       }
-      enqueueSnackbar("Failed to evaluate rule", { variant: "error" });
+      enqueueSnackbar(extractErrorMessage(error, "Failed to evaluate rule"), {
+        variant: "error",
+      });
     },
   });
 };
@@ -1575,9 +1578,13 @@ export const useQueueItemsForSource = (sources = [], options = {}) => {
 // Default queue hooks
 // ---------------------------------------------------------------------------
 
-export const useGetOrCreateDefaultQueue = () => {
+export const useGetOrCreateDefaultQueue = ({ notifyOnError = true } = {}) => {
   const queryClient = useQueryClient();
   return useMutation({
+    // This hook owns notification policy.  Marking the mutation handled keeps
+    // the app-level MutationCache from stacking a generic "Something went
+    // wrong" toast beside the exact entitlement response.
+    meta: { errorHandled: true },
     mutationFn: ({ projectId, datasetId, agentDefinitionId }) =>
       axios.post(annotationQueueEndpoints.getOrCreateDefault, {
         ...(projectId && { project_id: projectId }),
@@ -1599,6 +1606,7 @@ export const useGetOrCreateDefaultQueue = () => {
       queryClient.invalidateQueries({ queryKey: annotationQueueKeys.all });
     },
     onError: (error) => {
+      if (!notifyOnError) return;
       const msg = extractErrorMessage(error, "Failed to get default queue");
       enqueueSnackbar(typeof msg === "string" ? msg : JSON.stringify(msg), {
         variant: "error",

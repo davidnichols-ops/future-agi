@@ -30,7 +30,6 @@ from tracer.serializers.span_attributes import (
 from tracer.services.clickhouse.attribute_reads import (
     _LATEST_CARDINALITY_SQL,
     _STRATIFIED_CANDIDATE_SQL,
-    ATTRIBUTE_KEY_CURSOR_MAX_SEEN,
     ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES,
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_MAX_PROJECTS,
@@ -40,7 +39,6 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
-    ATTRIBUTE_VALUE_CURSOR_MAX_SEEN,
     AttributeCardinalityRead,
     AttributeDetailRead,
     AttributeKeyCursorPageRead,
@@ -2419,7 +2417,9 @@ def test_filter_value_cursor_page_is_newest_first_and_dedupes_across_pages():
     )
 
     assert [row.value for row in first.rows] == ["completed", "failed"]
-    assert first.metadata.query_status == "sampled"
+    assert first.metadata.query_complete is True
+    assert first.metadata.query_status == "complete"
+    assert first.metadata.query_error_code is None
     assert first.has_more is True
     assert first.next_before_identity == (
         PROJECT_A,
@@ -2447,7 +2447,7 @@ def test_filter_value_cursor_page_is_newest_first_and_dedupes_across_pages():
     assert all(row.value != "completed" for row in second.rows)
 
 
-def test_filter_value_cursor_page_caps_raw_candidate_batches_and_marks_sample():
+def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation():
     candidates = [
         _candidate(
             PROJECT_A,
@@ -2501,8 +2501,9 @@ def test_filter_value_cursor_page_caps_raw_candidate_batches_and_marks_sample():
             * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
         ),
     )
-    assert read.metadata.query_complete is False
-    assert read.metadata.query_error_code == "sample_limit"
+    assert read.metadata.query_complete is True
+    assert read.metadata.query_status == "complete"
+    assert read.metadata.query_error_code is None
     assert read.has_more is True
     assert read.next_before_identity == (
         PROJECT_A,
@@ -2597,10 +2598,7 @@ def test_filter_value_cursor_resume_budget_failure_never_advances_cursor():
 def test_filter_value_cursor_full_url_stays_below_common_request_line_limit():
     search = "x" * 512
     project_id = "00000000-0000-4000-8000-000000000005"
-    digests = tuple(
-        attribute_value_cursor_digest("string", f"value-{index}")
-        for index in range(ATTRIBUTE_VALUE_CURSOR_MAX_SEEN)
-    )
+    seen_reference = ("state", "a" * 64)
     scope = {
         "principal_id": "00000000-0000-4000-8000-000000000001",
         "auth_type": "TokenAuthentication",
@@ -2623,8 +2621,8 @@ def test_filter_value_cursor_full_url_stays_below_common_request_line_limit():
         page_size=50,
         window_start=NOW - timedelta(days=365),
         window_end=NOW,
-        order=(NOW, (), (), 0, digests),
-        seen_rows=len(digests),
+        order=(NOW, (), (), 0, seen_reference),
+        seen_rows=1_000_000,
     )
     full_url = "https://api.futureagi.com/tracer/dashboard/filter_values/?" + urlencode(
         {
@@ -3922,10 +3920,10 @@ def test_span_attribute_key_cursor_pages_resume_wide_rows_without_duplicates(
     assert first.browse_status == "continuation"
     assert first.metadata.query_status == "complete"
     assert first.metadata.query_error_code is None
-    assert len(second.seen_key_digests) < ATTRIBUTE_KEY_CURSOR_MAX_SEEN
+    assert len(second.seen_key_digests) == 2
 
 
-def test_span_attribute_key_cursor_reports_truthful_suggestion_cap(monkeypatch):
+def test_span_attribute_key_cursor_has_no_logical_vocabulary_cap(monkeypatch):
     identity = (PROJECT_A, "trace-cap", "span-cap", NOW - timedelta(hours=1))
     row = {
         "project_id": PROJECT_A,
@@ -3950,10 +3948,7 @@ def test_span_attribute_key_cursor_reports_truthful_suggestion_cap(monkeypatch):
         lambda *_args, **_kwargs: ((identity,), False, {}),
     )
     monkeypatch.setattr(selector, "_verify_latest", lambda *_args, **_kwargs: [row])
-    seen = tuple(
-        attribute_key_cursor_digest(f"prior-{index}")
-        for index in range(ATTRIBUTE_KEY_CURSOR_MAX_SEEN - 1)
-    )
+    seen = tuple(attribute_key_cursor_digest(f"prior-{index}") for index in range(300))
 
     page = selector.read_key_cursor_page(
         [PROJECT_A],
@@ -3964,9 +3959,9 @@ def test_span_attribute_key_cursor_reports_truthful_suggestion_cap(monkeypatch):
     )
 
     assert [item.key for item in page.rows] == ["last_recent_key"]
-    assert len(page.seen_key_digests) == ATTRIBUTE_KEY_CURSOR_MAX_SEEN
-    assert page.has_more is False
-    assert page.browse_status == "limit_reached"
+    assert len(page.seen_key_digests) == 301
+    assert page.has_more is True
+    assert page.browse_status == "continuation"
     assert page.metadata.query_complete is True
     assert page.metadata.query_status == "complete"
     assert page.metadata.query_error_code is None
@@ -4037,7 +4032,7 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     assert "query_error_code" not in first_response.data
     assert first_response.data["browse_mode"] == "recent_suggestions"
     assert first_response.data["browse_status"] == "continuation"
-    assert first_response.data["browse_limit"] == ATTRIBUTE_KEY_CURSOR_MAX_SEEN
+    assert "browse_limit" not in first_response.data
     contract = SpanAttributeKeysResponseSerializer(data=first_response.data)
     assert contract.is_valid(), contract.errors
     cursor = first_response.data["next_cursor"]
@@ -4076,10 +4071,7 @@ def _max_entropy_physical_id(label: str, length: int = 255) -> str:
 
 @pytest.mark.parametrize("checkpoint", ["before", "resume"])
 def test_span_attribute_key_cursor_reachable_full_url_stays_below_limit(checkpoint):
-    digests = tuple(
-        attribute_key_cursor_digest(f"attribute-{index}")
-        for index in range(ATTRIBUTE_KEY_CURSOR_MAX_SEEN - 1)
-    )
+    seen_reference = ("state", "a" * 64)
     scope = {
         "principal_id": "00000000-0000-4000-8000-000000000001",
         "auth_type": "TokenAuthentication",
@@ -4108,9 +4100,9 @@ def test_span_attribute_key_cursor_reachable_full_url_stays_below_limit(checkpoi
             before_identity,
             resume_identity,
             9_223_372_036_854_775_807 if checkpoint == "resume" else 0,
-            digests,
+            seen_reference,
         ),
-        seen_rows=len(digests),
+        seen_rows=1_000_000,
     )
     full_url = "https://api.futureagi.com/api/traces/span-attribute-keys/?" + urlencode(
         {"project_id": PROJECT_A, "page_size": 50, "cursor": cursor}
@@ -4120,7 +4112,9 @@ def test_span_attribute_key_cursor_reachable_full_url_stays_below_limit(checkpoi
     assert len(full_url.encode("utf-8")) < 8 * 1024
 
 
-def test_span_attribute_key_api_stops_before_publishing_oversized_cursor(monkeypatch):
+def test_span_attribute_key_api_does_not_turn_cursor_size_into_vocabulary_cap(
+    monkeypatch,
+):
     from tracer.views.span_attributes import SpanAttributeKeysView
 
     oversized_identity = (
@@ -4158,9 +4152,9 @@ def test_span_attribute_key_api_stops_before_publishing_oversized_cursor(monkeyp
 
     assert response.status_code == 200
     assert response.data["result"][0]["key"] == "recent_key"
-    assert response.data["has_more"] is False
-    assert response.data["next_cursor"] is None
-    assert response.data["browse_status"] == "limit_reached"
+    assert response.data["has_more"] is True
+    assert response.data["next_cursor"]
+    assert response.data["browse_status"] == "continuation"
     assert response.data["query_status"] == "complete"
     assert "query_error_code" not in response.data
 
@@ -4172,6 +4166,7 @@ def test_span_attribute_detail_contract_validates_key_and_exposes_read_state():
 
     assert query.is_valid(), query.errors
     assert query.validated_data["key"] == "customer.%_status\\path"
+    assert query.validated_data["refresh"] is False
     for invalid_key in ("", "contains\x00control", "é" * 257):
         invalid = SpanAttributeDetailQuerySerializer(
             data={"project_id": uuid.uuid4(), "key": invalid_key}
@@ -4181,9 +4176,12 @@ def test_span_attribute_detail_contract_validates_key_and_exposes_read_state():
     assert {
         "query_complete",
         "query_status",
+        "query_sampled",
         "query_error_code",
         "query_window_start",
         "query_window_end",
+        "query_refreshing",
+        "query_refresh_failed",
     } <= set(SpanAttributeDetailResponseSerializer().fields)
 
 
@@ -4900,37 +4898,42 @@ def test_span_attribute_detail_ownership_gate_precedes_any_ch_read(monkeypatch):
     assert calls == 0
 
 
-def test_span_attribute_detail_uses_bounded_v2_latest_state_distribution(monkeypatch):
+def test_span_attribute_detail_serves_or_schedules_exact_snapshot(monkeypatch):
     from tracer.views.span_attributes import SpanAttributeDetailView
 
     captured: dict[str, Any] = {}
 
-    def read_detail(self, project_ids, key, **kwargs):
-        captured.update(
-            project_ids=project_ids,
-            key=key,
-            typed_only=self._typed_only,
-            json_attribute_mode=self._json_attribute_mode,
-            kwargs=kwargs,
-        )
-        return AttributeDetailRead(
-            "string",
-            (
-                AttributeValueRow("Rejected", "string", 2),
-                AttributeValueRow("Accepted", "string", 1),
-            ),
-            _metadata(),
-        )
+    def read_or_schedule(namespace, identity, **kwargs):
+        captured.update(namespace=namespace, identity=identity, kwargs=kwargs)
+        return {
+            "key": "final_status",
+            "type": "string",
+            "count": 3,
+            "unique_values": 2,
+            "top_values": [
+                {"value": "Rejected", "count": 2, "percentage": 66.7},
+                {"value": "Accepted", "count": 1, "percentage": 33.3},
+            ],
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+            "query_refreshing": False,
+            "query_refresh_failed": False,
+        }
 
-    monkeypatch.setattr(AttributeReadSelector, "read_detail", read_detail)
+    monkeypatch.setattr(
+        "tracer.views.span_attributes.read_or_schedule_exact_snapshot",
+        read_or_schedule,
+    )
     monkeypatch.setattr(
         "tracer.views.span_attributes._project_is_in_request_scope",
         lambda _request, _project_id: True,
     )
     request = _authenticated_get(
         "/api/traces/span-attribute-detail/",
-        {"project_id": PROJECT_A, "key": "final_status"},
+        {"project_id": PROJECT_A, "key": "final_status", "refresh": "true"},
     )
+    request.workspace = SimpleNamespace(id="workspace-a")
 
     response = SpanAttributeDetailView.as_view()(request)
 
@@ -4944,56 +4947,72 @@ def test_span_attribute_detail_uses_bounded_v2_latest_state_distribution(monkeyp
         {"value": "Accepted", "count": 1, "percentage": 33.3},
     ]
     assert response.data["query_complete"] is True
+    assert response.data["query_sampled"] is False
     contract = SpanAttributeDetailResponseSerializer(data=response.data)
     assert contract.is_valid(), contract.errors
     assert captured == {
-        "project_ids": [PROJECT_A],
-        "key": "final_status",
-        "typed_only": True,
-        "json_attribute_mode": "arrays",
-        "kwargs": {},
+        "namespace": "attribute-detail",
+        "identity": {
+            "workspace_id": "workspace-a",
+            "project_id": PROJECT_A,
+            "attribute_key": "final_status",
+            "horizon_days": 365,
+        },
+        "kwargs": {
+            "refresh": True,
+            "pending_payload": {
+                "key": "final_status",
+                "type": None,
+                "count": 0,
+                "unique_values": 0,
+                "top_values": [],
+                "query_complete": False,
+                "query_status": "pending",
+                "query_sampled": False,
+            },
+        },
     }
 
 
-def test_span_attribute_numeric_detail_uses_weighted_nearest_rank_statistics():
-    from tracer.views.span_attributes import SpanAttributeDetailView
-
-    read = AttributeDetailRead(
-        "number",
-        (
-            AttributeValueRow(1.0, "number", 1),
-            AttributeValueRow(10.0, "number", 2),
-            AttributeValueRow(100.0, "number", 1),
-        ),
-        _metadata(),
-    )
-
-    payload = SpanAttributeDetailView._detail_payload("latency.score", read)
-
-    assert payload == {
+def test_span_attribute_numeric_detail_contract_accepts_exact_statistics():
+    payload = {
         "key": "latency.score",
         "type": "number",
         "count": 4,
+        "unique_values": 3,
+        "top_values": [
+            {"value": 10.0, "count": 2, "percentage": 50.0},
+        ],
         "min": 1.0,
         "max": 100.0,
         "avg": 30.25,
         "p50": 10.0,
         "p95": 100.0,
-        **read.metadata.public_payload(),
+        "stats": {
+            "min": 1.0,
+            "max": 100.0,
+            "avg": 30.25,
+            "p50": 10.0,
+            "p95": 100.0,
+        },
+        "query_complete": True,
+        "query_status": "complete",
+        "query_sampled": False,
     }
     contract = SpanAttributeDetailResponseSerializer(data=payload)
     assert contract.is_valid(), contract.errors
 
 
-def test_span_attribute_detail_budget_error_is_sanitized_degraded_success(
-    monkeypatch,
-):
+def test_span_attribute_detail_schedule_failure_is_sanitized(monkeypatch):
     from tracer.views.span_attributes import SpanAttributeDetailView
 
     def fail(*_args, **_kwargs):
         raise ServerException("secret SQL and internal stack", 159)
 
-    monkeypatch.setattr(AttributeReadSelector, "read_detail", fail)
+    monkeypatch.setattr(
+        "tracer.views.span_attributes.read_or_schedule_exact_snapshot",
+        fail,
+    )
     monkeypatch.setattr(
         "tracer.views.span_attributes._project_is_in_request_scope",
         lambda _request, _project_id: True,
@@ -5002,19 +5021,11 @@ def test_span_attribute_detail_budget_error_is_sanitized_degraded_success(
         "/api/traces/span-attribute-detail/",
         {"project_id": PROJECT_A, "key": "final_status"},
     )
+    request.workspace = SimpleNamespace(id="workspace-a")
 
     response = SpanAttributeDetailView.as_view()(request)
 
-    assert response.status_code == 200
-    assert response.data["key"] == "final_status"
-    assert response.data["type"] == "string"
-    assert response.data["count"] == 0
-    assert response.data["top_values"] == []
-    assert response.data["query_complete"] is False
-    assert response.data["query_status"] == "degraded"
-    assert response.data["query_error_code"] == "read_budget_exceeded"
-    contract = SpanAttributeDetailResponseSerializer(data=response.data)
-    assert contract.is_valid(), contract.errors
+    assert response.status_code == 500
     serialized = json.dumps(response.data)
     assert "secret" not in serialized
     assert "SELECT" not in serialized
@@ -5033,12 +5044,6 @@ def test_span_attribute_detail_budget_error_is_sanitized_degraded_success(
             "SpanAttributeValuesView",
             "read_values",
             "/api/traces/span-attribute-values/",
-            {"project_id": PROJECT_A, "key": "final_status"},
-        ),
-        (
-            "SpanAttributeDetailView",
-            "read_detail",
-            "/api/traces/span-attribute-detail/",
             {"project_id": PROJECT_A, "key": "final_status"},
         ),
     ],
@@ -5087,12 +5092,6 @@ def test_span_attribute_views_degrade_typed_transient_failures(
             "/api/traces/span-attribute-values/",
             {"project_id": PROJECT_A, "key": "final_status"},
         ),
-        (
-            "SpanAttributeDetailView",
-            "read_detail",
-            "/api/traces/span-attribute-detail/",
-            {"project_id": PROJECT_A, "key": "final_status"},
-        ),
     ],
 )
 def test_span_attribute_views_return_sanitized_500_for_programming_defects(
@@ -5136,11 +5135,6 @@ def test_span_attribute_views_return_sanitized_500_for_programming_defects(
             "/api/traces/span-attribute-values/",
             {"project_id": PROJECT_A, "key": "final_status"},
         ),
-        (
-            "SpanAttributeDetailView",
-            "/api/traces/span-attribute-detail/",
-            {"project_id": PROJECT_A, "key": "final_status"},
-        ),
     ],
 )
 def test_span_attribute_views_sanitize_unexpected_scope_failures(
@@ -5180,11 +5174,6 @@ def test_span_attribute_views_sanitize_unexpected_scope_failures(
         (
             "SpanAttributeValuesView",
             "/api/traces/span-attribute-values/",
-            {"project_id": PROJECT_A, "key": "final_status"},
-        ),
-        (
-            "SpanAttributeDetailView",
-            "/api/traces/span-attribute-detail/",
             {"project_id": PROJECT_A, "key": "final_status"},
         ),
     ],
@@ -5238,12 +5227,6 @@ def test_span_attribute_views_sanitize_selector_construction_failures(
             "SpanAttributeValuesView",
             "read_values",
             "/api/traces/span-attribute-values/",
-            {"project_id": PROJECT_A, "key": "final_status"},
-        ),
-        (
-            "SpanAttributeDetailView",
-            "read_detail",
-            "/api/traces/span-attribute-detail/",
             {"project_id": PROJECT_A, "key": "final_status"},
         ),
     ],

@@ -155,6 +155,8 @@ export default function WidgetChart({
   const isTable = chartType === "table";
   const isMetricCard = chartType === "metric";
   const isLineChart = apexType === "line";
+  const connectsAcrossMissingBuckets =
+    apexType === "line" || apexType === "area";
 
   // Measure container height so charts fill available space
   const containerRef = useRef(null);
@@ -339,8 +341,8 @@ export default function WidgetChart({
   }, [series, visibleSeries]);
 
   const plottedChartSeries = useMemo(
-    () => getPlottedChartSeries(chartSeries, isLineChart),
-    [chartSeries, isLineChart],
+    () => getPlottedChartSeries(chartSeries, connectsAcrossMissingBuckets),
+    [chartSeries, connectsAcrossMissingBuckets],
   );
 
   // Build from the full `series` list (not filtered chartSeries) so a

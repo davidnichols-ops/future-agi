@@ -1274,6 +1274,14 @@ function ValuePicker({
     source,
     search: usesBackendSearch ? debouncedSearch : "",
     pageSize: 10,
+    attributeType:
+      propertyCategory === "attribute"
+        ? property?.type === "text"
+          ? "string"
+          : ["float", "integer"].includes(property?.type)
+            ? "number"
+            : property?.type
+        : undefined,
     enabled:
       !hasStaticChoices &&
       Boolean(anchorEl) &&
@@ -2443,6 +2451,15 @@ const TraceFilterPanel = ({
     metricType: queryMetricType,
     projectIds: observeId ? [observeId] : [],
     source,
+    pageSize: queryMetricType === "custom_attribute" ? 10 : undefined,
+    attributeType:
+      queryMetricType === "custom_attribute"
+        ? queryFieldProp?.type === "text"
+          ? "string"
+          : ["float", "integer"].includes(queryFieldProp?.type)
+            ? "number"
+            : queryFieldProp?.type
+        : undefined,
   });
   const queryValuesMessage = getQueryReadMessage(
     queryValuesError ? "error" : queryValuesReadState,

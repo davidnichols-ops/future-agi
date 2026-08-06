@@ -286,6 +286,7 @@ export function useDashboardFilterValues({
   enabled = true,
   search = "",
   pageSize,
+  attributeType,
 }) {
   const query = useInfiniteQuery({
     queryKey: [
@@ -298,6 +299,7 @@ export function useDashboardFilterValues({
       workflow,
       search,
       pageSize,
+      attributeType,
     ],
     queryFn: ({ signal, pageParam }) =>
       axios
@@ -312,6 +314,7 @@ export function useDashboardFilterValues({
             ...(search ? { search } : {}),
             ...(pageSize ? { page_size: pageSize } : {}),
             ...(pageParam ? { cursor: pageParam } : {}),
+            ...(attributeType ? { attribute_type: attributeType } : {}),
           },
         })
         .then((res) => res.data?.result || {}),
@@ -356,6 +359,7 @@ export function useDashboardFilterValues({
     ...query,
     data: values,
     queryReadState,
+    attributeType: pages.find((page) => page?.attribute_type)?.attribute_type,
   };
 }
 

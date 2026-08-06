@@ -1635,6 +1635,7 @@ class EvalTemplateListChartsResponseResultSerializer(serializers.Serializer):
     charts = serializers.DictField(child=EvalTemplateListChartsItemSerializer())
     query_complete = serializers.BooleanField()
     query_status = serializers.ChoiceField(choices=["complete", "stale", "degraded"])
+    query_sampled = serializers.BooleanField()
     query_error_code = serializers.ChoiceField(
         choices=[
             "read_budget_exceeded",

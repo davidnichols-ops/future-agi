@@ -125,9 +125,7 @@ describe("GraphSection exact graph boundary", () => {
     renderGraph();
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
-    expect(
-      await screen.findByText("Preparing exact data…"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
   });
@@ -157,9 +155,7 @@ describe("GraphSection exact graph boundary", () => {
     renderGraph();
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
-    expect(
-      await screen.findByText("Preparing exact data…"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
     expect(axios.post).toHaveBeenCalledWith(
       "/tracer/trace/get_graph_methods/",
@@ -193,6 +189,6 @@ describe("GraphSection exact graph boundary", () => {
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
     expect(await screen.findByTestId("apex-chart")).toBeInTheDocument();
-    expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
   });
 });

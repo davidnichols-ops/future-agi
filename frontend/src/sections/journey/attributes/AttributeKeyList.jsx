@@ -8,6 +8,7 @@ import {
   TextField,
   InputAdornment,
   Chip,
+  Button,
 } from "@mui/material";
 import Iconify from "src/components/iconify";
 
@@ -17,7 +18,14 @@ const TYPE_COLORS = {
   boolean: "success",
 };
 
-const AttributeKeyList = ({ keys, selectedKey, onSelectKey }) => {
+const AttributeKeyList = ({
+  keys,
+  selectedKey,
+  onSelectKey,
+  hasMore,
+  isLoadingMore,
+  onLoadMore,
+}) => {
   const [search, setSearch] = useState("");
 
   const filtered = keys.filter((k) =>
@@ -54,7 +62,20 @@ const AttributeKeyList = ({ keys, selectedKey, onSelectKey }) => {
           }}
         />
       </Box>
-      <List sx={{ overflow: "auto", flex: 1, p: 1 }} dense>
+      <List
+        sx={{ overflow: "auto", flex: 1, p: 1 }}
+        dense
+        onScroll={(event) => {
+          const list = event.currentTarget;
+          if (
+            hasMore &&
+            !isLoadingMore &&
+            list.scrollTop + list.clientHeight >= list.scrollHeight - 32
+          ) {
+            onLoadMore?.();
+          }
+        }}
+      >
         {filtered.map(({ key, type, count }) => (
           <ListItemButton
             key={key}
@@ -81,9 +102,21 @@ const AttributeKeyList = ({ keys, selectedKey, onSelectKey }) => {
             />
           </ListItemButton>
         ))}
-        {filtered.length === 0 && (
+        {filtered.length === 0 && !hasMore && (
           <Box sx={{ p: 2, textAlign: "center", color: "text.secondary" }}>
             No attributes found
+          </Box>
+        )}
+        {isLoadingMore && (
+          <Box sx={{ p: 1, textAlign: "center", color: "text.secondary" }}>
+            Loading more…
+          </Box>
+        )}
+        {hasMore && !isLoadingMore && (
+          <Box sx={{ p: 1, textAlign: "center" }}>
+            <Button size="small" onClick={() => onLoadMore?.()}>
+              Load more attributes
+            </Button>
           </Box>
         )}
       </List>
@@ -101,6 +134,9 @@ AttributeKeyList.propTypes = {
   ).isRequired,
   selectedKey: PropTypes.string,
   onSelectKey: PropTypes.func.isRequired,
+  hasMore: PropTypes.bool,
+  isLoadingMore: PropTypes.bool,
+  onLoadMore: PropTypes.func,
 };
 
 export default AttributeKeyList;

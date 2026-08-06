@@ -12,20 +12,48 @@ import {
   Paper,
   LinearProgress,
   Chip,
+  Button,
+  Alert,
 } from "@mui/material";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import AttributeValueChart from "./AttributeValueChart";
 
 const AttributeDetail = ({ projectId, attributeKey }) => {
-  const { data: detail, isLoading } = useQuery({
-    queryKey: ["span-attribute-detail", projectId, attributeKey],
+  const queryKey = ["span-attribute-detail", projectId, attributeKey];
+  const {
+    data: detail,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
+    queryKey,
     queryFn: () =>
       axios.get(endpoints.project.spanAttributeDetail(), {
         params: { project_id: projectId, key: attributeKey },
       }),
     select: (data) => data.data,
     enabled: Boolean(projectId) && Boolean(attributeKey),
+    retry: false,
+    refetchInterval: (query) => {
+      const payload = query.state.data?.data;
+      return payload?.query_status === "pending" || payload?.query_refreshing
+        ? 1000
+        : false;
+    },
+    meta: { errorHandled: true },
+  });
+  const refreshMutation = useMutation({
+    mutationFn: () =>
+      axios.get(endpoints.project.spanAttributeDetail(), {
+        params: {
+          project_id: projectId,
+          key: attributeKey,
+          refresh: true,
+        },
+      }),
+    onSuccess: () => refetch(),
+    meta: { errorHandled: true },
   });
 
   if (!attributeKey) {
@@ -46,7 +74,7 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
     );
   }
 
-  if (isLoading) {
+  if (isLoading || detail?.query_status === "pending") {
     return (
       <Box
         sx={{
@@ -56,7 +84,47 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
           alignItems: "center",
         }}
       >
-        <CircularProgress size={24} />
+        <Box sx={{ textAlign: "center" }}>
+          <CircularProgress size={24} />
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+            Preparing exact attribute details…
+          </Typography>
+          {detail?.query_refresh_failed && (
+            <Button
+              size="small"
+              sx={{ mt: 1 }}
+              disabled={refreshMutation.isPending}
+              onClick={() => refreshMutation.mutate()}
+            >
+              Retry
+            </Button>
+          )}
+        </Box>
+      </Box>
+    );
+  }
+
+  if (isError) {
+    return (
+      <Box
+        sx={{
+          flex: 1,
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "center",
+          p: 3,
+        }}
+      >
+        <Alert
+          severity="warning"
+          action={
+            <Button size="small" onClick={() => refetch()}>
+              Retry
+            </Button>
+          }
+        >
+          Attribute details could not be loaded.
+        </Alert>
       </Box>
     );
   }
@@ -66,32 +134,59 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
   return (
     <Box sx={{ flex: 1, p: 2.5, overflow: "auto" }}>
       <Box sx={{ mb: 3 }}>
-        <Typography variant="h6" sx={{ mb: 0.5, wordBreak: "break-all" }}>
-          {detail.key}
-        </Typography>
-        <Box sx={{ display: "flex", gap: 1.5, alignItems: "center" }}>
-          <Chip
-            label={detail.type}
+        <Box sx={{ display: "flex", justifyContent: "space-between", gap: 2 }}>
+          <Typography variant="h6" sx={{ mb: 0.5, wordBreak: "break-all" }}>
+            {detail.key}
+          </Typography>
+          <Button
             size="small"
             variant="outlined"
-            color={
-              detail.type === "string"
-                ? "info"
-                : detail.type === "number"
-                  ? "warning"
-                  : "success"
-            }
-          />
+            disabled={refreshMutation.isPending || detail.query_refreshing}
+            onClick={() => refreshMutation.mutate()}
+          >
+            {refreshMutation.isPending || detail.query_refreshing
+              ? "Refreshing"
+              : "Refresh"}
+          </Button>
+        </Box>
+        <Box sx={{ display: "flex", gap: 1.5, alignItems: "center" }}>
+          {detail.type && (
+            <Chip
+              label={detail.type}
+              size="small"
+              variant="outlined"
+              color={
+                detail.type === "string"
+                  ? "info"
+                  : detail.type === "number"
+                    ? "warning"
+                    : "success"
+              }
+            />
+          )}
           <Typography variant="body2" color="text.secondary">
             {detail.count?.toLocaleString()} spans
           </Typography>
-          {detail.unique_values && (
+          {Number.isFinite(detail.unique_values) && (
             <Typography variant="body2" color="text.secondary">
               {detail.unique_values} unique values
             </Typography>
           )}
         </Box>
       </Box>
+
+      {detail.query_refresh_failed && (
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          The latest refresh could not finish. The last exact result is still
+          shown; retry when ready.
+        </Alert>
+      )}
+
+      {!detail.type && detail.count === 0 && (
+        <Typography variant="body2" color="text.secondary">
+          No values found for this attribute in the selected data window.
+        </Typography>
+      )}
 
       {detail.top_values && detail.top_values.length > 0 && (
         <>

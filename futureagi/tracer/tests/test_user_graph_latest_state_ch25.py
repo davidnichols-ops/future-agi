@@ -12,6 +12,9 @@ import pytest
 from clickhouse_driver import Client
 
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
+from tracer.services.clickhouse.v2.query_builders.agent_graph import (
+    AgentGraphQueryBuilderV2,
+)
 from tracer.services.clickhouse.v2.query_builders.user_time_series import (
     UserDetailTimeSeriesQueryBuilderV2,
     UserTimeSeriesQueryBuilderV2,
@@ -211,6 +214,108 @@ def test_exact_system_graph_statement_reads_current_latest_state(ch_client):
         assert "PREWHERE" in query
         assert "snapshot_version_ceiling" not in query
         assert "snapshot_version_ceiling" not in params
+    finally:
+        ch_client.execute(f"DROP TABLE {table}")
+
+
+def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client):
+    """Graph, topology, and path share the same newest-live physical rows."""
+
+    table = f"_test_agent_graph_snapshot_{uuid.uuid4().hex[:8]}"
+    ch_client.execute(
+        f"""
+        CREATE TABLE {table} (
+            project_id UUID,
+            observation_type String,
+            service_name String,
+            start_time DateTime64(6, 'UTC'),
+            trace_id String,
+            id String,
+            parent_span_id String,
+            name String,
+            latency_ms Int32,
+            total_tokens Int32,
+            cost Float64,
+            status String,
+            is_deleted UInt8,
+            _version UInt64
+        ) ENGINE = ReplacingMergeTree(_version, is_deleted)
+        PARTITION BY toDate(start_time)
+        ORDER BY (project_id, observation_type, service_name,
+                  toStartOfHour(start_time), trace_id, id)
+        """
+    )
+    try:
+        project_id = "00000000-0000-4000-8000-000000000063"
+        started_at = datetime(2026, 8, 1, 10, 0, tzinfo=UTC)
+
+        def row(
+            span_id: str,
+            parent_id: str,
+            name: str,
+            latency: int,
+            deleted: int,
+            version: int,
+            offset: int,
+        ):
+            return (
+                project_id,
+                "agent" if not parent_id else "tool",
+                "svc",
+                started_at + timedelta(seconds=offset),
+                "trace-a",
+                span_id,
+                parent_id,
+                name,
+                latency,
+                latency,
+                float(latency),
+                "OK",
+                deleted,
+                version,
+            )
+
+        ch_client.execute(
+            f"INSERT INTO {table} VALUES",
+            [
+                row("root", "", "agent", 100, 0, 1, 0),
+                row("root", "", "agent", 10, 0, 2, 0),
+                row("lookup", "root", "lookup", 20, 0, 1, 1),
+                row("lookup", "root", "lookup", 20, 1, 2, 1),
+                row("answer", "root", "answer", 30, 0, 1, 2),
+            ],
+        )
+
+        builder = AgentGraphQueryBuilderV2(
+            project_id=project_id,
+            filters=[
+                {
+                    "column_id": "created_at",
+                    "filter_config": {
+                        "filter_type": "datetime",
+                        "filter_op": "between",
+                        "filter_value": [
+                            started_at - timedelta(hours=1),
+                            started_at + timedelta(hours=1),
+                        ],
+                    },
+                }
+            ],
+        )
+        builder.TABLE = table
+        query, params = builder.build()
+        payload = builder.format_result(_execute(ch_client, query, params), [])
+
+        assert query.count(f"FROM {table}") == 1
+        assert {node["name"] for node in payload["nodes"]} == {"agent", "answer"}
+        root = next(node for node in payload["nodes"] if node["name"] == "agent")
+        assert root["avg_latency_ms"] == 10
+        assert [(edge["source"], edge["target"]) for edge in payload["edges"]] == [
+            ("agent:agent", "tool:answer")
+        ]
+        assert [(edge["source"], edge["target"]) for edge in payload["path_edges"]] == [
+            ("agent:agent", "tool:answer")
+        ]
     finally:
         ch_client.execute(f"DROP TABLE {table}")
 

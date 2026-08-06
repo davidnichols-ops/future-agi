@@ -33,7 +33,7 @@ import { logger } from "src/utils/logger";
 import { FILTER_FOR_HAS_EVAL, toBackendFilters } from "../common";
 import { buildDefaultDateEntry } from "./graphFilterUtils";
 import {
-  AGGREGATION_PREPARING_MESSAGE,
+  GRAPH_LOADING_MESSAGE,
   getAggregationPollDelay,
   getAggregationRefreshState,
   getExactAggregationReadState,
@@ -457,7 +457,7 @@ const GraphSection = ({
   const apiGraphReadMessage =
     !exactSnapshot &&
     (refreshUnavailable || apiGraphError || apiGraphReadState !== "complete")
-      ? AGGREGATION_PREPARING_MESSAGE
+      ? GRAPH_LOADING_MESSAGE
       : null;
 
   const chartData = useMemo(() => {

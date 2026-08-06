@@ -123,6 +123,8 @@ def test_voice_call_status_alias_matches_normalized_list_semantics_only():
     assert "multiIf(" in where
     assert "('ended', 'done', 'complete', 'completed'" in where
     assert "('in-progress', 'in_progress', 'ongoing'" in where
+    assert "('failed', 'failure', 'error', 'errored')" in where
+    assert "('not-connected', 'not_connected', 'no-answer'" in where
     assert "coalesce(" in where
 
     generic_where, _ = ClickHouseFilterBuilder().translate(

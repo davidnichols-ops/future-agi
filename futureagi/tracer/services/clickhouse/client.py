@@ -21,6 +21,8 @@ from tracer.services.clickhouse.server_readonly import (
 logger = structlog.get_logger(__name__)
 
 _QUERY_TRANSPORT_GRACE_SECONDS = 5.0
+_TOO_MANY_SIMULTANEOUS_QUERIES_CODE = 202
+_READ_ADMISSION_RETRY_DELAYS_SECONDS = (0.025, 0.075, 0.150)
 
 # Try to import clickhouse-driver, gracefully handle if not installed
 try:
@@ -320,12 +322,53 @@ class ClickHouseClient:
                 query=query[:200],
                 timeout_ms=timeout_ms,
             )
-            result = client.execute(
-                query,
-                params or {},
-                with_column_types=True,
-                settings=query_settings,
-            )
+            retry_attempt = 0
+            while True:
+                try:
+                    result = client.execute(
+                        query,
+                        params or {},
+                        with_column_types=True,
+                        settings=query_settings,
+                    )
+                    break
+                except CHError as exc:
+                    if getattr(
+                        exc, "code", None
+                    ) != _TOO_MANY_SIMULTANEOUS_QUERIES_CODE or retry_attempt >= len(
+                        _READ_ADMISSION_RETRY_DELAYS_SECONDS
+                    ):
+                        raise
+
+                    retry_delay = _READ_ADMISSION_RETRY_DELAYS_SECONDS[retry_attempt]
+                    elapsed_seconds = time.monotonic() - t_start
+                    if (
+                        timeout_ms is not None
+                        and elapsed_seconds + retry_delay >= timeout_ms / 1000.0
+                    ):
+                        raise
+
+                    retry_attempt += 1
+                    logger.warning(
+                        "ClickHouse read admission temporarily saturated",
+                        error_code=_TOO_MANY_SIMULTANEOUS_QUERIES_CODE,
+                        retry_attempt=retry_attempt,
+                        retry_delay_ms=round(retry_delay * 1000),
+                        backend="clickhouse",
+                    )
+                    time.sleep(retry_delay)
+
+                    # Preserve the caller's immutable settings while ensuring
+                    # a retry cannot extend the original wall-clock deadline.
+                    if query_settings is not None and timeout_ms is not None:
+                        remaining_seconds = max(
+                            (timeout_ms / 1000.0) - (time.monotonic() - t_start),
+                            0.001,
+                        )
+                        query_settings = {
+                            **query_settings,
+                            "max_execution_time": remaining_seconds,
+                        }
 
             rows, column_types = result
             query_time_ms = (time.monotonic() - t_start) * 1000

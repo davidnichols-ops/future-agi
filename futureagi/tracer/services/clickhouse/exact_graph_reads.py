@@ -37,6 +37,9 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
     resolved_id_expr,
     survivor_map_subquery,
 )
+from tracer.services.clickhouse.v2.query_builders.agent_graph import (
+    AgentGraphQueryBuilderV2,
+)
 from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
     EvalMetricsQueryBuilderV2,
 )
@@ -55,9 +58,12 @@ logger = structlog.get_logger(__name__)
 # HTTP request schedules that work and polls the last complete snapshot.  The
 # production qualification set contains valid exact queries with p95 958s and
 # a 1032.479s ceiling, so the old five-minute ClickHouse deadline rejected
-# healthy work.  Twenty minutes leaves about 16% observed headroom while
-# remaining well inside the activity's independent 60-minute hard limit.
-EXACT_GRAPH_QUERY_TIMEOUT_MS = 1_200_000
+# healthy work.  The largest production tenant already contains more than
+# 207M physical rows in a twelve-month window.  Give an exact refresh up to
+# 55 minutes while retaining an independent five-minute activity shutdown
+# margin; HTTP requests never wait for this work and keep serving the last
+# atomically published exact snapshot.
+EXACT_GRAPH_QUERY_TIMEOUT_MS = 3_300_000
 # This partition size belongs to the PostgreSQL-backed annotation membership
 # reader below.  System graphs deliberately remain one ClickHouse statement so
 # CH25.3 cannot stitch independently changing ReplacingMergeTree snapshots.
@@ -90,18 +96,19 @@ EXACT_GRAPH_READ_SETTINGS = {
     # immutable project/time predicates to PREWHERE.
     "optimize_move_to_prewhere_if_final": 0,
     "use_skip_indexes_if_final": 0,
-    # A valid seven-day Colectia attribute graph reads about 2.43M physical
-    # rows / 10.1 GiB uncompressed.  The previous 8-GiB ceiling rejected that
-    # request independently of SQL efficiency.  Keep finite guards sized for
-    # long-window exact background refreshes; atomic caching and refresh locks
-    # prevent the HTTP path from multiplying this work.
-    "max_rows_to_read": 100_000_000,
-    "max_bytes_to_read": 64 * 1024 * 1024 * 1024,
-    # The heaviest physical Map read plus compact trace aggregation reached
-    # 768.8 MiB after reducing 4.27M rows and spilling 4.14 GiB.  Keep finite
-    # headroom for the next allocation while remaining at half the old FINAL
-    # query's 2-GiB failure point.
-    "max_memory_usage": 1024 * 1024 * 1024,
+    # Row/byte volume is data, not an error condition.  Production evidence
+    # shows 207,479,677 physical rows in a valid twelve-month window and a
+    # seven-day attribute graph reading 68,719,963,633 bytes: the former was
+    # rejected by the old 100M-row cap and the latter crossed the old 64-GiB
+    # cap by 486,897 bytes.  ClickHouse defines zero as unlimited for these two
+    # settings.  Time, memory, one-thread execution, refresh admission, bounded
+    # result size, and atomic publication remain the operational safeguards.
+    "max_rows_to_read": 0,
+    "max_bytes_to_read": 0,
+    # The same observed seven-day read peaked at 1,055,221,165 bytes.  Preserve
+    # measured headroom while spilling compact aggregation/sort state early;
+    # the tasks_xl worker has a separate 32-GiB pod limit.
+    "max_memory_usage": 1536 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": 10_001,
     "max_result_bytes": 32 * 1024 * 1024,
@@ -268,6 +275,46 @@ def read_exact_system_graph(
             rows_returned=len(rows),
         ),
     )
+
+
+def read_exact_agent_graph(
+    *,
+    analytics: Any,
+    project_id: str,
+    filters: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compute exact node, topology-edge, and chronological-path aggregates.
+
+    The builder emits one direct-write statement.  Keeping execution here,
+    behind the shared exact-snapshot worker, prevents HTTP retries from
+    multiplying a long full-window read and guarantees that only a completely
+    formatted graph can replace the previous snapshot.
+    """
+
+    started = monotonic()
+    builder = AgentGraphQueryBuilderV2(
+        project_id=str(project_id),
+        filters=list(filters or []),
+    )
+    if builder.empty_window:
+        return {
+            **builder.format_result([], []),
+            **_metadata(started=started, query_count=0, rows_returned=0),
+        }
+
+    query, params = builder.build()
+    result = analytics.execute_ch_query(
+        query,
+        params,
+        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+        settings={**EXACT_GRAPH_READ_SETTINGS, "max_threads": 1},
+    )
+    rows = list(result.data or [])
+    columns = list(result.columns or [])
+    return {
+        **builder.format_result(rows, columns),
+        **_metadata(started=started, query_count=1, rows_returned=len(rows)),
+    }
 
 
 def read_exact_all_system_metrics(
@@ -1922,6 +1969,7 @@ __all__ = [
     "EXACT_GRAPH_MAX_BUCKETS_PER_PARTITION",
     "ExactGraphReadError",
     "output_bucket_partitions",
+    "read_exact_agent_graph",
     "read_exact_all_system_metrics",
     "read_exact_annotation_graph",
     "read_exact_eval_graph",

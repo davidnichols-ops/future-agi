@@ -212,9 +212,7 @@ describe("PrimaryGraph", () => {
       <PrimaryGraph observeIdOverride="project-override" />,
     );
 
-    expect(
-      await screen.findByText("Preparing exact data…"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
     expect(
       screen.queryByText("No data available for this time range"),
     ).not.toBeInTheDocument();
@@ -246,9 +244,7 @@ describe("PrimaryGraph", () => {
       <PrimaryGraph observeIdOverride="project-override" />,
     );
 
-    expect(
-      await screen.findByText("Preparing exact data…"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
     expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
     expect(
@@ -265,9 +261,7 @@ describe("PrimaryGraph", () => {
       <PrimaryGraph observeIdOverride="project-override" />,
     );
 
-    expect(
-      await screen.findByText("Preparing exact data…"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
     expect(screen.queryByText(/DB::Exception/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Stack trace/i)).not.toBeInTheDocument();
   });
@@ -341,7 +335,7 @@ describe("PrimaryGraph", () => {
       { params: { allow_sampled: false, refresh: true } },
     );
     expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/Preparing exact data/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Loading graph data/i)).not.toBeInTheDocument();
   });
 
   it("polls a cold pending graph without refresh and publishes only final completion", async () => {
@@ -385,7 +379,7 @@ describe("PrimaryGraph", () => {
     await act(async () => vi.advanceTimersByTimeAsync(10));
 
     expect(axios.post).toHaveBeenCalledOnce();
-    expect(screen.getByText("Preparing exact data…")).toBeInTheDocument();
+    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
     expect(exactCompletion).not.toHaveBeenCalled();
 
     await act(async () => vi.advanceTimersByTimeAsync(1000));
@@ -432,6 +426,6 @@ describe("PrimaryGraph", () => {
     expect(
       screen.queryByText("No data available for this time range"),
     ).not.toBeInTheDocument();
-    expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
   });
 });

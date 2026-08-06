@@ -54,9 +54,7 @@ def test_span_attribute_type_enum_matches_generated_openapi(
         "enum"
     ]
 
-    expected_choices = ["string", "number", "boolean", "array"]
-    if serializer_cls is SpanAttributeKeySerializer:
-        expected_choices.append("map")
+    expected_choices = ["string", "number", "boolean", "array", "map", "json"]
 
     assert runtime_choices == expected_choices
     assert openapi_choices == runtime_choices
@@ -66,7 +64,10 @@ def test_span_attribute_type_enum_matches_generated_openapi(
 def test_attribute_query_status_enum_is_declared_for_openapi(serializer_cls):
     runtime_choices = list(serializer_cls().fields["query_status"].choices)
 
-    assert runtime_choices == ["complete", "sampled", "degraded"]
+    expected = ["complete", "sampled", "degraded"]
+    if serializer_cls is SpanAttributeDetailResponseSerializer:
+        expected = ["complete", "pending", "sampled", "degraded"]
+    assert runtime_choices == expected
 
 
 @pytest.mark.parametrize(

@@ -42,6 +42,7 @@ class ListCursor:
     order: tuple[Any, ...]
     total_rows: int | None = None
     seen_rows: int = 0
+    scan_slice_start: datetime | None = None
     scan_slice_end: datetime | None = None
     scan_before_start_time: datetime | None = None
     scan_before_id: Any = None
@@ -219,6 +220,7 @@ def encode_list_cursor(
     order: tuple[Any, ...] | list[Any],
     seen_rows: int,
     total_rows: int | None = None,
+    scan_slice_start: datetime | None = None,
     scan_slice_end: datetime | None = None,
     scan_before_start_time: datetime | None = None,
     scan_before_id: Any = None,
@@ -235,8 +237,14 @@ def encode_list_cursor(
         raise ValueError("invalid list scan checkpoint")
     if scan_slice_end is not None and not (window_start < scan_slice_end <= window_end):
         raise ValueError("invalid list scan checkpoint")
+    if scan_slice_start is not None and (
+        scan_slice_end is None or not window_start <= scan_slice_start < scan_slice_end
+    ):
+        raise ValueError("invalid list scan checkpoint")
     if scan_before_start_time is not None and not (
-        window_start <= scan_before_start_time < (scan_slice_end or window_end)
+        (scan_slice_start or window_start)
+        <= scan_before_start_time
+        < (scan_slice_end or window_end)
     ):
         raise ValueError("invalid list scan checkpoint")
     payload = {
@@ -250,6 +258,7 @@ def encode_list_cursor(
         "order": _json_value(list(order)),
         "total_rows": int(total_rows) if total_rows is not None else None,
         "seen_rows": int(seen_rows),
+        "scan_slice_start": _json_value(scan_slice_start),
         "scan_slice_end": _json_value(scan_slice_end),
         "scan_before_start_time": _json_value(scan_before_start_time),
         "scan_before_id": _json_value(scan_before_id),
@@ -314,6 +323,10 @@ def decode_list_cursor(
         or payload["seen_rows"] < 0
     ):
         raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    # v3 cursors issued before scan_slice_start was added remain valid. A
+    # missing lower boundary falls back to the frozen request start when the
+    # selector resumes an in-slice keyset, which may rescan but cannot skip.
+    scan_slice_start = _restore_json_value(payload.get("scan_slice_start"))
     scan_slice_end = _restore_json_value(payload.get("scan_slice_end"))
     scan_before_start_time = _restore_json_value(payload.get("scan_before_start_time"))
     scan_before_id = _restore_json_value(payload.get("scan_before_id"))
@@ -322,11 +335,19 @@ def decode_list_cursor(
         or not window_start < scan_slice_end <= window_end
     ):
         raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    if scan_slice_start is not None and (
+        not isinstance(scan_slice_start, datetime)
+        or scan_slice_end is None
+        or not window_start <= scan_slice_start < scan_slice_end
+    ):
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
     if (scan_before_start_time is None) != (scan_before_id is None):
         raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
     if scan_before_start_time is not None and (
         not isinstance(scan_before_start_time, datetime)
-        or not window_start <= scan_before_start_time < (scan_slice_end or window_end)
+        or not (scan_slice_start or window_start)
+        <= scan_before_start_time
+        < (scan_slice_end or window_end)
     ):
         raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
     return ListCursor(
@@ -339,6 +360,7 @@ def decode_list_cursor(
             else None
         ),
         seen_rows=payload["seen_rows"],
+        scan_slice_start=scan_slice_start,
         scan_slice_end=scan_slice_end,
         scan_before_start_time=scan_before_start_time,
         scan_before_id=scan_before_id,

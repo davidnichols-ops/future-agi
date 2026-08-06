@@ -1,24 +1,60 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   buildConditionsForRule,
+  getTraceRulePanelMode,
   isScopeReady,
+  removeSubmittableFilterAtIndex,
   ruleConditionsToFilters,
 } from "../../utils/automation-rule-utils";
 
-vi.mock("src/api/annotation-queues/annotation-queues", () => ({
-  extractErrorMessage: (_error, fallback) => fallback,
-  useCreateAutomationRule: () => ({ mutate: vi.fn(), isPending: false }),
-}));
-
-vi.mock("src/api/develop/develop-detail", () => ({
-  getDatasetQueryOptions: () => ({}),
-}));
-
-vi.mock("src/api/project/project-detail", () => ({
-  useGetProjectDetails: () => ({ data: null, isLoading: false }),
-}));
-
 describe("create rule Observe filter serialization", () => {
+  it("uses the same trace, voice, span, and session panel modes as Observe", () => {
+    expect(getTraceRulePanelMode("trace")).toEqual({
+      source: "traces",
+      tab: "trace",
+      isSpansView: false,
+    });
+    expect(getTraceRulePanelMode("trace", { isVoiceProject: true })).toEqual({
+      source: "traces",
+      tab: "voiceCalls",
+      isSpansView: false,
+    });
+    expect(getTraceRulePanelMode("observation_span")).toEqual({
+      source: "traces",
+      tab: "spans",
+      isSpansView: true,
+    });
+    expect(getTraceRulePanelMode("trace_session")).toEqual({
+      source: "sessions",
+      tab: undefined,
+      isSpansView: false,
+    });
+  });
+
+  it("removes only the selected duplicate chip", () => {
+    const duplicate = {
+      column_id: "status",
+      filter_config: {
+        filter_type: "text",
+        filter_op: "in",
+        filter_value: ["OK"],
+      },
+    };
+    const filters = [
+      { ...duplicate, id: "first" },
+      { id: "draft", column_id: "", filter_config: {} },
+      {
+        ...duplicate,
+        id: "second",
+        filter_config: { ...duplicate.filter_config, filter_value: ["ERROR"] },
+      },
+    ];
+
+    expect(
+      removeSubmittableFilterAtIndex(filters, 1).map((row) => row.id),
+    ).toEqual(["first", "draft"]);
+  });
+
   it("preserves trace Observe filter col_type values and voice scope", () => {
     const filters = [
       {

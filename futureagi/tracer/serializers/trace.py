@@ -341,6 +341,11 @@ class TraceObserveIndexQuerySerializer(StrictInputSerializer):
 class TraceAgentGraphQuerySerializer(StrictInputSerializer):
     project_id = serializers.UUIDField()
     filters = filter_list_query_param_field(required=False, default=list)
+    refresh = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Recompute and atomically replace the last exact graph snapshot.",
+    )
 
 
 class UsersQuerySerializer(StrictInputSerializer):

@@ -1,6 +1,6 @@
 import { useState, useMemo } from "react";
-import { Box, Typography, CircularProgress } from "@mui/material";
-import { useQuery } from "@tanstack/react-query";
+import { Box, Typography, CircularProgress, Button } from "@mui/material";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import { useParams } from "react-router-dom";
 import AttributeGroupList from "./AttributeGroupList";
@@ -12,15 +12,35 @@ const AttributesView = () => {
   const [selectedGroup, setSelectedGroup] = useState(null);
   const [selectedKey, setSelectedKey] = useState(null);
 
-  const { data: attributeKeys = [], isLoading } = useQuery({
-    queryKey: ["span-attribute-keys", projectId],
-    queryFn: () =>
-      axios.get(endpoints.project.spanAttributeKeys(), {
-        params: { project_id: projectId },
-      }),
-    select: (data) => data.data?.result || [],
-    enabled: Boolean(projectId),
-  });
+  const { data, isLoading, hasNextPage, fetchNextPage, isFetchingNextPage } =
+    useInfiniteQuery({
+      queryKey: ["span-attribute-keys", projectId],
+      queryFn: ({ signal, pageParam }) =>
+        axios.get(endpoints.project.spanAttributeKeys(), {
+          signal,
+          params: {
+            project_id: projectId,
+            page_size: 25,
+            ...(pageParam ? { cursor: pageParam } : {}),
+          },
+        }),
+      initialPageParam: null,
+      getNextPageParam: (lastPage) =>
+        lastPage?.data?.has_more && lastPage?.data?.next_cursor
+          ? lastPage.data.next_cursor
+          : undefined,
+      enabled: Boolean(projectId),
+      retry: false,
+      meta: { errorHandled: true },
+    });
+  const seenAttributeKeys = new Set();
+  const attributeKeys = (data?.pages || []).flatMap((page) =>
+    (page?.data?.result || []).filter(({ key }) => {
+      if (!key || seenAttributeKeys.has(key)) return false;
+      seenAttributeKeys.add(key);
+      return true;
+    }),
+  );
 
   // Group attributes by dot-delimited prefix
   const groups = useMemo(() => {
@@ -53,6 +73,32 @@ const AttributesView = () => {
         }}
       >
         <CircularProgress />
+      </Box>
+    );
+  }
+
+  if (attributeKeys.length === 0 && hasNextPage) {
+    return (
+      <Box
+        sx={{
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "center",
+          height: "calc(100vh - 180px)",
+          flexDirection: "column",
+          gap: 1,
+        }}
+      >
+        {isFetchingNextPage ? (
+          <CircularProgress size={24} />
+        ) : (
+          <Button variant="outlined" onClick={() => fetchNextPage()}>
+            Continue loading attributes
+          </Button>
+        )}
+        <Typography variant="body2" color="text.secondary">
+          Searching older traces for attributes…
+        </Typography>
       </Box>
     );
   }
@@ -96,6 +142,9 @@ const AttributesView = () => {
         keys={filteredKeys}
         selectedKey={selectedKey}
         onSelectKey={setSelectedKey}
+        hasMore={hasNextPage}
+        isLoadingMore={isFetchingNextPage}
+        onLoadMore={fetchNextPage}
       />
       <AttributeDetail projectId={projectId} attributeKey={selectedKey} />
     </Box>

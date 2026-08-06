@@ -1,329 +1,398 @@
+"""One-snapshot aggregate Agent Graph/Path query for direct-write ClickHouse.
+
+The graph and path are two views of the same current span set:
+
+* ``edges`` are exact parent -> child topology transitions;
+* ``path_edges`` are exact adjacent chronological transitions inside each trace.
+
+Both, together with node metrics, are produced by one ClickHouse statement and
+one physical ``spans`` reference.  This matters on ClickHouse 25.3: named CTEs
+are expanded at every use, so separate edge/node statements (or a CTE reused by
+three UNION branches) can observe different ReplacingMergeTree part snapshots.
+The query below collapses every physical identity with ``argMax(_version)``,
+applies mutable filters only after that collapse, packs each accepted trace into
+one compact array, and emits node/hierarchy/path events through one final
+``arrayJoin``.
 """
-Agent Graph Query Builder for ClickHouse.
 
-Computes the aggregate agent topology graph for a project by analyzing
-parent-child span relationships across all traces in a time window.
-
-Two queries:
-1. **Edge query**: Self-join on ``spans`` to find all parent→child
-   transitions, grouped by (source_name, source_type, target_name, target_type).
-2. **Node metrics query**: Per-node aggregates (span_count, latency, tokens,
-   cost, errors) for all observation types.
-
-The result is a ``{nodes, edges}`` structure ready for React Flow rendering.
-"""
+from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
 
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
-from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
+    compile_exact_graph_row_predicates,
+)
 
 
 class AgentGraphQueryBuilder(BaseQueryBuilder):
-    """Build aggregate agent graph queries from the ``spans`` table.
-
-    Args:
-        project_id: Project UUID string.
-        filters: Frontend filter list (includes date range).
-        max_nodes: Maximum number of distinct nodes to return.
-        max_edges: Maximum number of edges to return.
-    """
+    """Build one exact latest-state Agent Graph/Path statement."""
 
     TABLE = "spans"
-    _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
+    VERSION_COLUMN = "_version"
+    DELETED_COLUMN = "is_deleted"
 
     def __init__(
         self,
         project_id: str,
         filters: list[dict] | None = None,
-        max_nodes: int = 100,
-        max_edges: int = 200,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id, **kwargs)
-        self.filters = filters or []
-        self.max_nodes = max_nodes
-        self.max_edges = max_edges
-
-        self.start_date, self.end_date = self.parse_time_range(self.filters)
-
-        # Default to 30 days when no explicit date filter is provided.
-        # The base class defaults to 3650 days (10 years), which causes
-        # ClickHouse to scan all historical spans — triggering OOM on large
-        # projects and the intermittent errors seen in TH-4422.
-        has_date_filter = any(
-            f.get("column_id") in ("created_at", "start_time") for f in self.filters
+        self.filters = list(filters or [])
+        analyzed = self.analyze_bounded_datetime_filters(self.filters, strict=True)
+        self.start_date = analyzed.start
+        self.end_date = analyzed.end
+        self.empty_window = analyzed.empty
+        self.params.update(
+            {
+                "start_date": self.start_date,
+                "end_date": self.end_date,
+                # Preserve the established trace-filter contract: ordinary
+                # scalar witnesses may sit in the adjacent ingest window,
+                # while contribution rows remain inside the selected window.
+                "graph_witness_start_date": self.start_date - timedelta(days=1),
+                "graph_witness_end_date": self.end_date + timedelta(days=1),
+            }
         )
-        if not has_date_filter:
-            self.start_date = self.end_date - timedelta(days=30)
-
-        self.params["start_date"] = self.start_date
-        self.params["end_date"] = self.end_date
-
-    def _build_filter_scope(self, span_alias: str) -> tuple[str, str, dict[str, Any]]:
-        """Build one tenant/time-bounded trace membership set for graph filters.
-
-        Filter-builder subqueries require a physical table name.  Passing the
-        edge query's ``child`` alias here used to emit ``FROM child`` for text
-        and attribute filters, which is not a ClickHouse table.  A finite CTE
-        also gives edge and node queries identical filter membership without
-        ambiguous unqualified columns in the self-join.
-        """
-
-        if not self.filters:
-            return "", "", {}
-
-        fb = self._FILTER_BUILDER_CLS(
-            table=self.TABLE,
-            project_id=self.project_id,
-            score_date_scope=True,
-            span_date_scope=True,
-            strict_trace_project_correlation=True,
-        )
-        extra_where, extra_params = fb.translate(self.filters)
-        if not extra_where:
-            return "", "", extra_params
-
-        cte = f"""
-        WITH filtered_trace_ids AS (
-            SELECT DISTINCT trace_id
-            FROM {self.TABLE}
-            PREWHERE project_id = %(project_id)s
-              AND created_at >= %(start_date)s - INTERVAL 1 DAY
-              AND created_at < %(end_date)s + INTERVAL 1 DAY
-            WHERE is_deleted = 0
-              AND start_time >= %(start_date)s
-              AND start_time < %(end_date)s
-              AND ({extra_where})
-        )
-        """
-        membership = (
-            f"AND {span_alias}.trace_id IN (SELECT trace_id FROM filtered_trace_ids)"
-        )
-        return cte, membership, extra_params
-
-    def build(self) -> tuple[str, dict[str, Any]]:
-        """Build the edge aggregation query (parent→child transitions).
-
-        Returns:
-            A ``(query_string, params)`` tuple. Each row represents an edge
-            between two node types with aggregate metrics.
-        """
-        filter_cte, filter_fragment, extra_params = self._build_filter_scope("child")
-        self.params.update(extra_params)
-
-        self.params["max_edges"] = self.max_edges
-
-        # `created_at` is the partition/sort key (`PARTITION BY
-        # toYYYYMM(created_at)`, `ORDER BY (project_id, toDate(created_at),
-        # trace_id, id)`), so filtering on it lets CH skip partitions and
-        # granules. `start_time` stays as the semantic bound so the user's
-        # window is respected exactly; `created_at` is applied with a 1-day
-        # buffer to tolerate replication lag / late backfills. Adding
-        # `parent.project_id` is the bigger win — without it CH scans all
-        # projects on the parent side of the self-join. Together this takes
-        # the query from 5s+ timeout to ~0.6s on a 236k-span, 7-day window.
-        query = f"""
-        {filter_cte}
-        SELECT
-            parent.name AS source_node,
-            parent.observation_type AS source_type,
-            child.name AS target_node,
-            child.observation_type AS target_type,
-            count() AS transition_count,
-            avg(child.latency_ms) AS avg_latency_ms,
-            sum(child.total_tokens) AS total_tokens,
-            sum(child.cost) AS total_cost,
-            countIf(child.status = 'ERROR') AS error_count,
-            uniqExact(child.trace_id) AS trace_count
-        FROM {self.TABLE} AS child
-        INNER JOIN {self.TABLE} AS parent
-            ON child.parent_span_id = parent.id
-            AND child.trace_id = parent.trace_id
-            AND parent.project_id = %(project_id)s
-            AND parent.is_deleted = 0
-            AND parent.start_time >= %(start_date)s
-            AND parent.start_time < %(end_date)s
-        WHERE child.project_id = %(project_id)s
-          AND parent.project_id = %(project_id)s
-          AND child.is_deleted = 0
-          AND child.parent_span_id IS NOT NULL
-          AND child.parent_span_id != ''
-          AND child.created_at >= %(start_date)s - INTERVAL 1 DAY
-          AND child.created_at < %(end_date)s + INTERVAL 1 DAY
-          AND parent.created_at >= %(start_date)s - INTERVAL 2 DAY
-          AND parent.created_at < %(end_date)s + INTERVAL 1 DAY
-          AND child.start_time >= %(start_date)s
-          AND child.start_time < %(end_date)s
-          {filter_fragment}
-        GROUP BY source_node, source_type, target_node, target_type
-        ORDER BY transition_count DESC
-        LIMIT %(max_edges)s
-        SETTINGS join_algorithm = 'parallel_hash', max_threads = 8
-        """
-        return query, self.params
-
-    def build_node_metrics(self) -> tuple[str, dict[str, Any]]:
-        """Build the node metrics aggregation query.
-
-        Returns per-node aggregates across all spans (not just edges).
-        This captures nodes that may not appear in edges (e.g., leaf nodes
-        without children, or root nodes without parents).
-
-        Returns:
-            A ``(query_string, params)`` tuple.
-        """
-        filter_cte, filter_fragment, filter_params = self._build_filter_scope("spans")
-        params = {
-            "project_id": self.project_id,
-            "start_date": self.start_date,
-            "end_date": self.end_date,
-            "max_nodes": self.max_nodes,
-            **filter_params,
-        }
-
-        query = f"""
-        {filter_cte}
-        SELECT
-            name AS node_name,
-            observation_type AS node_type,
-            count() AS span_count,
-            avg(latency_ms) AS avg_latency_ms,
-            sum(total_tokens) AS total_tokens,
-            sum(cost) AS total_cost,
-            countIf(status = 'ERROR') AS error_count,
-            uniqExact(trace_id) AS trace_count
-        FROM {self.TABLE}
-        {self.project_where()}
-          AND created_at >= %(start_date)s - INTERVAL 1 DAY
-          AND created_at < %(end_date)s + INTERVAL 1 DAY
-          AND start_time >= %(start_date)s
-          AND start_time < %(end_date)s
-          {filter_fragment}
-        GROUP BY node_name, node_type
-        ORDER BY span_count DESC
-        LIMIT %(max_nodes)s
-        """
-        return query, params
 
     @staticmethod
     def _make_node_id(name: str, node_type: str) -> str:
-        """Create a unique node identifier from type and name."""
         return f"{node_type}:{name}"
+
+    @staticmethod
+    def _latest_projection(
+        row_predicates: tuple[str, ...],
+        contribution_predicates: tuple[str, ...],
+    ) -> tuple[str, str, int]:
+        """Return argMax tuple expressions, aliases, and tombstone position."""
+
+        expressions = [
+            "id",
+            "parent_span_id",
+            "name",
+            "observation_type",
+            "start_time",
+            "toFloat64(latency_ms)",
+            "toInt64(total_tokens)",
+            "toFloat64(cost)",
+            "status",
+            "toUInt8(is_deleted)",
+        ]
+        aliases = [
+            "id",
+            "parent_span_id",
+            "name",
+            "observation_type",
+            "start_time",
+            "latency_ms",
+            "total_tokens",
+            "cost",
+            "status",
+            "is_deleted",
+        ]
+        for index, predicate in enumerate(row_predicates):
+            expressions.append(f"toUInt8(ifNull(({predicate}), 0))")
+            aliases.append(f"graph_row_match_{index}")
+        for index, predicate in enumerate(contribution_predicates):
+            expressions.append(f"toUInt8(ifNull(({predicate}), 0))")
+            aliases.append(f"graph_contribution_match_{index}")
+
+        tuple_sql = ",\n".join(
+            f"                        {item}" for item in expressions
+        )
+        projection_sql = ",\n".join(
+            f"            tupleElement(graph_latest_row, {index}) AS {alias}"
+            for index, alias in enumerate(aliases, start=1)
+        )
+        return tuple_sql, projection_sql, aliases.index("is_deleted") + 1
+
+    @staticmethod
+    def _span_tuple(prefix: str) -> str:
+        """Return the scalar tuple used after the wide latest-state collapse."""
+
+        return (
+            f"tuple({prefix}id, {prefix}parent_span_id, {prefix}name, "
+            f"{prefix}observation_type, toUnixTimestamp64Micro({prefix}start_time), "
+            f"toFloat64({prefix}latency_ms), toInt64({prefix}total_tokens), "
+            f"toFloat64({prefix}cost), {prefix}status)"
+        )
+
+    def build(self) -> tuple[str, dict[str, Any]]:
+        """Return one exact node/hierarchy/path aggregation statement."""
+
+        plan = compile_exact_graph_row_predicates(
+            self.filters,
+            project_id=str(self.project_id),
+            # The historical Agent Graph endpoint filters traces, then graphs
+            # every contributing child of each matched trace.
+            observe_type="trace",
+        )
+        self.params.update(plan.params)
+
+        tuple_sql, projection_sql, tombstone_index = self._latest_projection(
+            plan.predicates,
+            plan.contribution_predicates,
+        )
+        output_window = "start_time >= %(start_date)s AND start_time < %(end_date)s"
+        contribution_terms = [
+            output_window,
+            *(
+                f"graph_contribution_match_{index} = 1"
+                for index in range(len(plan.contribution_predicates))
+            ),
+        ]
+        contribution_condition = " AND ".join(
+            f"({term})" for term in contribution_terms
+        )
+        match_columns = []
+        match_having = []
+        for index, required in enumerate(plan.required_matches):
+            match_condition = f"graph_row_match_{index} = 1"
+            if plan.output_window_only[index]:
+                match_condition = f"({match_condition}) AND ({output_window})"
+            match_columns.append(
+                "            max(toUInt8(ifNull(("
+                f"{match_condition}), 0))) AS graph_match_{index}"
+            )
+            match_having.append(f"graph_match_{index} = {1 if required else 0}")
+
+        trace_projection = ""
+        if match_columns:
+            trace_projection = ",\n" + ",\n".join(match_columns)
+        trace_having = ["length(graph_spans) > 0", *match_having]
+        if self.empty_window:
+            trace_having.append("0 = 1")
+        trace_having_sql = " AND ".join(f"({item})" for item in trace_having)
+
+        span_tuple = self._span_tuple("")
+        # Tuple indexes in ``graph_spans``:
+        #   1 id, 2 parent id, 3 name, 4 type, 5 start-us,
+        #   6 latency, 7 tokens, 8 cost, 9 status.
+        node_events = """arrayMap(
+                    graph_span -> tuple(
+                        'node',
+                        tupleElement(graph_span, 3),
+                        tupleElement(graph_span, 4),
+                        '',
+                        '',
+                        tupleElement(graph_span, 6),
+                        tupleElement(graph_span, 7),
+                        tupleElement(graph_span, 8),
+                        toUInt8(upper(tupleElement(graph_span, 9)) IN
+                            ('ERROR', 'ERRORED', 'FAILED'))
+                    ),
+                    graph_spans
+                )"""
+        hierarchy_events = """arrayMap(
+                    graph_child -> tuple(
+                        'hierarchy',
+                        tupleElement(arrayFirst(
+                            graph_parent -> tupleElement(graph_parent, 1)
+                                = tupleElement(graph_child, 2),
+                            graph_spans
+                        ), 3),
+                        tupleElement(arrayFirst(
+                            graph_parent -> tupleElement(graph_parent, 1)
+                                = tupleElement(graph_child, 2),
+                            graph_spans
+                        ), 4),
+                        tupleElement(graph_child, 3),
+                        tupleElement(graph_child, 4),
+                        tupleElement(graph_child, 6),
+                        tupleElement(graph_child, 7),
+                        tupleElement(graph_child, 8),
+                        toUInt8(upper(tupleElement(graph_child, 9)) IN
+                            ('ERROR', 'ERRORED', 'FAILED'))
+                    ),
+                    arrayFilter(
+                        graph_child -> tupleElement(graph_child, 2) != ''
+                            AND arrayExists(
+                                graph_parent -> tupleElement(graph_parent, 1)
+                                    = tupleElement(graph_child, 2),
+                                graph_spans
+                            ),
+                        graph_spans
+                    )
+                )"""
+        path_events = """arrayMap(
+                    graph_index -> tuple(
+                        'path',
+                        tupleElement(graph_ordered_spans[graph_index], 3),
+                        tupleElement(graph_ordered_spans[graph_index], 4),
+                        tupleElement(graph_ordered_spans[graph_index + 1], 3),
+                        tupleElement(graph_ordered_spans[graph_index + 1], 4),
+                        tupleElement(graph_ordered_spans[graph_index + 1], 6),
+                        tupleElement(graph_ordered_spans[graph_index + 1], 7),
+                        tupleElement(graph_ordered_spans[graph_index + 1], 8),
+                        toUInt8(upper(tupleElement(
+                            graph_ordered_spans[graph_index + 1], 9
+                        )) IN ('ERROR', 'ERRORED', 'FAILED'))
+                    ),
+                    range(1, length(graph_ordered_spans))
+                )"""
+
+        query = f"""
+        WITH graph_latest_spans AS (
+            SELECT
+                trace_id,
+{projection_sql}
+            FROM (
+                SELECT
+                    trace_id,
+                    argMax(
+                        tuple(
+{tuple_sql}
+                        ),
+                        {self.VERSION_COLUMN}
+                    ) AS graph_latest_row
+                FROM {self.TABLE}
+                PREWHERE {self.project_filter_sql()}
+                  AND start_time >= %(graph_witness_start_date)s
+                  AND start_time < %(graph_witness_end_date)s
+                GROUP BY
+                    project_id,
+                    observation_type,
+                    service_name,
+                    toStartOfHour(start_time),
+                    trace_id,
+                    id
+            ) AS graph_physical_versions
+            WHERE tupleElement(graph_latest_row, {tombstone_index}) = 0
+        ),
+        graph_traces AS (
+            SELECT
+                trace_id,
+                groupArrayIf(
+                    {span_tuple},
+                    {contribution_condition}
+                ) AS graph_spans
+{trace_projection}
+            FROM graph_latest_spans
+            GROUP BY trace_id
+            HAVING {trace_having_sql}
+        ),
+        graph_ordered_traces AS (
+            SELECT
+                trace_id,
+                graph_spans,
+                arraySort(
+                    graph_span -> tuple(
+                        tupleElement(graph_span, 5),
+                        tupleElement(graph_span, 1)
+                    ),
+                    graph_spans
+                ) AS graph_ordered_spans
+            FROM graph_traces
+        ),
+        graph_events AS (
+            SELECT
+                trace_id,
+                arrayJoin(arrayConcat(
+                    {node_events},
+                    {hierarchy_events},
+                    {path_events}
+                )) AS graph_event
+            FROM graph_ordered_traces
+        )
+        SELECT
+            tupleElement(graph_event, 1) AS row_kind,
+            tupleElement(graph_event, 2) AS source_node,
+            tupleElement(graph_event, 3) AS source_type,
+            tupleElement(graph_event, 4) AS target_node,
+            tupleElement(graph_event, 5) AS target_type,
+            count() AS item_count,
+            avg(tupleElement(graph_event, 6)) AS avg_latency_ms,
+            sum(tupleElement(graph_event, 7)) AS total_tokens,
+            sum(tupleElement(graph_event, 8)) AS total_cost,
+            sum(tupleElement(graph_event, 9)) AS error_count,
+            uniqExact(trace_id) AS trace_count
+        FROM graph_events
+        GROUP BY
+            row_kind,
+            source_node,
+            source_type,
+            target_node,
+            target_type
+        ORDER BY row_kind, item_count DESC, source_type, source_node,
+                 target_type, target_node
+        SETTINGS
+            max_threads = 1,
+            optimize_aggregation_in_order = 1,
+            max_bytes_before_external_group_by = 33554432,
+            max_bytes_before_external_sort = 33554432
+        """
+        return query, self.params
+
+    # Kept as a hard failure so a future call site cannot silently reintroduce
+    # the old independently-snapshotted second statement.
+    def build_node_metrics(self) -> tuple[str, dict[str, Any]]:
+        raise RuntimeError("agent graph nodes and edges must use build() together")
 
     def format_result(
         self,
-        edge_rows: list,
-        edge_columns: list[str],
-        node_rows: list,
-        node_columns: list[str],
+        rows: list[Any],
+        columns: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Merge edge and node query results into graph response.
+        """Split the single statement's tagged rows into wire graph payloads."""
 
-        Returns:
-            ``{"nodes": [...], "edges": [...]}`` dict.
-        """
-        # Build node lookup from node metrics query
-        node_map: dict[str, dict[str, Any]] = {}
-        for row in node_rows:
+        names = list(columns or [])
+
+        def value(row: Any, key: str, index: int, default: Any = 0) -> Any:
             if isinstance(row, dict):
-                name = row.get("node_name", "")
-                ntype = row.get("node_type", "unknown")
-                span_count = row.get("span_count", 0)
-                avg_lat = row.get("avg_latency_ms", 0)
-                tokens = row.get("total_tokens", 0)
-                cost = row.get("total_cost", 0)
-                errors = row.get("error_count", 0)
-                traces = row.get("trace_count", 0)
-            else:
-                # Tuple row: (node_name, node_type, span_count, avg_latency,
-                #              total_tokens, total_cost, error_count, trace_count)
-                name = row[0] if len(row) > 0 else ""
-                ntype = row[1] if len(row) > 1 else "unknown"
-                span_count = row[2] if len(row) > 2 else 0
-                avg_lat = row[3] if len(row) > 3 else 0
-                tokens = row[4] if len(row) > 4 else 0
-                cost = row[5] if len(row) > 5 else 0
-                errors = row[6] if len(row) > 6 else 0
-                traces = row[7] if len(row) > 7 else 0
+                return row.get(key, default)
+            if names and key in names:
+                position = names.index(key)
+                return row[position] if len(row) > position else default
+            return row[index] if len(row) > index else default
 
-            node_id = self._make_node_id(name, ntype)
-            node_map[node_id] = {
-                "id": node_id,
-                "name": name,
-                "type": ntype,
-                "span_count": span_count,
-                "avg_latency_ms": round(float(avg_lat), 2) if avg_lat else 0,
-                "total_tokens": int(tokens) if tokens else 0,
-                "total_cost": round(float(cost), 6) if cost else 0,
-                "error_count": int(errors) if errors else 0,
-                "trace_count": int(traces) if traces else 0,
-            }
-
-        # Build edges from edge query
+        nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
-        for row in edge_rows:
-            if isinstance(row, dict):
-                src_name = row.get("source_node", "")
-                src_type = row.get("source_type", "unknown")
-                tgt_name = row.get("target_node", "")
-                tgt_type = row.get("target_type", "unknown")
-                trans = row.get("transition_count", 0)
-                avg_lat = row.get("avg_latency_ms", 0)
-                tokens = row.get("total_tokens", 0)
-                cost = row.get("total_cost", 0)
-                errors = row.get("error_count", 0)
-                traces = row.get("trace_count", 0)
-            else:
-                src_name = row[0] if len(row) > 0 else ""
-                src_type = row[1] if len(row) > 1 else "unknown"
-                tgt_name = row[2] if len(row) > 2 else ""
-                tgt_type = row[3] if len(row) > 3 else "unknown"
-                trans = row[4] if len(row) > 4 else 0
-                avg_lat = row[5] if len(row) > 5 else 0
-                tokens = row[6] if len(row) > 6 else 0
-                cost = row[7] if len(row) > 7 else 0
-                errors = row[8] if len(row) > 8 else 0
-                traces = row[9] if len(row) > 9 else 0
+        path_edges: list[dict[str, Any]] = []
+        for row in rows or []:
+            kind = str(value(row, "row_kind", 0, ""))
+            source_name = str(value(row, "source_node", 1, ""))
+            source_type = str(value(row, "source_type", 2, "unknown"))
+            target_name = str(value(row, "target_node", 3, ""))
+            target_type = str(value(row, "target_type", 4, "unknown"))
+            count = int(value(row, "item_count", 5, 0) or 0)
+            avg_latency = float(value(row, "avg_latency_ms", 6, 0) or 0)
+            total_tokens = int(value(row, "total_tokens", 7, 0) or 0)
+            total_cost = float(value(row, "total_cost", 8, 0) or 0)
+            error_count = int(value(row, "error_count", 9, 0) or 0)
+            trace_count = int(value(row, "trace_count", 10, 0) or 0)
 
-            source_id = self._make_node_id(src_name, src_type)
-            target_id = self._make_node_id(tgt_name, tgt_type)
-
-            # Ensure both nodes exist in node_map
-            for nid, nname, ntype in [
-                (source_id, src_name, src_type),
-                (target_id, tgt_name, tgt_type),
-            ]:
-                if nid not in node_map:
-                    node_map[nid] = {
-                        "id": nid,
-                        "name": nname,
-                        "type": ntype,
-                        "span_count": 0,
-                        "avg_latency_ms": 0,
-                        "total_tokens": 0,
-                        "total_cost": 0,
-                        "error_count": 0,
-                        "trace_count": 0,
+            source_id = self._make_node_id(source_name, source_type)
+            if kind == "node":
+                nodes.append(
+                    {
+                        "id": source_id,
+                        "name": source_name,
+                        "type": source_type,
+                        "span_count": count,
+                        "avg_latency_ms": round(avg_latency, 2),
+                        "total_tokens": total_tokens,
+                        "total_cost": round(total_cost, 6),
+                        "error_count": error_count,
+                        "trace_count": trace_count,
                     }
+                )
+                continue
+            if kind not in {"hierarchy", "path"}:
+                continue
+            target_id = self._make_node_id(target_name, target_type)
+            edge = {
+                "source": source_id,
+                "target": target_id,
+                "transition_count": count,
+                "avg_latency_ms": round(avg_latency, 2),
+                "total_tokens": total_tokens,
+                "total_cost": round(total_cost, 6),
+                "error_count": error_count,
+                "trace_count": trace_count,
+                "is_self_loop": source_id == target_id,
+            }
+            (edges if kind == "hierarchy" else path_edges).append(edge)
 
-            is_self_loop = source_id == target_id
-            edges.append(
-                {
-                    "source": source_id,
-                    "target": target_id,
-                    "transition_count": int(trans),
-                    "avg_latency_ms": round(float(avg_lat), 2) if avg_lat else 0,
-                    "total_tokens": int(tokens) if tokens else 0,
-                    "total_cost": round(float(cost), 6) if cost else 0,
-                    "error_count": int(errors) if errors else 0,
-                    "trace_count": int(traces) if traces else 0,
-                    "is_self_loop": is_self_loop,
-                }
-            )
-
-        return {
-            "nodes": list(node_map.values()),
-            "edges": edges,
-        }
+        return {"nodes": nodes, "edges": edges, "path_edges": path_edges}

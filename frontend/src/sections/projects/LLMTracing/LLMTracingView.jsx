@@ -162,6 +162,7 @@ import {
   restampColumns,
   columnStateToHideMap,
   reorderColumns,
+  mergePersistedCustomColumns,
   isColumnVisibilityDirty,
   isColumnOrderDirty,
 } from "./savedViewColumns";
@@ -2317,31 +2318,54 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       if (saved.showCompare) setShowCompare(saved.showCompare);
       if (saved.hasEvalFilter) setHasEvalFilter(saved.hasEvalFilter);
       // Accept both new {trace, spans} object shape and legacy flat array
-      // (treated as customs for the current tab only).
+      // (treated as customs for the current tab only). Merge immediately when
+      // a warm grid already has base columns; otherwise queue for that grid's
+      // config callback. This closes the reload race where the callback fired
+      // before this localStorage effect and the queued custom columns vanished.
       if (saved.customColumns) {
         const cloneEach = (arr) => arr.map((c) => ({ ...c }));
+        let traceCols = [];
+        let spansCols = [];
         if (Array.isArray(saved.customColumns)) {
           if (saved.customColumns.length > 0) {
             if (selectedTab === "trace") {
-              primaryTracePendingRef.current = cloneEach(saved.customColumns);
-              compareTracePendingRef.current = cloneEach(saved.customColumns);
+              traceCols = saved.customColumns;
             } else {
-              primarySpansPendingRef.current = cloneEach(saved.customColumns);
-              compareSpansPendingRef.current = cloneEach(saved.customColumns);
+              spansCols = saved.customColumns;
             }
           }
         } else {
-          const traceCols = saved.customColumns.trace || [];
-          const spansCols = saved.customColumns.spans || [];
-          if (traceCols.length > 0) {
-            primaryTracePendingRef.current = cloneEach(traceCols);
-            compareTracePendingRef.current = cloneEach(traceCols);
-          }
-          if (spansCols.length > 0) {
-            primarySpansPendingRef.current = cloneEach(spansCols);
-            compareSpansPendingRef.current = cloneEach(spansCols);
-          }
+          traceCols = saved.customColumns.trace || [];
+          spansCols = saved.customColumns.spans || [];
         }
+
+        const targets = [
+          ["primary-trace", primaryTracePendingRef, traceCols],
+          ["compare-trace", compareTracePendingRef, traceCols],
+          ["primary-spans", primarySpansPendingRef, spansCols],
+          ["compare-spans", compareSpansPendingRef, spansCols],
+        ];
+        targets.forEach(([, pendingRef, persisted]) => {
+          pendingRef.current = cloneEach(persisted);
+        });
+        setColumns((prev) => {
+          let next = prev;
+          targets.forEach(([slotKey, pendingRef, persisted]) => {
+            if (persisted.length === 0) return;
+            const slot = prev[slotKey] || [];
+            const hasBaseColumns = slot.some(
+              (col) => col?.groupBy !== "Custom Columns",
+            );
+            if (!hasBaseColumns) return;
+            const merged = mergePersistedCustomColumns(slot, persisted);
+            if (merged !== slot) {
+              if (next === prev) next = { ...prev };
+              next[slotKey] = merged;
+            }
+            pendingRef.current = [];
+          });
+          return next;
+        });
       }
     } catch {
       /* ignore corrupted localStorage */

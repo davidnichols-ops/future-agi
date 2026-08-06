@@ -17432,14 +17432,8 @@ export const getApiTracesSpanAttributeDetailListUrl = (params: ApiTracesSpanAttr
 }
 
 /**
- * Determines the attribute type by probing which map contains the key, then
-returns type-appropriate statistics:
-  - string: top values with percentages
-  - number: min, max, avg, p50, p95
-  - boolean: true/false distribution
-
-GET /api/traces/span-attribute-detail/?project_id=<uuid>&key=<attr_key>
- * @summary Full detail for a specific span attribute key.
+ * GET /api/traces/span-attribute-detail/?project_id=<uuid>&key=<attr_key>
+ * @summary Serve the last complete exact attribute snapshot and refresh out of band.
  */
 export const apiTracesSpanAttributeDetailList = async (params: ApiTracesSpanAttributeDetailListParams, options?: RequestInit): Promise<apiTracesSpanAttributeDetailListResponse> => {
 

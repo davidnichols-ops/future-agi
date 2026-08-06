@@ -9428,24 +9428,23 @@ export const ApiPublicTracesListResponse = zod.object({
 
 
 /**
- * Determines the attribute type by probing which map contains the key, then
-returns type-appropriate statistics:
-  - string: top values with percentages
-  - number: min, max, avg, p50, p95
-  - boolean: true/false distribution
-
-GET /api/traces/span-attribute-detail/?project_id=<uuid>&key=<attr_key>
- * @summary Full detail for a specific span attribute key.
+ * GET /api/traces/span-attribute-detail/?project_id=<uuid>&key=<attr_key>
+ * @summary Serve the last complete exact attribute snapshot and refresh out of band.
  */
 export const apiTracesSpanAttributeDetailListQueryKeyMax = 512;
 
-
+export const apiTracesSpanAttributeDetailListQueryRefreshDefault = false;
 
 export const ApiTracesSpanAttributeDetailListQueryParams = zod.object({
   "project_id": zod.string().uuid(),
-  "key": zod.string().min(1).max(apiTracesSpanAttributeDetailListQueryKeyMax)
+  "key": zod.string().min(1).max(apiTracesSpanAttributeDetailListQueryKeyMax),
+  "refresh": zod.boolean().default(apiTracesSpanAttributeDetailListQueryRefreshDefault)
 })
 
+
+export const apiTracesSpanAttributeDetailListResponseQueryCountMin = 0;
+
+export const apiTracesSpanAttributeDetailListResponseQueryElapsedMsMin = 0;
 
 
 
@@ -9471,7 +9470,7 @@ const spanAttributeJsonValueSchema: zod.ZodType<SpanAttributeJsonValue> =
 
 export const ApiTracesSpanAttributeDetailListResponse = zod.object({
   "key": zod.string().min(1),
-  "type": zod.enum(['string', 'number', 'boolean', 'array']),
+  "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']),
   "count": zod.number(),
   "unique_values": zod.number().optional(),
   "top_values": zod.array(zod.object({
@@ -9484,11 +9483,25 @@ export const ApiTracesSpanAttributeDetailListResponse = zod.object({
   "avg": zod.number().optional(),
   "p50": zod.number().optional(),
   "p95": zod.number().optional(),
+  "stats": zod.object({
+  "min": zod.number().optional(),
+  "max": zod.number().optional(),
+  "avg": zod.number().optional(),
+  "p50": zod.number().optional(),
+  "p95": zod.number().optional()
+}).optional(),
   "query_complete": zod.boolean(),
-  "query_status": zod.enum(['complete', 'sampled', 'degraded']),
+  "query_status": zod.enum(['complete', 'pending', 'sampled', 'degraded']),
+  "query_sampled": zod.boolean(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
-  "query_window_start": zod.string().datetime({"offset":true}),
-  "query_window_end": zod.string().datetime({"offset":true})
+  "query_window_start": zod.string().datetime({"offset":true}).optional(),
+  "query_window_end": zod.string().datetime({"offset":true}).optional(),
+  "query_count": zod.number().min(apiTracesSpanAttributeDetailListResponseQueryCountMin).optional(),
+  "query_elapsed_ms": zod.number().min(apiTracesSpanAttributeDetailListResponseQueryElapsedMsMin).optional(),
+  "query_completed_at": zod.string().datetime({"offset":true}).optional(),
+  "query_cached": zod.boolean().optional(),
+  "query_refreshing": zod.boolean().optional(),
+  "query_refresh_failed": zod.boolean().optional()
 })
 
 
@@ -9524,7 +9537,7 @@ export const apiTracesSpanAttributeKeysListResponseNextCursorMax = 8192;
 export const ApiTracesSpanAttributeKeysListResponse = zod.object({
   "result": zod.array(zod.object({
   "key": zod.string().min(1),
-  "type": zod.enum(['string', 'number', 'boolean', 'array', 'map']),
+  "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']),
   "count": zod.number()
 })),
   "query_complete": zod.boolean(),
@@ -9568,7 +9581,7 @@ export const ApiTracesSpanAttributeValuesListResponse = zod.object({
   "result": zod.array(zod.object({
   "value": spanAttributeJsonValueSchema,
   "count": zod.number(),
-  "type": zod.enum(['string', 'number', 'boolean', 'array']).optional()
+  "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']).optional()
 })),
   "query_complete": zod.boolean(),
   "query_status": zod.enum(['complete', 'sampled', 'degraded']),
@@ -34382,7 +34395,8 @@ export const TracerDashboardFilterValuesQueryParams = zod.object({
   "dataset_id": zod.string().uuid().optional(),
   "search": zod.string().max(tracerDashboardFilterValuesQuerySearchMax).default(tracerDashboardFilterValuesQuerySearchDefault),
   "page_size": zod.number().min(1).max(tracerDashboardFilterValuesQueryPageSizeMax).optional(),
-  "cursor": zod.string().min(1).max(tracerDashboardFilterValuesQueryCursorMax).optional()
+  "cursor": zod.string().min(1).max(tracerDashboardFilterValuesQueryCursorMax).optional(),
+  "attribute_type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']).optional()
 })
 
 export const tracerDashboardFilterValuesResponseStatusDefault = true;
@@ -34409,7 +34423,8 @@ export const TracerDashboardFilterValuesResponse = zod.object({
   "query_window_start": zod.string().datetime({"offset":true}).optional(),
   "query_window_end": zod.string().datetime({"offset":true}).optional(),
   "has_more": zod.boolean().optional(),
-  "next_cursor": zod.string().min(1).optional()
+  "next_cursor": zod.string().min(1).optional(),
+  "attribute_type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']).optional()
 })
 })
 

@@ -27,6 +27,7 @@ logger = structlog.get_logger(__name__)
 
 def _observe_payload(namespace: str, identity: dict[str, Any]) -> Any:
     from tracer.services.clickhouse.exact_graph_reads import (
+        read_exact_agent_graph,
         read_exact_all_system_metrics,
         read_exact_annotation_graph,
         read_exact_eval_graph,
@@ -37,6 +38,12 @@ def _observe_payload(namespace: str, identity: dict[str, Any]) -> Any:
     from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 
     analytics = V2AnalyticsQueryService()
+    if namespace == "observe-agent-graph":
+        return read_exact_agent_graph(
+            analytics=analytics,
+            project_id=str(identity["project_id"]),
+            filters=list(identity.get("filters") or []),
+        )
     common = {
         "analytics": analytics,
         "project_id": str(identity["project_id"]),
@@ -145,6 +152,26 @@ def _eval_usage_payload(identity: dict[str, Any]) -> Any:
     return payload
 
 
+def _attribute_detail_payload(identity: dict[str, Any]) -> Any:
+    """Re-authorize then compute one exact span-attribute snapshot."""
+
+    from tracer.models.project import Project
+    from tracer.services.clickhouse.exact_attribute_detail import (
+        read_exact_attribute_detail,
+    )
+
+    if not Project.objects.filter(
+        id=identity["project_id"],
+        workspace_id=identity["workspace_id"],
+    ).exists():
+        raise ValueError("attribute detail project scope is unavailable")
+    return read_exact_attribute_detail(
+        project_id=str(identity["project_id"]),
+        attribute_key=str(identity["attribute_key"]),
+        horizon_days=int(identity.get("horizon_days") or 365),
+    )
+
+
 def _load_exact_payload(namespace: str, identity: dict[str, Any]) -> Any:
     if namespace.startswith("observe-"):
         return _observe_payload(namespace, identity)
@@ -152,6 +179,8 @@ def _load_exact_payload(namespace: str, identity: dict[str, Any]) -> Any:
         return _dashboard_payload(identity)
     if namespace == "eval-usage":
         return _eval_usage_payload(identity)
+    if namespace == "attribute-detail":
+        return _attribute_detail_payload(identity)
     raise ValueError("unsupported exact aggregation refresh namespace")
 
 

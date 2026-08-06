@@ -85,6 +85,7 @@ from tracer.serializers.trace import (
 from tracer.services.clickhouse.bounded_graph_reads import BoundedGraphReadError
 from tracer.services.clickhouse.graph_dispatch import (
     enforce_exact_graph_data_contract,
+    fetch_agent_graph_ch,
     fetch_annotation_graph_ch,
     fetch_eval_graph_ch,
     fetch_system_metric_graph_ch,
@@ -167,6 +168,11 @@ TRACE_LIST_WALL_DEADLINE_MS = 10_000
 # only a ceiling: healthy reads return immediately and issue no additional query.
 TRACE_LIST_CANDIDATE_DEADLINE_MS = 8_000
 TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 900
+# Enrichments are page-local and individually bounded, but fanning every
+# optional field out at once can exceed ClickHouse's admission limit on a busy
+# tenant. Two workers retain overlap without turning one list request into a
+# five-query concurrency spike.
+TRACE_LIST_ENRICHMENT_MAX_WORKERS = 2
 TRACE_LIST_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
@@ -4088,6 +4094,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 ),
                 read_settings=page_read_settings,
                 include_incomplete_rows=publish_bounded_partial,
+                continuation_slice_start=(
+                    cursor_state.scan_slice_start if cursor_state is not None else None
+                ),
                 continuation_slice_end=(
                     cursor_state.scan_slice_end if cursor_state is not None else None
                 ),
@@ -4280,7 +4289,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             tasks["attributes"] = (attr_query, attr_params)
 
         enrichment_results: dict[str, Any] = {}
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=TRACE_LIST_ENRICHMENT_MAX_WORKERS
+        )
         future_names: dict[concurrent.futures.Future, str] = {}
         try:
             for task_name, (task_query, task_params) in tasks.items():
@@ -4661,6 +4672,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 window_end=window_end,
                 order=cursor_order,
                 seen_rows=cursor_seen_rows,
+                scan_slice_start=(
+                    bounded_page.continuation_slice_start
+                    if not bounded_page.has_more
+                    else None
+                ),
                 scan_slice_end=(
                     bounded_page.continuation_slice_end
                     if not bounded_page.has_more
@@ -4887,6 +4903,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             ),
             read_settings=page_read_settings,
             include_incomplete_rows=publish_bounded_partial,
+            continuation_slice_start=(
+                cursor_state.scan_slice_start if cursor_state is not None else None
+            ),
             continuation_slice_end=(
                 cursor_state.scan_slice_end if cursor_state is not None else None
             ),
@@ -5360,6 +5379,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     org_scope=False,
                 ),
                 seen_rows=cursor_seen_rows,
+                scan_slice_start=(
+                    bounded_page.continuation_slice_start
+                    if not bounded_page.has_more
+                    else None
+                ),
                 scan_slice_end=(
                     bounded_page.continuation_slice_end
                     if not bounded_page.has_more
@@ -5651,7 +5675,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         enrichment_results: dict[str, Any] = {}
         if tasks or (callable(bounded_user_resolver) and trace_user_identities):
             pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(tasks) + int(callable(bounded_user_resolver))
+                max_workers=min(
+                    TRACE_LIST_ENRICHMENT_MAX_WORKERS,
+                    len(tasks) + int(callable(bounded_user_resolver)),
+                )
             )
             future_names = {
                 pool.submit(_execute_project_version_enrichment, query, params): name
@@ -5886,18 +5913,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     )
     @action(detail=False, methods=["get"])
     def agent_graph(self, request, *args, **kwargs):
-        """Return the aggregate agent graph for a project.
-
-        Computes nodes (distinct span types/names) and edges (parent→child
-        transitions) across all traces in the given time window.
-        """
+        """Return one cached exact Agent Graph and chronological Agent Path."""
         project_id = None
-        filters = []
-        builder = None
         try:
             query = request.validated_query_data
             project_id = str(query["project_id"])
-            filters = query["filters"]
+            filters = bind_request_my_annotations_principal(
+                list(query.get("filters") or []),
+                request=request,
+            )
+            refresh = bool(query.get("refresh", False))
 
             project = (
                 _project_queryset_for_request(request).filter(id=project_id).first()
@@ -5905,45 +5930,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if not project:
                 return self._gm.bad_request("Project not found")
 
-            builder = AgentGraphQueryBuilderV2(
+            result = fetch_agent_graph_ch(
                 project_id=project_id,
                 filters=filters,
-            )
-
-            analytics = V2AnalyticsQueryService()
-            deadline = ReadDeadline.start(15000)
-
-            # Edge query
-            edge_query, edge_params = builder.build()
-            edge_result = analytics.execute_ch_query(
-                edge_query,
-                edge_params,
-                timeout_ms=deadline.remaining_ms(),
-            )
-
-            # Node metrics query
-            node_query, node_params = builder.build_node_metrics()
-            node_result = analytics.execute_ch_query(
-                node_query,
-                node_params,
-                timeout_ms=deadline.remaining_ms(),
-            )
-
-            # CH-only path. The "agent graph returned no nodes → fall back
-            # to PG" branch and the outer-except PG fallback were both
-            # removed: an empty CH result means the project genuinely has no
-            # spans (or the data-pipeline is broken — that's an alert, not
-            # a fallback opportunity). PG was the legacy source of truth;
-            # post-migration it's incomplete.
-            result = builder.format_result(
-                edge_result.data,
-                edge_result.columns or [],
-                node_result.data,
-                node_result.columns or [],
+                refresh=refresh,
             )
             return self._gm.success_response(result)
 
-        except UnsupportedFilterShapeError:
+        except (UnsupportedFilterShapeError, FilterPrincipalContextError):
             return self._gm.bad_request("Agent graph filter configuration is invalid")
         except Exception as exc:
             if is_clickhouse_api_read_unavailable_error(exc):

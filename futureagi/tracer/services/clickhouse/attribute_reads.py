@@ -104,12 +104,9 @@ ATTRIBUTE_READ_MAX_PROJECTS = 64
 ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE = 50
 ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT = 64
 ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 15
-# Keep the signed cursor below common 8 KiB request-line limits even when the
-# digests are random (and therefore barely compressible).  With the complete
-# scope/query/order envelope, 192 128-bit hex digests leave room for the full
-# endpoint path plus the maximum 512-byte search value under an 8 KiB request
-# line. The picker remains explicitly sample-labelled at this finite ceiling.
-ATTRIBUTE_VALUE_CURSOR_MAX_SEEN = 192
+# De-duplication state lives in immutable server-side chunks.  The signed URL
+# therefore remains fixed width while pagination can continue until the frozen
+# physical window is exhausted; there is no vocabulary-count ceiling.
 
 # Attribute-key browse cursors use the same frozen newest-first physical walk
 # as value cursors. Keep full 128-bit key identities and a lower suggestion cap
@@ -119,7 +116,6 @@ ATTRIBUTE_VALUE_CURSOR_MAX_SEEN = 192
 ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE = 50
 ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT = 64
 ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES = 15
-ATTRIBUTE_KEY_CURSOR_MAX_SEEN = 224
 ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES = 16
 # The absolute returned-token guard covers unexpected high-entropy identity
 # shapes as well as the modeled 255-byte trace/span maximum. The endpoint adds
@@ -2718,7 +2714,7 @@ class AttributeReadSelector:
             raise ValueError("key offset requires a resume identity")
 
         seen = tuple(dict.fromkeys(str(value) for value in seen_key_digests))
-        if len(seen) > ATTRIBUTE_KEY_CURSOR_MAX_SEEN or any(
+        if any(
             len(value) != ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES * 2
             or any(char not in "0123456789abcdef" for char in value)
             for value in seen
@@ -2764,8 +2760,6 @@ class AttributeReadSelector:
                         prior.count + 1,
                     )
                     continue
-                if len(seen_set) + len(emitted) >= ATTRIBUTE_KEY_CURSOR_MAX_SEEN:
-                    return False, index
                 emitted[digest] = AttributeKeyRow(key, attr_type, 1)
                 emitted_digests.append(digest)
                 if len(emitted) >= page_size:
@@ -2810,7 +2804,6 @@ class AttributeReadSelector:
             and len(emitted) < page_size
             and next_resume_identity is None
             and candidate_pages < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
-            and len(seen_set) + len(emitted) < ATTRIBUTE_KEY_CURSOR_MAX_SEEN
             # Every walk iteration issues one candidate query and one
             # latest-state verification query.  A resumed wide row consumes
             # one query before this loop, so leave room for the pair instead
@@ -2864,9 +2857,8 @@ class AttributeReadSelector:
 
         exhausted = current_segment_end <= start and next_resume_identity is None
         seen_after = (*seen, *emitted_digests)
-        capped = len(seen_after) >= ATTRIBUTE_KEY_CURSOR_MAX_SEEN
         browse_status: AttributeKeyBrowseStatus = (
-            "limit_reached" if capped else "exhausted" if exhausted else "continuation"
+            "exhausted" if exhausted else "continuation"
         )
         has_more = browse_status == "continuation"
         # A successful cursor page is a complete request, not a sampled
@@ -2907,6 +2899,7 @@ class AttributeReadSelector:
         resume_member_offset: int = 0,
         seen_value_digests: Iterable[str] = (),
         search: str | None = None,
+        attribute_type: AttributeType | None = None,
     ) -> AttributeValueCursorPageRead:
         """Return a bounded newest-first page of verified unique values.
 
@@ -2919,15 +2912,17 @@ class AttributeReadSelector:
         current state independently because ClickHouse 25.3 cannot preserve a
         historical ReplacingMergeTree snapshot after background merges.
 
-        The result remains explicitly sampled even when a particular request
-        exhausts its finite page budget.  Returned option values are exact;
-        only global vocabulary coverage is bounded.
+        Each returned page is exact for its ordered continuation prefix.  A
+        finite per-request scan budget yields another continuation rather than
+        truncating the vocabulary or publishing sampled/incomplete metadata.
         """
 
         self._begin_operation()
         projects = self._project_ids(project_ids)
         key = validate_attribute_key(key)
         normalized_search = validate_attribute_search(search or "")
+        if attribute_type is not None and attribute_type not in _TYPE_PRIORITY:
+            raise ValueError("invalid filter-value attribute type")
         page_size = int(page_size)
         if not 1 <= page_size <= ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE:
             raise ValueError("filter-value page_size is out of range")
@@ -2982,7 +2977,7 @@ class AttributeReadSelector:
             raise ValueError("member offset requires a resume identity")
 
         seen = tuple(dict.fromkeys(str(value) for value in seen_value_digests))
-        if len(seen) > ATTRIBUTE_VALUE_CURSOR_MAX_SEEN or any(
+        if any(
             len(value) != 32 or any(char not in "0123456789abcdef" for char in value)
             for value in seen
         ):
@@ -3010,6 +3005,8 @@ class AttributeReadSelector:
             """Consume one row; return (fully_consumed, next_member_offset)."""
 
             attr_type = decoded[0]
+            if attribute_type is not None and attr_type != attribute_type:
+                return True, len(candidates_for(decoded))
             candidates = candidates_for(decoded)
             if member_offset > len(candidates):
                 raise ValueError("invalid filter-value member offset")
@@ -3069,7 +3066,6 @@ class AttributeReadSelector:
             and len(emitted) < page_size
             and next_resume_identity is None
             and candidate_pages < ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
-            and len(seen_set) + len(emitted) < ATTRIBUTE_VALUE_CURSOR_MAX_SEEN
         ):
             segment_start = max(
                 start, current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
@@ -3130,15 +3126,13 @@ class AttributeReadSelector:
 
         exhausted = current_segment_end <= start and next_resume_identity is None
         seen_after = (*seen, *emitted_digests)
-        capped = len(seen_after) >= ATTRIBUTE_VALUE_CURSOR_MAX_SEEN
-        has_more = not exhausted and not capped
-        # Every cursor page uses a bounded physical sample.  Even the terminal
-        # page retains the sampled marker because it contains only values not
-        # emitted by earlier pages, rather than a full distribution payload.
+        has_more = not exhausted
+        # A list page is exact even while a later continuation exists.  This is
+        # not an aggregate coverage claim: every emitted option was verified
+        # against latest state and the cursor can exhaust the remaining window.
         metadata = self._metadata(
-            complete=False,
-            error_code="sample_limit",
-            sampled=True,
+            complete=True,
+            error_code=None,
             window_start=start,
             window_end=end,
             query_count=self._query_count,
@@ -3513,7 +3507,6 @@ def merge_read_metadata(
 __all__ = [
     "ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES",
     "ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE",
-    "ATTRIBUTE_KEY_CURSOR_MAX_SEEN",
     "ATTRIBUTE_READ_HORIZON_DAYS",
     "ATTRIBUTE_READ_MAX_PROJECTS",
     "ATTRIBUTE_READ_SETTINGS",

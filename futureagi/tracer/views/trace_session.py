@@ -2666,6 +2666,9 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_state.order[1] if cursor_state is not None else None
                 ),
                 include_incomplete_rows=cursor_enabled,
+                continuation_slice_start=(
+                    cursor_state.scan_slice_start if cursor_state is not None else None
+                ),
                 continuation_slice_end=(
                     cursor_state.scan_slice_end if cursor_state is not None else None
                 ),
@@ -3021,6 +3024,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_state=cursor_state,
                 ),
                 seen_rows=cursor_seen_rows,
+                scan_slice_start=(
+                    bounded_page.continuation_slice_start
+                    if not bounded_page.has_more
+                    else None
+                ),
                 scan_slice_end=(
                     bounded_page.continuation_slice_end
                     if not bounded_page.has_more

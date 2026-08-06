@@ -99,9 +99,9 @@ def _attribute_value_cursor_page(
     return AttributeValueCursorPageRead(
         tuple(AttributeValueRow(value, "string", 1) for value in values),
         AttributeReadMetadata(
-            query_complete=False,
-            query_status="sampled",
-            query_error_code="sample_limit",
+            query_complete=True,
+            query_status="complete",
+            query_error_code=None,
             query_window_start=now - timedelta(days=365),
             query_window_end=now,
             query_count=2,
@@ -1794,6 +1794,7 @@ class TestMetricsEndpoint:
                 "project_ids": str(observe_project.id),
                 "source": "traces",
                 "page_size": 2,
+                "attribute_type": "string",
             },
         )
 
@@ -1805,8 +1806,10 @@ class TestMetricsEndpoint:
         ]
         assert first_payload["has_more"] is True
         assert isinstance(first_payload["next_cursor"], str)
-        assert first_payload["query_status"] == "sampled"
-        assert first_payload["query_error_code"] == "sample_limit"
+        assert first_payload["attribute_type"] == "string"
+        assert first_payload["query_complete"] is True
+        assert first_payload["query_status"] == "complete"
+        assert "query_error_code" not in first_payload
 
         second = auth_client.get(
             "/tracer/dashboard/filter_values/",
@@ -1816,6 +1819,7 @@ class TestMetricsEndpoint:
                 "project_ids": str(observe_project.id),
                 "source": "traces",
                 "page_size": 2,
+                "attribute_type": "string",
                 "cursor": first_payload["next_cursor"],
             },
         )
@@ -1828,10 +1832,12 @@ class TestMetricsEndpoint:
         assert selector.read_value_cursor_page.call_count == 2
         second_kwargs = selector.read_value_cursor_page.call_args_list[1].kwargs
         assert second_kwargs["before_identity"] == first_before
+        assert second_kwargs["attribute_type"] == "string"
         assert second_kwargs["seen_value_digests"] == (
             completed_digest,
             failed_digest,
         )
+
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.AttributeReadSelector")
     def test_filter_values_cursor_is_bound_to_search_and_rejects_mismatch(

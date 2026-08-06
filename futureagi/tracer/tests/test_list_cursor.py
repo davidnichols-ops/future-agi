@@ -132,6 +132,7 @@ def test_cursor_round_trip_preserves_datetime_and_complete_order_tuple():
 
 def test_cursor_round_trip_preserves_scan_checkpoint_without_version_state():
     token, values = _token(
+        scan_slice_start=datetime(2026, 6, 30, 10, tzinfo=UTC),
         scan_slice_end=datetime(2026, 6, 30, 12, tzinfo=UTC),
         scan_before_start_time=datetime(2026, 6, 30, 11, 59, tzinfo=UTC),
         scan_before_id="candidate-9",
@@ -145,6 +146,7 @@ def test_cursor_round_trip_preserves_scan_checkpoint_without_version_state():
         page_size=values["page_size"],
     )
 
+    assert cursor.scan_slice_start == datetime(2026, 6, 30, 10, tzinfo=UTC)
     assert cursor.scan_slice_end == datetime(2026, 6, 30, 12, tzinfo=UTC)
     assert cursor.scan_before_start_time == datetime(2026, 6, 30, 11, 59, tzinfo=UTC)
     assert cursor.scan_before_id == "candidate-9"

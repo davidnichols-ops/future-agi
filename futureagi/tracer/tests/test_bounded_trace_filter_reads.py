@@ -2679,6 +2679,7 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
 def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
     from tracer.views.trace import (
         TRACE_LIST_CANDIDATE_DEADLINE_MS,
+        TRACE_LIST_ENRICHMENT_MAX_WORKERS,
         TRACE_LIST_READ_SETTINGS,
         TRACE_LIST_WALL_DEADLINE_MS,
         TraceView,
@@ -2786,6 +2787,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
         bounded_read.call_args.kwargs["deadline_ms"] <= TRACE_LIST_CANDIDATE_DEADLINE_MS
     )
     assert TRACE_LIST_CANDIDATE_DEADLINE_MS < TRACE_LIST_WALL_DEADLINE_MS < 30_000
+    assert TRACE_LIST_ENRICHMENT_MAX_WORKERS == 2
     assert len(analytics.calls) == 3
     assert all(0 < timeout_ms <= 900 for _, timeout_ms, _ in analytics.calls)
     assert all(
@@ -6194,6 +6196,7 @@ def test_bounded_continuation_resumes_after_last_fully_classified_seed_page() ->
     assert first.complete is False
     assert [row["id"] for row in first.rows] == ["span-0", "span-1"]
     assert first.has_more is False
+    assert first.continuation_slice_start is not None
     assert first.continuation_slice_end is not None
     assert first.continuation_before_start_time == rows[1]["start_time"]
     assert first.continuation_before_id == "span-1"
@@ -6214,6 +6217,7 @@ def test_bounded_continuation_resumes_after_last_fully_classified_seed_page() ->
         bounded_continuation=True,
         cursor_start_time=first.rows[-1]["start_time"],
         cursor_order_token=first.rows[-1]["id"],
+        continuation_slice_start=first.continuation_slice_start,
         continuation_slice_end=first.continuation_slice_end,
         continuation_before_start_time=first.continuation_before_start_time,
         continuation_before_id=first.continuation_before_id,

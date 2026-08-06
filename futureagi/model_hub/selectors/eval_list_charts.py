@@ -57,6 +57,7 @@ class EvalListChartsResult(TypedDict):
     charts: EvalTemplateCharts
     query_complete: bool
     query_status: QueryStatus
+    query_sampled: Literal[False]
     data_stale: bool
     query_error_code: NotRequired[QueryErrorCode]
 
@@ -126,6 +127,7 @@ def _result(
         charts=charts,
         query_complete=query_complete,
         query_status=query_status,
+        query_sampled=False,
         data_stale=data_stale,
     )
     if query_error_code is not None:

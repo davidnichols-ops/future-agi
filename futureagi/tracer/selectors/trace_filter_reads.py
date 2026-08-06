@@ -122,6 +122,7 @@ class BoundedFilterPage:
     # classified, so the next signed request can resume without rescanning an
     # already-published prefix or skipping unclassified candidates.
     continuation_slice_end: datetime | None = None
+    continuation_slice_start: datetime | None = None
     continuation_before_start_time: datetime | None = None
     continuation_before_id: Any = None
 
@@ -265,6 +266,7 @@ def read_bounded_filter_page(
     include_incomplete_rows: bool = False,
     cursor_start_time: datetime | None = None,
     cursor_order_token: Any = None,
+    continuation_slice_start: datetime | None = None,
     continuation_slice_end: datetime | None = None,
     continuation_before_start_time: datetime | None = None,
     continuation_before_id: Any = None,
@@ -309,6 +311,8 @@ def read_bounded_filter_page(
         raise ValueError("continuation seed values must be provided together")
     if continuation_slice_end is None and continuation_before_start_time is not None:
         raise ValueError("continuation seed requires a slice end")
+    if continuation_slice_start is not None and continuation_slice_end is None:
+        raise ValueError("continuation slice start requires a slice end")
     if cursor_start_time is not None and page_number != 0:
         raise ValueError("cursor reads must use page_number zero")
     if continuation_slice_end is not None and page_number != 0:
@@ -431,16 +435,24 @@ def read_bounded_filter_page(
     request_start, request_end = builder.parse_time_range(filters)
     request_start = _without_timezone(request_start)
     request_end = _without_timezone(request_end)
+    if continuation_slice_start is not None:
+        continuation_slice_start = _without_timezone(continuation_slice_start)
     if continuation_slice_end is not None:
         continuation_slice_end = _without_timezone(continuation_slice_end)
         if not request_start < continuation_slice_end <= request_end:
             raise ValueError("continuation slice is outside the request window")
+    if continuation_slice_start is not None and not (
+        request_start
+        <= continuation_slice_start
+        < (continuation_slice_end or request_end)
+    ):
+        raise ValueError("continuation slice is outside the request window")
     if continuation_before_start_time is not None:
         continuation_before_start_time = _without_timezone(
             continuation_before_start_time
         )
         if (
-            not request_start
+            not (continuation_slice_start or request_start)
             <= continuation_before_start_time
             < (continuation_slice_end or request_end)
         ):
@@ -858,6 +870,16 @@ def read_bounded_filter_page(
         if use_cursor_seed_keyset
         else request_end
     )
+    # A scan keyset is meaningful only inside the exact half-open slice that
+    # produced it. Preserve that lower boundary across requests. Legacy v3
+    # cursors did not carry it, so resume from the frozen window start: slower,
+    # but exact and gap-free.
+    active_slice_start: datetime | None = (
+        (continuation_slice_start or request_start)
+        if continuation_slice_end is not None
+        and continuation_before_start_time is not None
+        else None
+    )
     slice_width = _INITIAL_SLICE
     before_start_time: datetime | None = (
         continuation_before_start_time
@@ -873,6 +895,7 @@ def read_bounded_filter_page(
     page_complete = False
     degraded_error_code: str | None = None
     safe_slice_end = slice_end
+    safe_active_slice_start = active_slice_start
     safe_before_start_time = before_start_time
     safe_before_id = before_id
     safe_seen_seed_ids: set[Hashable] = set()
@@ -887,6 +910,7 @@ def read_bounded_filter_page(
         """Commit only a fully classified candidate-prefix scan position."""
 
         nonlocal safe_slice_end
+        nonlocal safe_active_slice_start
         nonlocal safe_before_start_time
         nonlocal safe_before_id
         nonlocal safe_seen_seed_ids
@@ -895,6 +919,7 @@ def read_bounded_filter_page(
         nonlocal safe_pending_identity_candidates
         nonlocal continuation_progressed
         safe_slice_end = slice_end
+        safe_active_slice_start = active_slice_start
         safe_before_start_time = before_start_time
         safe_before_id = before_id
         safe_seen_seed_ids = set(seen_seed_ids)
@@ -1849,7 +1874,15 @@ def read_bounded_filter_page(
                 active_width = max(active_width, remaining_window / remaining_attempts)
             if forced_width_cap is not None:
                 active_width = min(active_width, forced_width_cap)
-            slice_start = max(request_start, slice_end - active_width)
+            scheduled_slice_start = max(request_start, slice_end - active_width)
+            slice_start = active_slice_start or scheduled_slice_start
+            if active_slice_start is None:
+                # Bind every in-slice keyset checkpoint to the exact lower
+                # boundary that produced it. Without this assignment page N
+                # encoded only the upper boundary + before key and could resume
+                # from a newly scheduled wider slice, skipping older rows.
+                active_slice_start = slice_start
+            active_width = slice_end - slice_start
 
             seed_query, seed_params = seed_page_builder(
                 slice_start=slice_start,
@@ -1873,6 +1906,7 @@ def read_bounded_filter_page(
                     and active_width > _INITIAL_SLICE
                 ):
                     forced_width_cap = max(_INITIAL_SLICE, active_width / 2)
+                    active_slice_start = None
                     before_start_time = None
                     before_id = None
                     continue
@@ -1998,6 +2032,7 @@ def read_bounded_filter_page(
                 )
             slice_end = slice_start
             slice_width = min(active_width * 2, _MAX_SLICE)
+            active_slice_start = None
             before_start_time = None
             before_id = None
             if bounded_continuation:
@@ -2019,6 +2054,7 @@ def read_bounded_filter_page(
             pending_identity_candidates.clear()
             pending_identity_candidates.update(safe_pending_identity_candidates)
             slice_end = safe_slice_end
+            active_slice_start = safe_active_slice_start
             before_start_time = safe_before_start_time
             before_id = safe_before_id
 
@@ -2105,6 +2141,11 @@ def read_bounded_filter_page(
         attempts=tuple(attempts),
         deferred_candidate_rows=tuple(deferred_candidate_by_id.values()),
         classification_deferred=defer_classification,
+        continuation_slice_start=(
+            active_slice_start
+            if bounded_continuation and not page_complete and continuation_progressed
+            else None
+        ),
         continuation_slice_end=(
             slice_end
             if bounded_continuation and not page_complete and continuation_progressed

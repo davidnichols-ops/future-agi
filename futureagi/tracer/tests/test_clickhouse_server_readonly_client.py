@@ -1,6 +1,6 @@
 """Contracts for server-locked read-only ClickHouse connections."""
 
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -73,6 +73,94 @@ def test_regular_read_keeps_client_side_guardrails(monkeypatch):
         "readonly": 2,
         "max_execution_time": 0.25,
     }
+
+
+class _ClickHouseReadError(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(f"ClickHouse error {code}")
+
+
+def test_regular_read_retries_transient_admission_without_mutating_settings(
+    monkeypatch,
+):
+    native = Mock()
+    native.execute.side_effect = [
+        _ClickHouseReadError(202),
+        _ClickHouseReadError(202),
+        ([("ok",)], [("value", "String")]),
+    ]
+    client = _client(server_enforced_readonly=False)
+    return_client = Mock()
+    monkeypatch.setattr(client_module, "CHError", _ClickHouseReadError)
+    monkeypatch.setattr(client, "_get_client", Mock(return_value=native))
+    monkeypatch.setattr(client, "_return_client", return_client)
+    clock = iter([0.0, 0.01, 0.02, 0.04, 0.05, 0.10, 0.11])
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: next(clock))
+    sleep = Mock()
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
+    requested_settings = {"max_threads": 1}
+
+    rows, columns, _ = client.execute_read(
+        "SELECT 1",
+        timeout_ms=1_000,
+        settings=requested_settings,
+    )
+
+    assert rows == [("ok",)]
+    assert columns == [("value", "String")]
+    assert requested_settings == {"max_threads": 1}
+    assert native.execute.call_count == 3
+    assert native.execute.call_args_list[0].kwargs["settings"] == {
+        "max_threads": 1,
+        "readonly": 2,
+        "max_execution_time": 1.0,
+    }
+    assert (
+        native.execute.call_args_list[1].kwargs["settings"]["max_execution_time"] < 1.0
+    )
+    assert (
+        native.execute.call_args_list[2].kwargs["settings"]["max_execution_time"]
+        < native.execute.call_args_list[1].kwargs["settings"]["max_execution_time"]
+    )
+    assert sleep.call_args_list == [call(0.025), call(0.075)]
+    return_client.assert_called_once_with(native)
+
+
+def test_regular_read_does_not_retry_admission_past_deadline(monkeypatch):
+    native = Mock()
+    native.execute.side_effect = _ClickHouseReadError(202)
+    client = _client(server_enforced_readonly=False)
+    monkeypatch.setattr(client_module, "CHError", _ClickHouseReadError)
+    monkeypatch.setattr(client, "_get_client", Mock(return_value=native))
+    monkeypatch.setattr(client, "_return_client", Mock())
+    clock = iter([0.0, 0.09, 0.10])
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: next(clock))
+    sleep = Mock()
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
+
+    with pytest.raises(_ClickHouseReadError):
+        client.execute_read("SELECT 1", timeout_ms=100)
+
+    native.execute.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_regular_read_does_not_retry_non_admission_error(monkeypatch):
+    native = Mock()
+    native.execute.side_effect = _ClickHouseReadError(159)
+    client = _client(server_enforced_readonly=False)
+    monkeypatch.setattr(client_module, "CHError", _ClickHouseReadError)
+    monkeypatch.setattr(client, "_get_client", Mock(return_value=native))
+    monkeypatch.setattr(client, "_return_client", Mock())
+    sleep = Mock()
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
+
+    with pytest.raises(_ClickHouseReadError):
+        client.execute_read("SELECT 1", timeout_ms=1_000)
+
+    native.execute.assert_called_once()
+    sleep.assert_not_called()
 
 
 def test_long_read_uses_matching_disposable_native_transport(monkeypatch):

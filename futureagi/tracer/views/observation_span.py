@@ -1894,6 +1894,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 ),
                 read_settings=page_read_settings,
                 include_incomplete_rows=cursor_enabled,
+                continuation_slice_start=(
+                    cursor_state.scan_slice_start if cursor_state is not None else None
+                ),
                 continuation_slice_end=(
                     cursor_state.scan_slice_end if cursor_state is not None else None
                 ),
@@ -2431,22 +2434,19 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             else page_number * page_size
         ) + len(result.data)
         cursor_has_more = False
-        if (
-            cursor_enabled
-            and (
-                (bounded_page is None and has_more)
-                or (
-                    bounded_page is not None
-                    and bounded_page.complete
-                    and bounded_page.has_more
-                )
-                or (
-                    bounded_page is not None
-                    and not bounded_page.complete
-                    and (
-                        bounded_page.has_more
-                        or bounded_page.continuation_slice_end is not None
-                    )
+        if cursor_enabled and (
+            (bounded_page is None and has_more)
+            or (
+                bounded_page is not None
+                and bounded_page.complete
+                and bounded_page.has_more
+            )
+            or (
+                bounded_page is not None
+                and not bounded_page.complete
+                and (
+                    bounded_page.has_more
+                    or bounded_page.continuation_slice_end is not None
                 )
             )
         ):
@@ -2464,6 +2464,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_state=cursor_state,
                 ),
                 seen_rows=cursor_seen_rows,
+                scan_slice_start=(
+                    bounded_page.continuation_slice_start
+                    if bounded_page is not None and not bounded_page.has_more
+                    else None
+                ),
                 scan_slice_end=(
                     bounded_page.continuation_slice_end
                     if bounded_page is not None and not bounded_page.has_more

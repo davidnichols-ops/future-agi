@@ -131,11 +131,19 @@ _VOICE_RAW_STATUS = (
 _VOICE_CANONICAL_RAW_STATUS = (
     "multiIf("
     f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
-    "('ended', 'done', 'complete', 'completed', 'success', 'succeeded'), "
+    "('ended', 'done', 'complete', 'completed', 'success', 'succeeded', 'ok'), "
     "'completed', "
     f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
     "('in-progress', 'in_progress', 'ongoing', 'started', 'ringing', "
     "'queued', 'pending'), 'in-progress', "
+    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
+    "('failed', 'failure', 'error', 'errored'), 'failed', "
+    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
+    "('dropped', 'cancelled', 'canceled', 'aborted', 'hung-up', 'hung_up'), "
+    "'dropped', "
+    f"lowerUTF8(toString({_VOICE_RAW_STATUS})) IN "
+    "('not-connected', 'not_connected', 'no-answer', 'no_answer', "
+    "'unanswered', 'busy'), 'not-connected', "
     f"lowerUTF8(toString({_VOICE_RAW_STATUS})))"
 )
 _VOICE_HAS_RAW_LOG = (
