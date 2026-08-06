@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 DASHBOARD_QUERY_METADATA_FIELDS = (
     "query_complete",
     "query_status",
+    "query_sampled",
     "query_error_code",
     "query_sampling_strategy",
     "query_sampling_interval_seconds",
@@ -269,17 +270,17 @@ def rescale_rate_to_percent(agg_expr: str, aggregation: str) -> str:
 
 AGGREGATIONS: dict[str, str] = {
     "avg": "avg({col})",
-    "median": "quantile(0.5)({col})",
+    "median": "quantileExact(0.5)({col})",
     "max": "max({col})",
     "min": "min({col})",
-    "p25": "quantile(0.25)({col})",
-    "p50": "quantile(0.5)({col})",
-    "p75": "quantile(0.75)({col})",
-    "p90": "quantile(0.9)({col})",
-    "p95": "quantile(0.95)({col})",
-    "p99": "quantile(0.99)({col})",
+    "p25": "quantileExact(0.25)({col})",
+    "p50": "quantileExact(0.5)({col})",
+    "p75": "quantileExact(0.75)({col})",
+    "p90": "quantileExact(0.9)({col})",
+    "p95": "quantileExact(0.95)({col})",
+    "p99": "quantileExact(0.99)({col})",
     "count": "count()",
-    "count_distinct": "uniq({col})",
+    "count_distinct": "uniqExact({col})",
     "sum": "sum({col})",
 }
 
@@ -397,6 +398,7 @@ _MATERIALIZED_DASHBOARD_COLS: tuple[str, ...] = ()
 def _resolved_spans_source(
     alias: str | None = None,
     *,
+    latest_state: bool = False,
     include_end_user_dimension: bool = False,
     physical_end_user_filter: str = "",
     physical_trace_session_filter: str = "",
@@ -487,11 +489,12 @@ def _resolved_spans_source(
     additional_projection = (
         f", {', '.join(projected_columns)}" if projected_columns else ""
     )
+    spans_source = "spans AS sp FINAL" if latest_state else "spans AS sp"
     return (
         "(SELECT sp.project_id AS project_id, "
         f"sp.* EXCEPT ({', '.join(excluded_columns)})"
         f"{additional_projection} "
-        f"FROM spans AS sp {eu_join} {ts_join} {dimension_join}"
+        f"FROM {spans_source} {eu_join} {ts_join} {dimension_join}"
         f"{inner_scope}) AS {out_alias}"
     )
 
@@ -523,6 +526,13 @@ class DashboardQueryBuilder:
     # partitioned by start_time, and retaining the legacy predicate prevents
     # eligible queries from reading the root-span projection.
     _spans_partitioned_by_created_at: bool = True
+
+    # Direct-write CH25 spans are a ReplacingMergeTree. The V2 subclass flips
+    # this on so every aggregate reads one latest physical row per span rather
+    # than relying on background merges. Keeping FINAL in the SQL (instead of a
+    # query-local setting) also preserves exactness on server-locked read-only
+    # connections, which intentionally strip client settings.
+    _latest_state_spans_required: bool = False
 
     _DIRECT_USER_METRIC_EXPRESSIONS = {
         # Preserve the dictionary path's missing-label fallback: a live span
@@ -959,6 +969,7 @@ class DashboardQueryBuilder:
             )
             return _resolved_spans_source(
                 None if alias == "spans" else alias,
+                latest_state=self._latest_state_spans_required,
                 include_end_user_dimension=(
                     self._direct_end_users_available
                     and self._query_references_user_dimension(
@@ -972,6 +983,8 @@ class DashboardQueryBuilder:
                     metric_name, per_metric_filters
                 ),
             )
+        if self._latest_state_spans_required:
+            return "spans FINAL" if alias == "spans" else f"spans AS {alias} FINAL"
         return "spans" if alias == "spans" else f"spans AS {alias}"
 
     @staticmethod
@@ -1083,6 +1096,7 @@ class DashboardQueryBuilder:
         rollup enabled and the window inside coverage — fail-closed everywhere else."""
         return (
             self._attr_rollup_available
+            and not self.config.get("require_versioned_snapshot", False)
             and metric_name == "latency"
             and aggregation == "avg"
             and self.granularity in _ROLLUP_GRANULARITIES

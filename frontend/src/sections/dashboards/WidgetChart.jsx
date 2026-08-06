@@ -1,5 +1,5 @@
-/* eslint-disable react/prop-types */
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import PropTypes from "prop-types";
 import { Alert, Box, CircularProgress, Stack, Typography } from "@mui/material";
 import ChartLegend from "./ChartLegend";
 import ReactApexChart from "react-apexcharts";
@@ -7,11 +7,11 @@ import { useTheme } from "@mui/material/styles";
 import { useDashboardQuery } from "src/hooks/useDashboards";
 import { format } from "date-fns";
 import {
-  DEFAULT_DECIMALS,
   escapeHtml,
   formatValueWithConfig,
   fromAxisConfigPayload,
   getAutoDecimals,
+  getExactDashboardResult,
   getDashboardMetricSeriesState,
   getSeriesAverage,
   getSuggestedUnitConfig,
@@ -20,7 +20,13 @@ import {
   seriesHasDataPoints,
 } from "./widgetUtils";
 import { toTimeRangePayload } from "./dashboardDateRange";
-import { getQueryReadMessage } from "src/utils/queryReadState";
+import {
+  AGGREGATION_PREPARING_MESSAGE,
+  getAggregationPollDelay,
+  getAggregationRefreshState,
+  getExactAggregationReadState,
+  getQueryCompletedAt,
+} from "src/utils/queryReadState";
 
 const CHART_HEIGHT_FALLBACK = 280;
 const NO_DATA_FOR_RANGE_MESSAGE =
@@ -83,28 +89,47 @@ function getApexType(chartType) {
   return map[chartType] || "line";
 }
 
-function QueryReadAlerts({ hasSampledMetrics, hasDegradedMetrics }) {
-  if (!hasSampledMetrics && !hasDegradedMetrics) return null;
+function QueryReadStatus({ unavailable, hasSnapshot }) {
+  if (!unavailable || hasSnapshot) return null;
 
   return (
-    <Stack gap={0.5} sx={{ width: "100%", px: 1, pt: 0.5 }}>
-      {hasSampledMetrics && (
-        <Alert severity="warning" sx={{ py: 0 }}>
-          {getQueryReadMessage("sampled")}
-        </Alert>
-      )}
-      {hasDegradedMetrics && (
-        <Alert severity="error" sx={{ py: 0 }}>
-          {getQueryReadMessage("degraded")}
-        </Alert>
-      )}
-    </Stack>
+    <Typography
+      role="status"
+      variant="caption"
+      color="text.secondary"
+      sx={{ width: "100%", px: 1, pt: 0.5, textAlign: "center" }}
+    >
+      {AGGREGATION_PREPARING_MESSAGE}
+    </Typography>
   );
 }
 
-export default function WidgetChart({ widget, globalDateRange }) {
+QueryReadStatus.propTypes = {
+  unavailable: PropTypes.bool,
+  hasSnapshot: PropTypes.bool,
+};
+
+const getExactDashboardSnapshot = (response, signature) => {
+  const result = getExactDashboardResult(response);
+  if (!result) return null;
+
+  return {
+    signature,
+    result,
+    updatedAt: getQueryCompletedAt(response),
+  };
+};
+
+export default function WidgetChart({
+  widget,
+  dashboardId,
+  globalDateRange,
+  refreshRequestId = 0,
+  onQuerySettled,
+}) {
   const theme = useTheme();
   const queryMutation = useDashboardQuery();
+  const mutateDashboardQuery = queryMutation.mutate;
   const rawQueryConfig = widget.query_config;
   // If globalDateRange is provided, override the widget's time range
   const queryConfig = useMemo(() => {
@@ -156,18 +181,129 @@ export default function WidgetChart({ widget, globalDateRange }) {
     () => JSON.stringify(queryConfig || {}),
     [queryConfig],
   );
-  useEffect(() => {
-    if (queryConfig?.metrics?.length > 0) {
-      queryMutation.mutate(queryConfig);
-    }
-  }, [querySignature, queryConfig]);
+  // Mutation data can be pre-seeded by a caller/query cache on first mount.
+  // Subsequent responses are accepted only through the exactness gate below.
+  const initialSnapshot = getExactDashboardSnapshot(
+    queryMutation.data,
+    querySignature,
+  );
+  const [lastExactSnapshot, setLastExactSnapshot] = useState(initialSnapshot);
+  const [latestOutcome, setLatestOutcome] = useState(() => ({
+    signature: querySignature,
+    unavailable: Boolean(queryMutation.data && !initialSnapshot),
+  }));
+  const previousSignatureRef = useRef(null);
+  const previousRefreshRequestRef = useRef(refreshRequestId);
+  const onQuerySettledRef = useRef(onQuerySettled);
+  onQuerySettledRef.current = onQuerySettled;
 
-  const result = queryMutation.data?.data?.result;
-  const { renderableMetrics, series, hasSampledMetrics, hasDegradedMetrics } =
-    useMemo(
-      () => getDashboardMetricSeriesState(result?.metrics),
-      [result?.metrics],
-    );
+  useEffect(() => {
+    if (!queryConfig?.metrics?.length) return undefined;
+
+    const signatureChanged = previousSignatureRef.current !== querySignature;
+    const isManualRefresh =
+      !signatureChanged && refreshRequestId > previousRefreshRequestRef.current;
+    previousSignatureRef.current = querySignature;
+    previousRefreshRequestRef.current = refreshRequestId;
+    let active = true;
+    let pollTimer = null;
+    let pollAttempt = 0;
+    let refreshWasQueued = false;
+
+    const settle = (snapshot, exact) => {
+      if (!active) return;
+      onQuerySettledRef.current?.({
+        dashboardId,
+        widgetId: widget.id,
+        refreshRequestId,
+        manualRefresh: isManualRefresh,
+        exact,
+        updatedAt: exact ? snapshot?.updatedAt || null : null,
+      });
+    };
+
+    const schedulePoll = () => {
+      if (!active || pollTimer !== null) return;
+      const delay = getAggregationPollDelay(pollAttempt);
+      pollAttempt += 1;
+      pollTimer = window.setTimeout(() => {
+        pollTimer = null;
+        executeQuery(false);
+      }, delay);
+    };
+
+    const executeQuery = (refresh) => {
+      mutateDashboardQuery(
+        { queryConfig, refresh },
+        {
+          onSuccess: (response) => {
+            if (!active) return;
+            const snapshot = getExactDashboardSnapshot(
+              response,
+              querySignature,
+            );
+            const { isRefreshing, refreshFailed } =
+              getAggregationRefreshState(response);
+            const readState = getExactAggregationReadState(response);
+            if (snapshot) setLastExactSnapshot(snapshot);
+            setLatestOutcome({
+              signature: querySignature,
+              unavailable: !snapshot,
+            });
+
+            if (
+              isRefreshing &&
+              !refreshFailed &&
+              (snapshot || readState === "pending")
+            ) {
+              refreshWasQueued = true;
+              schedulePoll();
+              return;
+            }
+            if (refreshFailed) {
+              settle(snapshot, false);
+              return;
+            }
+            settle(snapshot, Boolean(snapshot));
+          },
+          onError: () => {
+            if (!active) return;
+            setLatestOutcome({ signature: querySignature, unavailable: true });
+            if (refreshWasQueued) {
+              schedulePoll();
+              return;
+            }
+            settle(null, false);
+          },
+        },
+      );
+    };
+
+    executeQuery(isManualRefresh);
+
+    return () => {
+      active = false;
+      if (pollTimer !== null) window.clearTimeout(pollTimer);
+    };
+  }, [
+    mutateDashboardQuery,
+    dashboardId,
+    queryConfig,
+    querySignature,
+    refreshRequestId,
+    widget.id,
+  ]);
+
+  const exactSnapshot =
+    lastExactSnapshot?.signature === querySignature ? lastExactSnapshot : null;
+  const result = exactSnapshot?.result;
+  const { renderableMetrics, series } = useMemo(
+    () => getDashboardMetricSeriesState(result?.metrics),
+    [result?.metrics],
+  );
+  const readUnavailable =
+    (latestOutcome.signature === querySignature && latestOutcome.unavailable) ||
+    (queryMutation.isError && !queryMutation.isPending);
 
   // Auto-select top 10 series by total value when there are many breakdown series
   const MAX_CHART_SERIES = 10;
@@ -194,6 +330,23 @@ export default function WidgetChart({ widget, globalDateRange }) {
     if (visibleSeries === null) return series;
     return series.filter((_, i) => visibleSeries.has(i));
   }, [series, visibleSeries]);
+
+  // A missing aggregate bucket is not a zero. Keep the exact response intact,
+  // but omit null points from line rendering so Apex connects the neighbouring
+  // observed points instead of drawing a misleading broken series. Tables and
+  // every non-line chart continue to receive the original sparse buckets.
+  const plottedChartSeries = useMemo(
+    () =>
+      isLineChart
+        ? chartSeries.map((chartSeriesItem) => ({
+            ...chartSeriesItem,
+            data: (chartSeriesItem.data || []).filter(
+              (point) => point?.y != null,
+            ),
+          }))
+        : chartSeries,
+    [chartSeries, isLineChart],
+  );
 
   // Build from the full `series` list (not filtered chartSeries) so a
   // hidden series keeps its slot and its color stays put when unhidden.
@@ -301,7 +454,7 @@ export default function WidgetChart({ widget, globalDateRange }) {
       formatValueWithConfig(val, cfg, { fallbackDecimals, includeUnit });
   const formatVal = makeFormatter(leftAxisFormatConfig);
 
-  if (queryMutation.isPending) {
+  if (queryMutation.isPending && !exactSnapshot) {
     return (
       <Box
         ref={containerRef}
@@ -315,26 +468,6 @@ export default function WidgetChart({ widget, globalDateRange }) {
         }}
       >
         <CircularProgress size={24} />
-      </Box>
-    );
-  }
-
-  if (queryMutation.isError) {
-    return (
-      <Box
-        ref={containerRef}
-        sx={{
-          display: "flex",
-          justifyContent: "center",
-          alignItems: "center",
-          width: "100%",
-          height: "100%",
-          minHeight: 0,
-        }}
-      >
-        <Typography variant="body2" color="error">
-          Failed to load chart data
-        </Typography>
       </Box>
     );
   }
@@ -353,11 +486,11 @@ export default function WidgetChart({ widget, globalDateRange }) {
           minHeight: 0,
         }}
       >
-        <QueryReadAlerts
-          hasSampledMetrics={hasSampledMetrics}
-          hasDegradedMetrics={hasDegradedMetrics}
+        <QueryReadStatus
+          unavailable={readUnavailable}
+          hasSnapshot={Boolean(exactSnapshot)}
         />
-        {!hasDegradedMetrics && (
+        {!readUnavailable && (
           <Typography variant="body2" color="text.disabled">
             No output for the selected inputs.
           </Typography>
@@ -381,9 +514,9 @@ export default function WidgetChart({ widget, globalDateRange }) {
           px: 2,
         }}
       >
-        <QueryReadAlerts
-          hasSampledMetrics={hasSampledMetrics}
-          hasDegradedMetrics={hasDegradedMetrics}
+        <QueryReadStatus
+          unavailable={readUnavailable}
+          hasSnapshot={Boolean(exactSnapshot)}
         />
         <Typography variant="body2" color="text.disabled">
           {NO_DATA_FOR_RANGE_MESSAGE}
@@ -405,9 +538,9 @@ export default function WidgetChart({ widget, globalDateRange }) {
           flexDirection: "column",
         }}
       >
-        <QueryReadAlerts
-          hasSampledMetrics={hasSampledMetrics}
-          hasDegradedMetrics={hasDegradedMetrics}
+        <QueryReadStatus
+          unavailable={readUnavailable}
+          hasSnapshot={Boolean(exactSnapshot)}
         />
         <Stack
           direction="row"
@@ -460,9 +593,9 @@ export default function WidgetChart({ widget, globalDateRange }) {
           minHeight: 0,
         }}
       >
-        <QueryReadAlerts
-          hasSampledMetrics={hasSampledMetrics}
-          hasDegradedMetrics={hasDegradedMetrics}
+        <QueryReadStatus
+          unavailable={readUnavailable}
+          hasSnapshot={Boolean(exactSnapshot)}
         />
         <table
           style={{
@@ -680,9 +813,9 @@ export default function WidgetChart({ widget, globalDateRange }) {
           flexDirection: "column",
         }}
       >
-        <QueryReadAlerts
-          hasSampledMetrics={hasSampledMetrics}
-          hasDegradedMetrics={hasDegradedMetrics}
+        <QueryReadStatus
+          unavailable={readUnavailable}
+          hasSnapshot={Boolean(exactSnapshot)}
         />
         {pieLegendNames.length > 1 && (
           <ChartLegend items={pieLegendNames} colors={COLORS} />
@@ -777,9 +910,9 @@ export default function WidgetChart({ widget, globalDateRange }) {
           overflow: "hidden",
         }}
       >
-        <QueryReadAlerts
-          hasSampledMetrics={hasSampledMetrics}
-          hasDegradedMetrics={hasDegradedMetrics}
+        <QueryReadStatus
+          unavailable={readUnavailable}
+          hasSnapshot={Boolean(exactSnapshot)}
         />
         {/* Legend */}
         <Stack
@@ -954,9 +1087,9 @@ export default function WidgetChart({ widget, globalDateRange }) {
           px: 2,
         }}
       >
-        <QueryReadAlerts
-          hasSampledMetrics={hasSampledMetrics}
-          hasDegradedMetrics={hasDegradedMetrics}
+        <QueryReadStatus
+          unavailable={readUnavailable}
+          hasSnapshot={Boolean(exactSnapshot)}
         />
         <Alert severity="warning" sx={{ width: "100%" }}>
           {outOfRangeWarning}
@@ -1311,9 +1444,9 @@ export default function WidgetChart({ widget, globalDateRange }) {
         flexDirection: "column",
       }}
     >
-      <QueryReadAlerts
-        hasSampledMetrics={hasSampledMetrics}
-        hasDegradedMetrics={hasDegradedMetrics}
+      <QueryReadStatus
+        unavailable={readUnavailable}
+        hasSnapshot={Boolean(exactSnapshot)}
       />
       {legendNames.length > 1 && (
         <ChartLegend
@@ -1327,7 +1460,7 @@ export default function WidgetChart({ widget, globalDateRange }) {
         <ReactApexChart
           key={`${axisConfig?.leftY?.unit}-${axisConfig?.leftY?.prefixSuffix}-${axisConfig?.leftY?.abbreviation}-${axisConfig?.leftY?.decimals}-${axisConfig?.leftY?.outOfBounds}`}
           options={options}
-          series={chartSeries}
+          series={plottedChartSeries}
           type={apexType}
           height={chartHeight - legendHeight}
         />
@@ -1335,3 +1468,26 @@ export default function WidgetChart({ widget, globalDateRange }) {
     </Box>
   );
 }
+
+WidgetChart.propTypes = {
+  widget: PropTypes.shape({
+    id: PropTypes.oneOfType([PropTypes.string, PropTypes.number]).isRequired,
+    query_config: PropTypes.object,
+    chart_config: PropTypes.object,
+  }).isRequired,
+  dashboardId: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
+  globalDateRange: PropTypes.shape({
+    start: PropTypes.oneOfType([
+      PropTypes.string,
+      PropTypes.number,
+      PropTypes.instanceOf(Date),
+    ]),
+    end: PropTypes.oneOfType([
+      PropTypes.string,
+      PropTypes.number,
+      PropTypes.instanceOf(Date),
+    ]),
+  }),
+  refreshRequestId: PropTypes.number,
+  onQuerySettled: PropTypes.func,
+};

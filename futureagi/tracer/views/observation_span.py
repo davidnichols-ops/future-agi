@@ -110,13 +110,16 @@ from tracer.services.clickhouse.graph_dispatch import (
 )
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
+    capture_list_relation_snapshot,
     capture_snapshot_version_ceiling,
     cursor_page_metadata,
+    cursor_requires_relation_snapshot,
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
     exact_total_explicitly_required,
     frozen_window_filter,
+    relation_snapshot_read_settings,
     snapshot_cursor_supported,
     snapshot_read_settings,
 )
@@ -139,6 +142,10 @@ from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.services.clickhouse.v2.span_selectors import (
     flatten_span_attributes_into_entry,
     merge_content_rows,
+)
+from tracer.services.filter_principal_context import (
+    FilterPrincipalContextError,
+    bind_request_my_annotations_principal,
 )
 from tracer.utils.annotations import build_annotation_subqueries
 from tracer.utils.create_otel_span import create_single_otel_span
@@ -252,6 +259,33 @@ def _span_page_identity_sets(
         list(dict.fromkeys(external)),
         app_identity_by_external,
     )
+
+
+def _span_cursor_order_for_partial_page(
+    *, rows: list[dict], bounded_page: Any, cursor_state: Any
+) -> tuple[Any, ...]:
+    """Return the exact row boundary or a progressed empty scan boundary."""
+
+    if rows:
+        row = rows[-1]
+        return (
+            row.get("start_time"),
+            str(row.get("id", "")),
+            str(row.get("trace_id", "")),
+            str(row.get("project_id", "")),
+        )
+    if cursor_state is not None:
+        return tuple(cursor_state.order)
+    checkpoint_time = (
+        bounded_page.continuation_before_start_time
+        or bounded_page.continuation_slice_end
+    )
+    if checkpoint_time is None:
+        raise ValueError("partial span page has no continuation checkpoint")
+    token = bounded_page.continuation_before_id
+    if isinstance(token, tuple) and len(token) == 3:
+        return checkpoint_time, *(str(value) for value in token)
+    return checkpoint_time, "\U0010ffff", "\U0010ffff", "\U0010ffff"
 
 
 class AddObservationSpanAnnotationsSerializer(serializers.Serializer):
@@ -764,15 +798,17 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
         except (ValueError, TypeError):
             span_attrs = {}
-        if not span_attrs:
-            # Fall back to reconstructing from decomposed maps
+        if not isinstance(span_attrs, dict):
             span_attrs = {}
-            for k, v in (row.get("attrs_string") or {}).items():
-                span_attrs[k] = v
-            for k, v in (row.get("attrs_number") or {}).items():
-                span_attrs[k] = v
-            for k, v in (row.get("attrs_bool") or {}).items():
-                span_attrs[k] = bool(v)
+        # Direct writes split scalar values into typed Maps and structured
+        # overflow into span_attributes. Always union all sources; overflow
+        # keeps precedence when a malformed producer duplicates a key.
+        for k, v in (row.get("attrs_string") or {}).items():
+            span_attrs.setdefault(k, v)
+        for k, v in (row.get("attrs_number") or {}).items():
+            span_attrs.setdefault(k, v)
+        for k, v in (row.get("attrs_bool") or {}).items():
+            span_attrs.setdefault(k, bool(v))
         # Build metadata from CH JSON column
         metadata_raw = row.get("metadata_json") or "{}"
         metadata = _parse_json(metadata_raw, default={})
@@ -1280,7 +1316,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             serializer = SpanListQuerySerializer(data=request.query_params)
             if not serializer.is_valid():
                 return self._gm.bad_request(serializer.errors)
-            validated_data = serializer.validated_data
+            validated_data = dict(serializer.validated_data)
+            validated_data["filters"] = bind_request_my_annotations_principal(
+                request,
+                validated_data.get("filters", []),
+            )
             project_version_id = str(validated_data["project_version_id"])
 
             # Tenant gate via PG (ProjectVersion + Project.organization).
@@ -1309,6 +1349,8 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.bad_request("Project version not found")
         except UnsupportedFilterShapeError:
             return self._gm.bad_request("Span filter configuration is invalid")
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
                 logger.warning(
@@ -1559,7 +1601,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
     @action(detail=False, methods=["get"])
     def list_spans_observe(self, request, *args, **kwargs):
         try:
-            validated_data = request.validated_query_data
+            validated_data = dict(request.validated_query_data)
+            validated_data["filters"] = bind_request_my_annotations_principal(
+                request,
+                validated_data.get("filters", []),
+            )
 
             project_id = (
                 str(validated_data["project_id"])
@@ -1623,6 +1669,8 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
         except UnsupportedFilterShapeError:
             return self._gm.bad_request("Span filter configuration is invalid")
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             if is_clickhouse_api_read_unavailable_error(exc):
                 logger.warning(
@@ -1787,18 +1835,6 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "Cursor pagination is unavailable for this query shape.",
             )
         cursor_enabled = cursor_requested and cursor_supported
-        version_ceiling = (
-            cursor_state.version_ceiling
-            if cursor_state is not None
-            else (
-                capture_snapshot_version_ceiling(
-                    analytics,
-                    timeout_ms=read_deadline.remaining_ms(250),
-                )
-                if cursor_enabled
-                else None
-            )
-        )
         builder = SpanListQueryBuilderV2(
             project_id=None if org_scope else str(project_id),
             project_ids=[str(p) for p in org_project_ids] if org_scope else None,
@@ -1809,15 +1845,59 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             annotation_label_ids=annotation_label_ids,
             bounded_internal_scan=cursor_enabled,
         )
-        page_read_settings = (
-            snapshot_read_settings(
-                SPAN_LIST_READ_SETTINGS,
-                builder=builder,
-                version_ceiling=version_ceiling,
-            )
-            if version_ceiling is not None
-            else SPAN_LIST_READ_SETTINGS
-        )
+        # Custom-sort/time-only legacy reads do not apply the bounded
+        # selector's keyset tuple. Advertising a cursor for that path would
+        # replay the first page forever, so keep its existing numbered-page
+        # contract and fail closed if a continuation somehow reaches it.
+        if cursor_enabled and not builder.supports_bounded_filter_scan():
+            if cursor_state is not None:
+                raise ListCursorError(
+                    "cursor_unsupported",
+                    "Cursor pagination is unavailable for this query shape.",
+                )
+            cursor_enabled = False
+            builder._bounded_internal_scan = False
+        relation_version_ceilings: dict[str, int] | None = None
+        version_ceiling = None
+        if cursor_enabled:
+            if cursor_state is not None:
+                version_ceiling = cursor_state.version_ceiling
+                relation_version_ceilings = cursor_state.relation_version_ceilings
+                page_read_settings = (
+                    relation_snapshot_read_settings(
+                        SPAN_LIST_READ_SETTINGS,
+                        version_ceilings=relation_version_ceilings,
+                    )
+                    if relation_version_ceilings
+                    else snapshot_read_settings(
+                        SPAN_LIST_READ_SETTINGS,
+                        builder=builder,
+                        version_ceiling=version_ceiling,
+                    )
+                )
+            else:
+                if cursor_requires_relation_snapshot(filters, resource="observe_spans"):
+                    page_read_settings, relation_version_ceilings = (
+                        capture_list_relation_snapshot(
+                            analytics=analytics,
+                            builder=builder,
+                            base_settings=SPAN_LIST_READ_SETTINGS,
+                            timeout_ms=read_deadline.remaining_ms(1_000),
+                        )
+                    )
+                    version_ceiling = relation_version_ceilings["spans"]
+                else:
+                    version_ceiling = capture_snapshot_version_ceiling(
+                        analytics,
+                        timeout_ms=read_deadline.remaining_ms(250),
+                    )
+                    page_read_settings = snapshot_read_settings(
+                        SPAN_LIST_READ_SETTINGS,
+                        builder=builder,
+                        version_ceiling=version_ceiling,
+                    )
+        else:
+            page_read_settings = SPAN_LIST_READ_SETTINGS
 
         # Phase 1: Paginated spans (light columns — no input/output).
         bounded_page = None
@@ -1855,6 +1935,19 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     tuple(cursor_state.order[1:]) if cursor_state is not None else None
                 ),
                 read_settings=page_read_settings,
+                include_incomplete_rows=cursor_enabled,
+                continuation_slice_end=(
+                    cursor_state.scan_slice_end if cursor_state is not None else None
+                ),
+                continuation_before_start_time=(
+                    cursor_state.scan_before_start_time
+                    if cursor_state is not None
+                    else None
+                ),
+                continuation_before_id=(
+                    cursor_state.scan_before_id if cursor_state is not None else None
+                ),
+                bounded_continuation=cursor_enabled,
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -1875,11 +1968,15 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     page_number=page_number,
                     error_code=bounded_page.error_code,
                 )
-                return self._gm.custom_error_response(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "Filtered span data is temporarily unavailable. Please retry.",
-                    code="service_unavailable",
-                )
+                if not cursor_enabled or (
+                    not bounded_page.rows
+                    and bounded_page.continuation_slice_end is None
+                ):
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Filtered span data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
             result = QueryResult(
                 data=bounded_page.rows,
                 row_count=len(bounded_page.rows),
@@ -2375,14 +2472,27 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             if cursor_state is not None
             else page_number * page_size
         ) + len(result.data)
+        cursor_has_more = False
         if (
             cursor_enabled
-            and bounded_page is not None
-            and has_more
-            and result.data
             and version_ceiling is not None
+            and (
+                (bounded_page is None and has_more)
+                or (
+                    bounded_page is not None
+                    and bounded_page.complete
+                    and bounded_page.has_more
+                )
+                or (
+                    bounded_page is not None
+                    and not bounded_page.complete
+                    and (
+                        bounded_page.has_more
+                        or bounded_page.continuation_slice_end is not None
+                    )
+                )
+            )
         ):
-            last_row = result.data[-1]
             window_start, window_end = builder.parse_time_range(filters)
             next_cursor = encode_list_cursor(
                 resource="observe_spans",
@@ -2391,22 +2501,38 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 page_size=page_size,
                 window_start=window_start,
                 window_end=window_end,
-                order=(
-                    last_row.get("start_time"),
-                    str(last_row.get("id", "")),
-                    str(last_row.get("trace_id", "")),
-                    str(last_row.get("project_id", "")),
+                order=_span_cursor_order_for_partial_page(
+                    rows=result.data,
+                    bounded_page=bounded_page,
+                    cursor_state=cursor_state,
                 ),
                 version_ceiling=version_ceiling,
                 seen_rows=cursor_seen_rows,
+                relation_version_ceilings=relation_version_ceilings,
+                scan_slice_end=(
+                    bounded_page.continuation_slice_end
+                    if bounded_page is not None and not bounded_page.has_more
+                    else None
+                ),
+                scan_before_start_time=(
+                    bounded_page.continuation_before_start_time
+                    if bounded_page is not None and not bounded_page.has_more
+                    else None
+                ),
+                scan_before_id=(
+                    bounded_page.continuation_before_id
+                    if bounded_page is not None and not bounded_page.has_more
+                    else None
+                ),
             )
+            cursor_has_more = True
 
         metadata = {"total_rows": total_count}
         if bounded_page is not None:
             metadata.update(
                 {
                     "total_rows_is_lower_bound": True,
-                    "has_more": has_more,
+                    "has_more": cursor_has_more,
                     "query_complete": bounded_page.complete,
                     "query_status": bounded_page.status,
                     "query_error_code": bounded_page.error_code,
@@ -2419,9 +2545,12 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         metadata.update(
             cursor_page_metadata(
                 enabled=cursor_enabled,
-                has_more=has_more,
+                has_more=cursor_has_more,
                 seen_rows=cursor_seen_rows,
                 next_cursor=next_cursor,
+                unseen_row_proven=bool(
+                    bounded_page is not None and bounded_page.has_more
+                ),
             )
         )
         if metadata.get(
@@ -2789,6 +2918,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         try:
             body = request.validated_data
             allow_sampled = request.validated_query_data["allow_sampled"]
+            refresh = request.validated_query_data.get("refresh", False)
             project_id = str(body["project_id"])
 
             try:
@@ -2802,7 +2932,10 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             if project.trace_type != "observe":
                 return self._gm.bad_request("Project should be of type observe")
 
-            filters = body["filters"]
+            filters = bind_request_my_annotations_principal(
+                request,
+                body["filters"],
+            )
             _property = body["property"]
             interval = body["interval"]
             req_data_config = body["req_data_config"]
@@ -2844,6 +2977,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         interval=interval,
                         metric_id=metric_id,
                         observe_type="span",
+                        refresh=refresh,
                     )
                 elif metric_type == "EVAL":
                     graph = fetch_eval_graph_ch(
@@ -2853,6 +2987,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         interval=interval,
                         req_data_config=req_data_config,
                         observe_type="span",
+                        refresh=refresh,
                     )
                 else:
                     graph = fetch_annotation_graph_ch(
@@ -2862,6 +2997,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         interval=interval,
                         req_data_config=req_data_config,
                         observe_type="span",
+                        refresh=refresh,
                     )
                 graph = enforce_exact_graph_data_contract(graph)
                 if not graph_payload_is_publishable(
@@ -2898,6 +3034,8 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         except UnsupportedFilterShapeError:
             return self._gm.bad_request("Graph filter configuration is invalid")
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             logger.exception(
                 "span_graph_request_failed",
@@ -2936,7 +3074,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
 
         selector = AttributeReadSelector(
             typed_only=True,
-            json_attribute_mode="arrays",
+            json_attribute_mode="structured",
         )
         try:
             keys, metadata = self._get_span_attribute_inventory(

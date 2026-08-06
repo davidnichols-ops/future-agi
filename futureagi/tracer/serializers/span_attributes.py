@@ -7,6 +7,7 @@ from tracer.services.clickhouse.attribute_reads import (
 )
 
 SPAN_ATTRIBUTE_TYPES = ("string", "number", "boolean", "array")
+SPAN_ATTRIBUTE_KEY_TYPES = (*SPAN_ATTRIBUTE_TYPES, "map")
 
 
 class SpanAttributeProjectQuerySerializer(serializers.Serializer):
@@ -60,7 +61,7 @@ class SpanAttributeDetailQuerySerializer(serializers.Serializer):
 
 class SpanAttributeKeySerializer(serializers.Serializer):
     key = serializers.CharField()
-    type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_TYPES)
+    type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_KEY_TYPES)
     count = serializers.IntegerField()
 
 

@@ -6,14 +6,10 @@ import {
   getListTotalState,
   getSelectionCountState,
 } from "../listTotalMetadata";
-import {
-  QUERY_READ_BOUNDED_TOTAL_MESSAGE,
-  QUERY_READ_RETRY_MESSAGE,
-  QUERY_READ_SAMPLED_MESSAGE,
-} from "src/utils/queryReadState";
+import { QUERY_READ_RETRY_MESSAGE } from "src/utils/queryReadState";
 
 describe("list total metadata", () => {
-  it("labels only the count as estimated when page rows are complete", () => {
+  it("does not warn when only the aggregate count is a lower bound", () => {
     const payload = {
       result: {
         metadata: {
@@ -25,7 +21,7 @@ describe("list total metadata", () => {
       },
     };
 
-    expect(getListReadMessage(payload)).toBe(QUERY_READ_BOUNDED_TOTAL_MESSAGE);
+    expect(getListReadMessage(payload)).toBeNull();
   });
 
   it("does not warn when both page rows and the total are exact", () => {
@@ -56,7 +52,7 @@ describe("list total metadata", () => {
     ).toBe(QUERY_READ_RETRY_MESSAGE);
   });
 
-  it("labels a valid sampled read as incomplete rather than count-only", () => {
+  it("does not show a sample banner on list surfaces", () => {
     expect(
       getListReadMessage({
         result: {
@@ -70,7 +66,22 @@ describe("list total metadata", () => {
           },
         },
       }),
-    ).toBe(QUERY_READ_SAMPLED_MESSAGE);
+    ).toBeNull();
+  });
+
+  it("does not warn when a degraded marker accompanies genuine rows", () => {
+    expect(
+      getListReadMessage({
+        result: {
+          table: [{ trace_id: "trace-a" }],
+          metadata: {
+            query_complete: false,
+            query_status: "degraded",
+            total_rows_is_lower_bound: true,
+          },
+        },
+      }),
+    ).toBeNull();
   });
 
   it("keeps an exact total available to exact-count consumers", () => {

@@ -440,7 +440,6 @@ async function fetchAllTraceIds(
         page_number: page,
         page_size: TRACE_ROWS_LIMIT,
         filters: serializedFilters,
-        allow_sampled: true,
       },
     });
     const res = resp?.data?.result;
@@ -483,7 +482,6 @@ async function fetchAllSpanIds(
         page_number: page,
         page_size: SPAN_ROWS_LIMIT,
         filters: serializedFilters,
-        allow_sampled: true,
       },
     });
     const res = resp?.data?.result;
@@ -1954,7 +1952,6 @@ function TraceSelector({
 
           const apiParams = {
             project_id: projectId,
-            allow_sampled: true,
             page_number: pageNumber,
             page_size: TRACE_ROWS_LIMIT,
             filters: JSON.stringify(
@@ -2626,7 +2623,6 @@ function SpanSelector({ onSetSelection, onSelectAll }) {
 
           const apiParams = {
             project_id: projectId,
-            allow_sampled: true,
             page_number: pageNumber,
             page_size: SPAN_ROWS_LIMIT,
             filters: JSON.stringify(
@@ -3202,7 +3198,6 @@ function SessionSelector({ onSetSelection, onSelectAll }) {
             {
               params: {
                 project_id: projectId,
-                allow_sampled: true,
                 ...(versionId ? { project_version_id: versionId } : {}),
                 page_number: pageNumber,
                 page_size: SESSION_ROWS_LIMIT,

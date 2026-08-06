@@ -44,6 +44,10 @@ from tracer.serializers.eval_task import (
 )
 from tracer.services.eval_tasks.edit_options import validate_edit_action
 from tracer.services.eval_tasks.entries import soft_delete_live
+from tracer.services.filter_principal_context import (
+    FilterPrincipalContextError,
+    bind_request_my_annotations_principal,
+)
 from tracer.utils.filters import FilterEngine
 from tracer.utils.helper import get_default_eval_task_config
 
@@ -439,9 +443,9 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
     )
     def create(self, request, *args, **kwargs):
         try:
-            data = request.data
+            data = request.data.copy()
             data["status"] = EvalTaskStatus.PENDING
-            filters = data.get("filters", {})
+            filters = data.get("filters") or {}
             project_id = data.get("project")
             if (
                 project_id
@@ -475,6 +479,8 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
 
         except ValidationError as exc:
             return self._gm.bad_request(exc.detail)
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             logger.exception(
                 "eval_task.create_failed",
@@ -1496,6 +1502,11 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 return self._gm.bad_request(serializer.errors)
 
             validated_data = serializer.validated_data
+            if "filters" in validated_data:
+                validated_data["filters"] = bind_request_my_annotations_principal(
+                    request,
+                    validated_data["filters"],
+                )
             edit_type = validated_data["edit_type"]
 
             # Get eval task with row-level locking to prevent concurrent modifications
@@ -1626,6 +1637,8 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
 
         except ValidationError as exc:
             return self._gm.bad_request(exc.detail)
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             logger.exception(
                 "eval_task.update_failed",

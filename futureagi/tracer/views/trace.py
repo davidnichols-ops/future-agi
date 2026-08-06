@@ -92,13 +92,16 @@ from tracer.services.clickhouse.graph_dispatch import (
 )
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
+    capture_list_relation_snapshot,
     capture_snapshot_version_ceiling,
     cursor_page_metadata,
+    cursor_requires_relation_snapshot,
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
     exact_total_explicitly_required,
     frozen_window_filter,
+    relation_snapshot_read_settings,
     snapshot_cursor_supported,
     snapshot_read_settings,
 )
@@ -106,6 +109,9 @@ from tracer.services.clickhouse.page_dedup import paginate_deduped
 from tracer.services.clickhouse.query_builders.base import NIL_UUID
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     UnsupportedFilterShapeError,
+)
+from tracer.services.clickhouse.query_builders.user_list import (
+    UnsupportedBoundedUserListQuery,
 )
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
 from tracer.services.clickhouse.read_budget import (
@@ -119,6 +125,7 @@ from tracer.services.clickhouse.v2.query_builders.agent_graph import (
     AgentGraphQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
+from tracer.services.clickhouse.v2.span_reader import merge_span_attributes
 from tracer.services.clickhouse.v2.span_selectors import (
     flatten_span_attributes_into_entry,
     merge_content_rows,
@@ -127,6 +134,10 @@ from tracer.services.clickhouse.v2.trace_detail_reads import (
     TraceDetailNotFound,
     TraceDetailReadUnavailable,
     read_trace_detail,
+)
+from tracer.services.filter_principal_context import (
+    FilterPrincipalContextError,
+    bind_request_my_annotations_principal,
 )
 from tracer.services.observability_providers import ObservabilityService
 from tracer.services.users_list_manager import UsersListManager
@@ -289,6 +300,33 @@ def _trace_list_cursor_order_for_row(
     return base_order
 
 
+def _trace_list_cursor_order_for_partial_page(
+    *,
+    rows: list[dict[str, Any]],
+    bounded_page: Any,
+    cursor_state: Any,
+    org_scope: bool,
+) -> tuple[Any, ...]:
+    """Return a public boundary for a progressed empty transport page."""
+
+    if rows:
+        return _trace_list_cursor_order_for_row(rows[-1], org_scope=org_scope)
+    if cursor_state is not None:
+        return tuple(cursor_state.order)
+    checkpoint_time = (
+        bounded_page.continuation_before_start_time
+        or bounded_page.continuation_slice_end
+    )
+    if checkpoint_time is None:
+        raise ValueError("partial trace page has no continuation checkpoint")
+    token = bounded_page.continuation_before_id
+    if org_scope:
+        if isinstance(token, tuple) and len(token) == 2:
+            return checkpoint_time, str(token[0]), str(token[1])
+        return checkpoint_time, "\U0010ffff", "\U0010ffff"
+    return checkpoint_time, str(token) if token is not None else "\U0010ffff"
+
+
 class TraceNavigationReadUnavailable(RuntimeError):
     def __init__(self, code: str):
         self.code = code
@@ -319,6 +357,33 @@ def _sanitize_nonfinite_floats(value):
     if isinstance(value, tuple):
         return tuple(_sanitize_nonfinite_floats(v) for v in value)
     return value
+
+
+def _trace_attribute_value_token(value: Any) -> tuple[str, str]:
+    """Return a stable exact token for heterogeneous custom-attribute values."""
+
+    if isinstance(value, (dict, list)):
+        return (
+            "structured",
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+        )
+    if isinstance(value, bool):
+        return ("bool", str(value).lower())
+    return (type(value).__name__, str(value))
+
+
+def _append_trace_attribute_value(values: list[Any], value: Any) -> None:
+    """Append one value exactly once, including scalar/JSON type changes."""
+
+    normalized = str(value).lower() if isinstance(value, bool) else value
+    token = _trace_attribute_value_token(normalized)
+    if all(_trace_attribute_value_token(existing) != token for existing in values):
+        values.append(normalized)
 
 
 _SIMULATOR_CALL_EXECUTION_KEYS = (
@@ -2086,6 +2151,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         try:
             body = request.validated_data
             allow_sampled = request.validated_query_data["allow_sampled"]
+            refresh = request.validated_query_data.get("refresh", False)
             project_id = str(body["project_id"])
             project = (
                 _project_queryset_for_request(self.request)
@@ -2099,7 +2165,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
 
             # Get parameters
-            filters = body["filters"]
+            filters = bind_request_my_annotations_principal(
+                request,
+                body["filters"],
+            )
             interval = body["interval"]
             req_data_config = body["req_data_config"]
 
@@ -2144,6 +2213,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         interval=interval,
                         metric_id=metric_id,
                         observe_type="trace",
+                        refresh=refresh,
                     )
                 elif metric_type == "EVAL":
                     graph = fetch_eval_graph_ch(
@@ -2153,6 +2223,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         interval=interval,
                         req_data_config=req_data_config,
                         observe_type="trace",
+                        refresh=refresh,
                     )
                 else:
                     graph = fetch_annotation_graph_ch(
@@ -2162,6 +2233,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         interval=interval,
                         req_data_config=req_data_config,
                         observe_type="trace",
+                        refresh=refresh,
                     )
                 graph = enforce_exact_graph_data_contract(graph)
                 if not graph_payload_is_publishable(
@@ -2198,6 +2270,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         except UnsupportedFilterShapeError:
             return self._gm.bad_request("Graph filter configuration is invalid")
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             logger.exception(
                 "trace_graph_request_failed",
@@ -2847,7 +2921,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     "unbounded-walk export against CH."
                 )
 
-            validated_data = request.validated_query_data
+            validated_data = dict(request.validated_query_data)
+            validated_data["filters"] = bind_request_my_annotations_principal(
+                request,
+                validated_data.get("filters", []),
+            )
             project_id = (
                 str(validated_data["project_id"])
                 if validated_data.get("project_id")
@@ -2905,6 +2983,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
         except UnsupportedFilterShapeError:
             return self._gm.bad_request("Trace filter configuration is invalid")
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             if is_clickhouse_api_read_unavailable_error(exc):
                 logger.warning(
@@ -2966,6 +3046,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 if not serializer.is_valid():
                     return self._gm.bad_request(serializer.errors)
                 validated_data = serializer.validated_data
+            validated_data = dict(validated_data)
+            validated_data["filters"] = bind_request_my_annotations_principal(
+                request,
+                validated_data.get("filters", []),
+            )
             project_id = str(validated_data["project_id"])
             remove_simulation_calls = validated_data.get(
                 "remove_simulation_calls", False
@@ -3005,6 +3090,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             raise
         except Project.DoesNotExist:
             return self._gm.bad_request("Project not found")
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
                 logger.warning(
@@ -3942,18 +4029,6 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "Cursor pagination is unavailable for this query shape.",
             )
         cursor_enabled = cursor_requested and cursor_supported
-        version_ceiling = (
-            cursor_state.version_ceiling
-            if cursor_state is not None
-            else (
-                capture_snapshot_version_ceiling(
-                    analytics,
-                    timeout_ms=read_deadline.remaining_ms(250),
-                )
-                if cursor_enabled
-                else None
-            )
-        )
         builder = TraceListQueryBuilderV2(
             project_id=None if org_scope else str(project_id),
             project_ids=[str(p) for p in org_project_ids] if org_scope else None,
@@ -3963,15 +4038,49 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             eval_config_ids=eval_config_ids,
             annotation_label_ids=annotation_label_ids,
         )
-        page_read_settings = (
-            snapshot_read_settings(
-                TRACE_LIST_READ_SETTINGS,
-                builder=builder,
-                version_ceiling=version_ceiling,
-            )
-            if version_ceiling is not None
-            else TRACE_LIST_READ_SETTINGS
-        )
+        relation_version_ceilings: dict[str, int] | None = None
+        version_ceiling = None
+        if cursor_enabled:
+            if cursor_state is not None:
+                version_ceiling = cursor_state.version_ceiling
+                relation_version_ceilings = cursor_state.relation_version_ceilings
+                page_read_settings = (
+                    relation_snapshot_read_settings(
+                        TRACE_LIST_READ_SETTINGS,
+                        version_ceilings=relation_version_ceilings,
+                    )
+                    if relation_version_ceilings
+                    else snapshot_read_settings(
+                        TRACE_LIST_READ_SETTINGS,
+                        builder=builder,
+                        version_ceiling=version_ceiling,
+                    )
+                )
+            else:
+                if cursor_requires_relation_snapshot(
+                    filters, resource="observe_traces"
+                ):
+                    page_read_settings, relation_version_ceilings = (
+                        capture_list_relation_snapshot(
+                            analytics=analytics,
+                            builder=builder,
+                            base_settings=TRACE_LIST_READ_SETTINGS,
+                            timeout_ms=read_deadline.remaining_ms(1_000),
+                        )
+                    )
+                    version_ceiling = relation_version_ceilings["spans"]
+                else:
+                    version_ceiling = capture_snapshot_version_ceiling(
+                        analytics,
+                        timeout_ms=read_deadline.remaining_ms(250),
+                    )
+                    page_read_settings = snapshot_read_settings(
+                        TRACE_LIST_READ_SETTINGS,
+                        builder=builder,
+                        version_ceiling=version_ceiling,
+                    )
+        else:
+            page_read_settings = TRACE_LIST_READ_SETTINGS
 
         # Phase 1: Paginated traces (light columns only — no input/output)
         bounded_page = None
@@ -4001,9 +4110,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # continuations remain fail-closed so an incomplete working set can
             # never be mistaken for an exact continuation.
             publish_bounded_partial = bool(
-                validated_data.get("allow_sampled") is True
+                (cursor_enabled or validated_data.get("allow_sampled") is True)
                 and page_number == 0
-                and cursor_state is None
+                and (cursor_state is None or cursor_enabled)
             )
             bounded_page = read_bounded_filter_page(
                 builder=builder,
@@ -4021,6 +4130,18 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 ),
                 read_settings=page_read_settings,
                 include_incomplete_rows=publish_bounded_partial,
+                continuation_slice_end=(
+                    cursor_state.scan_slice_end if cursor_state is not None else None
+                ),
+                continuation_before_start_time=(
+                    cursor_state.scan_before_start_time
+                    if cursor_state is not None
+                    else None
+                ),
+                continuation_before_id=(
+                    cursor_state.scan_before_id if cursor_state is not None else None
+                ),
+                bounded_continuation=cursor_enabled,
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -4042,6 +4163,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     error_code=bounded_page.error_code,
                 )
                 if not publish_bounded_partial:
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Filtered trace data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
+                if (
+                    cursor_enabled
+                    and not bounded_page.rows
+                    and bounded_page.continuation_slice_end is None
+                ):
                     return self._gm.custom_error_response(
                         status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Filtered trace data is temporarily unavailable. Please retry.",
@@ -4408,35 +4539,20 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if not tid or not attr_project_id:
                 continue
             attr_identity = (attr_project_id, tid)
-            raw = attr_row.get("attributes_extra", "{}")
-            try:
-                attrs = json.loads(raw) if isinstance(raw, str) else (raw or {})
-            except (json.JSONDecodeError, TypeError):
-                attrs = {}
-            # Fallback: merge from typed Map columns when raw is empty.
-            if not attrs:
-                str_map = attr_row.get("attrs_string") or {}
-                num_map = attr_row.get("attrs_number") or {}
-                if isinstance(str_map, dict):
-                    attrs.update(str_map)
-                if isinstance(num_map, dict):
-                    for key, value in num_map.items():
-                        if key not in attrs:
-                            attrs[key] = value
+            attrs = merge_span_attributes(
+                attr_row.get("attrs_string"),
+                attr_row.get("attrs_number"),
+                attr_row.get("attrs_bool"),
+                attr_row.get("attributes_extra", "{}"),
+            )
             aggregated_attrs.setdefault(attr_identity, {})
             for key, value in attrs.items():
                 if key.startswith(_SKIP_ATTR_PREFIXES):
                     continue
                 if isinstance(value, str) and len(value) > 500:
                     continue
-                if key not in aggregated_attrs[attr_identity]:
-                    aggregated_attrs[attr_identity][key] = (
-                        set() if isinstance(value, (str, int, float, bool)) else []
-                    )
-                if isinstance(value, (str, int, float, bool)):
-                    aggregated_attrs[attr_identity][key].add(
-                        value if not isinstance(value, bool) else str(value).lower()
-                    )
+                values = aggregated_attrs[attr_identity].setdefault(key, [])
+                _append_trace_attribute_value(values, value)
 
         # Build column config — get_default_trace_config() already includes
         # all standard columns (latency, tokens, cost, user_id, etc.)
@@ -4531,11 +4647,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
             for key, values in trace_attrs.items():
                 if key not in entry:
-                    if isinstance(values, set):
-                        vals = sorted(values, key=str)
-                        entry[key] = vals[0] if len(vals) == 1 else vals
-                    else:
-                        entry[key] = values
+                    vals = sorted(values, key=_trace_attribute_value_token)
+                    entry[key] = vals[0] if len(vals) == 1 else vals
 
             table_data.append(entry)
 
@@ -4559,18 +4672,27 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if cursor_state is not None
             else page_number * page_size
         ) + len(result.data)
+        cursor_has_more = False
         if (
             cursor_enabled
             and bounded_page is not None
-            and bounded_page.complete
-            and bounded_page.has_more
-            and result.data
             and version_ceiling is not None
+            and (
+                (bounded_page.complete and bounded_page.has_more)
+                or (
+                    not bounded_page.complete
+                    and (
+                        bounded_page.has_more
+                        or bounded_page.continuation_slice_end is not None
+                    )
+                )
+            )
         ):
-            last_row = result.data[-1]
             window_start, window_end = builder.parse_time_range(filters)
-            cursor_order = _trace_list_cursor_order_for_row(
-                last_row,
+            cursor_order = _trace_list_cursor_order_for_partial_page(
+                rows=result.data,
+                bounded_page=bounded_page,
+                cursor_state=cursor_state,
                 org_scope=org_scope,
             )
             next_cursor = encode_list_cursor(
@@ -4583,11 +4705,30 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 order=cursor_order,
                 version_ceiling=version_ceiling,
                 seen_rows=cursor_seen_rows,
+                relation_version_ceilings=relation_version_ceilings,
+                scan_slice_end=(
+                    bounded_page.continuation_slice_end
+                    if not bounded_page.has_more
+                    else None
+                ),
+                scan_before_start_time=(
+                    bounded_page.continuation_before_start_time
+                    if not bounded_page.has_more
+                    else None
+                ),
+                scan_before_id=(
+                    bounded_page.continuation_before_id
+                    if not bounded_page.has_more
+                    else None
+                ),
             )
+            cursor_has_more = True
 
         metadata = {"total_rows": total_count}
         if bounded_page is not None:
-            published_has_more = bool(bounded_page.complete and bounded_page.has_more)
+            published_has_more = (
+                bool(bounded_page.complete and bounded_page.has_more) or cursor_has_more
+            )
             metadata.update(
                 {
                     "total_rows_is_lower_bound": True,
@@ -4601,19 +4742,25 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     "query_result_payload_bytes": query_result_payload_bytes,
                 }
             )
-        if bounded_page is None or bounded_page.complete:
+        if bounded_page is None or bounded_page.complete or cursor_has_more:
             metadata.update(
                 cursor_page_metadata(
                     enabled=cursor_enabled,
-                    has_more=bool(bounded_page and bounded_page.has_more),
+                    has_more=cursor_has_more,
                     seen_rows=cursor_seen_rows,
                     next_cursor=next_cursor,
+                    unseen_row_proven=bool(
+                        bounded_page is not None and bounded_page.has_more
+                    ),
                 )
             )
-        if bounded_page is not None and not bounded_page.complete:
-            # A cursor-mode first page must not relabel a partial row count as
-            # exact. Publish an explicit terminal cursor contract instead;
-            # clients cannot prefetch or continue an incomplete prefix.
+        if (
+            bounded_page is not None
+            and not bounded_page.complete
+            and not cursor_has_more
+        ):
+            # An opted-in numbered request can still publish a first classified
+            # prefix, but only a signed snapshot cursor may continue it.
             metadata["has_more"] = False
             metadata["next_cursor"] = None
         if metadata.get(
@@ -4648,10 +4795,32 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             VoiceCallListQueryBuilderV2,
         )
 
-        filters = validated_data.get("filters", [])
+        read_deadline = ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
+
+        filters = list(validated_data.get("filters", []) or [])
         page = validated_data.get("page", 1)
         page_size = validated_data.get("page_size", 30)
         page_number = page - 1  # Convert 1-based to 0-based
+        cursor_token = validated_data.get("cursor")
+        cursor_requested = bool(cursor_token or validated_data.get("cursor_mode"))
+        cursor_scope = cursor_scope_for_request(request, project_ids=[str(project_id)])
+        cursor_query = dict(validated_data)
+        cursor_state = None
+        cursor_order_token = None
+        if cursor_token:
+            cursor_state = decode_list_cursor(
+                cursor_token,
+                resource="voice_calls",
+                scope=cursor_scope,
+                query=cursor_query,
+                page_size=page_size,
+            )
+            cursor_order_token = _decode_trace_list_cursor_order(
+                cursor_state.order,
+                org_scope=False,
+            )
+            filters.append(frozen_window_filter(cursor_state))
+            page_number = 0
         classify_batch_size = int(
             VoiceCallListQueryBuilderV2.recommended_filter_classify_batch_size()
         )
@@ -4682,6 +4851,18 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         annotation_label_ids = [str(label.id) for label in annotation_labels]
         label_types = {str(label.id): label.type for label in annotation_labels}
 
+        # A voice-call page is a trace-root page over the same versioned spans
+        # table. Reuse the trace cursor eligibility check so independently
+        # mutable eval/annotation relations continue to use numbered pages
+        # instead of receiving a snapshot guarantee we cannot uphold.
+        cursor_supported = snapshot_cursor_supported(filters, resource="observe_traces")
+        if cursor_state is not None and not cursor_supported:
+            raise ListCursorError(
+                "cursor_unsupported",
+                "Cursor pagination is unavailable for this query shape.",
+            )
+        cursor_enabled = cursor_requested and cursor_supported
+
         sim_flag = remove_simulation_calls and str(
             remove_simulation_calls
         ).lower() not in ("false", "0", "")
@@ -4695,6 +4876,45 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             remove_simulation_calls=sim_flag,
             annotation_label_ids=annotation_label_ids,
         )
+        relation_version_ceilings: dict[str, int] | None = None
+        version_ceiling = None
+        if cursor_enabled:
+            if cursor_state is not None:
+                version_ceiling = cursor_state.version_ceiling
+                relation_version_ceilings = cursor_state.relation_version_ceilings
+                page_read_settings = (
+                    relation_snapshot_read_settings(
+                        TRACE_LIST_READ_SETTINGS,
+                        version_ceilings=relation_version_ceilings,
+                    )
+                    if relation_version_ceilings
+                    else snapshot_read_settings(
+                        TRACE_LIST_READ_SETTINGS,
+                        builder=builder,
+                        version_ceiling=version_ceiling,
+                    )
+                )
+            elif cursor_requires_relation_snapshot(filters, resource="observe_traces"):
+                page_read_settings, relation_version_ceilings = (
+                    capture_list_relation_snapshot(
+                        analytics=analytics,
+                        builder=builder,
+                        base_settings=TRACE_LIST_READ_SETTINGS,
+                        timeout_ms=read_deadline.remaining_ms(1_000),
+                    )
+                )
+                version_ceiling = relation_version_ceilings["spans"]
+            else:
+                version_ceiling = capture_snapshot_version_ceiling(
+                    analytics, timeout_ms=read_deadline.remaining_ms(250)
+                )
+                page_read_settings = snapshot_read_settings(
+                    TRACE_LIST_READ_SETTINGS,
+                    builder=builder,
+                    version_ceiling=version_ceiling,
+                )
+        else:
+            page_read_settings = TRACE_LIST_READ_SETTINGS
 
         # Phase 1: bounded, newest-first latest-state voice roots. This is used
         # for the healthy path too: the previous raw count scanned the complete
@@ -4710,7 +4930,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # Omitted/false remain fail-closed so existing clients cannot silently
         # reinterpret a partial page as an exact ordered result.
         publish_bounded_partial = bool(
-            validated_data.get("allow_sampled") is True and page_number == 0
+            (cursor_enabled or validated_data.get("allow_sampled") is True)
+            and page_number == 0
+            and (cursor_state is None or cursor_enabled)
         )
         bounded_page = read_bounded_filter_page(
             builder=builder,
@@ -4719,8 +4941,27 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             key_field="trace_id",
             page_number=page_number,
             page_size=page_size,
-            deadline_ms=4500,
+            deadline_ms=read_deadline.remaining_ms(TRACE_LIST_CANDIDATE_DEADLINE_MS),
+            cursor_start_time=(
+                cursor_state.order[0] if cursor_state is not None else None
+            ),
+            cursor_order_token=(
+                cursor_order_token if cursor_state is not None else None
+            ),
+            read_settings=page_read_settings,
             include_incomplete_rows=publish_bounded_partial,
+            continuation_slice_end=(
+                cursor_state.scan_slice_end if cursor_state is not None else None
+            ),
+            continuation_before_start_time=(
+                cursor_state.scan_before_start_time
+                if cursor_state is not None
+                else None
+            ),
+            continuation_before_id=(
+                cursor_state.scan_before_id if cursor_state is not None else None
+            ),
+            bounded_continuation=cursor_enabled,
         )
         if not bounded_page.complete:
             if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -4741,7 +4982,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 page_number=page_number,
                 error_code=bounded_page.error_code,
             )
-            if not publish_bounded_partial:
+            if not publish_bounded_partial or (
+                cursor_enabled
+                and not bounded_page.rows
+                and bounded_page.continuation_slice_end is None
+            ):
                 return self._gm.custom_error_response(
                     status.HTTP_503_SERVICE_UNAVAILABLE,
                     "Voice call data is temporarily unavailable. Please retry.",
@@ -4780,15 +5025,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 root_identities=root_identities,
             )
             try:
+                content_timeout_ms = read_deadline.remaining_ms(1_500)
                 attrs_result = analytics.execute_ch_query(
                     attrs_query,
                     attrs_params,
-                    timeout_ms=1500,
+                    timeout_ms=content_timeout_ms,
                     settings={
-                        "max_threads": 1,
-                        "max_memory_usage": 256 * 1024 * 1024,
-                        "max_bytes_to_read": 512 * 1024 * 1024,
-                        "read_overflow_mode": "throw",
+                        **page_read_settings,
                         "max_result_rows": 200,
                         "result_overflow_mode": "throw",
                     },
@@ -4847,7 +5090,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     "provider": arow.get("provider"),
                 }
 
-        total_count = bounded_page.total_rows_lower_bound
+        cursor_seen_before = cursor_state.seen_rows if cursor_state is not None else 0
+        total_count = (
+            cursor_seen_before + bounded_page.total_rows_lower_bound
+            if cursor_enabled
+            else bounded_page.total_rows_lower_bound
+        )
 
         trace_ids = [str(row.get("trace_id", "")) for row in page_rows]
 
@@ -4857,10 +5105,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             eval_query, eval_params = builder.build_eval_query(trace_ids)
             if eval_query:
                 try:
+                    eval_timeout_ms = read_deadline.remaining_ms(1_500)
                     eval_result = analytics.execute_ch_query(
                         eval_query,
                         eval_params,
-                        timeout_ms=1500,
+                        timeout_ms=eval_timeout_ms,
                         settings={
                             "max_threads": 1,
                             "max_memory_usage": 256 * 1024 * 1024,
@@ -5143,19 +5392,77 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         import math
 
         total_pages = math.ceil(total_count / page_size) if page_size else 1
+        response_page = (
+            (cursor_seen_before // page_size) + 1 if cursor_state is not None else page
+        )
+        next_cursor = None
+        cursor_seen_rows = cursor_seen_before + len(page_rows)
+        cursor_has_more = False
+        if (
+            cursor_enabled
+            and version_ceiling is not None
+            and (
+                (bounded_page.complete and bounded_page.has_more)
+                or (
+                    not bounded_page.complete
+                    and (
+                        bounded_page.has_more
+                        or bounded_page.continuation_slice_end is not None
+                    )
+                )
+            )
+        ):
+            window_start, window_end = builder.parse_time_range(filters)
+            next_cursor = encode_list_cursor(
+                resource="voice_calls",
+                scope=cursor_scope,
+                query=cursor_query,
+                page_size=page_size,
+                window_start=window_start,
+                window_end=window_end,
+                order=_trace_list_cursor_order_for_partial_page(
+                    rows=page_rows,
+                    bounded_page=bounded_page,
+                    cursor_state=cursor_state,
+                    org_scope=False,
+                ),
+                version_ceiling=version_ceiling,
+                seen_rows=cursor_seen_rows,
+                relation_version_ceilings=relation_version_ceilings,
+                scan_slice_end=(
+                    bounded_page.continuation_slice_end
+                    if not bounded_page.has_more
+                    else None
+                ),
+                scan_before_start_time=(
+                    bounded_page.continuation_before_start_time
+                    if not bounded_page.has_more
+                    else None
+                ),
+                scan_before_id=(
+                    bounded_page.continuation_before_id
+                    if not bounded_page.has_more
+                    else None
+                ),
+            )
+            cursor_has_more = True
         response_data = {
             "count": total_count,
-            "count_is_lower_bound": True,
+            "count_is_lower_bound": (
+                cursor_has_more or not bounded_page.complete if cursor_enabled else True
+            ),
             "total_pages": total_pages,
-            "current_page": page,
+            "current_page": response_page,
             "next": None,
             "previous": None,
             "results": results,
             "config": column_config,
-            "has_more": bounded_page.has_more,
+            "has_more": cursor_has_more if cursor_enabled else bounded_page.has_more,
             "query_complete": bounded_page.complete,
             "query_status": bounded_page.status,
         }
+        if cursor_enabled:
+            response_data["next_cursor"] = next_cursor
         if bounded_page.error_code:
             response_data["query_error_code"] = bounded_page.error_code
         if response_data["count_is_lower_bound"] and exact_total_explicitly_required(
@@ -5166,10 +5473,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "Voice call data is temporarily unavailable. Please retry.",
                 code="service_unavailable",
             )
-        if bounded_page.has_more:
-            response_data["next"] = page + 1
-        if page > 1:
-            response_data["previous"] = page - 1
+        if response_data["has_more"]:
+            response_data["next"] = response_page + 1
+        if response_page > 1:
+            response_data["previous"] = response_page - 1
 
         from rest_framework.response import Response
 
@@ -5780,6 +6087,10 @@ class UsersView(APIView):
             )
 
             if export:
+                if query_data.get("cursor") or query_data.get("cursor_mode"):
+                    return self._gm.bad_request(
+                        "Continuation cursors are not available for CSV export"
+                    )
                 response = StreamingHttpResponse(
                     manager.iter_export_csv(),
                     content_type="text/csv",
@@ -5787,14 +6098,103 @@ class UsersView(APIView):
                 response["Content-Disposition"] = "attachment"
                 return response
 
+            cursor_token = query_data.get("cursor")
+            cursor_requested = bool(cursor_token or query_data.get("cursor_mode"))
+            if cursor_requested and query_data.get("sort_params"):
+                return self._gm.custom_error_response(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "Sorted user pages require numbered pagination.",
+                    code="cursor_sort_unsupported",
+                )
+            if cursor_requested:
+                cursor_scope = cursor_scope_for_request(
+                    request,
+                    project_ids=manager.scoped_project_ids,
+                )
+                cursor_query = {
+                    "project_id": str(query_data.get("project_id") or ""),
+                    "search": manager.search or "",
+                    "filters": manager.filters,
+                    "sort_params": manager.sort_params,
+                }
+                cursor_state = None
+                if cursor_token:
+                    cursor_state = decode_list_cursor(
+                        cursor_token,
+                        resource="observe_users",
+                        scope=cursor_scope,
+                        query=cursor_query,
+                        page_size=page_size,
+                    )
+                cursor_read = manager.list_cursor_payload(
+                    page_size=page_size,
+                    cursor=cursor_state,
+                )
+                next_cursor = None
+                if cursor_read.has_more:
+                    if cursor_read.checkpoint_order is None:
+                        raise RuntimeError(
+                            "user cursor page omitted its scan checkpoint"
+                        )
+                    spans_ceiling = cursor_read.relation_version_ceilings.get("spans")
+                    if not spans_ceiling:
+                        raise RuntimeError(
+                            "user cursor page omitted its spans snapshot"
+                        )
+                    next_cursor = encode_list_cursor(
+                        resource="observe_users",
+                        scope=cursor_scope,
+                        query=cursor_query,
+                        page_size=page_size,
+                        window_start=cursor_read.window_start,
+                        window_end=cursor_read.window_end,
+                        order=cursor_read.checkpoint_order,
+                        version_ceiling=spans_ceiling,
+                        seen_rows=cursor_read.seen_rows,
+                        relation_version_ceilings=(
+                            cursor_read.relation_version_ceilings
+                        ),
+                    )
+                payload = dict(cursor_read.payload)
+                payload["next_cursor"] = next_cursor
+                return self._gm.success_response(payload)
+
             payload = manager.list_payload(
                 page_size=page_size, current_page=current_page
             )
             return self._gm.success_response(payload)
 
-        except Exception:
-            logger.exception("users_list_failed")
-            return self._gm.bad_request("User data could not be loaded")
+        except ListCursorError as exc:
+            return self._gm.custom_error_response(
+                status.HTTP_400_BAD_REQUEST, str(exc), code=exc.code
+            )
+        except UnsupportedBoundedUserListQuery:
+            # A globally sorted page over a derived metric requires evaluating
+            # every matching user before LIMIT.  The bounded cursor path cannot
+            # preserve that contract, so fail explicitly instead of leaking a
+            # programming-style 500 or silently returning a page-local sort.
+            return self._gm.custom_error_response(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "This user sort is not available for the selected filters. Clear the sort and retry.",
+                code="user_sort_unsupported",
+            )
+        except Exception as exc:
+            if is_clickhouse_api_read_unavailable_error(exc):
+                logger.warning(
+                    "users_list_query_unavailable",
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "User data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.exception("users_list_failed", error_type=type(exc).__name__)
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "User data could not be loaded",
+                code="server_error",
+            )
 
 
 class GetUserCodeExampleView(APIView):

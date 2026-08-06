@@ -13,6 +13,7 @@ def validate_cursor_exclusivity(
     attrs: dict[str, Any],
     *,
     page_field: str,
+    first_page: int = 0,
 ) -> dict[str, Any]:
     """Reject ambiguous cursor + numbered-page requests at the API boundary."""
 
@@ -23,10 +24,14 @@ def validate_cursor_exclusivity(
     if (
         attrs.get("cursor_mode")
         and not attrs.get("cursor")
-        and int(attrs.get(page_field, 0)) != 0
+        and int(attrs.get(page_field, first_page)) != first_page
     ):
         raise serializers.ValidationError(
-            {"cursor_mode": f"cursor_mode can start only at {page_field}=0"}
+            {
+                "cursor_mode": (
+                    f"cursor_mode can start only at {page_field}={first_page}"
+                )
+            }
         )
     return attrs
 

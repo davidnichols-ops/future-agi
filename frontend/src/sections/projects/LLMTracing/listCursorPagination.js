@@ -15,16 +15,28 @@ const hasOwn = (value, key) =>
  * must reach a cursor-capable API pod, so backend rollout must finish before
  * the cursor-enabled frontend is released.
  */
-export const createListCursorPagination = () => {
+export const createListCursorPagination = ({
+  pageParam = "page_number",
+  pageOffset = 0,
+} = {}) => {
+  if (typeof pageParam !== "string" || pageParam.length === 0) {
+    throw new Error("Invalid list page parameter");
+  }
+  if (!Number.isInteger(pageOffset) || pageOffset < 0) {
+    throw new Error("Invalid list page offset");
+  }
+
   let mode = UNKNOWN_MODE;
   let generation = 0;
   const cursorByPage = new Map([[0, null]]);
+  const transportCursorByPage = new Map();
 
   const reset = () => {
     generation += 1;
     mode = UNKNOWN_MODE;
     cursorByPage.clear();
     cursorByPage.set(0, null);
+    transportCursorByPage.clear();
   };
 
   const disableCursor = () => {
@@ -32,6 +44,7 @@ export const createListCursorPagination = () => {
     mode = NUMBERED_MODE;
     cursorByPage.clear();
     cursorByPage.set(0, null);
+    transportCursorByPage.clear();
   };
 
   const requestParams = (pageNumber, baseParams) => {
@@ -40,20 +53,29 @@ export const createListCursorPagination = () => {
     }
 
     if (pageNumber === 0) {
+      const continuation = transportCursorByPage.get(0) || cursorByPage.get(0);
+      if (mode === CURSOR_MODE && continuation) {
+        return {
+          ...baseParams,
+          cursor_mode: true,
+          cursor: continuation,
+        };
+      }
       if (mode === NUMBERED_MODE) {
         return {
           ...baseParams,
-          page_number: 0,
+          [pageParam]: pageOffset,
         };
       }
       return {
         ...baseParams,
         cursor_mode: true,
-        page_number: 0,
+        [pageParam]: pageOffset,
       };
     }
 
-    const cursor = cursorByPage.get(pageNumber);
+    const cursor =
+      transportCursorByPage.get(pageNumber) || cursorByPage.get(pageNumber);
     if (mode === CURSOR_MODE) {
       if (!cursor) {
         throw new Error("Continuation cursor is unavailable for this page");
@@ -71,7 +93,7 @@ export const createListCursorPagination = () => {
     // a chain that already received a cursor cannot safely switch modes.
     return {
       ...baseParams,
-      page_number: pageNumber,
+      [pageParam]: pageNumber + pageOffset,
     };
   };
 
@@ -87,6 +109,7 @@ export const createListCursorPagination = () => {
         throw error;
       }
       mode = NUMBERED_MODE;
+      transportCursorByPage.delete(pageNumber);
       cursorByPage.delete(pageNumber + 1);
       return;
     }
@@ -100,12 +123,37 @@ export const createListCursorPagination = () => {
         throw new Error("List response omitted its continuation cursor");
       }
       cursorByPage.set(pageNumber + 1, metadata.next_cursor);
+      transportCursorByPage.delete(pageNumber);
       return;
     }
 
     if (metadata.has_more !== false || metadata.next_cursor != null) {
       throw new Error("List response returned invalid cursor metadata");
     }
+    cursorByPage.delete(pageNumber + 1);
+    transportCursorByPage.delete(pageNumber);
+  };
+
+  // A bounded transport page may scan a proven candidate prefix without
+  // finding a matching row. Keep the signed checkpoint on the same visible
+  // grid page so the caller can follow it immediately; advancing the visible
+  // page here would create an empty UI block and misalign later cursors.
+  const recordEmptyContinuation = (pageNumber, metadata) => {
+    if (
+      metadata?.has_more !== true ||
+      typeof metadata?.next_cursor !== "string" ||
+      metadata.next_cursor.length === 0
+    ) {
+      throw new Error("Empty list continuation is unavailable");
+    }
+    if (
+      (transportCursorByPage.get(pageNumber) ||
+        cursorByPage.get(pageNumber)) === metadata.next_cursor
+    ) {
+      throw new Error("List API returned a repeated continuation cursor");
+    }
+    mode = CURSOR_MODE;
+    transportCursorByPage.set(pageNumber, metadata.next_cursor);
     cursorByPage.delete(pageNumber + 1);
   };
 
@@ -121,6 +169,7 @@ export const createListCursorPagination = () => {
     disableCursor,
     requestParams,
     recordResponse,
+    recordEmptyContinuation,
     isLastPage,
     mode: () => mode,
     generation: () => generation,
@@ -129,6 +178,7 @@ export const createListCursorPagination = () => {
       mode === CURSOR_MODE &&
       pageNumber > 0 &&
       (error?.response?.status === 400 ||
+        error?.response?.status === 422 ||
         error?.code === MIXED_VERSION_ERROR_CODE),
   };
 };
@@ -138,3 +188,52 @@ export const LIST_CURSOR_MODES = Object.freeze({
   NUMBERED: NUMBERED_MODE,
   UNKNOWN: UNKNOWN_MODE,
 });
+
+export const listContinuationParams = (baseParams, cursor) => {
+  if (typeof cursor !== "string" || cursor.length === 0) {
+    throw new Error("Invalid list continuation cursor");
+  }
+  const { page: _page, page_number: _pageNumber, ...query } = baseParams;
+  return { ...query, cursor_mode: true, cursor };
+};
+
+/**
+ * Follow checkpoint-only transport pages until the API returns genuine rows
+ * or proves the cursor chain is exhausted.  Sparse filters can legitimately
+ * classify a bounded prefix without finding a match; exposing that transport
+ * page as an empty visible page would be both misleading and would strand
+ * older matches behind it.
+ */
+export const followEmptyListContinuations = async ({
+  initialResponse,
+  rowsFromResponse,
+  metadataFromResponse,
+  nextResponse,
+  onContinuation,
+  isCurrent = () => true,
+}) => {
+  let response = initialResponse;
+  const followed = new Set();
+  let rows = rowsFromResponse(response) || [];
+
+  while (rows.length === 0) {
+    const metadata = metadataFromResponse(response) || {};
+    const nextCursor = metadata.next_cursor;
+    if (
+      metadata.has_more !== true ||
+      typeof nextCursor !== "string" ||
+      nextCursor.length === 0
+    ) {
+      return response;
+    }
+    if (!isCurrent()) return response;
+    if (followed.has(nextCursor)) {
+      throw new Error("List API returned a repeated continuation cursor");
+    }
+    followed.add(nextCursor);
+    onContinuation?.(metadata);
+    response = await nextResponse(nextCursor);
+    rows = rowsFromResponse(response) || [];
+  }
+  return response;
+};

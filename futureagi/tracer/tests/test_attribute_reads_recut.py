@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
+from urllib.parse import urlencode
 
 import pytest
 from clickhouse_driver.errors import ServerException
@@ -33,6 +34,9 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT,
     ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
+    ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+    ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
+    ATTRIBUTE_VALUE_CURSOR_MAX_SEEN,
     AttributeCardinalityRead,
     AttributeDetailRead,
     AttributeKeyRead,
@@ -47,9 +51,11 @@ from tracer.services.clickhouse.attribute_reads import (
     V2AttributeQueryExecutor,
     _unix_microseconds,
     adaptive_attribute_windows,
+    attribute_value_cursor_digest,
     merge_read_metadata,
     validate_attribute_key,
 )
+from tracer.services.clickhouse.list_cursor import encode_list_cursor
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
 NOW = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
@@ -1910,6 +1916,49 @@ def test_array_filter_picker_does_not_advertise_json_object_as_filterable():
     assert read.metadata.query_complete is True
 
 
+def test_structured_filter_picker_advertises_json_array_and_object_types():
+    def respond(call, _):
+        if "segment_start" in call.params:
+            if call.params["segment_start"] != adaptive_attribute_windows(NOW)[0][0]:
+                return []
+            return [_candidate(PROJECT_A, "structured-json")]
+        return [
+            {
+                "project_id": PROJECT_A,
+                "id": "structured-json",
+                "start_time": NOW - timedelta(days=1),
+                "is_deleted": 0,
+                "trace_id": f"trace-{PROJECT_A}-structured-json",
+                "trace_session_id": "",
+                "parent_span_id": "",
+                "string_keys": ["typed_map"],
+                "number_keys": [],
+                "boolean_keys": [],
+                "attributes_extra": json.dumps(
+                    {
+                        "json_array": ["one", 2, True],
+                        "json_object": {"tier": "vip"},
+                        "json_scalar": "not-indexed",
+                    }
+                ),
+            }
+        ]
+
+    read = AttributeReadSelector(
+        RecordingExecutor(respond),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    ).discover_keys([PROJECT_A])
+
+    assert {(row.key, row.type) for row in read.rows} == {
+        ("typed_map", "string"),
+        ("json_array", "array"),
+        ("json_object", "map"),
+    }
+    assert read.metadata.query_complete is True
+
+
 def test_eval_mapping_inventory_includes_all_json_value_families():
     def respond(call, _):
         if "segment_start" in call.params:
@@ -2312,6 +2361,375 @@ def test_dense_typed_value_sample_stops_before_json_lane():
     assert "max(_version) AS latest_version" in certificate_call.sql
     assert "attrs_" not in certificate_call.sql
     assert "attributes_extra" not in certificate_call.sql
+
+
+def test_filter_value_cursor_page_is_newest_first_and_dedupes_across_pages():
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            span_id,
+            trace_id=f"trace-{span_id}",
+            start_time=NOW - timedelta(minutes=index + 1),
+        )
+        for index, span_id in enumerate(("new-a", "new-a-2", "new-b", "old-c"))
+    ]
+    value_by_id = {
+        "new-a": "completed",
+        "new-a-2": "completed",
+        "new-b": "failed",
+        "old-c": "queued",
+    }
+    by_id = {str(row["id"]): row for row in candidates}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            in_segment = [
+                row
+                for row in candidates
+                if call.params["segment_start"]
+                <= row["start_time"]
+                < call.params["segment_end"]
+            ]
+            return _keyset_candidate_page(in_segment, call)
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=by_id[span_id]["trace_id"],
+                start_time=by_id[span_id]["start_time"],
+                string=value_by_id[span_id],
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    first = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=2,
+        version_ceiling=123456,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert [row.value for row in first.rows] == ["completed", "failed"]
+    assert first.metadata.query_status == "sampled"
+    assert first.has_more is True
+    assert first.next_before_identity == (
+        PROJECT_A,
+        "trace-new-b",
+        "new-b",
+        NOW - timedelta(minutes=3),
+    )
+
+    second_executor = RecordingExecutor(respond)
+    second = AttributeReadSelector(
+        second_executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=2,
+        version_ceiling=123456,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        before_identity=first.next_before_identity,
+        seen_value_digests=first.seen_value_digests,
+    )
+
+    assert [row.value for row in second.rows] == ["queued"]
+    assert "attribute_version_ceiling" in second_executor.calls[0].params
+    assert second_executor.calls[0].params["attribute_version_ceiling"] == 123456
+    assert all(row.value != "completed" for row in second.rows)
+
+
+def test_filter_value_cursor_page_caps_raw_candidate_batches_and_marks_sample():
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"span-{index:03d}",
+            start_time=NOW - timedelta(seconds=index + 1),
+        )
+        for index in range(
+            ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+            * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
+            + 1
+        )
+    ]
+    by_id = {str(row["id"]): row for row in candidates}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            in_segment = [
+                row
+                for row in candidates
+                if call.params["segment_start"]
+                <= row["start_time"]
+                < call.params["segment_end"]
+            ]
+            return _keyset_candidate_page(in_segment, call)
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=by_id[span_id]["trace_id"],
+                start_time=by_id[span_id]["start_time"],
+                string="completed",
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    read = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=10,
+        version_ceiling=123456,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert read.rows == (
+        AttributeValueRow(
+            "completed",
+            "string",
+            ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+            * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
+        ),
+    )
+    assert read.metadata.query_complete is False
+    assert read.metadata.query_error_code == "sample_limit"
+    assert read.has_more is True
+    assert read.next_before_identity == (
+        PROJECT_A,
+        candidates[
+            ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+            * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
+            - 1
+        ]["trace_id"],
+        candidates[
+            ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+            * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
+            - 1
+        ]["id"],
+        candidates[
+            ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+            * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
+            - 1
+        ]["start_time"],
+    )
+    assert read.seen_value_digests == (
+        attribute_value_cursor_digest("string", "completed"),
+    )
+
+
+def test_filter_value_cursor_candidate_budget_failure_propagates_fail_closed():
+    executor = RecordingExecutor(lambda *_: ReadDeadlineExceeded("candidate deadline"))
+
+    with pytest.raises(ReadDeadlineExceeded, match="candidate deadline"):
+        AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+            [PROJECT_A],
+            "final_status",
+            page_size=10,
+            version_ceiling=123456,
+            window_start=NOW - timedelta(days=1),
+            window_end=NOW,
+        )
+
+    assert len(executor.calls) == 1
+    assert "segment_start" in executor.calls[0].params
+
+
+def test_filter_value_cursor_verify_budget_failure_propagates_fail_closed():
+    candidate = _candidate(
+        PROJECT_A,
+        "verify-budget",
+        start_time=NOW - timedelta(minutes=1),
+    )
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            return [candidate]
+        return ReadDeadlineExceeded("verify deadline")
+
+    executor = RecordingExecutor(respond)
+    with pytest.raises(ReadDeadlineExceeded, match="verify deadline"):
+        AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+            [PROJECT_A],
+            "final_status",
+            page_size=10,
+            version_ceiling=123456,
+            window_start=NOW - timedelta(days=1),
+            window_end=NOW,
+        )
+
+    assert len(executor.calls) == 2
+    assert "segment_start" in executor.calls[0].params
+    assert "segment_start" not in executor.calls[1].params
+
+
+def test_filter_value_cursor_resume_budget_failure_never_advances_cursor():
+    resume_identity = (
+        PROJECT_A,
+        "trace-resume-budget",
+        "resume-budget",
+        NOW - timedelta(minutes=1),
+    )
+    executor = RecordingExecutor(lambda *_: ReadDeadlineExceeded("resume deadline"))
+
+    with pytest.raises(ReadDeadlineExceeded, match="resume deadline"):
+        AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+            [PROJECT_A],
+            "final_status",
+            page_size=10,
+            version_ceiling=123456,
+            window_start=NOW - timedelta(days=1),
+            window_end=NOW,
+            resume_identity=resume_identity,
+            resume_member_offset=1,
+        )
+
+    assert len(executor.calls) == 1
+    assert "segment_start" not in executor.calls[0].params
+
+
+def test_filter_value_cursor_full_url_stays_below_common_request_line_limit():
+    search = "x" * 512
+    project_id = "00000000-0000-4000-8000-000000000005"
+    digests = tuple(
+        attribute_value_cursor_digest("string", f"value-{index}")
+        for index in range(ATTRIBUTE_VALUE_CURSOR_MAX_SEEN)
+    )
+    scope = {
+        "principal_id": "00000000-0000-4000-8000-000000000001",
+        "auth_type": "TokenAuthentication",
+        "auth_id": "00000000-0000-4000-8000-000000000002",
+        "organization_id": "00000000-0000-4000-8000-000000000003",
+        "workspace_id": "00000000-0000-4000-8000-000000000004",
+        "project_ids": [project_id],
+    }
+    cursor_query = {
+        "metric_name": "final_status",
+        "metric_type": "custom_attribute",
+        "source": "traces",
+        "project_ids": [project_id],
+        "search": search,
+    }
+    cursor = encode_list_cursor(
+        resource="dashboard_filter_values",
+        scope=scope,
+        query=cursor_query,
+        page_size=50,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        order=(NOW, (), (), 0, digests),
+        version_ceiling=1_785_000_000_000_000_000,
+        seen_rows=len(digests),
+    )
+    full_url = "https://api.futureagi.com/tracer/dashboard/filter_values/?" + urlencode(
+        {
+            "metric_name": "final_status",
+            "metric_type": "custom_attribute",
+            "project_ids": project_id,
+            "source": "traces",
+            "page_size": 50,
+            "search": search,
+            "cursor": cursor,
+        }
+    )
+
+    assert len(full_url.encode("utf-8")) < 8 * 1024
+
+
+def test_filter_value_cursor_resumes_mid_array_without_skipping_members():
+    candidate = _candidate(
+        PROJECT_A,
+        "array-row",
+        trace_id="trace-array-row",
+        start_time=NOW - timedelta(minutes=1),
+    )
+    members = ("one", "two", "three", "four", "five")
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            rows = (
+                [candidate]
+                if call.params["segment_start"]
+                <= candidate["start_time"]
+                < call.params["segment_end"]
+                else []
+            )
+            return _keyset_candidate_page(rows, call)
+        return [
+            _target_row(
+                PROJECT_A,
+                "array-row",
+                trace_id="trace-array-row",
+                start_time=candidate["start_time"],
+                legacy_raw=json.dumps(members),
+            )
+        ]
+
+    first = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=2,
+        version_ceiling=123456,
+        window_start=NOW - timedelta(hours=6),
+        window_end=NOW,
+    )
+    assert [row.value for row in first.rows] == ["one", "two"]
+    assert first.next_resume_identity == (
+        PROJECT_A,
+        "trace-array-row",
+        "array-row",
+        candidate["start_time"],
+    )
+    assert first.next_resume_member_offset == 2
+
+    second = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=2,
+        version_ceiling=123456,
+        window_start=NOW - timedelta(hours=6),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        before_identity=first.next_before_identity,
+        resume_identity=first.next_resume_identity,
+        resume_member_offset=first.next_resume_member_offset,
+        seen_value_digests=first.seen_value_digests,
+    )
+    assert [row.value for row in second.rows] == ["three", "four"]
+    assert second.next_resume_member_offset == 4
+
+    third = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=2,
+        version_ceiling=123456,
+        window_start=NOW - timedelta(hours=6),
+        window_end=NOW,
+        segment_end=second.next_segment_end,
+        before_identity=second.next_before_identity,
+        resume_identity=second.next_resume_identity,
+        resume_member_offset=second.next_resume_member_offset,
+        seen_value_digests=second.seen_value_digests,
+    )
+    assert [row.value for row in third.rows] == ["five"]
+    assert third.next_resume_identity is None
+    assert third.has_more is False
+    assert [row.value for page in (first, second, third) for row in page.rows] == list(
+        members
+    )
 
 
 def test_typed_value_version_certificate_narrows_hydration_to_current_live_rows():
@@ -3687,6 +4105,49 @@ def test_dashboard_budget_errors_return_sanitized_503_and_are_not_retried(
     assert calls == 1
 
 
+def test_dashboard_cursor_budget_failure_returns_503_without_values_or_cursor(
+    monkeypatch,
+):
+    from tracer.views.dashboard import DashboardViewSet
+
+    calls = 0
+
+    def fail(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise ReadDeadlineExceeded("private cursor deadline")
+
+    monkeypatch.setattr(AttributeReadSelector, "read_value_cursor_page", fail)
+    monkeypatch.setattr(
+        "tracer.views.dashboard.capture_snapshot_version_ceiling",
+        lambda _analytics: 123456,
+    )
+    monkeypatch.setattr(
+        "tracer.views.dashboard.project_queryset_for_request",
+        lambda _request: _ProjectScope([PROJECT_A]),
+    )
+
+    request = _authenticated_get(
+        "/tracer/dashboard/filter_values/",
+        {
+            "metric_name": "final_status",
+            "metric_type": "custom_attribute",
+            "project_ids": PROJECT_A,
+            "source": "traces",
+            "page_size": 10,
+        },
+    )
+    response = DashboardViewSet.as_view({"get": "filter_values"})(request)
+
+    assert response.status_code == 503
+    assert calls == 1
+    payload = json.dumps(response.data)
+    assert "temporarily unavailable" in payload
+    assert "private cursor deadline" not in payload
+    assert "next_cursor" not in payload
+    assert '"values"' not in payload
+
+
 def test_eval_picker_uses_selector_for_keys_and_cardinality_without_pg_fallback(
     monkeypatch,
 ):
@@ -4550,5 +5011,5 @@ def test_span_attribute_keys_use_v2_when_legacy_clickhouse_is_disabled(monkeypat
         "project_ids": [PROJECT_A],
         "exact_key": "json_choices",
         "typed_only": True,
-        "json_attribute_mode": "arrays",
+        "json_attribute_mode": "structured",
     }

@@ -1,4 +1,4 @@
-import { getQueryReadState } from "src/utils/queryReadState";
+import { getExactAggregationReadState } from "src/utils/queryReadState";
 
 export const DEFAULT_DECIMALS = 2;
 
@@ -6,7 +6,7 @@ export const getDashboardMetricSeriesState = (metrics = []) => {
   const metricReadStates = (Array.isArray(metrics) ? metrics : []).map(
     (metric) => ({
       metric,
-      readState: getQueryReadState(metric),
+      readState: getExactAggregationReadState(metric),
     }),
   );
   const hasSampledMetrics = metricReadStates.some(
@@ -15,12 +15,17 @@ export const getDashboardMetricSeriesState = (metrics = []) => {
   const hasDegradedMetrics = metricReadStates.some(
     ({ readState }) => readState === "degraded" || readState === "error",
   );
-  const renderableMetrics = metricReadStates.filter(
-    ({ readState }) => readState === "complete" || readState === "sampled",
+  const hasPendingMetrics = metricReadStates.some(
+    ({ readState }) => readState === "pending",
   );
+  const hasUnavailableMetrics =
+    hasSampledMetrics || hasDegradedMetrics || hasPendingMetrics;
+  const renderableMetrics = hasUnavailableMetrics
+    ? []
+    : metricReadStates.filter(({ readState }) => readState === "complete");
   const series = [];
 
-  for (const { metric, readState } of renderableMetrics) {
+  for (const { metric } of renderableMetrics) {
     for (const metricSeries of metric.series || []) {
       const isSingleMetric = renderableMetrics.length === 1;
       let name;
@@ -31,7 +36,6 @@ export const getDashboardMetricSeriesState = (metrics = []) => {
       } else {
         name = `${metric.name} / ${metricSeries.name} (${metric.aggregation})`;
       }
-      if (readState === "sampled") name = `${name} (sampled)`;
       series.push({
         name,
         metricName: metric.name,
@@ -51,7 +55,27 @@ export const getDashboardMetricSeriesState = (metrics = []) => {
     series,
     hasSampledMetrics,
     hasDegradedMetrics,
+    hasPendingMetrics,
   };
+};
+
+/**
+ * Dashboard responses are all-or-nothing aggregates. A single sampled,
+ * degraded, or failed metric makes the payload non-renderable.
+ */
+export const getExactDashboardResult = (payload) => {
+  if (!payload || getExactAggregationReadState(payload) !== "complete") {
+    return null;
+  }
+
+  const result = payload?.data?.result ?? payload?.result;
+  if (!result || !Array.isArray(result.metrics)) return null;
+  const metricState = getDashboardMetricSeriesState(result.metrics);
+  return metricState.hasSampledMetrics ||
+    metricState.hasDegradedMetrics ||
+    metricState.hasPendingMetrics
+    ? null
+    : result;
 };
 
 const toAxisPayload = ({ prefixSuffix, outOfBounds, ...axis } = {}) => ({

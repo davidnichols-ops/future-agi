@@ -1784,6 +1784,7 @@ class EvalUsageQuerySerializer(serializers.Serializer):
         required=False, allow_null=True, default=None
     )
     end_date = serializers.DateTimeField(required=False, allow_null=True, default=None)
+    refresh = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         # Both or neither. Half a range silently falling back to `period`
@@ -1938,7 +1939,7 @@ class EvalUsageStatsResponseResultSerializer(serializers.Serializer):
     template_id = serializers.UUIDField()
     is_composite = serializers.BooleanField()
     completeness = serializers.ChoiceField(
-        choices=["complete", "degraded"], required=False
+        choices=["complete", "degraded", "pending"], required=False
     )
     unavailable_fields = serializers.ListField(
         child=serializers.CharField(), required=False
@@ -1947,6 +1948,15 @@ class EvalUsageStatsResponseResultSerializer(serializers.Serializer):
     chart = EvalUsageChartPointSerializer(many=True)
     table = serializers.ListField(child=EvalUsageTableRowSerializer())
     logs = EvalUsagePaginationSerializer()
+    query_complete = serializers.BooleanField(required=False)
+    query_status = serializers.ChoiceField(
+        choices=["complete", "degraded", "pending"], required=False
+    )
+    query_sampled = serializers.BooleanField(required=False)
+    query_completed_at = serializers.DateTimeField(required=False)
+    query_cached = serializers.BooleanField(required=False)
+    query_refresh_failed = serializers.BooleanField(required=False)
+    query_refreshing = serializers.BooleanField(required=False)
 
 
 class EvalUsageStatsResponseSerializer(serializers.Serializer):

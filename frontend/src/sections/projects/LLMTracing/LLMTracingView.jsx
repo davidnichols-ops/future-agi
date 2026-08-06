@@ -1663,7 +1663,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   // }, [selectedTab, columns]);
 
   const refreshPrimary = useCallback(
-    (setLoading = true) => {
+    (setLoading = true, { includeAggregations = true } = {}) => {
       logger.debug("refreshPrimary", { setLoading });
       if (setLoading) {
         setLatestActive(true);
@@ -1680,16 +1680,18 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
         if (primarySpanGridRef.current) {
           primarySpanGridRef.current.api.refreshServerSide();
         }
-        queryClient.invalidateQueries({
-          queryKey: ["llm-tracing-graph"],
-        });
+        if (includeAggregations) {
+          queryClient.invalidateQueries({
+            queryKey: ["llm-tracing-graph"],
+          });
+        }
       }
     },
     [queryClient, projectSource],
   );
 
   const refreshCompare = useCallback(
-    (setLoading = true) => {
+    (setLoading = true, { includeAggregations = true } = {}) => {
       logger.debug("refreshCompare", { setLoading });
       if (setLoading) {
         setLatestActive(true);
@@ -1703,18 +1705,23 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
         compareSpanGridRef.current.api.refreshServerSide();
       }
 
-      queryClient.invalidateQueries({
-        queryKey: ["llm-tracing-graph"],
-      });
+      if (includeAggregations) {
+        queryClient.invalidateQueries({
+          queryKey: ["llm-tracing-graph"],
+        });
+      }
     },
     [queryClient],
   );
 
-  const refreshAll = useCallback(() => {
-    setLatestActive(true);
-    refreshPrimary(false);
-    refreshCompare(false);
-  }, [refreshCompare, refreshPrimary]);
+  const refreshAll = useCallback(
+    ({ includeAggregations = true } = {}) => {
+      setLatestActive(true);
+      refreshPrimary(false, { includeAggregations });
+      refreshCompare(false, { includeAggregations });
+    },
+    [refreshCompare, refreshPrimary],
+  );
 
   const columnKey = useMemo(() => {
     if (selectedGraph === "primary" && selectedTab === "trace") {

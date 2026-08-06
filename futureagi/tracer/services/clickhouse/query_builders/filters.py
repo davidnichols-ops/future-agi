@@ -853,7 +853,9 @@ class ClickHouseFilterBuilder:
             # Handle special annotation-related column_ids that are
             # independent of col_type (mirrors PG FilterEngine logic).
             if col_id == "my_annotations":
-                cond = self._build_my_annotations_condition(filter_value, config)
+                cond = self._build_my_annotations_condition(
+                    filter_value, config, filter_op
+                )
                 if cond:
                     conditions.append(cond)
                 continue
@@ -866,14 +868,14 @@ class ClickHouseFilterBuilder:
 
             # Handle has_eval filter — subquery against tracer_eval_logger
             if col_id == "has_eval":
-                cond = self._build_has_eval_condition(filter_value)
+                cond = self._build_has_eval_condition(filter_value, filter_op)
                 if cond:
                     conditions.append(cond)
                 continue
 
             # Handle has_annotation filter — subquery against model_hub_score
             if col_id == "has_annotation":
-                cond = self._build_has_annotation_condition(filter_value)
+                cond = self._build_has_annotation_condition(filter_value, filter_op)
                 if cond:
                     conditions.append(cond)
                 continue
@@ -2157,19 +2159,47 @@ class ClickHouseFilterBuilder:
     # Boolean metric filter handlers (has_eval, has_annotation)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _parse_boolean_meta_filter(
+        column_id: str,
+        filter_value: Any,
+        filter_op: str | None,
+    ) -> bool:
+        """Parse one boolean meta-filter without implicit operator inversion."""
+
+        if normalize_filter_op(filter_op) != "equals":
+            raise ValueError(f"{column_id} supports only the equals operation")
+        if isinstance(filter_value, bool):
+            return filter_value
+        if isinstance(filter_value, str):
+            normalized_value = filter_value.strip().lower()
+            if normalized_value in {"true", "false"}:
+                return normalized_value == "true"
+        raise ValueError(f"{column_id} requires a boolean value")
+
     def _build_has_eval_condition(
         self,
         filter_value: Any,
+        filter_op: str | None = "equals",
     ) -> str | None:
         """Handle ``has_eval`` filter: check if the trace has eval results.
 
         Generates a ``trace_id IN (SELECT ...)`` subquery against the
         ``tracer_eval_logger`` CDC table.
         """
-        if isinstance(filter_value, str):
-            filter_value = filter_value.lower() == "true"
-        if not filter_value:
-            return None
+        wants_eval = self._parse_boolean_meta_filter(
+            "has_eval", filter_value, filter_op
+        )
+        if (
+            not wants_eval
+            and self.candidate_ids_param is None
+            and self.candidate_entities_param is None
+        ):
+            # Absence has no positive row witness. Public list readers compile
+            # this predicate only after producing a <=200 candidate batch. Do
+            # not silently widen a negative filter into a whole-table anti-scan.
+            raise ValueError("has_eval=false requires bounded candidate scope")
+        membership_op = "IN" if wants_eval else "NOT IN"
         # The eval table has no ``project_id`` column, so scope the subquery by
         # INNER JOIN to the spans table (which does) — otherwise we would match
         # trace_ids from *every* project. Table + not-deleted predicate resolve
@@ -2207,7 +2237,7 @@ class ClickHouseFilterBuilder:
             )
             if not scoped_config_ids:
                 return (
-                    "trace_id IN (SELECT "
+                    f"trace_id {membership_op} (SELECT "
                     "toUUID('00000000-0000-0000-0000-000000000000'))"
                 )
             project_config_param = self._next_param("project_eval_cfg")
@@ -2220,7 +2250,7 @@ class ClickHouseFilterBuilder:
                 "eval_scan.trace_id", "eval_scan.observation_span_id"
             )
             return (
-                "tuple(trace_id, id) IN ("
+                f"tuple(trace_id, id) {membership_op} ("
                 "SELECT DISTINCT tuple("
                 "toString(latest_eval.trace_id), "
                 "toString(latest_eval.observation_span_id)) "
@@ -2247,7 +2277,7 @@ class ClickHouseFilterBuilder:
 
         candidate_filter = self._candidate_filter("eval_scan.trace_id")
         return (
-            "trace_id IN ("
+            f"trace_id {membership_op} ("
             "SELECT DISTINCT toString(latest_eval.trace_id) "
             "FROM (SELECT eval_scan.id, eval_scan.trace_id, "
             f"{eval_live_projection} "
@@ -2270,6 +2300,7 @@ class ClickHouseFilterBuilder:
     def _build_has_annotation_condition(
         self,
         filter_value: Any,
+        filter_op: str | None = "equals",
     ) -> str | None:
         """Handle ``has_annotation`` filter using annotation completeness.
 
@@ -2280,8 +2311,9 @@ class ClickHouseFilterBuilder:
         stored against observation_span_id. Resolve through ``spans`` so this
         filter sees the same annotations rendered in trace rows.
         """
-        if isinstance(filter_value, str):
-            filter_value = filter_value.lower() == "true"
+        wants_annotation = self._parse_boolean_meta_filter(
+            "has_annotation", filter_value, filter_op
+        )
 
         # Common subquery: resolve trace_id from Score rows even when the
         # annotation is attached to a span instead of directly to a trace.
@@ -2291,7 +2323,7 @@ class ClickHouseFilterBuilder:
         label_ids = self.annotation_label_ids
         if not label_ids:
             # Fallback: simple existence check
-            op = "IN" if filter_value else "NOT IN"
+            op = "IN" if wants_annotation else "NOT IN"
             return f"{target_column} {op} ({score_entity_sq})"
 
         # Completeness check: fully annotated = has scores for ALL labels
@@ -2309,9 +2341,9 @@ class ClickHouseFilterBuilder:
                 alias="entity_id",
                 distinct=False,
             )
-            + f" GROUP BY entity_id HAVING uniq(s.label_id) >= {total}"
+            + f" GROUP BY entity_id HAVING uniqExact(s.label_id) >= {total}"
         )
-        op = "IN" if filter_value else "NOT IN"
+        op = "IN" if wants_annotation else "NOT IN"
         return f"{target_column} {op} ({fully_annotated_sq})"
 
     # ------------------------------------------------------------------
@@ -2322,21 +2354,28 @@ class ClickHouseFilterBuilder:
         self,
         filter_value: Any,
         config: dict,
+        filter_op: str | None = "equals",
     ) -> str | None:
         """Handle ``my_annotations`` filter: check if the current user has
         any annotation on the trace.  ``filter_value`` should be truthy and
         the user_id is expected inside ``config``."""
-        if isinstance(filter_value, str):
-            filter_value = filter_value.lower() == "true"
-        if not filter_value:
-            return None
+        wants_my_annotations = self._parse_boolean_meta_filter(
+            "my_annotations", filter_value, filter_op
+        )
         user_id = config.get("user_id")
         if not user_id:
-            return None
+            # ``my_annotations`` is user-relative.  A missing server-bound
+            # principal must never turn the requested filter into an
+            # unfiltered query (which could expose another user's rows).
+            return "0 = 1"
         param = self._next_param("uid")
         self._params[param] = str(user_id)
         user_clause = f"AND s.annotator_id = toUUID(%({param})s)"
-        return f"{self._score_entity_column()} IN ({self._score_entity_select(user_clause)})"
+        operator = "IN" if wants_my_annotations else "NOT IN"
+        return (
+            f"{self._score_entity_column()} {operator} "
+            f"({self._score_entity_select(user_clause)})"
+        )
 
     def _build_annotator_condition(
         self,

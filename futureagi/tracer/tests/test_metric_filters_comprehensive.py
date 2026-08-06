@@ -80,16 +80,29 @@ class TestCHMetricFilters:
         assert params == {}
 
     def test_has_eval_false_no_condition(self):
-        where, _ = self._builder().translate([_has_eval_filter(False)])
-        assert where == ""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        where, _ = ClickHouseFilterBuilder(
+            candidate_ids_param="candidate_trace_ids"
+        ).translate([_has_eval_filter(False)])
+        assert "trace_id NOT IN" in where
+        assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in where
 
     def test_has_eval_string_true(self):
         where, _ = self._builder().translate([_has_eval_filter("true")])
         assert "tracer_eval_logger" in where
 
     def test_has_eval_string_false(self):
-        where, _ = self._builder().translate([_has_eval_filter("false")])
-        assert where == ""
+        from tracer.services.clickhouse.query_builders.filters import (
+            ClickHouseFilterBuilder,
+        )
+
+        where, _ = ClickHouseFilterBuilder(
+            candidate_ids_param="candidate_trace_ids"
+        ).translate([_has_eval_filter("false")])
+        assert "trace_id NOT IN" in where
 
     def test_has_eval_string_True_capital(self):
         where, _ = self._builder().translate([_has_eval_filter("True")])

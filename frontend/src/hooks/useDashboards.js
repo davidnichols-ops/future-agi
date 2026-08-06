@@ -5,7 +5,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
-import { getQueryReadState } from "src/utils/queryReadState";
+import { getFilterValueReadState } from "src/utils/queryReadState";
 
 const DASHBOARD_KEYS = {
   all: ["dashboards"],
@@ -234,7 +234,7 @@ export function useWidgetQuery() {
   return useMutation({
     mutationFn: ({ dashboardId, widgetId }) =>
       axios.post(endpoints.dashboard.widgetQuery(dashboardId, widgetId), {
-        allow_sampled: true,
+        allow_sampled: false,
       }),
     meta: { errorHandled: true },
   });
@@ -245,7 +245,7 @@ export function usePreviewQuery() {
     mutationFn: ({ dashboardId, queryConfig }) =>
       axios.post(endpoints.dashboard.widgetPreview(dashboardId), {
         query_config: queryConfig,
-        allow_sampled: true,
+        allow_sampled: false,
       }),
     meta: { errorHandled: true },
   });
@@ -253,11 +253,24 @@ export function usePreviewQuery() {
 
 export function useDashboardQuery() {
   return useMutation({
-    mutationFn: (queryConfig) =>
-      axios.post(endpoints.dashboard.query, {
+    mutationFn: (request) => {
+      // Backwards compatible with existing editor callers that pass the query
+      // config directly. Saved dashboards use the wrapper shape so an explicit
+      // user refresh can bypass the server snapshot cache.
+      const wrappedRequest = Boolean(request?.queryConfig);
+      const queryConfig = wrappedRequest ? request.queryConfig : request;
+      const refresh = wrappedRequest && request.refresh === true;
+      const body = {
         ...queryConfig,
-        allow_sampled: true,
-      }),
+        allow_sampled: false,
+      };
+
+      return refresh
+        ? axios.post(endpoints.dashboard.query, body, {
+            params: { refresh: true },
+          })
+        : axios.post(endpoints.dashboard.query, body);
+    },
     // Dashboard surfaces render a generic retry state. Keep raw backend/DB
     // details out of the global mutation snackbar.
     meta: { errorHandled: true },
@@ -272,8 +285,9 @@ export function useDashboardFilterValues({
   workflow,
   enabled = true,
   search = "",
+  pageSize,
 }) {
-  const query = useQuery({
+  const query = useInfiniteQuery({
     queryKey: [
       ...DASHBOARD_KEYS.all,
       "filterValues",
@@ -283,26 +297,29 @@ export function useDashboardFilterValues({
       source,
       workflow,
       search,
+      pageSize,
     ],
-    queryFn: ({ signal }) =>
-      axios.get(endpoints.dashboard.filterValues, {
-        signal,
-        params: {
-          metric_name: metricName,
-          metric_type: metricType,
-          project_ids: (projectIds || []).join(","),
-          source,
-          ...(workflow ? { workflow } : {}),
-          ...(search ? { search } : {}),
-        },
-      }),
-    select: (res) => {
-      const result = res.data?.result || {};
-      return {
-        values: result.values || [],
-        queryReadState: getQueryReadState(result),
-      };
-    },
+    queryFn: ({ signal, pageParam }) =>
+      axios
+        .get(endpoints.dashboard.filterValues, {
+          signal,
+          params: {
+            metric_name: metricName,
+            metric_type: metricType,
+            project_ids: (projectIds || []).join(","),
+            source,
+            ...(workflow ? { workflow } : {}),
+            ...(search ? { search } : {}),
+            ...(pageSize ? { page_size: pageSize } : {}),
+            ...(pageParam ? { cursor: pageParam } : {}),
+          },
+        })
+        .then((res) => res.data?.result || {}),
+    initialPageParam: null,
+    getNextPageParam: (lastPage) =>
+      lastPage?.has_more && lastPage?.next_cursor
+        ? lastPage.next_cursor
+        : undefined,
     enabled: enabled && Boolean(metricName),
     retry: false,
     staleTime: 5 * 60 * 1000,
@@ -312,12 +329,33 @@ export function useDashboardFilterValues({
     meta: { errorHandled: true },
   });
 
+  const pages = query.data?.pages || [];
+  const seenValues = new Set();
+  const values = pages.flatMap((page) =>
+    (page?.values || []).filter((option) => {
+      const value =
+        option && typeof option === "object" && "value" in option
+          ? option.value
+          : option;
+      const identity = `${typeof value}:${JSON.stringify(value)}`;
+      if (seenValues.has(identity)) return false;
+      seenValues.add(identity);
+      return true;
+    }),
+  );
+  const pageReadStates = pages.map((page) => getFilterValueReadState(page));
+  const queryReadState = query.isError
+    ? "error"
+    : pageReadStates.includes("degraded")
+      ? "degraded"
+      : pageReadStates.includes("sampled")
+        ? "sampled"
+        : "complete";
+
   return {
     ...query,
-    data: query.data?.values || [],
-    queryReadState: query.isError
-      ? "error"
-      : query.data?.queryReadState || "complete",
+    data: values,
+    queryReadState,
   };
 }
 

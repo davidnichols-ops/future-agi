@@ -294,7 +294,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         bounded_filters = self._bounded_filters()
         try:
-            partition_trace_filter_plans(bounded_filters)
+            self._partition_trace_filter_plans(bounded_filters)
         except (TypeError, ValueError):
             return False
         return (
@@ -327,6 +327,22 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 }
             )
         return filters
+
+    def _partition_trace_filter_plans(
+        self,
+        filters: list[dict[str, Any]],
+    ) -> tuple[list[LatestFilterPredicate], list[dict[str, Any]]]:
+        """Compile predicates with this list surface's filter semantics.
+
+        Voice lists inject a private filter subclass for response-normalized
+        aliases. Generic trace/span builders retain the canonical maps, so
+        their ``status`` and raw ``call.status`` contracts remain unchanged.
+        """
+
+        return partition_trace_filter_plans(
+            filters,
+            filter_builder_cls=self._FILTER_BUILDER_CLS,
+        )
 
     def _bounded_match_filters(self) -> list[dict[str, Any]]:
         """Return the full-window predicates used for latest-state membership."""
@@ -418,7 +434,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         complete request window before returning page 1 or page N.
         """
 
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         return not any(plan.scope == "any" for plan in plans)
 
     def filter_seed_proves_population_bound(self) -> bool:
@@ -434,7 +450,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         if not self._bounded_population_proof:
             return False
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         return any(plan.scope == "any" for plan in plans)
 
     @staticmethod
@@ -461,7 +477,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         root-ordered fallback ran.
         """
 
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         candidates = [
             (index, plan)
             for index, plan in enumerate(plans)
@@ -486,7 +502,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         classifier still applies every value/filter leaf to each candidate.
         """
 
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         candidates = [
             (index, plan)
             for index, plan in enumerate(plans)
@@ -601,7 +617,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return True
 
     def _has_unindexed_any_span_filter(self) -> bool:
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         return any(
             plan.scope == "any" and "JSONExtract" in plan.seed_predicate
             for plan in plans
@@ -616,7 +632,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         has a deployed index companion ClickHouse can actually apply.
         """
 
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         return bool(plans) and not any(
             self._plan_uses_selective_graph_anchor(plan) for plan in plans
         )
@@ -633,7 +649,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         not a latest-state proof.
         """
 
-        plans, residual_filters = partition_trace_filter_plans(self._bounded_filters())
+        plans, residual_filters = self._partition_trace_filter_plans(
+            self._bounded_filters()
+        )
         active_filters = self._active_non_time_filters()
         if residual_filters or len(plans) != len(active_filters):
             return None
@@ -708,7 +726,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         if self._bounded_bulk_scan:
             return 200
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         request_start, request_end = self._bounded_request_window
         if (
             request_end - request_start <= timedelta(hours=1)
@@ -725,7 +743,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def recommended_filter_classify_batch_size(self) -> int | None:
         """Keep the candidate-trace latest-state scan below CH's memory ceiling."""
 
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         if self._structured_attribute_filter_count() and not self._bounded_bulk_scan:
             # Interactive trace lists and graphs otherwise widen identity-only
             # classification to 100. Structured JSON/Map replay must stay on
@@ -887,8 +905,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         case read ceiling before the exact ordered-root fallback ran. Short
         windows retain the existing 513-row probe, and graph callers retain
         their explicit per-stratum ``anchor_probe_limit`` contract.
+
+        Membership-only historical eval reads already use the 100-identity
+        exact classifier envelope and can optionally prefilter each acquired
+        batch with finite typed-Map witnesses.  A broad whole-window anchor
+        cannot prove that selector's final membership/order, so do not spend
+        its fixed request budget before ordered candidate acquisition.
         """
 
+        if self.supports_filter_candidate_witness_prefilter_without_hydration():
+            return None
         request_start, request_end = self._bounded_request_window
         if (
             request_end - request_start > timedelta(hours=1)
@@ -1068,7 +1094,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return None
 
         try:
-            plans, residual_filters = partition_trace_filter_plans(
+            plans, residual_filters = self._partition_trace_filter_plans(
                 self._bounded_filters()
             )
         except (TypeError, ValueError):
@@ -1313,7 +1339,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if not request_start <= slice_start < slice_end <= request_end:
             raise ValueError("trace seed slice must stay inside the request window")
         self.start_date, self.end_date = request_start, request_end
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         root_plans = [plan for plan in plans if plan.scope == "root"]
         root_seed_plan_predicates = [
             (plan, plan.raw_witness_predicate or plan.seed_predicate)
@@ -1509,7 +1535,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self.start_date, self.end_date = request_start, request_end
         self.params.update({"start_date": request_start, "end_date": request_end})
 
-        plans, _ = partition_trace_filter_plans(self._bounded_filters())
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         root_plans = [plan for plan in plans if plan.scope == "root"]
         any_span_plans = [plan for plan in plans if plan.scope == "any"]
         # One directly-indexable any-span leaf is a complete candidate anchor:
@@ -1792,7 +1818,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # Preserve an explicit user time filter, however, because that *is*
         # part of the task's selection contract.
         scope_to_request_window = not candidate_full_state or has_explicit_time_filter
-        plans, residual_filters = partition_trace_filter_plans(match_filters)
+        plans, residual_filters = self._partition_trace_filter_plans(match_filters)
         root_plans = [plan for plan in plans if plan.scope == "root"]
         any_span_plans = [plan for plan in plans if plan.scope == "any"]
         params: dict[str, Any] = {

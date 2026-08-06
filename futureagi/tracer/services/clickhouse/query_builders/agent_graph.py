@@ -136,7 +136,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
             sum(child.total_tokens) AS total_tokens,
             sum(child.cost) AS total_cost,
             countIf(child.status = 'ERROR') AS error_count,
-            uniq(child.trace_id) AS trace_count
+            uniqExact(child.trace_id) AS trace_count
         FROM {self.TABLE} AS child
         INNER JOIN {self.TABLE} AS parent
             ON child.parent_span_id = parent.id
@@ -193,7 +193,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
             sum(total_tokens) AS total_tokens,
             sum(cost) AS total_cost,
             countIf(status = 'ERROR') AS error_count,
-            uniq(trace_id) AS trace_count
+            uniqExact(trace_id) AS trace_count
         FROM {self.TABLE}
         {self.project_where()}
           AND created_at >= %(start_date)s - INTERVAL 1 DAY

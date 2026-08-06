@@ -44,6 +44,7 @@ from tracer.services.clickhouse.graph_dispatch import (
     enforce_exact_graph_data_contract,
     fetch_annotation_graph_ch,
     fetch_eval_graph_ch,
+    fetch_user_system_metric_graph_ch,
     graph_payload_is_publishable,
 )
 from tracer.services.clickhouse.read_budget import (
@@ -54,9 +55,11 @@ from tracer.services.clickhouse.v2.query_builders.user_list import (
 )
 from tracer.services.clickhouse.v2.query_builders.user_time_series import (
     UserDetailTimeSeriesQueryBuilderV2,
-    UserTimeSeriesQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
+from tracer.services.filter_principal_context import (
+    bind_request_my_annotations_principal,
+)
 from tracer.utils.constants import (
     INSTALLATION_GUIDE,
     INSTRUMENTORS,
@@ -675,15 +678,20 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
         query_params = request.validated_query_data
         project_id = str(query_params["project_id"])
         allow_sampled = query_params["allow_sampled"]
+        refresh = query_params.get("refresh", False)
 
         try:
             if not self._get_project_in_scope(project_id):
                 return self._gm.bad_request("Project not found.")
             response_data = get_all_system_metrics(
                 interval=query_params["interval"],
-                filters=query_params["filters"],
+                filters=bind_request_my_annotations_principal(
+                    request,
+                    query_params["filters"],
+                ),
                 property="average",
                 system_metric_filters={"project_id": project_id},
+                refresh=refresh,
             )
             if not graph_payload_is_publishable(
                 response_data,
@@ -713,7 +721,10 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             body = request.validated_data
             end_user_id = str(body["end_user_id"])
             project_id = str(body["project_id"])
-            filters = body["filters"]
+            filters = bind_request_my_annotations_principal(
+                request,
+                body["filters"],
+            )
 
             if not self._get_project_in_scope(project_id):
                 return self._gm.bad_request("Project not found.")
@@ -790,8 +801,12 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
         try:
             body = request.validated_data
             allow_sampled = request.validated_query_data["allow_sampled"]
+            refresh = request.validated_query_data.get("refresh", False)
             project_id = str(body["project_id"])
-            filters = body["filters"]
+            filters = bind_request_my_annotations_principal(
+                request,
+                body["filters"],
+            )
             interval = body["interval"]
             req_data_config = body["req_data_config"]
             metric_type = req_data_config.get("type", "SYSTEM_METRIC")
@@ -816,34 +831,24 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
 
             if metric_type == "SYSTEM_METRIC":
                 try:
-                    builder = UserTimeSeriesQueryBuilderV2(
-                        project_id=str(project_id),
+                    graph_data = fetch_user_system_metric_graph_ch(
+                        analytics=analytics,
+                        project_id=project_id,
                         filters=filters,
                         interval=interval,
+                        metric_id=metric_id,
+                        refresh=refresh,
                     )
-                    query, params = builder.build()
-                    result = analytics.execute_ch_query(query, params, timeout_ms=10000)
-                    ch_data = builder.format_result(result.data, result.columns or [])
-
-                    metric_key = metric_id if metric_id in ch_data else "active_users"
-                    metric_points = ch_data.get(metric_key, [])
-                    traffic_points = ch_data.get("traffic", [])
-                    traffic_by_ts = {
-                        t.get("timestamp"): t.get("traffic", 0) for t in traffic_points
-                    }
-                    graph_data = {
-                        "metric_name": metric_id,
-                        "data": [
-                            {
-                                "timestamp": p.get("timestamp"),
-                                "value": p.get("value", 0),
-                                "primary_traffic": traffic_by_ts.get(
-                                    p.get("timestamp"), 0
-                                ),
-                            }
-                            for p in metric_points
-                        ],
-                    }
+                    graph_data = enforce_exact_graph_data_contract(graph_data)
+                    if not graph_payload_is_publishable(
+                        graph_data,
+                        allow_sampled=allow_sampled,
+                    ):
+                        return self._gm.custom_error_response(
+                            status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "User graph data is temporarily unavailable. Please retry.",
+                            code="service_unavailable",
+                        )
                     return self._gm.success_response(graph_data)
                 except Exception as e:
                     logger.warning("CH user time-series failed", error=str(e))
@@ -870,6 +875,8 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                             filters=user_filters,
                             interval=interval,
                             req_data_config=req_data_config,
+                            refresh=refresh,
+                            aggregation_context="user",
                         )
                     except Exception as e:
                         logger.exception(
@@ -887,6 +894,8 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                             interval=interval,
                             req_data_config=req_data_config,
                             observe_type="trace",
+                            refresh=refresh,
+                            aggregation_context="user",
                         )
                     except Exception as e:
                         logger.exception(
@@ -944,7 +953,10 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
 
             try:
                 interval = body["interval"]
-                filters = body["filters"]
+                filters = bind_request_my_annotations_principal(
+                    request,
+                    body["filters"],
+                )
                 analytics = V2AnalyticsQueryService()
                 _org = get_request_organization(request) or request.user.organization
                 builder = UserDetailTimeSeriesQueryBuilderV2(

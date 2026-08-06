@@ -1,6 +1,6 @@
 import React from "react";
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "src/utils/test-utils";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
+import { act, render, screen, waitFor } from "src/utils/test-utils";
 import WidgetChart from "../WidgetChart";
 
 const h = vi.hoisted(() => ({
@@ -30,10 +30,17 @@ const baseWidget = {
 const queryResult = (points) => ({
   data: {
     result: {
+      query_complete: true,
+      query_status: "complete",
+      query_sampled: false,
+      query_completed_at: "2026-08-03T02:00:00Z",
       metrics: [
         {
           name: "Latency",
           aggregation: "avg",
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
           series: [{ name: "total", data: points }],
         },
       ],
@@ -42,9 +49,7 @@ const queryResult = (points) => ({
 });
 
 const NO_DATA_MESSAGE = /No data available for this time period/i;
-const SAMPLED_MESSAGE =
-  /Results are incomplete and sample-limited; values are estimates/i;
-const DEGRADED_MESSAGE = /Results are incomplete. Please retry/i;
+const PREPARING_MESSAGE = /Preparing exact data/i;
 
 describe("WidgetChart — empty time-range state", () => {
   beforeEach(() => {
@@ -73,6 +78,48 @@ describe("WidgetChart — empty time-range state", () => {
     expect(screen.queryByText(NO_DATA_MESSAGE)).not.toBeInTheDocument();
   });
 
+  it("connects exact line points across null buckets without coercing zeroes", () => {
+    h.query.data = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 12 },
+      { timestamp: "2026-07-09T01:00:00Z", value: null },
+      { timestamp: "2026-07-09T02:00:00Z", value: 0 },
+      { timestamp: "2026-07-09T03:00:00Z", value: 18 },
+    ]);
+
+    render(<WidgetChart widget={baseWidget} globalDateRange={null} />);
+
+    const renderedData = h.apex.mock.calls.at(-1)[0].series[0].data;
+    expect(renderedData.map((point) => point.y)).toEqual([12, 0, 18]);
+    expect(renderedData.map((point) => point.x)).toEqual([
+      new Date("2026-07-09T00:00:00Z").getTime(),
+      new Date("2026-07-09T02:00:00Z").getTime(),
+      new Date("2026-07-09T03:00:00Z").getTime(),
+    ]);
+    expect(
+      h.query.data.data.result.metrics[0].series[0].data[1].value,
+    ).toBeNull();
+  });
+
+  it("keeps null buckets in table data and renders them as a dash", () => {
+    h.query.data = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 12 },
+      { timestamp: "2026-07-09T01:00:00Z", value: null },
+    ]);
+
+    render(
+      <WidgetChart
+        widget={{ ...baseWidget, chart_config: { chart_type: "table" } }}
+        globalDateRange={null}
+      />,
+    );
+
+    expect(screen.getByText("-")).toBeInTheDocument();
+    expect(
+      h.query.data.data.result.metrics[0].series[0].data[1].value,
+    ).toBeNull();
+    expect(h.apex).not.toHaveBeenCalled();
+  });
+
   // Regression guard: hasNoDataForRange must stay ABOVE the metric-card/table/pie/
   // horizontal early returns so those widget types show this message too, instead of
   // falling into their own type-specific render with an empty series.
@@ -86,6 +133,113 @@ describe("WidgetChart — empty time-range state", () => {
   });
 });
 
+describe("WidgetChart — queued exact refresh", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    h.query.isPending = false;
+    h.query.isError = false;
+    h.query.data = null;
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it("polls a cold pending read without refresh and settles only on exact completion", async () => {
+    vi.useFakeTimers();
+    const pendingResponse = {
+      data: {
+        result: {
+          metrics: [],
+          query_complete: false,
+          query_status: "pending",
+          query_sampled: false,
+          query_refreshing: true,
+        },
+      },
+    };
+    const completedResponse = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 12 },
+    ]);
+    const onQuerySettled = vi.fn();
+    h.query.mutate
+      .mockImplementationOnce((_request, options) =>
+        options?.onSuccess?.(pendingResponse),
+      )
+      .mockImplementationOnce((_request, options) =>
+        options?.onSuccess?.(completedResponse),
+      );
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    expect(h.query.mutate).toHaveBeenCalledOnce();
+    expect(screen.getByText(PREPARING_MESSAGE)).toBeInTheDocument();
+    expect(onQuerySettled).not.toHaveBeenCalled();
+
+    await act(async () => vi.advanceTimersByTime(1000));
+
+    expect(h.query.mutate).toHaveBeenCalledTimes(2);
+    expect(h.query.mutate.mock.calls[1][0]).toEqual({
+      queryConfig: baseWidget.query_config,
+      refresh: false,
+    });
+    expect(onQuerySettled).toHaveBeenCalledOnce();
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dashboardId: "dashboard-1",
+        exact: true,
+        updatedAt: new Date("2026-08-03T02:00:00Z"),
+      }),
+    );
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+  });
+
+  it("keeps cached exact data visible and treats terminal refresh failure as unsettled", async () => {
+    vi.useFakeTimers();
+    const cachedResponse = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 12 },
+    ]);
+    cachedResponse.data.result.query_refreshing = true;
+    const failedResponse = structuredClone(cachedResponse);
+    failedResponse.data.result.query_refreshing = false;
+    failedResponse.data.result.query_refresh_failed = true;
+    const onQuerySettled = vi.fn();
+    h.query.data = cachedResponse;
+    h.query.mutate
+      .mockImplementationOnce((_request, options) =>
+        options?.onSuccess?.(cachedResponse),
+      )
+      .mockImplementationOnce((_request, options) =>
+        options?.onSuccess?.(failedResponse),
+      );
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+    expect(onQuerySettled).not.toHaveBeenCalled();
+
+    await act(async () => vi.advanceTimersByTime(1000));
+
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: false, updatedAt: null }),
+    );
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+    expect(screen.queryByText(PREPARING_MESSAGE)).not.toBeInTheDocument();
+  });
+});
+
 describe("WidgetChart — bounded dashboard read state", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -94,7 +248,7 @@ describe("WidgetChart — bounded dashboard read state", () => {
     h.query.data = null;
   });
 
-  it("visibly labels a bounded sampled metric while rendering its series", () => {
+  it("fails a bounded sampled metric closed instead of rendering estimates", () => {
     h.query.data = {
       data: {
         result: {
@@ -123,13 +277,13 @@ describe("WidgetChart — bounded dashboard read state", () => {
 
     render(<WidgetChart widget={baseWidget} globalDateRange={null} />);
 
-    expect(screen.getByText(SAMPLED_MESSAGE)).toBeInTheDocument();
-    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
-    expect(h.apex.mock.calls.at(-1)[0].series[0].name).toContain("sampled");
+    expect(screen.getByText(PREPARING_MESSAGE)).toBeInTheDocument();
+    expect(screen.queryByTestId("apex-line")).not.toBeInTheDocument();
+    expect(h.apex).not.toHaveBeenCalled();
   });
 
   it.each(["metric", "table", "pie", "bar"])(
-    "keeps the sampled disclosure visible for the %s render path",
+    "fails sampled payloads closed for the %s render path",
     (chartType) => {
       h.query.data = {
         data: {
@@ -165,7 +319,8 @@ describe("WidgetChart — bounded dashboard read state", () => {
         />,
       );
 
-      expect(screen.getByText(SAMPLED_MESSAGE)).toBeInTheDocument();
+      expect(screen.getByText(PREPARING_MESSAGE)).toBeInTheDocument();
+      expect(h.apex).not.toHaveBeenCalled();
     },
   );
 
@@ -198,7 +353,7 @@ describe("WidgetChart — bounded dashboard read state", () => {
 
     render(<WidgetChart widget={baseWidget} globalDateRange={null} />);
 
-    expect(screen.getByText(DEGRADED_MESSAGE)).toBeInTheDocument();
+    expect(screen.getByText(PREPARING_MESSAGE)).toBeInTheDocument();
     expect(screen.queryByTestId("apex-line")).not.toBeInTheDocument();
     expect(h.apex).not.toHaveBeenCalled();
   });
@@ -228,34 +383,95 @@ describe("WidgetChart — bounded dashboard read state", () => {
 
     render(<WidgetChart widget={baseWidget} globalDateRange={null} />);
 
-    expect(screen.getByText(DEGRADED_MESSAGE)).toBeInTheDocument();
+    expect(screen.getByText(PREPARING_MESSAGE)).toBeInTheDocument();
     expect(screen.queryByTestId("apex-line")).not.toBeInTheDocument();
     expect(h.apex).not.toHaveBeenCalled();
   });
 
-  it("keeps exact metrics renderable while excluding a degraded sibling", () => {
-    h.query.data = {
+  it.each([
+    [
+      "sampled",
+      {
+        query_complete: false,
+        query_status: "sampled",
+        query_error_code: "sample_limit",
+        query_sampling_strategy: "bounded_physical_rows_per_time_bucket",
+        query_sampling_interval_seconds: 86400,
+        query_sample_limit: 8192,
+        query_sample_per_bucket: 128,
+      },
+    ],
+    [
+      "degraded",
+      {
+        query_complete: false,
+        query_status: "degraded",
+        query_error_code: "read_budget_exceeded",
+      },
+    ],
+    ["error", { queryReadState: "error" }],
+  ])(
+    "fails the whole widget closed for complete + %s metrics",
+    (_, unavailableState) => {
+      const metricPoint = {
+        name: "total",
+        data: [{ timestamp: "2026-07-09T00:00:00Z", value: 12 }],
+      };
+      h.query.data = {
+        data: {
+          result: {
+            metrics: [
+              {
+                name: "Latency",
+                aggregation: "avg",
+                query_complete: true,
+                query_status: "complete",
+                query_sampled: false,
+                series: [metricPoint],
+              },
+              {
+                name: "Cost",
+                aggregation: "sum",
+                ...unavailableState,
+                series: [
+                  {
+                    ...metricPoint,
+                    data: [{ ...metricPoint.data[0], value: 999 }],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      };
+
+      render(<WidgetChart widget={baseWidget} globalDateRange={null} />);
+
+      expect(screen.getByText(PREPARING_MESSAGE)).toBeInTheDocument();
+      expect(screen.queryByTestId("apex-line")).not.toBeInTheDocument();
+      expect(h.apex).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps the last exact chart when a manual refresh returns sampled data", async () => {
+    const exactResponse = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 12 },
+      { timestamp: "2026-07-09T01:00:00Z", value: null },
+    ]);
+    const sampledResponse = {
       data: {
         result: {
           metrics: [
             {
               name: "Latency",
               aggregation: "avg",
-              query_complete: true,
-              query_status: "complete",
-              series: [
-                {
-                  name: "total",
-                  data: [{ timestamp: "2026-07-09T00:00:00Z", value: 12 }],
-                },
-              ],
-            },
-            {
-              name: "Cost",
-              aggregation: "sum",
               query_complete: false,
-              query_status: "degraded",
-              query_error_code: "read_budget_exceeded",
+              query_status: "sampled",
+              query_error_code: "sample_limit",
+              query_sampling_strategy: "bounded_physical_rows_per_time_bucket",
+              query_sampling_interval_seconds: 3600,
+              query_sample_limit: 8192,
+              query_sample_per_bucket: 128,
               series: [
                 {
                   name: "total",
@@ -267,14 +483,43 @@ describe("WidgetChart — bounded dashboard read state", () => {
         },
       },
     };
+    let response = exactResponse;
+    h.query.data = exactResponse;
+    h.query.mutate.mockImplementation((_request, options) => {
+      options?.onSuccess?.(response);
+    });
 
-    render(<WidgetChart widget={baseWidget} globalDateRange={null} />);
+    const { rerender } = render(
+      <WidgetChart
+        widget={baseWidget}
+        globalDateRange={null}
+        refreshRequestId={0}
+      />,
+    );
+    expect(h.apex.mock.calls.at(-1)[0].series[0].data[0].y).toBe(12);
 
-    expect(screen.getByText(DEGRADED_MESSAGE)).toBeInTheDocument();
-    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
-    const renderedSeries = h.apex.mock.calls.at(-1)[0].series;
-    expect(renderedSeries).toHaveLength(1);
-    expect(renderedSeries[0].name).toContain("Latency");
-    expect(renderedSeries[0].name).not.toContain("Cost");
+    response = sampledResponse;
+    rerender(
+      <WidgetChart
+        widget={baseWidget}
+        globalDateRange={null}
+        refreshRequestId={1}
+      />,
+    );
+
+    await waitFor(() => expect(h.query.mutate).toHaveBeenCalledTimes(2));
+    expect(h.apex.mock.calls.at(-1)[0].series[0].data[0].y).toBe(12);
+    expect(h.apex.mock.calls.at(-1)[0].series[0].data).toHaveLength(1);
+    expect(
+      exactResponse.data.result.metrics[0].series[0].data[1].value,
+    ).toBeNull();
+    expect(h.query.mutate.mock.calls.at(-1)[0]).toEqual({
+      queryConfig: baseWidget.query_config,
+      refresh: true,
+    });
+    await waitFor(() =>
+      expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText(PREPARING_MESSAGE)).not.toBeInTheDocument();
   });
 });

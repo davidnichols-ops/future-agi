@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { buildTracingPreviewListParams } from "./TracingTestMode";
+import {
+  buildTracingPreviewListParams,
+  buildTracingVoicePreviewListParams,
+} from "./TracingTestMode";
 import { mergeTracingFieldNames } from "./useExactEvalAttributeFields";
 
 describe("buildTracingPreviewListParams", () => {
@@ -24,9 +27,9 @@ describe("buildTracingPreviewListParams", () => {
 
     expect(params).toEqual({
       project_id: "project-1",
-      allow_sampled: true,
       page_number: 0,
       page_size: 50,
+      cursor_mode: true,
       filters: JSON.stringify([
         {
           column_id: "created_at",
@@ -42,6 +45,22 @@ describe("buildTracingPreviewListParams", () => {
       ]),
     });
     expect(params).not.toHaveProperty("interval");
+    expect(params).not.toHaveProperty("allow_sampled");
+  });
+
+  it("does not opt filtered voice previews into partial first pages", () => {
+    const params = buildTracingVoicePreviewListParams({
+      selectedProjectId: "project-1",
+      effectiveFilters: [{ column_id: "call_status" }],
+    });
+
+    expect(params).toMatchObject({
+      project_id: "project-1",
+      page: 1,
+      page_size: 50,
+      cursor_mode: true,
+    });
+    expect(params).not.toHaveProperty("allow_sampled");
   });
 
   it("merges an exact rare field omitted by the preview-row catalog", () => {

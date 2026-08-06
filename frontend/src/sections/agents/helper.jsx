@@ -842,12 +842,13 @@ export const useCallLogs = ({
   page,
   pageLimit,
   params,
+  paginationParams,
   enabled = true,
 }) => {
   const isProjectModule = module === "project";
   const condition = isProjectModule ? !!id : !!id && !!version;
   const queryKey = isProjectModule
-    ? ["callLogs", module, id, pageLimit, params, page]
+    ? ["callLogs", module, id, pageLimit, params, page, paginationParams]
     : ["callLogs", module, id, version, pageLimit, params, page];
   const getEndpoint = () =>
     isProjectModule
@@ -857,12 +858,13 @@ export const useCallLogs = ({
     queryKey: queryKey,
     queryFn: () =>
       axios.get(getEndpoint(), {
-        params: {
-          page,
-          page_size: pageLimit,
-          ...(isProjectModule && { allow_sampled: true }),
-          ...params,
-        },
+        params: paginationParams
+          ? { ...params, ...paginationParams }
+          : {
+              page,
+              page_size: pageLimit,
+              ...params,
+            },
       }),
     enabled: condition && enabled,
     select: (data) => data?.data,
@@ -872,7 +874,7 @@ export const useCallLogs = ({
 
 export const prefetchCallLogs = (
   queryClient,
-  { module, id, version, page, pageLimit, params },
+  { module, id, version, page, pageLimit, params, paginationParams },
 ) => {
   const isProjectModule = module === "project";
   const condition = isProjectModule ? !!id : !!id && !!version;
@@ -883,18 +885,19 @@ export const prefetchCallLogs = (
     ? endpoints.project.getCallLogs
     : endpoints.agentDefinitions.getCallLogs(id, version);
   const queryKey = isProjectModule
-    ? ["callLogs", module, id, pageLimit, params, page]
+    ? ["callLogs", module, id, pageLimit, params, page, paginationParams]
     : ["callLogs", module, id, version, pageLimit, params, page];
   queryClient.prefetchQuery({
     queryKey,
     queryFn: () =>
       axios.get(endpoint, {
-        params: {
-          page,
-          page_size: pageLimit,
-          ...(isProjectModule && { allow_sampled: true }),
-          ...params,
-        },
+        params: paginationParams
+          ? { ...params, ...paginationParams }
+          : {
+              page,
+              page_size: pageLimit,
+              ...params,
+            },
       }),
   });
 };

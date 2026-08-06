@@ -46,6 +46,10 @@ import {
 } from "src/components/inline-audio/audio-detection";
 import { ID_ONLY_FIELDS } from "src/sections/projects/LLMTracing/idFields";
 import {
+  followEmptyListContinuations,
+  listContinuationParams,
+} from "src/sections/projects/LLMTracing/listCursorPagination";
+import {
   ANNOTATION_COLUMN_IDS,
   FIELD_CATEGORY_TO_COL_TYPE,
   RANGE_OPS,
@@ -118,6 +122,23 @@ export function buildApiFilterArray(oldFormatFilters, startDate, endDate) {
   }
 
   return userFilters;
+}
+
+// Trace/span/session/voice previews opt into signed bounded continuation. Every row is
+// a genuine classified match; checkpoint-only transport pages are followed by
+// the caller below until at least one row is found or the frozen window ends.
+// eslint-disable-next-line react-refresh/only-export-components
+export function buildTaskPreviewListParams({ rowType, projectId, apiFilters }) {
+  const cursorCapable = ["voiceCalls", "traces", "spans", "sessions"].includes(
+    rowType,
+  );
+  return {
+    project_id: projectId,
+    ...(rowType === "voiceCalls" ? { page: 1 } : { page_number: 0 }),
+    page_size: 50,
+    filters: JSON.stringify(apiFilters),
+    ...(cursorCapable ? { cursor_mode: true } : {}),
+  };
 }
 
 // Deep search: check if a value (including nested JSON) matches query
@@ -251,20 +272,36 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
       if (!projectId) return { rows: [], total: 0, columns: [] };
 
       if (rowType === "voiceCalls") {
-        const resp = await axios.get(endpoints.project.getCallLogs, {
-          params: {
-            project_id: projectId,
-            allow_sampled: true,
-            page: 1,
-            page_size: 50,
-            filters: JSON.stringify(apiFilters),
+        const requestParams = buildTaskPreviewListParams({
+          rowType,
+          projectId,
+          apiFilters,
+        });
+        let resp = await axios.get(endpoints.project.getCallLogs, {
+          params: requestParams,
+        });
+        resp = await followEmptyListContinuations({
+          initialResponse: resp,
+          rowsFromResponse: (response) => {
+            const result = response?.data?.result || response?.data || {};
+            return result.results || result.data || result.calls || [];
           },
+          metadataFromResponse: (response) =>
+            response?.data?.result || response?.data || {},
+          nextResponse: (cursor) =>
+            axios.get(endpoints.project.getCallLogs, {
+              params: listContinuationParams(requestParams, cursor),
+            }),
         });
         const result = resp.data?.result || resp.data || {};
         const rowsOut = result.results || result.data || result.calls || [];
         return {
           rows: rowsOut,
-          total: result.total_count || result.total || rowsOut.length,
+          total:
+            result.count ??
+            result.total_count ??
+            result.total ??
+            rowsOut.length,
           columns: [],
         };
       }
@@ -284,14 +321,21 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           url = endpoints.project.getSpansForObserveProject();
       }
 
-      const resp = await axios.get(url, {
-        params: {
-          project_id: projectId,
-          allow_sampled: true,
-          page_number: 0,
-          page_size: 50,
-          filters: JSON.stringify(apiFilters),
-        },
+      const requestParams = buildTaskPreviewListParams({
+        rowType,
+        projectId,
+        apiFilters,
+      });
+      let resp = await axios.get(url, { params: requestParams });
+      resp = await followEmptyListContinuations({
+        initialResponse: resp,
+        rowsFromResponse: (response) => response?.data?.result?.table || [],
+        metadataFromResponse: (response) =>
+          response?.data?.result?.metadata || {},
+        nextResponse: (cursor) =>
+          axios.get(url, {
+            params: listContinuationParams(requestParams, cursor),
+          }),
       });
       const result = resp.data?.result || {};
       return {
@@ -310,7 +354,6 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
   });
 
   const rows = listData?.rows || [];
-  const total = listData?.total || 0;
   const columns = listData?.columns || [];
   const currentRow = rows[currentRowIndex] || null;
 
@@ -582,7 +625,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           sx={{ fontSize: "11px", display: "block" }}
         >
           {projectId
-            ? "Browse a sample row matching your current filters"
+            ? "Browse a row matching your current filters"
             : "Select a project to preview matching rows"}
         </Typography>
       </Box>
@@ -639,14 +682,6 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
               >
                 Row {Math.min(currentRowIndex + 1, rows.length)} of{" "}
                 {rows.length}
-                {total > rows.length && (
-                  <Typography
-                    component="span"
-                    sx={{ fontSize: "11px", color: "text.disabled", ml: 0.5 }}
-                  >
-                    ({total} matching total)
-                  </Typography>
-                )}
               </Typography>
               <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
                 <IconButton

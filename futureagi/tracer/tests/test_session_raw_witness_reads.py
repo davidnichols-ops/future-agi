@@ -114,6 +114,67 @@ def test_session_seed_prefers_indexed_scalar_when_json_filter_comes_first() -> N
 
 
 @pytest.mark.unit
+def test_one_year_multi_attribute_session_filter_stays_candidate_scoped() -> None:
+    """Long windows change the number of bounded slices, not classifier width."""
+
+    long_start = END - timedelta(days=365)
+    filters = [
+        {
+            "column_id": "created_at",
+            "filter_config": {
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [long_start.isoformat(), END.isoformat()],
+            },
+        },
+        _attribute_filter("final_status", ["Rechazado"], operation="in"),
+        _attribute_filter(
+            "customer_context",
+            {"country": "CO"},
+            filter_type="map",
+            operation="contains",
+        ),
+        _attribute_filter(
+            "quality_score",
+            0.75,
+            filter_type="number",
+            operation="greater_than_or_equal",
+        ),
+        _attribute_filter(
+            "reviewed",
+            True,
+            filter_type="boolean",
+            operation="equals",
+        ),
+    ]
+    builder = SessionListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=filters,
+        bounded_internal_scan=True,
+    )
+
+    seed_sql, seed_params = builder.build_filter_seed_page(
+        slice_start=END - timedelta(minutes=5),
+        slice_end=END,
+        limit=200,
+    )
+    match_sql, match_params = builder.build_filter_match_query([CANDIDATE_SESSION_ID])
+
+    assert builder.parse_time_range(filters) == (long_start, END)
+    assert seed_params["filter_slice_start"] == END - timedelta(minutes=5)
+    assert seed_params["filter_slice_end"] == END
+    assert "LIMIT %(filter_seed_limit)s" in seed_sql
+    assert "JSONExtract" not in seed_sql
+    assert "candidate_filter_session_ids" in match_params
+    assert match_params["candidate_filter_session_ids"] == (CANDIDATE_SESSION_ID,)
+    assert "latest_json_map_exists_1" in match_sql
+    assert "latest_attr_exists_0" in match_sql
+    assert "latest_attr_exists_2" in match_sql
+    assert "latest_attr_exists_3" in match_sql
+    assert "LIMIT %(bounded_match_limit)s" in match_sql
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("filter_type", "value", "raw_expression"),
     [

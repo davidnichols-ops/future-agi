@@ -80,11 +80,12 @@ const incompleteData = {
 const completeData = {
   count: 16,
   count_is_lower_bound: true,
-  total_pages: 2,
+  total_pages: 7,
   current_page: 1,
   results: [{ id: "trace-a", trace_id: "trace-a", status: "completed" }],
   config: [],
   has_more: true,
+  next_cursor: "signed-voice-page-2",
   query_complete: true,
   query_status: "complete",
   query_error_code: null,
@@ -108,7 +109,7 @@ describe("CallLogsGrid bounded-read state", () => {
     render(<CallLogsGrid id="project-1" module="project" hideDrawer />);
 
     expect(await screen.findByRole("status")).toHaveTextContent(
-      "Results are incomplete. Please retry in a moment.",
+      "Some results could not be loaded. Please try again.",
     );
     expect(screen.queryByText("No calls found")).not.toBeInTheDocument();
     expect(agGridState.props.rowData).toEqual([]);
@@ -135,6 +136,9 @@ describe("CallLogsGrid bounded-read state", () => {
     expect(
       screen.getByRole("button", { name: /go to page 2/i }),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /go to page 3/i }),
+    ).not.toBeInTheDocument();
     expect(screen.getByText("Next").closest("button")).not.toBeDisabled();
     expect(prefetchCallLogsMock).toHaveBeenCalledWith(
       expect.anything(),
@@ -143,7 +147,42 @@ describe("CallLogsGrid bounded-read state", () => {
         id: "project-1",
         page: 2,
         pageLimit: 15,
+        paginationParams: {
+          cursor_mode: true,
+          cursor: "signed-voice-page-2",
+          page_size: 15,
+        },
       }),
     );
+    expect(useCallLogsMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paginationParams: {
+          cursor_mode: true,
+          page: 1,
+          page_size: 15,
+        },
+      }),
+    );
+  });
+
+  it("keeps proven rows and cursor navigation usable despite degraded total metadata", async () => {
+    useCallLogsMock.mockReturnValue({
+      data: {
+        ...completeData,
+        query_complete: false,
+        query_status: "degraded",
+        query_error_code: "count_budget_exceeded",
+      },
+      isLoading: false,
+      error: null,
+      queryKey: ["callLogs", "project", "project-1", 15, {}, 1],
+    });
+
+    render(<CallLogsGrid id="project-1" module="project" hideDrawer />);
+
+    await waitFor(() => expect(prefetchCallLogsMock).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(agGridState.props.rowData).toEqual(completeData.results);
+    expect(screen.getByText("Next").closest("button")).not.toBeDisabled();
   });
 });

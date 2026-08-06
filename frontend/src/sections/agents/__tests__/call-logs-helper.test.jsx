@@ -94,10 +94,38 @@ describe("useCallLogs", () => {
     expect(axiosMocks.agentGetCallLogs).not.toHaveBeenCalled();
     expect(axiosMocks.get).toHaveBeenCalledWith(axiosMocks.projectGetCallLogs, {
       params: {
-        allow_sampled: true,
         page: 1,
         page_size: 25,
         project_id: "project-1",
+      },
+    });
+  });
+
+  it("uses an opaque voice continuation without also sending a numbered page", async () => {
+    renderHook(
+      () =>
+        useCallLogs({
+          module: "project",
+          id: "project-1",
+          page: 2,
+          pageLimit: 25,
+          params: { project_id: "project-1" },
+          paginationParams: {
+            cursor_mode: true,
+            cursor: "signed-voice-page-2",
+            page_size: 25,
+          },
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(axiosMocks.get).toHaveBeenCalledTimes(1));
+    expect(axiosMocks.get).toHaveBeenCalledWith(axiosMocks.projectGetCallLogs, {
+      params: {
+        project_id: "project-1",
+        cursor_mode: true,
+        cursor: "signed-voice-page-2",
+        page_size: 25,
       },
     });
   });

@@ -277,15 +277,18 @@ class TraceVoiceCallListQuerySerializer(TraceExportQuerySerializer):
         help_text=(
             "One-based numbered page. Pages whose required ordered work exceeds "
             "the finite read contract return HTTP 422 with code "
-            "page_depth_exceeded; request an earlier page or narrow the time "
-            "range. This endpoint does not provide cursor or unrestricted "
-            "deep-page traversal."
+            "page_depth_exceeded; request an earlier page, use the additive "
+            "continuation cursor, or narrow the time range."
         ),
     )
     page_size = serializers.IntegerField(
         required=False, default=30, min_value=1, max_value=500
     )
     remove_simulation_calls = serializers.BooleanField(required=False, default=False)
+    cursor = serializers.CharField(
+        required=False, allow_blank=False, max_length=4096, help_text=CURSOR_HELP_TEXT
+    )
+    cursor_mode = serializers.BooleanField(required=False, default=False)
     allow_sampled = serializers.BooleanField(
         required=False,
         help_text=(
@@ -296,6 +299,15 @@ class TraceVoiceCallListQuerySerializer(TraceExportQuerySerializer):
             "the full ordered prefix cannot be proven inside the read budget."
         ),
     )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        return validate_cursor_exclusivity(
+            self,
+            attrs,
+            page_field="page",
+            first_page=1,
+        )
 
 
 class TraceVoiceCallListResponseSerializer(serializers.Serializer):
@@ -308,6 +320,7 @@ class TraceVoiceCallListResponseSerializer(serializers.Serializer):
     results = serializers.ListField(child=serializers.DictField())
     config = serializers.ListField(child=serializers.DictField())
     has_more = serializers.BooleanField()
+    next_cursor = serializers.CharField(required=False, allow_null=True)
     query_complete = serializers.BooleanField()
     query_status = serializers.ChoiceField(choices=("complete", "degraded"))
     query_error_code = serializers.CharField(required=False)
@@ -338,6 +351,19 @@ class UsersQuerySerializer(StrictInputSerializer):
     sort_params = SortParamListQueryParamField(required=False, default=list)
     filters = filter_list_query_param_field(required=False, default=list)
     export = serializers.BooleanField(required=False, default=False)
+    cursor = serializers.CharField(
+        required=False, allow_blank=False, max_length=4096, help_text=CURSOR_HELP_TEXT
+    )
+    cursor_mode = serializers.BooleanField(required=False, default=False)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        return validate_cursor_exclusivity(
+            self,
+            attrs,
+            page_field="current_page_index",
+            first_page=0,
+        )
 
 
 class UsersTableRowSerializer(serializers.Serializer):
@@ -368,6 +394,13 @@ class UsersResultSerializer(serializers.Serializer):
     table = serializers.ListField(child=serializers.JSONField())
     total_count = serializers.IntegerField()
     total_pages = serializers.IntegerField()
+    count_is_lower_bound = serializers.BooleanField(required=False)
+    has_more = serializers.BooleanField(required=False)
+    next_cursor = serializers.CharField(required=False, allow_null=True)
+    query_complete = serializers.BooleanField(required=False)
+    query_status = serializers.ChoiceField(
+        choices=("complete", "degraded"), required=False
+    )
 
 
 class UsersResponseSerializer(serializers.Serializer):

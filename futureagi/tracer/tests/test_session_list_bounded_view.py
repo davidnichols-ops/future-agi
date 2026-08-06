@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from tracer.selectors.trace_filter_reads import BoundedFilterPage
+from tracer.services.clickhouse.list_cursor import ListCursorError
 
 
 def _attribute_filter() -> dict:
@@ -24,6 +25,17 @@ def _attribute_filter() -> dict:
     }
 
 
+def _has_eval_filter(value: bool | str) -> dict:
+    return {
+        "column_id": "has_eval",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
+
+
 def _bounded_page(
     *,
     rows: list[dict] | None = None,
@@ -31,6 +43,9 @@ def _bounded_page(
     complete: bool = True,
     error_code: str | None = None,
     total_rows_lower_bound: int = 0,
+    continuation_slice_end: datetime | None = None,
+    continuation_before_start_time: datetime | None = None,
+    continuation_before_id: str | None = None,
 ) -> BoundedFilterPage:
     return BoundedFilterPage(
         rows=list(rows or []),
@@ -44,6 +59,9 @@ def _bounded_page(
         rows_returned=len(rows or []),
         result_payload_bytes=128,
         attempts=(),
+        continuation_slice_end=continuation_slice_end,
+        continuation_before_start_time=continuation_before_start_time,
+        continuation_before_id=continuation_before_id,
     )
 
 
@@ -68,6 +86,64 @@ def _view_and_request():
         user=SimpleNamespace(organization=organization),
     )
     return view, request
+
+
+@pytest.mark.unit
+def test_direct_write_session_attribute_query_replays_all_typed_maps():
+    from tracer.services.clickhouse.v2.query_builders.session_list import (
+        SessionListQueryBuilderV2,
+    )
+
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "filter_type": "datetime",
+                    "filter_op": "between",
+                    "filter_value": [
+                        datetime(2026, 7, 1, tzinfo=UTC),
+                        datetime(2026, 8, 1, tzinfo=UTC),
+                    ],
+                },
+            }
+        ],
+    )
+
+    query, _ = builder.build_span_attributes_query([str(uuid.uuid4())])
+
+    assert "argMax(attrs_string, _version) AS latest_attrs_string" in query
+    assert "argMax(attrs_number, _version) AS latest_attrs_number" in query
+    assert "argMax(attrs_bool, _version) AS latest_attrs_bool" in query
+    assert "latest_attrs_bool AS attrs_bool" in query
+    assert "length(mapKeys(latest_attrs_bool)) > 0" in query
+
+
+@pytest.mark.unit
+def test_direct_write_session_attribute_merge_unions_scalar_and_json_sources():
+    from tracer.views.trace_session import _merge_session_attribute_sources
+
+    attrs = _merge_session_attribute_sources(
+        {
+            "span_attributes_raw": '{"structured":{"attempt":2},"shared":"json"}',
+            "attrs_string": {
+                "final_status": "Rechazado",
+                "shared": "typed-map",
+            },
+            "attrs_number": {"score": 12.5},
+            "attrs_bool": {"approved": 1, "rejected": 0},
+        }
+    )
+
+    assert attrs == {
+        "structured": {"attempt": 2},
+        "shared": "json",
+        "final_status": "Rechazado",
+        "score": 12.5,
+        "approved": True,
+        "rejected": False,
+    }
 
 
 @pytest.mark.unit
@@ -470,3 +546,186 @@ def test_incomplete_bounded_session_list_returns_sanitized_503_without_hydration
     builder.build_candidate_page_query.assert_not_called()
     builder.build.assert_not_called()
     builder.build_page_metrics_query.assert_not_called()
+
+
+@pytest.mark.unit
+def test_tampered_session_cursor_fails_closed_before_clickhouse_read():
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    analytics = mock.MagicMock()
+
+    with pytest.raises(ListCursorError) as exc_info:
+        TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=str(uuid.uuid4()),
+            project=None,
+            analytics=analytics,
+            validated_data={
+                "filters": [_attribute_filter()],
+                "sort_params": [],
+                "page_number": 0,
+                "page_size": 30,
+                "cursor_mode": True,
+                "cursor": "tampered-token",
+            },
+        )
+
+    assert exc_info.value.code == "invalid_cursor"
+    assert str(exc_info.value) == "The continuation cursor is invalid."
+    analytics.execute_ch_query.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("membership_filter", "relation_version_ceilings"),
+    [
+        (
+            _attribute_filter(),
+            {"spans": 42, "trace_session_id_remap": 84},
+        ),
+        (
+            _has_eval_filter(False),
+            {
+                "spans": 42,
+                "trace_session_id_remap": 84,
+                "tracer_eval_logger_v2": 126,
+            },
+        ),
+    ],
+)
+def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
+    membership_filter,
+    relation_version_ceilings,
+):
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    project_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    window_start = datetime(2025, 8, 1, tzinfo=UTC)
+    window_end = datetime(2026, 8, 1, tzinfo=UTC)
+    checkpoint_end = window_end - timedelta(days=30)
+    session_start = window_start + timedelta(days=2)
+
+    builder = mock.MagicMock()
+    builder.supports_candidate_first_page.return_value = True
+    builder.supports_bounded_filter_scan.return_value = True
+    builder.recommended_filter_classify_batch_size.return_value = 50
+    builder.parse_time_range.return_value = (window_start, window_end)
+    builder.build_page_metrics_query.return_value = ("page metrics", {})
+    builder.build_content_query.return_value = ("page content", {})
+    builder.build_span_attributes_query.return_value = ("page attributes", {})
+    builder.format_sessions.side_effect = lambda rows, columns: [
+        dict(zip(columns, row, strict=True)) for row in rows
+    ]
+    analytics = mock.MagicMock()
+
+    def _execute(query, _params, **_kwargs):
+        if query == "page metrics":
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": session_id,
+                        "session_start": session_start,
+                        "session_end": session_start,
+                        "duration": 0,
+                        "total_cost": 0,
+                        "total_tokens": 0,
+                        "traces_count": 1,
+                    }
+                ]
+            )
+        if query == "page content":
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": session_id,
+                        "first_message": "first",
+                        "last_message": "last",
+                    }
+                ]
+            )
+        if query == "page attributes":
+            return SimpleNamespace(data=[])
+        raise AssertionError(f"unexpected ClickHouse query: {query}")
+
+    analytics.execute_ch_query.side_effect = _execute
+    view._fetch_session_names = mock.MagicMock(return_value={})
+    view._fetch_end_user_info = mock.MagicMock(return_value={})
+    first_page = _bounded_page(
+        complete=False,
+        error_code="deadline_exceeded",
+        continuation_slice_end=checkpoint_end,
+    )
+    second_page = _bounded_page(
+        rows=[{"session_id": session_id, "start_time": session_start}],
+        complete=True,
+        total_rows_lower_bound=1,
+    )
+    validated_data = {
+        "filters": [membership_filter],
+        "sort_params": [],
+        "page_number": 0,
+        "page_size": 1,
+        "cursor_mode": True,
+    }
+
+    with (
+        mock.patch(
+            "tracer.views.trace_session.SessionListQueryBuilderV2",
+            return_value=builder,
+        ),
+        mock.patch(
+            "tracer.views.trace_session.capture_list_relation_snapshot",
+            return_value=(
+                {},
+                relation_version_ceilings,
+            ),
+        ) as capture_snapshot,
+        mock.patch(
+            "tracer.views.trace_session.read_bounded_filter_page",
+            side_effect=[first_page, second_page],
+        ) as bounded_read,
+        mock.patch(
+            "tracer.views.trace_session.AnnotationsLabels.objects.filter",
+            return_value=[],
+        ),
+    ):
+        first_status, first_payload = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=project_id,
+            project=None,
+            analytics=analytics,
+            validated_data=validated_data,
+        )
+        cursor = first_payload["metadata"]["next_cursor"]
+        second_status, second_payload = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=project_id,
+            project=None,
+            analytics=analytics,
+            validated_data={**validated_data, "cursor": cursor},
+        )
+
+    assert first_status == "ok"
+    assert first_payload["table"] == []
+    assert first_payload["metadata"]["total_rows"] == 0
+    assert first_payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert first_payload["metadata"]["has_more"] is True
+    assert isinstance(cursor, str)
+    assert second_status == "ok"
+    assert [row["session_id"] for row in second_payload["table"]] == [session_id]
+    assert second_payload["metadata"]["has_more"] is False
+    assert second_payload["metadata"]["next_cursor"] is None
+    assert second_payload["metadata"]["total_rows_exact"] == 1
+    assert capture_snapshot.call_count == 1
+    assert bounded_read.call_count == 2
+    continuation = bounded_read.call_args_list[1].kwargs
+    assert continuation["page_number"] == 0
+    assert continuation["bounded_continuation"] is True
+    assert continuation["include_incomplete_rows"] is True
+    assert continuation["continuation_slice_end"] == checkpoint_end

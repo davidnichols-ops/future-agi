@@ -57,6 +57,9 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
     AGG_TABLE = "spans_hourly_rollup"
     # Denormalized raw table (for filtered queries)
     RAW_TABLE = "spans"
+    # This builder is in the legacy-neutral package but its raw source is the
+    # direct-write CH25 table.
+    SNAPSHOT_VERSION_COLUMN = "_version"
 
     def __init__(
         self,
@@ -64,14 +67,22 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         filters: list[dict] | None = None,
         interval: str = "hour",
         system_metric_filters: dict[str, Any] | None = None,
+        exact_snapshot: bool = False,
+        observe_type: str = "span",
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id, **kwargs)
         self.filters = filters or []
         self.interval = interval
         self.system_metric_filters = system_metric_filters or {}
-        self.start_date: datetime | None = None
-        self.end_date: datetime | None = None
+        self.exact_snapshot = bool(exact_snapshot)
+        self.observe_type = str(observe_type or "span").strip().lower()
+        if self.observe_type not in {"trace", "span"}:
+            raise ValueError("observe_type must be trace or span")
+        self.start_date = start_date
+        self.end_date = end_date
 
     # ------------------------------------------------------------------
     # Public API
@@ -88,7 +99,8 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             ClickHouseFilterBuilderV2 as ClickHouseFilterBuilder,
         )
 
-        self.start_date, self.end_date = self.parse_time_range(self.filters)
+        if self.start_date is None or self.end_date is None:
+            self.start_date, self.end_date = self.parse_time_range(self.filters)
         self.params["start_date"] = self.start_date
         self.params["end_date"] = self.end_date
 
@@ -97,15 +109,29 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         # Project + window scope must reach the filter compiler: without them
         # the trace-membership subqueries it emits for SPAN_ATTRIBUTE /
         # SYSTEM_METRIC filters scan every tenant's spans for all time.
-        filter_builder = ClickHouseFilterBuilder(
-            table=self.RAW_TABLE,
-            project_id=self.project_id,
-            project_ids=self.project_ids,
-            span_date_scope=True,
-        )
-        extra_where, extra_params = filter_builder.translate(self.filters)
+        if self.exact_snapshot:
+            from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+                compile_exact_graph_filter_predicates,
+            )
+
+            extra_where, extra_params = compile_exact_graph_filter_predicates(
+                self.filters,
+                project_id=str(self.project_id),
+                observe_type=self.observe_type,
+            )
+        else:
+            filter_builder = ClickHouseFilterBuilder(
+                table=self.RAW_TABLE,
+                project_id=self.project_id,
+                project_ids=self.project_ids,
+                span_date_scope=True,
+                query_mode=self.observe_type,
+            )
+            extra_where, extra_params = filter_builder.translate(self.filters)
         self.params.update(extra_params)
 
+        if self.exact_snapshot:
+            return self._build_exact_raw_query(extra_where)
         if extra_where:
             return self._build_raw_query(extra_where)
         return self._build_agg_query()
@@ -330,6 +356,69 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
           AND start_time >= %(start_date)s
           AND start_time < %(end_date)s
           AND {extra_where}
+        GROUP BY time_bucket
+        ORDER BY time_bucket
+        """
+        return query, self.params
+
+    def _build_exact_raw_query(self, extra_where: str) -> tuple[str, dict[str, Any]]:
+        """Aggregate the complete latest-live raw row set.
+
+        The caller applies one physical ``_version`` ceiling through
+        ``additional_table_filters`` and reuses it for every output partition.
+        ``FINAL`` therefore resolves corrections and tombstones as of that one
+        ceiling instead of mixing versions that arrive during a refresh.
+
+        A trace graph selects the complete trace population first and then
+        aggregates all live child spans. A span graph applies the filter to the
+        contributing span rows directly.
+        """
+
+        assert self.start_date is not None and self.end_date is not None
+        bucket_fn = self.time_bucket_expr(self.interval)
+        match_clause = f"AND {extra_where}" if extra_where else ""
+        self.params["snapshot_start_date"] = self.start_date
+        self.params["snapshot_end_date"] = self.end_date
+
+        # A date-only trace graph has no membership predicate: every live span
+        # in the frozen window contributes, exactly as it did through the
+        # unfiltered rollup path.  Building a DISTINCT trace-id set in that
+        # case only doubles the scan and can exhaust ClickHouse while creating
+        # a set containing the whole tenant.  Membership is required only when
+        # a non-time trace filter must first select matching traces.
+        if self.observe_type == "trace" and extra_where:
+            membership = f"""
+              AND trace_id IN (
+                  SELECT DISTINCT trace_id
+                  FROM {self.RAW_TABLE} FINAL
+                  {self.project_where()}
+                    AND start_time >= %(snapshot_start_date)s
+                    AND start_time < %(snapshot_end_date)s
+                    {match_clause}
+              )
+            """
+            contribution_filter = ""
+        else:
+            membership = ""
+            contribution_filter = match_clause
+
+        query = f"""
+        SELECT
+            {bucket_fn}(start_time) AS time_bucket,
+            avg(latency_ms) AS avg_latency,
+            sum(total_tokens) AS total_tokens,
+            avg(cost) AS avg_cost,
+            count() AS traffic_count,
+            sum(prompt_tokens) AS prompt_tokens,
+            sum(completion_tokens) AS completion_tokens,
+            countIf(upper(status) IN ('ERROR', 'ERRORED', 'FAILED'))
+                * 100.0 / greatest(count(), 1) AS error_rate
+        FROM {self.RAW_TABLE} FINAL
+        {self.project_where()}
+          AND start_time >= %(start_date)s
+          AND start_time < %(end_date)s
+          {membership}
+          {contribution_filter}
         GROUP BY time_bucket
         ORDER BY time_bucket
         """

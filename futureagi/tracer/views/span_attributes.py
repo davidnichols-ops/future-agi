@@ -95,7 +95,7 @@ class SpanAttributeKeysView(APIView):
             exact_key = request.validated_query_data.get("q")
             selector = AttributeReadSelector(
                 typed_only=True,
-                json_attribute_mode="arrays",
+                json_attribute_mode="structured",
             )
             if not _project_is_in_request_scope(request, project_id):
                 return self._gm.not_found("Project not found")

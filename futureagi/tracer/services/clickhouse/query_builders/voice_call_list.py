@@ -70,6 +70,111 @@ _VOICE_ROOT_FILTER = {
 }
 
 
+def _raw_log_has_key(key: str) -> str:
+    """Return a code-owned predicate for a key in either raw-log encoding."""
+
+    return (
+        "(JSONHas(span_attributes_raw, 'raw_log', '"
+        f"{key}') OR "
+        "JSONHas(JSONExtractString(span_attributes_raw, 'raw_log'), '"
+        f"{key}') OR "
+        "JSONHas(span_attr_str['raw_log'], '"
+        f"{key}'))"
+    )
+
+
+def _raw_log_number(path: tuple[str, ...]) -> str:
+    """Read one provider number from object, encoded-string, or Map raw_log."""
+
+    quoted_path = ", ".join(f"'{part}'" for part in path)
+    nested_path = f"'raw_log', {quoted_path}"
+    encoded_raw_log = "JSONExtractString(span_attributes_raw, 'raw_log')"
+    map_raw_log = "span_attr_str['raw_log']"
+    return (
+        "coalesce("
+        f"if(JSONHas(span_attributes_raw, {nested_path}), "
+        f"JSONExtractFloat(span_attributes_raw, {nested_path}), null), "
+        f"if(JSONHas({encoded_raw_log}, {quoted_path}), "
+        f"JSONExtractFloat({encoded_raw_log}, {quoted_path}), null), "
+        f"if(JSONHas({map_raw_log}, {quoted_path}), "
+        f"JSONExtractFloat({map_raw_log}, {quoted_path}), null)"
+        ")"
+    )
+
+
+_RAW_RETELL_COST_CENTS = _raw_log_number(("call_cost", "combined_cost"))
+_RAW_VAPI_COST_DOLLARS = _raw_log_number(("cost",))
+_RAW_ELEVEN_LABS_COST_CENTS = _raw_log_number(("metadata", "cost"))
+_RAW_PRICE_DOLLARS = _raw_log_number(("price",))
+_VOICE_PROVIDER = "lowerUTF8(toString(provider))"
+_VOICE_COST_CENTS_EXPR = (
+    "coalesce("
+    f"({_RAW_RETELL_COST_CENTS}), "
+    f"nullIf(({_RAW_VAPI_COST_DOLLARS}), 0) * 100, "
+    f"({_RAW_ELEVEN_LABS_COST_CENTS}), "
+    f"abs(({_RAW_PRICE_DOLLARS})) * 100, "
+    "if(mapContains(span_attr_num, 'combined_cost'), "
+    "span_attr_num['combined_cost'], null), "
+    "if(mapContains(span_attr_num, 'cost_breakdown.total'), "
+    "span_attr_num['cost_breakdown.total'] * 100, null), "
+    "multiIf("
+    f"{_VOICE_PROVIDER} IN ('retell', 'eleven_labs'), toFloat64(cost), "
+    f"{_VOICE_PROVIDER} IN ('vapi', 'bland', 'twilio'), "
+    "abs(toFloat64(cost)) * 100, "
+    "CAST(NULL AS Nullable(Float64))))"
+)
+
+_VOICE_RAW_STATUS = (
+    "if(mapContains(span_attr_str, 'call.status'), "
+    "nullIf(span_attr_str['call.status'], ''), null)"
+)
+_VOICE_HAS_RAW_LOG = (
+    "(JSONHas(span_attributes_raw, 'raw_log') OR mapContains(span_attr_str, 'raw_log'))"
+)
+_VOICE_IS_RETELL = _raw_log_has_key("call_status")
+_VOICE_IS_ELEVEN_LABS = _raw_log_has_key("conversation_id")
+_VOICE_IS_BLAND = _raw_log_has_key("call_length")
+_VOICE_IS_TWILIO = _raw_log_has_key("sid")
+_VOICE_IS_VAPI = f"({_raw_log_has_key('startedAt')} OR {_raw_log_has_key('createdAt')})"
+_VOICE_CALL_STATUS_EXPR = (
+    "multiIf("
+    f"NOT {_VOICE_HAS_RAW_LOG}, coalesce({_VOICE_RAW_STATUS}, 'completed'), "
+    f"({_VOICE_IS_RETELL} OR {_VOICE_IS_VAPI} "
+    f"OR {_VOICE_PROVIDER} IN ('retell', 'vapi')), "
+    f"if({_VOICE_RAW_STATUS} = 'ended', 'completed', 'in-progress'), "
+    f"({_VOICE_IS_ELEVEN_LABS} OR {_VOICE_PROVIDER} = 'eleven_labs'), "
+    f"if({_VOICE_RAW_STATUS} IN ('done', 'ended'), "
+    f"'completed', {_VOICE_RAW_STATUS}), "
+    f"({_VOICE_IS_BLAND} OR {_VOICE_IS_TWILIO} "
+    f"OR {_VOICE_PROVIDER} IN ('bland', 'twilio')), {_VOICE_RAW_STATUS}, "
+    f"{_VOICE_RAW_STATUS})"
+)
+
+# Public, code-owned expressions used by the voice list and its filter-value
+# suggestions.  They intentionally retain legacy column tokens here; the CH25
+# compiler rewrites those tokens once at its normal schema boundary.
+VOICE_CALL_STATUS_FILTER_EXPRESSION = _VOICE_CALL_STATUS_EXPR
+VOICE_COST_CENTS_FILTER_EXPRESSION = _VOICE_COST_CENTS_EXPR
+
+
+class VoiceCallFilterBuilder(ClickHouseFilterBuilder):
+    """Voice-list-only aliases matching the normalized list response."""
+
+    VOICE_SYSTEM_METRIC_EXPRS = {
+        **ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_EXPRS,
+        "cost_cents": VOICE_COST_CENTS_FILTER_EXPRESSION,
+    }
+    VOICE_SYSTEM_METRIC_STR_MAP = {
+        key: value
+        for key, value in ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_STR_MAP.items()
+        if key != "call_status"
+    }
+    VOICE_SYSTEM_METRIC_STR_EXPRS = {
+        **ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_STR_EXPRS,
+        "call_status": VOICE_CALL_STATUS_FILTER_EXPRESSION,
+    }
+
+
 class VoiceCallListQueryBuilder(BaseQueryBuilder):
     """Build queries for the paginated voice call list view.
 
@@ -85,7 +190,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
     TABLE = "spans"
     EVAL_TABLE = "tracer_eval_logger"
     ANNOTATION_TABLE = "model_hub_score"
-    _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
+    _FILTER_BUILDER_CLS = VoiceCallFilterBuilder
     # Legacy/default behavior follows the rollout setting. The V2 subclass
     # injects the direct-write helper explicitly.
     _EVAL_LOGGER_SOURCE = staticmethod(eval_logger_source)
@@ -99,6 +204,10 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         eval_config_ids: list[str] | None = None,
         remove_simulation_calls: bool = False,
         annotation_label_ids: list[str] | None = None,
+        bounded_internal_scan: bool = False,
+        bounded_identity_only: bool = False,
+        bounded_sampling_salt: str | None = None,
+        bounded_sampling_rate: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id, **kwargs)
@@ -108,6 +217,18 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         self.eval_config_ids = eval_config_ids or []
         self.remove_simulation_calls = remove_simulation_calls
         self.annotation_label_ids = annotation_label_ids or []
+        self._bounded_internal_scan = bool(bounded_internal_scan)
+        self._bounded_identity_only = bool(bounded_identity_only)
+        if (bounded_sampling_salt is None) != (bounded_sampling_rate is None):
+            raise ValueError(
+                "bounded_sampling_salt and bounded_sampling_rate must be paired"
+            )
+        if bounded_sampling_rate is not None and not (
+            0 <= float(bounded_sampling_rate) <= 100
+        ):
+            raise ValueError("bounded_sampling_rate must be between 0 and 100")
+        self._bounded_sampling_salt = bounded_sampling_salt
+        self._bounded_sampling_rate = bounded_sampling_rate
         # ``parse_time_range([])`` derives its default end from ``utcnow``.
         # The bounded selector asks for the request range and then delegates
         # each seed/classifier query; recomputing that implicit range would
@@ -171,6 +292,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
             eval_config_ids=self.eval_config_ids,
             annotation_label_ids=self.annotation_label_ids,
             bounded_internal_scan=True,
+            bounded_identity_only=self._bounded_identity_only,
         )
         delegate.TABLE = self.TABLE
         # Residual end-user/eval/annotation filters must use the same schema
@@ -219,16 +341,18 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
             candidate_ids,
             candidate_full_state=candidate_full_state,
         )
-        if not query or not self.remove_simulation_calls:
+        if not query:
             return query, params
 
-        # Simulator exclusion used to happen after pagination in Python. That
-        # returned short/incorrect pages whenever a simulator occupied a page
-        # slot. Keep the expensive raw-log JSON work candidate-scoped: at most
-        # the 50 trace IDs in this classifier batch are inspected, and every
-        # physical root is reduced to its latest version before the predicate.
-        params = {**params, "simulator_phone_numbers": tuple(VAPI_PHONE_NUMBERS)}
-        simulator_phone = """
+        if self.remove_simulation_calls:
+            # Simulator exclusion used to happen after pagination in Python.
+            # That returned short/incorrect pages whenever a simulator occupied
+            # a page slot. Keep the expensive raw-log JSON work candidate-scoped:
+            # at most the 50 trace IDs in this classifier batch are inspected,
+            # and every physical root is reduced to its latest version before
+            # the predicate.
+            params = {**params, "simulator_phone_numbers": tuple(VAPI_PHONE_NUMBERS)}
+            simulator_phone = """
             coalesce(
                 nullIf(JSONExtractString(
                     latest_raw_log_json, 'customer', 'number'
@@ -241,7 +365,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
                 ), '')
             )
         """
-        retell_phone = """
+            retell_phone = """
             coalesce(
                 nullIf(JSONExtractString(
                     latest_raw_log_json, 'from_number'
@@ -254,15 +378,15 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
                 ), '')
             )
         """
-        simulator_time_scope = (
-            """
+            simulator_time_scope = (
+                """
                   AND start_time >= %(candidate_start_date)s
                   AND start_time < %(candidate_end_date)s
-        """
-            if "candidate_start_date" in params
-            else ""
-        )
-        query = f"""
+            """
+                if "candidate_start_date" in params
+                else ""
+            )
+            query = f"""
         SELECT *
         FROM ({query}) AS bounded_voice_candidates
         WHERE trace_id NOT IN (
@@ -310,6 +434,31 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         ORDER BY start_time DESC, trace_id DESC
         LIMIT 50
         """
+
+        if self._bounded_sampling_rate is not None:
+            # Historical voice tasks expose the canonical root span ID, not
+            # the trace ID. Apply their deterministic hash only after the
+            # finite candidate classifier has resolved that root. Seeding on
+            # trace IDs remains an unsampled safe superset, so sparse samples
+            # continue across adjacent batches instead of returning short.
+            params = {
+                **params,
+                "bounded_sampling_salt": str(self._bounded_sampling_salt),
+                "bounded_sampling_rate": float(self._bounded_sampling_rate),
+            }
+            query = f"""
+            SELECT *
+            FROM ({query}) AS bounded_sampled_voice_candidates
+            WHERE modulo(
+                cityHash64(
+                    %(bounded_sampling_salt)s,
+                    toString(root_span_id)
+                ),
+                100
+            ) < %(bounded_sampling_rate)s
+            ORDER BY start_time DESC, trace_id DESC
+            LIMIT 50
+            """
         return query, params
 
     # ------------------------------------------------------------------
@@ -322,7 +471,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         self.params["start_date"] = start_date
         self.params["end_date"] = end_date
 
-        fb = ClickHouseFilterBuilder(
+        fb = self._FILTER_BUILDER_CLS(
             table=self.TABLE,
             annotation_label_ids=self.annotation_label_ids,
             project_id=self.project_id,

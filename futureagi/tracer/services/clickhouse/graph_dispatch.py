@@ -17,12 +17,9 @@ from tracer.services.annotation_label_source import (
 )
 from tracer.services.clickhouse.bounded_graph_reads import (
     GRAPH_CANDIDATE_LIMIT,
-    GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
     GRAPH_MAX_POINTS,
     BoundedGraphReadError,
     GraphCandidateSample,
-    aggregate_system_candidate_graph,
-    read_graph_candidates,
 )
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders import (
@@ -30,7 +27,9 @@ from tracer.services.clickhouse.query_builders import (
 )
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.read_budget import is_read_budget_error
-from tracer.utils.helper import get_annotation_labels_for_project
+from tracer.services.exact_aggregation_cache import (
+    read_or_schedule_exact_snapshot,
+)
 
 GRAPH_WALL_DEADLINE_MS = 4_400
 GRAPH_QUERY_TIMEOUT_MS = 1_200
@@ -324,14 +323,14 @@ def graph_payload_is_publishable(
     *,
     allow_sampled: bool,
 ) -> bool:
-    """Fail closed unless every incomplete graph series was explicitly accepted.
+    """Fail closed unless every graph series is complete and exact.
 
-    Additive response metadata cannot protect older clients that ignore it and
-    chart ordinary numeric points as exact totals. Public views therefore call
-    this boundary before returning data. Exact responses (including legacy
-    responses without coverage metadata) remain publishable; sampled responses
-    require both a client opt-in and complete declared sampling-strata coverage.
+    ``allow_sampled`` remains in older request schemas for compatibility, but
+    aggregation endpoints never use it to publish estimates. Lists may expose
+    progressive pages; aggregate values may not be sampled.
     """
+
+    del allow_sampled
 
     series = payload if isinstance(payload, list) else [payload]
     for item in series:
@@ -339,24 +338,52 @@ def graph_payload_is_publishable(
             return False
         status = item.get("query_status")
         complete = item.get("query_complete")
-        if status == "degraded":
-            return False
-        if status == "sampled":
-            planned = item.get("query_sampling_strata")
+        if status == "pending":
             if (
-                not allow_sampled
-                or complete is not False
-                or not item.get("query_sampling_strategy")
-                or not isinstance(planned, int)
-                or isinstance(planned, bool)
-                or planned < 1
-                or item.get("query_sampling_strata_completed") != planned
+                complete is not False
+                or item.get("query_sampled") is not False
+                or item.get("query_refreshing") is not True
+                or bool(item.get("data"))
             ):
                 return False
             continue
-        if complete is False:
+        if (
+            status != "complete"
+            or complete is not True
+            or item.get("query_sampled") is not False
+            or item.get("error")
+        ):
             return False
     return True
+
+
+def _read_or_refresh_exact_graph(
+    *,
+    namespace: str,
+    identity: dict[str, Any],
+    refresh: bool,
+    pending_payload: Any,
+) -> Any:
+    """Return immediately while a deduplicated exact refresh runs out of band."""
+
+    return read_or_schedule_exact_snapshot(
+        namespace,
+        identity,
+        refresh=refresh,
+        pending_payload=pending_payload,
+    )
+
+
+def _pending_graph_payload(metric_id: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "metric_name": str(metric_id or ""),
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+        "query_refreshing": True,
+        **extra,
+    }
 
 
 def _span_identity(row: dict[str, Any]) -> SpanIdentity | None:
@@ -788,62 +815,27 @@ def fetch_system_metric_graph_ch(
     metric_id: str,
     observe_type: str = "trace",
     timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Read an exact graph or an explicitly bounded latest-state sample."""
+    """Read one complete exact graph, reusing its last successful snapshot."""
 
-    started = monotonic()
+    del timeout_ms
     project_id = _validated_project_id(project_id)
     filters = list(filters or [])
-    analyzed_window = BaseQueryBuilder.analyze_bounded_datetime_filters(
-        filters,
-        strict=True,
+    normalized_observe_type = str(observe_type or "trace").strip().lower()
+    identity = {
+        "project_id": project_id,
+        "filters": filters,
+        "interval": interval,
+        "metric_id": str(metric_id or ""),
+        "observe_type": normalized_observe_type,
+    }
+    return _read_or_refresh_exact_graph(
+        namespace="observe-system-graph",
+        identity=identity,
+        refresh=bool(refresh),
+        pending_payload=_pending_graph_payload(str(metric_id or "")),
     )
-    if analyzed_window.empty:
-        return {
-            "metric_name": str(metric_id or ""),
-            "data": [],
-            **_complete_metadata(started=started, query_count=0, rows_returned=0),
-        }
-    # The insertion-only hourly rollup cannot retract corrected or deleted
-    # spans, while an exact full-window ReplacingMergeTree collapse is not a
-    # finite production read.  Use the same bounded latest-state candidate lane
-    # for time-only and filtered graphs.  Long windows are intentionally marked
-    # sampled; short exhausted candidate sets remain exact.
-    normalized_observe_type = str(observe_type or "").strip().lower()
-    candidate_read_options: dict[str, Any] = {}
-    if normalized_observe_type == "trace":
-        # A trace graph still has to discover child-span identities and replay
-        # their latest state after candidate selection.  Keep that work inside
-        # the same reservation already used by eval, annotation, and session
-        # graphs instead of allowing the selector to consume the whole request
-        # wall deadline.
-        candidate_read_options["deadline_ms"] = GRAPH_DECORATION_CANDIDATE_DEADLINE_MS
-    sample = read_graph_candidates(
-        analytics=analytics,
-        project_id=project_id,
-        filters=filters,
-        observe_type=observe_type,
-        allow_time_only_seed=not _active_filters(filters),
-        **candidate_read_options,
-    )
-    _require_renderable_sample(sample)
-    if normalized_observe_type == "trace":
-        return _fetch_trace_system_metric_graph(
-            analytics=analytics,
-            sample=sample,
-            project_id=project_id,
-            interval=interval,
-            metric_id=metric_id,
-            started=started,
-            timeout_ms=timeout_ms,
-        )
-    response = aggregate_system_candidate_graph(
-        sample,
-        metric_id=metric_id,
-        interval=interval,
-    )
-    response["query_elapsed_ms"] = round((monotonic() - started) * 1000, 3)
-    return enforce_exact_graph_data_contract(response)
 
 
 def fetch_all_system_metrics_ch(
@@ -853,95 +845,60 @@ def fetch_all_system_metrics_ch(
     filters: list[dict[str, Any]],
     interval: str,
     timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Read all public project-chart metrics through one finite span replay.
+    """Read the complete exact project-chart metric bundle."""
 
-    The project chart historically applies every filter to ``ObservationSpan``
-    rows before aggregation.  A trace candidate followed by decorating all of
-    its children changes that contract: one matching child attribute would make
-    unrelated siblings contribute to traffic, tokens, cost, and latency.  Read
-    the bounded *span* candidates instead and aggregate their hydrated latest
-    state in process.  This also removes the two decoration queries while
-    keeping coverage metadata authoritative.
-    """
-
-    started = monotonic()
+    del timeout_ms
     project_id = _validated_project_id(project_id)
     filters = list(filters or [])
-    analyzed_window = BaseQueryBuilder.analyze_bounded_datetime_filters(
-        filters,
-        strict=True,
-    )
-    if analyzed_window.empty:
-        empty = TimeSeriesQueryBuilder(
-            project_id=project_id,
-            filters=filters,
-            interval=interval,
-        )
-        empty.start_date = analyzed_window.start
-        empty.end_date = analyzed_window.end
-        return {
-            **empty.format_result([], []),
-            **_complete_metadata(started=started, query_count=0, rows_returned=0),
-        }
-
-    sample = read_graph_candidates(
-        analytics=analytics,
-        project_id=project_id,
-        filters=filters,
-        observe_type="span",
-        allow_time_only_seed=not _active_filters(filters),
-    )
-    _require_renderable_sample(sample)
-    metric_ids = (
-        "latency",
-        "tokens",
-        "cost",
-        "traffic",
-        "prompt_tokens",
-        "completion_tokens",
-        "error_rate",
-    )
-    reduced = {
-        metric_id: aggregate_system_candidate_graph(
-            sample,
-            metric_id=metric_id,
-            interval=interval,
-        )["data"]
-        for metric_id in metric_ids
+    identity = {
+        "project_id": project_id,
+        "filters": filters,
+        "interval": interval,
     }
+    return _read_or_refresh_exact_graph(
+        namespace="observe-all-system-graphs",
+        identity=identity,
+        refresh=bool(refresh),
+        pending_payload={
+            "latency": [],
+            "tokens": [],
+            "cost": [],
+            "traffic": [],
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+            "query_refreshing": True,
+        },
+    )
 
-    def with_alias(points: list[dict[str, Any]], alias: str) -> list[dict[str, Any]]:
-        return [
-            {
-                "timestamp": point.get("timestamp"),
-                "value": point.get("value", 0),
-                alias: point.get("value", 0),
-            }
-            for point in points
-        ]
 
-    metrics = {
-        "latency": with_alias(reduced["latency"], "latency"),
-        "tokens": with_alias(reduced["tokens"], "tokens"),
-        "cost": with_alias(reduced["cost"], "cost"),
-        "traffic": [
-            {
-                "timestamp": point.get("timestamp"),
-                "traffic": point.get("value", 0),
-            }
-            for point in reduced["traffic"]
-        ],
-        "prompt_tokens": reduced["prompt_tokens"],
-        "completion_tokens": reduced["completion_tokens"],
-        "input_tokens": reduced["prompt_tokens"],
-        "output_tokens": reduced["completion_tokens"],
-        "total_tokens": with_alias(reduced["tokens"], "tokens"),
-        "error_rate": reduced["error_rate"],
+def fetch_user_system_metric_graph_ch(
+    *,
+    analytics: Any,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    interval: str,
+    metric_id: str,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Read one complete exact user-grain graph snapshot."""
+
+    project_id = _validated_project_id(project_id)
+    filters = list(filters or [])
+    identity = {
+        "project_id": project_id,
+        "filters": filters,
+        "interval": interval,
+        "metric_id": str(metric_id or ""),
     }
-    metadata = sample.metadata()
-    metadata["query_elapsed_ms"] = round((monotonic() - started) * 1000, 3)
-    return {**metrics, **metadata}
+    return _read_or_refresh_exact_graph(
+        namespace="observe-user-system-graph",
+        identity=identity,
+        refresh=bool(refresh),
+        pending_payload=_pending_graph_payload(str(metric_id or "")),
+    )
 
 
 def normalize_eval_graph_output_type(req_data_config: dict[str, Any]) -> str:
@@ -1227,27 +1184,29 @@ def fetch_eval_graph_ch(
     req_data_config: dict[str, Any],
     observe_type: str = "trace",
     timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
+    refresh: bool = False,
+    aggregation_context: str = "trace",
 ) -> dict[str, Any]:
-    del timeout_ms  # Eval decorations use the stricter shared wall budget.
-    started = monotonic()
+    del timeout_ms
     project_id = _validated_project_id(project_id)
     filters = list(filters or [])
-    sample = read_graph_candidates(
-        analytics=analytics,
-        project_id=project_id,
-        filters=filters,
-        observe_type=observe_type,
-        deadline_ms=GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
-        allow_time_only_seed=not _active_filters(filters),
-    )
-    _require_renderable_sample(sample)
-    return _finite_eval_graph(
-        analytics=analytics,
-        sample=sample,
-        observe_type=observe_type,
-        interval=interval,
-        req_data_config=req_data_config,
-        started=started,
+    normalized_observe_type = str(observe_type or "trace").strip().lower()
+    normalized_aggregation_context = str(aggregation_context or "trace").strip().lower()
+    if normalized_aggregation_context not in {"trace", "session", "user"}:
+        raise ValueError("unsupported eval graph aggregation context")
+    identity = {
+        "project_id": project_id,
+        "filters": filters,
+        "interval": interval,
+        "req_data_config": req_data_config,
+        "observe_type": normalized_observe_type,
+        "aggregation_context": normalized_aggregation_context,
+    }
+    return _read_or_refresh_exact_graph(
+        namespace="observe-eval-graph",
+        identity=identity,
+        refresh=bool(refresh),
+        pending_payload=_pending_graph_payload(str(req_data_config.get("id") or "")),
     )
 
 
@@ -1259,83 +1218,31 @@ def fetch_eval_chart_series_ch(
     interval: str,
     req_data_config: dict[str, Any],
     eval_name: str,
+    refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return public eval-chart series from one bounded candidate/logger read."""
+    """Return a cached complete exact eval-chart series bundle."""
 
-    started = monotonic()
     project_id = _validated_project_id(project_id)
     filters = list(filters or [])
-    sample = read_graph_candidates(
-        analytics=analytics,
-        project_id=project_id,
-        filters=filters,
-        observe_type="trace",
-        deadline_ms=GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
-        allow_time_only_seed=not _active_filters(filters),
+    identity = {
+        "project_id": project_id,
+        "filters": filters,
+        "interval": interval,
+        "req_data_config": req_data_config,
+        "eval_name": eval_name,
+    }
+    return _read_or_refresh_exact_graph(
+        namespace="observe-eval-chart-series",
+        identity=identity,
+        refresh=bool(refresh),
+        pending_payload=[
+            _pending_graph_payload(
+                str(req_data_config.get("id") or ""),
+                id=str(req_data_config.get("id") or ""),
+                name=str(eval_name or ""),
+            )
+        ],
     )
-    _require_renderable_sample(sample)
-    sample = _bounded_trace_decoration_sample(sample)
-    metric_id = str(req_data_config.get("id") or "")
-    output_type = normalize_eval_graph_output_type(req_data_config)
-    rows, truncated, event_query_count, event_rows_returned = _finite_eval_rows(
-        analytics=analytics,
-        sample=sample,
-        observe_type="trace",
-        eval_config_id=metric_id,
-        started=started,
-    )
-    metadata = _decoration_metadata(
-        sample=sample,
-        truncated=truncated,
-        started=started,
-        query_count=sample.query_count + event_query_count,
-        rows_returned=sample.rows_returned + event_rows_returned,
-    )
-    choices = [str(value) for value in (req_data_config.get("choices") or [])]
-    series_values: list[tuple[str, Any]]
-    if output_type == "CHOICES":
-        series_values = [(f"{eval_name} - {choice}", choice) for choice in choices]
-    else:
-        # Historical public charts expose pass rate (True), not a separate fail
-        # series. Score ignores this selector in the reducer.
-        series_values = [(eval_name, True)]
-
-    result: list[dict[str, Any]] = []
-    for name, selected in series_values:
-        values = _eval_bucket_values(
-            rows,
-            interval=interval,
-            output_type=output_type,
-            selected=selected,
-        )
-        points = _zero_filled_points(
-            sample=sample,
-            interval=interval,
-            values=values,
-        )
-        response = enforce_exact_graph_data_contract(
-            {
-                "metric_name": metric_id,
-                "data": points,
-                **metadata,
-            }
-        )
-        result.append(
-            {
-                "name": name,
-                "data": [
-                    {"timestamp": point["timestamp"], "value": point["value"]}
-                    for point in response["data"]
-                ],
-                "id": metric_id,
-                **{
-                    key: value
-                    for key, value in response.items()
-                    if key.startswith("query_")
-                },
-            }
-        )
-    return result
 
 
 def annotation_output_type(
@@ -1553,94 +1460,32 @@ def fetch_annotation_graph_ch(
     req_data_config: dict[str, Any],
     observe_type: str,
     timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
+    refresh: bool = False,
+    aggregation_context: str = "trace",
 ) -> dict[str, Any]:
-    del timeout_ms  # Decoration reads use the stricter shared wall budget above.
-    started = monotonic()
+    del timeout_ms
     project_id = _validated_project_id(project_id)
+    filters = list(filters or [])
     label_id = str(req_data_config.get("id") or "")
     if not label_id:
         raise ValueError("Annotation label ID is required")
-    # PostgreSQL owns the small label record and Score values; trace/span
-    # candidates remain direct-write CH25-only.
-    label = get_annotation_labels_for_project(project_id).get(id=label_id)
-    sample = read_graph_candidates(
-        analytics=analytics,
-        project_id=project_id,
-        filters=list(filters or []),
-        observe_type=observe_type,
-        deadline_ms=GRAPH_DECORATION_CANDIDATE_DEADLINE_MS,
-        allow_time_only_seed=True,
-    )
-    _require_renderable_sample(sample)
-    if str(observe_type or "").strip().lower() == "trace":
-        sample = _bounded_trace_decoration_sample(sample)
-    trace_span_identities: tuple[SpanIdentity, ...] = ()
-    trace_span_ids_truncated = False
-    span_identity_query_count = 0
-    span_identity_rows_returned = 0
-    if observe_type == "trace" and any(row.get("trace_id") for row in sample.rows):
-        (
-            trace_span_identities,
-            trace_span_ids_truncated,
-            span_identity_query_count,
-            span_identity_rows_returned,
-        ) = _finite_trace_span_ids(
-            analytics=analytics, sample=sample, project_id=project_id, started=started
-        )
-    (
-        rows,
-        truncated,
-        event_query_count,
-        event_rows_returned,
-    ) = _finite_annotation_rows(
-        analytics=analytics,
-        sample=sample,
-        project_id=project_id,
-        observe_type=observe_type,
-        trace_span_identities=trace_span_identities,
-        label_id=label_id,
-        started=started,
-    )
-    output_type = annotation_output_type(label, req_data_config.get("output_type"))
-    selected = req_data_config.get("value")
-    states: dict[datetime, dict[str, Any]] = {}
-    for row in rows:
-        created_at = row.get("created_at")
-        if not isinstance(created_at, datetime):
-            continue
-        value = _annotation_value(row.get("value"), output_type, selected)
-        if value is None:
-            continue
-        bucket = BaseQueryBuilder._normalize_timestamp(created_at, interval)
-        state = states.setdefault(bucket, {"sum": 0.0, "count": 0})
-        state["sum"] += value
-        state["count"] += 1
-    values = {
-        bucket: (state["sum"] / max(state["count"], 1), state["count"])
-        for bucket, state in states.items()
+    normalized_observe_type = str(observe_type or "trace").strip().lower()
+    normalized_aggregation_context = str(aggregation_context or "trace").strip().lower()
+    if normalized_aggregation_context not in {"trace", "session", "user"}:
+        raise ValueError("unsupported annotation graph aggregation context")
+    identity = {
+        "project_id": project_id,
+        "filters": filters,
+        "interval": interval,
+        "req_data_config": req_data_config,
+        "observe_type": normalized_observe_type,
+        "aggregation_context": normalized_aggregation_context,
     }
-    metadata = _decoration_metadata(
-        sample=sample,
-        truncated=truncated or trace_span_ids_truncated,
-        started=started,
-        query_count=(
-            sample.query_count + span_identity_query_count + event_query_count
-        ),
-        rows_returned=(
-            sample.rows_returned + span_identity_rows_returned + event_rows_returned
-        ),
-    )
-    return enforce_exact_graph_data_contract(
-        {
-            "metric_name": label_id,
-            "name": label.name,
-            "data": _zero_filled_points(
-                sample=sample,
-                interval=interval,
-                values=values,
-            ),
-            **metadata,
-        }
+    return _read_or_refresh_exact_graph(
+        namespace="observe-annotation-graph",
+        identity=identity,
+        refresh=bool(refresh),
+        pending_payload=_pending_graph_payload(label_id),
     )
 
 
@@ -1656,6 +1501,7 @@ __all__ = [
     "fetch_eval_chart_series_ch",
     "fetch_eval_graph_ch",
     "fetch_system_metric_graph_ch",
+    "fetch_user_system_metric_graph_ch",
     "format_system_metric_graph",
     "normalize_eval_graph_output_type",
 ]

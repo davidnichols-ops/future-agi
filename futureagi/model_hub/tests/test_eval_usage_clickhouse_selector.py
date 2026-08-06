@@ -17,26 +17,42 @@ from tracer.services.clickhouse.client import ClickHouseClient
 
 
 class _FakeClient:
-    def __init__(self, *, total_runs=9):
+    def __init__(
+        self,
+        *,
+        total_runs=9,
+        avg_duration=0.25,
+        avg_score=0.75,
+    ):
         self.calls = []
         self.lock = threading.Lock()
         self.total_runs = total_runs
+        self.avg_duration = avg_duration
+        self.avg_score = avg_score
 
     def execute_read(self, query, params, *, timeout_ms, settings):
         with self.lock:
             self.calls.append((query, params, timeout_ms, settings))
+        if "AS usage_version_ceiling" in query:
+            return [(1_786_000_000_000_000, 1_786_000_000_000_000_000)], [], 1.0
+        if "SELECT created_at" in query and "ORDER BY created_at ASC" in query:
+            return [(datetime(2026, 8, 1, tzinfo=UTC),)], [], 1.0
+        if "SELECT created_at" in query and "ORDER BY created_at DESC" in query:
+            return [(datetime(2026, 8, 1, 0, 1, tzinfo=UTC),)], [], 1.0
         if "AS total_runs" in query:
             return [(self.total_runs,)], [], 1.0
-        if "AS runs_period" in query and "toStartOfInterval" not in query:
-            return [(3, 2, 1)], [], 1.0
         if "toStartOfInterval" in query:
             return (
                 [
                     (
                         datetime(2026, 8, 1, tzinfo=UTC),
                         3,
-                        0.25,
-                        0.75,
+                        self.avg_duration * 3,
+                        3,
+                        self.avg_score * 3,
+                        3,
+                        2,
+                        1,
                         2,
                         1,
                     )
@@ -44,6 +60,8 @@ class _FakeClient:
                 [],
                 1.0,
             )
+        available = max(0, 3 - int(params.get("partition_offset", 0)))
+        row_count = min(int(params.get("partition_limit", 1)), available)
         return (
             [
                 (
@@ -52,6 +70,63 @@ class _FakeClient:
                     "success",
                     datetime(2026, 8, 1, tzinfo=UTC),
                 )
+                for _ in range(row_count)
+            ],
+            [],
+            1.0,
+        )
+
+
+class _HeavyPartitionClient:
+    def __init__(self, *, start: datetime, end: datetime, rows_per_partition: int):
+        self.start = start
+        self.end = end
+        self.rows_per_partition = rows_per_partition
+        self.calls = []
+
+    def execute_read(self, query, params, *, timeout_ms, settings):
+        self.calls.append((query, dict(params), timeout_ms, settings))
+        if "AS usage_version_ceiling" in query:
+            return [(1_786_000_000_000_000, 1_786_000_000_000_000_000)], [], 1.0
+        if "SELECT created_at" in query and "ORDER BY created_at ASC" in query:
+            return [(self.start,)], [], 1.0
+        if "SELECT created_at" in query and "ORDER BY created_at DESC" in query:
+            return [(self.end - timedelta(microseconds=1),)], [], 1.0
+        if "AS total_runs" in query:
+            return [(self.rows_per_partition,)], [], 1.0
+        if "toStartOfInterval" in query:
+            return (
+                [
+                    (
+                        params["partition_start"],
+                        self.rows_per_partition,
+                        self.rows_per_partition * 2.0,
+                        self.rows_per_partition,
+                        self.rows_per_partition * 0.5,
+                        self.rows_per_partition,
+                        self.rows_per_partition,
+                        0,
+                        self.rows_per_partition,
+                        0,
+                    )
+                ],
+                [],
+                1.0,
+            )
+        available = max(
+            0,
+            self.rows_per_partition - int(params.get("partition_offset", 0)),
+        )
+        count = min(int(params.get("partition_limit", 0)), available)
+        return (
+            [
+                (
+                    str(uuid.uuid4()),
+                    {},
+                    "success",
+                    params["partition_end"] - timedelta(microseconds=index + 1),
+                )
+                for index in range(count)
             ],
             [],
             1.0,
@@ -72,7 +147,7 @@ def test_eval_usage_queries_are_project_scoped_bounded_and_page_only(monkeypatch
         start_date=now - timedelta(days=30),
         end_date=now,
         bucket_minutes=1440,
-        page=2,
+        page=0,
         page_size=25,
     )
 
@@ -81,8 +156,33 @@ def test_eval_usage_queries_are_project_scoped_bounded_and_page_only(monkeypatch
     assert result.unavailable_fields == ()
     assert result.runs_period == 3
     assert result.logs[0].config == {"output": {"output": 0.75}}
-    assert len(fake.calls) == 4
-    for query, params, timeout_ms, settings in fake.calls:
+    assert len(fake.calls) == 6
+    snapshot_query = next(
+        query for query, *_ in fake.calls if "AS usage_version_ceiling" in query
+    )
+    assert "toUnixTimestamp64Micro(now64" in snapshot_query
+    assert "toUnixTimestamp64Nano(now64" in snapshot_query
+    assert "usage_apicalllog" not in snapshot_query
+    assert "FROM traces" not in snapshot_query
+    frozen_calls = [
+        call for call in fake.calls if "AS usage_version_ceiling" not in call[0]
+    ]
+    data_calls = [
+        call
+        for call in frozen_calls
+        if "AS total_runs" in call[0]
+        or "toStartOfInterval" in call[0]
+        or "toString(log_id)" in call[0]
+    ]
+    for _query, _params, timeout_ms, settings in frozen_calls:
+        assert 0 < timeout_ms <= eval_usage.QUERY_TIMEOUT_MS
+        assert settings["additional_table_filters"] == {
+            "usage_apicalllog": (
+                "_peerdb_synced_at < fromUnixTimestamp64Micro(1786000000000000, 'UTC')"
+            ),
+            "traces": "_version < 1786000000000000000",
+        }
+    for query, params, timeout_ms, settings in data_calls:
         assert "usage_apicalllog FINAL" not in query
         assert "PREWHERE organization_id = toUUID" in query
         assert "workspace_id = toUUID" in query
@@ -91,17 +191,17 @@ def test_eval_usage_queries_are_project_scoped_bounded_and_page_only(monkeypatch
         assert "LIMIT 1 BY id" in query
         assert "WHERE _peerdb_is_deleted = 0 AND deleted = 0" in query
         assert params["project_ids"]
-        assert 0 < timeout_ms <= eval_usage.READ_TIMEOUT_MS
+        assert 0 < timeout_ms <= eval_usage.QUERY_TIMEOUT_MS
         assert settings["readonly"] if "readonly" in settings else True
-    page_query = next(query for query, *_ in fake.calls if "toString(log_id)" in query)
-    assert "LIMIT %(limit)s OFFSET %(offset)s" in page_query
-    total_query = next(query for query, *_ in fake.calls if "AS total_runs" in query)
+    page_query = next(query for query, *_ in data_calls if "toString(log_id)" in query)
+    assert "LIMIT %(partition_limit)s OFFSET %(partition_offset)s" in page_query
+    total_query = next(query for query, *_ in data_calls if "AS total_runs" in query)
     assert "trace_dict" not in total_query
     assert "FROM traces" not in total_query
     assert "IN %(project_ids)s" not in total_query
-    assert "created_at >= %(start_date)s" not in total_query
-    assert "created_at <= %(end_date)s" not in total_query
-    period_queries = [query for query, *_ in fake.calls if "AS total_runs" not in query]
+    assert "created_at >= %(partition_start)s" in total_query
+    assert "created_at < %(partition_end)s" in total_query
+    period_queries = [query for query, *_ in data_calls if "AS total_runs" not in query]
     assert all(
         "trace_dict" not in query
         and "FROM traces" in query
@@ -113,10 +213,226 @@ def test_eval_usage_queries_are_project_scoped_bounded_and_page_only(monkeypatch
         and "LEFT JOIN (" in query
         and "allowed_trace_projects.trace_id = toUUIDOrZero(eval_trace_id)" in query
         and "allowed_trace_projects.project_id IN %(project_ids)s" in query
-        and "created_at >= %(start_date)s" in query
-        and "created_at <= %(end_date)s" in query
+        and "created_at >= %(partition_start)s" in query
+        and "created_at < %(partition_end)s" in query
         for query in period_queries
     )
+
+
+@pytest.mark.unit
+def test_eval_usage_heavy_12m_is_exact_partitioned_and_single_snapshot(monkeypatch):
+    end = datetime(2026, 8, 1, tzinfo=UTC)
+    start = end - timedelta(days=365)
+    fake = _HeavyPartitionClient(
+        start=start,
+        end=end + timedelta(microseconds=1),
+        rows_per_partition=1_000_000,
+    )
+    monkeypatch.setattr(eval_usage, "get_clickhouse_client", lambda: fake)
+
+    result = read_eval_usage(
+        organization_id=str(uuid.uuid4()),
+        workspace_id=str(uuid.uuid4()),
+        project_ids=[str(uuid.uuid4())],
+        template_id=str(uuid.uuid4()),
+        start_date=start,
+        end_date=end,
+        bucket_minutes=1440,
+        page=0,
+        page_size=25,
+    )
+
+    total_calls = [call for call in fake.calls if "AS total_runs" in call[0]]
+    chart_calls = [call for call in fake.calls if "toStartOfInterval" in call[0]]
+    snapshot_calls = [
+        call for call in fake.calls if "AS usage_version_ceiling" in call[0]
+    ]
+    assert len(snapshot_calls) == 1
+    assert len(total_calls) == 12
+    assert len(chart_calls) == 12
+    assert result.total_runs == 12_000_000
+    assert result.runs_period == 12_000_000
+    assert len(result.logs) == 25
+    assert result.completeness == eval_usage.EvalUsageReadCompleteness.COMPLETE
+    assert all(
+        call_params["partition_end"] - call_params["partition_start"]
+        <= timedelta(days=31)
+        for _query, call_params, _timeout, _settings in total_calls + chart_calls
+    )
+    frozen_filters = {
+        tuple(sorted(call_settings["additional_table_filters"].items()))
+        for _query, _params, _timeout, call_settings in fake.calls
+        if "AS usage_version_ceiling" not in _query
+    }
+    assert len(frozen_filters) == 1
+    assert all(
+        call_settings["max_rows_to_read"] == 25_000_000
+        and call_settings["max_bytes_to_read"] == 4 * 1024 * 1024 * 1024
+        for _query, _params, _timeout, call_settings in total_calls + chart_calls
+    )
+
+
+@pytest.mark.unit
+def test_eval_usage_page_n_skips_and_fills_across_exact_partitions(monkeypatch):
+    start = datetime(2026, 5, 1, tzinfo=UTC)
+    end = start + timedelta(days=93)
+    fake = _HeavyPartitionClient(
+        start=start,
+        end=end,
+        rows_per_partition=10,
+    )
+    monkeypatch.setattr(eval_usage, "get_clickhouse_client", lambda: fake)
+
+    result = read_eval_usage(
+        organization_id=str(uuid.uuid4()),
+        workspace_id=str(uuid.uuid4()),
+        project_ids=[str(uuid.uuid4())],
+        template_id=str(uuid.uuid4()),
+        start_date=start,
+        end_date=end - timedelta(microseconds=1),
+        bucket_minutes=1440,
+        page=1,
+        page_size=15,
+    )
+
+    page_calls = [call for call in fake.calls if "toString(log_id)" in call[0]]
+    assert len(result.logs) == 15
+    assert len(page_calls) == 2
+    assert [call[1]["partition_offset"] for call in page_calls] == [5, 0]
+    assert [call[1]["partition_limit"] for call in page_calls] == [15, 10]
+    assert page_calls[0][1]["partition_start"] > page_calls[1][1]["partition_start"]
+
+
+@pytest.mark.unit
+def test_eval_usage_merges_split_aggregate_counts_exactly(monkeypatch):
+    start = datetime(2026, 8, 1, tzinfo=UTC)
+    end = start + timedelta(days=2)
+
+    class SplitClient(_HeavyPartitionClient):
+        def execute_read(self, query, params, *, timeout_ms, settings):
+            if "toStartOfInterval" in query and params["partition_end"] - params[
+                "partition_start"
+            ] > timedelta(days=1):
+                self.calls.append((query, dict(params), timeout_ms, settings))
+                raise ServerException("partition too large", code=241)
+            if "toStartOfInterval" in query:
+                self.calls.append((query, dict(params), timeout_ms, settings))
+                first = params["partition_start"] == start
+                calls = 2 if first else 3
+                return (
+                    [
+                        (
+                            start,
+                            calls,
+                            4.0 if first else 9.0,
+                            calls,
+                            1.0 if first else 2.0,
+                            calls,
+                            1 if first else 2,
+                            1,
+                            calls - 1,
+                            1,
+                        )
+                    ],
+                    [],
+                    1.0,
+                )
+            if "toString(log_id)" in query:
+                self.calls.append((query, dict(params), timeout_ms, settings))
+                calls = 2 if params["partition_start"] == start else 3
+                available = max(0, calls - int(params["partition_offset"]))
+                count = min(int(params["partition_limit"]), available)
+                return (
+                    [
+                        (
+                            str(uuid.uuid4()),
+                            {},
+                            "success",
+                            params["partition_end"] - timedelta(microseconds=index + 1),
+                        )
+                        for index in range(count)
+                    ],
+                    [],
+                    1.0,
+                )
+            return super().execute_read(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+
+    fake = SplitClient(start=start, end=end, rows_per_partition=5)
+    monkeypatch.setattr(eval_usage, "get_clickhouse_client", lambda: fake)
+
+    result = read_eval_usage(
+        organization_id=str(uuid.uuid4()),
+        workspace_id=None,
+        project_ids=[str(uuid.uuid4())],
+        template_id=str(uuid.uuid4()),
+        start_date=start,
+        end_date=end - timedelta(microseconds=1),
+        bucket_minutes=1440,
+        page=0,
+        page_size=5,
+    )
+
+    assert result.runs_period == 5
+    assert result.success_count == 3
+    assert result.error_count == 2
+    assert len(result.chart) == 1
+    assert result.chart[0].calls == 5
+    assert result.chart[0].avg_duration == pytest.approx(13.0 / 5.0)
+    assert result.chart[0].avg_score == pytest.approx(3.0 / 5.0)
+    assert result.chart[0].pass_count == 3
+    assert result.chart[0].fail_count == 2
+    assert len(result.logs) == 5
+
+
+@pytest.mark.unit
+def test_eval_usage_partial_partition_failure_is_fail_closed(monkeypatch):
+    start = datetime(2026, 8, 1, tzinfo=UTC)
+    end = start + timedelta(days=2)
+
+    class PartialFailureClient(_HeavyPartitionClient):
+        def execute_read(self, query, params, *, timeout_ms, settings):
+            if "toStartOfInterval" in query:
+                self.calls.append((query, dict(params), timeout_ms, settings))
+                width = params["partition_end"] - params["partition_start"]
+                if width > timedelta(days=1):
+                    raise ServerException("partition too large", code=241)
+                if params["partition_start"] > start:
+                    raise NetworkError("second partition unavailable")
+                return (
+                    [(start, 2, 4.0, 2, 1.0, 2, 1, 1, 1, 1)],
+                    [],
+                    1.0,
+                )
+            return super().execute_read(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+
+    fake = PartialFailureClient(start=start, end=end, rows_per_partition=2)
+    monkeypatch.setattr(eval_usage, "get_clickhouse_client", lambda: fake)
+
+    with pytest.raises(eval_usage.EvalUsageReadError) as raised:
+        read_eval_usage(
+            organization_id=str(uuid.uuid4()),
+            workspace_id=None,
+            project_ids=[str(uuid.uuid4())],
+            template_id=str(uuid.uuid4()),
+            start_date=start,
+            end_date=end - timedelta(microseconds=1),
+            bucket_minutes=1440,
+            page=0,
+            page_size=25,
+        )
+
+    assert raised.value.code == eval_usage.EvalUsageReadErrorCode.QUERY_FAILED
+    assert raised.value.operations == ("chart",)
 
 
 @pytest.mark.unit
@@ -146,6 +462,28 @@ def test_eval_usage_exact_total_can_be_zero(monkeypatch):
     assert result.total_runs == 0
     assert result.completeness == eval_usage.EvalUsageReadCompleteness.COMPLETE
     assert result.unavailable_fields == ()
+
+
+@pytest.mark.unit
+def test_eval_usage_normalizes_non_finite_empty_averages(monkeypatch):
+    fake = _FakeClient(avg_duration=float("nan"), avg_score=float("inf"))
+    monkeypatch.setattr(eval_usage, "get_clickhouse_client", lambda: fake)
+    now = datetime(2026, 8, 2, tzinfo=UTC)
+
+    result = read_eval_usage(
+        organization_id=str(uuid.uuid4()),
+        workspace_id=str(uuid.uuid4()),
+        project_ids=[str(uuid.uuid4())],
+        template_id=str(uuid.uuid4()),
+        start_date=now - timedelta(days=1),
+        end_date=now,
+        bucket_minutes=60,
+        page=0,
+        page_size=25,
+    )
+
+    assert result.chart[0].avg_duration is None
+    assert result.chart[0].avg_score is None
 
 
 @pytest.mark.unit
@@ -225,7 +563,13 @@ def test_eval_usage_clickhouse_failures_are_typed(monkeypatch, failure, expected
         )
 
     assert raised.value.code == expected_code
-    assert raised.value.operations[0] in {"chart", "page", "stats", "total"}
+    assert raised.value.operations[0] in {
+        "chart",
+        "page",
+        "snapshot",
+        "stats",
+        "total",
+    }
 
 
 @pytest.mark.unit
@@ -320,6 +664,7 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
             eval_trace_id String,
             deleted UInt8,
             created_at DateTime64(6, 'UTC'),
+            _peerdb_synced_at DateTime64(6, 'UTC'),
             _peerdb_is_deleted UInt8,
             _peerdb_version Int64
         ) ENGINE = MergeTree
@@ -360,6 +705,7 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
                 str(trace_id),
                 0,
                 now - timedelta(hours=2),
+                now - timedelta(hours=2),
                 0,
                 1,
             ),
@@ -375,6 +721,7 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
                 str(trace_id),
                 0,
                 now - timedelta(hours=1),
+                now - timedelta(hours=1),
                 0,
                 1,
             ),
@@ -389,6 +736,7 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
                 str(trace_id),
                 1,
                 now - timedelta(hours=1),
+                now - timedelta(minutes=59),
                 1,
                 2,
             ),
@@ -404,6 +752,7 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
                 str(other_trace_id),
                 0,
                 now - timedelta(minutes=30),
+                now - timedelta(minutes=30),
                 0,
                 1,
             ),
@@ -418,6 +767,7 @@ def test_eval_usage_real_ch25_latest_tombstone_and_project_scope(
                 '{"response_time":250,"output":{"output":{"label":"Passed","score":1.0}}}',
                 "",
                 0,
+                now - timedelta(minutes=15),
                 now - timedelta(minutes=15),
                 0,
                 1,

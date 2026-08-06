@@ -13,6 +13,7 @@ falls back to PostgreSQL.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import threading
@@ -38,8 +39,8 @@ from tracer.utils.filter_operators import (
 
 logger = structlog.get_logger(__name__)
 
-AttributeType = Literal["string", "number", "boolean", "array", "json"]
-JsonAttributeMode = Literal["none", "scalars", "arrays", "all"]
+AttributeType = Literal["string", "number", "boolean", "array", "map", "json"]
+JsonAttributeMode = Literal["none", "scalars", "arrays", "structured", "all"]
 QueryStatus = Literal["complete", "sampled", "degraded"]
 PhysicalSpanIdentity = tuple[str, str, str, datetime]
 JsonScalar = str | int | float | bool
@@ -94,6 +95,21 @@ ATTRIBUTE_READ_MAX_KEY_BYTES = 512
 ATTRIBUTE_READ_MAX_SEARCH_BYTES = 512
 ATTRIBUTE_READ_MAX_PROJECTS = 64
 
+# Cursor-mode filter-value pickers walk a frozen one-year snapshot in small,
+# newest-first physical batches.  The public page is intentionally small while
+# the larger internal batch amortizes duplicate values (for example thousands
+# of consecutive ``completed`` calls) without allowing one request to become
+# an unbounded distinct scan.
+ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE = 50
+ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT = 64
+ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 15
+# Keep the signed cursor below common 8 KiB request-line limits even when the
+# digests are random (and therefore barely compressible).  With the complete
+# scope/query/order envelope, 192 128-bit hex digests leave room for the full
+# endpoint path plus the maximum 512-byte search value under an 8 KiB request
+# line. The picker remains explicitly sample-labelled at this finite ceiling.
+ATTRIBUTE_VALUE_CURSOR_MAX_SEEN = 192
+
 _MIB = 1024 * 1024
 ATTRIBUTE_READ_SETTINGS: dict[str, Any] = {
     "max_threads": 1,
@@ -131,7 +147,8 @@ _TYPE_PRIORITY: dict[AttributeType, int] = {
     "number": 1,
     "boolean": 2,
     "array": 3,
-    "json": 4,
+    "map": 4,
+    "json": 5,
 }
 
 _NIL_UUID = "00000000-0000-0000-0000-000000000000"
@@ -211,6 +228,20 @@ class AttributeKeyRead:
 class AttributeValueRead:
     rows: tuple[AttributeValueRow, ...]
     metadata: AttributeReadMetadata
+
+
+@dataclass(frozen=True)
+class AttributeValueCursorPageRead:
+    """One verified, newest-first page from a bounded physical-span walk."""
+
+    rows: tuple[AttributeValueRow, ...]
+    metadata: AttributeReadMetadata
+    has_more: bool
+    next_segment_end: datetime
+    next_before_identity: PhysicalSpanIdentity | None
+    next_resume_identity: PhysicalSpanIdentity | None
+    next_resume_member_offset: int
+    seen_value_digests: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -821,14 +852,21 @@ class AttributeReadSelector:
         self._query_count = 0
         # ``typed_only`` remains the compatibility switch for callers that
         # must never touch the JSON overflow.  Filter pickers opt into
-        # ``arrays`` explicitly: structured array predicates are supported by
-        # the bounded classifier, while JSON-only scalars/objects are not and
-        # therefore must not be advertised as filterable.  Eval mapping uses
-        # ``all`` because it needs key names, not a filter operator contract.
+        # ``structured`` explicitly: bounded predicates support JSON array and
+        # finite flat-object filters, while JSON-only scalars are not indexed
+        # and therefore must not be advertised as filterable.  Eval mapping
+        # uses ``all`` because it needs key names, not a filter operator
+        # contract.
         self._typed_only = bool(typed_only)
         if json_attribute_mode is None:
             json_attribute_mode = "none" if self._typed_only else "scalars"
-        if json_attribute_mode not in {"none", "scalars", "arrays", "all"}:
+        if json_attribute_mode not in {
+            "none",
+            "scalars",
+            "arrays",
+            "structured",
+            "all",
+        }:
             raise ValueError("Unsupported JSON attribute discovery mode")
         self._json_attribute_mode: JsonAttributeMode = json_attribute_mode
         self._reads_json_overflow = json_attribute_mode != "none"
@@ -1063,6 +1101,7 @@ class AttributeReadSelector:
         query_timeout_ms: int | None = None,
         candidate_query_settings: dict[str, Any] | None = None,
         include_versions: bool = False,
+        version_ceiling: int | None = None,
     ) -> tuple[
         tuple[PhysicalSpanIdentity, ...],
         bool,
@@ -1077,6 +1116,11 @@ class AttributeReadSelector:
         }
         if attribute_key is not None:
             params["attribute_key"] = attribute_key
+        if version_ceiling is not None:
+            if int(version_ceiling) <= 0:
+                raise ValueError("version_ceiling must be positive")
+            params["attribute_version_ceiling"] = int(version_ceiling)
+            predicate = f"({predicate}) AND _version < %(attribute_version_ceiling)s"
         ordered = ordered or before_identity is not None
         candidate_sql = _ORDERED_CANDIDATE_SQL if ordered else _CANDIDATE_SQL
         query_settings = dict(candidate_query_settings or {})
@@ -1192,6 +1236,7 @@ class AttributeReadSelector:
         candidate_ids: tuple[PhysicalSpanIdentity, ...],
         attribute_key: str | None = None,
         query_timeout_ms: int | None = None,
+        version_ceiling: int | None = None,
     ) -> list[dict[str, Any]]:
         if not candidate_ids:
             return []
@@ -1204,6 +1249,13 @@ class AttributeReadSelector:
         }
         if attribute_key is not None:
             params["attribute_key"] = attribute_key
+        if version_ceiling is not None:
+            if int(version_ceiling) <= 0:
+                raise ValueError("version_ceiling must be positive")
+            params["attribute_version_ceiling"] = int(version_ceiling)
+            candidate_predicate = (
+                f"({candidate_predicate}) AND _version < %(attribute_version_ceiling)s"
+            )
         replay_sql = self._single_project_scope_sql(
             sql.format(candidate_predicate=candidate_predicate),
             project_ids,
@@ -1230,6 +1282,7 @@ class AttributeReadSelector:
         candidate_versions: dict[PhysicalSpanIdentity, int],
         attribute_key: str,
         query_timeout_ms: int | None = None,
+        version_ceiling: int | None = None,
     ) -> list[dict[str, Any]]:
         """Hydrate only key-bearing candidate rows certified latest and live."""
 
@@ -1242,6 +1295,7 @@ class AttributeReadSelector:
             project_ids=project_ids,
             candidate_ids=candidate_ids,
             query_timeout_ms=query_timeout_ms,
+            version_ceiling=version_ceiling,
         )
         active_ids = tuple(
             self._physical_identity(row)
@@ -1258,6 +1312,7 @@ class AttributeReadSelector:
             candidate_ids=active_ids,
             attribute_key=attribute_key,
             query_timeout_ms=query_timeout_ms,
+            version_ceiling=version_ceiling,
         )
 
     @staticmethod
@@ -1320,13 +1375,12 @@ class AttributeReadSelector:
     ) -> tuple[AttributeType, Any] | None:
         """Decode only JSON value families the caller can faithfully use.
 
-        ``arrays`` is the filter-picker contract.  It intentionally ignores
-        JSON-only scalars and objects: the bounded list classifier supports
-        array membership over ``attributes_extra`` but scalar filters still
-        use the indexed typed Maps.  ``all`` is reserved for eval mapping,
-        where an object/null key is a valid field path even though it is not a
-        filterable scalar.  Array members are reduced to the exact finite JSON
-        scalar vocabulary accepted by the public filter serializer.
+        ``arrays`` is the value-picker contract. ``structured`` is the
+        filter-key contract and adds finite flat JSON objects (``map``) while
+        still excluding JSON-only scalars. ``all`` is reserved for eval
+        mapping, where an object/null key is a valid field path even though it
+        is not necessarily filterable. Array members are reduced to the exact
+        finite JSON scalar vocabulary accepted by the public serializer.
         """
 
         if mode == "none" or raw == "" or (raw is None and json_encoded):
@@ -1340,7 +1394,7 @@ class AttributeReadSelector:
             scalar = cls._decode_legacy_scalar(value, json_encoded=False)
             if scalar is not None:
                 return scalar
-        if mode in {"arrays", "all"} and isinstance(value, list):
+        if mode in {"arrays", "structured", "all"} and isinstance(value, list):
             members: list[JsonScalar] = []
             seen: set[tuple[str, str]] = set()
             total_string_bytes = 0
@@ -1383,6 +1437,11 @@ class AttributeReadSelector:
                     if len(members) > ATTRIBUTE_READ_MAX_VALUES:
                         break
             return "array", tuple(members)
+        if mode == "structured" and isinstance(value, dict):
+            # Key discovery consumes only the type.  Do not retain or copy the
+            # object here: the filter serializer independently enforces the
+            # finite, flat, scalar-only public map contract on user input.
+            return "map", None
         if mode == "all":
             # Eval mapping only consumes the key/type, never this value.  A
             # single sentinel keeps null/object keys discoverable without
@@ -2561,6 +2620,272 @@ class AttributeReadSelector:
             ),
         )
 
+    def read_value_cursor_page(
+        self,
+        project_ids: Iterable[Any],
+        key: str,
+        *,
+        page_size: int,
+        version_ceiling: int,
+        window_start: datetime,
+        window_end: datetime,
+        segment_end: datetime | None = None,
+        before_identity: PhysicalSpanIdentity | None = None,
+        resume_identity: PhysicalSpanIdentity | None = None,
+        resume_member_offset: int = 0,
+        seen_value_digests: Iterable[str] = (),
+        search: str | None = None,
+    ) -> AttributeValueCursorPageRead:
+        """Return a bounded newest-first page of verified unique values.
+
+        Cursor mode deliberately walks narrow physical-span batches instead of
+        running an unbounded ``DISTINCT`` across a year of Map/JSON data.  Each
+        selected identity is replayed through ``argMax(_version)`` below the
+        frozen snapshot ceiling before its value can be published.  A signed
+        API cursor carries the next physical key and digests of values already
+        emitted, so later pages neither repeat options nor trust client state.
+
+        The result remains explicitly sampled even when a particular request
+        exhausts its finite page budget.  Returned option values are exact;
+        only global vocabulary coverage is bounded.
+        """
+
+        self._begin_operation()
+        projects = self._project_ids(project_ids)
+        key = validate_attribute_key(key)
+        normalized_search = validate_attribute_search(search or "")
+        page_size = int(page_size)
+        if not 1 <= page_size <= ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE:
+            raise ValueError("filter-value page_size is out of range")
+        if int(version_ceiling) <= 0:
+            raise ValueError("version_ceiling must be positive")
+
+        start = _utc(window_start)
+        end = _utc(window_end)
+        current_segment_end = _utc(segment_end or end)
+        if start >= end or not start < current_segment_end <= end:
+            raise ValueError("invalid filter-value cursor window")
+        if not projects:
+            return AttributeValueCursorPageRead(
+                (),
+                self._metadata(
+                    complete=True,
+                    error_code=None,
+                    window_start=start,
+                    window_end=end,
+                    query_count=self._query_count,
+                ),
+                False,
+                start,
+                None,
+                None,
+                0,
+                (),
+            )
+        if before_identity is not None:
+            before_identity = (
+                str(before_identity[0]),
+                str(before_identity[1]),
+                str(before_identity[2]),
+                _utc(before_identity[3]),
+            )
+            if (
+                before_identity[0] not in projects
+                or not start <= before_identity[3] < current_segment_end
+            ):
+                raise ValueError("invalid filter-value physical cursor")
+        if resume_identity is not None:
+            resume_identity = (
+                str(resume_identity[0]),
+                str(resume_identity[1]),
+                str(resume_identity[2]),
+                _utc(resume_identity[3]),
+            )
+            if (
+                resume_identity[0] not in projects
+                or not start <= resume_identity[3] < current_segment_end
+                or int(resume_member_offset) < 0
+            ):
+                raise ValueError("invalid filter-value member cursor")
+        elif int(resume_member_offset) != 0:
+            raise ValueError("member offset requires a resume identity")
+
+        seen = tuple(dict.fromkeys(str(value) for value in seen_value_digests))
+        if len(seen) > ATTRIBUTE_VALUE_CURSOR_MAX_SEEN or any(
+            len(value) != 32 or any(char not in "0123456789abcdef" for char in value)
+            for value in seen
+        ):
+            raise ValueError("invalid filter-value seen-value state")
+        seen_set = set(seen)
+        emitted_digests: list[str] = []
+        emitted: dict[str, AttributeValueRow] = {}
+        needle = normalized_search.casefold()
+        candidate_pages = 0
+        cursor_before = before_identity
+        next_resume_identity: PhysicalSpanIdentity | None = None
+        next_resume_member_offset = 0
+
+        def candidates_for(decoded: tuple[AttributeType, Any]) -> tuple[Any, ...]:
+            attr_type, value = decoded
+            if attr_type == "array":
+                return value if isinstance(value, tuple) else ()
+            return () if value in (None, "") else (value,)
+
+        def consume_decoded(
+            decoded: tuple[AttributeType, Any],
+            *,
+            member_offset: int = 0,
+        ) -> tuple[bool, int]:
+            """Consume one row; return (fully_consumed, next_member_offset)."""
+
+            attr_type = decoded[0]
+            candidates = candidates_for(decoded)
+            if member_offset > len(candidates):
+                raise ValueError("invalid filter-value member offset")
+            for index in range(member_offset, len(candidates)):
+                value = candidates[index]
+                display = _value_search_text(value)
+                if needle and needle not in display.casefold():
+                    continue
+                digest = attribute_value_cursor_digest(attr_type, value)
+                if digest in seen_set:
+                    continue
+                prior = emitted.get(digest)
+                if prior is not None:
+                    emitted[digest] = AttributeValueRow(
+                        prior.value, prior.type, prior.count + 1
+                    )
+                    continue
+                emitted[digest] = AttributeValueRow(value, attr_type, 1)
+                emitted_digests.append(digest)
+                if len(emitted) >= page_size:
+                    next_offset = index + 1
+                    return next_offset >= len(candidates), next_offset
+            return True, len(candidates)
+
+        if resume_identity is not None:
+            resume_rows = self._verify_latest(
+                sql=_LATEST_TARGET_SQL,
+                project_ids=projects,
+                candidate_ids=(resume_identity,),
+                attribute_key=key,
+                version_ceiling=version_ceiling,
+            )
+            resume_row = resume_rows[0] if resume_rows else None
+            decoded = (
+                self._decode_target_value(
+                    resume_row,
+                    json_attribute_mode=self._json_attribute_mode,
+                )
+                if resume_row is not None
+                and self._row_is_active_in_window(resume_row, start, end)
+                else None
+            )
+            if decoded is not None:
+                fully_consumed, next_offset = consume_decoded(
+                    decoded,
+                    member_offset=int(resume_member_offset),
+                )
+                if not fully_consumed:
+                    next_resume_identity = resume_identity
+                    next_resume_member_offset = next_offset
+                else:
+                    cursor_before = resume_identity
+            else:
+                cursor_before = resume_identity
+
+        while (
+            current_segment_end > start
+            and len(emitted) < page_size
+            and next_resume_identity is None
+            and candidate_pages < ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
+            and len(seen_set) + len(emitted) < ATTRIBUTE_VALUE_CURSOR_MAX_SEEN
+        ):
+            segment_start = max(
+                start, current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
+            )
+            segment = (segment_start, current_segment_end)
+            candidate_ids: tuple[PhysicalSpanIdentity, ...] = ()
+            segment_truncated = False
+            candidate_ids, segment_truncated, _ = self._candidate_ids(
+                projects,
+                segment,
+                predicate="1",
+                attribute_key=key,
+                ordered=True,
+                before_identity=cursor_before,
+                candidate_limit=ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+                version_ceiling=version_ceiling,
+            )
+            candidate_pages += 1
+            rows = self._verify_latest(
+                sql=_LATEST_TARGET_SQL,
+                project_ids=projects,
+                candidate_ids=candidate_ids,
+                attribute_key=key,
+                version_ceiling=version_ceiling,
+            )
+
+            rows_by_identity = {self._physical_identity(row): row for row in rows}
+            fully_processed_identity = cursor_before
+            for identity in candidate_ids:
+                row = rows_by_identity.get(identity)
+                if row is None or not self._row_is_active_in_window(row, start, end):
+                    fully_processed_identity = identity
+                    continue
+                decoded = self._decode_target_value(
+                    row,
+                    json_attribute_mode=self._json_attribute_mode,
+                )
+                if decoded is None:
+                    fully_processed_identity = identity
+                    continue
+                fully_consumed, next_offset = consume_decoded(decoded)
+                if not fully_consumed:
+                    next_resume_identity = identity
+                    next_resume_member_offset = next_offset
+                    break
+                fully_processed_identity = identity
+                if len(emitted) >= page_size:
+                    break
+
+            cursor_before = fully_processed_identity
+            if next_resume_identity is not None:
+                break
+            if len(emitted) >= page_size:
+                break
+            if segment_truncated and candidate_ids:
+                cursor_before = candidate_ids[-1]
+                continue
+            current_segment_end = segment_start
+            cursor_before = None
+
+        exhausted = current_segment_end <= start and next_resume_identity is None
+        seen_after = (*seen, *emitted_digests)
+        capped = len(seen_after) >= ATTRIBUTE_VALUE_CURSOR_MAX_SEEN
+        has_more = not exhausted and not capped
+        # Every cursor page uses a bounded physical sample.  Even the terminal
+        # page retains the sampled marker because it contains only values not
+        # emitted by earlier pages, rather than a full distribution payload.
+        metadata = self._metadata(
+            complete=False,
+            error_code="sample_limit",
+            sampled=True,
+            window_start=start,
+            window_end=end,
+            query_count=self._query_count,
+        )
+        return AttributeValueCursorPageRead(
+            tuple(emitted[digest] for digest in emitted_digests),
+            metadata,
+            has_more,
+            current_segment_end,
+            cursor_before,
+            next_resume_identity,
+            next_resume_member_offset,
+            seen_after,
+        )
+
     def read_detail(
         self,
         project_ids: Iterable[Any],
@@ -2850,6 +3175,13 @@ def _canonical_value(attr_type: AttributeType, value: Any) -> str:
             value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
         )
     return json.dumps(str(value), ensure_ascii=False, separators=(",", ":"))
+
+
+def attribute_value_cursor_digest(attr_type: AttributeType, value: Any) -> str:
+    """Return a compact opaque identity for signed cursor de-duplication."""
+
+    canonical = f"{attr_type}\0{_canonical_value(attr_type, value)}".encode()
+    return hashlib.blake2s(canonical, digest_size=16).hexdigest()
 
 
 def _value_search_text(value: Any) -> str:

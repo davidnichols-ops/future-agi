@@ -11,11 +11,20 @@ import json
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 import structlog
 
+from tracer.services.clickhouse.dashboard_snapshot import (
+    capture_dashboard_relation_snapshot,
+)
+from tracer.services.clickhouse.list_cursor import (
+    ListCursor,
+    relation_snapshot_read_settings,
+)
 from tracer.services.clickhouse.read_budget import (
     ReadDeadline,
     ReadDeadlineExceeded,
@@ -63,11 +72,14 @@ _SKIP_ATTR_PREFIXES = (
     "output.value",
 )
 
-USER_LIST_WALL_DEADLINE_MS = 3_000
+USER_LIST_WALL_DEADLINE_MS = 12_000
 USER_LIST_PRESENCE_TIMEOUT_MS = 1_500
-USER_LIST_QUERY_TIMEOUT_MS = 2_200
-USER_LIST_ENRICHMENT_TIMEOUT_MS = 900
+USER_LIST_QUERY_TIMEOUT_MS = 8_000
+USER_LIST_ENRICHMENT_TIMEOUT_MS = 5_000
 USER_EXPORT_WALL_DEADLINE_MS = 30_000
+USER_LIST_SNAPSHOT_TIMEOUT_MS = 1_500
+USER_LIST_CANDIDATE_BATCH_SIZE = 100
+USER_LIST_MAX_CANDIDATE_BATCHES = 8
 
 _USER_LIST_READ_SETTINGS = {
     "max_threads": 2,
@@ -87,6 +99,20 @@ _USER_LIST_ATTR_RESULT_ROWS = 50_000
 MAX_EXPORT_ROWS = 10_000
 
 
+@dataclass(frozen=True)
+class UserCursorRead:
+    """One exact bounded Users page plus opaque transport state."""
+
+    payload: dict[str, Any]
+    window_start: datetime
+    window_end: datetime
+    checkpoint_order: tuple[Any, ...] | None
+    relation_version_ceilings: dict[str, int]
+    seen_rows: int
+    has_more: bool
+    unseen_row_proven: bool
+
+
 def _read_settings(*, max_result_rows: int) -> dict[str, int | str]:
     """Return hard server-side bounds for one user-list ClickHouse read."""
 
@@ -100,6 +126,22 @@ def _read_settings(*, max_result_rows: int) -> dict[str, int | str]:
     }
 
 
+def _snapshot_read_settings(
+    snapshot_settings: dict[str, Any] | None,
+    *,
+    max_result_rows: int,
+) -> dict[str, Any]:
+    """Combine immutable-relation filters with one query's result ceiling."""
+
+    settings: dict[str, Any] = _read_settings(max_result_rows=max_result_rows)
+    if snapshot_settings:
+        settings.update(snapshot_settings)
+        settings["max_result_rows"] = int(max_result_rows)
+        settings["max_result_bytes"] = _USER_LIST_RESULT_BYTES
+        settings["result_overflow_mode"] = "throw"
+    return settings
+
+
 def _log_user_read_failure(event: str, exc: Exception, **context: object) -> None:
     """Log operational reads compactly and programming defects with a stack."""
 
@@ -109,7 +151,13 @@ def _log_user_read_failure(event: str, exc: Exception, **context: object) -> Non
     logger.exception(event, error_type=type(exc).__name__, **context)
 
 
-def _users_attr_enrichment_query(project_id=None, project_ids=None):
+def _users_attr_enrichment_query(
+    project_id=None,
+    project_ids=None,
+    *,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+):
     """Build the Observe-Users span-attribute enrichment query (DESIGN §3).
 
     P3b step1.5 DUAL id-remap so a cross-cutover straddler's attributes unify
@@ -136,6 +184,16 @@ def _users_attr_enrichment_query(project_id=None, project_ids=None):
 
     eu_map = survivor_map_subquery("end_user_id_remap")
     resolved = resolved_id_expr("latest_end_user_id", "eu_remap")
+    if (start_date is None) != (end_date is None):
+        raise ValueError("attribute enrichment window must be provided together")
+    time_filter = ""
+    if start_date is not None:
+        params["attr_start_date"] = start_date
+        params["attr_end_date"] = end_date
+        time_filter = """
+          AND start_time >= %(attr_start_date)s
+          AND start_time < %(attr_end_date)s
+        """
     sql = f"""
     WITH
     eu_survivor_map AS ({eu_map}),
@@ -144,6 +202,7 @@ def _users_attr_enrichment_query(project_id=None, project_ids=None):
         FROM spans
         PREWHERE 1 = 1
           {project_clause}
+          {time_filter}
           AND (
               end_user_id IN %(eu_ids)s
               OR end_user_id IN (
@@ -163,10 +222,12 @@ def _users_attr_enrichment_query(project_id=None, project_ids=None):
             argMax(tuple(attributes_extra), _version).1 AS latest_attributes_extra,
             argMax(attrs_string, _version) AS latest_attrs_string,
             argMax(attrs_number, _version) AS latest_attrs_number,
+            argMax(attrs_bool, _version) AS latest_attrs_bool,
             argMax(is_deleted, _version) AS latest_is_deleted
         FROM spans
         PREWHERE 1 = 1
           {project_clause}
+          {time_filter}
           AND (project_id, trace_id, id, start_time) IN (
               SELECT project_id, trace_id, id, start_time
               FROM candidate_span_identities
@@ -177,7 +238,8 @@ def _users_attr_enrichment_query(project_id=None, project_ids=None):
         {resolved} AS end_user_id,
         latest_attributes_extra AS attributes_extra,
         latest_attrs_string AS attrs_string,
-        latest_attrs_number AS attrs_number
+        latest_attrs_number AS attrs_number,
+        latest_attrs_bool AS attrs_bool
     FROM latest_candidate_spans
     LEFT JOIN eu_survivor_map AS eu_remap
         ON latest_end_user_id = eu_remap.any_id
@@ -187,6 +249,7 @@ def _users_attr_enrichment_query(project_id=None, project_ids=None):
         (latest_attributes_extra != '{{}}' AND latest_attributes_extra != '')
         OR length(mapKeys(latest_attrs_string)) > 0
         OR length(mapKeys(latest_attrs_number)) > 0
+        OR length(mapKeys(latest_attrs_bool)) > 0
       )
     """
     from tracer.services.clickhouse.v2.query_builders.filters import (
@@ -284,6 +347,7 @@ class UsersListManager:
         deadline: ReadDeadline,
         *,
         timeout_cap_ms: int | None = USER_LIST_ENRICHMENT_TIMEOUT_MS,
+        snapshot_settings: dict[str, Any] | None = None,
     ) -> dict[str, dict]:
         """Return latest-row raw metrics for the already finite user page."""
 
@@ -298,7 +362,10 @@ class UsersListManager:
             query,
             params,
             timeout_ms=deadline.remaining_ms(timeout_cap_ms),
-            settings=_read_settings(max_result_rows=max(1, len(end_user_ids))),
+            settings=_snapshot_read_settings(
+                snapshot_settings,
+                max_result_rows=max(1, len(end_user_ids)),
+            ),
         )
         return {str(row.get("end_user_id", "")): row for row in result.data}
 
@@ -322,6 +389,10 @@ class UsersListManager:
         self,
         rows: list[dict],
         deadline: ReadDeadline,
+        *,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        snapshot_settings: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, object]]:
         """Return page-user attributes under the request-owned wall deadline."""
 
@@ -332,13 +403,18 @@ class UsersListManager:
         attr_query, attr_params = _users_attr_enrichment_query(
             project_id=self.project_id,
             project_ids=self.scoped_project_ids,
+            start_date=start_date,
+            end_date=end_date,
         )
         attr_params["eu_ids"] = tuple(str(e) for e in end_user_ids)
         attr_result = analytics.execute_ch_query(
             attr_query,
             attr_params,
             timeout_ms=deadline.remaining_ms(USER_LIST_ENRICHMENT_TIMEOUT_MS),
-            settings=_read_settings(max_result_rows=_USER_LIST_ATTR_RESULT_ROWS),
+            settings=_snapshot_read_settings(
+                snapshot_settings,
+                max_result_rows=_USER_LIST_ATTR_RESULT_ROWS,
+            ),
         )
         user_attrs: dict[str, dict[str, object]] = {}
         for attr_row in attr_result.data:
@@ -350,16 +426,16 @@ class UsersListManager:
                 attrs = {}
             if not isinstance(attrs, dict):
                 attrs = {}
-            # Fallback: merge from typed Map columns when raw is empty.
-            if not attrs:
-                str_map = attr_row.get("attrs_string") or {}
-                num_map = attr_row.get("attrs_number") or {}
-                if isinstance(str_map, dict):
-                    attrs.update(str_map)
-                if isinstance(num_map, dict):
-                    for key, value in num_map.items():
-                        if key not in attrs:
-                            attrs[key] = value
+            # Direct writes split scalar attributes across typed Maps while
+            # structured values remain in attributes_extra. Merge every source
+            # on every row; structured/raw values win if a malformed producer
+            # writes the same key to more than one physical column.
+            for typed_map_name in ("attrs_string", "attrs_number", "attrs_bool"):
+                typed_map = attr_row.get(typed_map_name) or {}
+                if not isinstance(typed_map, dict):
+                    continue
+                for key, value in typed_map.items():
+                    attrs.setdefault(key, value)
             if uid not in user_attrs:
                 user_attrs[uid] = {}
             for key, value in attrs.items():
@@ -369,14 +445,38 @@ class UsersListManager:
                     continue
                 if key not in user_attrs[uid]:
                     user_attrs[uid][key] = (
-                        set() if isinstance(value, (str, int, float, bool)) else []
+                        set()
+                        if value is None or isinstance(value, (str, int, float, bool))
+                        else []
                     )
-                if isinstance(value, (str, int, float, bool)):
+                if value is None or isinstance(value, (str, int, float, bool)):
                     values = user_attrs[uid][key]
-                    assert isinstance(values, set)
-                    values.add(
+                    normalized = (
                         value if not isinstance(value, bool) else str(value).lower()
                     )
+                    if isinstance(values, set):
+                        values.add(normalized)
+                    elif normalized not in values:
+                        # A custom attribute can legitimately change type across
+                        # spans. Keep both exact representations rather than
+                        # crashing because an earlier row happened to be JSON.
+                        values.append(normalized)
+                elif isinstance(value, (dict, list)):
+                    values = user_attrs[uid][key]
+                    if isinstance(values, set):
+                        # Promote a scalar bucket when this key later carries a
+                        # structured value. The output becomes a deterministic
+                        # multi-value attribute and no exact value is discarded.
+                        values = sorted(values, key=str)
+                        user_attrs[uid][key] = values
+                    canonical = json.dumps(
+                        value,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
+                    if canonical not in values:
+                        values.append(canonical)
         return user_attrs
 
     @staticmethod
@@ -395,13 +495,21 @@ class UsersListManager:
                         sorted_values[0] if len(sorted_values) == 1 else sorted_values
                     )
                 else:
-                    entry[key] = values
+                    entry[key] = sorted(
+                        values,
+                        key=lambda value: (
+                            type(value).__name__,
+                            UsersListManager._canonical_filter_value(value),
+                        ),
+                    )
 
     def _read_evals(
         self,
         rows: list[dict],
         builder: UserListQueryBuilderV2,
         deadline: ReadDeadline,
+        *,
+        snapshot_settings: dict[str, Any] | None = None,
     ) -> dict[str, dict]:
         """Return page-user eval metrics under the shared request deadline."""
 
@@ -418,7 +526,10 @@ class UsersListManager:
             eval_query,
             eval_params,
             timeout_ms=deadline.remaining_ms(USER_LIST_ENRICHMENT_TIMEOUT_MS),
-            settings=_read_settings(max_result_rows=max(1, len(end_user_ids))),
+            settings=_snapshot_read_settings(
+                snapshot_settings,
+                max_result_rows=max(1, len(end_user_ids)),
+            ),
         )
         return {str(row.get("end_user_id", "")): row for row in eval_result.data}
 
@@ -429,6 +540,492 @@ class UsersListManager:
             eval_row = eval_map.get(end_user_id, {})
             entry["bool_eval_pass_rate"] = eval_row.get("bool_eval_pass_rate", 0)
             entry["avg_output_float"] = eval_row.get("avg_output_float", 0)
+
+    @staticmethod
+    def _frozen_filters(
+        filters: list[dict],
+        *,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> list[dict]:
+        return [
+            *[
+                item
+                for item in filters
+                if not UserListQueryBuilderV2._is_date_filter(item)
+            ],
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "filter_type": "datetime",
+                    "filter_op": "between",
+                    "filter_value": [window_start, window_end],
+                },
+            },
+        ]
+
+    def _capture_cursor_snapshot(
+        self,
+        *,
+        deadline: ReadDeadline,
+        frozen_filters: list[dict],
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """Freeze every mutable relation used by the bounded Users page."""
+
+        dummy_id = "00000000-0000-0000-0000-000000000000"
+        candidate_builder = UserListQueryBuilderV2(
+            organization_id=self.organization_id,
+            project_ids=self.scoped_project_ids,
+            filters=frozen_filters,
+            empty_scope=self.empty_scope,
+        )
+        candidate_sql, _ = candidate_builder.build_dimension_candidate_query(limit=1)
+        finite_builder = UserListQueryBuilderV2(
+            organization_id=self.organization_id,
+            project_ids=self.scoped_project_ids,
+            filters=[
+                item
+                for item in frozen_filters
+                if UserListQueryBuilderV2._is_date_filter(item)
+            ],
+            limit=1,
+            offset=0,
+            candidate_end_user_ids=[dummy_id],
+            empty_scope=self.empty_scope,
+        )
+        page_sql, _ = finite_builder.build_candidate_page_query()
+        metric_sql, _ = finite_builder.build_page_metrics_query([dummy_id])
+        eval_sql, _ = finite_builder.build_eval_query([dummy_id])
+        start_date, end_date = finite_builder.parse_time_range(finite_builder.filters)
+        attr_sql, _ = _users_attr_enrichment_query(
+            project_id=self.project_id,
+            project_ids=self.scoped_project_ids,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        snapshot = capture_dashboard_relation_snapshot(
+            analytics=V2AnalyticsQueryService(),
+            sql_statements=[
+                candidate_sql,
+                page_sql,
+                metric_sql,
+                eval_sql,
+                attr_sql,
+            ],
+            base_settings=_read_settings(max_result_rows=1),
+            timeout_ms=deadline.remaining_ms(USER_LIST_SNAPSHOT_TIMEOUT_MS),
+        )
+        return snapshot.settings, dict(snapshot.version_ceilings)
+
+    def _read_dimension_candidates(
+        self,
+        *,
+        deadline: ReadDeadline,
+        limit: int,
+        before_first_seen: datetime | None,
+        before_end_user_id: str | None,
+        snapshot_settings: dict[str, Any],
+    ) -> list[dict]:
+        builder = UserListQueryBuilderV2(
+            organization_id=self.organization_id,
+            project_ids=self.scoped_project_ids,
+            search=self.search,
+            empty_scope=self.empty_scope,
+        )
+        query, params = builder.build_dimension_candidate_query(
+            limit=limit,
+            before_first_seen=before_first_seen,
+            before_end_user_id=before_end_user_id,
+        )
+        result = V2AnalyticsQueryService().execute_ch_query(
+            query,
+            params,
+            timeout_ms=deadline.remaining_ms(USER_LIST_QUERY_TIMEOUT_MS),
+            settings=_snapshot_read_settings(
+                snapshot_settings,
+                max_result_rows=limit,
+            ),
+        )
+        return list(result.data or [])
+
+    def _read_exact_candidate_rows(
+        self,
+        *,
+        candidate_ids: list[str],
+        frozen_filters: list[dict],
+        window_start: datetime,
+        window_end: datetime,
+        deadline: ReadDeadline,
+        snapshot_settings: dict[str, Any],
+    ) -> list[dict]:
+        if not candidate_ids:
+            return []
+        date_filters = [
+            item
+            for item in frozen_filters
+            if UserListQueryBuilderV2._is_date_filter(item)
+        ]
+        builder = UserListQueryBuilderV2(
+            organization_id=self.organization_id,
+            project_ids=self.scoped_project_ids,
+            filters=date_filters,
+            limit=len(candidate_ids),
+            offset=0,
+            candidate_end_user_ids=candidate_ids,
+            empty_scope=self.empty_scope,
+        )
+        query, params = builder.build_candidate_page_query()
+        result = V2AnalyticsQueryService().execute_ch_query(
+            query,
+            params,
+            timeout_ms=deadline.remaining_ms(USER_LIST_QUERY_TIMEOUT_MS),
+            settings=_snapshot_read_settings(
+                snapshot_settings,
+                max_result_rows=max(1, len(candidate_ids)),
+            ),
+        )
+        rows = builder.format_rows(result.data)["table"]
+        if not rows:
+            return []
+
+        pool = ThreadPoolExecutor(max_workers=3)
+        futures = {
+            pool.submit(
+                self._read_page_metrics,
+                rows,
+                builder,
+                deadline,
+                snapshot_settings=snapshot_settings,
+            ): "metrics",
+            pool.submit(
+                self._read_span_attributes,
+                rows,
+                deadline,
+                start_date=window_start,
+                end_date=window_end,
+                snapshot_settings=snapshot_settings,
+            ): "attributes",
+            pool.submit(
+                self._read_evals,
+                rows,
+                builder,
+                deadline,
+                snapshot_settings=snapshot_settings,
+            ): "evals",
+        }
+        completed: dict[str, dict] = {}
+        try:
+            for future, phase in futures.items():
+                completed[phase] = future.result(timeout=deadline.remaining_ms() / 1000)
+            deadline.remaining_ms()
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        self._apply_page_metrics(rows, completed["metrics"])
+        self._apply_span_attributes(rows, completed["attributes"])
+        self._apply_evals(rows, completed["evals"])
+        return rows
+
+    @staticmethod
+    def _candidate_value_matches(candidate: Any, op: str | None, expected: Any) -> bool:
+        if isinstance(candidate, (list, tuple, set)):
+            values = list(candidate)
+            if op in {"not_equals", "not_in", "not_contains"}:
+                positive_op = {
+                    "not_equals": "equals",
+                    "not_in": "in",
+                    "not_contains": "contains",
+                }[str(op)]
+                return all(
+                    not UsersListManager._candidate_value_matches(
+                        value, positive_op, expected
+                    )
+                    for value in values
+                )
+            return any(
+                UsersListManager._candidate_value_matches(value, op, expected)
+                for value in values
+            )
+        if op == "is_null":
+            return candidate is None
+        if op == "is_not_null":
+            return candidate is not None
+        if op in {"in", "not_in"}:
+            expected_values = expected if isinstance(expected, list) else [expected]
+            left = UsersListManager._canonical_filter_value(candidate)
+            matched = any(
+                left == UsersListManager._canonical_filter_value(value)
+                for value in expected_values
+            )
+            return not matched if op == "not_in" else matched
+        if op in {"equals", "not_equals"}:
+            left = UsersListManager._canonical_filter_value(candidate)
+            right = UsersListManager._canonical_filter_value(expected)
+            matched = left == right
+            return not matched if op == "not_equals" else matched
+        if op in {"contains", "not_contains", "starts_with", "ends_with"}:
+            left = UsersListManager._canonical_filter_value(candidate or "").lower()
+            right = UsersListManager._canonical_filter_value(expected or "").lower()
+            if op == "starts_with":
+                return left.startswith(right)
+            if op == "ends_with":
+                return left.endswith(right)
+            matched = right in left
+            return not matched if op == "not_contains" else matched
+        if op in {
+            "greater_than",
+            "greater_than_or_equal",
+            "less_than",
+            "less_than_or_equal",
+        }:
+            try:
+                left = float(candidate)
+                right = float(expected)
+            except (TypeError, ValueError):
+                return False
+            if op == "greater_than":
+                return left > right
+            if op == "greater_than_or_equal":
+                return left >= right
+            if op == "less_than":
+                return left < right
+            return left <= right
+        if op in {"between", "not_between"}:
+            if not isinstance(expected, (list, tuple)) or len(expected) != 2:
+                return False
+            try:
+                matched = expected[0] <= candidate < expected[1]
+            except TypeError:
+                left = str(candidate)
+                matched = str(expected[0]) <= left < str(expected[1])
+            return not matched if op == "not_between" else matched
+        return True
+
+    @staticmethod
+    def _canonical_filter_value(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            return json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, (int, float, Decimal)):
+            numeric = Decimal(str(value))
+            if numeric.is_finite():
+                if numeric == 0:
+                    return "0"
+                return format(numeric.normalize(), "f")
+            return str(value).lower()
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.lower() in {"true", "false"}:
+                return stripped.lower()
+            if stripped.startswith(("{", "[")):
+                try:
+                    structured = json.loads(stripped)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                else:
+                    if isinstance(structured, (dict, list)):
+                        return json.dumps(
+                            structured,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        )
+        return str(value)
+
+    def _row_matches_filters(self, row: dict[str, Any]) -> bool:
+        for item in self.filters:
+            if UserListQueryBuilderV2._is_date_filter(item):
+                continue
+            config = item.get("filter_config") or {}
+            column_id = item.get("column_id") or item.get("columnId")
+            if not column_id:
+                continue
+            if column_id == "eval_score":
+                key = "bool_eval_pass_rate"
+            else:
+                key = UserListQueryBuilderV2.OUTPUT_FILTER_MAP.get(column_id, column_id)
+            if not self._candidate_value_matches(
+                row.get(key),
+                config.get("filter_op") or config.get("filterOp"),
+                config.get("filter_value", config.get("filterValue")),
+            ):
+                return False
+        return True
+
+    def list_cursor_payload(
+        self,
+        *,
+        page_size: int,
+        cursor: ListCursor | None = None,
+    ) -> UserCursorRead:
+        """Return exact rows from a bounded, signed dimension continuation.
+
+        The list is intentionally candidate ordered.  It never samples or
+        publishes a partially hydrated user; an unfinished dimension scan is
+        represented only by ``has_more`` plus the next opaque cursor.
+        """
+
+        deadline = ReadDeadline.start(USER_LIST_WALL_DEADLINE_MS)
+        base_builder = UserListQueryBuilderV2(
+            organization_id=self.organization_id,
+            project_ids=self.scoped_project_ids,
+            filters=self.filters,
+            empty_scope=self.empty_scope,
+        )
+        if cursor is None:
+            window_start, window_end = base_builder.parse_time_range(self.filters)
+            frozen_filters = self._frozen_filters(
+                self.filters,
+                window_start=window_start,
+                window_end=window_end,
+            )
+            snapshot_settings, relation_version_ceilings = (
+                self._capture_cursor_snapshot(
+                    deadline=deadline,
+                    frozen_filters=frozen_filters,
+                )
+            )
+            seen_before = 0
+            before_first_seen = None
+            before_end_user_id = None
+        else:
+            window_start, window_end = cursor.window_start, cursor.window_end
+            frozen_filters = self._frozen_filters(
+                self.filters,
+                window_start=window_start,
+                window_end=window_end,
+            )
+            if not cursor.relation_version_ceilings:
+                raise ValueError("user list cursor relation snapshot is unavailable")
+            relation_version_ceilings = dict(cursor.relation_version_ceilings)
+            snapshot_settings = relation_snapshot_read_settings(
+                {}, version_ceilings=relation_version_ceilings
+            )
+            seen_before = cursor.seen_rows
+            if len(cursor.order) != 2:
+                raise ValueError("user list cursor order is invalid")
+            before_first_seen = cursor.order[0]
+            before_end_user_id = str(cursor.order[1])
+
+        published: list[dict] = []
+        checkpoint: tuple[Any, ...] | None = None
+        has_more = False
+        unseen_row_proven = False
+
+        for _ in range(USER_LIST_MAX_CANDIDATE_BATCHES):
+            try:
+                candidate_rows = self._read_dimension_candidates(
+                    deadline=deadline,
+                    limit=USER_LIST_CANDIDATE_BATCH_SIZE + 1,
+                    before_first_seen=before_first_seen,
+                    before_end_user_id=before_end_user_id,
+                    snapshot_settings=snapshot_settings,
+                )
+                if not candidate_rows:
+                    has_more = False
+                    break
+
+                batch = candidate_rows[:USER_LIST_CANDIDATE_BATCH_SIZE]
+                dimension_has_more = len(candidate_rows) > len(batch)
+                candidate_ids = [str(row["end_user_id"]) for row in batch]
+                exact_rows = self._read_exact_candidate_rows(
+                    candidate_ids=candidate_ids,
+                    frozen_filters=frozen_filters,
+                    window_start=window_start,
+                    window_end=window_end,
+                    deadline=deadline,
+                    snapshot_settings=snapshot_settings,
+                )
+                exact_by_id = {
+                    str(row.get("end_user_id")): row
+                    for row in exact_rows
+                    if row.get("end_user_id")
+                }
+                consumed = 0
+                for candidate in batch:
+                    consumed += 1
+                    row = exact_by_id.get(str(candidate.get("end_user_id")))
+                    if row is None or not self._row_matches_filters(row):
+                        continue
+                    published.append(row)
+                    if len(published) == page_size:
+                        unseen_row_proven = any(
+                            (
+                                exact_by_id.get(str(later.get("end_user_id")))
+                                is not None
+                                and self._row_matches_filters(
+                                    exact_by_id[str(later.get("end_user_id"))]
+                                )
+                            )
+                            for later in batch[consumed:]
+                        )
+                        break
+
+                consumed_row = batch[consumed - 1]
+                checkpoint = (
+                    consumed_row["first_seen"],
+                    str(consumed_row["end_user_id"]),
+                )
+                before_first_seen = checkpoint[0]
+                before_end_user_id = checkpoint[1]
+                unconsumed_candidates = consumed < len(batch)
+                has_more = bool(
+                    unconsumed_candidates
+                    or dimension_has_more
+                    or len(batch) == USER_LIST_CANDIDATE_BATCH_SIZE
+                )
+                if len(published) == page_size:
+                    break
+                if (
+                    not dimension_has_more
+                    and len(batch) < USER_LIST_CANDIDATE_BATCH_SIZE
+                ):
+                    has_more = False
+                    break
+            except (FuturesTimeoutError, ReadDeadlineExceeded):
+                if checkpoint is None:
+                    raise
+                has_more = True
+                break
+            except Exception as exc:
+                if checkpoint is None or not is_read_budget_error(exc):
+                    raise
+                has_more = True
+                break
+        else:
+            has_more = checkpoint is not None
+
+        seen_rows = seen_before + len(published)
+        lower_bound = seen_rows + (1 if has_more and unseen_row_proven else 0)
+        total_pages = (lower_bound + page_size - 1) // page_size
+        payload = {
+            "table": published,
+            "total_count": lower_bound,
+            "total_pages": total_pages,
+            "count_is_lower_bound": has_more,
+            "has_more": has_more,
+            # Every published row completed exact latest-state hydration and
+            # every requested predicate. ``has_more`` describes only the
+            # dimension traversal; it must not relabel an exact list page as an
+            # incomplete/sampled result in shared UI state handling.
+            "query_complete": True,
+            "query_status": "complete",
+        }
+        return UserCursorRead(
+            payload=payload,
+            window_start=window_start,
+            window_end=window_end,
+            checkpoint_order=checkpoint,
+            relation_version_ceilings=relation_version_ceilings,
+            seen_rows=seen_rows,
+            has_more=has_more,
+            unseen_row_proven=unseen_row_proven,
+        )
 
     def list_payload(self, *, page_size: int, current_page: int) -> dict:
         """Paginated list response: rows + span/eval enrichment + page totals."""

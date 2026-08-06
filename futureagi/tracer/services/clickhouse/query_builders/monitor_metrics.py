@@ -204,8 +204,9 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         elif metric_type == ERROR_FREE_SESSION_RATES:
             query = f"""
                 SELECT
-                    CASE WHEN uniq(session_id) = 0 THEN NULL
-                         ELSE uniqIf(session_id, error_count = 0) / uniq(session_id)
+                    CASE WHEN uniqExact(session_id) = 0 THEN NULL
+                         ELSE uniqExactIf(session_id, error_count = 0)
+                              / uniqExact(session_id)
                     END AS value
                 FROM (
                     SELECT
@@ -223,8 +224,9 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
         elif metric_type == SERVICE_PROVIDER_ERROR_RATES:
             query = f"""
                 SELECT
-                    CASE WHEN uniq(provider) = 0 THEN NULL
-                         ELSE uniqIf(provider, error_count = 0) / uniq(provider)
+                    CASE WHEN uniqExact(provider) = 0 THEN NULL
+                         ELSE uniqExactIf(provider, error_count = 0)
+                              / uniqExact(provider)
                     END AS value
                 FROM (
                     SELECT
@@ -614,8 +616,9 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             query = f"""
                 SELECT
                     timestamp,
-                    CASE WHEN uniq(session_id) = 0 THEN 0
-                         ELSE uniqIf(session_id, error_count = 0) / uniq(session_id)
+                    CASE WHEN uniqExact(session_id) = 0 THEN 0
+                         ELSE uniqExactIf(session_id, error_count = 0)
+                              / uniqExact(session_id)
                     END AS value
                 FROM (
                     SELECT
@@ -637,8 +640,9 @@ class MonitorMetricsQueryBuilder(BaseQueryBuilder):
             query = f"""
                 SELECT
                     timestamp,
-                    CASE WHEN uniq(provider) = 0 THEN 0
-                         ELSE uniqIf(provider, error_count = 0) / uniq(provider)
+                    CASE WHEN uniqExact(provider) = 0 THEN 0
+                         ELSE uniqExactIf(provider, error_count = 0)
+                              / uniqExact(provider)
                     END AS value
                 FROM (
                     SELECT

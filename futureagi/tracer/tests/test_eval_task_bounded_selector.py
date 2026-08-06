@@ -22,6 +22,9 @@ from tracer.services.clickhouse.query_builders.session_list import (
 )
 from tracer.services.clickhouse.query_builders.span_list import SpanListQueryBuilder
 from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
+from tracer.services.clickhouse.query_builders.voice_call_list import (
+    VoiceCallListQueryBuilder,
+)
 from tracer.services.clickhouse.query_service import QueryResult
 
 PROJECT_ID = "00000000-0000-4000-8000-000000000001"
@@ -50,6 +53,49 @@ def _attribute_filter(key: str, value: str) -> dict:
             "filter_value": value,
         },
     }
+
+
+def _has_eval_filter(value: bool | str) -> dict:
+    return {
+        "column_id": "has_eval",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
+
+
+@pytest.mark.parametrize("value", [False, "false"])
+def test_historical_voice_classifier_samples_exact_root_after_eval_filter(
+    value: bool | str,
+) -> None:
+    builder = VoiceCallListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _has_eval_filter(value)],
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_sampling_salt="task-salt",
+        bounded_sampling_rate=25.0,
+    )
+
+    seed_sql, seed_params = builder.build_filter_seed_page(
+        slice_start=END - timedelta(minutes=5),
+        slice_end=END,
+        limit=25,
+    )
+    match_sql, match_params = builder.build_filter_match_query(["trace-a"])
+
+    assert builder.supports_bounded_filter_scan() is True
+    assert "tracer_eval_logger" not in seed_sql
+    assert "cityHash64" not in seed_sql
+    assert "bounded_sampling_salt" not in seed_params
+    assert "trace_id NOT IN" in match_sql
+    assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in match_sql
+    assert "toString(root_span_id)" in match_sql
+    assert match_params["candidate_trace_ids"] == ("trace-a",)
+    assert match_params["bounded_sampling_salt"] == "task-salt"
+    assert match_params["bounded_sampling_rate"] == 25.0
 
 
 @pytest.mark.parametrize(
@@ -248,6 +294,74 @@ def test_bounded_resolver_returns_only_a_complete_latest_state_page(
         )
         assert "filter_witness_0" not in membership_sql
         assert "argMinIf(tuple(grouped_id, latest_start_time)" not in membership_sql
+
+
+@pytest.mark.parametrize("value", [False, "false"])
+def test_bounded_historical_voice_returns_canonical_root_span_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    value: bool | str,
+) -> None:
+    captured: dict = {}
+
+    def fake_read(**kwargs):
+        captured.update(kwargs)
+        return BoundedFilterPage(
+            rows=[
+                {
+                    "trace_id": "trace-b",
+                    "root_span_id": "voice-root-b",
+                    "start_time": END - timedelta(minutes=1),
+                },
+                {
+                    "trace_id": "trace-a",
+                    "root_span_id": "voice-root-a",
+                    "start_time": END - timedelta(minutes=2),
+                },
+            ],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=2,
+            elapsed_ms=10,
+            query_count=2,
+            rows_returned=4,
+            result_payload_bytes=100,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    ids = row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=25.0,
+        filters={
+            "filters": [_has_eval_filter(value)],
+            "date_range": [START, END],
+        },
+        limit=25,
+        batch_size=256,
+        row_type=RowType.VOICE_CALLS,
+    )
+
+    assert ids == ["voice-root-b", "voice-root-a"]
+    assert captured["key_field"] == "trace_id"
+    assert captured["classify_batch_size"] == 50
+    assert isinstance(captured["builder"], VoiceCallListQueryBuilder)
+    assert captured["builder"]._bounded_identity_only is True
+    assert captured["builder"]._bounded_sampling_salt == "task-salt"
+    assert captured["builder"]._bounded_sampling_rate == 25.0
+    match_sql, match_params = captured["builder"].build_filter_match_query(["trace-a"])
+    assert "trace_id NOT IN" in match_sql
+    assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in match_sql
+    assert "toString(root_span_id)" in match_sql
+    assert match_params["candidate_trace_ids"] == ("trace-a",)
 
 
 def test_bounded_historical_session_selector_proves_and_sorts_full_population(
@@ -1225,7 +1339,10 @@ def test_configured_1m_task_returns_complete_small_population_deterministically(
     assert captured["page_size"] == 10_000
 
 
-@pytest.mark.parametrize("row_type", [RowType.SPANS, RowType.TRACES, RowType.SESSIONS])
+@pytest.mark.parametrize(
+    "row_type",
+    [RowType.SPANS, RowType.TRACES, RowType.SESSIONS, RowType.VOICE_CALLS],
+)
 def test_task_at_10k_routes_directly_to_bounded_selector_without_legacy_sql(
     monkeypatch: pytest.MonkeyPatch,
     row_type: str,

@@ -54,7 +54,11 @@ def test_span_attribute_type_enum_matches_generated_openapi(
         "enum"
     ]
 
-    assert runtime_choices == ["string", "number", "boolean", "array"]
+    expected_choices = ["string", "number", "boolean", "array"]
+    if serializer_cls is SpanAttributeKeySerializer:
+        expected_choices.append("map")
+
+    assert runtime_choices == expected_choices
     assert openapi_choices == runtime_choices
 
 

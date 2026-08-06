@@ -9,6 +9,7 @@ from rest_framework import status
 from model_hub.models.choices import OwnerChoices
 from model_hub.models.evals_metric import EvalTemplate
 from model_hub.selectors.eval_usage import (
+    EvalUsageChartBucket,
     EvalUsageRead,
     EvalUsageReadCompleteness,
     EvalUsageReadError,
@@ -29,6 +30,13 @@ def _usage_template(organization, workspace):
         model="turing_large",
         visible_ui=True,
     )
+
+
+def test_finite_usage_metric_rejects_clickhouse_empty_average_sentinels():
+    assert separate_evals._finite_usage_metric(float("nan")) is None
+    assert separate_evals._finite_usage_metric(float("inf")) is None
+    assert separate_evals._finite_usage_metric("not-a-number") is None
+    assert separate_evals._finite_usage_metric(0.25) == 0.25
 
 
 @pytest.mark.django_db
@@ -146,6 +154,54 @@ def test_eval_usage_clickhouse_response_preserves_required_total_runs(
     assert result["completeness"] == "complete"
     assert result["unavailable_fields"] == []
     assert result["stats"]["total_runs"] == 0
+
+
+@pytest.mark.django_db
+def test_eval_usage_non_finite_chart_averages_do_not_crash_api(
+    auth_client,
+    organization,
+    workspace,
+    monkeypatch,
+):
+    template = _usage_template(organization, workspace)
+    monkeypatch.setattr(separate_evals, "APICallLog", SimpleNamespace())
+    monkeypatch.setattr(separate_evals, "is_clickhouse_enabled", lambda: True)
+    monkeypatch.setattr(
+        separate_evals,
+        "read_eval_usage",
+        lambda **kwargs: EvalUsageRead(
+            total_runs=1,
+            runs_period=1,
+            success_count=1,
+            error_count=0,
+            chart=[
+                EvalUsageChartBucket(
+                    bucket=separate_evals._round_to_usage_bucket(
+                        kwargs["start_date"], kwargs["bucket_minutes"]
+                    ),
+                    calls=1,
+                    avg_duration=float("nan"),
+                    avg_score=float("inf"),
+                    pass_count=1,
+                    fail_count=0,
+                )
+            ],
+            logs=[],
+            completeness=EvalUsageReadCompleteness.COMPLETE,
+            unavailable_fields=(),
+        ),
+    )
+
+    response = auth_client.get(
+        f"/model-hub/eval-templates/{template.id}/usage/",
+        {"page": 0, "page_size": 25, "period": "30d"},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    chart = response.json()["result"]["chart"]
+    assert chart[0]["calls"] == 1
+    assert chart[0]["avg_latency_ms"] == 0
+    assert chart[0]["avg_score"] is None
 
 
 @pytest.mark.django_db

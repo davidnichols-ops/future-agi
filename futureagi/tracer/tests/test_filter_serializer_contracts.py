@@ -73,7 +73,11 @@ def _span_attr_filter(filter_op="equals", filter_value="alpha"):
 class TestFilterSerializerContracts:
     @pytest.mark.parametrize(
         "serializer_class",
-        [TraceObserveListQuerySerializer, SpanObserveListQuerySerializer],
+        [
+            TraceObserveListQuerySerializer,
+            SpanObserveListQuerySerializer,
+            TraceSessionListQuerySerializer,
+        ],
     )
     def test_cursor_capable_page_help_does_not_deny_cursor_support(
         self, serializer_class
@@ -86,6 +90,29 @@ class TestFilterSerializerContracts:
             "does not provide cursor" not in serializer.fields["page_number"].help_text
         )
 
+    @pytest.mark.parametrize(
+        "serializer_class",
+        [
+            TraceObserveListQuerySerializer,
+            SpanObserveListQuerySerializer,
+            TraceSessionListQuerySerializer,
+        ],
+    )
+    def test_cursor_capable_lists_reject_ambiguous_numbered_pagination(
+        self, serializer_class
+    ):
+        with_cursor_and_page = serializer_class(
+            data={"cursor": "signed-token", "page_number": 0}
+        )
+        deep_cursor_start = serializer_class(
+            data={"cursor_mode": True, "page_number": 1}
+        )
+
+        assert not with_cursor_and_page.is_valid()
+        assert "cursor" in with_cursor_and_page.errors
+        assert not deep_cursor_start.is_valid()
+        assert "cursor_mode" in deep_cursor_start.errors
+
     def test_users_query_serializer_decodes_strict_filter_query_param(self):
         serializer = UsersQuerySerializer(
             data={
@@ -97,6 +124,25 @@ class TestFilterSerializerContracts:
         assert serializer.is_valid(), serializer.errors
         filters = serializer.validated_data["filters"]
         assert filters[0]["filter_config"]["filter_op"] == "equals"
+
+    def test_users_cursor_rejects_ambiguous_numbered_pagination(self):
+        with_cursor_and_page = UsersQuerySerializer(
+            data={"cursor": "signed-token", "current_page_index": 0}
+        )
+        deep_cursor_start = UsersQuerySerializer(
+            data={"cursor_mode": True, "current_page_index": 1}
+        )
+
+        assert not with_cursor_and_page.is_valid()
+        assert "cursor" in with_cursor_and_page.errors
+        assert not deep_cursor_start.is_valid()
+        assert "cursor_mode" in deep_cursor_start.errors
+
+    def test_users_cursor_first_page_is_additive(self):
+        serializer = UsersQuerySerializer(data={"cursor_mode": True, "page_size": 25})
+
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["cursor_mode"] is True
 
     def test_users_query_serializer_rejects_camel_case_filter_config(self):
         payload = _span_attr_filter()

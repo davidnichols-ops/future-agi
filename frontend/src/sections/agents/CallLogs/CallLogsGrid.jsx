@@ -42,6 +42,7 @@ import {
   getQueryReadMessage,
   getQueryReadState,
 } from "src/utils/queryReadState";
+import { createListCursorPagination } from "src/sections/projects/LLMTracing/listCursorPagination";
 
 const CELL_HEIGHT_MAP = { Short: 40, Medium: 52, Large: 68, "Extra Large": 88 };
 
@@ -117,8 +118,19 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
   const [page, setPage] = useState(1);
   const [pageLimit, setPageLimit] = useState(15);
   const [totalPages, setTotalPages] = useState(1);
-  const [lastFilters, setLastFilters] = useState(params?.filters);
+  const [, advanceCursorTransport] = useState(0);
+  const cursorPagination = useRef(
+    createListCursorPagination({ pageParam: "page", pageOffset: 1 }),
+  );
   const { selectedVersion } = useAgentDetailsStore();
+  const cursorQuerySignature = JSON.stringify({
+    id,
+    module,
+    selectedVersion,
+    params,
+  });
+  const [lastCursorQuerySignature, setLastCursorQuerySignature] =
+    useState(cursorQuerySignature);
   const [callLogsColumnDefs, setCallLogsColumnDefs] = useState(null);
   const previousConfigRef = useRef({
     configLength: undefined,
@@ -151,9 +163,12 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     },
     [activeCallId],
   );
-  // Derived state: reset page synchronously when filters change (avoids extra API call)
-  if (lastFilters !== params?.filters) {
-    setLastFilters(params?.filters);
+  // Reset the opaque chain synchronously whenever any query-shaping input
+  // changes. A cursor is signed against the complete normalized request, not
+  // only the visible filter array.
+  if (lastCursorQuerySignature !== cursorQuerySignature) {
+    cursorPagination.current.reset();
+    setLastCursorQuerySignature(cursorQuerySignature);
     setPage(1);
   }
 
@@ -195,6 +210,15 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     }),
     [],
   );
+  const paginationRequest =
+    module === "project"
+      ? {
+          generation: cursorPagination.current.generation(),
+          params: cursorPagination.current.requestParams(page - 1, {
+            page_size: pageLimit,
+          }),
+        }
+      : { generation: null, params: undefined };
   const { data, isLoading, error, queryKey } = useCallLogs({
     module,
     id: id,
@@ -202,23 +226,99 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     page,
     pageLimit,
     params,
+    paginationParams: paginationRequest.params,
     enabled,
   });
   const readState = useMemo(
     () => getQueryReadState(data, { isError: Boolean(error) }),
     [data, error],
   );
-  const readMessage = getQueryReadMessage(readState);
+  const responseRows = useMemo(
+    () => (Array.isArray(data?.results) ? data.results : []),
+    [data?.results],
+  );
+  const hasCursorContinuation =
+    module === "project" &&
+    data?.has_more === true &&
+    typeof data?.next_cursor === "string" &&
+    data.next_cursor.length > 0;
+  const hasCursorContract =
+    module === "project" &&
+    typeof data?.has_more === "boolean" &&
+    Object.prototype.hasOwnProperty.call(data || {}, "next_cursor");
+  const readMessage =
+    responseRows.length > 0 || readState === "sampled" || hasCursorContinuation
+      ? null
+      : getQueryReadMessage(readState);
   const isCompleteRead = readState === "complete";
+  const isUsableListRead =
+    !error &&
+    (isCompleteRead || responseRows.length > 0 || hasCursorContinuation);
+
+  useEffect(() => {
+    if (
+      module !== "project" ||
+      isLoading ||
+      error ||
+      !data ||
+      !cursorPagination.current.isCurrent(paginationRequest.generation)
+    ) {
+      return;
+    }
+    try {
+      if (responseRows.length === 0 && hasCursorContinuation) {
+        cursorPagination.current.recordEmptyContinuation(page - 1, data);
+        // Keep the same visible pagination page. The project query key includes
+        // the advanced opaque cursor, so this rerender fetches the next bounded
+        // transport prefix without flashing an empty page to the user.
+        advanceCursorTransport((revision) => revision + 1);
+        return;
+      }
+      cursorPagination.current.recordResponse(page - 1, data);
+    } catch (cursorError) {
+      if (
+        cursorPagination.current.canRecoverFromContinuationError(
+          page - 1,
+          cursorError,
+        )
+      ) {
+        cursorPagination.current.disableCursor();
+        setPage(1);
+      }
+    }
+  }, [
+    data,
+    error,
+    hasCursorContinuation,
+    isLoading,
+    module,
+    page,
+    paginationRequest.generation,
+    responseRows.length,
+  ]);
 
   useEffect(() => {
     if (!isLoading) {
-      // A lower-bound/incomplete total cannot safely enable numbered-page
-      // navigation. Keep the visible bounded rows, but expose only a disabled
-      // single-page control until an exact response arrives.
-      setTotalPages(isCompleteRead ? data?.total_pages || 1 : 1);
+      const reportedPages = Number(data?.total_pages) || 1;
+      const continuationFloor = data?.has_more === true ? page + 1 : page;
+      setTotalPages(
+        isUsableListRead
+          ? Math.max(
+              1,
+              continuationFloor,
+              hasCursorContract ? page : reportedPages,
+            )
+          : 1,
+      );
     }
-  }, [data?.total_pages, isCompleteRead, isLoading]);
+  }, [
+    data?.has_more,
+    data?.total_pages,
+    hasCursorContract,
+    isLoading,
+    isUsableListRead,
+    page,
+  ]);
 
   const rows = useMemo(() => {
     if (isLoading) {
@@ -231,8 +331,8 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
         status: "",
       }));
     }
-    return data?.results || [];
-  }, [data, isLoading]);
+    return responseRows;
+  }, [isLoading, responseRows]);
 
   // Pass full column list to parent (base + eval/annotation) for DisplayPanel.
   // Use a ref to avoid re-firing when callLogsColumnDefs reference changes
@@ -261,7 +361,13 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
 
   // Prefetch next page so pagination feels instant
   useEffect(() => {
-    if (isCompleteRead && data?.results?.length > 0 && page < totalPages) {
+    if (isUsableListRead && responseRows.length > 0 && page < totalPages) {
+      const nextPaginationParams =
+        module === "project"
+          ? cursorPagination.current.requestParams(page, {
+              page_size: pageLimit,
+            })
+          : undefined;
       prefetchCallLogs(queryClient, {
         module,
         id,
@@ -269,6 +375,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
         page: page + 1,
         pageLimit,
         params,
+        paginationParams: nextPaginationParams,
       });
     }
   }, [
@@ -281,7 +388,8 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     selectedVersion,
     pageLimit,
     params,
-    isCompleteRead,
+    isUsableListRead,
+    responseRows.length,
   ]);
 
   const configLength = data?.config?.length;
@@ -578,6 +686,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
               id="page-size-select"
               value={pageLimit}
               onChange={(e) => {
+                cursorPagination.current.reset();
                 setPage(1);
                 setPageLimit(Number(e.target.value));
               }}
@@ -592,12 +701,12 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
           </Stack>
 
           <Pagination
-            count={isCompleteRead ? totalPages : 1}
+            count={isUsableListRead ? totalPages : 1}
             variant="outlined"
             shape="rounded"
-            page={isCompleteRead ? page : 1}
+            page={isUsableListRead ? page : 1}
             color="primary"
-            disabled={!isCompleteRead}
+            disabled={!isUsableListRead}
             onChange={(e, value) => {
               setPage(value);
             }}

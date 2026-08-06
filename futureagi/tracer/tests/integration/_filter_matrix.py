@@ -892,8 +892,7 @@ def _trace_aggregate_leaves():
 def _meta_leaves():
     # has_eval / has_annotation are trace/session-scoped in the backend (a
     # trace matches if ANY child span qualifies). meta_kind tells the harness
-    # to roll the per-span flag up to the target grain. The `=False` variant of
-    # has_eval is a known no-op (filters.py:1818 returns None), so it's a gap.
+    # to roll the per-span flag up to the target grain.
     return [
         (
             "has_eval",
@@ -911,10 +910,7 @@ def _meta_leaves():
             "has_eval",
             False,
             lambda r: not r.has_eval,
-            {
-                "meta_kind": "has_eval",
-                "contract_gap": "has_eval=False is a no-op (filters.py:1818)",
-            },
+            {"meta_kind": "has_eval"},
         ),
         (
             "has_annotation",
@@ -1041,13 +1037,26 @@ def _combo_leaves(eval_config_id, label_id, choice_eval_config_id):
 # wired to the right stored key and discriminates; a failing case means the
 # filter is wrong and the code must be fixed (no xfail).
 _V_NUM_OPS = [
-    "equals", "not_equals", "greater_than", "less_than",
-    "greater_than_or_equal", "less_than_or_equal",
-    "between", "not_between", "is_null", "is_not_null",
+    "equals",
+    "not_equals",
+    "greater_than",
+    "less_than",
+    "greater_than_or_equal",
+    "less_than_or_equal",
+    "between",
+    "not_between",
+    "is_null",
+    "is_not_null",
 ]
 _V_STR_OPS = [
-    "in", "not_in", "contains", "not_contains",
-    "starts_with", "ends_with", "is_null", "is_not_null",
+    "in",
+    "not_in",
+    "contains",
+    "not_contains",
+    "starts_with",
+    "ends_with",
+    "is_null",
+    "is_not_null",
 ]
 
 
@@ -1088,7 +1097,12 @@ def _v_num_values(op, disp):
     n = len(disp)
     lo, hi, mid = disp[0], disp[-1], disp[n // 2]
     q1, q3 = disp[n // 4], disp[min(n - 1, (3 * n) // 4)]
-    if op in ("greater_than", "less_than", "greater_than_or_equal", "less_than_or_equal"):
+    if op in (
+        "greater_than",
+        "less_than",
+        "greater_than_or_equal",
+        "less_than_or_equal",
+    ):
         return [(mid, "mid"), (lo, "lo")]
     if op in ("equals", "not_equals"):
         return [(mid, "hit"), (hi + 1, "miss")]
@@ -1115,8 +1129,15 @@ def _voice_number_leaves():
                 if suf:
                     ex["val_suffix"] = f"-{suf}"
                 leaves.append(
-                    ("SYSTEM_METRIC", "number", op, col_id, val,
-                     _v_num_pred(seed_key, precision, op, val), ex)
+                    (
+                        "SYSTEM_METRIC",
+                        "number",
+                        op,
+                        col_id,
+                        val,
+                        _v_num_pred(seed_key, precision, op, val),
+                        ex,
+                    )
                 )
     return leaves
 
@@ -1161,8 +1182,15 @@ def _voice_text_leaves():
                 if suf:
                     ex["val_suffix"] = f"-{suf}"
                 leaves.append(
-                    ("SYSTEM_METRIC", "text", op, col_id, val,
-                     _v_str_pred(seed_key, op, val), ex)
+                    (
+                        "SYSTEM_METRIC",
+                        "text",
+                        op,
+                        col_id,
+                        val,
+                        _v_str_pred(seed_key, op, val),
+                        ex,
+                    )
                 )
     return leaves
 

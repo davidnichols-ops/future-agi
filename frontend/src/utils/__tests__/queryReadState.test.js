@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   failServerSideGridRead,
+  getAttributeLookupMessage,
+  getAggregationPollDelay,
+  getAggregationRefreshState,
+  getExactAggregationReadState,
   getExactGraphData,
+  getFilterValueReadMessage,
+  getFilterValueReadState,
+  getQueryCompletedAt,
   getQueryReadMessage,
   getQueryReadState,
   getRenderableGraphData,
@@ -11,8 +18,138 @@ import {
 } from "../queryReadState";
 
 describe("queryReadState", () => {
+  it("keeps bounded-read UI copy free of sampling and incompleteness claims", () => {
+    const customerMessages = [
+      getQueryReadMessage("sampled"),
+      getQueryReadMessage("degraded"),
+      getQueryReadMessage("error"),
+      getFilterValueReadMessage("sampled"),
+      getFilterValueReadMessage("degraded"),
+      getAttributeLookupMessage("sampled"),
+      getAttributeLookupMessage("degraded"),
+    ].filter(Boolean);
+
+    expect(customerMessages.join(" ")).not.toMatch(
+      /sampled|sample-limited|incomplete|estimat/i,
+    );
+  });
+
+  it("reads only the backend aggregation completion time", () => {
+    expect(
+      getQueryCompletedAt({
+        result: { query_completed_at: "2026-08-03T02:00:00Z" },
+      }),
+    ).toEqual(new Date("2026-08-03T02:00:00Z"));
+
+    expect(getQueryCompletedAt({ result: {} })).toBeNull();
+    expect(
+      getQueryCompletedAt({
+        result: { query_completed_at: "not-a-timestamp" },
+      }),
+    ).toBeNull();
+  });
+
+  it("reads status and completion time through an Axios response wrapper", () => {
+    const response = {
+      data: {
+        result: {
+          query_complete: false,
+          query_status: "degraded",
+          query_completed_at: "2026-08-03T02:00:00Z",
+        },
+      },
+    };
+
+    expect(getQueryReadState(response)).toBe("degraded");
+    expect(getQueryCompletedAt(response)).toEqual(
+      new Date("2026-08-03T02:00:00Z"),
+    );
+  });
+
   it("preserves legacy behaviour when bounded-read metadata is absent", () => {
     expect(getQueryReadState({ result: { table: [] } })).toBe("complete");
+  });
+
+  it("keeps list compatibility while failing metadata-less aggregates closed", () => {
+    const payload = { result: { data: [{ value: 1 }] } };
+    expect(getQueryReadState(payload)).toBe("complete");
+    expect(getExactAggregationReadState(payload)).toBe("degraded");
+  });
+
+  it("recognizes a queued exact aggregation as pending but non-chartable", () => {
+    const payload = {
+      result: {
+        data: [],
+        query_complete: false,
+        query_status: "pending",
+        query_sampled: false,
+        query_refreshing: true,
+      },
+    };
+
+    expect(getQueryReadState(payload)).toBe("degraded");
+    expect(getExactAggregationReadState(payload)).toBe("pending");
+    expect(getExactGraphData(payload)).toEqual([]);
+    expect(getAggregationRefreshState(payload)).toEqual({
+      isRefreshing: true,
+      refreshFailed: false,
+    });
+  });
+
+  it("keeps a cached exact snapshot chartable while its replacement is queued", () => {
+    const payload = {
+      result: {
+        data: [{ timestamp: "2026-08-03T00:00:00Z", value: 2 }],
+        query_complete: true,
+        query_status: "complete",
+        query_sampled: false,
+        query_refreshing: true,
+      },
+    };
+
+    expect(getExactAggregationReadState(payload)).toBe("complete");
+    expect(getExactGraphData(payload)).toEqual(payload.result.data);
+    expect(getAggregationRefreshState(payload).isRefreshing).toBe(true);
+  });
+
+  it("recognizes terminal refresh failure without making prior exact data unsafe", () => {
+    const payload = {
+      result: {
+        data: [],
+        query_complete: true,
+        query_status: "complete",
+        query_sampled: false,
+        query_refreshing: false,
+        query_refresh_failed: true,
+      },
+    };
+
+    expect(getExactAggregationReadState(payload)).toBe("complete");
+    expect(getAggregationRefreshState(payload)).toEqual({
+      isRefreshing: false,
+      refreshFailed: true,
+    });
+  });
+
+  it("supports exactness metadata on each item of an aggregation array", () => {
+    expect(
+      getExactAggregationReadState({
+        result: [
+          {
+            data: [],
+            query_complete: true,
+            query_status: "complete",
+            query_sampled: false,
+          },
+        ],
+      }),
+    ).toBe("complete");
+  });
+
+  it("backs aggregation polling off to a bounded maximum", () => {
+    expect([0, 1, 2, 3, 99].map(getAggregationPollDelay)).toEqual([
+      1000, 2000, 4000, 8000, 8000,
+    ]);
   });
 
   it("recognizes explicit complete metadata", () => {
@@ -101,6 +238,43 @@ describe("queryReadState", () => {
 
     expect(getQueryReadState(payload)).toBe("sampled");
     expect(getQueryReadMessage("sampled")).toBe(QUERY_READ_SAMPLED_MESSAGE);
+  });
+
+  it("uses picker-specific language for bounded attribute suggestions", () => {
+    expect(getAttributeLookupMessage("sampled")).toMatch(
+      /Recent matching attributes/i,
+    );
+    expect(getAttributeLookupMessage("error")).toMatch(
+      /Enter an exact attribute name/i,
+    );
+    expect(getAttributeLookupMessage("complete")).toBeNull();
+  });
+
+  it("recognizes the endpoint-specific sampled filter-value contract", () => {
+    const payload = {
+      values: [{ value: "completed", label: "completed" }],
+      query_complete: false,
+      query_status: "sampled",
+      query_error_code: "sample_limit",
+    };
+
+    // Graph reads still fail closed without graph coverage metadata.
+    expect(getQueryReadState(payload)).toBe("degraded");
+    expect(getFilterValueReadState(payload)).toBe("sampled");
+    expect(getFilterValueReadMessage("sampled")).toBe(
+      "Recent values — search or enter an exact value.",
+    );
+  });
+
+  it("keeps malformed filter-value sampling metadata retryable", () => {
+    expect(
+      getFilterValueReadState({
+        values: ["completed"],
+        query_complete: false,
+        query_status: "sampled",
+      }),
+    ).toBe("degraded");
+    expect(getFilterValueReadMessage("degraded")).toMatch(/retry/i);
   });
 
   it("recognizes sampled metadata on public chart-series arrays", () => {
@@ -210,7 +384,7 @@ describe("queryReadState", () => {
     expect(getQueryReadMessage("error")).not.toContain(rawError);
   });
 
-  it("returns exact graph points for current and legacy complete responses", () => {
+  it("returns graph points only for explicitly complete responses", () => {
     const points = [{ timestamp: "2026-08-03T00:00:00Z", value: 2 }];
 
     expect(
@@ -218,9 +392,10 @@ describe("queryReadState", () => {
         data: points,
         query_complete: true,
         query_status: "complete",
+        query_sampled: false,
       }),
     ).toEqual(points);
-    expect(getExactGraphData({ result: { data: points } })).toEqual(points);
+    expect(getExactGraphData({ result: { data: points } })).toEqual([]);
   });
 
   it.each([{ query_complete: false }, { query_status: "degraded" }])(

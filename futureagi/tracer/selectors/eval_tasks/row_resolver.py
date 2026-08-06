@@ -399,7 +399,8 @@ def resolve_desired_rows(
         return ResolvedRowSet((), (), True)
 
     if (
-        task.row_type in (RowType.SPANS, RowType.TRACES, RowType.SESSIONS)
+        task.row_type
+        in (RowType.SPANS, RowType.TRACES, RowType.SESSIONS, RowType.VOICE_CALLS)
         and task.run_type == RunType.HISTORICAL
         and limit is not None
     ):
@@ -623,7 +624,7 @@ def _resolve_bounded_historical_span_ids(
     row_type: str = RowType.SPANS,
     include_trace_filter_witnesses: bool = False,
 ) -> list[str] | _BoundedHistoricalResult:
-    """Resolve a complete historical span/trace/session set with bounded CH reads.
+    """Resolve a complete historical span/trace/session/voice set with bounded reads.
 
     Adjacent time slices produce only candidate identities. Every candidate is
     then reclassified against global latest state before it can be returned.
@@ -652,9 +653,15 @@ def _resolve_bounded_historical_span_ids(
 
     if limit <= 0:
         return resolved_result(())
-    if row_type not in (RowType.SPANS, RowType.TRACES, RowType.SESSIONS):
+    if row_type not in (
+        RowType.SPANS,
+        RowType.TRACES,
+        RowType.SESSIONS,
+        RowType.VOICE_CALLS,
+    ):
         raise ValueError(
-            "Bounded historical resolution supports spans, traces, and sessions"
+            "Bounded historical resolution supports spans, traces, sessions, "
+            "and voice calls"
         )
     if not 0 <= float(sampling_rate) <= 100:
         raise ValueError("sampling_rate must be between 0 and 100")
@@ -713,6 +720,11 @@ def _resolve_bounded_historical_span_ids(
         )
 
     query_type, key_field = _BUILDER_BY_ROW_TYPE[row_type]
+    # Voice classifiers are candidate-scoped by trace, but the public task
+    # identity is the canonical conversation root span returned as
+    # ``root_span_id``. The bounded reader therefore keysets/de-duplicates on
+    # trace_id and maps only fully classified rows to task IDs below.
+    reader_key_field = "trace_id" if row_type == RowType.VOICE_CALLS else key_field
     trace_any_span_witnesses = bool(
         row_type == RowType.TRACES
         and include_trace_filter_witnesses
@@ -840,7 +852,7 @@ def _resolve_bounded_historical_span_ids(
             builder=builder,
             analytics=analytics,
             filters=ui_filters,
-            key_field=key_field,
+            key_field=reader_key_field,
             page_number=0,
             page_size=bounded_limit,
             deadline_ms=int(phase_one_deadline_seconds * 1000),
@@ -900,6 +912,16 @@ def _resolve_bounded_historical_span_ids(
                 str(row[key_field])
                 for row in resolved_rows
                 if row.get(key_field) not in (None, "")
+            )
+        )
+        final_ids = sorted(resolved) if requires_population_proof else resolved
+        return resolved_result(final_ids, resolved_rows, ui_filters=ui_filters)
+    if row_type == RowType.VOICE_CALLS:
+        resolved = list(
+            dict.fromkeys(
+                str(row["root_span_id"])
+                for row in resolved_rows
+                if row.get("root_span_id") not in (None, "")
             )
         )
         final_ids = sorted(resolved) if requires_population_proof else resolved

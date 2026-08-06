@@ -146,6 +146,7 @@ describe("useExactTraceAttributeProperties", () => {
     ["retry_count", "number"],
     ["was_escalated", "boolean"],
     ["json_choices", "array"],
+    ["customer_context", "map"],
   ])("preserves the exact %s attribute type", async (key, type) => {
     mocks.get.mockResolvedValue({
       data: {

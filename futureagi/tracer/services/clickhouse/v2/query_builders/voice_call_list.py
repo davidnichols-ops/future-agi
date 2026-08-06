@@ -15,6 +15,7 @@ because neither query targets `spans`.
 from __future__ import annotations
 
 from tracer.services.clickhouse.query_builders.voice_call_list import (
+    VoiceCallFilterBuilder,
     VoiceCallListQueryBuilder,
 )
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
@@ -23,11 +24,19 @@ from tracer.services.clickhouse.v2.query_builders.filters import (
 )
 
 
+class VoiceCallFilterBuilderV2(ClickHouseFilterBuilderV2):
+    """CH25 compiler carrying only the voice-list normalized aliases."""
+
+    VOICE_SYSTEM_METRIC_EXPRS = VoiceCallFilterBuilder.VOICE_SYSTEM_METRIC_EXPRS
+    VOICE_SYSTEM_METRIC_STR_MAP = VoiceCallFilterBuilder.VOICE_SYSTEM_METRIC_STR_MAP
+    VOICE_SYSTEM_METRIC_STR_EXPRS = VoiceCallFilterBuilder.VOICE_SYSTEM_METRIC_STR_EXPRS
+
+
 class VoiceCallListQueryBuilderV2(V2RewriteMixin, VoiceCallListQueryBuilder):
     """Drop-in v2 VoiceCallList builder."""
 
     _v2_rewrite_exclude = frozenset({"build_eval_query", "build_annotation_query"})
-    _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
+    _FILTER_BUILDER_CLS = VoiceCallFilterBuilderV2
 
 
-__all__ = ["VoiceCallListQueryBuilderV2"]
+__all__ = ["VoiceCallFilterBuilderV2", "VoiceCallListQueryBuilderV2"]

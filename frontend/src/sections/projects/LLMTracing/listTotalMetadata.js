@@ -1,7 +1,6 @@
 import {
   getQueryReadMessage,
   getQueryReadState,
-  QUERY_READ_BOUNDED_TOTAL_MESSAGE,
 } from "src/utils/queryReadState";
 
 const normalizeRowCount = (value) => {
@@ -10,23 +9,17 @@ const normalizeRowCount = (value) => {
 };
 
 /**
- * Keep an incomplete/sampled read warning distinct from an exact page whose
- * aggregate count is only a lower bound. The latter does not make the rows on
- * the page sampled or incomplete.
+ * List rows returned by the bounded selectors are individually proven exact.
+ * A sampled/lower-bound aggregate marker therefore must not turn those rows
+ * into an "incomplete" UI state or produce a sampling banner. Keep a retry
+ * message only for a genuinely degraded empty page or a transport failure.
  */
 export const getListReadMessage = (payload, { isError = false } = {}) => {
   const readState = getQueryReadState(payload, { isError });
-  const readMessage = getQueryReadMessage(readState);
-  if (readMessage) return readMessage;
-
-  const metadata = payload?.result?.metadata ?? payload?.metadata;
-  if (
-    readState === "complete" &&
-    metadata?.total_rows_is_lower_bound === true
-  ) {
-    return QUERY_READ_BOUNDED_TOTAL_MESSAGE;
-  }
-  return null;
+  const rows = payload?.result?.table ?? payload?.table;
+  if (Array.isArray(rows) && rows.length > 0) return null;
+  if (readState === "sampled") return null;
+  return getQueryReadMessage(readState);
 };
 
 /**

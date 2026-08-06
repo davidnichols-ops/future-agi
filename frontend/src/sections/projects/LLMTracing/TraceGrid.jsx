@@ -42,7 +42,10 @@ import {
   getQueryReadState,
   QUERY_FAILED_RETRY_MESSAGE,
 } from "src/utils/queryReadState";
-import { createListCursorPagination } from "./listCursorPagination";
+import {
+  createListCursorPagination,
+  followEmptyListContinuations,
+} from "./listCursorPagination";
 import { getListReadMessage, getListTotalState } from "./listTotalMetadata";
 
 const ROWS_LIMIT = 25;
@@ -245,7 +248,6 @@ const TraceGrid = React.forwardRef(
                   // project_id as org-scoped (used by the cross-project user
                   // detail page).
                   ...(projectId ? { project_id: projectId } : {}),
-                  allow_sampled: true,
                   page_size: ROWS_LIMIT,
                   filters: JSON.stringify(
                     toBackendFilters([
@@ -261,12 +263,30 @@ const TraceGrid = React.forwardRef(
               // Use prefetched data if available, otherwise fetch
               const cached = prefetchCache.current.get(pageNumber);
               prefetchCache.current.delete(pageNumber);
-              const results =
+              let results =
                 cached ||
                 (await axios.get(
                   endpoints.project.getTracesForObserveProject(),
                   { params: buildParams(pageNumber) },
                 ));
+              results = await followEmptyListContinuations({
+                initialResponse: results,
+                rowsFromResponse: (response) =>
+                  response?.data?.result?.table || [],
+                metadataFromResponse: (response) =>
+                  response?.data?.result?.metadata || {},
+                onContinuation: (metadata) =>
+                  cursorPagination.current.recordEmptyContinuation(
+                    pageNumber,
+                    metadata,
+                  ),
+                isCurrent: () =>
+                  cursorPagination.current.isCurrent(requestGeneration),
+                nextResponse: () =>
+                  axios.get(endpoints.project.getTracesForObserveProject(), {
+                    params: buildParams(pageNumber),
+                  }),
+              });
               if (!cursorPagination.current.isCurrent(requestGeneration)) {
                 failServerSideGridRead(params);
                 return;

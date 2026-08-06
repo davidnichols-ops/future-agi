@@ -90,7 +90,17 @@ from tracer.services.clickhouse.graph_dispatch import (
     enforce_exact_graph_data_contract,
     graph_payload_is_publishable,
 )
-from tracer.services.clickhouse.list_cursor import exact_total_explicitly_required
+from tracer.services.clickhouse.list_cursor import (
+    ListCursorError,
+    capture_list_relation_snapshot,
+    cursor_page_metadata,
+    cursor_scope_for_request,
+    decode_list_cursor,
+    encode_list_cursor,
+    exact_total_explicitly_required,
+    frozen_window_filter,
+    relation_snapshot_read_settings,
+)
 from tracer.services.clickhouse.query_builders.base import NIL_UUID, BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.eval_status import (
     non_terminal_eval_marker,
@@ -113,6 +123,10 @@ from tracer.services.clickhouse.v2.query_builders.session_list import (
     SessionListQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
+from tracer.services.filter_principal_context import (
+    FilterPrincipalContextError,
+    bind_request_my_annotations_principal,
+)
 from tracer.utils.filters import FilterEngine, apply_created_at_filters
 from tracer.utils.helper import (
     FieldConfig,
@@ -160,6 +174,51 @@ def _session_read_settings(*, max_result_rows: int) -> dict[str, int | str]:
         "max_result_bytes": SESSION_LIST_RESULT_BYTES,
         "result_overflow_mode": "throw",
     }
+
+
+def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_state):
+    """Return a stable public order tuple, including checkpoint-only pages."""
+
+    if rows:
+        last = rows[-1]
+        return last.get("start_time"), str(last.get("session_id") or "")
+    if cursor_state is not None:
+        return tuple(cursor_state.order)
+    if bounded_page.continuation_before_start_time is not None:
+        return (
+            bounded_page.continuation_before_start_time,
+            str(bounded_page.continuation_before_id or ""),
+        )
+    if bounded_page.continuation_slice_end is not None:
+        return bounded_page.continuation_slice_end, "\U0010ffff" * 8
+    raise RuntimeError("session continuation has no stable order boundary")
+
+
+def _merge_session_attribute_sources(attr_row: dict) -> dict:
+    """Union direct-write typed Maps with structured overflow attributes.
+
+    Scalar attributes are written to the three typed Maps while JSON objects
+    and arrays remain in ``attributes_extra``.  Every physical source can be
+    populated on the same span, so merge them unconditionally.  Structured
+    JSON wins on duplicate keys, matching the other direct-write read paths.
+    """
+
+    raw = attr_row.get("span_attributes_raw", "{}")
+    try:
+        attrs = _json_loads(raw) if isinstance(raw, str) and raw else (raw or {})
+    except (json.JSONDecodeError, ValueError, TypeError):
+        attrs = {}
+    if not isinstance(attrs, dict):
+        attrs = {}
+    for map_name in ("attrs_string", "attrs_number", "attrs_bool"):
+        typed_map = attr_row.get(map_name) or {}
+        if not isinstance(typed_map, dict):
+            continue
+        for key, value in typed_map.items():
+            if map_name == "attrs_bool":
+                value = bool(value)
+            attrs.setdefault(key, value)
+    return attrs
 
 
 def _resolve_session_ids_to_canonical(
@@ -1212,6 +1271,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         try:
             body = request.validated_data
             allow_sampled = request.validated_query_data["allow_sampled"]
+            refresh = request.validated_query_data.get("refresh", False)
             project_id = str(body["project_id"])
             project = _project_queryset_for_request(request).get(id=project_id)
             req_data_config = body["req_data_config"]
@@ -1247,9 +1307,13 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 graph = fetch_session_graph_ch(
                     analytics=V2AnalyticsQueryService(),
                     project_id=project_id,
-                    filters=body["filters"],
+                    filters=bind_request_my_annotations_principal(
+                        request,
+                        body["filters"],
+                    ),
                     interval=body["interval"],
                     req_data_config=req_data_config,
+                    refresh=refresh,
                 )
             except Exception as exc:
                 if isinstance(exc, BoundedGraphReadError):
@@ -1302,6 +1366,8 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             return self._gm.bad_request("Project not found")
         except UnsupportedFilterShapeError:
             return self._gm.bad_request("Graph filter configuration is invalid")
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             bounded_retryable = isinstance(exc, BoundedGraphReadError) and (
                 exc.error_code in SESSION_GRAPH_RETRYABLE_ERROR_CODES or exc.retryable
@@ -1342,7 +1408,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         List traces filtered by project ID and project version ID with optimized queries.
         """
         try:
-            validated_data = request.validated_query_data
+            validated_data = dict(request.validated_query_data)
+            validated_data["filters"] = bind_request_my_annotations_principal(
+                request,
+                validated_data.get("filters", []),
+            )
             filters = list(validated_data.get("filters", []) or [])
             has_non_time_filter = any(
                 isinstance(item, dict)
@@ -1821,8 +1891,14 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
         except Project.DoesNotExist:
             return self._gm.bad_request("Project not found")
+        except ListCursorError as exc:
+            return self._gm.custom_error_response(
+                drf_status.HTTP_400_BAD_REQUEST, str(exc), code=exc.code
+            )
         except UnsupportedFilterShapeError:
             return self._gm.bad_request("Session filter configuration is invalid")
+        except FilterPrincipalContextError as exc:
+            return self._gm.bad_request(str(exc))
         except Exception as exc:
             if is_clickhouse_api_read_unavailable_error(exc):
                 session_logger.warning(
@@ -2474,6 +2550,38 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         if bookmark_filter is not None:
             filters.append(bookmark_filter)
 
+        cursor_token = validated_data.get("cursor")
+        cursor_requested = bool(cursor_token or validated_data.get("cursor_mode"))
+        cursor_supported = not sort_params and not export
+        if cursor_token and not cursor_supported:
+            raise ListCursorError(
+                "cursor_unsupported",
+                "Cursor pagination is unavailable for this query shape.",
+            )
+        cursor_enabled = cursor_requested and cursor_supported
+        cursor_scope = cursor_scope_for_request(
+            request,
+            project_ids=[
+                str(value)
+                for value in (org_project_ids or ([project_id] if project_id else []))
+            ],
+        )
+        # Bind the token to resolved end-user/bookmark membership as well as
+        # the public request. If either independently mutable lookup changes,
+        # the continuation fails closed instead of changing membership mid-page.
+        cursor_query = {**validated_data, "filters": list(filters)}
+        cursor_state = None
+        if cursor_token:
+            cursor_state = decode_list_cursor(
+                cursor_token,
+                resource="observe_sessions",
+                scope=cursor_scope,
+                query=cursor_query,
+                page_size=page_size,
+            )
+            filters.append(frozen_window_filter(cursor_state))
+            page_number = 0
+
         builder = SessionListQueryBuilderV2(
             project_id=None if org_scope else str(project_id),
             project_ids=[str(p) for p in org_project_ids] if org_scope else None,
@@ -2482,7 +2590,42 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             page_size=page_size,
             sort_params=sort_params,
             user_id=None,
+            bounded_internal_scan=cursor_enabled,
         )
+        if cursor_enabled and not builder.supports_bounded_filter_scan():
+            if cursor_state is not None:
+                raise ListCursorError(
+                    "cursor_unsupported",
+                    "Cursor pagination is unavailable for this query shape.",
+                )
+            cursor_enabled = False
+            builder._bounded_internal_scan = False
+
+        relation_version_ceilings = None
+        if cursor_enabled:
+            if cursor_state is not None:
+                relation_version_ceilings = cursor_state.relation_version_ceilings
+                if not relation_version_ceilings:
+                    raise ListCursorError(
+                        "invalid_cursor",
+                        "The continuation cursor is invalid.",
+                    )
+            else:
+                _, relation_version_ceilings = capture_list_relation_snapshot(
+                    analytics=analytics,
+                    builder=builder,
+                    base_settings=_session_read_settings(max_result_rows=200),
+                    timeout_ms=read_deadline.remaining_ms(600),
+                )
+
+        def _page_read_settings(max_result_rows):
+            settings = _session_read_settings(max_result_rows=max_result_rows)
+            if relation_version_ceilings:
+                return relation_snapshot_read_settings(
+                    settings,
+                    version_ceilings=relation_version_ceilings,
+                )
+            return settings
 
         # Phase 1: select the exact page identities before hydrating cost/token,
         # content, and attributes. Default/session-level shapes use the narrow
@@ -2491,7 +2634,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         # latest-state classification. The latter avoids the historical
         # full-window GROUP BY that timed out on high-volume tenants while
         # preserving the same newest-session page membership.
-        candidate_first = builder.supports_candidate_first_page()
+        candidate_first = builder.supports_candidate_first_page() and not cursor_enabled
         bounded_page = None
         if not candidate_first and not builder.supports_bounded_filter_scan():
             degraded_error_code = builder.bounded_filter_degraded_error_code()
@@ -2518,7 +2661,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 page_query,
                 page_params,
                 timeout_ms=read_deadline.remaining_ms(SESSION_LIST_QUERY_TIMEOUT_MS),
-                settings=_session_read_settings(max_result_rows=page_size + 1),
+                settings=_page_read_settings(page_size + 1),
             )
             page_candidates = page_result.data[:page_size]
             if page_candidates:
@@ -2538,7 +2681,26 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 # builder's smaller production-safe classifier recommendation.
                 max_candidates=200,
                 classify_batch_size=builder.recommended_filter_classify_batch_size(),
-                read_settings=_session_read_settings(max_result_rows=200),
+                read_settings=_page_read_settings(200),
+                cursor_start_time=(
+                    cursor_state.order[0] if cursor_state is not None else None
+                ),
+                cursor_order_token=(
+                    cursor_state.order[1] if cursor_state is not None else None
+                ),
+                include_incomplete_rows=cursor_enabled,
+                continuation_slice_end=(
+                    cursor_state.scan_slice_end if cursor_state is not None else None
+                ),
+                continuation_before_start_time=(
+                    cursor_state.scan_before_start_time
+                    if cursor_state is not None
+                    else None
+                ),
+                continuation_before_id=(
+                    cursor_state.scan_before_id if cursor_state is not None else None
+                ),
+                bounded_continuation=cursor_enabled,
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -2560,16 +2722,25 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     error_code=bounded_page.error_code,
                     query_count=bounded_page.query_count,
                 )
-                return self._gm.custom_error_response(
-                    drf_status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "Filtered session data is temporarily unavailable. Please retry.",
-                    code="service_unavailable",
-                )
+                if not cursor_enabled or (
+                    not bounded_page.rows
+                    and bounded_page.continuation_slice_end is None
+                ):
+                    return self._gm.custom_error_response(
+                        drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Filtered session data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
             page_candidates = bounded_page.rows
             # As on bounded trace/span lists, this is the proven count prefix.
             # Re-running the legacy full-window count would reintroduce the
             # exact timeout this path removes.
-            candidate_total_count = bounded_page.total_rows_lower_bound
+            candidate_total_count = (
+                (cursor_state.seen_rows if cursor_state is not None else 0)
+                + bounded_page.total_rows_lower_bound
+                if cursor_enabled
+                else bounded_page.total_rows_lower_bound
+            )
 
         candidate_ids = [
             str(row.get("session_id", ""))
@@ -2614,7 +2785,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 timeout_ms=read_deadline.remaining_ms(
                     SESSION_LIST_ENRICHMENT_TIMEOUT_MS
                 ),
-                settings=_session_read_settings(max_result_rows=max_result_rows),
+                settings=_page_read_settings(max_result_rows),
             )
 
         tasks: dict[str, tuple] = {}
@@ -2701,6 +2872,17 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         actual_data = [
             metrics_by_id[sid] for sid in candidate_ids if sid in metrics_by_id
         ]
+        if len(actual_data) != len(candidate_ids):
+            session_logger.warning(
+                "session_list_metrics_hydration_incomplete",
+                expected_rows=len(candidate_ids),
+                actual_rows=len(actual_data),
+            )
+            return self._gm.custom_error_response(
+                drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Session data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         session_ids_page = [str(row.get("session_id", "")) for row in actual_data]
         content_result = completed.get("content")
         content_map = {
@@ -2770,26 +2952,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     and len(aggregated_attrs[sid]) >= _MAX_ATTR_KEYS_PER_SESSION
                 ):
                     continue
-                raw = attr_row.get("span_attributes_raw", "{}")
-                try:
-                    attrs = (
-                        _json_loads(raw)
-                        if isinstance(raw, str) and raw
-                        else (raw or {})
-                    )
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    attrs = {}
-                if not isinstance(attrs, dict):
-                    attrs = {}
-                if not attrs:
-                    str_map = attr_row.get("attrs_string") or {}
-                    num_map = attr_row.get("attrs_number") or {}
-                    if isinstance(str_map, dict):
-                        attrs.update(str_map)
-                    if isinstance(num_map, dict):
-                        for key, value in num_map.items():
-                            if key not in attrs:
-                                attrs[key] = value
+                attrs = _merge_session_attribute_sources(attr_row)
                 if sid not in aggregated_attrs:
                     aggregated_attrs[sid] = {}
                 for key, value in attrs.items():
@@ -2848,6 +3011,60 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                         lid = str(label.id)
                         entry[lid] = session_scores.get(lid)
 
+        cursor_seen_rows = (
+            cursor_state.seen_rows if cursor_state is not None else 0
+        ) + len(page_candidates)
+        next_cursor = None
+        cursor_has_more = False
+        if (
+            cursor_enabled
+            and bounded_page is not None
+            and relation_version_ceilings
+            and (
+                (bounded_page.complete and bounded_page.has_more)
+                or (
+                    not bounded_page.complete
+                    and (
+                        bounded_page.has_more
+                        or bounded_page.continuation_slice_end is not None
+                    )
+                )
+            )
+        ):
+            window_start, window_end = builder.parse_time_range(filters)
+            next_cursor = encode_list_cursor(
+                resource="observe_sessions",
+                scope=cursor_scope,
+                query=cursor_query,
+                page_size=page_size,
+                window_start=window_start,
+                window_end=window_end,
+                order=_session_list_cursor_order_for_partial_page(
+                    rows=page_candidates,
+                    bounded_page=bounded_page,
+                    cursor_state=cursor_state,
+                ),
+                version_ceiling=relation_version_ceilings["spans"],
+                seen_rows=cursor_seen_rows,
+                relation_version_ceilings=relation_version_ceilings,
+                scan_slice_end=(
+                    bounded_page.continuation_slice_end
+                    if not bounded_page.has_more
+                    else None
+                ),
+                scan_before_start_time=(
+                    bounded_page.continuation_before_start_time
+                    if not bounded_page.has_more
+                    else None
+                ),
+                scan_before_id=(
+                    bounded_page.continuation_before_id
+                    if not bounded_page.has_more
+                    else None
+                ),
+            )
+            cursor_has_more = True
+
         metadata = {"total_rows": total_count}
         if bounded_page is not None:
             # The selector proves page membership and whether another page
@@ -2856,12 +3073,25 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             metadata.update(
                 {
                     "total_rows_is_lower_bound": True,
-                    "has_more": bounded_page.has_more,
+                    "has_more": cursor_has_more
+                    if cursor_enabled
+                    else bounded_page.has_more,
                     "query_complete": bounded_page.complete,
                     "query_status": bounded_page.status,
                     "query_error_code": bounded_page.error_code,
                 }
             )
+        metadata.update(
+            cursor_page_metadata(
+                enabled=cursor_enabled,
+                has_more=cursor_has_more,
+                seen_rows=cursor_seen_rows,
+                next_cursor=next_cursor,
+                unseen_row_proven=bool(
+                    bounded_page is not None and bounded_page.has_more
+                ),
+            )
+        )
         if export and (
             page_number != 0
             or metadata.get("total_rows_is_lower_bound")

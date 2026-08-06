@@ -12,9 +12,6 @@ import pytest
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.models.observation_span import ObservationSpan
 from tracer.services.clickhouse import graph_dispatch
-from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
-    EvalMetricsQueryBuilderV2,
-)
 from tracer.utils.graphs_optimized import (
     EvalGraphReadError,
     SystemMetricGraphReadError,
@@ -53,14 +50,9 @@ def test_public_chart_routes_have_no_full_window_latest_spans_collapse():
     source = inspect.getsource(graph_dispatch.fetch_all_system_metrics_ch)
     assert "WITH latest_spans AS" not in source
     assert "ORDER BY _version DESC" not in source
-    assert "read_graph_candidates" in source
-
-    with pytest.raises(ValueError, match="bounded graph dispatcher"):
-        EvalMetricsQueryBuilderV2(
-            project_id=PROJECT_ID,
-            custom_eval_config_id=EVAL_CONFIG_ID,
-            filters=[WINDOW_FILTER, FINAL_STATUS_FILTER],
-        ).build()
+    assert "_read_or_refresh_exact_graph" in source
+    assert "read_graph_candidates" not in source
+    assert 'namespace="observe-all-system-graphs"' in source
 
 
 @pytest.mark.unit
@@ -78,9 +70,9 @@ def test_all_system_metrics_uses_direct_filtered_ch25_query(
         "tokens": [],
         "cost": [],
         "traffic": [],
-        "query_complete": False,
-        "query_status": "sampled",
-        "query_error_code": "sample_limit",
+        "query_complete": True,
+        "query_status": "complete",
+        "query_sampled": False,
     }
 
     with mock.patch.object(ObservationSpan.objects, "filter") as pg_filter:
@@ -97,19 +89,21 @@ def test_all_system_metrics_uses_direct_filtered_ch25_query(
         project_id=PROJECT_ID,
         filters=[WINDOW_FILTER, FINAL_STATUS_FILTER],
         interval="day",
+        refresh=False,
     )
-    assert result["query_status"] == "sampled"
-    assert result["query_error_code"] == "sample_limit"
+    assert result["query_status"] == "complete"
+    assert result["query_complete"] is True
+    assert result["query_sampled"] is False
 
 
 @pytest.mark.unit
+@mock.patch("tracer.services.clickhouse.graph_dispatch.fetch_all_system_metrics_ch")
 @mock.patch("tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService")
 def test_single_system_metric_does_not_fall_back_or_expose_ch_error(
     analytics_cls,
+    exact_metrics,
 ):
-    analytics_cls.return_value.execute_ch_query.side_effect = RuntimeError(
-        "secret ClickHouse host and stack"
-    )
+    exact_metrics.side_effect = RuntimeError("secret ClickHouse host and stack")
 
     with mock.patch.object(ObservationSpan.objects, "filter") as pg_filter:
         with pytest.raises(SystemMetricGraphReadError) as exc_info:
@@ -143,8 +137,9 @@ def test_eval_graph_uses_authoritative_table_and_applies_attribute_filter(
             "name": "Outcome",
             "id": EVAL_CONFIG_ID,
             "data": [],
-            "query_complete": False,
-            "query_status": "sampled",
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
         }
     ]
     config = SimpleNamespace(
@@ -178,16 +173,17 @@ def test_eval_graph_uses_authoritative_table_and_applies_attribute_filter(
             "choices": [],
         },
         eval_name="Outcome",
+        refresh=False,
     )
-    assert result[0]["query_status"] == "sampled"
+    assert result[0]["query_status"] == "complete"
+    assert result[0]["query_sampled"] is False
 
 
 @pytest.mark.unit
+@mock.patch("tracer.services.clickhouse.graph_dispatch.fetch_eval_chart_series_ch")
 @mock.patch("tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService")
-def test_eval_graph_sanitizes_direct_ch25_failure(analytics_cls):
-    analytics_cls.return_value.execute_ch_query.side_effect = RuntimeError(
-        "secret ClickHouse host and stack"
-    )
+def test_eval_graph_sanitizes_direct_ch25_failure(analytics_cls, exact_eval):
+    exact_eval.side_effect = RuntimeError("secret ClickHouse host and stack")
     config = SimpleNamespace(
         id=EVAL_CONFIG_ID,
         name="Outcome",

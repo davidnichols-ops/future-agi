@@ -1,7 +1,7 @@
 import React from "react";
 import PropTypes from "prop-types";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import {
   MutationCache,
   QueryClient,
@@ -195,7 +195,7 @@ describe("useDashboards widget mutations", () => {
 describe("useDashboardFilterValues bounded-read state", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  const renderValues = () => {
+  const renderValues = (overrides = {}) => {
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -207,6 +207,7 @@ describe("useDashboardFilterValues bounded-read state", () => {
           projectIds: ["project-synthetic"],
           source: "traces",
           search: "Rejected",
+          ...overrides,
         }),
       { wrapper: createQueryWrapper(queryClient) },
     );
@@ -250,6 +251,101 @@ describe("useDashboardFilterValues bounded-read state", () => {
     expect(result.current.data).toEqual([]);
     expect(result.current.queryReadState).toBe("error");
   });
+
+  it("paginates with an opaque cursor and deduplicates values across pages", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "completed", label: "completed" }],
+            query_complete: false,
+            query_status: "sampled",
+            query_error_code: "sample_limit",
+            has_more: true,
+            next_cursor: "opaque-page-2",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [
+              { value: "completed", label: "duplicate" },
+              { value: "failed", label: "failed" },
+            ],
+            query_complete: true,
+            query_status: "complete",
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      });
+    const { result } = renderValues({ pageSize: 10 });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.queryReadState).toBe("sampled");
+    expect(result.current.hasNextPage).toBe(true);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(result.current.data).toEqual([
+      { value: "completed", label: "completed" },
+      { value: "failed", label: "failed" },
+    ]);
+    expect(mocks.get).toHaveBeenNthCalledWith(
+      2,
+      "/tracer/dashboard/filter_values/",
+      expect.objectContaining({
+        params: expect.objectContaining({
+          page_size: 10,
+          cursor: "opaque-page-2",
+        }),
+      }),
+    );
+  });
+
+  it("starts a searched result set without reusing the previous cursor", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          values: ["completed"],
+          query_complete: true,
+          query_status: "complete",
+          has_more: false,
+          next_cursor: null,
+        },
+      },
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { rerender } = renderHook(
+      ({ search }) =>
+        useDashboardFilterValues({
+          metricName: "call.status",
+          metricType: "custom_attribute",
+          projectIds: ["project-synthetic"],
+          source: "traces",
+          search,
+          pageSize: 10,
+        }),
+      {
+        initialProps: { search: "comp" },
+        wrapper: createQueryWrapper(queryClient),
+      },
+    );
+
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(1));
+    rerender({ search: "fail" });
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+
+    expect(mocks.get.mock.calls[1][1].params).toMatchObject({
+      search: "fail",
+      page_size: 10,
+    });
+    expect(mocks.get.mock.calls[1][1].params).not.toHaveProperty("cursor");
+  });
 });
 
 describe("useDashboardQuery error boundary", () => {
@@ -278,9 +374,34 @@ describe("useDashboardQuery error boundary", () => {
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(mocks.post).toHaveBeenCalledWith("/tracer/dashboard/query/", {
       metrics: [{ name: "Latency" }],
-      allow_sampled: true,
+      allow_sampled: false,
     });
     expect(failedMutation?.options.meta).toEqual({ errorHandled: true });
+  });
+
+  it("only sends the cache-bypass flag for an explicit dashboard refresh", async () => {
+    mocks.post.mockResolvedValue({ data: { result: { metrics: [] } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const { result } = renderHook(() => useDashboardQuery(), {
+      wrapper: createQueryWrapper(queryClient),
+    });
+
+    result.current.mutate({
+      queryConfig: { metrics: [{ name: "Latency" }] },
+      refresh: true,
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mocks.post).toHaveBeenCalledWith(
+      "/tracer/dashboard/query/",
+      {
+        metrics: [{ name: "Latency" }],
+        allow_sampled: false,
+      },
+      { params: { refresh: true } },
+    );
   });
 
   it.each([
@@ -289,7 +410,7 @@ describe("useDashboardQuery error boundary", () => {
       useWidgetQuery,
       { dashboardId: "dash-1", widgetId: "widget-1" },
       "/tracer/dashboard/dash-1/widgets/widget-1/query/",
-      { allow_sampled: true },
+      { allow_sampled: false },
     ],
     [
       "widget preview",
@@ -301,7 +422,7 @@ describe("useDashboardQuery error boundary", () => {
       "/tracer/dashboard/dash-1/widgets/preview/",
       {
         query_config: { metrics: [{ name: "Latency" }] },
-        allow_sampled: true,
+        allow_sampled: false,
       },
     ],
   ])(

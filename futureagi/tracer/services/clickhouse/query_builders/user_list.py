@@ -107,6 +107,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
         offset: int | None = None,
         max_rows: int | None = None,
         end_user_id: str | None = None,
+        candidate_end_user_ids: list[str] | tuple[str, ...] | None = None,
         include_null_workspace: bool = False,
         empty_scope: bool = False,
     ) -> None:
@@ -132,12 +133,116 @@ class UserListQueryBuilder(BaseQueryBuilder):
         # into worker memory. Independent of `limit`/`offset` paging.
         self.max_rows = max_rows
         self.end_user_id = str(end_user_id) if end_user_id else None
+        self.candidate_end_user_ids = tuple(
+            str(value) for value in (candidate_end_user_ids or ())
+        )
         self.include_null_workspace = include_null_workspace
         # When the caller resolved an EMPTY workspace-project set, the read must
         # return nothing — NOT fall through to an org-wide scan. (BaseQueryBuilder
         # treats `project_ids=[]` as falsy and would otherwise drop project
         # scoping entirely, re-introducing a cross-workspace leak.)
         self.empty_scope = empty_scope
+
+    def build_dimension_candidate_query(
+        self,
+        *,
+        limit: int,
+        before_first_seen: Any | None = None,
+        before_end_user_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return one stable, finite page from the curated user dimension.
+
+        This query is only a candidate selector.  The caller replays the
+        latest physical spans for the returned ids before publishing a row, so
+        a stale/tombstoned dimension entry can create extra bounded work but
+        can never become a false list result.  Ordering by the immutable
+        ``first_seen``/UUID tuple gives continuation pages a total order without
+        scanning or grouping the tenant's full span window.
+        """
+
+        if limit <= 0:
+            raise ValueError("dimension candidate limit must be positive")
+        if (before_first_seen is None) != (before_end_user_id is None):
+            raise ValueError("dimension continuation values must be provided together")
+
+        params: dict[str, Any] = {
+            "org_id": self.organization_id,
+            "dimension_limit": int(limit),
+        }
+        if self.project_ids is not None:
+            params["project_ids"] = tuple(self.project_ids)
+        else:
+            params["project_id"] = self.project_id
+        if self.search:
+            params["search"] = self.search
+        if before_first_seen is not None:
+            params["before_first_seen"] = before_first_seen
+            params["before_end_user_id"] = str(before_end_user_id)
+
+        empty_scope_filter = "AND 0 = 1" if self.empty_scope else ""
+        search_filter = (
+            "AND positionCaseInsensitive(user_id, %(search)s) > 0"
+            if self.search
+            else ""
+        )
+        continuation_filter = (
+            """
+            AND (
+                first_seen < %(before_first_seen)s
+                OR (
+                    first_seen = %(before_first_seen)s
+                    AND end_user_id < toUUID(%(before_end_user_id)s)
+                )
+            )
+            """
+            if before_first_seen is not None
+            else ""
+        )
+        eu_map = survivor_map_subquery("end_user_id_remap")
+        resolved_eu = resolved_id_expr("eu.end_user_id", "eu_remap")
+        query = f"""
+        WITH
+        eu_survivor_map AS ({eu_map}),
+        latest_candidates AS (
+            SELECT
+                {resolved_eu} AS end_user_id,
+                argMax(
+                    eu.user_id,
+                    tuple(eu.end_user_id = {resolved_eu}, eu.version)
+                ) AS user_id,
+                argMax(
+                    eu.user_id_type,
+                    tuple(eu.end_user_id = {resolved_eu}, eu.version)
+                ) AS user_id_type,
+                argMax(
+                    eu.user_id_hash,
+                    tuple(eu.end_user_id = {resolved_eu}, eu.version)
+                ) AS user_id_hash,
+                min(eu.first_seen) AS first_seen
+            FROM end_users AS eu FINAL
+            LEFT JOIN eu_survivor_map AS eu_remap
+                ON eu.end_user_id = eu_remap.any_id
+            WHERE eu.organization_id = toUUID(%(org_id)s)
+              AND eu.is_deleted = 0
+              AND notEmpty(eu.user_id)
+              AND {self._project_predicate("eu")}
+              {empty_scope_filter}
+            GROUP BY end_user_id
+        )
+        SELECT
+            toString(end_user_id) AS end_user_id,
+            user_id,
+            user_id_type,
+            user_id_hash,
+            first_seen
+        FROM latest_candidates
+        WHERE 1 = 1
+          {search_filter}
+          {continuation_filter}
+        ORDER BY first_seen DESC, end_user_id DESC
+        LIMIT %(dimension_limit)s
+        """
+        return query, params
 
     def supports_candidate_first_page(self) -> bool:
         """Whether the request can page exactly from latest physical spans.
@@ -229,6 +334,8 @@ class UserListQueryBuilder(BaseQueryBuilder):
             self.params["search"] = self.search
         if self.end_user_id:
             self.params["end_user_id"] = self.end_user_id
+        if self.candidate_end_user_ids:
+            self.params["candidate_end_user_ids"] = self.candidate_end_user_ids
         if self.limit is not None and self.offset is not None:
             self.params["limit"] = int(self.limit)
             self.params["offset"] = int(self.offset)
@@ -246,6 +353,11 @@ class UserListQueryBuilder(BaseQueryBuilder):
         )
         end_user_filter = (
             "AND eu.end_user_id = toUUID(%(end_user_id)s)" if self.end_user_id else ""
+        )
+        candidate_end_user_filter = (
+            "HAVING end_user_id IN %(candidate_end_user_ids)s"
+            if self.candidate_end_user_ids
+            else ""
         )
         final_filter = f"WHERE {output_where}" if output_where else ""
         order_by = self._order_by()
@@ -296,6 +408,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
             LEFT JOIN eu_survivor_map AS eu_remap
                 ON eu.end_user_id = eu_remap.any_id
             GROUP BY end_user_id
+            {candidate_end_user_filter}
         ),
         expanded_filtered_end_user_ids AS (
             SELECT any_id AS end_user_id
@@ -525,10 +638,10 @@ class UserListQueryBuilder(BaseQueryBuilder):
             SELECT
                 end_user_id,
                 countIf(observation_type = 'llm') AS num_llm_calls,
-                uniqIf(trace_id, observation_type = 'guardrail') AS num_guardrails_triggered,
+                uniqExactIf(trace_id, observation_type = 'guardrail') AS num_guardrails_triggered,
                 round(avgIf(latency_ms, isNotNull(latency_ms)), 2) AS avg_trace_latency,
                 uniqExact(toDate(start_time)) AS num_active_days,
-                uniqIf(trace_id, status = 'ERROR') AS num_traces_with_errors
+                uniqExactIf(trace_id, status = 'ERROR') AS num_traces_with_errors
             FROM resolved_candidate_spans
             GROUP BY end_user_id
         ),
@@ -830,10 +943,10 @@ class UserListQueryBuilder(BaseQueryBuilder):
             SELECT
                 end_user_id,
                 countIf(observation_type = 'llm') AS num_llm_calls,
-                uniqIf(trace_id, observation_type = 'guardrail') AS num_guardrails_triggered,
+                uniqExactIf(trace_id, observation_type = 'guardrail') AS num_guardrails_triggered,
                 round(avgIf(latency_ms, isNotNull(latency_ms)), 2) AS avg_trace_latency,
                 uniqExact(toDate(start_time)) AS num_active_days,
-                uniqIf(trace_id, status = 'ERROR') AS num_traces_with_errors
+                uniqExactIf(trace_id, status = 'ERROR') AS num_traces_with_errors
             FROM resolved_candidate_spans
             GROUP BY end_user_id
         ),

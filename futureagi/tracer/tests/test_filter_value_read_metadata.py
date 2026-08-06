@@ -3,6 +3,8 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from tracer.services.clickhouse.filter_value_reads import (
     FilterValueRead,
     read_span_system_filter_values,
@@ -61,3 +63,47 @@ def test_system_filter_value_cap_produces_a_labelled_sample():
     assert read.query_complete is False
     assert read.query_error_code == "sample_limit"
     assert read.metadata()["query_status"] == "sampled"
+
+
+@pytest.mark.parametrize(
+    ("metric_name", "expected_value", "sql_markers"),
+    [
+        (
+            "call_status",
+            "completed",
+            ("multiIf(", "'ended', 'completed', 'in-progress'", "attrs_string"),
+        ),
+        (
+            "cost_cents",
+            "12.2",
+            ("'call_cost', 'combined_cost'", "'cost_breakdown.total'", "* 100"),
+        ),
+    ],
+)
+def test_voice_system_suggestions_use_normalized_list_expressions(
+    metric_name,
+    expected_value,
+    sql_markers,
+):
+    class Analytics:
+        call = None
+
+        def execute_ch_query(self, query, params, **kwargs):
+            self.call = (query, params, kwargs)
+            return SimpleNamespace(data=[{"val": expected_value}])
+
+    analytics = Analytics()
+    read = read_span_system_filter_values(
+        analytics,
+        project_ids=[PROJECT_ID],
+        metric_name=metric_name,
+        now=NOW,
+    )
+
+    assert read.values == (expected_value,)
+    query, _, _ = analytics.call
+    assert "latest_observation_type = 'conversation'" in query
+    assert "latest_parent_span_id IS NULL" in query
+    assert "attributes_extra" in query
+    for marker in sql_markers:
+        assert marker in query

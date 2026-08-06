@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "src/utils/test-utils";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import TraceFilterPanel, {
+  buildManualAttributeProperty,
   buildTraceFilterProperties,
   filterPropertiesForPicker,
   getTraceFilterFields,
@@ -15,6 +16,22 @@ import {
 } from "../filterValuePickerUtils";
 
 const parseQueryMock = vi.fn();
+const dashboardFilterValuesMock = vi.hoisted(() => vi.fn());
+
+const defaultDashboardFilterValues = () => ({
+  data: [],
+  isLoading: false,
+  isError: false,
+  queryReadState: "complete",
+  fetchNextPage: vi.fn(),
+  hasNextPage: false,
+  isFetchingNextPage: false,
+  refetch: vi.fn(),
+});
+
+beforeEach(() => {
+  dashboardFilterValuesMock.mockReturnValue(defaultDashboardFilterValues());
+});
 
 describe("JSON array picker value identity", () => {
   it("preserves scalar JSON types and removes only exact duplicates", () => {
@@ -48,11 +65,7 @@ vi.mock("src/hooks/use-ai-filter", () => ({
 }));
 
 vi.mock("src/hooks/useDashboards", () => ({
-  useDashboardFilterValues: () => ({
-    data: [],
-    isLoading: false,
-    isError: false,
-  }),
+  useDashboardFilterValues: dashboardFilterValuesMock,
 }));
 
 function renderPanel({
@@ -318,6 +331,277 @@ describe("getTraceFilterFields (TH-4571)", () => {
     // are not required; structural equality is what consumers rely on).
     expect(fromNull).toEqual(fromUndefined);
     expect(fromNull).toEqual(fromUnknown);
+  });
+
+  it("uses canonical voice-call fields without remapping global OTel status", () => {
+    const fields = getTraceFilterFields("voiceCalls");
+
+    expect(
+      fields.find((field) => field.responseKey === "status"),
+    ).toMatchObject({
+      value: "call_status",
+      category: "system",
+      apiColType: "SYSTEM_METRIC",
+    });
+    expect(
+      fields.find((field) => field.responseKey === "cost_cents"),
+    ).toMatchObject({
+      value: "cost_cents",
+      type: "number",
+      apiColType: "SYSTEM_METRIC",
+    });
+    expect(
+      fields.find((field) => field.responseKey === "duration_seconds"),
+    ).toMatchObject({ value: "duration", type: "number" });
+
+    // Normal trace/spans surfaces retain the OTel status column.
+    expect(
+      getTraceFilterFields("trace").some((field) => field.value === "status"),
+    ).toBe(true);
+  });
+});
+
+describe("voice-call property search aliases", () => {
+  const properties = getTraceFilterFields("voiceCalls").map((field) =>
+    toStaticFilterProperty(field),
+  );
+
+  it("finds the displayed cost field by its Live Preview response key", () => {
+    expect(
+      filterPropertiesForPicker({ properties, search: "cost_cents" }),
+    ).toEqual([
+      expect.objectContaining({
+        id: "cost_cents",
+        name: "Cost (cents)",
+        apiColType: "SYSTEM_METRIC",
+      }),
+    ]);
+  });
+
+  it("finds status and uses the normalized voice-list system metric", () => {
+    expect(filterPropertiesForPicker({ properties, search: "status" })).toEqual(
+      [
+        expect.objectContaining({
+          id: "call_status",
+          category: "system",
+          apiColType: "SYSTEM_METRIC",
+        }),
+      ],
+    );
+  });
+
+  it("requests provider-normalized status suggestions from the system alias", () => {
+    renderPanel({
+      properties,
+      currentFilters: [
+        {
+          field: "call_status",
+          fieldName: "Status",
+          fieldCategory: "system",
+          fieldType: "string",
+          apiColType: "SYSTEM_METRIC",
+          operator: "in",
+          value: [],
+        },
+      ],
+    });
+
+    fireEvent.click(
+      document.querySelector('[data-filter-value-trigger="call_status"]'),
+    );
+
+    expect(dashboardFilterValuesMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        metricName: "call_status",
+        metricType: "system_metric",
+        source: "traces",
+        pageSize: 10,
+        enabled: true,
+      }),
+    );
+  });
+});
+
+describe("exact manual attribute fallback", () => {
+  it("offers an exact text attribute only after bounded discovery has no exact key", () => {
+    expect(
+      buildManualAttributeProperty({
+        search: "final_status",
+        category: "all",
+        properties: [],
+      }),
+    ).toEqual({
+      id: "final_status",
+      name: "final_status",
+      category: "attribute",
+      rawCategory: "custom_attribute",
+      type: "string",
+      apiColType: "SPAN_ATTRIBUTE",
+      isManualExactAttribute: true,
+    });
+  });
+
+  it("keeps the exact backend type and never duplicates an existing attribute", () => {
+    expect(
+      buildManualAttributeProperty({
+        search: "final_status",
+        category: "attribute",
+        properties: [
+          {
+            id: "final_status",
+            category: "attribute",
+            type: "boolean",
+          },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  it("does not shadow an exact system property such as voice cost_cents", () => {
+    expect(
+      buildManualAttributeProperty({
+        search: "cost_cents",
+        category: "all",
+        properties: [
+          {
+            id: "cost_cents",
+            category: "system",
+            type: "number",
+          },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  it("does not inject attributes into a system-only or specialized picker", () => {
+    expect(
+      buildManualAttributeProperty({
+        search: "final_status",
+        category: "system",
+        properties: [],
+      }),
+    ).toBeNull();
+    expect(
+      buildManualAttributeProperty({
+        search: "final_status",
+        category: "all",
+        properties: [],
+        hasCategorySidebar: false,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("filter-value picker bounded-read UX", () => {
+  const statusProperty = {
+    id: "call.status",
+    name: "Status",
+    category: "attribute",
+    type: "string",
+    apiColType: "SPAN_ATTRIBUTE",
+  };
+  const currentFilters = [
+    {
+      field: "call.status",
+      fieldName: "Status",
+      fieldCategory: "attribute",
+      fieldType: "string",
+      apiColType: "SPAN_ATTRIBUTE",
+      operator: "in",
+      value: [],
+    },
+  ];
+
+  const openValuePicker = () => {
+    const trigger = document.querySelector(
+      '[data-filter-value-trigger="call.status"]',
+    );
+    expect(trigger).toBeTruthy();
+    fireEvent.click(trigger);
+  };
+
+  it("renders sampled recent values normally without incomplete-result copy", () => {
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [{ value: "completed", label: "completed" }],
+      queryReadState: "sampled",
+    });
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+    });
+
+    openValuePicker();
+
+    expect(screen.getByText("completed")).toBeInTheDocument();
+    expect(
+      screen.getByText("Recent values — search or enter an exact value."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/results are incomplete/i),
+    ).not.toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("offers Retry and exact free-text entry only for a real request error", () => {
+    const refetch = vi.fn();
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      isError: true,
+      queryReadState: "error",
+      refetch,
+    });
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+    });
+
+    openValuePicker();
+    expect(
+      screen.getByText(
+        "Suggestions are temporarily unavailable. Enter an exact value or retry.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetch).toHaveBeenCalledOnce();
+
+    fireEvent.change(screen.getByPlaceholderText("Search values..."), {
+      target: { value: "completed" },
+    });
+    expect(
+      screen.getByText("completed", { selector: "strong" }),
+    ).toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("loads the next value page when the options list reaches the bottom", () => {
+    const fetchNextPage = vi.fn();
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [{ value: "completed", label: "completed" }],
+      hasNextPage: true,
+      fetchNextPage,
+    });
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+    });
+
+    openValuePicker();
+    const optionsList = document.querySelector(
+      "[data-filter-value-options-list]",
+    );
+    Object.defineProperties(optionsList, {
+      scrollTop: { configurable: true, value: 180 },
+      clientHeight: { configurable: true, value: 220 },
+      scrollHeight: { configurable: true, value: 400 },
+    });
+    fireEvent.scroll(optionsList);
+
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+    document.body.removeChild(anchorEl);
   });
 });
 

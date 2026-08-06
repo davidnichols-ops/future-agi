@@ -601,7 +601,9 @@ class BaseQueryBuilder(ABC):
 
         while current <= end_date:
             yield current
-            if interval == "hour":
+            if interval == "minute":
+                current += timedelta(minutes=1)
+            elif interval == "hour":
                 current += timedelta(hours=1)
             elif interval == "day":
                 current += timedelta(days=1)

@@ -13,6 +13,7 @@ Covers:
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlencode
 
@@ -32,8 +33,10 @@ from tracer.serializers.dashboard import (
 )
 from tracer.services.clickhouse.attribute_reads import (
     AttributeReadMetadata,
+    AttributeValueCursorPageRead,
     AttributeValueRead,
     AttributeValueRow,
+    attribute_value_cursor_digest,
 )
 from tracer.services.clickhouse.query_builders.dashboard import (
     AGGREGATIONS,
@@ -55,7 +58,14 @@ from tracer.services.clickhouse.server_readonly import without_query_settings
 from tracer.services.clickhouse.v2.query_builders.dashboard import (
     DashboardQueryBuilderV2,
 )
-from tracer.views.dashboard import DashboardViewSet, _normalize_dashboard_query_filters
+from tracer.services.exact_aggregation_cache import snapshot_cache_key
+from tracer.views.dashboard import (
+    _DASHBOARD_TRACE_READ_SETTINGS,
+    DashboardViewSet,
+    _fetch_exact_dashboard_rows,
+    _materialize_dashboard_query_scope,
+    _normalize_dashboard_query_filters,
+)
 
 
 def _attribute_value_read(
@@ -73,6 +83,128 @@ def _attribute_value_read(
             query_count=5,
         ),
     )
+
+
+def _attribute_value_cursor_page(
+    values,
+    *,
+    has_more,
+    next_before_identity=None,
+    next_resume_identity=None,
+    next_resume_member_offset=0,
+    seen_value_digests=(),
+):
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    return AttributeValueCursorPageRead(
+        tuple(AttributeValueRow(value, "string", 1) for value in values),
+        AttributeReadMetadata(
+            query_complete=False,
+            query_status="sampled",
+            query_error_code="sample_limit",
+            query_window_start=now - timedelta(days=365),
+            query_window_end=now,
+            query_count=2,
+        ),
+        has_more=has_more,
+        next_segment_end=now,
+        next_before_identity=next_before_identity,
+        next_resume_identity=next_resume_identity,
+        next_resume_member_offset=next_resume_member_offset,
+        seen_value_digests=seen_value_digests,
+    )
+
+
+class _DashboardPartitionAnalytics:
+    def __init__(self, *, failing_leaf_hours=()):
+        self.failing_leaf_hours = set(failing_leaf_hours)
+        self.calls = []
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        copied_params = dict(params)
+        self.calls.append((query, copied_params, timeout_ms, dict(settings)))
+        duration = params["end_date"] - params["start_date"]
+        if duration > timedelta(hours=1):
+            raise ServerException("private read budget detail", code=159)
+        if params["start_date"].hour in self.failing_leaf_hours:
+            raise ServerException("private leaf budget detail", code=159)
+        return SimpleNamespace(
+            data=[{"time_bucket": params["start_date"], "value": 1}],
+            columns=["time_bucket", "value"],
+        )
+
+
+def _dashboard_partition_params(*, hours):
+    return {
+        "start_date": datetime(2026, 8, 1, 0, 0),
+        "end_date": datetime(2026, 8, 1, hours, 0),
+        "filter_identity": ("final_status", "Rechazado", 0.8, True),
+    }
+
+
+@pytest.mark.unit
+def test_dashboard_exact_rows_adaptively_split_with_frozen_filter_and_ceiling():
+    analytics = _DashboardPartitionAnalytics()
+    settings = {
+        **_DASHBOARD_TRACE_READ_SETTINGS,
+        "additional_table_filters": {"spans": "_version < 900"},
+    }
+
+    rows = _fetch_exact_dashboard_rows(
+        analytics=analytics,
+        sql="SELECT exact dashboard metric",
+        params=_dashboard_partition_params(hours=4),
+        granularity="hour",
+        timeout_ms=300_000,
+        settings=settings,
+    )
+
+    assert [row["time_bucket"].hour for row in rows] == [0, 1, 2, 3]
+    assert {call[2] for call in analytics.calls} == {30_000, 300_000}
+    assert all(
+        params["filter_identity"] == ("final_status", "Rechazado", 0.8, True)
+        and call_settings["additional_table_filters"]["spans"] == "_version < 900"
+        for _query, params, _timeout, call_settings in analytics.calls
+    )
+
+
+@pytest.mark.unit
+def test_dashboard_indivisible_bucket_budget_failure_fails_closed():
+    analytics = _DashboardPartitionAnalytics(failing_leaf_hours={0})
+
+    with pytest.raises(ServerException):
+        _fetch_exact_dashboard_rows(
+            analytics=analytics,
+            sql="SELECT exact dashboard metric",
+            params=_dashboard_partition_params(hours=1),
+            granularity="hour",
+            timeout_ms=300_000,
+            settings=_DASHBOARD_TRACE_READ_SETTINGS,
+        )
+
+    assert len(analytics.calls) == 1
+    assert analytics.calls[0][2] == 300_000
+
+
+@pytest.mark.unit
+def test_dashboard_partition_failure_never_returns_partial_rows_to_publisher():
+    analytics = _DashboardPartitionAnalytics(failing_leaf_hours={1})
+    published = []
+
+    with pytest.raises(ServerException):
+        rows = _fetch_exact_dashboard_rows(
+            analytics=analytics,
+            sql="SELECT exact dashboard metric",
+            params=_dashboard_partition_params(hours=2),
+            granularity="hour",
+            timeout_ms=300_000,
+            settings=_DASHBOARD_TRACE_READ_SETTINGS,
+        )
+        published.extend(rows)
+
+    # The first leaf did complete, but the executor raised before returning its
+    # private accumulator. The snapshot publisher therefore receives nothing.
+    assert published == []
+    assert [call[1]["start_date"].hour for call in analytics.calls] == [0, 0, 1]
 
 
 def test_join_alias_prefixing_never_rewrites_quoted_customer_data():
@@ -1505,6 +1637,189 @@ class TestMetricsEndpoint:
         assert payload["query_error_code"] == "sample_limit"
 
     @pytest.mark.django_db
+    @patch(
+        "tracer.views.dashboard.capture_snapshot_version_ceiling",
+        return_value=123456,
+    )
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_custom_attribute_cursor_pages_are_opaque_and_unique(
+        self,
+        mock_selector_cls,
+        mock_capture_ceiling,
+        auth_client,
+        observe_project,
+    ):
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        completed_digest = attribute_value_cursor_digest("string", "completed")
+        failed_digest = attribute_value_cursor_digest("string", "failed")
+        queued_digest = attribute_value_cursor_digest("string", "queued")
+        first_before = (
+            str(observe_project.id),
+            "trace-first",
+            "span-first",
+            now - timedelta(minutes=1),
+        )
+        selector = mock_selector_cls.return_value
+        selector.read_value_cursor_page.side_effect = [
+            _attribute_value_cursor_page(
+                ("completed", "failed"),
+                has_more=True,
+                next_before_identity=first_before,
+                seen_value_digests=(completed_digest, failed_digest),
+            ),
+            _attribute_value_cursor_page(
+                ("queued",),
+                has_more=False,
+                seen_value_digests=(
+                    completed_digest,
+                    failed_digest,
+                    queued_digest,
+                ),
+            ),
+        ]
+
+        first = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {
+                "metric_name": "call.status",
+                "metric_type": "custom_attribute",
+                "project_ids": str(observe_project.id),
+                "source": "traces",
+                "page_size": 2,
+            },
+        )
+
+        assert first.status_code == 200
+        first_payload = first.json()["result"]
+        assert [value["value"] for value in first_payload["values"]] == [
+            "completed",
+            "failed",
+        ]
+        assert first_payload["has_more"] is True
+        assert isinstance(first_payload["next_cursor"], str)
+        assert first_payload["query_status"] == "sampled"
+        assert first_payload["query_error_code"] == "sample_limit"
+
+        second = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {
+                "metric_name": "call.status",
+                "metric_type": "custom_attribute",
+                "project_ids": str(observe_project.id),
+                "source": "traces",
+                "page_size": 2,
+                "cursor": first_payload["next_cursor"],
+            },
+        )
+
+        assert second.status_code == 200
+        second_payload = second.json()["result"]
+        assert [value["value"] for value in second_payload["values"]] == ["queued"]
+        assert second_payload["has_more"] is False
+        assert second_payload["next_cursor"] is None
+        assert selector.read_value_cursor_page.call_count == 2
+        second_kwargs = selector.read_value_cursor_page.call_args_list[1].kwargs
+        assert second_kwargs["before_identity"] == first_before
+        assert second_kwargs["seen_value_digests"] == (
+            completed_digest,
+            failed_digest,
+        )
+        mock_capture_ceiling.assert_called_once()
+
+    @pytest.mark.django_db
+    @patch(
+        "tracer.views.dashboard.capture_snapshot_version_ceiling",
+        return_value=123456,
+    )
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_cursor_is_bound_to_search_and_rejects_mismatch(
+        self,
+        mock_selector_cls,
+        _mock_capture_ceiling,
+        auth_client,
+        observe_project,
+    ):
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        digest = attribute_value_cursor_digest("string", "completed")
+        mock_selector_cls.return_value.read_value_cursor_page.return_value = (
+            _attribute_value_cursor_page(
+                ("completed",),
+                has_more=True,
+                next_before_identity=(
+                    str(observe_project.id),
+                    "trace-first",
+                    "span-first",
+                    now - timedelta(minutes=1),
+                ),
+                seen_value_digests=(digest,),
+            )
+        )
+        base = {
+            "metric_name": "call.status",
+            "metric_type": "custom_attribute",
+            "project_ids": str(observe_project.id),
+            "source": "traces",
+            "page_size": 10,
+        }
+        first = auth_client.get("/tracer/dashboard/filter_values/", base)
+        token = first.json()["result"]["next_cursor"]
+
+        mismatched = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {**base, "search": "failed", "cursor": token},
+        )
+
+        assert mismatched.status_code == 400
+        assert mismatched.json()["code"] == "cursor_mismatch"
+        assert mock_selector_cls.return_value.read_value_cursor_page.call_count == 1
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_rejects_malformed_cursor_without_clickhouse(
+        self,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {
+                "metric_name": "call.status",
+                "metric_type": "custom_attribute",
+                "project_ids": str(observe_project.id),
+                "source": "traces",
+                "page_size": 10,
+                "cursor": "not-a-signed-cursor",
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "invalid_cursor"
+        mock_selector_cls.return_value.read_value_cursor_page.assert_not_called()
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_legacy_request_does_not_enter_cursor_mode(
+        self,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        mock_selector_cls.return_value.read_values.return_value = _attribute_value_read(
+            ("completed",)
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/"
+            "?metric_name=call.status&metric_type=custom_attribute"
+            f"&project_ids={observe_project.id}&source=traces"
+        )
+
+        assert response.status_code == 200
+        mock_selector_cls.return_value.read_values.assert_called_once()
+        mock_selector_cls.return_value.read_value_cursor_page.assert_not_called()
+
+    @pytest.mark.django_db
     @patch("tracer.views.dashboard.AttributeReadSelector")
     def test_filter_values_custom_attribute_preserves_json_array_type(
         self,
@@ -2016,7 +2331,7 @@ class TestChartsView:
 
     @pytest.mark.django_db
     @patch("tracer.views.charts.get_system_metric_data")
-    def test_fetch_graph_requires_sample_opt_in(
+    def test_fetch_graph_rejects_sampled_payload_even_with_legacy_opt_in(
         self, mock_system_metric_data, auth_client, observe_project
     ):
         mock_system_metric_data.return_value = {
@@ -2044,8 +2359,8 @@ class TestChartsView:
         )
 
         assert legacy_response.status_code == 503
-        assert opted_in_response.status_code == 200
-        assert opted_in_response.json()["result"]["query_status"] == "sampled"
+        assert opted_in_response.status_code == 503
+        assert "temporarily unavailable" in str(opted_in_response.json())
 
     @pytest.mark.django_db
     @pytest.mark.django_db
@@ -2126,6 +2441,8 @@ class TestDashboardQueryBuilder:
         sql, _, _ = builder.build_all_queries()[0]
 
         assert "created_at >=" not in sql
+        assert "FROM spans FINAL" in sql
+        assert "FROM spans FINAL" in without_query_settings(sql)
         assert "start_time >= %(start_date)s" in sql
         assert "start_time < %(end_date)s" in sql
         assert "project_id IN %(project_ids)s" in sql
@@ -2177,56 +2494,21 @@ class TestDashboardQueryBuilder:
             (custom_sql, custom_params, custom_info),
             (breakdown_sql, breakdown_params, breakdown_info),
         ):
-            slice_count = sum(
-                key.startswith("_raw_attr_slice_start_") for key in params
-            )
             assert "created_at >=" not in sql
             assert "start_time >= %(start_date)s" in sql
             assert "start_time < %(end_date)s" in sql
             assert "project_id IN %(project_ids)s" in sql
             assert "is_deleted = 0" in sql
             assert "mapContains(attrs_string" in sql
-            assert 1 <= slice_count <= 64
-            assert sql.count("PREWHERE") == slice_count + 1
-            assert (
-                "toUnixTimestamp64Micro(start_time),\n        _version\n    ) IN ("
-                in sql
-            )
-            assert "LIMIT %(_raw_attr_candidates_per_bucket)s BY" not in sql
-            assert sql.count("LIMIT %(_raw_attr_candidates_per_bucket)s") == (
-                slice_count
-            )
-            assert sql.count("UNION ALL") == slice_count - 1
-            assert "LIMIT %(_raw_attr_candidate_limit)s" in sql
-            assert "SELECT *\n    FROM spans\n    PREWHERE" in sql
-            assert params["_raw_attr_slice_start_0"] == params["start_date"]
-            assert (
-                params[f"_raw_attr_slice_end_{slice_count - 1}"] == params["end_date"]
-            )
-            assert "optimize_move_to_prewhere" not in sql
-            candidate_sql = sql.split(") IN (", 1)[1].split(")\n    LIMIT", 1)[0]
-            assert "attrs_string[" not in candidate_sql
-            assert "mapValues(attrs_string)" not in candidate_sql
-            assert params["_raw_attr_candidates_per_bucket"] == 128
-            assert params["_raw_attr_candidate_limit"] == 8192
-            assert metric_info["query_complete"] is False
-            assert metric_info["query_status"] == "sampled"
-            assert metric_info["query_error_code"] == "sample_limit"
-            assert metric_info["query_sampling_interval_seconds"] == 86400
-            assert metric_info["query_sample_limit"] == 8192
-            assert metric_info["query_sample_per_bucket"] == 128
+            assert "_raw_attr_candidate_limit" not in sql
+            assert not any(key.startswith("_raw_attr_slice_") for key in params)
+            assert "query_status" not in metric_info
 
-        assert "uniq(attrs_string" in custom_sql
+        assert "uniqExact(attrs_string" in custom_sql
         assert "parent_span_id" not in custom_sql
-        breakdown_slice_count = sum(
-            key.startswith("_raw_attr_slice_start_") for key in breakdown_params
-        )
-        assert (
-            breakdown_sql.count("(parent_span_id IS NULL OR parent_span_id = '')")
-            == breakdown_slice_count + 1
-        )
+        assert "(parent_span_id IS NULL OR parent_span_id = '')" in breakdown_sql
 
-    def test_raw_attribute_sampling_is_v2_shape_local(
+    def test_obsolete_raw_attribute_sampling_is_absent_from_both_builders(
         self, sample_query_config, settings
     ):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
@@ -2251,7 +2533,7 @@ class TestDashboardQueryBuilder:
         assert "_raw_attr_candidate_limit" not in system_sql
         assert "query_status" not in system_info
 
-    def test_raw_attribute_sampling_requires_explicit_opt_in(
+    def test_raw_attribute_exact_read_is_the_strict_default(
         self, sample_query_config, settings
     ):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
@@ -2272,14 +2554,66 @@ class TestDashboardQueryBuilder:
 
         builder = DashboardQueryBuilderV2(config)
         metric_info = builder.metric_info(config["metrics"][0])
+        sql, params = builder.build_metric_query(config["metrics"][0])
 
-        assert metric_info["query_complete"] is False
-        assert metric_info["query_status"] == "degraded"
-        assert metric_info["query_error_code"] == "query_failed"
-        with pytest.raises(InvalidMetricCombinationError, match="allow_sampled=true"):
-            builder.build_metric_query(config["metrics"][0])
+        assert "query_complete" not in metric_info
+        assert "query_status" not in metric_info
+        assert "query_error_code" not in metric_info
+        assert "FROM spans" in sql
+        assert "mapContains(attrs_string, %(custom_metric_attr_key)s)" in sql
+        assert params["custom_metric_attr_key"] == "final_status"
+        assert "_raw_attr_candidate_limit" not in sql
+        assert not any(key.startswith("_raw_attr_slice_") for key in params)
 
-    def test_raw_attribute_sampling_covers_legacy_metric_and_scalar_filter_gaps(
+    def test_strict_raw_attribute_breakdown_and_filter_are_exact(
+        self, sample_query_config, settings
+    ):
+        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
+        canonical_filter = {
+            "column_id": "final_status",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "Rechazado",
+            },
+        }
+        internal_filter = {
+            "metric_type": "custom_attribute",
+            "metric_name": "final_status",
+            "operator": "equal_to",
+            "value": "Rechazado",
+            "attribute_type": "string",
+            "canonical_filter": canonical_filter,
+        }
+        config = {
+            **sample_query_config,
+            "allow_sampled": False,
+            "filters": [internal_filter],
+            "breakdowns": [
+                {
+                    "type": "custom_attribute",
+                    "name": "country",
+                    "source": "traces",
+                    "attribute_type": "string",
+                }
+            ],
+        }
+
+        sql, params, metric_info = DashboardQueryBuilderV2(config).build_all_queries()[
+            0
+        ]
+
+        assert "attrs_string[%(_custom_bd_key_0)s] AS breakdown_value" in sql
+        assert "lowerUTF8(toString(attrs_string[%(latest_filter_key_0)s]))" in sql
+        assert "mapContains(attrs_string, %(_custom_bd_key_0)s)" in sql
+        assert params["_custom_bd_key_0"] == "country"
+        assert "rechazado" in params.values()
+        assert "_raw_attr_candidate_limit" not in sql
+        assert not any(key.startswith("_raw_attr_slice_") for key in params)
+        assert "query_status" not in metric_info
+
+    def test_raw_attribute_exact_reads_cover_legacy_metric_and_scalar_filter_gaps(
         self, sample_query_config, settings
     ):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
@@ -2321,19 +2655,17 @@ class TestDashboardQueryBuilder:
             (unknown_sql, unknown_params, unknown_info),
             (filtered_sql, filtered_params, filtered_info),
         ):
-            slice_count = sum(
-                key.startswith("_raw_attr_slice_start_") for key in params
-            )
-            assert sql.count("PREWHERE") == slice_count + 1
-            assert "SELECT *\n    FROM spans\n    PREWHERE" in sql
-            assert info["query_status"] == "sampled"
+            assert "FROM spans FINAL" in sql
+            assert "_raw_attr_candidate_limit" not in sql
+            assert not any(key.startswith("_raw_attr_slice_") for key in params)
+            assert "query_status" not in info
         assert "attrs_number" in unknown_sql
         assert "legacy_numeric_attribute" in unknown_params.values()
         assert "attrs_string" in filtered_sql
         assert "Rechazado" not in filtered_sql
         assert "rechazado" in filtered_params.values()
 
-    def test_time_to_first_token_sample_candidates_require_metric_key(
+    def test_time_to_first_token_exact_read_uses_metric_key(
         self, sample_query_config, settings
     ):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
@@ -2348,11 +2680,10 @@ class TestDashboardQueryBuilder:
             {**sample_query_config, "metrics": [metric]}
         ).build_all_queries()[0]
 
-        assert "has(attrs_number.keys, %(_raw_attr_presence_key_0)s)" in sql
-        assert params["_raw_attr_presence_key_0"] == (
-            "gen_ai.server.time_to_first_token"
-        )
-        assert metric_info["query_status"] == "sampled"
+        assert "FROM spans FINAL" in sql
+        assert "attrs_number['gen_ai.server.time_to_first_token']" in sql
+        assert not any(key.startswith("_raw_attr_") for key in params)
+        assert "query_status" not in metric_info
 
     def test_canonical_boolean_array_and_map_filters_compile_together(
         self, sample_query_config, settings
@@ -2399,9 +2730,9 @@ class TestDashboardQueryBuilder:
         assert "JSONExtractArrayRaw(attributes_extra" in sql
         assert "JSONExtractRaw(attributes_extra" in sql
         assert "JSONLength(JSONExtractRaw(attributes_extra" in sql
-        slice_count = sum(key.startswith("_raw_attr_slice_start_") for key in params)
-        assert sql.count("PREWHERE") == slice_count + 1
-        assert metric_info["query_status"] == "sampled"
+        assert "FROM spans FINAL" in sql
+        assert not any(key.startswith("_raw_attr_") for key in params)
+        assert "query_status" not in metric_info
         assert "True" not in sql
         assert 1 in params.values()
 
@@ -2423,9 +2754,10 @@ class TestDashboardQueryBuilder:
 
         assert "attrs_string['optional_status'] = ''" in sql
         assert "_raw_attr_presence_key_0" not in params
-        assert metric_info["query_status"] == "sampled"
+        assert "FROM spans FINAL" in sql
+        assert "query_status" not in metric_info
 
-    def test_legacy_boolean_filter_uses_boolean_map_in_both_sample_phases(
+    def test_legacy_boolean_filter_uses_boolean_map_in_exact_read(
         self, sample_query_config, settings
     ):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
@@ -2442,12 +2774,13 @@ class TestDashboardQueryBuilder:
         ).build_all_queries()[0]
 
         assert "attrs_bool['is_final'] = %(f_0_val)s" in sql
-        assert "has(attrs_bool.keys, %(_raw_attr_presence_key_0)s)" in sql
+        assert "_raw_attr_presence_key_0" not in params
         assert "attrs_string['is_final']" not in sql
         assert params["f_0_val"] is True
-        assert metric_info["query_status"] == "sampled"
+        assert "FROM spans FINAL" in sql
+        assert "query_status" not in metric_info
 
-    def test_long_minute_window_stratifies_without_truncating_the_tail(
+    def test_long_minute_window_is_exact_without_candidate_truncation(
         self, sample_query_config, settings
     ):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
@@ -2473,22 +2806,18 @@ class TestDashboardQueryBuilder:
             0
         ]
 
-        slice_count = sum(key.startswith("_raw_attr_slice_start_") for key in params)
-        assert slice_count == 64
-        assert sql.count("UNION ALL") == 63
-        assert sql.count("LIMIT %(_raw_attr_candidates_per_bucket)s") == 64
-        assert "LIMIT %(_raw_attr_candidates_per_bucket)s BY" not in sql
-        assert params["_raw_attr_candidates_per_bucket"] == 128
-        assert metric_info["query_sampling_interval_seconds"] == 492750
-        assert metric_info["query_sample_per_bucket"] == 128
-        assert params["_raw_attr_slice_start_0"] == datetime(2025, 1, 1, tzinfo=UTC)
-        assert params["_raw_attr_slice_end_63"] == datetime(2026, 1, 1, tzinfo=UTC)
+        assert "FROM spans FINAL" in sql
+        assert "UNION ALL" not in sql
+        assert "LIMIT %(_raw_attr_" not in sql
+        assert not any(key.startswith("_raw_attr_") for key in params)
+        assert params["start_date"] == datetime(2025, 1, 1, tzinfo=UTC)
+        assert params["end_date"] == datetime(2026, 1, 1, tzinfo=UTC)
+        assert "query_status" not in metric_info
         stripped = without_query_settings(sql)
         assert "SETTINGS" not in stripped
-        assert "SELECT *\n    FROM spans\n    PREWHERE" in stripped
-        assert stripped.count("LIMIT %(_raw_attr_candidate_limit)s") == 2
+        assert "FROM spans FINAL" in stripped
 
-    def test_raw_attribute_sample_prewhere_stays_inside_id_remap_source(
+    def test_raw_attribute_exact_source_keeps_latest_state_inside_id_remap(
         self, sample_query_config, settings
     ):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
@@ -2518,16 +2847,14 @@ class TestDashboardQueryBuilder:
             0
         ]
 
-        remap_end = sql.index(") AS spans")
-        sample_prewhere = sql.index("PREWHERE (\n        project_id")
         assert "trace_session_id_remap" in sql
-        assert sample_prewhere < remap_end
-        assert "\nPREWHERE" not in sql[remap_end : sql.index("\nWHERE", remap_end)]
-        slice_count = sum(key.startswith("_raw_attr_slice_start_") for key in params)
-        assert sql.count("PREWHERE") == slice_count + 1
-        assert metric_info["query_status"] == "sampled"
+        assert "FROM spans AS sp FINAL" in sql
+        assert "FROM spans AS sp FINAL" in without_query_settings(sql)
+        assert "_raw_attr_candidate_limit" not in sql
+        assert not any(key.startswith("_raw_attr_") for key in params)
+        assert "query_status" not in metric_info
 
-    def test_raw_sampling_ignores_non_trace_filter_and_breakdown_sources(
+    def test_exact_raw_read_ignores_non_trace_filter_and_breakdown_sources(
         self, sample_query_config, settings
     ):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
@@ -2562,7 +2889,7 @@ class TestDashboardQueryBuilder:
         assert "simulation_only_key" not in sql
         assert "query_status" not in metric_info
 
-    def test_sampled_metric_metadata_survives_both_dashboard_formatters(
+    def test_exact_builder_never_emits_obsolete_sampling_metadata(
         self, sample_query_config, settings
     ):
         settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
@@ -2592,16 +2919,13 @@ class TestDashboardQueryBuilder:
         )
 
         for formatted_metric in (trace_payload["metrics"][0], merged_metric):
-            assert formatted_metric["query_complete"] is False
-            assert formatted_metric["query_status"] == "sampled"
-            assert formatted_metric["query_error_code"] == "sample_limit"
-            assert (
-                formatted_metric["query_sampling_strategy"]
-                == "bounded_physical_rows_per_time_bucket"
-            )
-            assert formatted_metric["query_sampling_interval_seconds"] == 86400
-            assert formatted_metric["query_sample_limit"] == 8192
-            assert formatted_metric["query_sample_per_bucket"] == 128
+            assert "query_status" not in formatted_metric
+            assert "query_sampled" not in formatted_metric
+            assert "query_error_code" not in formatted_metric
+            assert "query_sampling_strategy" not in formatted_metric
+            assert "query_sampling_interval_seconds" not in formatted_metric
+            assert "query_sample_limit" not in formatted_metric
+            assert "query_sample_per_bucket" not in formatted_metric
 
         serializer = DashboardQueryApiResponseSerializer(
             data={"status": True, "result": trace_payload}
@@ -3154,7 +3478,7 @@ class TestDashboardQueryBuilder:
         builder = DashboardQueryBuilder(config)
         queries = builder.build_all_queries()
         sql, _, _ = queries[0]
-        assert "quantile(0.5)(latency_ms)" in sql
+        assert "quantileExact(0.5)(latency_ms)" in sql
 
     def test_system_metric_count_distinct_aggregation(self):
         config = {
@@ -3173,7 +3497,7 @@ class TestDashboardQueryBuilder:
         builder = DashboardQueryBuilder(config)
         queries = builder.build_all_queries()
         sql, _, _ = queries[0]
-        assert "uniq(model)" in sql
+        assert "uniqExact(model)" in sql
 
     def test_project_metric_count_uses_distinct_projects(self):
         config = {
@@ -3192,7 +3516,7 @@ class TestDashboardQueryBuilder:
         builder = DashboardQueryBuilder(config)
         queries = builder.build_all_queries()
         sql, _, _ = queries[0]
-        assert "uniq(project_id)" in sql
+        assert "uniqExact(project_id)" in sql
 
     def test_user_count_forces_uniq_on_resolved_user_dict_regardless_of_agg(
         self,
@@ -3216,7 +3540,7 @@ class TestDashboardQueryBuilder:
                 ],
             }
             sql, _, _ = DashboardQueryBuilder(config).build_all_queries()[0]
-            assert "uniq(" in sql
+            assert "uniqExact(" in sql
             assert "end_users_dict" in sql
             # row-count fallbacks should never win here
             assert "count(*)" not in sql
@@ -3376,7 +3700,7 @@ class TestDashboardQueryBuilder:
 
         sql, params, _ = DashboardQueryBuilderV2(config).build_all_queries()[0]
 
-        assert "uniq(attrs_string[%(custom_metric_attr_key)s])" in sql
+        assert "uniqExact(attrs_string[%(custom_metric_attr_key)s])" in sql
         assert "mapContains(attrs_string, %(custom_metric_attr_key)s)" in sql
         assert params["custom_metric_attr_key"] == "final_status"
         assert "span_attr_str" not in sql
@@ -3665,8 +3989,8 @@ class TestDashboardAttrRollupRouting:
         config = self._config(breakdowns=[self._bd("final_status")])
         sql, _, metric_info = self._v2(config).build_all_queries()[0]
         assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-        assert metric_info["query_status"] == "sampled"
+        assert "FROM spans FINAL" in sql
+        assert "query_status" not in metric_info
 
     def test_coverage_unset_falls_back_to_spans(self, settings):
         # [FALLBACK] FIX 2 — flag on but no coverage date set → spans path.
@@ -4310,6 +4634,11 @@ class TestDashboardQueryExecution:
             format="json",
         )
         assert response.status_code == 200
+        _, kwargs = mock_service.execute_ch_query.call_args
+        assert kwargs["settings"] == _DASHBOARD_TRACE_READ_SETTINGS
+        assert kwargs["settings"]["read_overflow_mode"] == "throw"
+        assert kwargs["settings"]["result_overflow_mode"] == "throw"
+        assert kwargs["settings"]["timeout_overflow_mode"] == "throw"
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.V2AnalyticsQueryService")
@@ -5155,6 +5484,8 @@ class TestWidgetQueryExecution:
         data = response.json()["result"]
         assert "metrics" in data
         assert "time_range" in data
+        _, kwargs = mock_client.execute_read.call_args
+        assert kwargs["settings"] == _DASHBOARD_TRACE_READ_SETTINGS
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
@@ -7313,7 +7644,7 @@ class TestDashboardV2RewriteRouting:
             and "WHERE eu.project_id IN %(project_ids)s AND eu.is_deleted = 0"
             in compact_sql
         )
-        assert "uniq(if(" in compact_sql
+        assert "uniqExact(if(" in compact_sql
         assert "eu_dimension.user_id" in compact_sql
 
     def test_user_filter_uses_direct_dimension_and_keeps_external_id_semantics(self):
@@ -8097,6 +8428,96 @@ class TestAnnotationMetricAggregation:
 
 
 class TestDashboardQueryValidation:
+    def test_implicit_all_scope_is_concrete_and_changes_with_workspace_membership(
+        self,
+    ):
+        workspace = MagicMock()
+        workspace.id = uuid.uuid4()
+        first_project_id = uuid.uuid4()
+        second_project_id = uuid.uuid4()
+        first_dataset_id = uuid.uuid4()
+        second_dataset_id = uuid.uuid4()
+
+        def scoped_queryset(ids):
+            queryset = MagicMock()
+            queryset.values_list.return_value = ids
+            return queryset
+
+        trace_metric = {
+            "id": "latency",
+            "name": "latency",
+            "type": "system_metric",
+            "source": "traces",
+            "aggregation": "avg",
+        }
+        dataset_metric = {
+            "id": "row_count",
+            "name": "row_count",
+            "type": "system_metric",
+            "source": "datasets",
+            "aggregation": "count",
+        }
+        query_config = {
+            "project_ids": [],
+            "dataset_ids": [],
+            "granularity": "day",
+            "time_range": {"preset": "7D"},
+            "metrics": [trace_metric, dataset_metric],
+        }
+
+        with (
+            patch(
+                "tracer.views.dashboard.Project.objects.filter",
+                side_effect=[
+                    scoped_queryset([first_project_id, second_project_id]),
+                    scoped_queryset([first_project_id]),
+                ],
+            ),
+            patch(
+                "model_hub.models.develop_dataset.Dataset.objects.filter",
+                side_effect=[
+                    scoped_queryset([first_dataset_id, second_dataset_id]),
+                    scoped_queryset([first_dataset_id]),
+                ],
+            ),
+        ):
+            first_scope = _materialize_dashboard_query_scope(
+                query_config,
+                workspace,
+                trace_metrics=[trace_metric],
+                dataset_metrics=[dataset_metric],
+            )
+            current_scope = _materialize_dashboard_query_scope(
+                query_config,
+                workspace,
+                trace_metrics=[trace_metric],
+                dataset_metrics=[dataset_metric],
+            )
+
+        first_key = snapshot_cache_key(
+            "dashboard-query",
+            {
+                "workspace_id": str(workspace.id),
+                "query_config": first_scope,
+            },
+        )
+        current_key = snapshot_cache_key(
+            "dashboard-query",
+            {
+                "workspace_id": str(workspace.id),
+                "query_config": current_scope,
+            },
+        )
+        assert first_scope["project_ids"] == sorted(
+            [str(first_project_id), str(second_project_id)]
+        )
+        assert first_scope["dataset_ids"] == sorted(
+            [str(first_dataset_id), str(second_dataset_id)]
+        )
+        assert current_scope["project_ids"] == [str(first_project_id)]
+        assert current_scope["dataset_ids"] == [str(first_dataset_id)]
+        assert current_key != first_key
+
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.AnalyticsQueryService")
     def test_cross_workspace_project_ids_returns_400(

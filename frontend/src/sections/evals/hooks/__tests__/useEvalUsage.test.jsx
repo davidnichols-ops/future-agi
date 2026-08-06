@@ -1,7 +1,7 @@
 import React from "react";
 import PropTypes from "prop-types";
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { renderHook, waitFor } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const mocks = vi.hoisted(() => ({ get: vi.fn() }));
@@ -31,12 +31,28 @@ function createQueryWrapper() {
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 20));
+const exactResult = (result = {}) => ({
+  query_complete: true,
+  query_status: "complete",
+  query_sampled: false,
+  query_completed_at: "2026-08-03T02:00:00Z",
+  stats: {},
+  chart: [],
+  table: [],
+  logs: {},
+  ...result,
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  mocks.get.mockReset();
+});
 
 describe("useEvalUsage date params", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.get.mockResolvedValue({
-      data: { result: { stats: {}, chart: [], table: [], logs: {} } },
+      data: { result: exactResult() },
     });
   });
 
@@ -56,9 +72,15 @@ describe("useEvalUsage date params", () => {
 
   it("does not fetch for an incomplete Custom range", async () => {
     const wrapper = createQueryWrapper();
-    renderHook(() => useEvalUsageChart("t1", "30d", "Custom", null), { wrapper });
+    renderHook(() => useEvalUsageChart("t1", "30d", "Custom", null), {
+      wrapper,
+    });
     renderHook(
-      () => useEvalUsageLogs("t1", { dateOption: "Custom", dateFilter: [null, null] }),
+      () =>
+        useEvalUsageLogs("t1", {
+          dateOption: "Custom",
+          dateFilter: [null, null],
+        }),
       { wrapper },
     );
     await flush();
@@ -80,6 +102,81 @@ describe("useEvalUsage date params", () => {
     expect(params.start_date).toBeTruthy();
     expect(params.end_date).toBeTruthy();
   });
+
+  it("uses refresh=true only for an explicit chart refresh", async () => {
+    mocks.get.mockResolvedValue({ data: { result: exactResult() } });
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () => useEvalUsageChart("t1", "30d", "30D", null),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mocks.get.mock.calls[0][1].params).not.toHaveProperty("refresh");
+
+    await act(async () => result.current.refresh());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+    expect(mocks.get.mock.calls[1][1].params.refresh).toBe(true);
+    expect(result.current.data.queryCompletedAt).toBe(
+      "2026-08-03T02:00:00.000Z",
+    );
+  });
+
+  it("fails metadata-less aggregation responses closed", async () => {
+    mocks.get.mockResolvedValue({
+      data: { result: { stats: {}, chart: [] } },
+    });
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () => useEvalUsageChart("t1", "30d", "30D", null),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+  });
+
+  it("polls a cold pending chart with an ordinary request until exact", async () => {
+    vi.useFakeTimers();
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            stats: {},
+            chart: [],
+            query_complete: false,
+            query_status: "pending",
+            query_sampled: false,
+            query_refreshing: true,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: exactResult({
+            chart: [{ timestamp: "2026-08-03T00:00:00Z", calls: 2 }],
+          }),
+        },
+      });
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () => useEvalUsageChart("t1", "30d", "30D", null),
+      { wrapper },
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(result.current.data?.queryPending).toBe(true);
+    expect(result.current.data?.queryRefreshing).toBe(true);
+    expect(mocks.get).toHaveBeenCalledOnce();
+
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.get.mock.calls[1][1].params).not.toHaveProperty("refresh");
+    expect(result.current.data?.queryPending).toBe(false);
+    expect(result.current.data?.chart).toHaveLength(1);
+  });
 });
 
 describe("useEvalUsageLogs response mapping", () => {
@@ -87,7 +184,12 @@ describe("useEvalUsageLogs response mapping", () => {
 
   it("maps result.table → table and result.logs → pagination", async () => {
     mocks.get.mockResolvedValue({
-      data: { result: { table: [{ row_id: "a" }], logs: { total: 5, page: 0 } } },
+      data: {
+        result: exactResult({
+          table: [{ row_id: "a" }],
+          logs: { total: 5, page: 0 },
+        }),
+      },
     });
     const wrapper = createQueryWrapper();
     const { result } = renderHook(

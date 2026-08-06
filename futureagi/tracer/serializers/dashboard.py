@@ -296,7 +296,14 @@ class DashboardQuerySerializer(StrictInputSerializer):
     metrics = DashboardMetricSerializer(many=True)
     filters = filter_list_field(required=False, default=list)
     breakdowns = DashboardBreakdownSerializer(many=True, required=False, default=list)
-    allow_sampled = serializers.BooleanField(required=False, default=False)
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Deprecated compatibility parameter; accepted but ignored. "
+            "Dashboard aggregates are always exact."
+        ),
+    )
 
     class Meta:
         swagger_schema_fields = {"additionalProperties": False}
@@ -311,14 +318,28 @@ class DashboardQuerySerializer(StrictInputSerializer):
 
 class DashboardPreviewQuerySerializer(StrictInputSerializer):
     query_config = DashboardQuerySerializer(required=True)
-    allow_sampled = serializers.BooleanField(required=False, default=False)
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Deprecated compatibility parameter; accepted but ignored. "
+            "Dashboard aggregates are always exact."
+        ),
+    )
 
     class Meta:
         swagger_schema_fields = {"additionalProperties": False}
 
 
 class DashboardSampleOptInSerializer(StrictInputSerializer):
-    allow_sampled = serializers.BooleanField(required=False, default=False)
+    allow_sampled = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Deprecated compatibility parameter; accepted but ignored. "
+            "Dashboard aggregates are always exact."
+        ),
+    )
 
     class Meta:
         swagger_schema_fields = {"additionalProperties": False}
@@ -341,6 +362,7 @@ class DashboardQueryMetricResultSerializer(serializers.Serializer):
     unit = serializers.CharField(allow_blank=True)
     series = DashboardQuerySeriesSerializer(many=True)
     query_complete = serializers.BooleanField(required=False)
+    query_sampled = serializers.BooleanField(required=False)
     query_status = serializers.ChoiceField(
         choices=["complete", "sampled", "degraded"], required=False
     )
@@ -365,6 +387,22 @@ class DashboardQueryResultSerializer(serializers.Serializer):
     metrics = DashboardQueryMetricResultSerializer(many=True)
     time_range = DashboardQueryTimeRangeResultSerializer()
     granularity = serializers.ChoiceField(choices=DASHBOARD_GRANULARITIES)
+    query_complete = serializers.BooleanField(required=False)
+    query_status = serializers.ChoiceField(
+        choices=["complete", "degraded", "pending"], required=False
+    )
+    query_sampled = serializers.BooleanField(required=False)
+    query_completed_at = serializers.DateTimeField(required=False)
+    query_cached = serializers.BooleanField(required=False)
+    query_refresh_failed = serializers.BooleanField(required=False)
+    query_refreshing = serializers.BooleanField(required=False)
+    query_snapshot_version_ceiling = serializers.IntegerField(
+        min_value=1, required=False
+    )
+    query_snapshot_capture_count = serializers.IntegerField(min_value=0, required=False)
+    query_snapshot_relation_count = serializers.IntegerField(
+        min_value=0, required=False
+    )
 
 
 class DashboardQueryApiResponseSerializer(serializers.Serializer):
@@ -466,6 +504,23 @@ class DashboardFilterValuesQuerySerializer(serializers.Serializer):
         # source-specific branch before any database work.
         max_length=512,
     )
+    page_size = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=50,
+    )
+    cursor = serializers.CharField(
+        required=False,
+        allow_blank=False,
+        max_length=16_384,
+    )
+
+    def validate(self, attrs):
+        if attrs.get("cursor") and "page_size" not in attrs:
+            raise serializers.ValidationError(
+                {"page_size": "page_size is required with cursor"}
+            )
+        return attrs
 
     def validate_search(self, value):
         # Import lazily so serializer/OpenAPI discovery does not initialize the
@@ -517,6 +572,12 @@ class DashboardFilterValuesResultSerializer(serializers.Serializer):
     )
     query_window_start = serializers.DateTimeField(required=False)
     query_window_end = serializers.DateTimeField(required=False)
+    has_more = serializers.BooleanField(required=False)
+    next_cursor = serializers.CharField(
+        required=False,
+        allow_null=True,
+        allow_blank=False,
+    )
 
 
 class DashboardFilterValuesResponseSerializer(serializers.Serializer):

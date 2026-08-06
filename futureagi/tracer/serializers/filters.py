@@ -702,14 +702,19 @@ class ObserveGraphDataQuerySerializer(StrictInputSerializer):
         required=False,
         default=False,
         help_text=(
-            "Explicitly opt in to bounded sample points. Clients that set this "
-            "must label sampled values as estimates rather than exact totals."
+            "Deprecated compatibility parameter; accepted but ignored. "
+            "Aggregate graph results are always exact."
         ),
+    )
+    refresh = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Recompute and atomically replace the last complete exact result.",
     )
 
 
 class ObserveGraphDataPointSerializer(serializers.Serializer):
-    """One exact or explicitly sampled graph point."""
+    """One exact graph point."""
 
     timestamp = serializers.CharField()
     value = serializers.FloatField(allow_null=True)
@@ -722,15 +727,13 @@ class ObserveGraphDataResultSerializer(serializers.Serializer):
     data = ObserveGraphDataPointSerializer(
         many=True,
         help_text=(
-            "Graph points for exact reads and explicitly bounded samples. "
-            "Inspect query_status before interpreting values: sampled values "
-            "describe selected rows, not full totals; degraded reads always "
-            "return an empty list."
+            "Exact graph points. Pending or failed refreshes never publish "
+            "partial aggregate values."
         ),
     )
     query_complete = serializers.BooleanField(required=False)
     query_status = serializers.ChoiceField(
-        choices=("complete", "sampled", "degraded"), required=False
+        choices=("complete", "sampled", "degraded", "pending"), required=False
     )
     query_error_code = serializers.ChoiceField(
         choices=("sample_limit", "read_budget_exceeded", "query_failed"),
@@ -745,6 +748,13 @@ class ObserveGraphDataResultSerializer(serializers.Serializer):
     query_result_bytes = serializers.IntegerField(required=False, min_value=0)
     query_total_rows_lower_bound = serializers.IntegerField(required=False, min_value=0)
     query_sampled = serializers.BooleanField(required=False)
+    query_completed_at = serializers.DateTimeField(required=False)
+    query_cached = serializers.BooleanField(required=False)
+    query_refresh_failed = serializers.BooleanField(required=False)
+    query_refreshing = serializers.BooleanField(required=False)
+    query_snapshot_version_ceiling = serializers.IntegerField(
+        required=False, min_value=1
+    )
     query_sampling_strategy = serializers.ChoiceField(
         choices=("time_stratified_latest_state", "bounded_latest_state_prefix"),
         required=False,

@@ -48,7 +48,10 @@ import {
   getQueryReadMessage,
   getQueryReadState,
 } from "src/utils/queryReadState";
-import { createListCursorPagination } from "./listCursorPagination";
+import {
+  createListCursorPagination,
+  followEmptyListContinuations,
+} from "./listCursorPagination";
 import { getListTotalState } from "./listTotalMetadata";
 
 const ROWS_LIMIT = 25;
@@ -425,7 +428,6 @@ const SpanGrid = React.forwardRef(
                   // Omit project_id when null — backend treats absent
                   // project_id as org-scoped (used by user-detail page).
                   ...(observeId ? { project_id: observeId } : {}),
-                  allow_sampled: true,
                   page_size: ROWS_LIMIT,
                   filters: JSON.stringify(
                     toBackendFilters([
@@ -440,12 +442,30 @@ const SpanGrid = React.forwardRef(
               // Use prefetched data if available, otherwise fetch
               const cached = prefetchCache.current.get(pageNumber);
               prefetchCache.current.delete(pageNumber);
-              const results =
+              let results =
                 cached ||
                 (await axios.get(
                   endpoints.project.getSpansForObserveProject(),
                   { params: buildParams(pageNumber) },
                 ));
+              results = await followEmptyListContinuations({
+                initialResponse: results,
+                rowsFromResponse: (response) =>
+                  response?.data?.result?.table || [],
+                metadataFromResponse: (response) =>
+                  response?.data?.result?.metadata || {},
+                onContinuation: (metadata) =>
+                  cursorPagination.current.recordEmptyContinuation(
+                    pageNumber,
+                    metadata,
+                  ),
+                isCurrent: () =>
+                  cursorPagination.current.isCurrent(requestGeneration),
+                nextResponse: () =>
+                  axios.get(endpoints.project.getSpansForObserveProject(), {
+                    params: buildParams(pageNumber),
+                  }),
+              });
               if (!cursorPagination.current.isCurrent(requestGeneration)) {
                 failServerSideGridRead(params);
                 return;
@@ -453,9 +473,14 @@ const SpanGrid = React.forwardRef(
 
               const res = results?.data?.result;
               const nextReadState = getQueryReadState(results?.data);
-              if (pageNumber === 0 || nextReadState !== "complete") {
-                readStateRef.current = nextReadState;
-                setReadState(nextReadState);
+              const responseRows = res?.table || [];
+              const visibleListReadState =
+                responseRows.length > 0 || nextReadState === "sampled"
+                  ? "complete"
+                  : nextReadState;
+              if (pageNumber === 0 || visibleListReadState !== "complete") {
+                readStateRef.current = visibleListReadState;
+                setReadState(visibleListReadState);
               }
               const newCols = normalizeConfigKeys(res?.config);
 
@@ -514,7 +539,7 @@ const SpanGrid = React.forwardRef(
                 }
               }
 
-              const rows = res?.table || [];
+              const rows = responseRows;
               const metadata = res?.metadata || {};
               cursorPagination.current.recordResponse(pageNumber, metadata);
               const totalState = getListTotalState(metadata);

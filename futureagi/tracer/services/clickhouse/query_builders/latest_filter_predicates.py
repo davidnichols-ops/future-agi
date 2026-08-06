@@ -894,6 +894,108 @@ def compile_span_attribute_row_predicate(
     return f"({source_exists}) AND ({core})", params
 
 
+def compile_exact_graph_filter_predicates(
+    filters: list[dict[str, Any]],
+    *,
+    project_id: str,
+    observe_type: str,
+) -> tuple[str, dict[str, Any]]:
+    """Compile exact graph filters, including overflow JSON arrays/maps.
+
+    ``ClickHouseFilterBuilderV2`` remains the canonical compiler for scalar,
+    relational, eval, and annotation filters. Structured SPAN_ATTRIBUTE values
+    use :func:`compile_span_attribute_row_predicate`, which preserves JSON type
+    domains (missing/null/wrong-type never masquerade as an empty value).
+
+    Span graphs apply each structured predicate to the contributing physical
+    row. Trace graphs wrap each predicate in its own latest-live full-window
+    trace-membership selector, matching the scalar any-span contract even when
+    separate filters are satisfied by different sibling spans.
+    """
+
+    normalized_observe_type = str(observe_type or "trace").strip().lower()
+    if normalized_observe_type not in {"trace", "span"}:
+        raise UnsupportedFilterShapeError("observe_type must be trace or span")
+
+    # Lazy imports avoid the base-filter <-> v2-filter module cycle.
+    from tracer.services.clickhouse.v2.query_builders.filters import (
+        ClickHouseFilterBuilderV2,
+        rewrite_v1_sql_to_v2,
+    )
+
+    ordinary_filters: list[dict[str, Any]] = []
+    structured_filters: list[tuple[int, dict[str, Any]]] = []
+    for index, item in enumerate(filters or []):
+        if not isinstance(item, dict):
+            raise UnsupportedFilterShapeError("filter must be an object")
+        config_key = "filter_config" if "filter_config" in item else "filterConfig"
+        config = item.get(config_key) or {}
+        if not isinstance(config, dict):
+            raise UnsupportedFilterShapeError("filter config must be an object")
+        col_type = config.get("col_type") or config.get("colType")
+        raw_value = config.get("filter_value", config.get("filterValue"))
+        filter_type = str(config.get("filter_type") or config.get("filterType") or "")
+        if col_type == ClickHouseFilterBuilderV2.SPAN_ATTRIBUTE:
+            normalized_type = normalize_span_attribute_filter_type(
+                filter_type,
+                raw_value,
+            )
+            # Legacy filter_type=json is value-sensitive. Normalize scalar JSON
+            # too so it reaches the typed Map compiler as text/number/boolean.
+            if normalized_type != filter_type:
+                normalized_config = dict(config)
+                normalized_config[
+                    "filter_type" if "filter_type" in config else "filterType"
+                ] = normalized_type
+                item = {**item, config_key: normalized_config}
+            if normalized_type in {"array", "map"}:
+                structured_filters.append((index, item))
+                continue
+        ordinary_filters.append(item)
+
+    query_mode = (
+        ClickHouseFilterBuilderV2.QUERY_MODE_SPAN
+        if normalized_observe_type == "span"
+        else ClickHouseFilterBuilderV2.QUERY_MODE_TRACE
+    )
+    builder = ClickHouseFilterBuilderV2(
+        table="spans",
+        project_id=project_id,
+        query_mode=query_mode,
+        span_date_scope=True,
+    )
+    ordinary_clause, params = builder.translate(ordinary_filters)
+    clauses = [ordinary_clause] if ordinary_clause else []
+    params = dict(params)
+
+    for index, item in structured_filters:
+        row_clause, row_params = compile_span_attribute_row_predicate(
+            item,
+            index=index,
+        )
+        row_clause = rewrite_v1_sql_to_v2(row_clause)
+        if not row_clause:
+            raise UnsupportedFilterShapeError(
+                "structured attribute predicate cannot be empty"
+            )
+        if normalized_observe_type == "trace":
+            row_clause = f"""
+            trace_id IN (
+                SELECT DISTINCT trace_id
+                FROM spans FINAL
+                PREWHERE project_id = toUUID(%(project_id)s)
+                  AND start_time >= %(snapshot_start_date)s
+                  AND start_time < %(snapshot_end_date)s
+                WHERE is_deleted = 0
+                  AND {row_clause}
+            )
+            """
+        clauses.append(row_clause)
+        params.update(row_params)
+
+    return " AND ".join(f"({clause})" for clause in clauses), params
+
+
 def _column_plan(
     item: dict[str, Any],
     *,
@@ -1013,7 +1115,11 @@ _DATETIME_SYSTEM_COLUMNS = {"start_time", "end_time", "created_at"}
 
 
 def _system_metric_plan(
-    item: dict[str, Any], *, index: int, trace_mode: bool
+    item: dict[str, Any],
+    *,
+    index: int,
+    trace_mode: bool,
+    filter_builder_cls: type[ClickHouseFilterBuilder] = ClickHouseFilterBuilder,
 ) -> LatestFilterPredicate:
     """Preserve legacy SYSTEM_METRIC aliases with latest-version semantics.
 
@@ -1025,14 +1131,14 @@ def _system_metric_plan(
     """
 
     key, config = _parts(item)
-    if key in ClickHouseFilterBuilder._ENDUSER_STRING_COLUMNS:
+    if key in filter_builder_cls._ENDUSER_STRING_COLUMNS:
         raise UnsupportedFilterShapeError(
             "end-user string metric needs residual lookup"
         )
 
-    if key in ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_STR_MAP:
+    if key in filter_builder_cls.VOICE_SYSTEM_METRIC_STR_MAP:
         mapped = dict(item)
-        mapped["column_id"] = ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_STR_MAP[key]
+        mapped["column_id"] = filter_builder_cls.VOICE_SYSTEM_METRIC_STR_MAP[key]
         return _attribute_plan(
             mapped,
             index=index,
@@ -1042,26 +1148,26 @@ def _system_metric_plan(
     filter_type = str(
         config.get("filter_type") or config.get("filterType") or ""
     ).lower()
-    if key in ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_EXPRS:
+    if key in filter_builder_cls.VOICE_SYSTEM_METRIC_EXPRS:
         return _expression_plan(
             item,
             index=index,
-            expression=ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_EXPRS[key],
+            expression=filter_builder_cls.VOICE_SYSTEM_METRIC_EXPRS[key],
             value_type="number",
             nullable=True,
             scope="any" if trace_mode else "span",
         )
-    if key in ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_STR_EXPRS:
+    if key in filter_builder_cls.VOICE_SYSTEM_METRIC_STR_EXPRS:
         return _expression_plan(
             item,
             index=index,
-            expression=ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_STR_EXPRS[key],
+            expression=filter_builder_cls.VOICE_SYSTEM_METRIC_STR_EXPRS[key],
             value_type="text",
             nullable=True,
             scope="any" if trace_mode else "span",
         )
 
-    column = ClickHouseFilterBuilder.SYSTEM_METRIC_MAP.get(key)
+    column = filter_builder_cls.SYSTEM_METRIC_MAP.get(key)
     if column is None:
         # This is the legacy compiler's documented fallback.  Keep the real
         # customer key bound as data and classify its latest typed-map value.
@@ -1080,9 +1186,8 @@ def _system_metric_plan(
     if value_type == "number" and filter_type != "number":
         raise UnsupportedFilterShapeError("numeric system metric requires number")
 
-    mapped_root_only = key in ClickHouseFilterBuilder.ROOT_ONLY_SYSTEM_METRICS or (
-        key != "span_name"
-        and column in ClickHouseFilterBuilder.ROOT_ONLY_SYSTEM_METRICS
+    mapped_root_only = key in filter_builder_cls.ROOT_ONLY_SYSTEM_METRICS or (
+        key != "span_name" and column in filter_builder_cls.ROOT_ONLY_SYSTEM_METRICS
     )
     scope = (
         "root" if trace_mode and mapped_root_only else ("any" if trace_mode else "span")
@@ -1138,6 +1243,8 @@ def _call_type_plan(item: dict[str, Any], *, index: int) -> LatestFilterPredicat
 
 def compile_trace_filter_plans(
     filters: list[dict[str, Any]],
+    *,
+    filter_builder_cls: type[ClickHouseFilterBuilder] = ClickHouseFilterBuilder,
 ) -> list[LatestFilterPredicate]:
     plans: list[LatestFilterPredicate] = []
     for item in filters:
@@ -1192,7 +1299,14 @@ def compile_trace_filter_plans(
             # semantics: separate child spans may satisfy separate filters.
             plans.append(_attribute_plan(item, index=index, scope="any"))
         elif col_type in {"SYSTEM_METRIC", "TRACE_END_USER"}:
-            plans.append(_system_metric_plan(item, index=index, trace_mode=True))
+            plans.append(
+                _system_metric_plan(
+                    item,
+                    index=index,
+                    trace_mode=True,
+                    filter_builder_cls=filter_builder_cls,
+                )
+            )
         else:
             raise UnsupportedFilterShapeError(f"unsupported trace filter {key!r}")
     return plans
@@ -1249,6 +1363,8 @@ def _is_candidate_residual_filter(item: dict[str, Any]) -> bool:
 
 def partition_trace_filter_plans(
     filters: list[dict[str, Any]],
+    *,
+    filter_builder_cls: type[ClickHouseFilterBuilder] = ClickHouseFilterBuilder,
 ) -> tuple[list[LatestFilterPredicate], list[dict[str, Any]]]:
     """Split scalar latest predicates from candidate-scoped relational ones."""
 
@@ -1263,9 +1379,12 @@ def partition_trace_filter_plans(
         else:
             # Validate each leaf before combining it so malformed payloads do
             # not get mislabeled as a relational residual.
-            compile_trace_filter_plans([item])
+            compile_trace_filter_plans([item], filter_builder_cls=filter_builder_cls)
             supported.append(item)
-    return compile_trace_filter_plans(supported), residual
+    return (
+        compile_trace_filter_plans(supported, filter_builder_cls=filter_builder_cls),
+        residual,
+    )
 
 
 def partition_span_filter_plans(
@@ -1363,6 +1482,7 @@ def targets_span_filter_domain(filters: list[dict[str, Any]]) -> bool:
 __all__ = [
     "LatestFilterPredicate",
     "UnsupportedFilterShapeError",
+    "compile_exact_graph_filter_predicates",
     "compile_span_attribute_row_predicate",
     "compile_span_filter_plans",
     "compile_trace_filter_plans",

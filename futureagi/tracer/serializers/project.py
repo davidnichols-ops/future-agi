@@ -86,9 +86,14 @@ class ProjectGraphDataQuerySerializer(StrictInputSerializer):
         required=False,
         default=False,
         help_text=(
-            "Explicitly opt in to bounded sample points. Clients that set this "
-            "must label sampled values as estimates rather than exact totals."
+            "Deprecated compatibility parameter; accepted but ignored. "
+            "Aggregate graph results are always exact."
         ),
+    )
+    refresh = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Recompute and atomically replace the last complete exact result.",
     )
 
 

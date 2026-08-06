@@ -15,6 +15,10 @@ from tracer.serializers.monitor import (
     FetchGraphSerializer,
 )
 from tracer.services.clickhouse.graph_dispatch import graph_payload_is_publishable
+from tracer.services.filter_principal_context import (
+    FilterPrincipalContextError,
+    bind_request_my_annotations_principal,
+)
 from tracer.utils.graphs_optimized import (
     EvalGraphConfigurationError,
     EvalGraphReadError,
@@ -95,10 +99,14 @@ class ChartsView(GenericViewSet):
             validated_data = serializer.validated_data
             req_data_config = validated_data.get("req_data_config")
             interval = validated_data.get("interval")
-            filters = validated_data.get("filters")
+            filters = bind_request_my_annotations_principal(
+                request,
+                validated_data.get("filters"),
+            )
             property = validated_data.get("property")
             project_id = validated_data.get("project_id")
             allow_sampled = validated_data["allow_sampled"]
+            refresh = validated_data.get("refresh", False)
 
             if not project_id:
                 return self._gm.bad_request("Project id is required")
@@ -133,6 +141,7 @@ class ChartsView(GenericViewSet):
                     req_data_config=req_data_config,
                     eval_logger_filters={"project_id": project_id},
                     observe_type="charts",
+                    refresh=refresh,
                 )
 
             elif data_type == "SYSTEM_METRICS":
@@ -141,6 +150,7 @@ class ChartsView(GenericViewSet):
                     filters=filters,
                     property=property,
                     system_metric_filters={"project_id": project_id},
+                    refresh=refresh,
                 )
 
             elif data_type == "SYSTEM_METRIC":
@@ -151,6 +161,7 @@ class ChartsView(GenericViewSet):
                     req_data_config=req_data_config,
                     system_metric_filters={"project_id": project_id},
                     observe_type="charts",
+                    refresh=refresh,
                 )
 
             else:
@@ -177,6 +188,8 @@ class ChartsView(GenericViewSet):
             return self._gm.success_response(metric_data)
 
         except EvalGraphConfigurationError as exc:
+            return self._gm.bad_request(str(exc))
+        except FilterPrincipalContextError as exc:
             return self._gm.bad_request(str(exc))
         except (EvalGraphReadError, SystemMetricGraphReadError):
             elapsed_time = time.time() - start_time

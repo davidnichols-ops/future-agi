@@ -79,35 +79,111 @@ def _latest_created_at_spans_ctes(*, table: str, project_predicate: str) -> str:
     """
 
 
+def _entity_safe_latest_spans_ctes(*, table: str, project_predicate: str) -> str:
+    """Hydrate complete traces whose earliest span belongs to this partition."""
+
+    return f"""
+    candidate_trace_ids AS (
+        SELECT trace_id
+        FROM {table} FINAL
+        PREWHERE {project_predicate}
+          AND start_time >= %(snapshot_start_date)s
+          AND start_time < %(snapshot_end_date)s
+          AND trace_id IN (
+              SELECT DISTINCT trace_id
+              FROM {table} FINAL
+              PREWHERE {project_predicate}
+                AND start_time >= %(start_date)s
+                AND start_time < %(end_date)s
+              WHERE is_deleted = 0
+          )
+        WHERE is_deleted = 0
+        GROUP BY trace_id
+        HAVING min(start_time) >= %(start_date)s
+           AND min(start_time) < %(end_date)s
+    ),
+    latest_spans AS (
+        SELECT *
+        FROM {table} FINAL
+        PREWHERE {project_predicate}
+          AND start_time >= %(snapshot_start_date)s
+          AND start_time < %(snapshot_end_date)s
+          AND trace_id IN (SELECT trace_id FROM candidate_trace_ids)
+        WHERE is_deleted = 0
+    )
+    """
+
+
 class UserTimeSeriesQueryBuilderV2(V2RewriteMixin, UserTimeSeriesQueryBuilder):
     """Aggregate user graphs from each direct-write span's latest live row."""
 
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
     END_USER_REMAP_TABLE = "end_user_id_remap"
 
+    def __init__(
+        self,
+        *args: Any,
+        user_membership_sql: str | None = None,
+        user_membership_params: dict[str, Any] | None = None,
+        exact_snapshot_start: datetime | None = None,
+        exact_snapshot_end: datetime | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.user_membership_sql = user_membership_sql
+        self.user_membership_params = dict(user_membership_params or {})
+        if (exact_snapshot_start is None) != (exact_snapshot_end is None):
+            raise ValueError("both exact snapshot bounds are required")
+        self.exact_snapshot_start = exact_snapshot_start
+        self.exact_snapshot_end = exact_snapshot_end
+        super().__init__(*args, **kwargs)
+
     def build(self) -> tuple[str, dict[str, Any]]:
         self.start_date, self.end_date = self.parse_time_range(self.filters)
         self.params["start_date"] = self.start_date
         self.params["end_date"] = self.end_date
+        if (
+            self.exact_snapshot_start is not None
+            and self.exact_snapshot_end is not None
+        ):
+            self.params["snapshot_start_date"] = self.exact_snapshot_start
+            self.params["snapshot_end_date"] = self.exact_snapshot_end
 
-        # Compile every outer and relational filter against the replayed CTE.
-        # In particular, trace-membership subqueries now read latest_spans too,
-        # so an older matching physical version cannot revive a corrected or
-        # tombstoned span.
-        filter_builder = self._FILTER_BUILDER_CLS(
-            table="latest_spans",
-            project_id=self.project_id,
-            span_date_scope=True,
-            strict_trace_project_correlation=True,
-        )
-        extra_where, extra_params = filter_builder.translate(self.filters)
-        self.params.update(extra_params)
-        where_clause = extra_where if extra_where else "1 = 1"
+        if self.user_membership_sql:
+            # User-list fields (num_traces, num_sessions, total_cost, etc.) are
+            # full-window entity aggregates. They must be compiled once by the
+            # shared exact user selector, never reinterpreted here as raw span
+            # columns/attributes. The selector returns canonical remap-resolved
+            # user IDs and this query only reduces contributions from them.
+            self.params.update(self.user_membership_params)
+            where_clause = (
+                f"{resolved_id_expr('rs.end_user_id')} IN ({self.user_membership_sql})"
+            )
+        else:
+            # Compile every outer and relational filter against the replayed
+            # CTE. In particular, trace-membership subqueries now read
+            # latest_spans too, so an older matching physical version cannot
+            # revive a corrected or tombstoned span.
+            filter_builder = self._FILTER_BUILDER_CLS(
+                table="latest_spans",
+                project_id=self.project_id,
+                span_date_scope=True,
+                strict_trace_project_correlation=True,
+            )
+            extra_where, extra_params = filter_builder.translate(self.filters)
+            self.params.update(extra_params)
+            where_clause = extra_where if extra_where else "1 = 1"
         bucket_fn = self.time_bucket_expr(self.interval)
 
-        latest_spans_cte = _latest_start_time_spans_cte(
-            table=self.TABLE,
-            project_predicate=self.project_filter_sql(),
+        latest_spans_cte = (
+            _entity_safe_latest_spans_ctes(
+                table=self.TABLE,
+                project_predicate=self.project_filter_sql(),
+            )
+            if self.exact_snapshot_start is not None
+            else _latest_start_time_spans_cte(
+                table=self.TABLE,
+                project_predicate=self.project_filter_sql(),
+            )
         )
         remap_join = remap_left_join(
             "rs.end_user_id",

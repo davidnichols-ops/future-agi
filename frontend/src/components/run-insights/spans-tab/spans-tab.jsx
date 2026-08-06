@@ -301,7 +301,6 @@ const SpanTab = React.forwardRef(
                   project_version_id: runId,
                   page_number: pageNumber,
                   page_size: 10,
-                  allow_sampled: true,
                 },
               },
             );

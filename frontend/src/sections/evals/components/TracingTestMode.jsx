@@ -27,7 +27,12 @@ import DraggableColResizer from "src/components/draggable-col-resizer";
 import Iconify from "src/components/iconify";
 import axios, { endpoints } from "src/utils/axios";
 import { PROJECT_SOURCE } from "src/utils/constants";
+import { getSafeActionErrorMessage } from "src/utils/errorUtils";
 import { canonicalEntries } from "src/utils/utils";
+import {
+  followEmptyListContinuations,
+  listContinuationParams,
+} from "src/sections/projects/LLMTracing/listCursorPagination";
 
 import {
   InlineAudio,
@@ -56,6 +61,7 @@ import {
 import { buildCompositeRuntimeConfig } from "../Helpers/compositeRuntimeConfig";
 import { useExecuteCompositeEvalAdhoc } from "../hooks/useCompositeEval";
 import {
+  getAttributeLookupMessage,
   getQueryReadMessage,
   getQueryReadState,
 } from "src/utils/queryReadState";
@@ -221,10 +227,22 @@ export const buildTracingPreviewListParams = ({
   effectiveFilters,
 }) => ({
   project_id: selectedProjectId,
-  allow_sampled: true,
   page_number: 0,
   page_size: 50,
   filters: JSON.stringify(effectiveFilters || []),
+  cursor_mode: true,
+});
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const buildTracingVoicePreviewListParams = ({
+  selectedProjectId,
+  effectiveFilters,
+}) => ({
+  project_id: selectedProjectId,
+  page: 1,
+  page_size: 50,
+  filters: JSON.stringify(effectiveFilters || []),
+  cursor_mode: true,
 });
 
 const TracingTestMode = React.forwardRef(
@@ -487,22 +505,45 @@ const TracingTestMode = React.forwardRef(
         setRows([]);
         try {
           if (rowType === "VoiceCall") {
-            const { data } = await axios.get(endpoints.project.getCallLogs, {
-              params: {
-                project_id: selectedProjectId,
-                allow_sampled: true,
-                page: 1,
-                page_size: 50,
-                filters: JSON.stringify(effectiveFilters || []),
-              },
+            const requestParams = buildTracingVoicePreviewListParams({
+              selectedProjectId,
+              effectiveFilters,
             });
+            let response = await axios.get(endpoints.project.getCallLogs, {
+              params: requestParams,
+            });
+            response = await followEmptyListContinuations({
+              initialResponse: response,
+              rowsFromResponse: (nextResponse) => {
+                const result =
+                  nextResponse?.data?.result || nextResponse?.data || {};
+                return result.results || result.data || result.calls || [];
+              },
+              metadataFromResponse: (nextResponse) =>
+                nextResponse?.data?.result || nextResponse?.data || {},
+              nextResponse: (cursor) =>
+                axios.get(endpoints.project.getCallLogs, {
+                  params: listContinuationParams(requestParams, cursor),
+                }),
+            });
+            const { data } = response;
             if (cancelled) return;
             const result = data?.result || data || {};
-            setListReadState(getQueryReadState(data));
             const rowsOut = result.results || result.data || result.calls || [];
+            const nextReadState = getQueryReadState(data);
+            setListReadState(
+              rowsOut.length > 0 || nextReadState === "sampled"
+                ? "complete"
+                : nextReadState,
+            );
             setColumns([]);
             setRows(rowsOut);
-            setTotalRows(result.total_count || result.total || rowsOut.length);
+            setTotalRows(
+              result.count ??
+                result.total_count ??
+                result.total ??
+                rowsOut.length,
+            );
             setCurrentRowIndex(0);
             return;
           }
@@ -521,13 +562,30 @@ const TracingTestMode = React.forwardRef(
             endpoint = endpoints.project.projectSessionList();
           }
 
-          const { data } = await axios.get(endpoint, { params });
+          let response = await axios.get(endpoint, { params });
+          response = await followEmptyListContinuations({
+            initialResponse: response,
+            rowsFromResponse: (nextResponse) =>
+              nextResponse?.data?.result?.table || [],
+            metadataFromResponse: (nextResponse) =>
+              nextResponse?.data?.result?.metadata || {},
+            nextResponse: (cursor) =>
+              axios.get(endpoint, {
+                params: listContinuationParams(params, cursor),
+              }),
+          });
+          const { data } = response;
           if (cancelled) return;
           const res = data?.result || {};
-          setListReadState(getQueryReadState(data));
 
           const cols = res.config || [];
           const tableRows = res.table || [];
+          const nextReadState = getQueryReadState(data);
+          setListReadState(
+            tableRows.length > 0 || nextReadState === "sampled"
+              ? "complete"
+              : nextReadState,
+          );
           const total = res.metadata?.total_rows || tableRows.length;
 
           setColumns(cols);
@@ -1052,16 +1110,18 @@ const TracingTestMode = React.forwardRef(
             startErrorLocalizerPoll(data.result.log_id);
           }
         } else {
-          const errMsg = data?.result || "Evaluation failed";
+          // A successful HTTP response can still carry a failed evaluation.
+          // Do not treat the result payload as user-safe: provider, query, and
+          // infrastructure errors have historically been returned here.
+          const errMsg = "Evaluation failed. Please retry.";
           setError(errMsg);
           onTestResult?.(false, errMsg);
         }
       } catch (err) {
-        const errMsg =
-          err?.result ||
-          err?.detail ||
-          err?.message ||
-          "Failed to run evaluation";
+        const errMsg = getSafeActionErrorMessage(
+          err,
+          "Failed to run evaluation. Please retry.",
+        );
         setError(errMsg);
         onTestResult?.(false, errMsg);
       } finally {
@@ -1693,7 +1753,7 @@ const TracingTestMode = React.forwardRef(
             const mappingDisabledTooltip = isFetchingColumns
               ? "Columns are being fetched"
               : "";
-            const exactAttributeReadMessage = getQueryReadMessage(
+            const exactAttributeReadMessage = getAttributeLookupMessage(
               exactAttributeReadState,
             );
             return (

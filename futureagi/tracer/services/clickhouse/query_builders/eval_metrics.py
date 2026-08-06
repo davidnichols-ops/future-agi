@@ -253,7 +253,8 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         query = f"""
         SELECT
             {bucket_fn}(created_at) AS time_bucket,
-            ifNotFinite(avg(output_float) * 100, NULL) AS value
+            ifNotFinite(avg(output_float) * 100, NULL) AS value,
+            count() AS primary_traffic
         FROM {raw_table} AS raw_eval_logger FINAL
         WHERE {live_predicate}
           AND custom_eval_config_id = toUUID(%(eval_config_id)s)
@@ -304,7 +305,8 @@ class EvalMetricsQueryBuilder(BaseQueryBuilder):
         SELECT
             {bucket_fn}(created_at) AS time_bucket,
             ifNotFinite(avg(CASE WHEN output_bool = 1 THEN 100.0 ELSE 0.0 END), NULL)
-                AS value
+                AS value,
+            count() AS primary_traffic
         FROM {raw_table} AS raw_eval_logger FINAL
         WHERE {live_predicate}
           AND custom_eval_config_id = toUUID(%(eval_config_id)s)

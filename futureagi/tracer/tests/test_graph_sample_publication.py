@@ -1,4 +1,4 @@
-"""Public graph values require an explicit client sample capability."""
+"""Public aggregate graphs never publish sampled values."""
 
 from inspect import unwrap
 from types import SimpleNamespace
@@ -24,8 +24,8 @@ def _sampled_series(**overrides):
 
 
 @pytest.mark.unit
-def test_exact_and_legacy_graph_payloads_remain_publishable():
-    assert graph_payload_is_publishable(
+def test_only_explicit_exact_or_empty_pending_graph_payloads_are_publishable():
+    assert not graph_payload_is_publishable(
         {"metric_name": "latency", "data": []},
         allow_sampled=False,
     )
@@ -35,17 +35,29 @@ def test_exact_and_legacy_graph_payloads_remain_publishable():
             "data": [],
             "query_complete": True,
             "query_status": "complete",
+            "query_sampled": False,
+        },
+        allow_sampled=False,
+    )
+    assert graph_payload_is_publishable(
+        {
+            "metric_name": "latency",
+            "data": [],
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+            "query_refreshing": True,
         },
         allow_sampled=False,
     )
 
 
 @pytest.mark.unit
-def test_sampled_graph_requires_explicit_opt_in():
+def test_sampled_graph_is_rejected_even_with_legacy_opt_in():
     sample = _sampled_series()
 
     assert not graph_payload_is_publishable(sample, allow_sampled=False)
-    assert graph_payload_is_publishable(sample, allow_sampled=True)
+    assert not graph_payload_is_publishable(sample, allow_sampled=True)
 
 
 @pytest.mark.unit
@@ -110,7 +122,7 @@ def test_project_system_graph_view_fails_closed_without_opt_in(monkeypatch):
         return unwrap(project_view.ProjectView.get_graph_data)(view, request)
 
     assert call(False).status_code == 503
-    assert call(True).status_code == 200
+    assert call(True).status_code == 503
 
 
 @pytest.mark.unit
@@ -148,7 +160,7 @@ def test_users_aggregate_graph_view_fails_closed_without_opt_in(monkeypatch):
         )
 
     assert call(False).status_code == 503
-    assert call(True).status_code == 200
+    assert call(True).status_code == 503
 
 
 @pytest.mark.unit
@@ -187,7 +199,7 @@ def test_public_charts_view_fails_closed_without_opt_in(monkeypatch):
         return unwrap(charts_view.ChartsView.fetch_graph)(view, request)
 
     assert call(False).status_code == 503
-    assert call(True).status_code == 200
+    assert call(True).status_code == 503
 
 
 @pytest.mark.unit
@@ -234,4 +246,4 @@ def test_session_graph_view_fails_closed_without_opt_in_and_clears_points(
     rejected = call(False)
     assert rejected.status_code == 503
     assert rejected.data["result"]["data"] == []
-    assert call(True).status_code == 200
+    assert call(True).status_code == 503

@@ -1,4 +1,3 @@
-/* eslint-disable react/prop-types */
 import React, {
   useState,
   useEffect,
@@ -6,6 +5,7 @@ import React, {
   useCallback,
   useRef,
 } from "react";
+import PropTypes from "prop-types";
 import {
   Alert,
   Box,
@@ -81,6 +81,7 @@ import {
   fromAxisConfigPayload,
   getAggColumnLabel,
   getAutoDecimals,
+  getExactDashboardResult,
   getDashboardMetricSeriesState,
   getSeriesAverage,
   getSuggestedUnitConfig,
@@ -88,7 +89,12 @@ import {
   getYAxisRangeWarning,
   toAxisConfigPayload,
 } from "./widgetUtils";
-import { getQueryReadMessage } from "src/utils/queryReadState";
+import {
+  AGGREGATION_PREPARING_MESSAGE,
+  getAggregationPollDelay,
+  getAggregationRefreshState,
+  getExactAggregationReadState,
+} from "src/utils/queryReadState";
 import {
   AGGREGATION_OPTIONS,
   ALL_AGGREGATIONS,
@@ -435,6 +441,18 @@ function ToggleButtons({ options, value, onChange, theme }) {
   );
 }
 
+ToggleButtons.propTypes = {
+  options: PropTypes.arrayOf(
+    PropTypes.shape({
+      label: PropTypes.node.isRequired,
+      value: PropTypes.any,
+    }),
+  ).isRequired,
+  value: PropTypes.any,
+  onChange: PropTypes.func.isRequired,
+  theme: PropTypes.object.isRequired,
+};
+
 function AxisSection({ title, config, onChange, theme, showReset, onReset }) {
   return (
     <Box sx={{ mb: 3 }}>
@@ -698,6 +716,15 @@ function AxisSection({ title, config, onChange, theme, showReset, onReset }) {
   );
 }
 
+AxisSection.propTypes = {
+  title: PropTypes.string.isRequired,
+  config: PropTypes.object.isRequired,
+  onChange: PropTypes.func.isRequired,
+  theme: PropTypes.object.isRequired,
+  showReset: PropTypes.bool,
+  onReset: PropTypes.func,
+};
+
 function AggregationPicker({
   value,
   onChange,
@@ -884,6 +911,19 @@ function AggregationPicker({
   );
 }
 
+AggregationPicker.propTypes = {
+  value: PropTypes.string.isRequired,
+  onChange: PropTypes.func.isRequired,
+  theme: PropTypes.object.isRequired,
+  extraOptions: PropTypes.arrayOf(
+    PropTypes.shape({
+      label: PropTypes.string.isRequired,
+      value: PropTypes.string.isRequired,
+    }),
+  ),
+  allowedAggregations: PropTypes.arrayOf(PropTypes.string),
+};
+
 // Filter value picker popup — fetches distinct values for a given attribute
 function FilterValuePickerPopup({
   anchorEl,
@@ -1065,6 +1105,14 @@ function FilterValuePickerPopup({
   );
 }
 
+FilterValuePickerPopup.propTypes = {
+  anchorEl: PropTypes.object,
+  filter: PropTypes.object,
+  onClose: PropTypes.func.isRequired,
+  onApply: PropTypes.func.isRequired,
+  source: PropTypes.string.isRequired,
+};
+
 export default function WidgetEditorView() {
   const theme = useTheme();
   const navigate = useNavigate();
@@ -1082,7 +1130,14 @@ export default function WidgetEditorView() {
   const updateMutation = useUpdateWidget();
   const deleteMutation = useDeleteWidget();
   const queryMutation = useDashboardQuery();
+  const mutateDashboardQuery = queryMutation.mutate;
+  const resetDashboardQuery = queryMutation.reset;
   const { data: simulationAgents = [] } = useSimulationAgents();
+  const [lastExactPreview, setLastExactPreview] = useState(null);
+  const currentPreviewSignatureRef = useRef("");
+  const previewPollTimerRef = useRef(null);
+  const previewGenerationRef = useRef(0);
+  const [isPreviewRefreshing, setIsPreviewRefreshing] = useState(false);
 
   // Build a map: agent_definition_id → observability project for cross-source correlation
   const simAgentObsMap = useMemo(() => {
@@ -1805,6 +1860,92 @@ export default function WidgetEditorView() {
     };
   }, [timePreset, customDateRange, granularity, metrics, filters, breakdowns]);
 
+  const previewQueryConfig = buildQueryConfig();
+  const previewQuerySignature = JSON.stringify(previewQueryConfig);
+  currentPreviewSignatureRef.current = previewQuerySignature;
+
+  useEffect(() => {
+    previewGenerationRef.current += 1;
+    clearTimeout(previewPollTimerRef.current);
+    previewPollTimerRef.current = null;
+    setIsPreviewRefreshing(false);
+  }, [previewQuerySignature]);
+
+  useEffect(
+    () => () => {
+      previewGenerationRef.current += 1;
+      clearTimeout(previewPollTimerRef.current);
+    },
+    [],
+  );
+
+  const runPreviewQuery = useCallback(
+    (queryConfig, { refresh = false } = {}) => {
+      const signature = JSON.stringify(queryConfig);
+      const generation = previewGenerationRef.current + 1;
+      previewGenerationRef.current = generation;
+      clearTimeout(previewPollTimerRef.current);
+      previewPollTimerRef.current = null;
+      let pollAttempt = 0;
+      let refreshWasQueued = false;
+
+      const isCurrent = () =>
+        previewGenerationRef.current === generation &&
+        currentPreviewSignatureRef.current === signature;
+
+      const schedulePoll = () => {
+        if (!isCurrent() || previewPollTimerRef.current !== null) return;
+        const delay = getAggregationPollDelay(pollAttempt);
+        pollAttempt += 1;
+        previewPollTimerRef.current = window.setTimeout(() => {
+          previewPollTimerRef.current = null;
+          execute(false);
+        }, delay);
+      };
+
+      const execute = (forceRefresh) => {
+        mutateDashboardQuery(
+          { queryConfig, refresh: forceRefresh },
+          {
+            onSuccess: (response) => {
+              if (!isCurrent()) return;
+
+              const exactResult = getExactDashboardResult(response);
+              const { isRefreshing, refreshFailed } =
+                getAggregationRefreshState(response);
+              const readState = getExactAggregationReadState(response);
+              if (exactResult) {
+                setLastExactPreview({ signature, result: exactResult });
+              }
+              if (
+                isRefreshing &&
+                !refreshFailed &&
+                (exactResult || readState === "pending")
+              ) {
+                refreshWasQueued = true;
+                setIsPreviewRefreshing(true);
+                schedulePoll();
+                return;
+              }
+              setIsPreviewRefreshing(false);
+            },
+            onError: () => {
+              if (!isCurrent()) return;
+              if (refreshWasQueued) {
+                schedulePoll();
+                return;
+              }
+              setIsPreviewRefreshing(false);
+            },
+          },
+        );
+      };
+
+      execute(refresh);
+    },
+    [mutateDashboardQuery],
+  );
+
   // Auto-preview when config changes (debounced)
   const previewTimerRef = useRef(null);
   useEffect(() => {
@@ -1812,10 +1953,10 @@ export default function WidgetEditorView() {
     if (metrics.length > 0 && !customWithoutRange) {
       clearTimeout(previewTimerRef.current);
       previewTimerRef.current = setTimeout(() => {
-        queryMutation.mutate(buildQueryConfig());
+        runPreviewQuery(buildQueryConfig());
       }, 400);
     } else {
-      queryMutation.reset();
+      resetDashboardQuery();
     }
     return () => clearTimeout(previewTimerRef.current);
   }, [
@@ -1839,6 +1980,8 @@ export default function WidgetEditorView() {
         .map((f) => ({ id: f.id, op: f.operator, val: f.value })),
     ),
     JSON.stringify(breakdowns.filter((b) => b.id).map((b) => b.id)),
+    runPreviewQuery,
+    resetDashboardQuery,
   ]);
 
   const openPicker = (e, mode, targetIndex = null, metricIndex = null) => {
@@ -2105,19 +2248,16 @@ export default function WidgetEditorView() {
 
   // Chart preview
   // Backend returns: { metrics: [{ name, aggregation, unit, series: [{ name, data: [{ timestamp, value }] }] }] }
-  const previewResult = queryMutation.data?.data?.result;
-  const {
-    renderableMetrics: previewRenderableMetrics,
-    series: previewSeries,
-    hasSampledMetrics: hasSampledPreviewMetrics,
-    hasDegradedMetrics: hasDegradedPreviewMetrics,
-  } = useMemo(
-    () =>
-      getDashboardMetricSeriesState(
-        queryMutation.isError ? [] : previewResult?.metrics,
-      ),
-    [previewResult?.metrics, queryMutation.isError],
-  );
+  const activeExactPreview =
+    lastExactPreview?.signature === previewQuerySignature
+      ? lastExactPreview
+      : null;
+  const previewResult = activeExactPreview?.result;
+  const { renderableMetrics: previewRenderableMetrics, series: previewSeries } =
+    useMemo(
+      () => getDashboardMetricSeriesState(previewResult?.metrics),
+      [previewResult?.metrics],
+    );
 
   // Auto-select top 10 series when there are more than 10 breakdown series
   const MAX_CHART_SERIES = 10;
@@ -2807,9 +2947,15 @@ export default function WidgetEditorView() {
     metrics.length > 0 && !(timePreset === "custom" && !customDateRange);
 
   const previewLoading =
-    queryMutation.isPending ||
+    (queryMutation.isPending && !activeExactPreview) ||
     (isEditing && !initialized) ||
-    (canPreview && queryMutation.isIdle);
+    (canPreview && queryMutation.isIdle && !activeExactPreview);
+
+  const emptyPreviewMessage = canPreview
+    ? activeExactPreview
+      ? "No data for this selection"
+      : AGGREGATION_PREPARING_MESSAGE
+    : "Fill in the required fields to see preview";
 
   const cleanupDragRef = useRef(null);
   const handleDragStart = useCallback(
@@ -3128,18 +3274,24 @@ export default function WidgetEditorView() {
           </MenuItem>
           <Divider />
           <MenuItem
-            disabled={metrics.length === 0}
+            disabled={metrics.length === 0 || isPreviewRefreshing}
             onClick={() => {
               setMoreMenuAnchor(null);
               if (metrics.length > 0) {
-                queryMutation.mutate(buildQueryConfig());
+                runPreviewQuery(buildQueryConfig(), { refresh: true });
               }
             }}
           >
             <ListItemIcon>
-              <Iconify icon="mdi:refresh" width={18} />
+              {isPreviewRefreshing ? (
+                <CircularProgress size={16} />
+              ) : (
+                <Iconify icon="mdi:refresh" width={18} />
+              )}
             </ListItemIcon>
-            <ListItemText>Refresh Data</ListItemText>
+            <ListItemText>
+              {isPreviewRefreshing ? "Refreshing Data" : "Refresh Data"}
+            </ListItemText>
           </MenuItem>
         </Menu>
 
@@ -3354,25 +3506,6 @@ export default function WidgetEditorView() {
               overflow: "hidden",
             }}
           >
-            {!previewLoading &&
-              (hasSampledPreviewMetrics ||
-                hasDegradedPreviewMetrics ||
-                queryMutation.isError) && (
-                <Stack gap={0.5} sx={{ width: "100%", px: 1, pt: 0.5 }}>
-                  {hasSampledPreviewMetrics && (
-                    <Alert severity="warning" sx={{ py: 0 }}>
-                      {getQueryReadMessage("sampled")}
-                    </Alert>
-                  )}
-                  {(hasDegradedPreviewMetrics || queryMutation.isError) && (
-                    <Alert severity="error" sx={{ py: 0 }}>
-                      {getQueryReadMessage(
-                        queryMutation.isError ? "error" : "degraded",
-                      )}
-                    </Alert>
-                  )}
-                </Stack>
-              )}
             {/* Bar chart — horizontal bars (left) + search/checkboxes (right) */}
             {isHorizontal && previewLoading && (
               <Box
@@ -3396,7 +3529,7 @@ export default function WidgetEditorView() {
                 }}
               >
                 <Typography variant="body2" color="text.secondary">
-                  Fill in the required fields to see preview
+                  {emptyPreviewMessage}
                 </Typography>
               </Box>
             )}
@@ -4089,7 +4222,7 @@ export default function WidgetEditorView() {
                   </Box>
                 ) : (
                   <Typography variant="body2" color="text.secondary">
-                    Fill in the required fields to see preview
+                    {emptyPreviewMessage}
                   </Typography>
                 )}
               </Box>

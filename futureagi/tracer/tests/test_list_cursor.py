@@ -6,11 +6,15 @@ import pytest
 from django.test import override_settings
 
 from tracer.serializers.observation_span import SpanObserveListQuerySerializer
-from tracer.serializers.trace import TraceObserveListQuerySerializer
+from tracer.serializers.trace import (
+    TraceObserveListQuerySerializer,
+    TraceVoiceCallListQuerySerializer,
+)
 from tracer.services.clickhouse.list_cursor import (
     ListCursorError,
     capture_snapshot_version_ceiling,
     cursor_page_metadata,
+    cursor_requires_relation_snapshot,
     cursor_scope_for_request,
     decode_list_cursor,
     encode_list_cursor,
@@ -97,6 +101,34 @@ def test_cursor_round_trip_preserves_datetime_and_complete_order_tuple():
     assert cursor.order == values["order"]
     assert cursor.version_ceiling == values["version_ceiling"]
     assert cursor.seen_rows == 25
+
+
+def test_cursor_round_trip_preserves_relation_snapshot_and_scan_checkpoint():
+    token, values = _token(
+        relation_version_ceilings={
+            "spans": 1_785_742_808_330_811_452,
+            "model_hub_score": 918,
+        },
+        scan_slice_end=datetime(2026, 6, 30, 12, tzinfo=UTC),
+        scan_before_start_time=datetime(2026, 6, 30, 11, 59, tzinfo=UTC),
+        scan_before_id="candidate-9",
+    )
+
+    cursor = decode_list_cursor(
+        token,
+        resource=values["resource"],
+        scope=values["scope"],
+        query=values["query"],
+        page_size=values["page_size"],
+    )
+
+    assert cursor.relation_version_ceilings == {
+        "spans": values["version_ceiling"],
+        "model_hub_score": 918,
+    }
+    assert cursor.scan_slice_end == datetime(2026, 6, 30, 12, tzinfo=UTC)
+    assert cursor.scan_before_start_time == datetime(2026, 6, 30, 11, 59, tzinfo=UTC)
+    assert cursor.scan_before_id == "candidate-9"
 
 
 def test_cursor_normalizes_filter_order_and_in_value_order():
@@ -309,6 +341,45 @@ def test_observe_list_serializers_keep_numbered_deep_pages_backward_compatible(
     assert serializer.validated_data["cursor_mode"] is False
 
 
+def test_voice_list_serializer_accepts_one_based_additive_cursor_mode():
+    serializer = TraceVoiceCallListQuerySerializer(
+        data={
+            "project_id": "00000000-0000-4000-8000-000000000001",
+            "cursor_mode": True,
+            "page": 1,
+        }
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["cursor_mode"] is True
+
+
+def test_voice_list_serializer_rejects_cursor_with_explicit_numbered_page():
+    serializer = TraceVoiceCallListQuerySerializer(
+        data={
+            "project_id": "00000000-0000-4000-8000-000000000001",
+            "cursor": "opaque",
+            "page": 2,
+        }
+    )
+
+    assert not serializer.is_valid()
+    assert "cursor" in serializer.errors
+
+
+def test_voice_list_serializer_keeps_numbered_pages_backward_compatible():
+    serializer = TraceVoiceCallListQuerySerializer(
+        data={
+            "project_id": "00000000-0000-4000-8000-000000000001",
+            "page": 2,
+        }
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["page"] == 2
+    assert serializer.validated_data["cursor_mode"] is False
+
+
 def _filter(column_id, *, col_type="SPAN_ATTRIBUTE", filter_type="text"):
     filter_value = {"tier": "value"} if filter_type in {"map", "json"} else "value"
     return {
@@ -331,6 +402,7 @@ def test_snapshot_cursor_accepts_span_local_scalar_map_and_json_filters(resource
     ]
 
     assert snapshot_cursor_supported(filters, resource=resource) is True
+    assert cursor_requires_relation_snapshot(filters, resource=resource) is False
 
 
 @pytest.mark.parametrize("resource", ["observe_traces", "observe_spans"])
@@ -342,10 +414,9 @@ def test_snapshot_cursor_accepts_span_local_scalar_map_and_json_filters(resource
         _filter("user_id", col_type="TRACE_END_USER"),
     ],
 )
-def test_snapshot_cursor_falls_back_for_independently_mutable_relations(
-    resource, filter_item
-):
-    assert snapshot_cursor_supported([filter_item], resource=resource) is False
+def test_snapshot_cursor_freezes_independently_mutable_relations(resource, filter_item):
+    assert snapshot_cursor_supported([filter_item], resource=resource) is True
+    assert cursor_requires_relation_snapshot([filter_item], resource=resource) is True
 
 
 def test_legacy_fallback_omits_cursor_metadata_even_when_more_rows_exist():
@@ -375,12 +446,22 @@ def test_cursor_metadata_never_claims_terminal_without_a_required_continuation()
         seen_rows=25,
         next_cursor="opaque",
     ) == {
-        "total_rows": 26,
+        "total_rows": 25,
         "total_rows_exact": None,
         "total_rows_is_lower_bound": True,
         "has_more": True,
         "next_cursor": "opaque",
     }
+    assert (
+        cursor_page_metadata(
+            enabled=True,
+            has_more=True,
+            seen_rows=25,
+            next_cursor="opaque",
+            unseen_row_proven=True,
+        )["total_rows"]
+        == 26
+    )
 
 
 def test_terminal_cursor_metadata_reports_the_exact_seen_total():

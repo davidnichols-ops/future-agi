@@ -1,21 +1,37 @@
 export const QUERY_READ_RETRY_MESSAGE =
-  "Results are incomplete. Please retry in a moment.";
+  "Some results could not be loaded. Please try again.";
 
-export const QUERY_READ_SAMPLED_MESSAGE =
-  "Results are incomplete and sample-limited; values are estimates.";
+export const QUERY_READ_SAMPLED_MESSAGE = "Showing the newest matching rows.";
 
-export const QUERY_READ_BOUNDED_TOTAL_MESSAGE =
-  "Row results are complete; only the total count is estimated.";
+export const FILTER_VALUE_SAMPLED_MESSAGE =
+  "Recent values — search or enter an exact value.";
+
+export const FILTER_VALUE_UNAVAILABLE_MESSAGE =
+  "Suggestions are temporarily unavailable. Enter an exact value or retry.";
+
+export const ATTRIBUTE_LOOKUP_SAMPLED_MESSAGE =
+  "Recent matching attributes are shown. Enter an exact attribute name if needed.";
+
+export const ATTRIBUTE_LOOKUP_UNAVAILABLE_MESSAGE =
+  "Attribute suggestions are temporarily unavailable. Enter an exact attribute name.";
 
 export const QUERY_FAILED_RETRY_MESSAGE =
   "We couldn't load this data. Please retry in a moment.";
 
+export const AGGREGATION_PREPARING_MESSAGE = "Preparing exact data…";
+
 const payloadCandidates = (payload) => {
+  const responseData =
+    payload?.data && !Array.isArray(payload.data) ? payload.data : null;
   const candidates = [
     payload,
+    responseData,
     payload?.result,
+    responseData?.result,
     payload?.metadata,
     payload?.result?.metadata,
+    responseData?.metadata,
+    responseData?.result?.metadata,
   ]
     .flatMap((candidate) =>
       Array.isArray(candidate) ? candidate : [candidate],
@@ -57,9 +73,24 @@ const hasValidStatusPair = (candidate) => {
   if (status === "sampled") {
     return complete === false && candidate?.query_sampled !== false;
   }
+  if (status === "pending") {
+    return (
+      complete === false &&
+      candidate?.query_sampled === false &&
+      (candidate?.query_refreshing === true ||
+        candidate?.query_refresh_failed === true)
+    );
+  }
   if (status === "degraded") return complete === false;
   return false;
 };
+
+const isPendingAggregationCandidate = (candidate) =>
+  candidate?.query_complete === false &&
+  candidate?.query_status === "pending" &&
+  candidate?.query_sampled === false &&
+  (candidate?.query_refreshing === true ||
+    candidate?.query_refresh_failed === true);
 
 const hasCompleteSamplingCoverage = (candidate) => {
   const planned = candidate?.query_sampling_strata;
@@ -123,10 +154,194 @@ export function getQueryReadState(payload, { isError = false } = {}) {
   return sampled ? "sampled" : "complete";
 }
 
+/**
+ * Aggregation endpoints publish an explicit exactness contract. Unlike list
+ * reads, they must fail closed when that contract is missing: an unmarked
+ * payload is never safe to chart as an exact aggregate.
+ */
+export function getExactAggregationReadState(
+  payload,
+  { isError = false } = {},
+) {
+  if (isError) return "error";
+
+  const responseData =
+    payload?.data && !Array.isArray(payload.data) ? payload.data : null;
+  const authoritativeValue =
+    responseData?.result ?? payload?.result ?? responseData ?? payload;
+  let authoritativeCandidates = Array.isArray(authoritativeValue)
+    ? authoritativeValue.filter(Boolean)
+    : [authoritativeValue].filter(Boolean);
+
+  // Some array-shaped aggregation endpoints attach the contract to the
+  // response wrapper when the result itself is empty.
+  if (authoritativeCandidates.length === 0) {
+    authoritativeCandidates = [responseData, payload].filter(
+      hasBoundedReadMetadata,
+    );
+  }
+  if (
+    authoritativeCandidates.length === 0 ||
+    authoritativeCandidates.some(
+      (candidate) =>
+        !hasBoundedReadMetadata(candidate) || !hasValidStatusPair(candidate),
+    )
+  ) {
+    return "degraded";
+  }
+
+  if (authoritativeCandidates.some(isPendingAggregationCandidate)) {
+    return authoritativeCandidates.every(
+      (candidate) =>
+        isPendingAggregationCandidate(candidate) ||
+        (candidate?.query_complete === true &&
+          candidate?.query_status === "complete" &&
+          candidate?.query_sampled === false &&
+          !candidate?.query_error_code),
+    )
+      ? "pending"
+      : "degraded";
+  }
+
+  const authoritativeSampled = authoritativeCandidates.filter(
+    (candidate) => candidate?.query_status === "sampled",
+  );
+  if (authoritativeSampled.length > 0) {
+    return authoritativeSampled.length === authoritativeCandidates.length &&
+      authoritativeSampled.every(hasCompleteSamplingCoverage)
+      ? "sampled"
+      : "degraded";
+  }
+  if (
+    authoritativeCandidates.some(
+      (candidate) =>
+        candidate?.query_complete !== true ||
+        candidate?.query_status !== "complete" ||
+        candidate?.query_sampled !== false ||
+        candidate?.query_error_code,
+    )
+  ) {
+    return "degraded";
+  }
+
+  const boundedCandidates = payloadCandidates(payload).filter(
+    hasBoundedReadMetadata,
+  );
+  if (boundedCandidates.some((candidate) => !hasValidStatusPair(candidate))) {
+    return "degraded";
+  }
+  if (
+    boundedCandidates.some(
+      (candidate) =>
+        candidate?.query_status === "degraded" ||
+        (candidate?.query_complete === false &&
+          candidate?.query_status !== "sampled" &&
+          candidate?.query_status !== "pending"),
+    )
+  ) {
+    return "degraded";
+  }
+
+  if (boundedCandidates.some(isPendingAggregationCandidate)) return "pending";
+
+  const sampledCandidates = boundedCandidates.filter(
+    (candidate) => candidate?.query_status === "sampled",
+  );
+  if (sampledCandidates.length > 0) {
+    return sampledCandidates.every(hasCompleteSamplingCoverage)
+      ? "sampled"
+      : "degraded";
+  }
+
+  return "complete";
+}
+
+/**
+ * Queued exact reads keep rendering their prior exact snapshot, when one
+ * exists, while the client polls the ordinary (non-refresh) request. A failed
+ * queued job is terminal until the user explicitly asks to refresh again.
+ */
+export function getAggregationRefreshState(payload) {
+  const candidates = payloadCandidates(payload);
+  return {
+    isRefreshing: candidates.some(
+      (candidate) => candidate?.query_refreshing === true,
+    ),
+    refreshFailed: candidates.some(
+      (candidate) => candidate?.query_refresh_failed === true,
+    ),
+  };
+}
+
+const AGGREGATION_POLL_DELAYS_MS = [1000, 2000, 4000, 8000];
+
+/** Exponential polling cadence capped at eight seconds. */
+export function getAggregationPollDelay(attempt = 0) {
+  const index = Math.min(
+    Math.max(Number.isInteger(attempt) ? attempt : 0, 0),
+    AGGREGATION_POLL_DELAYS_MS.length - 1,
+  );
+  return AGGREGATION_POLL_DELAYS_MS[index];
+}
+
 export function getQueryReadMessage(state) {
   if (state === "sampled") return QUERY_READ_SAMPLED_MESSAGE;
   if (state === "degraded") return QUERY_READ_RETRY_MESSAGE;
   if (state === "error") return QUERY_FAILED_RETRY_MESSAGE;
+  return null;
+}
+
+/**
+ * Exact aggregation responses may be served from a persisted snapshot. The
+ * backend exposes the time that exact computation completed as an ISO-8601
+ * `query_completed_at` field. Missing or malformed timestamps stay absent;
+ * completion labels must never substitute the browser's clock.
+ */
+export function getQueryCompletedAt(payload) {
+  const raw = payloadCandidates(payload)
+    .map((candidate) => candidate?.query_completed_at)
+    .find(Boolean);
+  const parsed = raw ? new Date(raw) : null;
+  if (parsed && !Number.isNaN(parsed.getTime())) return parsed;
+  return null;
+}
+
+/**
+ * Filter-value pages have a deliberately smaller sampling contract than graph
+ * responses. A valid sampled page carries the status triplet plus its values,
+ * but no graph-specific stratum/per-bucket metadata. Keep this endpoint-aware
+ * interpretation separate so graph rendering continues to fail closed when
+ * coverage metadata is missing.
+ */
+export function getFilterValueReadState(payload, { isError = false } = {}) {
+  if (isError) return "error";
+
+  const result = payload?.result ?? payload;
+  if (
+    Array.isArray(result?.values) &&
+    result?.query_complete === false &&
+    result?.query_status === "sampled" &&
+    result?.query_error_code === "sample_limit"
+  ) {
+    return "sampled";
+  }
+
+  return getQueryReadState(payload);
+}
+
+export function getFilterValueReadMessage(state) {
+  if (state === "sampled") return FILTER_VALUE_SAMPLED_MESSAGE;
+  if (state === "degraded" || state === "error") {
+    return FILTER_VALUE_UNAVAILABLE_MESSAGE;
+  }
+  return null;
+}
+
+export function getAttributeLookupMessage(state) {
+  if (state === "sampled") return ATTRIBUTE_LOOKUP_SAMPLED_MESSAGE;
+  if (state === "degraded" || state === "error") {
+    return ATTRIBUTE_LOOKUP_UNAVAILABLE_MESSAGE;
+  }
   return null;
 }
 
@@ -139,7 +354,7 @@ export function getQueryReadMessage(state) {
  * because it carries points alongside `query_complete: false`.
  */
 export function getExactGraphData(payload) {
-  if (getQueryReadState(payload) !== "complete") return [];
+  if (getExactAggregationReadState(payload) !== "complete") return [];
 
   const data = payload?.data ?? payload?.result?.data;
   return Array.isArray(data) ? data : [];

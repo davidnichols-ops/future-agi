@@ -35,8 +35,8 @@ import TraceFilterPanel from "../LLMTracing/TraceFilterPanel";
 import FilterChips from "../LLMTracing/FilterChips";
 import { buildApiFilterFromPanelRow } from "src/api/contracts/filter-contract";
 import {
-  getQueryReadMessage,
-  getQueryReadState,
+  AGGREGATION_PREPARING_MESSAGE,
+  getExactAggregationReadState,
 } from "src/utils/queryReadState";
 
 const DateRangeButtonOptions = [
@@ -293,7 +293,6 @@ const ChartsView = () => {
           project_id: observeId,
           filters: JSON.stringify(filters),
           interval: selectedInterval?.toLowerCase(),
-          allow_sampled: true,
         },
       });
       return response.data;
@@ -302,19 +301,19 @@ const ChartsView = () => {
   });
 
   const systemMetrics = graphData?.result?.system_metrics;
-  const graphReadState = getQueryReadState(systemMetrics, {
+  const graphReadState = getExactAggregationReadState(systemMetrics, {
     isError: graphError,
   });
-  const graphReadMessage = getQueryReadMessage(graphReadState);
+  const graphReadMessage =
+    graphReadState === "complete" ? null : AGGREGATION_PREPARING_MESSAGE;
 
   const chartCategories = useMemo(() => {
     if (
-      (graphReadState === "complete" || graphReadState === "sampled") &&
+      graphReadState === "complete" &&
       systemMetrics &&
       Object.keys(systemMetrics)?.length > 0
     ) {
       setIsData(true);
-      const samplePrefix = graphReadState === "sampled" ? "Sampled " : "";
       return [
         {
           label: "System Metrics",
@@ -327,7 +326,7 @@ const ChartsView = () => {
               isEvaluationChart: false,
               series: [
                 {
-                  name: `${samplePrefix}Latency`,
+                  name: "Latency",
                   data:
                     systemMetrics?.latency?.map((item) => ({
                       x: normalizeTimestamp(item?.timestamp),
@@ -344,7 +343,7 @@ const ChartsView = () => {
               isEvaluationChart: false,
               series: [
                 {
-                  name: `${samplePrefix}Tokens`,
+                  name: "Tokens",
                   data:
                     systemMetrics?.tokens?.map((item) => ({
                       x: normalizeTimestamp(item?.timestamp),
@@ -361,7 +360,7 @@ const ChartsView = () => {
               isEvaluationChart: false,
               series: [
                 {
-                  name: `${samplePrefix}Traffic`,
+                  name: "Traffic",
                   data:
                     systemMetrics?.traffic?.map((item) => ({
                       x: normalizeTimestamp(item?.timestamp),
@@ -378,7 +377,7 @@ const ChartsView = () => {
               isEvaluationChart: false,
               series: [
                 {
-                  name: `${samplePrefix}Cost`,
+                  name: "Cost",
                   data:
                     systemMetrics?.cost?.map((item) => ({
                       x: normalizeTimestamp(item?.timestamp),
@@ -582,7 +581,7 @@ const ChartsView = () => {
           <Typography
             role="status"
             variant="caption"
-            color={graphReadState === "sampled" ? "warning.main" : "error.main"}
+            color="text.secondary"
             sx={{ display: "block", mb: 1 }}
           >
             {graphReadMessage}

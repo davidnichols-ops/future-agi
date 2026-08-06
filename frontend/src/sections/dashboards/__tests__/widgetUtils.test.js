@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   fromAxisConfigPayload,
   getAggColumnLabel,
+  getExactDashboardResult,
   getDashboardMetricSeriesState,
   getYAxisRangeWarning,
   seriesHasDataPoints,
@@ -156,8 +157,16 @@ describe("getDashboardMetricSeriesState", () => {
     query_sample_per_bucket: 128,
     series: [{ name: "total", data: [point] }],
   };
+  const completeMetric = {
+    name: "latency",
+    aggregation: "avg",
+    query_complete: true,
+    query_status: "complete",
+    query_sampled: false,
+    series: [{ name: "total", data: [point] }],
+  };
 
-  it("labels sampled series and excludes degraded siblings", () => {
+  it("fails sampled and degraded metrics closed", () => {
     const degradedMetric = {
       name: "latency",
       aggregation: "avg",
@@ -174,11 +183,8 @@ describe("getDashboardMetricSeriesState", () => {
 
     expect(state.hasSampledMetrics).toBe(true);
     expect(state.hasDegradedMetrics).toBe(true);
-    expect(state.series).toHaveLength(1);
-    expect(state.series[0].name).toBe(
-      "final_status (count_distinct) (sampled)",
-    );
-    expect(state.series[0].metricName).toBe("final_status");
+    expect(state.renderableMetrics).toEqual([]);
+    expect(state.series).toEqual([]);
   });
 
   it("fails closed instead of plotting a malformed sample", () => {
@@ -189,6 +195,108 @@ describe("getDashboardMetricSeriesState", () => {
     expect(state.hasSampledMetrics).toBe(false);
     expect(state.hasDegradedMetrics).toBe(true);
     expect(state.series).toEqual([]);
+  });
+
+  it("keeps a pending metric non-renderable while an exact snapshot is built", () => {
+    const state = getDashboardMetricSeriesState([
+      {
+        ...completeMetric,
+        query_complete: false,
+        query_status: "pending",
+        query_refreshing: true,
+        series: [],
+      },
+    ]);
+
+    expect(state.hasPendingMetrics).toBe(true);
+    expect(state.renderableMetrics).toEqual([]);
+    expect(state.series).toEqual([]);
+  });
+
+  it.each([
+    ["sampled", sampledMetric, true, false],
+    [
+      "degraded",
+      {
+        ...sampledMetric,
+        query_status: "degraded",
+        query_error_code: "read_budget_exceeded",
+      },
+      false,
+      true,
+    ],
+    [
+      "error",
+      {
+        ...sampledMetric,
+        query_complete: undefined,
+        query_status: undefined,
+        query_error_code: undefined,
+        queryReadState: "error",
+      },
+      false,
+      true,
+    ],
+  ])(
+    "fails the whole widget closed for complete + %s metrics",
+    (_, unavailableMetric, hasSampled, hasDegraded) => {
+      const state = getDashboardMetricSeriesState([
+        completeMetric,
+        unavailableMetric,
+      ]);
+
+      expect(state.hasSampledMetrics).toBe(hasSampled);
+      expect(state.hasDegradedMetrics).toBe(hasDegraded);
+      expect(state.renderableMetrics).toEqual([]);
+      expect(state.series).toEqual([]);
+    },
+  );
+});
+
+describe("getExactDashboardResult", () => {
+  it("accepts an all-exact response and rejects one unavailable sibling", () => {
+    const exactMetric = {
+      name: "latency",
+      aggregation: "avg",
+      query_complete: true,
+      query_status: "complete",
+      query_sampled: false,
+      series: [],
+    };
+    const exactResult = {
+      query_complete: true,
+      query_status: "complete",
+      query_sampled: false,
+      metrics: [exactMetric],
+    };
+
+    expect(getExactDashboardResult({ data: { result: exactResult } })).toBe(
+      exactResult,
+    );
+    expect(
+      getExactDashboardResult({
+        data: {
+          result: {
+            query_complete: true,
+            query_status: "complete",
+            query_sampled: false,
+            metrics: [
+              exactMetric,
+              {
+                ...exactMetric,
+                query_complete: false,
+                query_status: "degraded",
+              },
+            ],
+          },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      getExactDashboardResult({
+        data: { result: { metrics: [exactMetric] } },
+      }),
+    ).toBeNull();
   });
 });
 

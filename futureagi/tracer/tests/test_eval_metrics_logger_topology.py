@@ -221,8 +221,8 @@ def test_v1_legacy_raw_eval_graph_includes_cdc_tombstone_guard(settings):
 
 
 @pytest.mark.unit
-def test_filtered_raw_graph_fails_closed_to_bounded_dispatch(settings):
-    """A caller cannot reintroduce the removed full-window spans scan."""
+def test_filtered_raw_graph_freezes_membership_window_across_partitions(settings):
+    """Outer eval buckets must not shrink trace membership semantics."""
 
     settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
     filters = [
@@ -237,8 +237,22 @@ def test_filtered_raw_graph_fails_closed_to_bounded_dispatch(settings):
         }
     ]
 
-    with pytest.raises(ValueError, match="bounded graph dispatcher"):
-        _raw_builder("SCORE", filters=filters).build()
+    query, params = _raw_builder("SCORE", filters=filters).build()
+
+    assert "SELECT DISTINCT trace_id FROM spans FINAL" in query
+    assert "start_time >= %(snapshot_start_date)s" in query
+    assert "start_time < %(snapshot_end_date)s" in query
+    assert params["snapshot_start_date"] == START
+    assert params["snapshot_end_date"] == END
+    # The exact worker overwrites only these outer eval bounds per output
+    # partition; the membership pair remains frozen to the request window.
+    partition_params = {
+        **params,
+        "start_date": datetime(2026, 7, 25),
+        "end_date": datetime(2026, 7, 26),
+    }
+    assert partition_params["snapshot_start_date"] == START
+    assert partition_params["snapshot_end_date"] == END
 
 
 @pytest.mark.unit

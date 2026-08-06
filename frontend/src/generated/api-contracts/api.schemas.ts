@@ -3866,6 +3866,7 @@ export const SpanAttributeKeyApiType = {
   number: 'number',
   boolean: 'boolean',
   array: 'array',
+  map: 'map',
 } as const;
 
 export interface SpanAttributeKeyApi {
@@ -10434,6 +10435,7 @@ export type EvalUsageStatsResponseResultApiCompleteness = typeof EvalUsageStatsR
 export const EvalUsageStatsResponseResultApiCompleteness = {
   complete: 'complete',
   degraded: 'degraded',
+  pending: 'pending',
 } as const;
 
 export interface EvalUsageStatsApi {
@@ -10534,6 +10536,15 @@ export interface EvalUsagePaginationApi {
   page_size: number;
 }
 
+export type EvalUsageStatsResponseResultApiQueryStatus = typeof EvalUsageStatsResponseResultApiQueryStatus[keyof typeof EvalUsageStatsResponseResultApiQueryStatus];
+
+
+export const EvalUsageStatsResponseResultApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+  pending: 'pending',
+} as const;
+
 export interface EvalUsageStatsResponseResultApi {
   template_id: string;
   is_composite: boolean;
@@ -10543,6 +10554,13 @@ export interface EvalUsageStatsResponseResultApi {
   chart: EvalUsageChartPointApi[];
   table: EvalUsageTableRowApi[];
   logs: EvalUsagePaginationApi;
+  query_complete?: boolean;
+  query_status?: EvalUsageStatsResponseResultApiQueryStatus;
+  query_sampled?: boolean;
+  query_completed_at?: string;
+  query_cached?: boolean;
+  query_refresh_failed?: boolean;
+  query_refreshing?: boolean;
 }
 
 export interface EvalUsageStatsResponseApi {
@@ -18521,8 +18539,10 @@ export interface FetchGraphApi {
   property?: string;
   req_data_config: string;
   project_id: string;
-  /** Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals. */
+  /** Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact. */
   allow_sampled?: boolean;
+  /** Recompute and atomically replace the last complete exact result. */
+  refresh?: boolean;
 }
 
 export type CustomEvalConfigApiConfig = { [key: string]: unknown };
@@ -18626,6 +18646,9 @@ export interface DashboardFilterValuesResultApi {
   query_error_code?: DashboardFilterValuesResultApiQueryErrorCode;
   query_window_start?: string;
   query_window_end?: string;
+  has_more?: boolean;
+  /** @minLength 1 */
+  next_cursor?: string;
 }
 
 export interface DashboardFilterValuesResponseApi {
@@ -18917,6 +18940,7 @@ export interface DashboardQueryApi {
   metrics: DashboardMetricApi[];
   filters?: DashboardQueryApiFiltersItem[];
   breakdowns?: DashboardBreakdownApi[];
+  /** Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact. */
   allow_sampled?: boolean;
 }
 
@@ -18981,6 +19005,7 @@ export interface DashboardQueryMetricResultApi {
   unit: string;
   series: DashboardQuerySeriesApi[];
   query_complete?: boolean;
+  query_sampled?: boolean;
   query_status?: DashboardQueryMetricResultApiQueryStatus;
   query_error_code?: DashboardQueryMetricResultApiQueryErrorCode;
   /** @minLength 1 */
@@ -19011,10 +19036,32 @@ export const DashboardQueryResultApiGranularity = {
   month: 'month',
 } as const;
 
+export type DashboardQueryResultApiQueryStatus = typeof DashboardQueryResultApiQueryStatus[keyof typeof DashboardQueryResultApiQueryStatus];
+
+
+export const DashboardQueryResultApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+  pending: 'pending',
+} as const;
+
 export interface DashboardQueryResultApi {
   metrics: DashboardQueryMetricResultApi[];
   time_range: DashboardQueryTimeRangeResultApi;
   granularity: DashboardQueryResultApiGranularity;
+  query_complete?: boolean;
+  query_status?: DashboardQueryResultApiQueryStatus;
+  query_sampled?: boolean;
+  query_completed_at?: string;
+  query_cached?: boolean;
+  query_refresh_failed?: boolean;
+  query_refreshing?: boolean;
+  /** @minimum 1 */
+  query_snapshot_version_ceiling?: number;
+  /** @minimum 0 */
+  query_snapshot_capture_count?: number;
+  /** @minimum 0 */
+  query_snapshot_relation_count?: number;
 }
 
 export interface DashboardQueryApiResponseApi {
@@ -19058,10 +19105,12 @@ export interface DashboardWidgetApi {
 
 export interface DashboardPreviewQueryApi {
   query_config: DashboardQueryApi;
+  /** Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact. */
   allow_sampled?: boolean;
 }
 
 export interface DashboardSampleOptInApi {
+  /** Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact. */
   allow_sampled?: boolean;
 }
 
@@ -20302,7 +20351,7 @@ export interface ObserveGraphDataRequestApi {
 }
 
 /**
- * Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.
+ * Exact graph points. Pending or failed refreshes never publish partial aggregate values.
  */
 export interface ObserveGraphDataPointApi {
   /** @minLength 1 */
@@ -20318,6 +20367,7 @@ export const ObserveGraphDataResultApiQueryStatus = {
   complete: 'complete',
   sampled: 'sampled',
   degraded: 'degraded',
+  pending: 'pending',
 } as const;
 
 export type ObserveGraphDataResultApiQueryErrorCode = typeof ObserveGraphDataResultApiQueryErrorCode[keyof typeof ObserveGraphDataResultApiQueryErrorCode];
@@ -20340,7 +20390,7 @@ export const ObserveGraphDataResultApiQuerySamplingStrategy = {
 export interface ObserveGraphDataResultApi {
   metric_name: string;
   name?: string;
-  /** Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list. */
+  /** Exact graph points. Pending or failed refreshes never publish partial aggregate values. */
   data: ObserveGraphDataPointApi[];
   query_complete?: boolean;
   query_status?: ObserveGraphDataResultApiQueryStatus;
@@ -20362,6 +20412,12 @@ export interface ObserveGraphDataResultApi {
   /** @minimum 0 */
   query_total_rows_lower_bound?: number;
   query_sampled?: boolean;
+  query_completed_at?: string;
+  query_cached?: boolean;
+  query_refresh_failed?: boolean;
+  query_refreshing?: boolean;
+  /** @minimum 1 */
+  query_snapshot_version_ceiling?: number;
   query_sampling_strategy?: ObserveGraphDataResultApiQuerySamplingStrategy;
   /** @minimum 0 */
   query_sampling_strata?: number;
@@ -21652,6 +21708,7 @@ export const ObserveGraphDataErrorResultApiQueryStatus = {
   complete: 'complete',
   sampled: 'sampled',
   degraded: 'degraded',
+  pending: 'pending',
 } as const;
 
 export type ObserveGraphDataErrorResultApiQueryErrorCode = typeof ObserveGraphDataErrorResultApiQueryErrorCode[keyof typeof ObserveGraphDataErrorResultApiQueryErrorCode];
@@ -21674,7 +21731,7 @@ export const ObserveGraphDataErrorResultApiQuerySamplingStrategy = {
 export interface ObserveGraphDataErrorResultApi {
   metric_name: string;
   name?: string;
-  /** Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list. */
+  /** Exact graph points. Pending or failed refreshes never publish partial aggregate values. */
   data: ObserveGraphDataPointApi[];
   query_complete?: boolean;
   query_status?: ObserveGraphDataErrorResultApiQueryStatus;
@@ -21696,6 +21753,12 @@ export interface ObserveGraphDataErrorResultApi {
   /** @minimum 0 */
   query_total_rows_lower_bound?: number;
   query_sampled?: boolean;
+  query_completed_at?: string;
+  query_cached?: boolean;
+  query_refresh_failed?: boolean;
+  query_refreshing?: boolean;
+  /** @minimum 1 */
+  query_snapshot_version_ceiling?: number;
   query_sampling_strategy?: ObserveGraphDataErrorResultApiQuerySamplingStrategy;
   /** @minimum 0 */
   query_sampling_strata?: number;
@@ -21770,6 +21833,8 @@ export interface TraceVoiceCallListResponseApi {
   results: TraceVoiceCallListResponseApiResultsItem[];
   config: TraceVoiceCallListResponseApiConfigItem[];
   has_more: boolean;
+  /** @minLength 1 */
+  next_cursor?: string;
   query_complete: boolean;
   query_status: TraceVoiceCallListResponseApiQueryStatus;
   /** @minLength 1 */
@@ -22107,12 +22172,26 @@ export interface UserAlertMonitorPreviewGraphApi {
   created_by?: string;
 }
 
+export type UsersResultApiQueryStatus = typeof UsersResultApiQueryStatus[keyof typeof UsersResultApiQueryStatus];
+
+
+export const UsersResultApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
 export type UsersResultApiTableItem = { [key: string]: unknown };
 
 export interface UsersResultApi {
   table: UsersResultApiTableItem[];
   total_count: number;
   total_pages: number;
+  count_is_lower_bound?: boolean;
+  has_more?: boolean;
+  /** @minLength 1 */
+  next_cursor?: string;
+  query_complete?: boolean;
+  query_status?: UsersResultApiQueryStatus;
 }
 
 export interface UsersResponseApi {
@@ -24826,6 +24905,7 @@ page_size?: number;
 period?: ModelHubEvalTemplatesUsageListPeriod;
 start_date?: string;
 end_date?: string;
+refresh?: boolean;
 };
 
 export type ModelHubEvalTemplatesUsageListPeriod = typeof ModelHubEvalTemplatesUsageListPeriod[keyof typeof ModelHubEvalTemplatesUsageListPeriod];
@@ -26192,6 +26272,16 @@ dataset_id?: string;
  * @maxLength 512
  */
 search?: string;
+/**
+ * @minimum 1
+ * @maximum 50
+ */
+page_size?: number;
+/**
+ * @minLength 1
+ * @maxLength 16384
+ */
+cursor?: string;
 };
 
 export type TracerDashboardFilterValuesMetricType = typeof TracerDashboardFilterValuesMetricType[keyof typeof TracerDashboardFilterValuesMetricType];
@@ -26631,9 +26721,13 @@ export type TracerObservationSpanGetEvaluationDetails200 = {
 
 export type TracerObservationSpanGetGraphMethodsParams = {
 /**
- * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ * Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.
  */
 allow_sampled?: boolean;
+/**
+ * Recompute and atomically replace the last complete exact result.
+ */
+refresh?: boolean;
 };
 
 export type TracerObservationSpanGetObservationSpanFieldsParams = {
@@ -26972,9 +27066,13 @@ interval?: string;
  */
 filters?: string;
 /**
- * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ * Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.
  */
 allow_sampled?: boolean;
+/**
+ * Recompute and atomically replace the last complete exact result.
+ */
+refresh?: boolean;
 };
 
 export type TracerProjectGetGraphData200 = {
@@ -26991,9 +27089,13 @@ end_user_id: string;
 
 export type TracerProjectGetUsersAggregateGraphDataParams = {
 /**
- * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ * Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.
  */
 allow_sampled?: boolean;
+/**
+ * Recompute and atomically replace the last complete exact result.
+ */
+refresh?: boolean;
 };
 
 export type TracerProjectListProjectIdsParams = {
@@ -27139,9 +27241,13 @@ export const TracerTraceSessionGetSessionFilterValuesColumn = {
 
 export type TracerTraceSessionGetSessionGraphDataParams = {
 /**
- * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ * Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.
  */
 allow_sampled?: boolean;
+/**
+ * Recompute and atomically replace the last complete exact result.
+ */
+refresh?: boolean;
 };
 
 export type TracerTraceSessionGetTraceSessionExportDataParams = {
@@ -27192,6 +27298,13 @@ page_number?: number;
  * @maximum 500
  */
 page_size?: number;
+/**
+ * Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.
+ * @minLength 1
+ * @maxLength 4096
+ */
+cursor?: string;
+cursor_mode?: boolean;
 interval?: string;
 /**
  * Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.
@@ -27260,9 +27373,13 @@ export type TracerTraceGetEvalNames200 = {
 
 export type TracerTraceGetGraphMethodsParams = {
 /**
- * Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.
+ * Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.
  */
 allow_sampled?: boolean;
+/**
+ * Recompute and atomically replace the last complete exact result.
+ */
+refresh?: boolean;
 };
 
 export type TracerTraceGetPropertiesParams = {
@@ -27438,7 +27555,7 @@ project_id: string;
  */
 filters?: string;
 /**
- * One-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.
+ * One-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page, use the additive continuation cursor, or narrow the time range.
  * @minimum 1
  */
 page?: number;
@@ -27448,6 +27565,13 @@ page?: number;
  */
 page_size?: number;
 remove_simulation_calls?: boolean;
+/**
+ * Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.
+ * @minLength 1
+ * @maxLength 4096
+ */
+cursor?: string;
+cursor_mode?: boolean;
 /**
  * Omit for backward-compatible complete bounded pages, which may label count as a lower bound. Send false to require an exact total. Send true to opt in explicitly to lower-bound totals and, on the first page, a clearly labelled bounded partial result when the full ordered prefix cannot be proven inside the read budget.
  */
@@ -27576,6 +27700,13 @@ sort_params?: string;
  */
 filters?: string;
 export?: boolean;
+/**
+ * Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.
+ * @minLength 1
+ * @maxLength 4096
+ */
+cursor?: string;
+cursor_mode?: boolean;
 };
 
 export type UsageAdminCustomPlanListParams = {

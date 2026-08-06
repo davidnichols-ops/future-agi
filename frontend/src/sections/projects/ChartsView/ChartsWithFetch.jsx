@@ -9,8 +9,8 @@ import { useChartsViewContext } from "./ChartsViewProvider/ChartsViewContext";
 import { getStorage } from "src/hooks/use-local-storage";
 import { normalizeTimestamp } from "./ChartsViewProvider/common";
 import {
-  getQueryReadMessage,
-  getQueryReadState,
+  AGGREGATION_PREPARING_MESSAGE,
+  getExactAggregationReadState,
 } from "src/utils/queryReadState";
 
 export default function ChartWithFetch({ evaluation, observeId, inView }) {
@@ -35,7 +35,6 @@ export default function ChartWithFetch({ evaluation, observeId, inView }) {
         property: "average",
         interval: selectedInterval?.toLowerCase(),
         filters: JSON.stringify(filters),
-        allow_sampled: true,
         ...transformEvaluationPayload(evaluation),
       };
 
@@ -50,8 +49,9 @@ export default function ChartWithFetch({ evaluation, observeId, inView }) {
   });
 
   const result = data?.data?.result;
-  const queryReadState = getQueryReadState(result, { isError });
-  const queryReadMessage = getQueryReadMessage(queryReadState);
+  const queryReadState = getExactAggregationReadState(result, { isError });
+  const queryReadMessage =
+    queryReadState === "complete" ? null : AGGREGATION_PREPARING_MESSAGE;
 
   const evalsChartData = useMemo(() => {
     const baseChart = {
@@ -62,20 +62,14 @@ export default function ChartWithFetch({ evaluation, observeId, inView }) {
       isEvaluationChart: true,
     };
 
-    if (
-      !Array.isArray(result) ||
-      (queryReadState !== "complete" && queryReadState !== "sampled")
-    ) {
+    if (!Array.isArray(result) || queryReadState !== "complete") {
       return { ...baseChart, series: [] };
     }
 
     return {
       ...baseChart,
       series: result.map((seriesObj) => ({
-        name:
-          queryReadState === "sampled"
-            ? `Sampled ${seriesObj?.name}`
-            : seriesObj?.name,
+        name: seriesObj?.name,
         data: (seriesObj?.data ?? []).map((item) => ({
           x: normalizeTimestamp(item.timestamp),
           y: item?.value,
@@ -94,7 +88,7 @@ export default function ChartWithFetch({ evaluation, observeId, inView }) {
         <Typography
           role="status"
           variant="caption"
-          color={queryReadState === "sampled" ? "warning.main" : "error.main"}
+          color="text.secondary"
           sx={{ display: "block", mb: 1 }}
         >
           {queryReadMessage}

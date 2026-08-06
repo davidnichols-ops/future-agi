@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from django.test import override_settings
 
 from tracer.selectors.trace_filter_reads import read_bounded_filter_page
 from tracer.services.clickhouse.query_builders.user_list import (
@@ -38,6 +39,17 @@ def _window(now: datetime) -> list[dict]:
             },
         }
     ]
+
+
+def _has_eval_filter(value: bool | str) -> dict:
+    return {
+        "column_id": "has_eval",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
 
 
 @pytest.mark.unit
@@ -225,7 +237,7 @@ def test_attribute_bulk_filter_uses_bounded_seed_and_latest_candidate_classifier
     assert "candidate_raw_session_id = candidate_ts_remap.any_id" in match_sql
     assert "SELECT session_id FROM candidate_filter_sessions" in match_sql
     assert "WHERE survivor_id IN (" in match_sql
-    assert "rejected" in match_params.values()
+    assert ("rejected",) in match_params.values()
 
 
 @pytest.mark.unit
@@ -481,6 +493,112 @@ def test_session_eval_seed_allows_shared_512_rows_but_classifier_stays_at_200():
         )
     with pytest.raises(ValueError, match="exceeds bounded limit"):
         builder.build_filter_match_query([str(uuid.uuid4()) for _ in range(201)])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("filter_value", "membership_op"),
+    [(False, "NOT IN"), ("false", "NOT IN"), (True, "IN")],
+)
+@override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
+def test_session_has_eval_is_finite_latest_state_and_page_n_safe(
+    filter_value: bool | str,
+    membership_op: str,
+):
+    now = datetime(2026, 7, 31, 12, 0)
+    candidate_session_id = str(uuid.uuid4())
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[*_window(now), _has_eval_filter(filter_value)],
+        bounded_internal_scan=True,
+    )
+
+    seed_sql, seed_params = builder.build_filter_seed_page(
+        slice_start=now - timedelta(days=1),
+        slice_end=now + timedelta(days=1),
+        limit=50,
+        before_start_time=now,
+        before_id=str(uuid.uuid4()),
+    )
+    sql, params = builder.build_filter_match_query([candidate_session_id])
+
+    assert builder.supports_bounded_filter_scan() is True
+    assert builder.bounded_filter_degraded_error_code() is None
+    assert "tracer_eval_logger" not in seed_sql
+    assert seed_params["filter_before_start_time"] == now
+    assert "candidate_filter_sessions AS" in sql
+    assert "candidate_eval_trace_ids AS" in sql
+    assert "SELECT DISTINCT toUUIDOrNull(trace_id) AS trace_id" in sql
+    assert "FROM tracer_eval_logger_v2 AS eval_scan" in sql
+    assert (
+        "eval_scan.trace_id IN (\n                SELECT trace_id "
+        "FROM candidate_eval_trace_ids" in sql
+    )
+    assert "eval_scan.created_at >= %(start_date)s - INTERVAL 7 DAY" in sql
+    assert "ORDER BY eval_scan._version DESC" in sql
+    assert "LIMIT 1 BY eval_scan.id" in sql
+    assert "latest_eval.is_deleted = 0" in sql
+    assert "tracer_eval_logger_v2 FINAL" not in sql
+    assert (
+        f"trace_id {membership_op} "
+        "(SELECT trace_id FROM live_candidate_eval_trace_ids)" in sql
+    )
+    if membership_op == "IN":
+        assert (
+            "trace_id NOT IN (SELECT trace_id FROM live_candidate_eval_trace_ids)"
+            not in sql
+        )
+    assert params["candidate_filter_session_ids"] == (candidate_session_id,)
+    assert params["bounded_match_limit"] == 1
+
+
+@pytest.mark.unit
+@override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger")
+def test_session_has_eval_false_combines_before_exact_session_aggregation():
+    now = datetime(2026, 7, 31, 12, 0)
+    candidate_session_id = str(uuid.uuid4())
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            *_window(now),
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rejected",
+                },
+            },
+            {
+                "column_id": "total_tokens",
+                "filter_config": {
+                    "filter_type": "number",
+                    "filter_op": "greater_than",
+                    "filter_value": 10,
+                },
+            },
+            _has_eval_filter(False),
+        ],
+        bounded_internal_scan=True,
+    )
+
+    sql, params = builder.build_filter_match_query([candidate_session_id])
+
+    sessions_cte = sql.split("sessions AS (", 1)[1]
+    assert "attrs_string" in sql
+    assert (
+        "trace_id NOT IN (SELECT trace_id FROM live_candidate_eval_trace_ids)"
+        in sessions_cte
+    )
+    assert sessions_cte.index("trace_id NOT IN") < sessions_cte.index(
+        "GROUP BY session_id"
+    )
+    assert "HAVING total_tokens >" in sessions_cte
+    assert "eval_scan._peerdb_version" in sql
+    assert "eval_scan._version" not in sql
+    assert "latest_eval._peerdb_is_deleted = 0" in sql
+    assert "rejected" in params.values()
 
 
 @pytest.mark.unit

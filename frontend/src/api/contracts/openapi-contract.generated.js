@@ -17940,6 +17940,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "type": "string",
               "format": "date-time"
             }
+          },
+          "refresh": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "responses": {
@@ -30377,6 +30384,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "maxLength": 512,
               "default": ""
             }
+          },
+          "page_size": {
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            }
+          },
+          "cursor": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16384
+            }
           }
         },
         "responses": {
@@ -32685,6 +32708,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "type": "boolean",
               "default": false
             }
+          },
+          "refresh": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "responses": {
@@ -34018,6 +34048,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "type": "boolean",
               "default": false
             }
+          },
+          "refresh": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "responses": {
@@ -34118,6 +34155,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "queryParameters": {
           "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "refresh": {
             "required": false,
             "schema": {
               "type": "boolean",
@@ -35168,6 +35212,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "type": "boolean",
               "default": false
             }
+          },
+          "refresh": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "responses": {
@@ -35313,6 +35364,21 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "minimum": 1,
               "maximum": 500,
               "default": 30
+            }
+          },
+          "cursor": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "cursor_mode": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
             }
           },
           "interval": {
@@ -35693,6 +35759,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "queryParameters": {
           "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "refresh": {
             "required": false,
             "schema": {
               "type": "boolean",
@@ -36258,6 +36331,21 @@ export const OPENAPI_CONTRACT = Object.freeze({
             }
           },
           "remove_simulation_calls": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "cursor": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "cursor_mode": {
             "required": false,
             "schema": {
               "type": "boolean",
@@ -37070,6 +37158,21 @@ export const OPENAPI_CONTRACT = Object.freeze({
             }
           },
           "export": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "cursor": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "cursor_mode": {
             "required": false,
             "schema": {
               "type": "boolean",
@@ -51130,6 +51233,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "allow_sampled": {
           "title": "Allow sampled",
+          "description": "Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.",
           "type": "boolean",
           "default": false
         }
@@ -51246,6 +51350,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "allow_sampled": {
           "title": "Allow sampled",
+          "description": "Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.",
           "type": "boolean",
           "default": false
         }
@@ -51273,6 +51378,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
       "properties": {
         "allow_sampled": {
           "title": "Allow sampled",
+          "description": "Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.",
           "type": "boolean",
           "default": false
         }
@@ -56541,7 +56647,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "allow_sampled": {
           "title": "Allow sampled",
-          "description": "Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.",
+          "description": "Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.",
+          "type": "boolean",
+          "default": false
+        },
+        "refresh": {
+          "title": "Refresh",
+          "description": "Recompute and atomically replace the last complete exact result.",
           "type": "boolean",
           "default": false
         }
@@ -72024,6 +72136,12 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Has more",
           "type": "boolean"
         },
+        "next_cursor": {
+          "title": "Next cursor",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
         "query_complete": {
           "title": "Query complete",
           "type": "boolean"
@@ -79065,6 +79183,16 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Query window end",
           "type": "string",
           "format": "date-time"
+        },
+        "has_more": {
+          "title": "Has more",
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "title": "Next cursor",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
         }
       }
     },
@@ -79420,6 +79548,55 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "week",
             "month"
           ]
+        },
+        "query_complete": {
+          "title": "Query complete",
+          "type": "boolean"
+        },
+        "query_status": {
+          "title": "Query status",
+          "type": "string",
+          "enum": [
+            "complete",
+            "degraded",
+            "pending"
+          ]
+        },
+        "query_sampled": {
+          "title": "Query sampled",
+          "type": "boolean"
+        },
+        "query_completed_at": {
+          "title": "Query completed at",
+          "type": "string",
+          "format": "date-time"
+        },
+        "query_cached": {
+          "title": "Query cached",
+          "type": "boolean"
+        },
+        "query_refresh_failed": {
+          "title": "Query refresh failed",
+          "type": "boolean"
+        },
+        "query_refreshing": {
+          "title": "Query refreshing",
+          "type": "boolean"
+        },
+        "query_snapshot_version_ceiling": {
+          "title": "Query snapshot version ceiling",
+          "type": "integer",
+          "minimum": 1
+        },
+        "query_snapshot_capture_count": {
+          "title": "Query snapshot capture count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_snapshot_relation_count": {
+          "title": "Query snapshot relation count",
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -81527,7 +81704,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "enum": [
             "complete",
-            "degraded"
+            "degraded",
+            "pending"
           ]
         },
         "unavailable_fields": {
@@ -81554,6 +81732,40 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "logs": {
           "$ref": "#/definitions/EvalUsagePagination"
+        },
+        "query_complete": {
+          "title": "Query complete",
+          "type": "boolean"
+        },
+        "query_status": {
+          "title": "Query status",
+          "type": "string",
+          "enum": [
+            "complete",
+            "degraded",
+            "pending"
+          ]
+        },
+        "query_sampled": {
+          "title": "Query sampled",
+          "type": "boolean"
+        },
+        "query_completed_at": {
+          "title": "Query completed at",
+          "type": "string",
+          "format": "date-time"
+        },
+        "query_cached": {
+          "title": "Query cached",
+          "type": "boolean"
+        },
+        "query_refresh_failed": {
+          "title": "Query refresh failed",
+          "type": "boolean"
+        },
+        "query_refreshing": {
+          "title": "Query refreshing",
+          "type": "boolean"
         }
       }
     },
@@ -85407,7 +85619,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string"
         },
         "data": {
-          "description": "Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.",
+          "description": "Exact graph points. Pending or failed refreshes never publish partial aggregate values.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ObserveGraphDataPoint"
@@ -85423,7 +85635,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "enum": [
             "complete",
             "sampled",
-            "degraded"
+            "degraded",
+            "pending"
           ]
         },
         "query_error_code": {
@@ -85478,6 +85691,28 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "query_sampled": {
           "title": "Query sampled",
           "type": "boolean"
+        },
+        "query_completed_at": {
+          "title": "Query completed at",
+          "type": "string",
+          "format": "date-time"
+        },
+        "query_cached": {
+          "title": "Query cached",
+          "type": "boolean"
+        },
+        "query_refresh_failed": {
+          "title": "Query refresh failed",
+          "type": "boolean"
+        },
+        "query_refreshing": {
+          "title": "Query refreshing",
+          "type": "boolean"
+        },
+        "query_snapshot_version_ceiling": {
+          "title": "Query snapshot version ceiling",
+          "type": "integer",
+          "minimum": 1
         },
         "query_sampling_strategy": {
           "title": "Query sampling strategy",
@@ -85520,7 +85755,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string"
         },
         "data": {
-          "description": "Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.",
+          "description": "Exact graph points. Pending or failed refreshes never publish partial aggregate values.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ObserveGraphDataPoint"
@@ -85536,7 +85771,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "enum": [
             "complete",
             "sampled",
-            "degraded"
+            "degraded",
+            "pending"
           ]
         },
         "query_error_code": {
@@ -85591,6 +85827,28 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "query_sampled": {
           "title": "Query sampled",
           "type": "boolean"
+        },
+        "query_completed_at": {
+          "title": "Query completed at",
+          "type": "string",
+          "format": "date-time"
+        },
+        "query_cached": {
+          "title": "Query cached",
+          "type": "boolean"
+        },
+        "query_refresh_failed": {
+          "title": "Query refresh failed",
+          "type": "boolean"
+        },
+        "query_refreshing": {
+          "title": "Query refreshing",
+          "type": "boolean"
+        },
+        "query_snapshot_version_ceiling": {
+          "title": "Query snapshot version ceiling",
+          "type": "integer",
+          "minimum": 1
         },
         "query_sampling_strategy": {
           "title": "Query sampling strategy",
@@ -90058,7 +90316,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "string",
             "number",
             "boolean",
-            "array"
+            "array",
+            "map"
           ]
         },
         "count": {
@@ -91900,6 +92159,32 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "total_pages": {
           "title": "Total pages",
           "type": "integer"
+        },
+        "count_is_lower_bound": {
+          "title": "Count is lower bound",
+          "type": "boolean"
+        },
+        "has_more": {
+          "title": "Has more",
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "title": "Next cursor",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "query_complete": {
+          "title": "Query complete",
+          "type": "boolean"
+        },
+        "query_status": {
+          "title": "Query status",
+          "type": "string",
+          "enum": [
+            "complete",
+            "degraded"
+          ]
         }
       }
     },
@@ -93443,6 +93728,10 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "query_complete": {
           "title": "Query complete",
+          "type": "boolean"
+        },
+        "query_sampled": {
+          "title": "Query sampled",
           "type": "boolean"
         },
         "query_status": {
@@ -97621,7 +97910,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
       }
     },
     "ObserveGraphDataPoint": {
-      "description": "Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.",
+      "description": "Exact graph points. Pending or failed refreshes never publish partial aggregate values.",
       "required": [
         "timestamp",
         "value"

@@ -117,6 +117,13 @@ class BoundedFilterPage:
     # can never mistake an unclassified anchor for a proven match.
     deferred_candidate_rows: tuple[dict[str, Any], ...] = ()
     classification_deferred: bool = False
+    # A degraded cursor page may still contain individually classified rows.
+    # These fields describe the first candidate position that was *not* fully
+    # classified, so the next signed request can resume without rescanning an
+    # already-published prefix or skipping unclassified candidates.
+    continuation_slice_end: datetime | None = None
+    continuation_before_start_time: datetime | None = None
+    continuation_before_id: Any = None
 
 
 @dataclass(frozen=True)
@@ -258,6 +265,10 @@ def read_bounded_filter_page(
     include_incomplete_rows: bool = False,
     cursor_start_time: datetime | None = None,
     cursor_order_token: Any = None,
+    continuation_slice_end: datetime | None = None,
+    continuation_before_start_time: datetime | None = None,
+    continuation_before_id: Any = None,
+    bounded_continuation: bool = False,
     read_settings: dict[str, Any] | None = None,
     anchor_probe_only: bool = False,
     anchor_probe_limit: int | None = None,
@@ -294,8 +305,18 @@ def read_bounded_filter_page(
         raise ValueError("page_number, page_size and deadline_ms must be positive")
     if (cursor_start_time is None) != (cursor_order_token is None):
         raise ValueError("cursor order values must be provided together")
+    if (continuation_before_start_time is None) != (continuation_before_id is None):
+        raise ValueError("continuation seed values must be provided together")
+    if continuation_slice_end is None and continuation_before_start_time is not None:
+        raise ValueError("continuation seed requires a slice end")
     if cursor_start_time is not None and page_number != 0:
         raise ValueError("cursor reads must use page_number zero")
+    if continuation_slice_end is not None and page_number != 0:
+        raise ValueError("continuation reads must use page_number zero")
+    if bounded_continuation and (not include_incomplete_rows or page_number != 0):
+        raise ValueError(
+            "bounded continuation requires page-zero classified partial rows"
+        )
     if include_incomplete_rows and page_number != 0:
         raise ValueError("incomplete rows are available only for page zero")
     if defer_classification and (page_number != 0 or not include_incomplete_rows):
@@ -410,6 +431,20 @@ def read_bounded_filter_page(
     request_start, request_end = builder.parse_time_range(filters)
     request_start = _without_timezone(request_start)
     request_end = _without_timezone(request_end)
+    if continuation_slice_end is not None:
+        continuation_slice_end = _without_timezone(continuation_slice_end)
+        if not request_start < continuation_slice_end <= request_end:
+            raise ValueError("continuation slice is outside the request window")
+    if continuation_before_start_time is not None:
+        continuation_before_start_time = _without_timezone(
+            continuation_before_start_time
+        )
+        if (
+            not request_start
+            <= continuation_before_start_time
+            < (continuation_slice_end or request_end)
+        ):
+            raise ValueError("continuation seed is outside the request window")
     cursor_key: tuple[datetime, Any] | None = None
     if cursor_start_time is not None:
         cursor_key = (_without_timezone(cursor_start_time), cursor_order_token)
@@ -458,8 +493,13 @@ def read_bounded_filter_page(
         builder, "recommended_filter_page_hydration_reserve_ms", None
     )
     identity_only_classification = (
-        not include_incomplete_rows
-        and not defer_classification
+        not defer_classification
+        # A resumable cursor page may publish a genuine classified prefix
+        # before the whole request window is exhausted.  Keep using the
+        # identity classifier for that path, then hydrate the public page
+        # below.  Ordinary graph-only incomplete reads continue to classify
+        # full presentation rows because they have no continuation contract.
+        and (not include_incomplete_rows or bounded_continuation)
         and callable(identity_classification_capability)
         and bool(identity_classification_capability())
     )
@@ -626,6 +666,7 @@ def read_bounded_filter_page(
     )
     anchor_can_run = (
         not seed_proves_population_bound
+        and not bounded_continuation
         and cursor_key is None
         and (
             anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
@@ -760,6 +801,7 @@ def read_bounded_filter_page(
     # filter shapes return no probe and retain the existing exact path.
     candidate_witness_probe_enabled = bool(
         probe_limits_enforced
+        and not bounded_continuation
         and candidate_witness_prefilter_allowed
         and callable(candidate_witness_probe_builder)
         and callable(candidate_witness_probe_preference)
@@ -806,20 +848,60 @@ def read_bounded_filter_page(
     # predicate runs before LIMIT 1 BY trace: the older canonical physical root
     # can seed the trace even when a newer raw root was later tombstoned. Direct
     # any-span child order remains unrelated to the public trace order.
-    use_cursor_seed_keyset = cursor_key is not None and cursor_seed_keyset_is_safe
-    slice_end = (
+    use_cursor_seed_keyset = bool(
+        cursor_key is not None
+        and cursor_seed_keyset_is_safe
+        and continuation_slice_end is None
+    )
+    slice_end = continuation_slice_end or (
         min(request_end, cursor_key[0] + timedelta(microseconds=1))
         if use_cursor_seed_keyset
         else request_end
     )
     slice_width = _INITIAL_SLICE
     before_start_time: datetime | None = (
-        cursor_key[0] if use_cursor_seed_keyset else None
+        continuation_before_start_time
+        if continuation_slice_end is not None
+        else (cursor_key[0] if use_cursor_seed_keyset else None)
     )
-    before_id: Any = cursor_key[1] if use_cursor_seed_keyset else None
+    before_id: Any = (
+        continuation_before_id
+        if continuation_slice_end is not None
+        else (cursor_key[1] if use_cursor_seed_keyset else None)
+    )
     forced_width_cap: timedelta | None = None
     page_complete = False
     degraded_error_code: str | None = None
+    safe_slice_end = slice_end
+    safe_before_start_time = before_start_time
+    safe_before_id = before_id
+    safe_seen_seed_ids: set[Hashable] = set()
+    safe_seen_candidate_ids: set[Hashable] = set()
+    safe_matched_by_id: dict[Hashable, dict[str, Any]] = {}
+    safe_pending_identity_candidates: dict[
+        Hashable, tuple[dict[str, Any], datetime, datetime]
+    ] = {}
+    continuation_progressed = False
+
+    def checkpoint_continuation() -> None:
+        """Commit only a fully classified candidate-prefix scan position."""
+
+        nonlocal safe_slice_end
+        nonlocal safe_before_start_time
+        nonlocal safe_before_id
+        nonlocal safe_seen_seed_ids
+        nonlocal safe_seen_candidate_ids
+        nonlocal safe_matched_by_id
+        nonlocal safe_pending_identity_candidates
+        nonlocal continuation_progressed
+        safe_slice_end = slice_end
+        safe_before_start_time = before_start_time
+        safe_before_id = before_id
+        safe_seen_seed_ids = set(seen_seed_ids)
+        safe_seen_candidate_ids = set(seen_candidate_ids)
+        safe_matched_by_id = dict(matched_by_id)
+        safe_pending_identity_candidates = dict(pending_identity_candidates)
+        continuation_progressed = True
 
     def execute(
         *,
@@ -1420,6 +1502,7 @@ def read_bounded_filter_page(
             micro_width_builder()
             if (
                 not graph_key_witness_probe
+                and not bounded_continuation
                 and callable(micro_width_builder)
                 and callable(micro_seed_builder)
             )
@@ -1882,7 +1965,17 @@ def read_bounded_filter_page(
                 next_start_time, next_id = seed_row_key(seed_rows[-1])
                 if (next_start_time, next_id) == (before_start_time, before_id):
                     break
+                if bounded_continuation and pending_identity_candidates:
+                    classify_or_buffer_seed_rows(
+                        [],
+                        active_start=slice_start,
+                        active_end=slice_end,
+                        stop_on_ordered_prefix=seed_proves_result_order,
+                        force=True,
+                    )
                 before_start_time, before_id = next_start_time, next_id
+                if bounded_continuation:
+                    checkpoint_continuation()
                 continue
 
             if slice_start <= request_start:
@@ -1895,13 +1988,39 @@ def read_bounded_filter_page(
                 )
                 page_complete = True
                 break
+            if bounded_continuation and pending_identity_candidates:
+                classify_or_buffer_seed_rows(
+                    [],
+                    active_start=slice_start,
+                    active_end=slice_end,
+                    stop_on_ordered_prefix=seed_proves_result_order,
+                    force=True,
+                )
             slice_end = slice_start
             slice_width = min(active_width * 2, _MAX_SLICE)
             before_start_time = None
             before_id = None
+            if bounded_continuation:
+                checkpoint_continuation()
     except _BudgetExceeded as exc:
         page_complete = False
         degraded_error_code = exc.error_code
+        if bounded_continuation:
+            # A classifier may have completed one sub-batch before the next
+            # sub-batch hits a cap. Roll the whole seed page back to the last
+            # committed checkpoint; the signed continuation will replay it,
+            # so no row can be skipped or published twice.
+            seen_seed_ids.clear()
+            seen_seed_ids.update(safe_seen_seed_ids)
+            seen_candidate_ids.clear()
+            seen_candidate_ids.update(safe_seen_candidate_ids)
+            matched_by_id.clear()
+            matched_by_id.update(safe_matched_by_id)
+            pending_identity_candidates.clear()
+            pending_identity_candidates.update(safe_pending_identity_candidates)
+            slice_end = safe_slice_end
+            before_start_time = safe_before_start_time
+            before_id = safe_before_id
 
     ordered_matches = sorted(matched_by_id.values(), key=result_row_key, reverse=True)
     offset = page_number * page_size
@@ -1912,7 +2031,12 @@ def read_bounded_filter_page(
         else []
     )
 
-    if page_complete and identity_only_classification and page_rows:
+    # The identity classifier deliberately returns only the stable ordering
+    # tuple.  Partial cursor pages are publishable too, so hydrate every
+    # non-empty publishable identity page rather than only complete pages.
+    # Otherwise a bounded continuation can return genuine identities with
+    # blank/incorrect presentation fields.
+    if identity_only_classification and page_rows:
         try:
             hydration_query, hydration_params = page_hydration_builder(page_rows)
             hydration_result = execute(
@@ -1946,6 +2070,10 @@ def read_bounded_filter_page(
                 degraded_error_code = "classification_drift"
                 page_rows = []
                 has_more = False
+                # The committed scan checkpoint is after these identities.
+                # Without a hydrated page we must not hand that checkpoint to
+                # the caller or the matching rows would be skipped forever.
+                continuation_progressed = False
             else:
                 page_rows = sorted(
                     hydrated_by_id.values(), key=result_row_key, reverse=True
@@ -1955,6 +2083,7 @@ def read_bounded_filter_page(
             degraded_error_code = exc.error_code
             page_rows = []
             has_more = False
+            continuation_progressed = False
 
     error_code = (
         None if page_complete else degraded_error_code or "scan_budget_exceeded"
@@ -1976,6 +2105,21 @@ def read_bounded_filter_page(
         attempts=tuple(attempts),
         deferred_candidate_rows=tuple(deferred_candidate_by_id.values()),
         classification_deferred=defer_classification,
+        continuation_slice_end=(
+            slice_end
+            if bounded_continuation and not page_complete and continuation_progressed
+            else None
+        ),
+        continuation_before_start_time=(
+            before_start_time
+            if bounded_continuation and not page_complete and continuation_progressed
+            else None
+        ),
+        continuation_before_id=(
+            before_id
+            if bounded_continuation and not page_complete and continuation_progressed
+            else None
+        ),
     )
 
 

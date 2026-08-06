@@ -98,6 +98,7 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
                 argMax(tuple(attributes_extra), _version).1 AS latest_attributes_extra,
                 argMax(attrs_string, _version) AS latest_attrs_string,
                 argMax(attrs_number, _version) AS latest_attrs_number,
+                argMax(attrs_bool, _version) AS latest_attrs_bool,
                 argMax(is_deleted, _version) AS latest_is_deleted
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
@@ -115,7 +116,8 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
             {resolved_ts} AS session_id,
             latest_attributes_extra AS span_attributes_raw,
             latest_attrs_string AS attrs_string,
-            latest_attrs_number AS attrs_number
+            latest_attrs_number AS attrs_number,
+            latest_attrs_bool AS attrs_bool
         FROM latest_roots
         LEFT JOIN ts_survivor_map AS ts_remap
             ON latest_trace_session_id = ts_remap.any_id
@@ -125,6 +127,7 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
             (latest_attributes_extra != '{{}}' AND latest_attributes_extra != '')
             OR length(mapKeys(latest_attrs_string)) > 0
             OR length(mapKeys(latest_attrs_number)) > 0
+            OR length(mapKeys(latest_attrs_bool)) > 0
           )
           AND {resolved_ts} IN %(attr_session_ids)s
         LIMIT 500

@@ -9514,7 +9514,7 @@ export const ApiTracesSpanAttributeKeysListQueryParams = zod.object({
 export const ApiTracesSpanAttributeKeysListResponse = zod.object({
   "result": zod.array(zod.object({
   "key": zod.string().min(1),
-  "type": zod.enum(['string', 'number', 'boolean', 'array']),
+  "type": zod.enum(['string', 'number', 'boolean', 'array', 'map']),
   "count": zod.number()
 })),
   "query_complete": zod.boolean(),
@@ -20041,13 +20041,15 @@ export const modelHubEvalTemplatesUsageListQueryPageSizeDefault = 25;
 export const modelHubEvalTemplatesUsageListQueryPageSizeMax = 100;
 
 export const modelHubEvalTemplatesUsageListQueryPeriodDefault = `30d`;
+export const modelHubEvalTemplatesUsageListQueryRefreshDefault = false;
 
 export const ModelHubEvalTemplatesUsageListQueryParams = zod.object({
   "page": zod.number().min(modelHubEvalTemplatesUsageListQueryPageMin).max(modelHubEvalTemplatesUsageListQueryPageMax).default(modelHubEvalTemplatesUsageListQueryPageDefault),
   "page_size": zod.number().min(1).max(modelHubEvalTemplatesUsageListQueryPageSizeMax).default(modelHubEvalTemplatesUsageListQueryPageSizeDefault),
   "period": zod.enum(['30m', '6h', '1d', '7d', '30d', '90d', '180d', '365d']).default(modelHubEvalTemplatesUsageListQueryPeriodDefault),
   "start_date": zod.string().datetime({"offset":true}).optional(),
-  "end_date": zod.string().datetime({"offset":true}).optional()
+  "end_date": zod.string().datetime({"offset":true}).optional(),
+  "refresh": zod.boolean().default(modelHubEvalTemplatesUsageListQueryRefreshDefault)
 })
 
 
@@ -20063,7 +20065,7 @@ export const ModelHubEvalTemplatesUsageListResponse = zod.object({
   "result": zod.object({
   "template_id": zod.string().uuid(),
   "is_composite": zod.boolean(),
-  "completeness": zod.enum(['complete', 'degraded']).optional(),
+  "completeness": zod.enum(['complete', 'degraded', 'pending']).optional(),
   "unavailable_fields": zod.array(zod.string().min(1)).optional(),
   "stats": zod.object({
   "total_runs": zod.number(),
@@ -20144,7 +20146,14 @@ export const ModelHubEvalTemplatesUsageListResponse = zod.object({
   "total": zod.number(),
   "page": zod.number(),
   "page_size": zod.number()
-})
+}),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'degraded', 'pending']).optional(),
+  "query_sampled": zod.boolean().optional(),
+  "query_completed_at": zod.string().datetime({"offset":true}).optional(),
+  "query_cached": zod.boolean().optional(),
+  "query_refresh_failed": zod.boolean().optional(),
+  "query_refreshing": zod.boolean().optional()
 })
 })
 
@@ -33865,6 +33874,7 @@ export const TracerChartsFetchGraphQueryParams = zod.object({
 export const tracerChartsFetchGraphResponseResultsItemFiltersDefault = [];
 export const tracerChartsFetchGraphResponseResultsItemPropertyDefault = `average`;
 export const tracerChartsFetchGraphResponseResultsItemAllowSampledDefault = false;
+export const tracerChartsFetchGraphResponseResultsItemRefreshDefault = false;
 
 export const TracerChartsFetchGraphResponse = zod.object({
   "count": zod.number(),
@@ -33887,7 +33897,8 @@ export const TracerChartsFetchGraphResponse = zod.object({
   "property": zod.string().default(tracerChartsFetchGraphResponseResultsItemPropertyDefault),
   "req_data_config": zod.string(),
   "project_id": zod.string().uuid(),
-  "allow_sampled": zod.boolean().default(tracerChartsFetchGraphResponseResultsItemAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+  "allow_sampled": zod.boolean().default(tracerChartsFetchGraphResponseResultsItemAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.'),
+  "refresh": zod.boolean().default(tracerChartsFetchGraphResponseResultsItemRefreshDefault).describe('Recompute and atomically replace the last complete exact result.')
 }))
 })
 
@@ -34338,6 +34349,10 @@ export const tracerDashboardFilterValuesQueryProjectIdsDefault = ``;
 export const tracerDashboardFilterValuesQuerySearchDefault = ``;
 export const tracerDashboardFilterValuesQuerySearchMax = 512;
 
+export const tracerDashboardFilterValuesQueryPageSizeMax = 50;
+
+export const tracerDashboardFilterValuesQueryCursorMax = 16384;
+
 
 
 export const TracerDashboardFilterValuesQueryParams = zod.object({
@@ -34348,10 +34363,13 @@ export const TracerDashboardFilterValuesQueryParams = zod.object({
   "source": zod.enum(['traces', 'sessions', 'datasets', 'dataset_column', 'simulation']).default(tracerDashboardFilterValuesQuerySourceDefault),
   "project_ids": zod.string().default(tracerDashboardFilterValuesQueryProjectIdsDefault),
   "dataset_id": zod.string().uuid().optional(),
-  "search": zod.string().max(tracerDashboardFilterValuesQuerySearchMax).default(tracerDashboardFilterValuesQuerySearchDefault)
+  "search": zod.string().max(tracerDashboardFilterValuesQuerySearchMax).default(tracerDashboardFilterValuesQuerySearchDefault),
+  "page_size": zod.number().min(1).max(tracerDashboardFilterValuesQueryPageSizeMax).optional(),
+  "cursor": zod.string().min(1).max(tracerDashboardFilterValuesQueryCursorMax).optional()
 })
 
 export const tracerDashboardFilterValuesResponseStatusDefault = true;
+
 
 
 
@@ -34372,7 +34390,9 @@ export const TracerDashboardFilterValuesResponse = zod.object({
   "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().datetime({"offset":true}).optional(),
-  "query_window_end": zod.string().datetime({"offset":true}).optional()
+  "query_window_end": zod.string().datetime({"offset":true}).optional(),
+  "has_more": zod.boolean().optional(),
+  "next_cursor": zod.string().min(1).optional()
 })
 })
 
@@ -34503,7 +34523,7 @@ export const TracerDashboardQueryBody = zod.object({
   "column_id": zod.string().optional(),
   "data_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardQueryBodyBreakdownsItemDataTypeDefault)
 })).default(tracerDashboardQueryBodyBreakdownsDefault),
-  "allow_sampled": zod.boolean().default(tracerDashboardQueryBodyAllowSampledDefault)
+  "allow_sampled": zod.boolean().default(tracerDashboardQueryBodyAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.')
 })
 
 export const tracerDashboardQueryResponseStatusDefault = true;
@@ -34513,6 +34533,11 @@ export const tracerDashboardQueryResponseStatusDefault = true;
 
 
 
+
+
+export const tracerDashboardQueryResponseResultQuerySnapshotCaptureCountMin = 0;
+
+export const tracerDashboardQueryResponseResultQuerySnapshotRelationCountMin = 0;
 
 
 
@@ -34532,6 +34557,7 @@ export const TracerDashboardQueryResponse = zod.object({
 }))
 })),
   "query_complete": zod.boolean().optional(),
+  "query_sampled": zod.boolean().optional(),
   "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_sampling_strategy": zod.string().min(1).optional(),
@@ -34543,7 +34569,17 @@ export const TracerDashboardQueryResponse = zod.object({
   "start": zod.string().min(1),
   "end": zod.string().min(1)
 }),
-  "granularity": zod.enum(['minute', 'hour', 'day', 'week', 'month'])
+  "granularity": zod.enum(['minute', 'hour', 'day', 'week', 'month']),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'degraded', 'pending']).optional(),
+  "query_sampled": zod.boolean().optional(),
+  "query_completed_at": zod.string().datetime({"offset":true}).optional(),
+  "query_cached": zod.boolean().optional(),
+  "query_refresh_failed": zod.boolean().optional(),
+  "query_refreshing": zod.boolean().optional(),
+  "query_snapshot_version_ceiling": zod.number().min(1).optional(),
+  "query_snapshot_capture_count": zod.number().min(tracerDashboardQueryResponseResultQuerySnapshotCaptureCountMin).optional(),
+  "query_snapshot_relation_count": zod.number().min(tracerDashboardQueryResponseResultQuerySnapshotRelationCountMin).optional()
 })
 })
 
@@ -34821,9 +34857,9 @@ export const TracerDashboardWidgetsPreviewQueryBody = zod.object({
   "column_id": zod.string().optional(),
   "data_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsItemDataTypeDefault)
 })).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigBreakdownsDefault),
-  "allow_sampled": zod.boolean().default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigAllowSampledDefault)
+  "allow_sampled": zod.boolean().default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.')
 }),
-  "allow_sampled": zod.boolean().default(tracerDashboardWidgetsPreviewQueryBodyAllowSampledDefault)
+  "allow_sampled": zod.boolean().default(tracerDashboardWidgetsPreviewQueryBodyAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.')
 })
 
 export const tracerDashboardWidgetsPreviewQueryResponseStatusDefault = true;
@@ -34833,6 +34869,11 @@ export const tracerDashboardWidgetsPreviewQueryResponseStatusDefault = true;
 
 
 
+
+
+export const tracerDashboardWidgetsPreviewQueryResponseResultQuerySnapshotCaptureCountMin = 0;
+
+export const tracerDashboardWidgetsPreviewQueryResponseResultQuerySnapshotRelationCountMin = 0;
 
 
 
@@ -34852,6 +34893,7 @@ export const TracerDashboardWidgetsPreviewQueryResponse = zod.object({
 }))
 })),
   "query_complete": zod.boolean().optional(),
+  "query_sampled": zod.boolean().optional(),
   "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_sampling_strategy": zod.string().min(1).optional(),
@@ -34863,7 +34905,17 @@ export const TracerDashboardWidgetsPreviewQueryResponse = zod.object({
   "start": zod.string().min(1),
   "end": zod.string().min(1)
 }),
-  "granularity": zod.enum(['minute', 'hour', 'day', 'week', 'month'])
+  "granularity": zod.enum(['minute', 'hour', 'day', 'week', 'month']),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'degraded', 'pending']).optional(),
+  "query_sampled": zod.boolean().optional(),
+  "query_completed_at": zod.string().datetime({"offset":true}).optional(),
+  "query_cached": zod.boolean().optional(),
+  "query_refresh_failed": zod.boolean().optional(),
+  "query_refreshing": zod.boolean().optional(),
+  "query_snapshot_version_ceiling": zod.number().min(1).optional(),
+  "query_snapshot_capture_count": zod.number().min(tracerDashboardWidgetsPreviewQueryResponseResultQuerySnapshotCaptureCountMin).optional(),
+  "query_snapshot_relation_count": zod.number().min(tracerDashboardWidgetsPreviewQueryResponseResultQuerySnapshotRelationCountMin).optional()
 })
 })
 
@@ -35121,7 +35173,7 @@ export const TracerDashboardWidgetsExecuteQueryParams = zod.object({
 export const tracerDashboardWidgetsExecuteQueryBodyAllowSampledDefault = false;
 
 export const TracerDashboardWidgetsExecuteQueryBody = zod.object({
-  "allow_sampled": zod.boolean().default(tracerDashboardWidgetsExecuteQueryBodyAllowSampledDefault)
+  "allow_sampled": zod.boolean().default(tracerDashboardWidgetsExecuteQueryBodyAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Dashboard aggregates are always exact.')
 })
 
 export const tracerDashboardWidgetsExecuteQueryResponseStatusDefault = true;
@@ -35131,6 +35183,11 @@ export const tracerDashboardWidgetsExecuteQueryResponseStatusDefault = true;
 
 
 
+
+
+export const tracerDashboardWidgetsExecuteQueryResponseResultQuerySnapshotCaptureCountMin = 0;
+
+export const tracerDashboardWidgetsExecuteQueryResponseResultQuerySnapshotRelationCountMin = 0;
 
 
 
@@ -35150,6 +35207,7 @@ export const TracerDashboardWidgetsExecuteQueryResponse = zod.object({
 }))
 })),
   "query_complete": zod.boolean().optional(),
+  "query_sampled": zod.boolean().optional(),
   "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_sampling_strategy": zod.string().min(1).optional(),
@@ -35161,7 +35219,17 @@ export const TracerDashboardWidgetsExecuteQueryResponse = zod.object({
   "start": zod.string().min(1),
   "end": zod.string().min(1)
 }),
-  "granularity": zod.enum(['minute', 'hour', 'day', 'week', 'month'])
+  "granularity": zod.enum(['minute', 'hour', 'day', 'week', 'month']),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'degraded', 'pending']).optional(),
+  "query_sampled": zod.boolean().optional(),
+  "query_completed_at": zod.string().datetime({"offset":true}).optional(),
+  "query_cached": zod.boolean().optional(),
+  "query_refresh_failed": zod.boolean().optional(),
+  "query_refreshing": zod.boolean().optional(),
+  "query_snapshot_version_ceiling": zod.number().min(1).optional(),
+  "query_snapshot_capture_count": zod.number().min(tracerDashboardWidgetsExecuteQueryResponseResultQuerySnapshotCaptureCountMin).optional(),
+  "query_snapshot_relation_count": zod.number().min(tracerDashboardWidgetsExecuteQueryResponseResultQuerySnapshotRelationCountMin).optional()
 })
 })
 
@@ -38001,9 +38069,11 @@ export const TracerObservationSpanGetEvaluationDetailsResponse = zod.object({
  * Fetch data for the observe graph with optimized queries
  */
 export const tracerObservationSpanGetGraphMethodsQueryAllowSampledDefault = false;
+export const tracerObservationSpanGetGraphMethodsQueryRefreshDefault = false;
 
 export const TracerObservationSpanGetGraphMethodsQueryParams = zod.object({
-  "allow_sampled": zod.boolean().default(tracerObservationSpanGetGraphMethodsQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+  "allow_sampled": zod.boolean().default(tracerObservationSpanGetGraphMethodsQueryAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.'),
+  "refresh": zod.boolean().default(tracerObservationSpanGetGraphMethodsQueryRefreshDefault).describe('Recompute and atomically replace the last complete exact result.')
 })
 
 export const tracerObservationSpanGetGraphMethodsBodyFiltersDefault = [];
@@ -38053,6 +38123,7 @@ export const tracerObservationSpanGetGraphMethodsResponseResultQueryResultBytesM
 
 export const tracerObservationSpanGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin = 0;
 
+
 export const tracerObservationSpanGetGraphMethodsResponseResultQuerySamplingStrataMin = 0;
 
 export const tracerObservationSpanGetGraphMethodsResponseResultQuerySamplingStrataCompletedMin = 0;
@@ -38068,9 +38139,9 @@ export const TracerObservationSpanGetGraphMethodsResponse = zod.object({
   "timestamp": zod.string().min(1),
   "value": zod.number(),
   "primary_traffic": zod.number().optional()
-}).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.')).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.'),
+}).describe('Exact graph points. Pending or failed refreshes never publish partial aggregate values.')).describe('Exact graph points. Pending or failed refreshes never publish partial aggregate values.'),
   "query_complete": zod.boolean().optional(),
-  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded', 'pending']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().min(1).optional(),
   "query_window_end": zod.string().min(1).optional(),
@@ -38081,6 +38152,11 @@ export const TracerObservationSpanGetGraphMethodsResponse = zod.object({
   "query_result_bytes": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQueryResultBytesMin).optional(),
   "query_total_rows_lower_bound": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin).optional(),
   "query_sampled": zod.boolean().optional(),
+  "query_completed_at": zod.string().datetime({"offset":true}).optional(),
+  "query_cached": zod.boolean().optional(),
+  "query_refresh_failed": zod.boolean().optional(),
+  "query_refreshing": zod.boolean().optional(),
+  "query_snapshot_version_ceiling": zod.number().min(1).optional(),
   "query_sampling_strategy": zod.enum(['time_stratified_latest_state', 'bounded_latest_state_prefix']).optional(),
   "query_sampling_strata": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQuerySamplingStrataMin).optional(),
   "query_sampling_strata_completed": zod.number().min(tracerObservationSpanGetGraphMethodsResponseResultQuerySamplingStrataCompletedMin).optional()
@@ -39901,6 +39977,7 @@ export const tracerProjectGetGraphDataQueryIntervalDefault = `hour`;
 export const tracerProjectGetGraphDataQueryFiltersDefault = `[]`;
 
 export const tracerProjectGetGraphDataQueryAllowSampledDefault = false;
+export const tracerProjectGetGraphDataQueryRefreshDefault = false;
 
 export const TracerProjectGetGraphDataQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -39908,7 +39985,8 @@ export const TracerProjectGetGraphDataQueryParams = zod.object({
   "project_id": zod.string().uuid(),
   "interval": zod.string().min(1).default(tracerProjectGetGraphDataQueryIntervalDefault),
   "filters": zod.string().min(1).default(tracerProjectGetGraphDataQueryFiltersDefault),
-  "allow_sampled": zod.boolean().default(tracerProjectGetGraphDataQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+  "allow_sampled": zod.boolean().default(tracerProjectGetGraphDataQueryAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.'),
+  "refresh": zod.boolean().default(tracerProjectGetGraphDataQueryRefreshDefault).describe('Recompute and atomically replace the last complete exact result.')
 })
 
 export const tracerProjectGetGraphDataResponseResultsItemNameMax = 255;
@@ -40000,9 +40078,11 @@ All metrics are aggregated at the user level.
  * @summary Fetch time-series aggregate user metrics for the observe graph.
  */
 export const tracerProjectGetUsersAggregateGraphDataQueryAllowSampledDefault = false;
+export const tracerProjectGetUsersAggregateGraphDataQueryRefreshDefault = false;
 
 export const TracerProjectGetUsersAggregateGraphDataQueryParams = zod.object({
-  "allow_sampled": zod.boolean().default(tracerProjectGetUsersAggregateGraphDataQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+  "allow_sampled": zod.boolean().default(tracerProjectGetUsersAggregateGraphDataQueryAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.'),
+  "refresh": zod.boolean().default(tracerProjectGetUsersAggregateGraphDataQueryRefreshDefault).describe('Recompute and atomically replace the last complete exact result.')
 })
 
 export const tracerProjectGetUsersAggregateGraphDataBodyIntervalDefault = `day`;
@@ -41559,9 +41639,11 @@ Response shape matches trace graph: {metric_name, data: [{timestamp, value, prim
  * @summary Fetch time-series session metrics for the observe graph.
  */
 export const tracerTraceSessionGetSessionGraphDataQueryAllowSampledDefault = false;
+export const tracerTraceSessionGetSessionGraphDataQueryRefreshDefault = false;
 
 export const TracerTraceSessionGetSessionGraphDataQueryParams = zod.object({
-  "allow_sampled": zod.boolean().default(tracerTraceSessionGetSessionGraphDataQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+  "allow_sampled": zod.boolean().default(tracerTraceSessionGetSessionGraphDataQueryAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.'),
+  "refresh": zod.boolean().default(tracerTraceSessionGetSessionGraphDataQueryRefreshDefault).describe('Recompute and atomically replace the last complete exact result.')
 })
 
 export const tracerTraceSessionGetSessionGraphDataBodyFiltersDefault = [];
@@ -41611,6 +41693,7 @@ export const tracerTraceSessionGetSessionGraphDataResponseResultQueryResultBytes
 
 export const tracerTraceSessionGetSessionGraphDataResponseResultQueryTotalRowsLowerBoundMin = 0;
 
+
 export const tracerTraceSessionGetSessionGraphDataResponseResultQuerySamplingStrataMin = 0;
 
 export const tracerTraceSessionGetSessionGraphDataResponseResultQuerySamplingStrataCompletedMin = 0;
@@ -41626,9 +41709,9 @@ export const TracerTraceSessionGetSessionGraphDataResponse = zod.object({
   "timestamp": zod.string().min(1),
   "value": zod.number(),
   "primary_traffic": zod.number().optional()
-}).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.')).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.'),
+}).describe('Exact graph points. Pending or failed refreshes never publish partial aggregate values.')).describe('Exact graph points. Pending or failed refreshes never publish partial aggregate values.'),
   "query_complete": zod.boolean().optional(),
-  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded', 'pending']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().min(1).optional(),
   "query_window_end": zod.string().min(1).optional(),
@@ -41639,6 +41722,11 @@ export const TracerTraceSessionGetSessionGraphDataResponse = zod.object({
   "query_result_bytes": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQueryResultBytesMin).optional(),
   "query_total_rows_lower_bound": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQueryTotalRowsLowerBoundMin).optional(),
   "query_sampled": zod.boolean().optional(),
+  "query_completed_at": zod.string().datetime({"offset":true}).optional(),
+  "query_cached": zod.boolean().optional(),
+  "query_refresh_failed": zod.boolean().optional(),
+  "query_refreshing": zod.boolean().optional(),
+  "query_snapshot_version_ceiling": zod.number().min(1).optional(),
   "query_sampling_strategy": zod.enum(['time_stratified_latest_state', 'bounded_latest_state_prefix']).optional(),
   "query_sampling_strata": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQuerySamplingStrataMin).optional(),
   "query_sampling_strata_completed": zod.number().min(tracerTraceSessionGetSessionGraphDataResponseResultQuerySamplingStrataCompletedMin).optional()
@@ -41685,7 +41773,9 @@ export const tracerTraceSessionListSessionsQueryPageNumberMin = 0;
 export const tracerTraceSessionListSessionsQueryPageSizeDefault = 30;
 export const tracerTraceSessionListSessionsQueryPageSizeMax = 500;
 
+export const tracerTraceSessionListSessionsQueryCursorMax = 4096;
 
+export const tracerTraceSessionListSessionsQueryCursorModeDefault = false;
 
 export const TracerTraceSessionListSessionsQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
@@ -41697,6 +41787,8 @@ export const TracerTraceSessionListSessionsQueryParams = zod.object({
   "sort_params": zod.string().min(1).default(tracerTraceSessionListSessionsQuerySortParamsDefault),
   "page_number": zod.number().min(tracerTraceSessionListSessionsQueryPageNumberMin).default(tracerTraceSessionListSessionsQueryPageNumberDefault).describe('Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range.'),
   "page_size": zod.number().min(1).max(tracerTraceSessionListSessionsQueryPageSizeMax).default(tracerTraceSessionListSessionsQueryPageSizeDefault),
+  "cursor": zod.string().min(1).max(tracerTraceSessionListSessionsQueryCursorMax).optional().describe('Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.'),
+  "cursor_mode": zod.boolean().default(tracerTraceSessionListSessionsQueryCursorModeDefault),
   "interval": zod.string().optional(),
   "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.')
 })
@@ -42103,9 +42195,11 @@ export const TracerTraceGetEvalNamesResponse = zod.object({
  * Fetch data for the observe graph with optimized queries
  */
 export const tracerTraceGetGraphMethodsQueryAllowSampledDefault = false;
+export const tracerTraceGetGraphMethodsQueryRefreshDefault = false;
 
 export const TracerTraceGetGraphMethodsQueryParams = zod.object({
-  "allow_sampled": zod.boolean().default(tracerTraceGetGraphMethodsQueryAllowSampledDefault).describe('Explicitly opt in to bounded sample points. Clients that set this must label sampled values as estimates rather than exact totals.')
+  "allow_sampled": zod.boolean().default(tracerTraceGetGraphMethodsQueryAllowSampledDefault).describe('Deprecated compatibility parameter; accepted but ignored. Aggregate graph results are always exact.'),
+  "refresh": zod.boolean().default(tracerTraceGetGraphMethodsQueryRefreshDefault).describe('Recompute and atomically replace the last complete exact result.')
 })
 
 export const tracerTraceGetGraphMethodsBodyFiltersDefault = [];
@@ -42155,6 +42249,7 @@ export const tracerTraceGetGraphMethodsResponseResultQueryResultBytesMin = 0;
 
 export const tracerTraceGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin = 0;
 
+
 export const tracerTraceGetGraphMethodsResponseResultQuerySamplingStrataMin = 0;
 
 export const tracerTraceGetGraphMethodsResponseResultQuerySamplingStrataCompletedMin = 0;
@@ -42170,9 +42265,9 @@ export const TracerTraceGetGraphMethodsResponse = zod.object({
   "timestamp": zod.string().min(1),
   "value": zod.number(),
   "primary_traffic": zod.number().optional()
-}).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.')).describe('Graph points for exact reads and explicitly bounded samples. Inspect query_status before interpreting values: sampled values describe selected rows, not full totals; degraded reads always return an empty list.'),
+}).describe('Exact graph points. Pending or failed refreshes never publish partial aggregate values.')).describe('Exact graph points. Pending or failed refreshes never publish partial aggregate values.'),
   "query_complete": zod.boolean().optional(),
-  "query_status": zod.enum(['complete', 'sampled', 'degraded']).optional(),
+  "query_status": zod.enum(['complete', 'sampled', 'degraded', 'pending']).optional(),
   "query_error_code": zod.enum(['sample_limit', 'read_budget_exceeded', 'query_failed']).optional(),
   "query_window_start": zod.string().min(1).optional(),
   "query_window_end": zod.string().min(1).optional(),
@@ -42183,6 +42278,11 @@ export const TracerTraceGetGraphMethodsResponse = zod.object({
   "query_result_bytes": zod.number().min(tracerTraceGetGraphMethodsResponseResultQueryResultBytesMin).optional(),
   "query_total_rows_lower_bound": zod.number().min(tracerTraceGetGraphMethodsResponseResultQueryTotalRowsLowerBoundMin).optional(),
   "query_sampled": zod.boolean().optional(),
+  "query_completed_at": zod.string().datetime({"offset":true}).optional(),
+  "query_cached": zod.boolean().optional(),
+  "query_refresh_failed": zod.boolean().optional(),
+  "query_refreshing": zod.boolean().optional(),
+  "query_snapshot_version_ceiling": zod.number().min(1).optional(),
   "query_sampling_strategy": zod.enum(['time_stratified_latest_state', 'bounded_latest_state_prefix']).optional(),
   "query_sampling_strata": zod.number().min(tracerTraceGetGraphMethodsResponseResultQuerySamplingStrataMin).optional(),
   "query_sampling_strata_completed": zod.number().min(tracerTraceGetGraphMethodsResponseResultQuerySamplingStrataCompletedMin).optional()
@@ -42557,19 +42657,25 @@ export const tracerTraceListVoiceCallsQueryPageSizeDefault = 30;
 export const tracerTraceListVoiceCallsQueryPageSizeMax = 500;
 
 export const tracerTraceListVoiceCallsQueryRemoveSimulationCallsDefault = false;
+export const tracerTraceListVoiceCallsQueryCursorMax = 4096;
+
+export const tracerTraceListVoiceCallsQueryCursorModeDefault = false;
 
 export const TracerTraceListVoiceCallsQueryParams = zod.object({
   "project_id": zod.string().uuid(),
   "filters": zod.string().min(1).default(tracerTraceListVoiceCallsQueryFiltersDefault),
-  "page": zod.number().min(1).default(tracerTraceListVoiceCallsQueryPageDefault).describe('One-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range. This endpoint does not provide cursor or unrestricted deep-page traversal.'),
+  "page": zod.number().min(1).default(tracerTraceListVoiceCallsQueryPageDefault).describe('One-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page, use the additive continuation cursor, or narrow the time range.'),
   "page_size": zod.number().min(1).max(tracerTraceListVoiceCallsQueryPageSizeMax).default(tracerTraceListVoiceCallsQueryPageSizeDefault),
   "remove_simulation_calls": zod.boolean().default(tracerTraceListVoiceCallsQueryRemoveSimulationCallsDefault),
+  "cursor": zod.string().min(1).max(tracerTraceListVoiceCallsQueryCursorMax).optional().describe('Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.'),
+  "cursor_mode": zod.boolean().default(tracerTraceListVoiceCallsQueryCursorModeDefault),
   "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label count as a lower bound. Send false to require an exact total. Send true to opt in explicitly to lower-bound totals and, on the first page, a clearly labelled bounded partial result when the full ordered prefix cannot be proven inside the read budget.')
 })
 
 export const tracerTraceListVoiceCallsResponseCountMin = 0;
 
 export const tracerTraceListVoiceCallsResponseTotalPagesMin = 0;
+
 
 
 
@@ -42587,6 +42693,7 @@ export const TracerTraceListVoiceCallsResponse = zod.object({
   "results": zod.array(zod.record(zod.string(), zod.string())),
   "config": zod.array(zod.record(zod.string(), zod.string())),
   "has_more": zod.boolean(),
+  "next_cursor": zod.string().min(1).optional(),
   "query_complete": zod.boolean(),
   "query_status": zod.enum(['complete', 'degraded']),
   "query_error_code": zod.string().min(1).optional()
@@ -43990,6 +44097,9 @@ export const tracerUsersListQuerySortParamsDefault = `[]`;
 export const tracerUsersListQueryFiltersDefault = `[]`;
 
 export const tracerUsersListQueryExportDefault = false;
+export const tracerUsersListQueryCursorMax = 4096;
+
+export const tracerUsersListQueryCursorModeDefault = false;
 
 export const TracerUsersListQueryParams = zod.object({
   "project_id": zod.string().uuid().optional(),
@@ -43998,10 +44108,13 @@ export const TracerUsersListQueryParams = zod.object({
   "current_page_index": zod.number().min(tracerUsersListQueryCurrentPageIndexMin).optional(),
   "sort_params": zod.string().min(1).default(tracerUsersListQuerySortParamsDefault),
   "filters": zod.string().min(1).default(tracerUsersListQueryFiltersDefault),
-  "export": zod.boolean().default(tracerUsersListQueryExportDefault)
+  "export": zod.boolean().default(tracerUsersListQueryExportDefault),
+  "cursor": zod.string().min(1).max(tracerUsersListQueryCursorMax).optional().describe('Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.'),
+  "cursor_mode": zod.boolean().default(tracerUsersListQueryCursorModeDefault)
 })
 
 export const tracerUsersListResponseStatusDefault = true;
+
 
 export const TracerUsersListResponse = zod.object({
   "status": zod.boolean().default(tracerUsersListResponseStatusDefault),
@@ -44010,7 +44123,12 @@ export const TracerUsersListResponse = zod.object({
 
 }).passthrough()),
   "total_count": zod.number(),
-  "total_pages": zod.number()
+  "total_pages": zod.number(),
+  "count_is_lower_bound": zod.boolean().optional(),
+  "has_more": zod.boolean().optional(),
+  "next_cursor": zod.string().min(1).optional(),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'degraded']).optional()
 })
 })
 

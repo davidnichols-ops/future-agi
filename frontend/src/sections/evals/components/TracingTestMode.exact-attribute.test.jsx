@@ -1,7 +1,7 @@
 import React from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, userEvent, waitFor } from "src/utils/test-utils";
+import { act, render, screen, userEvent, waitFor } from "src/utils/test-utils";
 
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
@@ -78,7 +78,7 @@ import TracingTestMode from "./TracingTestMode";
 
 const PROJECT_ID = "00000000-0000-4000-8000-000000000901";
 
-function renderTaskMapping(onReadyChange) {
+function renderTaskMapping(onReadyChange, extraProps = {}) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -91,6 +91,7 @@ function renderTaskMapping(onReadyChange) {
         initialRowType="spans"
         allowCustomFieldPath
         onReadyChange={onReadyChange}
+        {...extraProps}
       />
     </QueryClientProvider>,
   );
@@ -168,8 +169,14 @@ describe("TracingTestMode exact task attribute mapping", () => {
   });
 
   it.each([
-    ["degraded", "Results are incomplete. Please retry in a moment."],
-    ["error", "We couldn't load this data. Please retry in a moment."],
+    [
+      "degraded",
+      "Attribute suggestions are temporarily unavailable. Enter an exact attribute name.",
+    ],
+    [
+      "error",
+      "Attribute suggestions are temporarily unavailable. Enter an exact attribute name.",
+    ],
   ])(
     "shows a sanitized %s warning instead of treating no exact fields as authoritative",
     async (readState, message) => {
@@ -187,7 +194,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
     },
   );
 
-  it("keeps a bounded exact suggestion selectable while warning that the read is degraded", async () => {
+  it("keeps a verified suggestion selectable while exact-name entry remains available", async () => {
     mocks.exactFields = ["final_status"];
     mocks.exactReadState = "degraded";
     const onReadyChange = vi.fn();
@@ -202,7 +209,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
 
     expect(
       await screen.findByText(
-        "Results are incomplete. Please retry in a moment.",
+        "Attribute suggestions are temporarily unavailable. Enter an exact attribute name.",
       ),
     ).toBeInTheDocument();
     await userEvent.click(
@@ -214,6 +221,34 @@ describe("TracingTestMode exact task attribute mapping", () => {
       expect(onReadyChange).toHaveBeenCalledWith(true, {
         evaluation_result: "final_status",
       }),
+    );
+  });
+
+  it("never renders raw infrastructure details from a failed eval test", async () => {
+    const rawError =
+      "Code: 159. DB::Exception: Timeout exceeded\nStack trace: SELECT secret FROM spans";
+    mocks.post.mockRejectedValueOnce({
+      response: { status: 500, data: { detail: rawError } },
+    });
+    const ref = React.createRef();
+    const onTestResult = vi.fn();
+    renderTaskMapping(vi.fn(), { ref, onTestResult });
+
+    await screen.findByPlaceholderText(
+      "Search or type a path (e.g. attributes.input.value)",
+    );
+    await waitFor(() => expect(ref.current).toBeTruthy());
+    await act(async () => {
+      ref.current.runTest();
+    });
+
+    expect(
+      await screen.findByText("Failed to run evaluation. Please retry."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/DB::Exception/)).not.toBeInTheDocument();
+    expect(onTestResult).toHaveBeenCalledWith(
+      false,
+      "Failed to run evaluation. Please retry.",
     );
   });
 });

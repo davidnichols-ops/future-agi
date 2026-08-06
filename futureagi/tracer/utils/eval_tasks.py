@@ -24,6 +24,7 @@ from tracer.models.eval_task import (
 )
 from tracer.models.observation_span import EvalLogger, ObservationSpan
 from tracer.models.trace import Trace
+from tracer.services.filter_principal_context import bound_my_annotations_principal
 from tracer.utils.annotations import build_annotation_subqueries
 from tracer.utils.eval import (
     evaluate_observation_span_observe,
@@ -202,11 +203,13 @@ def parsing_evaltask_filters(
             if q_eval:
                 combined_q &= q_eval
 
-            # user_id=None: background activity, so my_annotations is a no-op.
+            # Eval-task creation binds user-relative filters to the creator.
+            # Legacy payloads without that binding fail closed inside
+            # FilterEngine instead of silently broadening the task selection.
             q_anno, anno_anns = (
                 FilterEngine.get_filter_conditions_for_voice_call_annotations(
                     items,
-                    user_id=None,
+                    user_id=bound_my_annotations_principal(items),
                     source_q=annotation_source_q,
                 )
             )

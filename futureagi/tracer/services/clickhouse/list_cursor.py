@@ -17,8 +17,12 @@ from typing import Any
 from django.conf import settings
 from django.core import signing
 
-CURSOR_VERSION = 1
-CURSOR_SALT = "tracer.clickhouse-list-cursor.v1"
+# Relation ceilings and scan checkpoints are part of the signed wire state.
+# Do not let a token minted before those fields existed resume a query against
+# only the spans ceiling: residual eval/annotation/user membership could then
+# change between pages.  A version/salt bump makes those old tokens fail closed.
+CURSOR_VERSION = 2
+CURSOR_SALT = "tracer.clickhouse-list-cursor.v2"
 DEFAULT_CURSOR_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
@@ -38,6 +42,10 @@ class ListCursor:
     total_rows: int | None = None
     version_ceiling: int = 0
     seen_rows: int = 0
+    relation_version_ceilings: dict[str, int] | None = None
+    scan_slice_end: datetime | None = None
+    scan_before_start_time: datetime | None = None
+    scan_before_id: Any = None
 
 
 def _json_value(value: Any) -> Any:
@@ -204,6 +212,10 @@ def encode_list_cursor(
     version_ceiling: int,
     seen_rows: int,
     total_rows: int | None = None,
+    relation_version_ceilings: dict[str, int] | None = None,
+    scan_slice_end: datetime | None = None,
+    scan_before_start_time: datetime | None = None,
+    scan_before_id: Any = None,
 ) -> str:
     if (
         not resource
@@ -214,6 +226,24 @@ def encode_list_cursor(
         or seen_rows < 0
     ):
         raise ValueError("invalid list cursor state")
+    normalized_relation_ceilings = {
+        str(table): int(ceiling)
+        for table, ceiling in (relation_version_ceilings or {}).items()
+    }
+    if normalized_relation_ceilings and (
+        any(not table for table in normalized_relation_ceilings)
+        or any(ceiling <= 0 for ceiling in normalized_relation_ceilings.values())
+        or normalized_relation_ceilings.get("spans") != int(version_ceiling)
+    ):
+        raise ValueError("invalid list relation snapshot")
+    if (scan_before_start_time is None) != (scan_before_id is None):
+        raise ValueError("invalid list scan checkpoint")
+    if scan_slice_end is not None and not (window_start < scan_slice_end <= window_end):
+        raise ValueError("invalid list scan checkpoint")
+    if scan_before_start_time is not None and not (
+        window_start <= scan_before_start_time < (scan_slice_end or window_end)
+    ):
+        raise ValueError("invalid list scan checkpoint")
     payload = {
         "v": CURSOR_VERSION,
         "resource": resource,
@@ -226,6 +256,10 @@ def encode_list_cursor(
         "total_rows": int(total_rows) if total_rows is not None else None,
         "version_ceiling": int(version_ceiling),
         "seen_rows": int(seen_rows),
+        "relation_version_ceilings": normalized_relation_ceilings or None,
+        "scan_slice_end": _json_value(scan_slice_end),
+        "scan_before_start_time": _json_value(scan_before_start_time),
+        "scan_before_id": _json_value(scan_before_id),
     }
     return signing.dumps(
         payload, key=settings.SECRET_KEY, salt=CURSOR_SALT, compress=True
@@ -289,6 +323,45 @@ def decode_list_cursor(
         or payload["seen_rows"] < 0
     ):
         raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    raw_relation_ceilings = payload.get("relation_version_ceilings")
+    if raw_relation_ceilings is None:
+        relation_version_ceilings = None
+    elif not isinstance(raw_relation_ceilings, dict):
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    else:
+        try:
+            relation_version_ceilings = {
+                str(table): int(ceiling)
+                for table, ceiling in raw_relation_ceilings.items()
+            }
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ListCursorError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            ) from exc
+        if (
+            not relation_version_ceilings
+            or any(not table for table in relation_version_ceilings)
+            or any(ceiling <= 0 for ceiling in relation_version_ceilings.values())
+            or relation_version_ceilings.get("spans") != int(payload["version_ceiling"])
+        ):
+            raise ListCursorError(
+                "invalid_cursor", "The continuation cursor is invalid."
+            )
+    scan_slice_end = _restore_json_value(payload.get("scan_slice_end"))
+    scan_before_start_time = _restore_json_value(payload.get("scan_before_start_time"))
+    scan_before_id = _restore_json_value(payload.get("scan_before_id"))
+    if scan_slice_end is not None and (
+        not isinstance(scan_slice_end, datetime)
+        or not window_start < scan_slice_end <= window_end
+    ):
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    if (scan_before_start_time is None) != (scan_before_id is None):
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
+    if scan_before_start_time is not None and (
+        not isinstance(scan_before_start_time, datetime)
+        or not window_start <= scan_before_start_time < (scan_slice_end or window_end)
+    ):
+        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
     return ListCursor(
         window_start=window_start,
         window_end=window_end,
@@ -300,6 +373,10 @@ def decode_list_cursor(
         ),
         version_ceiling=payload["version_ceiling"],
         seen_rows=payload["seen_rows"],
+        relation_version_ceilings=relation_version_ceilings,
+        scan_slice_end=scan_slice_end,
+        scan_before_start_time=scan_before_start_time,
+        scan_before_id=scan_before_id,
     )
 
 
@@ -312,20 +389,96 @@ def snapshot_read_settings(
         raise ValueError("version_ceiling must be positive")
     table = str(getattr(builder, "TABLE", "spans"))
     is_v2 = ".v2." in builder.__class__.__module__
-    version_column = "_version" if is_v2 else "_peerdb_version"
+    version_column = getattr(
+        builder,
+        "SNAPSHOT_VERSION_COLUMN",
+        "_version" if is_v2 else "_peerdb_version",
+    )
     existing = dict(base.get("additional_table_filters") or {})
     existing[table] = f"{version_column} < {int(version_ceiling)}"
     return {**base, "additional_table_filters": existing}
 
 
-def snapshot_cursor_supported(filters: list[dict[str, Any]], *, resource: str) -> bool:
-    """Whether list membership depends only on the versioned spans table.
+_DIRECT_EPOCH_NANO_TABLES = frozenset({"spans", "tracer_eval_logger_v2", "traces"})
+_PEERDB_INTEGER_TABLES = frozenset({"model_hub_score", "tracer_eval_logger"})
+_DATETIME64_MICRO_TABLES = frozenset(
+    {"end_user_id_remap", "end_users", "trace_session_id_remap"}
+)
+_LIST_SNAPSHOT_TABLES = (
+    _DIRECT_EPOCH_NANO_TABLES | _PEERDB_INTEGER_TABLES | _DATETIME64_MICRO_TABLES
+)
 
-    Relational eval, annotation, and end-user filters consult independently
-    mutable ClickHouse relations. Until a cursor carries a ceiling for every
-    one of those relations, they must retain legacy numbered pagination rather
-    than claiming a cross-page snapshot that is not actually frozen.
+
+def relation_snapshot_read_settings(
+    base: dict[str, Any], *, version_ceilings: dict[str, int]
+) -> dict[str, Any]:
+    """Rebuild strict per-table filters carried by a signed list cursor."""
+
+    if not version_ceilings or "spans" not in version_ceilings:
+        raise ValueError("list relation snapshot is incomplete")
+    unknown = set(version_ceilings) - _LIST_SNAPSHOT_TABLES
+    if unknown:
+        raise ValueError("list relation snapshot contains an unsupported table")
+    additional_filters = dict(base.get("additional_table_filters") or {})
+    for table, raw_ceiling in version_ceilings.items():
+        ceiling = int(raw_ceiling)
+        if ceiling <= 0:
+            raise ValueError("list relation snapshot ceiling must be positive")
+        if table in _DIRECT_EPOCH_NANO_TABLES:
+            predicate = f"_version < {ceiling}"
+        elif table in _PEERDB_INTEGER_TABLES:
+            predicate = f"_peerdb_version < {ceiling}"
+        else:
+            predicate = f"toUnixTimestamp64Micro(version) < {ceiling}"
+        existing = additional_filters.get(table)
+        if existing is not None and existing != predicate:
+            raise ValueError("list relation snapshot settings conflict")
+        additional_filters[table] = predicate
+    return {**base, "additional_table_filters": additional_filters}
+
+
+def capture_list_relation_snapshot(
+    *,
+    analytics: Any,
+    builder: Any,
+    base_settings: dict[str, Any],
+    timeout_ms: int,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Freeze every physical relation used by a bounded list classifier.
+
+    The generated classifier is the source of truth for dependencies, avoiding
+    a second hand-maintained mapping from public filter shapes to tables.  The
+    dashboard snapshot helper is imported lazily to avoid its intentional
+    dependency on the direct-write ceiling capture in this module.
     """
+
+    if timeout_ms <= 0:
+        raise ValueError("list snapshot timeout must be positive")
+    query, _ = builder.build_filter_match_query(
+        ["00000000-0000-0000-0000-000000000000"]
+    )
+    if not query:
+        raise ValueError("list classifier snapshot query is unavailable")
+    from tracer.services.clickhouse.dashboard_snapshot import (
+        capture_dashboard_relation_snapshot,
+    )
+
+    snapshot = capture_dashboard_relation_snapshot(
+        analytics=analytics,
+        sql_statements=[query],
+        base_settings=base_settings,
+        timeout_ms=timeout_ms,
+    )
+    if "spans" not in snapshot.version_ceilings:
+        raise ValueError("list classifier snapshot omitted spans")
+    unknown = set(snapshot.version_ceilings) - _LIST_SNAPSHOT_TABLES
+    if unknown:
+        raise ValueError("list classifier uses an unsupported snapshot relation")
+    return snapshot.settings, dict(snapshot.version_ceilings)
+
+
+def snapshot_cursor_supported(filters: list[dict[str, Any]], *, resource: str) -> bool:
+    """Whether the bounded compiler can freeze every list membership relation."""
 
     from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
         partition_span_filter_plans,
@@ -339,14 +492,39 @@ def snapshot_cursor_supported(filters: list[dict[str, Any]], *, resource: str) -
     if partition is None:
         raise ValueError("unsupported cursor resource")
     try:
-        _, residual_filters = partition(filters)
+        partition(filters)
     except (TypeError, ValueError):
         return False
-    return not residual_filters
+    return True
+
+
+def cursor_requires_relation_snapshot(
+    filters: list[dict[str, Any]], *, resource: str
+) -> bool:
+    """Return whether membership reads relations beyond direct-write spans."""
+
+    from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+        partition_span_filter_plans,
+        partition_trace_filter_plans,
+    )
+
+    partition = {
+        "observe_traces": partition_trace_filter_plans,
+        "observe_spans": partition_span_filter_plans,
+    }.get(resource)
+    if partition is None:
+        raise ValueError("unsupported cursor resource")
+    _, residual_filters = partition(filters)
+    return bool(residual_filters)
 
 
 def cursor_page_metadata(
-    *, enabled: bool, has_more: bool, seen_rows: int, next_cursor: str | None
+    *,
+    enabled: bool,
+    has_more: bool,
+    seen_rows: int,
+    next_cursor: str | None,
+    unseen_row_proven: bool = False,
 ) -> dict[str, Any]:
     """Build cursor totals, or no cursor contract for a legacy fallback page."""
 
@@ -357,7 +535,10 @@ def cursor_page_metadata(
     if has_more and not next_cursor:
         raise RuntimeError("cursor page with more rows requires a continuation token")
     return {
-        "total_rows": seen_rows + (1 if has_more else 0),
+        # A scan checkpoint means more search space, not necessarily another
+        # matching row. Add the sentinel only when the selector has already
+        # classified an extra match beyond the published page.
+        "total_rows": seen_rows + (1 if has_more and unseen_row_proven else 0),
         "total_rows_exact": None if has_more else seen_rows,
         "total_rows_is_lower_bound": has_more,
         "has_more": has_more,
@@ -405,6 +586,9 @@ __all__ = [
     "encode_list_cursor",
     "frozen_window_filter",
     "normalize_cursor_query",
+    "capture_list_relation_snapshot",
+    "cursor_requires_relation_snapshot",
+    "relation_snapshot_read_settings",
     "snapshot_cursor_supported",
     "snapshot_read_settings",
 ]

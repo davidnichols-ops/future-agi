@@ -537,6 +537,56 @@ def test_span_retrieve_does_not_require_a_postgres_span_row():
 
 
 @pytest.mark.unit
+def test_span_retrieve_unions_typed_maps_with_nonempty_structured_extra():
+    from tracer.views.observation_span import ObservationSpanView
+
+    row = _root_span_row(project_id="P1")
+    row.update(
+        span_attributes='{"dupe":"from-extra","structured":{"attempt":2}}',
+        attrs_string={"final_status": "Rechazado", "dupe": "from-map"},
+        attrs_number={"score": 12.0},
+        attrs_bool={"approved": 1},
+    )
+    detail = TraceDetailRead(
+        project_id="P1",
+        spans=(row,),
+        eval_config_ids=(),
+        evals=(),
+        annotations=(),
+        query_count=3,
+        elapsed_ms=0.0,
+    )
+    project_manager = MagicMock()
+    project_manager.filter.return_value.values_list.return_value.__getitem__.return_value = [
+        "P1"
+    ]
+    request = SimpleNamespace(
+        organization=SimpleNamespace(id="ORG1"),
+        workspace=None,
+        user=SimpleNamespace(organization=SimpleNamespace(id="ORG1")),
+    )
+
+    with (
+        patch.object(Project, "no_workspace_objects", project_manager),
+        patch("tracer.views.observation_span.V2AnalyticsQueryService"),
+        patch(
+            "tracer.services.clickhouse.v2.trace_detail_reads.read_span_detail",
+            return_value=detail,
+        ),
+    ):
+        response = unwrap(ObservationSpanView.retrieve)(
+            ObservationSpanView(), request, pk="S1"
+        )
+
+    attrs = response.data["result"]["observation_span"]["span_attributes"]
+    assert attrs["structured"] == {"attempt": 2}
+    assert attrs["final_status"] == "Rechazado"
+    assert attrs["score"] == 12.0
+    assert attrs["approved"] is True
+    assert attrs["dupe"] == "from-extra"
+
+
+@pytest.mark.unit
 def test_eval_detail_keeps_organization_gate_without_workspace_context():
     from tracer.views.observation_span import ObservationSpanView
 

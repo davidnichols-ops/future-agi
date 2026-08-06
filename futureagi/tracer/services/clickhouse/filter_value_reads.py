@@ -12,11 +12,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, NotRequired, TypedDict
 
+from tracer.services.clickhouse.query_builders.voice_call_list import (
+    VOICE_CALL_STATUS_FILTER_EXPRESSION,
+    VOICE_COST_CENTS_FILTER_EXPRESSION,
+)
 from tracer.services.clickhouse.query_service import QueryExecutor
 from tracer.services.clickhouse.v2.id_remap_sql import (
     NIL_UUID,
     remap_left_join,
     resolved_id_expr,
+)
+from tracer.services.clickhouse.v2.query_builders.filters import (
+    rewrite_v1_sql_to_v2,
 )
 
 FILTER_VALUE_READ_TIMEOUT_MS = 4_000
@@ -55,7 +62,13 @@ _SYSTEM_VALUE_SOURCE_COLUMNS = {
     "prompt_version": "prompt_version_id",
     "prompt_label": "prompt_label_id",
 }
-SYSTEM_FILTER_VALUE_METRICS = frozenset(_SYSTEM_VALUE_SOURCE_COLUMNS)
+_VOICE_SYSTEM_VALUE_EXPRESSIONS = {
+    "call_status": rewrite_v1_sql_to_v2(VOICE_CALL_STATUS_FILTER_EXPRESSION),
+    "cost_cents": rewrite_v1_sql_to_v2(VOICE_COST_CENTS_FILTER_EXPRESSION),
+}
+SYSTEM_FILTER_VALUE_METRICS = frozenset(
+    {*_SYSTEM_VALUE_SOURCE_COLUMNS, *_VOICE_SYSTEM_VALUE_EXPRESSIONS}
+)
 
 
 class FilterValueMetadata(TypedDict):
@@ -126,6 +139,33 @@ def _latest_span_value_cte(source_column: str) -> str:
     """
 
 
+def _latest_voice_value_cte() -> str:
+    """Latest root fields needed by normalized voice response expressions."""
+
+    return """
+        latest_spans AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(is_deleted, _version) AS latest_is_deleted,
+                argMax(tuple(parent_span_id), _version).1 AS latest_parent_span_id,
+                argMax(observation_type, _version) AS latest_observation_type,
+                argMax(tuple(provider), _version).1 AS provider,
+                argMax(tuple(cost), _version).1 AS cost,
+                argMax(attrs_string, _version) AS attrs_string,
+                argMax(attrs_number, _version) AS attrs_number,
+                argMax(tuple(attributes_extra), _version).1 AS attributes_extra
+            FROM spans
+            PREWHERE project_id IN %(project_ids)s
+              AND start_time >= %(window_start)s
+              AND start_time < %(window_end)s
+            GROUP BY project_id, trace_id, id, start_time
+        )
+    """
+
+
 def _system_value_expression(metric_name: str) -> tuple[str, str]:
     """Return the code-owned value expression and any remap join."""
 
@@ -173,21 +213,35 @@ def read_span_system_filter_values(
 
     if not 1 <= int(limit) <= 500:
         raise ValueError("filter-value limit must be between 1 and 500")
-    try:
-        source_column = _SYSTEM_VALUE_SOURCE_COLUMNS[metric_name]
-    except KeyError as exc:
-        raise ValueError("unsupported system filter-value metric") from exc
+    voice_expression = _VOICE_SYSTEM_VALUE_EXPRESSIONS.get(metric_name)
+    if voice_expression is None:
+        try:
+            source_column = _SYSTEM_VALUE_SOURCE_COLUMNS[metric_name]
+        except KeyError as exc:
+            raise ValueError("unsupported system filter-value metric") from exc
+        latest_value_cte = _latest_span_value_cte(source_column)
+    else:
+        latest_value_cte = _latest_voice_value_cte()
     window_start, window_end = _window(lookback_days=lookback_days, now=now)
     project_scope = tuple(dict.fromkeys(str(value) for value in project_ids if value))
     if not project_scope:
         return FilterValueRead((), True, None, window_start, window_end)
 
-    value_expression, join = _system_value_expression(metric_name)
-    root_clause = (
-        "AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')"
-        if metric_name == "name"
-        else ""
-    )
+    if voice_expression is None:
+        value_expression, join = _system_value_expression(metric_name)
+    else:
+        value_expression, join = voice_expression, ""
+    if voice_expression is not None:
+        root_clause = (
+            "AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '') "
+            "AND latest_observation_type = 'conversation'"
+        )
+    elif metric_name == "name":
+        root_clause = (
+            "AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')"
+        )
+    else:
+        root_clause = ""
     search_clause = (
         "AND positionCaseInsensitiveUTF8(toString(raw_picker_value), "
         "%(filter_value_search)s) > 0"
@@ -195,7 +249,7 @@ def read_span_system_filter_values(
         else ""
     )
     query = f"""
-        WITH {_latest_span_value_cte(source_column)}
+        WITH {latest_value_cte}
         SELECT DISTINCT toString(raw_picker_value) AS val
         FROM (
             SELECT {value_expression} AS raw_picker_value

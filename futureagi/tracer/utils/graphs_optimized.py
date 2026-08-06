@@ -110,6 +110,7 @@ def get_eval_graph_data(
     observe_type: str,
     req_data_config: dict,
     eval_logger_filters: dict,
+    refresh: bool = False,
 ) -> Any:
     """Read an eval graph from the authoritative direct-write CH25 tables."""
     del property
@@ -147,77 +148,27 @@ def get_eval_graph_data(
 
     try:
         from tracer.services.clickhouse.graph_dispatch import (
-            GRAPH_READ_SETTINGS,
-            GRAPH_WALL_DEADLINE_MS,
             fetch_eval_chart_series_ch,
-        )
-        from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
-        from tracer.services.clickhouse.v2.query_builders.eval_metrics import (
-            EvalMetricsQueryBuilderV2,
         )
         from tracer.services.clickhouse.v2.query_service import (
             V2AnalyticsQueryService,
         )
 
-        active_filters = [
-            item
-            for item in filters
-            if (item.get("column_id") or item.get("columnId"))
-            not in {"created_at", "start_time"}
-            or BaseQueryBuilder.is_datetime_complement_filter(item)
-        ]
         output_type = custom_eval_config.eval_template.config.get("output", "SCORE")
         choices = custom_eval_config.eval_template.choices or []
-        analytics = V2AnalyticsQueryService()
-        if active_filters:
-            return fetch_eval_chart_series_ch(
-                analytics=analytics,
-                project_id=str(ch_project_id),
-                filters=filters,
-                interval=interval,
-                req_data_config={
-                    **req_data_config,
-                    "eval_output_type": output_type,
-                    "choices": choices,
-                },
-                eval_name=custom_eval_config.name,
-            )
-
-        # A time-only eval read is already config/time-pruned on the
-        # authoritative logger and does not need a spans membership scan.
-        ch_start, ch_end = parse_time_filters(filters)
-        builder = EvalMetricsQueryBuilderV2(
+        return fetch_eval_chart_series_ch(
+            analytics=V2AnalyticsQueryService(),
             project_id=str(ch_project_id),
-            custom_eval_config_id=str(custom_eval_config_id),
-            start_date=ch_start,
-            end_date=ch_end,
+            filters=filters,
             interval=interval,
-            eval_output_type=output_type,
+            req_data_config={
+                **req_data_config,
+                "eval_output_type": output_type,
+                "choices": choices,
+            },
             eval_name=custom_eval_config.name,
-            choices=choices,
+            refresh=refresh,
         )
-        query, params = builder.build()
-        result = analytics.execute_ch_query(
-            query,
-            params,
-            timeout_ms=GRAPH_WALL_DEADLINE_MS,
-            settings=GRAPH_READ_SETTINGS,
-        )
-        ch_data = builder.format_result(result.data, result.columns or [])
-        # The public charts contract wraps non-choice eval series in a list.
-        if observe_type == "charts" and builder.eval_output_type != "CHOICES":
-            if isinstance(ch_data, dict):
-                ch_data = [ch_data]
-        if isinstance(ch_data, list):
-            ch_data = [
-                {
-                    **series,
-                    "query_complete": True,
-                    "query_status": "complete",
-                }
-                for series in ch_data
-            ]
-        return ch_data
     except Exception as exc:
         logger.exception(
             "ch_eval_graph_read_failed",
@@ -472,6 +423,7 @@ def _read_direct_system_metrics(
     project_id: str,
     filters: list[dict],
     interval: str,
+    refresh: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Execute the direct-write system-metric builder on the CH25 service."""
     try:
@@ -487,6 +439,7 @@ def _read_direct_system_metrics(
             project_id=project_id,
             filters=filters,
             interval=interval,
+            refresh=refresh,
         )
     except Exception as exc:
         logger.exception(
@@ -503,6 +456,7 @@ def get_all_system_metrics(
     filters: list[dict],
     property: str,
     system_metric_filters: dict,
+    refresh: bool = False,
 ) -> dict:
     """Read latency, token, cost, and traffic series in one CH25 query."""
     del property
@@ -515,6 +469,7 @@ def get_all_system_metrics(
         project_id=str(project_id),
         filters=filters,
         interval=interval,
+        refresh=refresh,
     )
     # Preserve the historical public response exactly; the shared builder also
     # exposes additional aliases used by newer dashboard endpoints.
@@ -719,6 +674,7 @@ def get_system_metric_data(
     req_data_config: dict,
     system_metric_filters: dict,
     observe_type: str = "span",
+    refresh: bool = False,
 ) -> dict:
     """Read one public system-metric series from direct-write CH25."""
     del property
@@ -738,6 +694,7 @@ def get_system_metric_data(
         project_id=str(project_id),
         filters=filters,
         interval=interval,
+        refresh=refresh,
     )
     metric_key = metric_name if metric_name in metrics else "latency"
     traffic_by_timestamp = {

@@ -38,6 +38,10 @@ vi.mock("src/assets/illustrations/empty-graph", () => ({
   default: () => null,
 }));
 vi.mock("src/components/svg-color", () => ({ default: () => null }));
+vi.mock("../../common", () => ({
+  FILTER_FOR_HAS_EVAL: { column_id: "has_eval" },
+  toBackendFilters: (filters) => filters,
+}));
 vi.mock("src/components/show", () => ({
   ShowComponent: ({ condition, children }) => (condition ? children : null),
 }));
@@ -122,15 +126,13 @@ describe("GraphSection exact graph boundary", () => {
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
     expect(
-      await screen.findByText(
-        "Results are incomplete. Please retry in a moment.",
-      ),
+      await screen.findByText("Preparing exact data…"),
     ).toBeInTheDocument();
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
   });
 
-  it("charts explicitly sampled points with a visible sample warning", async () => {
+  it("does not chart explicitly sampled points", async () => {
     axios.post.mockResolvedValue({
       data: {
         result: {
@@ -156,25 +158,15 @@ describe("GraphSection exact graph boundary", () => {
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
     expect(
-      await screen.findByText(
-        "Results are incomplete and sample-limited; values are estimates.",
-      ),
+      await screen.findByText("Preparing exact data…"),
     ).toBeInTheDocument();
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
     expect(axios.post).toHaveBeenCalledWith(
       "/tracer/trace/get_graph_methods/",
       expect.any(Object),
-      { params: { allow_sampled: true } },
+      { params: { allow_sampled: false } },
     );
-    const chart = screen.getByTestId("apex-chart");
-    expect(chart).toBeInTheDocument();
-    expect(chart).toHaveAttribute(
-      "data-traffic-series-name",
-      "Sampled traffic",
-    );
-    expect(chart).toHaveAttribute(
-      "data-traffic-axis-series-name",
-      "Sampled traffic",
-    );
+    expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
+    expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
   });
 });

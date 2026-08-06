@@ -135,6 +135,12 @@ from tracer.models.custom_eval_config import CustomEvalConfig, InlineEval, Model
 from tracer.models.external_eval_config import ExternalEvalConfig
 from tracer.models.observation_span import EvalLogger
 from tracer.services.clickhouse.client import is_clickhouse_enabled
+from tracer.services.exact_aggregation_cache import (
+    mark_refresh_failed,
+    publish_exact_snapshot,
+    read_exact_snapshot,
+    read_or_schedule_exact_snapshot,
+)
 from tracer.utils.filters import apply_created_at_filters
 from tracer.utils.graphs import GraphEngine
 
@@ -4842,6 +4848,43 @@ def _round_to_usage_bucket(ts, bucket_minutes):
     return ts.replace(minute=rounded_minute, second=0, microsecond=0)
 
 
+def _finite_usage_metric(value):
+    """Return a finite float, or ``None`` for empty CH aggregate sentinels."""
+
+    if value is None:
+        return None
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if math.isfinite(normalized) else None
+
+
+def _pending_eval_usage_payload(template_id, page, page_size):
+    """Return the normal usage shape without publishing false zero totals."""
+
+    return {
+        "template_id": str(template_id),
+        "is_composite": False,
+        "completeness": "pending",
+        "unavailable_fields": [],
+        "stats": {
+            "total_runs": 0,
+            "runs_period": 0,
+            "success_count": 0,
+            "error_count": 0,
+            "pass_rate": 0.0,
+        },
+        "chart": [],
+        "table": [],
+        "logs": {"total": 0, "page": page, "page_size": page_size},
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+        "query_refreshing": True,
+    }
+
+
 class EvalUsageStatsView(APIView):
     """
     GET /model-hub/eval-templates/<id>/usage/
@@ -4875,6 +4918,7 @@ class EvalUsageStatsView(APIView):
         responses={200: EvalUsageStatsResponseSerializer, **MODEL_HUB_ERROR_RESPONSES},
     )
     def get(self, request, template_id, *args, **kwargs):
+        previous_exact = None
         try:
             query = request.validated_query_data
             page = query["page"]
@@ -4899,6 +4943,11 @@ class EvalUsageStatsView(APIView):
                     "chart": [],
                     "table": [],
                     "logs": {"total": 0, "page": page, "page_size": page_size},
+                    "query_complete": True,
+                    "query_status": "complete",
+                    "query_sampled": False,
+                    "query_completed_at": timezone.now().isoformat(),
+                    "query_cached": False,
                 }
                 return self._gm.success_response(
                     EvalUsageStatsResponseResultSerializer(instance=empty).data
@@ -4939,6 +4988,31 @@ class EvalUsageStatsView(APIView):
                 period_delta = self.PERIOD_MAP.get(period, timedelta(days=30))
                 end_date = timezone.now()
                 start_date = end_date - period_delta
+
+            cache_identity = {
+                "organization_id": str(organization.id),
+                "workspace_id": str(workspace.id) if workspace else None,
+                "template_id": str(template_id),
+                "page": page,
+                "page_size": page_size,
+                "period": period,
+                "start_date": query.get("start_date"),
+                "end_date": query.get("end_date"),
+            }
+            previous_exact = read_exact_snapshot("eval-usage", cache_identity)
+            if not getattr(request, "_exact_aggregation_worker", False):
+                return self._gm.success_response(
+                    read_or_schedule_exact_snapshot(
+                        "eval-usage",
+                        cache_identity,
+                        refresh=bool(query["refresh"]),
+                        pending_payload=_pending_eval_usage_payload(
+                            template_id,
+                            page,
+                            page_size,
+                        ),
+                    )
+                )
 
             if period in ("30m", "6h", "1d"):
                 bucket_minutes = (
@@ -5020,7 +5094,12 @@ class EvalUsageStatsView(APIView):
                 while current_bucket <= end_date:
                     ts_key = current_bucket.isoformat()
                     bucket = chart_by_bucket.get(ts_key)
-                    avg_duration = bucket.avg_duration if bucket else None
+                    avg_duration = _finite_usage_metric(
+                        bucket.avg_duration if bucket else None
+                    )
+                    avg_score = _finite_usage_metric(
+                        bucket.avg_score if bucket else None
+                    )
                     chart_data.append(
                         {
                             "timestamp": ts_key,
@@ -5031,9 +5110,7 @@ class EvalUsageStatsView(APIView):
                                 else round(avg_duration or 0)
                             ),
                             "avg_score": (
-                                round(bucket.avg_score, 3)
-                                if bucket and bucket.avg_score is not None
-                                else None
+                                round(avg_score, 3) if avg_score is not None else None
                             ),
                             "pass_count": bucket.pass_count if bucket else 0,
                             "fail_count": bucket.fail_count if bucket else 0,
@@ -5410,12 +5487,30 @@ class EvalUsageStatsView(APIView):
                     "page": page,
                     "page_size": page_size,
                 },
+                "query_complete": True,
+                "query_status": "complete",
+                "query_sampled": False,
             }
+            if read_completeness != EvalUsageReadCompleteness.COMPLETE.value:
+                if previous_exact is not None and not getattr(
+                    request, "_exact_aggregation_worker", False
+                ):
+                    return self._gm.success_response(
+                        mark_refresh_failed(previous_exact)
+                    )
+                return self._gm.custom_error_response(
+                    503,
+                    "Evaluation usage could not be loaded exactly. Please retry.",
+                    code="eval_usage_query_failed",
+                )
             # Contract boundary: the serializer builds the wire format. A
             # missing/mistyped field raises here (caught below → 400 + log)
             # instead of shipping a drifted shape to the FE.
+            serialized = EvalUsageStatsResponseResultSerializer(instance=response).data
+            if getattr(request, "_exact_aggregation_worker", False):
+                return self._gm.success_response(serialized)
             return self._gm.success_response(
-                EvalUsageStatsResponseResultSerializer(instance=response).data
+                publish_exact_snapshot("eval-usage", cache_identity, serialized)
             )
 
         except EvalUsageReadError as exc:
@@ -5424,6 +5519,10 @@ class EvalUsageStatsView(APIView):
                 error_code=exc.code.value,
                 operations=exc.operations,
             )
+            if getattr(request, "_exact_aggregation_worker", False):
+                raise
+            if previous_exact is not None:
+                return self._gm.success_response(mark_refresh_failed(previous_exact))
             return self._gm.custom_error_response(
                 503,
                 "Evaluation usage could not be loaded. Please try again later.",

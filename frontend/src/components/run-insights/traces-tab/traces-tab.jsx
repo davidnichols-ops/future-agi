@@ -311,7 +311,6 @@ const TraceTab = React.forwardRef(
                 trace_ids: selectedTraceIds.join(","),
                 page_size: 10,
                 filters: JSON.stringify(debouncedValidatedFilters),
-                allow_sampled: true,
               },
             });
             const res = normalizeTraceListPayload(results?.data?.result);

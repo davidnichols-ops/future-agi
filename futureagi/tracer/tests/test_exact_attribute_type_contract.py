@@ -33,7 +33,11 @@ def _metadata() -> AttributeReadMetadata:
 
 @pytest.mark.parametrize(
     ("key", "attribute_type"),
-    [("retry_count", "number"), ("was_escalated", "boolean")],
+    [
+        ("retry_count", "number"),
+        ("was_escalated", "boolean"),
+        ("customer_context", "map"),
+    ],
 )
 def test_exact_attribute_key_response_preserves_numeric_and_boolean_types(
     monkeypatch,

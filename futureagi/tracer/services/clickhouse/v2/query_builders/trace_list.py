@@ -60,6 +60,54 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
     # (end_users, etc.) instead of the dropped legacy CDC tables.
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
 
+    def build_span_attributes_query(
+        self, trace_ids: list[str]
+    ) -> tuple[str, dict[str, Any]]:
+        """Hydrate every live latest span attribute for a finite trace page."""
+
+        if not trace_ids:
+            return "", {}
+        params: dict[str, Any] = {
+            **self.params,
+            "attr_trace_ids": tuple(trace_ids),
+        }
+        span_window = self._span_time_window(params)
+        query = f"""
+        SELECT
+            toString(project_id) AS project_id,
+            trace_id,
+            latest_attributes_extra AS attributes_extra,
+            latest_attrs_string AS attrs_string,
+            latest_attrs_number AS attrs_number,
+            latest_attrs_bool AS attrs_bool
+        FROM (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(attributes_extra), _version).1
+                    AS latest_attributes_extra,
+                argMax(attrs_string, _version) AS latest_attrs_string,
+                argMax(attrs_number, _version) AS latest_attrs_number,
+                argMax(attrs_bool, _version) AS latest_attrs_bool,
+                argMax(is_deleted, _version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE trace_id IN %(attr_trace_ids)s
+              AND {self.project_filter_sql()}
+              {span_window}
+            GROUP BY project_id, trace_id, id, start_time
+        ) AS latest_physical_spans
+        WHERE latest_is_deleted = 0
+          AND (
+            latest_attributes_extra NOT IN ('', '{{}}', 'null')
+            OR length(mapKeys(latest_attrs_string)) > 0
+            OR length(mapKeys(latest_attrs_number)) > 0
+            OR length(mapKeys(latest_attrs_bool)) > 0
+          )
+        """
+        return query, params
+
     @staticmethod
     def _trace_tags_select_sql() -> str:
         """Project tags from the bounded latest trace row, without a dictionary."""

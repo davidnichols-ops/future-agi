@@ -29,6 +29,9 @@ from tracer.services.clickhouse.read_budget import (
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
 )
+from tracer.services.exact_aggregation_cache import (
+    read_or_schedule_exact_snapshot,
+)
 
 SESSION_GRAPH_WALL_DEADLINE_MS = 4_400
 SESSION_GRAPH_QUERY_TIMEOUT_MS = 1_200
@@ -551,12 +554,11 @@ def fetch_session_graph_ch(
     interval: str,
     req_data_config: dict[str, Any],
     wall_deadline_ms: int = SESSION_GRAPH_WALL_DEADLINE_MS,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Dispatch every supported session graph to direct-write CH25 only."""
+    """Dispatch complete exact session aggregates to direct-write CH25."""
 
-    started = monotonic()
-    deadline = ReadDeadline.start(wall_deadline_ms)
-    bounded_analytics = _DeadlineBoundAnalytics(analytics, deadline)
+    del wall_deadline_ms
     metric_type = str(req_data_config.get("type") or "")
     metric_id = str(req_data_config.get("id") or "session_count")
     filters = list(filters or [])
@@ -564,35 +566,48 @@ def fetch_session_graph_ch(
     if metric_type == "SYSTEM_METRIC":
         if metric_id not in SESSION_SYSTEM_METRICS:
             raise ValueError("Unsupported session system metric")
-        return _fetch_system_metric_graph(
-            analytics=bounded_analytics,
-            project_id=project_id,
-            filters=filters,
-            interval=interval,
-            metric_id=metric_id,
-            started=started,
+        identity = {
+            "project_id": str(project_id),
+            "filters": filters,
+            "interval": interval,
+            "metric_id": metric_id,
+        }
+        return read_or_schedule_exact_snapshot(
+            "observe-session-system-graph",
+            identity,
+            refresh=bool(refresh),
+            pending_payload={
+                "metric_name": metric_id,
+                "data": [],
+                "query_complete": False,
+                "query_status": "pending",
+                "query_sampled": False,
+                "query_refreshing": True,
+            },
         )
 
     session_filters = _session_scoped_filters(filters)
     if metric_type == "EVAL":
         return fetch_eval_graph_ch(
-            analytics=bounded_analytics,
+            analytics=analytics,
             project_id=project_id,
             filters=session_filters,
             interval=interval,
             req_data_config=req_data_config,
             observe_type="trace",
-            timeout_ms=deadline.remaining_ms(SESSION_GRAPH_QUERY_TIMEOUT_MS),
+            refresh=refresh,
+            aggregation_context="session",
         )
     if metric_type == "ANNOTATION":
         return fetch_annotation_graph_ch(
-            analytics=bounded_analytics,
+            analytics=analytics,
             project_id=project_id,
             filters=session_filters,
             interval=interval,
             req_data_config=req_data_config,
             observe_type="trace",
-            timeout_ms=deadline.remaining_ms(SESSION_GRAPH_QUERY_TIMEOUT_MS),
+            refresh=refresh,
+            aggregation_context="session",
         )
     raise ValueError("Unsupported session graph metric type")
 

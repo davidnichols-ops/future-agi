@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import Any, NoReturn
 
 from tracer.services.clickhouse.client import get_clickhouse_client
 from tracer.services.clickhouse.read_budget import (
@@ -17,15 +20,18 @@ from tracer.services.clickhouse.trace_project_scope import (
     latest_live_trace_projects_sql,
 )
 
-READ_TIMEOUT_MS = 4_000
+READ_TIMEOUT_MS = 55 * 60 * 1000
+QUERY_TIMEOUT_MS = 120_000
 MAX_PAGE_SIZE = 100
 _USAGE_TABLE = "usage_apicalllog"
+_PARTITION_DAYS = 31
+_MIN_PARTITION_MINUTES = 60
 
 _READ_SETTINGS = {
     "max_threads": 2,
-    "max_rows_to_read": 8_000_000,
+    "max_rows_to_read": 25_000_000,
     "read_overflow_mode": "throw",
-    "max_bytes_to_read": 768 * 1024 * 1024,
+    "max_bytes_to_read": 4 * 1024 * 1024 * 1024,
     "max_memory_usage": 256 * 1024 * 1024,
     "timeout_overflow_mode": "throw",
 }
@@ -100,6 +106,24 @@ def _decode_config(value: Any) -> dict[str, Any]:
     return decoded if isinstance(decoded, dict) else {}
 
 
+def _finite_float_or_none(value: Any) -> float | None:
+    """Normalize ClickHouse empty-aggregate sentinels at the read boundary.
+
+    ClickHouse returns ``NaN`` for an empty ``avgIf`` over non-nullable
+    floating-point inputs.  Non-finite values are not meaningful usage
+    metrics and must not reach response formatting, where rounding ``NaN``
+    raises for integer precision.
+    """
+
+    if value is None:
+        return None
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if math.isfinite(normalized) else None
+
+
 def _scope(
     *,
     organization_id: str,
@@ -118,17 +142,15 @@ def _latest_usage_slice(
     projection: str,
     scope: list[str],
     source_id_param: str = "template_id",
-    time_predicate: bool,
+    start_param: str | None,
+    end_param: str | None,
     project_scoped: bool = True,
 ) -> str:
     candidate_scope = [*scope, f"source_id = %({source_id_param})s"]
-    if time_predicate:
-        candidate_scope.extend(
-            [
-                "created_at >= %(start_date)s",
-                "created_at <= %(end_date)s",
-            ]
-        )
+    if start_param:
+        candidate_scope.append(f"created_at >= %({start_param})s")
+    if end_param:
+        candidate_scope.append(f"created_at < %({end_param})s")
     project_join = ""
     project_scope = ""
     if project_scoped:
@@ -158,6 +180,48 @@ def _latest_usage_slice(
         ORDER BY _peerdb_version DESC
         LIMIT 1 BY id
     """
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _partition_windows(
+    start: datetime,
+    end: datetime,
+    *,
+    days: int = _PARTITION_DAYS,
+) -> tuple[tuple[datetime, datetime], ...]:
+    """Return deterministic half-open windows with no gaps or overlaps."""
+
+    current = _utc(start)
+    stop = _utc(end)
+    if current >= stop:
+        return ()
+    width = timedelta(days=max(1, days))
+    windows: list[tuple[datetime, datetime]] = []
+    while current < stop:
+        partition_end = min(current + width, stop)
+        windows.append((current, partition_end))
+        current = partition_end
+    return tuple(windows)
+
+
+def _split_window(
+    start: datetime,
+    end: datetime,
+    *,
+    minimum_minutes: int = _MIN_PARTITION_MINUTES,
+) -> tuple[tuple[datetime, datetime], tuple[datetime, datetime]] | None:
+    minimum = timedelta(minutes=max(1, minimum_minutes))
+    if end - start <= minimum:
+        return None
+    midpoint = start + (end - start) / 2
+    # Microsecond precision matches usage_apicalllog.created_at. Keep both
+    # children non-empty even for odd-width ranges.
+    if midpoint <= start or midpoint >= end:
+        return None
+    return (start, midpoint), (midpoint, end)
 
 
 def read_eval_usage(
@@ -203,8 +267,6 @@ def read_eval_usage(
             "bucket_minutes": bucket_minutes,
             "success_status": "success",
             "error_status": "error",
-            "limit": page_size,
-            "offset": page * page_size,
         }
     )
 
@@ -218,31 +280,13 @@ def read_eval_usage(
     total_slice = _latest_usage_slice(
         projection="id, deleted, _peerdb_is_deleted",
         scope=scope,
-        time_predicate=False,
+        start_param="partition_start",
+        end_param="partition_end",
         project_scoped=False,
     )
     total_query = f"""
         SELECT count() AS total_runs
         FROM ({total_slice}) AS latest_usage
-        WHERE {live}
-    """
-
-    # Period stats remain exact and partition-bounded.
-    stats_slice = _latest_usage_slice(
-        projection="id, created_at, status, deleted, _peerdb_is_deleted",
-        scope=scope,
-        time_predicate=True,
-    )
-    stats_query = f"""
-        SELECT
-            count() AS runs_period,
-            countIf(
-                status = %(success_status)s
-            ) AS success_count,
-            countIf(
-                status = %(error_status)s
-            ) AS error_count
-        FROM ({stats_slice}) AS latest_usage
         WHERE {live}
     """
 
@@ -252,7 +296,8 @@ def read_eval_usage(
     period_slice = _latest_usage_slice(
         projection=period_projection,
         scope=scope,
-        time_predicate=True,
+        start_param="partition_start",
+        end_param="partition_end",
     )
 
     # ``config`` has existed in two encodings: a JSON object and a JSON string
@@ -307,10 +352,14 @@ def read_eval_usage(
                 'UTC'
             ) AS bucket,
             count() AS calls,
-            avgIf({duration_expr}, {duration_present}) AS avg_duration,
-            avgIf({score_expr}, {score_expr} IS NOT NULL) AS avg_score,
+            sumKahanIf({duration_expr}, {duration_present}) AS duration_sum,
+            countIf({duration_present}) AS duration_count,
+            sumKahanIf({score_expr}, {score_expr} IS NOT NULL) AS score_sum,
+            countIf({score_expr} IS NOT NULL) AS score_count,
             countIf({pass_expr}) AS pass_count,
-            countIf({fail_expr}) AS fail_count
+            countIf({fail_expr}) AS fail_count,
+            countIf(status = %(success_status)s) AS success_count,
+            countIf(status = %(error_status)s) AS error_count
         FROM ({period_slice}) AS latest_usage
         WHERE {live}
         GROUP BY bucket
@@ -326,153 +375,358 @@ def read_eval_usage(
         FROM ({period_slice}) AS latest_usage
         WHERE {live}
         ORDER BY created_at DESC, id DESC
-        LIMIT %(limit)s OFFSET %(offset)s
+        LIMIT %(partition_limit)s OFFSET %(partition_offset)s
     """
 
     deadline_at = time.monotonic() + (READ_TIMEOUT_MS / 1000.0)
 
-    def remaining_ms(operation: str) -> int:
+    def remaining_ms(operation: str, *, cap_ms: int = QUERY_TIMEOUT_MS) -> int:
         remaining = int((deadline_at - time.monotonic()) * 1000)
         if remaining <= 0:
             raise EvalUsageReadError(
                 EvalUsageReadErrorCode.DEADLINE_EXCEEDED,
                 operations=(operation,),
             )
-        return min(READ_TIMEOUT_MS, remaining)
+        return min(cap_ms, remaining)
 
-    def execute(
+    def raise_typed(operation: str, exc: Exception) -> NoReturn:
+        if isinstance(exc, EvalUsageReadError):
+            raise exc
+        if is_read_budget_error(exc):
+            raise EvalUsageReadError(
+                EvalUsageReadErrorCode.DEADLINE_EXCEEDED,
+                operations=(operation,),
+            ) from exc
+        if is_clickhouse_query_error(exc):
+            raise EvalUsageReadError(
+                EvalUsageReadErrorCode.QUERY_FAILED,
+                operations=(operation,),
+            ) from exc
+        raise exc
+
+    worker_pool = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="eval-usage-exact-ch",
+    )
+
+    def execute_read(
         operation: str,
         query: str,
-        *,
-        settings: dict[str, Any] | None = None,
-    ):
-        # Client acquisition is inside the future.  The first pool checkout may
-        # establish a network connection, and that connect time must consume the
-        # same request-owned wall deadline as query execution.
-        client = get_clickhouse_client()
-        rows, _columns, _elapsed = client.execute_read(
-            query,
-            params,
-            timeout_ms=remaining_ms(operation),
-            settings={**_READ_SETTINGS, **(settings or {})},
-        )
-        return rows
-
-    # Independent reads share one real monotonic wall deadline.  Do not use the
-    # executor context manager here: its implicit shutdown(wait=True) would make
-    # a connect stall block the request after our timeout had already expired.
-    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="eval-usage-ch")
-    futures: dict[Future, str] = {}
-    try:
-        futures[pool.submit(execute, "total", total_query)] = "total"
-        futures[pool.submit(execute, "stats", stats_query)] = "stats"
-        futures[
-            pool.submit(
-                execute,
-                "chart",
-                chart_query,
-                settings={
-                    "max_result_rows": 550,
-                    "max_result_bytes": 4 * 1024 * 1024,
-                    "result_overflow_mode": "throw",
-                },
+        query_params: dict[str, Any],
+        query_settings: dict[str, Any],
+    ) -> list[tuple]:
+        def read():
+            client = get_clickhouse_client()
+            rows, _columns, _elapsed = client.execute_read(
+                query,
+                query_params,
+                timeout_ms=remaining_ms(operation),
+                settings=query_settings,
             )
-        ] = "chart"
-        futures[
-            pool.submit(
-                execute,
-                "page",
-                page_query,
-                settings={
-                    "max_result_rows": page_size,
-                    "max_result_bytes": 16 * 1024 * 1024,
-                    "result_overflow_mode": "throw",
-                },
-            )
-        ] = "page"
+            return rows
 
-        completed_rows: dict[str, list[tuple]] = {}
-        pending = set(futures)
-        while pending:
-            remaining_seconds = deadline_at - time.monotonic()
-            if remaining_seconds <= 0:
-                raise EvalUsageReadError(
-                    EvalUsageReadErrorCode.DEADLINE_EXCEEDED,
-                    operations=tuple(sorted(futures[future] for future in pending)),
-                )
-            done, pending = wait(
-                pending,
-                timeout=remaining_seconds,
-                return_when=FIRST_COMPLETED,
-            )
-            if not done:
-                raise EvalUsageReadError(
-                    EvalUsageReadErrorCode.DEADLINE_EXCEEDED,
-                    operations=tuple(sorted(futures[future] for future in pending)),
-                )
-            for future in done:
-                operation = futures[future]
-                try:
-                    completed_rows[operation] = future.result()
-                except EvalUsageReadError:
-                    raise
-                except Exception as exc:
-                    if is_read_budget_error(exc):
-                        raise EvalUsageReadError(
-                            EvalUsageReadErrorCode.DEADLINE_EXCEEDED,
-                            operations=(operation,),
-                        ) from exc
-                    if is_clickhouse_query_error(exc):
-                        raise EvalUsageReadError(
-                            EvalUsageReadErrorCode.QUERY_FAILED,
-                            operations=(operation,),
-                        ) from exc
-                    # Python/application defects are not database degradation.
-                    # Preserve their original type and traceback.
-                    raise
-
-        total_rows = completed_rows["total"]
-        stats_rows = completed_rows["stats"]
-        chart_rows = completed_rows["chart"]
-        page_rows = completed_rows["page"]
-    finally:
-        for future in futures:
+        future = worker_pool.submit(read)
+        try:
+            return future.result(timeout=max(deadline_at - time.monotonic(), 0))
+        except FutureTimeoutError as exc:
             future.cancel()
-        pool.shutdown(wait=False, cancel_futures=True)
+            raise EvalUsageReadError(
+                EvalUsageReadErrorCode.DEADLINE_EXCEEDED,
+                operations=(operation,),
+            ) from exc
 
-    stats = stats_rows[0] if stats_rows else (0, 0, 0)
-    chart = [
-        EvalUsageChartBucket(
-            bucket=row[0],
-            calls=int(row[1] or 0),
-            avg_duration=float(row[2]) if row[2] is not None else None,
-            avg_score=float(row[3]) if row[3] is not None else None,
-            pass_count=int(row[4] or 0),
-            fail_count=int(row[5] or 0),
+    def execute_typed(
+        operation: str,
+        query: str,
+        query_params: dict[str, Any],
+        query_settings: dict[str, Any],
+    ) -> list[tuple]:
+        try:
+            return execute_read(operation, query, query_params, query_settings)
+        except Exception as exc:
+            raise_typed(operation, exc)
+
+    # Freeze physical visibility in O(1). The legacy CDC table is fenced by
+    # its sync timestamp; direct-write traces use epoch-nanosecond versions.
+    # This avoids the previous max(version) full scans while every later
+    # partition still observes one immutable snapshot.
+    ceiling_query = """
+        SELECT
+            toUnixTimestamp64Micro(now64(6, 'UTC')) AS usage_version_ceiling,
+            toUnixTimestamp64Nano(now64(9, 'UTC')) AS trace_version_ceiling
+    """
+
+    try:
+        ceiling_rows = execute_typed(
+            "snapshot",
+            ceiling_query,
+            params,
+            {**_READ_SETTINGS, "max_result_rows": 1},
         )
-        for row in chart_rows
-    ]
-    logs = [
-        EvalUsageLog(
-            log_id=str(row[0]),
-            config=_decode_config(row[1]),
-            status=str(row[2] or ""),
-            created_at=row[3],
+        if not ceiling_rows:
+            raise EvalUsageReadError(
+                EvalUsageReadErrorCode.QUERY_FAILED,
+                operations=("snapshot",),
+            )
+        usage_version_ceiling = max(int(ceiling_rows[0][0] or 0), 1)
+        trace_version_ceiling = max(int(ceiling_rows[0][1] or 0), 1)
+        snapshot_settings = {
+            **_READ_SETTINGS,
+            "additional_table_filters": {
+                _USAGE_TABLE: (
+                    "_peerdb_synced_at < "
+                    f"fromUnixTimestamp64Micro({usage_version_ceiling}, 'UTC')"
+                ),
+                "traces": f"_version < {trace_version_ceiling}",
+            },
+        }
+
+        bound_scope = [*scope, "source_id = %(template_id)s"]
+
+        def bound_query(direction: str) -> str:
+            if direction not in {"ASC", "DESC"}:
+                raise ValueError("invalid usage-bound direction")
+            return f"""
+                SELECT created_at
+                FROM {_USAGE_TABLE}
+                PREWHERE {" AND ".join(bound_scope)}
+                ORDER BY created_at {direction}, id {direction}
+                LIMIT 1
+            """
+
+        earliest_rows = execute_typed(
+            "total_bounds",
+            bound_query("ASC"),
+            params,
+            {**snapshot_settings, "max_result_rows": 1},
         )
-        for row in page_rows
-    ]
-    total_runs = int(total_rows[0][0] or 0) if total_rows else 0
-    runs_period = int(stats[0] or 0)
-    return EvalUsageRead(
-        total_runs=total_runs,
-        runs_period=runs_period,
-        success_count=int(stats[1] or 0),
-        error_count=int(stats[2] or 0),
-        chart=chart,
-        logs=logs,
-        completeness=EvalUsageReadCompleteness.COMPLETE,
-        unavailable_fields=(),
-    )
+        if not earliest_rows:
+            return EvalUsageRead(
+                total_runs=0,
+                runs_period=0,
+                success_count=0,
+                error_count=0,
+                chart=[],
+                logs=[],
+                completeness=EvalUsageReadCompleteness.COMPLETE,
+                unavailable_fields=(),
+            )
+        latest_rows = execute_typed(
+            "total_bounds",
+            bound_query("DESC"),
+            params,
+            {**snapshot_settings, "max_result_rows": 1},
+        )
+        if not latest_rows:
+            raise EvalUsageReadError(
+                EvalUsageReadErrorCode.QUERY_FAILED,
+                operations=("total_bounds",),
+            )
+        total_start = _utc(earliest_rows[0][0])
+        total_end = _utc(latest_rows[0][0]) + timedelta(microseconds=1)
+        period_start = _utc(start_date)
+        period_end = _utc(end_date) + timedelta(microseconds=1)
+
+        def partition_params(start: datetime, end: datetime) -> dict[str, Any]:
+            return {
+                **params,
+                "partition_start": start,
+                "partition_end": end,
+            }
+
+        def execute_partitions(
+            operation: str,
+            query: str,
+            windows: tuple[tuple[datetime, datetime], ...],
+            *,
+            settings: dict[str, Any],
+        ) -> list[tuple[datetime, datetime, list[tuple]]]:
+            completed: list[tuple[datetime, datetime, list[tuple]]] = []
+
+            def visit(start: datetime, end: datetime) -> None:
+                try:
+                    rows = execute_read(
+                        operation,
+                        query,
+                        partition_params(start, end),
+                        {**snapshot_settings, **settings},
+                    )
+                except Exception as exc:
+                    split = _split_window(start, end)
+                    if is_read_budget_error(exc) and split is not None:
+                        visit(*split[0])
+                        visit(*split[1])
+                        return
+                    raise_typed(operation, exc)
+                    return
+                completed.append((start, end, rows))
+
+            for window_start, window_end in windows:
+                visit(window_start, window_end)
+            return completed
+
+        total_partitions = execute_partitions(
+            "total",
+            total_query,
+            _partition_windows(total_start, total_end),
+            settings={"max_result_rows": 1},
+        )
+        total_runs = 0
+        for _start, _end, rows in total_partitions:
+            if len(rows) != 1:
+                raise EvalUsageReadError(
+                    EvalUsageReadErrorCode.QUERY_FAILED,
+                    operations=("total",),
+                )
+            total_runs += int(rows[0][0] or 0)
+
+        chart_partitions = execute_partitions(
+            "chart",
+            chart_query,
+            _partition_windows(period_start, period_end),
+            settings={
+                "max_result_rows": 50_000,
+                "max_result_bytes": 16 * 1024 * 1024,
+                "result_overflow_mode": "throw",
+            },
+        )
+
+        bucket_state: dict[datetime, dict[str, Any]] = defaultdict(
+            lambda: {
+                "calls": 0,
+                "duration_sums": [],
+                "duration_count": 0,
+                "duration_valid": True,
+                "score_sums": [],
+                "score_count": 0,
+                "score_valid": True,
+                "pass_count": 0,
+                "fail_count": 0,
+            }
+        )
+        partition_counts: list[tuple[datetime, datetime, int]] = []
+        runs_period = 0
+        success_count = 0
+        error_count = 0
+        for window_start, window_end, rows in chart_partitions:
+            window_calls = 0
+            for row in rows:
+                bucket = row[0]
+                state = bucket_state[bucket]
+                calls = int(row[1] or 0)
+                duration_count = int(row[3] or 0)
+                score_count = int(row[5] or 0)
+                duration_sum = _finite_float_or_none(row[2])
+                score_sum = _finite_float_or_none(row[4])
+                state["calls"] += calls
+                state["duration_count"] += duration_count
+                state["score_count"] += score_count
+                if duration_count:
+                    if duration_sum is None:
+                        state["duration_valid"] = False
+                    else:
+                        state["duration_sums"].append(duration_sum)
+                if score_count:
+                    if score_sum is None:
+                        state["score_valid"] = False
+                    else:
+                        state["score_sums"].append(score_sum)
+                state["pass_count"] += int(row[6] or 0)
+                state["fail_count"] += int(row[7] or 0)
+                success_count += int(row[8] or 0)
+                error_count += int(row[9] or 0)
+                window_calls += calls
+                runs_period += calls
+            partition_counts.append((window_start, window_end, window_calls))
+
+        chart: list[EvalUsageChartBucket] = []
+        for bucket in sorted(bucket_state):
+            state = bucket_state[bucket]
+            duration_count = state["duration_count"]
+            score_count = state["score_count"]
+            avg_duration = (
+                math.fsum(state["duration_sums"]) / duration_count
+                if duration_count and state["duration_valid"]
+                else None
+            )
+            avg_score = (
+                math.fsum(state["score_sums"]) / score_count
+                if score_count and state["score_valid"]
+                else None
+            )
+            chart.append(
+                EvalUsageChartBucket(
+                    bucket=bucket,
+                    calls=state["calls"],
+                    avg_duration=avg_duration,
+                    avg_score=avg_score,
+                    pass_count=state["pass_count"],
+                    fail_count=state["fail_count"],
+                )
+            )
+
+        page_rows: list[tuple] = []
+        page_offset = page * page_size
+        for window_start, window_end, window_calls in reversed(partition_counts):
+            if len(page_rows) >= page_size:
+                break
+            if page_offset >= window_calls:
+                page_offset -= window_calls
+                continue
+            partition_limit = page_size - len(page_rows)
+            expected_rows = min(partition_limit, window_calls - page_offset)
+            page_params = {
+                **partition_params(window_start, window_end),
+                "partition_limit": partition_limit,
+                "partition_offset": page_offset,
+            }
+            try:
+                rows = execute_read(
+                    "page",
+                    page_query,
+                    page_params,
+                    {
+                        **snapshot_settings,
+                        "max_result_rows": partition_limit,
+                        "max_result_bytes": 16 * 1024 * 1024,
+                        "result_overflow_mode": "throw",
+                    },
+                )
+            except Exception as exc:
+                raise_typed("page", exc)
+            if len(rows) != expected_rows:
+                raise EvalUsageReadError(
+                    EvalUsageReadErrorCode.QUERY_FAILED,
+                    operations=("page",),
+                )
+            page_rows.extend(rows)
+            page_offset = 0
+
+        logs = [
+            EvalUsageLog(
+                log_id=str(row[0]),
+                config=_decode_config(row[1]),
+                status=str(row[2] or ""),
+                created_at=row[3],
+            )
+            for row in page_rows
+        ]
+        return EvalUsageRead(
+            total_runs=total_runs,
+            runs_period=runs_period,
+            success_count=success_count,
+            error_count=error_count,
+            chart=chart,
+            logs=logs,
+            completeness=EvalUsageReadCompleteness.COMPLETE,
+            unavailable_fields=(),
+        )
+    except Exception as exc:
+        if isinstance(exc, EvalUsageReadError):
+            raise
+        raise_typed("eval_usage", exc)
+    finally:
+        worker_pool.shutdown(wait=False, cancel_futures=True)
 
 
 __all__ = [

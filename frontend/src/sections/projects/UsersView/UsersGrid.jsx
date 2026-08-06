@@ -1,4 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useRef } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Box, useTheme, Typography } from "@mui/material";
 import { AgGridReact } from "ag-grid-react";
 import "src/styles/clean-data-table.css";
@@ -16,6 +22,19 @@ import { useDebounce } from "src/hooks/use-debounce";
 import PropTypes from "prop-types";
 import NoRowsOverlay from "src/sections/project-detail/CompareDrawer/NoRowsOverlay";
 import { APP_CONSTANTS } from "src/utils/constants";
+import {
+  createListCursorPagination,
+  followEmptyListContinuations,
+  LIST_CURSOR_MODES,
+} from "../LLMTracing/listCursorPagination";
+import {
+  failServerSideGridRead,
+  QUERY_FAILED_RETRY_MESSAGE,
+} from "src/utils/queryReadState";
+import {
+  isUserGlobalSortSupported,
+  sanitizeUserSortModel,
+} from "./userSortContract";
 
 const getUsersGridThemeParams = (theme) => ({
   columnBorder: false,
@@ -41,6 +60,14 @@ const UsersGrid = React.memo(
     const theme = useTheme();
     const agTheme = useAgThemeWith(getUsersGridThemeParams(theme));
     const gridApiRef = useRef(null);
+    const cursorPagination = useRef(
+      createListCursorPagination({
+        pageParam: "current_page_index",
+        pageOffset: 0,
+      }),
+    );
+    const cursorQueryKeyRef = useRef(null);
+    const [readError, setReadError] = useState(null);
     const {
       setGridApi,
       searchQuery,
@@ -58,6 +85,7 @@ const UsersGrid = React.memo(
 
     const { observeId } = useParams();
     const updatedObserveId = observeId;
+    const sortStorageKey = `ag-grid-sort-model-${updatedObserveId}`;
     const debouncedSearchQuery = useDebounce(searchQuery.trim(), 500);
 
     const validatedFilters = useMemo(
@@ -89,6 +117,7 @@ const UsersGrid = React.memo(
         return baseConfig.map((col) => ({
           ...col,
           colId: col.field,
+          sortable: isUserGlobalSortSupported(col.field),
           hide: col.hide || false,
           lockVisible: false,
           minWidth: col?.minWidth ?? 120,
@@ -109,6 +138,7 @@ const UsersGrid = React.memo(
             colId: col.id,
             hide: !col.isVisible,
             lockVisible: false,
+            sortable: false,
             minWidth: 160,
             flex: 1,
             valueGetter: (params) => params.data?.[col.id] ?? null,
@@ -122,6 +152,7 @@ const UsersGrid = React.memo(
         return {
           ...originalCol,
           colId: col.id,
+          sortable: isUserGlobalSortSupported(col.id),
           hide: !col.isVisible,
           lockVisible: false,
           minWidth: originalCol?.minWidth ?? 120,
@@ -147,125 +178,264 @@ const UsersGrid = React.memo(
       return result;
     }, [columns]);
 
-    const dataSource = useMemo(
-      () => ({
+    const dataSource = useMemo(() => {
+      cursorPagination.current.reset();
+      cursorQueryKeyRef.current = null;
+
+      return {
         getRows: async (params) => {
+          let pageNumber = 0;
+          let requestGeneration = null;
           try {
             setIsLoading(true);
             params.api.hideOverlay();
             const { request } = params;
             const pageSize = request.endRow - request.startRow;
-            const pageNumber = Math.floor(request.startRow / pageSize);
+            pageNumber = Math.floor(request.startRow / pageSize);
             if (userFirstRef.current) {
-              const savedSort = localStorage.getItem(
-                `ag-grid-sort-model-${updatedObserveId}`,
-              );
+              const savedSort = localStorage.getItem(sortStorageKey);
               if (savedSort) {
-                const sortModel = JSON.parse(savedSort);
+                let parsedSortModel = [];
+                try {
+                  parsedSortModel = JSON.parse(savedSort);
+                } catch {
+                  // A corrupt browser preference must not fail the data read.
+                }
+                const sortModel = sanitizeUserSortModel(parsedSortModel);
+                if (sortModel.length > 0) {
+                  localStorage.setItem(
+                    sortStorageKey,
+                    JSON.stringify(sortModel),
+                  );
+                } else {
+                  localStorage.removeItem(sortStorageKey);
+                }
                 params.api.applyColumnState({
-                  state: sortModel.map((sort) => ({
-                    colId: sort.colId,
-                    sort: sort.sort,
-                  })),
+                  state: sortModel,
                   defaultState: { sort: null },
                 });
               }
               userFirstRef.current = false;
             }
+            const requestedSortModel = Array.isArray(request.sortModel)
+              ? request.sortModel
+              : [];
+            const supportedSortModel =
+              sanitizeUserSortModel(requestedSortModel);
+            if (
+              JSON.stringify(supportedSortModel) !==
+              JSON.stringify(requestedSortModel)
+            ) {
+              // Saved AG Grid/view state may predate the exact Users sort
+              // contract. Clear only unsupported sorts so the header never
+              // claims an ordering the server did not execute.
+              params.api.applyColumnState({
+                state: supportedSortModel,
+                defaultState: { sort: null },
+              });
+              if (supportedSortModel.length > 0) {
+                localStorage.setItem(
+                  sortStorageKey,
+                  JSON.stringify(supportedSortModel),
+                );
+              } else {
+                localStorage.removeItem(sortStorageKey);
+              }
+            }
             const sortParams =
-              request.sortModel && request.sortModel.length > 0
-                ? request.sortModel.map(({ colId, sort }) => ({
+              supportedSortModel.length > 0
+                ? supportedSortModel.map(({ colId, sort }) => ({
                     column_id: colId,
                     direction: sort,
                   }))
-                : request.sortModel || [];
+                : [];
+            const useCursorPagination = sortParams.length === 0;
             // Mirror the active sort into the store so the export button (in the
             // Observe header) can carry the same sort the grid is showing.
             useUsersStore.setState({ sortParams });
-            const results = await axios.get(endpoints.project.getUsersList(), {
-              params: {
-                // Omit project_id when there's no project context — the
-                // backend handles project_id=null as org-scoped, used by
-                // the cross-project users page at /dashboard/users.
-                ...(updatedObserveId ? { project_id: updatedObserveId } : {}),
-                sort_params: JSON.stringify(sortParams),
-                search: debouncedSearchQuery?.length
-                  ? debouncedSearchQuery
-                  : null,
-                page_size: pageSize,
-                current_page_index: pageNumber,
-                filters: JSON.stringify(validatedFilters),
-              },
+            const queryKey = JSON.stringify({
+              projectId: updatedObserveId || null,
+              search: debouncedSearchQuery || "",
+              filters: validatedFilters,
+              sort: sortParams,
+              pageSize,
             });
+            if (cursorQueryKeyRef.current !== queryKey) {
+              cursorPagination.current.reset();
+              // The bounded users cursor has one deterministic candidate order.
+              // Explicit AG Grid sorts retain the existing numbered/exact path;
+              // mixing a sort with an opaque cursor would change row order.
+              if (!useCursorPagination) {
+                cursorPagination.current.disableCursor();
+              }
+              cursorQueryKeyRef.current = queryKey;
+            }
+            requestGeneration = cursorPagination.current.generation();
 
-            const res = results?.data?.result;
+            const buildBaseParams = () => ({
+              // Omit project_id when there's no project context — the
+              // backend handles project_id=null as org-scoped, used by
+              // the cross-project users page at /dashboard/users.
+              ...(updatedObserveId ? { project_id: updatedObserveId } : {}),
+              sort_params: JSON.stringify(sortParams),
+              search: debouncedSearchQuery?.length
+                ? debouncedSearchQuery
+                : null,
+              page_size: pageSize,
+              filters: JSON.stringify(validatedFilters),
+            });
+            const buildParams = (page) =>
+              cursorPagination.current.requestParams(page, buildBaseParams());
+
+            let results = await axios.get(endpoints.project.getUsersList(), {
+              params: buildParams(pageNumber),
+            });
+            if (useCursorPagination) {
+              results = await followEmptyListContinuations({
+                initialResponse: results,
+                rowsFromResponse: (response) =>
+                  response?.data?.result?.table || [],
+                metadataFromResponse: (response) =>
+                  response?.data?.result?.metadata ||
+                  response?.data?.result ||
+                  {},
+                onContinuation: (metadata) =>
+                  cursorPagination.current.recordEmptyContinuation(
+                    pageNumber,
+                    metadata,
+                  ),
+                isCurrent: () =>
+                  cursorPagination.current.isCurrent(requestGeneration),
+                nextResponse: () =>
+                  axios.get(endpoints.project.getUsersList(), {
+                    params: buildParams(pageNumber),
+                  }),
+              });
+            }
+            if (!cursorPagination.current.isCurrent(requestGeneration)) {
+              failServerSideGridRead(params);
+              return;
+            }
+
+            const res = results?.data?.result || {};
             const userData = res?.table || [];
             const hasResults = userData.length > 0;
-            setHasData(hasResults);
-            const total = res?.total_count ?? 0;
+            if (pageNumber === 0) setHasData(hasResults);
+            else if (hasResults) setHasData(true);
 
-            if (!hasResults) {
+            const reportedTotal = Number(res?.total_count);
+            const total =
+              Number.isFinite(reportedTotal) && reportedTotal >= 0
+                ? Math.floor(reportedTotal)
+                : request.startRow + userData.length;
+            if (useCursorPagination) {
+              cursorPagination.current.recordResponse(pageNumber, res);
+            }
+            const isLastPage = useCursorPagination
+              ? cursorPagination.current.isLastPage(
+                  res,
+                  userData.length,
+                  pageSize,
+                )
+              : Number.isFinite(reportedTotal) && reportedTotal >= 0
+                ? request.startRow + userData.length >= total
+                : userData.length < pageSize;
+            const countIsLowerBound =
+              res?.count_is_lower_bound === true ||
+              res?.total_count_is_lower_bound === true;
+            const exactTotal = countIsLowerBound ? null : total;
+            const lowerBoundTotal = countIsLowerBound ? total : null;
+            const gridRowCount = isLastPage
+              ? request.startRow + userData.length
+              : useCursorPagination &&
+                  cursorPagination.current.mode() === LIST_CURSOR_MODES.CURSOR
+                ? request.endRow + 1
+                : Math.max(total, request.endRow + 1);
+
+            setReadError(null);
+
+            if (pageNumber === 0 && !hasResults) {
               params.api.showNoRowsOverlay();
             } else {
               params.api.hideOverlay();
             }
 
-            if (debouncedSearchQuery === "") {
-              if (hasActiveFilter) {
-                setSearchState("searching");
+            if (pageNumber === 0) {
+              if (debouncedSearchQuery === "") {
+                if (hasActiveFilter) {
+                  setSearchState("searching");
+                } else {
+                  setSearchState(hasResults ? "idle" : "empty");
+                }
               } else {
-                setSearchState(hasResults ? "idle" : "empty");
+                setSearchState("searching");
               }
-            } else {
-              setSearchState("searching");
             }
 
             // Merge new total into AG Grid's context
             const existingContext = params.api.getGridOption("context") || {};
             params.api.setGridOption("context", {
               ...existingContext,
-              totalRowCount: total,
+              totalRowCount: exactTotal,
+              totalRowCountLowerBound: lowerBoundTotal,
+              totalRowCountIsLowerBound: countIsLowerBound,
             });
 
-            // Clear selection when no data
-            if (total === 0) {
+            // Clear selection only after an exact, successful first-page empty
+            // result. A failed or stale page must preserve the current grid.
+            if (
+              pageNumber === 0 &&
+              isLastPage &&
+              !countIsLowerBound &&
+              userData.length === 0
+            ) {
               clearSelection();
             }
 
             params.success({
               rowData: userData,
-              rowCount: total,
+              rowCount: gridRowCount,
             });
           } catch (error) {
-            // Clear selection on error
-            clearSelection();
-            // setHasData(false);
-            if (debouncedSearchQuery === "") {
-              setSearchState("empty");
+            if (
+              requestGeneration !== null &&
+              !cursorPagination.current.isCurrent(requestGeneration)
+            ) {
+              params.fail();
+              return;
             }
-            // Pass empty data on error instead of calling params.fail()
-            params.success({
-              rowData: [],
-              rowCount: 0,
-            });
-            params.api.showNoRowsOverlay();
+            if (
+              cursorPagination.current.canRecoverFromContinuationError(
+                pageNumber,
+                error,
+              )
+            ) {
+              cursorPagination.current.disableCursor();
+              setReadError(null);
+              params.fail();
+              params.api?.refreshServerSide?.({ purge: true });
+              return;
+            }
+            setReadError(QUERY_FAILED_RETRY_MESSAGE);
+            setSearchState("error");
+            failServerSideGridRead(params);
           } finally {
             setIsLoading(false);
           }
         },
         getRowId: ({ data }) => data.user_id,
-      }),
-      [
-        updatedObserveId,
-        debouncedSearchQuery,
-        validatedFilters,
-        clearSelection,
-        setHasData,
-        setIsLoading,
-        setSearchState,
-        hasActiveFilter,
-      ],
-    );
+      };
+    }, [
+      updatedObserveId,
+      debouncedSearchQuery,
+      validatedFilters,
+      clearSelection,
+      setHasData,
+      setIsLoading,
+      setSearchState,
+      hasActiveFilter,
+      sortStorageKey,
+    ]);
 
     const defaultColDef = useMemo(
       () => ({
@@ -423,21 +593,26 @@ const UsersGrid = React.memo(
     );
 
     const onSortChanged = (params) => {
-      const sortModel = params.api
+      const requestedSortModel = params.api
         .getColumnState()
         .filter((col) => col.sort != null)
         .map((col) => ({
           colId: col.colId,
           sort: col.sort,
         }));
+      const sortModel = sanitizeUserSortModel(requestedSortModel);
+
+      if (sortModel.length !== requestedSortModel.length) {
+        params.api.applyColumnState({
+          state: sortModel,
+          defaultState: { sort: null },
+        });
+      }
 
       if (sortModel.length > 0) {
-        localStorage.setItem(
-          `ag-grid-sort-model-${updatedObserveId}`,
-          JSON.stringify(sortModel),
-        );
+        localStorage.setItem(sortStorageKey, JSON.stringify(sortModel));
       } else {
-        localStorage.removeItem(`ag-grid-sort-model-${updatedObserveId}`);
+        localStorage.removeItem(sortStorageKey);
       }
     };
     return (
@@ -482,11 +657,12 @@ const UsersGrid = React.memo(
               noRowsOverlayComponent={() =>
                 NoRowsOverlay(
                   <Typography
+                    role={readError ? "alert" : undefined}
                     typography="m3"
                     color="text.primary"
                     fontWeight="fontWeightMedium"
                   >
-                    No active users for current filters
+                    {readError || "No active users for current filters"}
                   </Typography>,
                 )
               }

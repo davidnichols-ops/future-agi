@@ -3,6 +3,10 @@ from rest_framework import serializers
 
 from tracer.models.project import Project
 from tracer.models.trace_session import TraceSession
+from tracer.serializers.cursor_pagination import (
+    CURSOR_HELP_TEXT,
+    validate_cursor_exclusivity,
+)
 from tracer.serializers.filters import (
     BOUNDED_PAGE_NUMBER_HELP_TEXT,
     ObserveGraphDataRequestSerializer,
@@ -99,6 +103,10 @@ class TraceSessionListQuerySerializer(StrictInputSerializer):
     page_size = serializers.IntegerField(
         required=False, default=30, min_value=1, max_value=500
     )
+    cursor = serializers.CharField(
+        required=False, allow_blank=False, max_length=4096, help_text=CURSOR_HELP_TEXT
+    )
+    cursor_mode = serializers.BooleanField(required=False, default=False)
     interval = serializers.CharField(required=False, allow_blank=True)
     allow_sampled = serializers.BooleanField(
         required=False,
@@ -108,6 +116,10 @@ class TraceSessionListQuerySerializer(StrictInputSerializer):
             "total, or true to opt in explicitly to lower-bound totals."
         ),
     )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        return validate_cursor_exclusivity(self, attrs, page_field="page_number")
 
 
 class TraceSessionExportQuerySerializer(TraceSessionListQuerySerializer):

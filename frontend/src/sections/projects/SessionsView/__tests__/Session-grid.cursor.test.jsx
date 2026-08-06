@@ -1,0 +1,280 @@
+import React from "react";
+import PropTypes from "prop-types";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, waitFor } from "src/utils/test-utils";
+
+const { enqueueSnackbarMock, getMock, gridState, sessionStoreState } =
+  vi.hoisted(() => ({
+    enqueueSnackbarMock: vi.fn(),
+    getMock: vi.fn(),
+    gridState: { props: null },
+    sessionStoreState: {
+      toggledNodes: [],
+      selectAll: false,
+      totalRowCount: null,
+    },
+  }));
+
+function MockAgGridReact(props) {
+  gridState.props = props;
+  return <div data-testid="session-grid" />;
+}
+
+MockAgGridReact.propTypes = {
+  serverSideDatasource: PropTypes.object,
+};
+
+vi.mock("ag-grid-react", () => ({ AgGridReact: MockAgGridReact }));
+vi.mock("src/styles/clean-data-table.css", () => ({}));
+vi.mock("src/utils/utils", () => ({ getRandomId: () => "column" }));
+vi.mock("src/sections/develop-detail/Common/TotalRowsStatusBar", () => ({
+  default: () => null,
+}));
+vi.mock("src/utils/axios", () => ({
+  default: { get: (...args) => getMock(...args) },
+  endpoints: {
+    project: { projectSessionList: () => "/sessions/list/" },
+  },
+}));
+vi.mock("notistack", () => ({
+  enqueueSnackbar: (...args) => enqueueSnackbarMock(...args),
+}));
+vi.mock("../../TracesDrawer/TracesDrawer", () => ({ default: () => null }));
+vi.mock("src/hooks/use-ag-theme", () => ({ useAgThemeWith: () => ({}) }));
+vi.mock("../common", () => ({
+  getSessionListColumnDef: (column) => ({ field: column.id }),
+}));
+vi.mock("src/utils/Mixpanel", () => ({
+  Events: { observeSessionidClicked: "session" },
+  trackEvent: vi.fn(),
+}));
+vi.mock("src/routes/hooks/use-url-state", () => ({
+  useUrlState: () => ["day", vi.fn()],
+}));
+vi.mock("../../UsersView/common", () => ({
+  userTraceRowHeightMapping: { Short: { height: 40 } },
+}));
+vi.mock("src/sections/projects/LLMTracing/common", () => ({
+  normalizeConfigKeys: (config) => config || [],
+  toBackendFilters: (filters) => filters,
+}));
+vi.mock("../ReplaySessions/store", () => {
+  const useSessionsGridStore = { setState: vi.fn() };
+  return {
+    useSessionsGridStore,
+    useSessionsGridStoreShallow: (selector) => selector(sessionStoreState),
+  };
+});
+
+import SessionGrid from "../Session-grid";
+
+const sessionResponse = ({
+  rows = [],
+  hasMore,
+  nextCursor,
+  totalRows = rows.length,
+  lowerBound = false,
+} = {}) => {
+  const metadata = {
+    total_rows: totalRows,
+    total_rows_is_lower_bound: lowerBound,
+  };
+  if (hasMore !== undefined) metadata.has_more = hasMore;
+  if (nextCursor !== undefined) metadata.next_cursor = nextCursor;
+  return {
+    data: {
+      result: {
+        config: [],
+        table: rows,
+        metadata,
+      },
+    },
+  };
+};
+
+const row = (number) => ({ session_id: `session-${number}` });
+
+const renderGrid = () =>
+  render(
+    <SessionGrid
+      updateObj={{ session_id: true }}
+      columns={[{ id: "session_id", isVisible: true }]}
+      setColumns={vi.fn()}
+      filters={[{ column_id: "created_at" }]}
+      projectId="project-1"
+      cellHeight="Short"
+      onSelectionChanged={vi.fn()}
+      className=""
+      onGridReady={vi.fn()}
+    />,
+  );
+
+const makeParams = ({ startRow = 0, sortModel = [] } = {}) => ({
+  request: { startRow, endRow: startRow + 25, sortModel },
+  api: {
+    showNoRowsOverlay: vi.fn(),
+    refreshServerSide: vi.fn(),
+  },
+  success: vi.fn(),
+  fail: vi.fn(),
+});
+
+const getRows = async (params) => {
+  await act(async () => {
+    await gridState.props.serverSideDatasource.getRows(params);
+  });
+};
+
+describe("SessionGrid cursor continuation", () => {
+  beforeEach(() => {
+    getMock.mockReset();
+    enqueueSnackbarMock.mockReset();
+    gridState.props = null;
+  });
+
+  it("falls back to numbered prefetch when a sorted response omits cursor metadata", async () => {
+    getMock
+      .mockResolvedValueOnce(
+        sessionResponse({
+          rows: Array.from({ length: 25 }, (_, index) => row(index)),
+          totalRows: 50,
+        }),
+      )
+      .mockResolvedValueOnce(sessionResponse({ rows: [row(25)] }));
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const params = makeParams({
+      sortModel: [{ colId: "started_at", sort: "desc" }],
+    });
+    await getRows(params);
+
+    expect(getMock.mock.calls[0][1].params).toEqual(
+      expect.objectContaining({
+        cursor_mode: true,
+        page_number: 0,
+        sort_params: JSON.stringify([
+          { column_id: "started_at", direction: "desc" },
+        ]),
+      }),
+    );
+    expect(getMock.mock.calls[1][1].params).toEqual(
+      expect.objectContaining({ page_number: 1 }),
+    );
+    expect(getMock.mock.calls[1][1].params).not.toHaveProperty("cursor_mode");
+    expect(getMock.mock.calls[1][1].params).not.toHaveProperty("cursor");
+    expect(params.success).toHaveBeenCalledTimes(1);
+  });
+
+  it("follows an empty checkpoint and publishes only the first genuine match", async () => {
+    getMock
+      .mockResolvedValueOnce(
+        sessionResponse({
+          hasMore: true,
+          nextCursor: "checkpoint-1",
+          lowerBound: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        sessionResponse({
+          rows: [row(8)],
+          hasMore: false,
+          nextCursor: null,
+          totalRows: 1,
+        }),
+      );
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const params = makeParams();
+    await getRows(params);
+
+    expect(getMock).toHaveBeenCalledTimes(2);
+    expect(getMock.mock.calls[1][1].params).toEqual(
+      expect.objectContaining({
+        cursor_mode: true,
+        cursor: "checkpoint-1",
+      }),
+    );
+    expect(getMock.mock.calls[1][1].params).not.toHaveProperty("page_number");
+    expect(params.success).toHaveBeenCalledWith({
+      rowData: [row(8)],
+      rowCount: 1,
+    });
+  });
+
+  it("fails instead of looping or displaying a false empty page on a repeated token", async () => {
+    getMock
+      .mockResolvedValueOnce(
+        sessionResponse({ hasMore: true, nextCursor: "same-token" }),
+      )
+      .mockResolvedValueOnce(
+        sessionResponse({ hasMore: true, nextCursor: "same-token" }),
+      );
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const params = makeParams();
+    await getRows(params);
+
+    expect(params.fail).toHaveBeenCalledTimes(1);
+    expect(params.success).not.toHaveBeenCalled();
+    expect(enqueueSnackbarMock).toHaveBeenCalledWith(
+      "Session data could not be loaded. Please retry.",
+      { variant: "error" },
+    );
+  });
+
+  it("sanitizes API errors and does not convert them into successful empty data", async () => {
+    getMock.mockRejectedValue({
+      response: {
+        status: 500,
+        data: { detail: "DB::Exception Code 159 private stack" },
+      },
+    });
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const params = makeParams();
+    await getRows(params);
+
+    expect(params.fail).toHaveBeenCalledTimes(1);
+    expect(params.success).not.toHaveBeenCalled();
+    expect(enqueueSnackbarMock).toHaveBeenCalledWith(
+      "Session data could not be loaded. Please retry.",
+      { variant: "error" },
+    );
+    expect(enqueueSnackbarMock).not.toHaveBeenCalledWith(
+      expect.stringMatching(/DB::Exception/i),
+      expect.anything(),
+    );
+  });
+
+  it("silently discards an in-flight response from an older sort generation", async () => {
+    let resolveStale;
+    const staleResponse = new Promise((resolve) => {
+      resolveStale = resolve;
+    });
+    getMock
+      .mockReturnValueOnce(staleResponse)
+      .mockResolvedValueOnce(sessionResponse({ rows: [row(9)] }));
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const staleParams = makeParams();
+    const staleRead = gridState.props.serverSideDatasource.getRows(staleParams);
+    await waitFor(() => expect(getMock).toHaveBeenCalledTimes(1));
+
+    const currentParams = makeParams({
+      sortModel: [{ colId: "started_at", sort: "desc" }],
+    });
+    await getRows(currentParams);
+    resolveStale(sessionResponse({ rows: [row(1)] }));
+    await act(async () => staleRead);
+
+    expect(currentParams.success).toHaveBeenCalledTimes(1);
+    expect(staleParams.fail).toHaveBeenCalledTimes(1);
+    expect(staleParams.success).not.toHaveBeenCalled();
+    expect(enqueueSnackbarMock).not.toHaveBeenCalled();
+  });
+});

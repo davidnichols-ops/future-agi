@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from django.conf import settings
@@ -42,9 +43,24 @@ from tracer.services.clickhouse.client import (
     get_clickhouse_client,
     is_clickhouse_enabled,
 )
+from tracer.services.clickhouse.dashboard_snapshot import (
+    DashboardRelationSnapshotError,
+    capture_dashboard_relation_snapshot,
+)
+from tracer.services.clickhouse.exact_graph_reads import (
+    execute_exact_output_partitions,
+    output_bucket_partitions,
+)
 from tracer.services.clickhouse.filter_value_reads import (
     SYSTEM_FILTER_VALUE_METRICS,
     read_span_system_filter_values,
+)
+from tracer.services.clickhouse.list_cursor import (
+    ListCursorError,
+    capture_snapshot_version_ceiling,
+    cursor_scope_for_request,
+    decode_list_cursor,
+    encode_list_cursor,
 )
 from tracer.services.clickhouse.query_builders.dashboard import (
     METRIC_UNITS,
@@ -72,9 +88,141 @@ from tracer.services.clickhouse.v2.query_builders.dashboard import (
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.services.dashboard_metrics_catalog import get_cached_metrics_catalog
+from tracer.services.exact_aggregation_cache import (
+    mark_refresh_failed,
+    publish_exact_snapshot,
+    read_exact_snapshot,
+    read_or_schedule_exact_snapshot,
+)
 from tracer.utils.workspace_scope import project_queryset_for_request
 
 logger = structlog.get_logger(__name__)
+
+
+class DashboardExactReadError(RuntimeError):
+    """A dashboard refresh did not produce every requested exact metric."""
+
+
+class DashboardQueryScopeError(ValueError):
+    """A requested dashboard scope is outside the current workspace."""
+
+
+def _materialize_dashboard_query_scope(
+    query_config,
+    workspace,
+    *,
+    trace_metrics,
+    dataset_metrics,
+):
+    """Freeze every implicit all-resource scope into the exact cache identity.
+
+    Empty ``project_ids``/``dataset_ids`` mean "all current workspace rows" at
+    the API boundary. Keeping that sentinel in a long-lived cache key can serve
+    a project after it moves out of the workspace or omit a resource added
+    later. Resolve, authorize, stringify, and sort the concrete IDs before any
+    cache read or refresh is scheduled.
+    """
+
+    scoped = {**query_config}
+    if trace_metrics:
+        requested_project_ids = list(scoped.get("project_ids") or [])
+        project_queryset = Project.objects.filter(workspace=workspace)
+        if requested_project_ids:
+            project_queryset = project_queryset.filter(id__in=requested_project_ids)
+        project_ids = sorted(
+            str(value) for value in project_queryset.values_list("id", flat=True)
+        )
+        if requested_project_ids and len(project_ids) != len(requested_project_ids):
+            raise DashboardQueryScopeError(
+                "One or more project_ids do not belong to this workspace"
+            )
+        scoped["project_ids"] = project_ids
+
+    if dataset_metrics:
+        from model_hub.models.develop_dataset import Dataset
+
+        requested_dataset_ids = list(scoped.get("dataset_ids") or [])
+        dataset_queryset = Dataset.objects.filter(
+            workspace=workspace,
+            deleted=False,
+        )
+        if requested_dataset_ids:
+            dataset_queryset = dataset_queryset.filter(id__in=requested_dataset_ids)
+        dataset_ids = sorted(
+            str(value) for value in dataset_queryset.values_list("id", flat=True)
+        )
+        if requested_dataset_ids and len(dataset_ids) != len(requested_dataset_ids):
+            raise DashboardQueryScopeError(
+                "Some dataset_ids are invalid or not in this workspace"
+            )
+        scoped["dataset_ids"] = dataset_ids
+
+    return scoped
+
+
+# Exact trace dashboards may hydrate wide attribute Maps. Keep every query
+# finite at the ClickHouse boundary so an exact read either completes or is
+# returned as unavailable without monopolising the shared cluster. Two metric
+# queries are allowed in flight below, making the aggregate request ceiling
+# predictable as well.
+_DASHBOARD_TRACE_READ_SETTINGS = {
+    "max_threads": 2,
+    "max_rows_to_read": 30_000_000,
+    "max_bytes_to_read": 8 * 1024 * 1024 * 1024,
+    "max_memory_usage": 512 * 1024 * 1024,
+    "read_overflow_mode": "throw",
+    "max_result_rows": 250_000,
+    "max_result_bytes": 64 * 1024 * 1024,
+    "result_overflow_mode": "throw",
+    "timeout_overflow_mode": "throw",
+}
+_DASHBOARD_TRACE_MAX_CONCURRENT_METRICS = 2
+_DASHBOARD_TRACE_MAX_BUCKETS_PER_PARTITION = 7
+
+
+def _fetch_exact_dashboard_rows(
+    *,
+    analytics,
+    sql,
+    params,
+    granularity,
+    timeout_ms,
+    settings,
+):
+    """Run one exact dashboard metric with bucket-boundary budget retries."""
+
+    rows, _columns, _query_count = execute_exact_output_partitions(
+        analytics=analytics,
+        query=sql,
+        params=params,
+        partitions=output_bucket_partitions(
+            params["start_date"],
+            params["end_date"],
+            granularity,
+            max_buckets=_DASHBOARD_TRACE_MAX_BUCKETS_PER_PARTITION,
+        ),
+        settings=settings,
+        interval=granularity,
+        leaf_timeout_ms=timeout_ms,
+        probe_timeout_ms=min(timeout_ms, 30_000),
+    )
+    return rows
+
+
+def _pending_dashboard_payload(query_config):
+    """Return a structurally valid response with no chartable aggregate data."""
+
+    now = datetime.now(UTC).isoformat()
+    return {
+        "metrics": [],
+        "time_range": {"start": now, "end": now},
+        "granularity": query_config.get("granularity", "day"),
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+        "query_refreshing": True,
+    }
+
 
 DASHBOARD_FILTER_COL_TYPE_TO_METRIC_TYPE = {
     "SYSTEM_METRIC": "system_metric",
@@ -174,23 +322,46 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         return 30000 if has_eval_metrics or has_project_breakdown else 10000
 
     @staticmethod
-    def _run_metric_queries(builder, source, fetch_rows):
+    def _run_metric_queries(
+        builder,
+        source,
+        fetch_rows,
+        *,
+        max_workers=4,
+        prepared_queries=None,
+    ):
         """Build + execute each metric in parallel; return [(metric_info, rows)].
 
         Invalid combinations and explicit read-budget exhaustion are isolated
         to the affected metric. Programming, compiler, and transport defects
         still propagate so they cannot masquerade as valid empty charts.
         """
-        metrics = builder.metrics
-        if not metrics:
+        work_items = (
+            [(metric, None, None) for metric in builder.metrics]
+            if prepared_queries is None
+            else list(prepared_queries)
+        )
+        if not work_items:
             return []
 
-        def _exec_one(metric):
+        def _exec_one(work_item):
+            metric, prepared_sql, prepared_params = work_item
             metric_info = builder.metric_info(metric)
             metric_info["source"] = source
             try:
-                sql, params = builder.build_metric_query(metric)
-                return (metric_info, fetch_rows(sql, params))
+                if prepared_sql is None:
+                    sql, params = builder.build_metric_query(metric)
+                else:
+                    sql, params = prepared_sql, prepared_params
+                rows = fetch_rows(sql, params)
+                metric_info.update(
+                    {
+                        "query_complete": True,
+                        "query_status": "complete",
+                        "query_sampled": False,
+                    }
+                )
+                return (metric_info, rows)
             except InvalidMetricCombinationError as e:
                 metric_info.update(
                     {
@@ -218,12 +389,27 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 )
                 return (metric_info, [])
 
-        if len(metrics) == 1:
-            return [_exec_one(metrics[0])]
+        if len(work_items) == 1:
+            return [_exec_one(work_items[0])]
 
-        with ThreadPoolExecutor(max_workers=min(len(metrics), 4)) as pool:
-            futures = [pool.submit(_exec_one, m) for m in metrics]
+        with ThreadPoolExecutor(max_workers=min(len(work_items), max_workers)) as pool:
+            futures = [pool.submit(_exec_one, item) for item in work_items]
         return [f.result() for f in futures]
+
+    @staticmethod
+    def _prepare_metric_queries(builder):
+        """Freeze generated SQL/params before capturing relation ceilings."""
+
+        prepared = []
+        for metric in builder.metrics:
+            try:
+                sql, params = builder.build_metric_query(metric)
+            except InvalidMetricCombinationError as exc:
+                raise DashboardExactReadError(
+                    "one or more dashboard metrics cannot be read exactly"
+                ) from exc
+            prepared.append((metric, sql, params))
+        return tuple(prepared)
 
     def _format_merged_metric_results(self, query_config, all_metric_results):
         formatter = DatasetQueryBuilder(
@@ -409,6 +595,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         it reaches any query builder.
         """
         query_config = _normalize_dashboard_query_filters(request.validated_data)
+        # Kept in the request schema for older clients, but aggregation never
+        # takes a sampled execution path.
+        query_config["allow_sampled"] = False
 
         query_config["metrics"] = self._normalize_metric_sources(
             query_config["metrics"]
@@ -424,200 +613,35 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         dataset_metrics = [
             m for m in query_config["metrics"] if m.get("source") == "datasets"
         ]
-        simulation_metrics = [
-            m for m in query_config["metrics"] if m.get("source") == "simulation"
-        ]
-
+        # Authorization must be rechecked before serving a cached result; the
+        # concrete scope is also part of the key so moves/additions cannot reuse
+        # an all-resources snapshot produced for different membership.
         try:
-            # Observability metrics are direct-write CH25 data. Keep the V2
-            # service explicit so routing configuration cannot select the
-            # legacy cluster.
-            analytics = V2AnalyticsQueryService()
-            all_metric_results = []
-            project_name_map = {}
-
-            # --- Trace metrics via DashboardQueryBuilder ---
-            if trace_metrics:
-                trace_config = {**query_config, "metrics": trace_metrics}
-
-                # Resolve project_ids
-                project_ids = trace_config.get("project_ids", [])
-                if not project_ids:
-                    project_ids = list(
-                        Project.objects.filter(
-                            workspace=request.workspace,
-                        ).values_list("id", flat=True)
-                    )
-                    trace_config["project_ids"] = [str(pid) for pid in project_ids]
-                else:
-                    # Validate project_ids belong to this workspace
-                    valid_count = Project.objects.filter(
-                        id__in=project_ids,
-                        workspace=request.workspace,
-                    ).count()
-                    if valid_count != len(project_ids):
-                        return self._gm.bad_request(
-                            "One or more project_ids do not belong to this workspace"
-                        )
-
-                # Build project name map from current workspace projects
-                project_name_map = dict(
-                    Project.objects.filter(
-                        id__in=trace_config["project_ids"],
-                        workspace=request.workspace,
-                    ).values_list("id", "name")
-                )
-                project_name_map = {str(k): v for k, v in project_name_map.items()}
-
-                # For eval metrics: extend with ALL org projects so
-                # cross-workspace project breakdowns resolve correctly.
-                has_eval_metrics = any(
-                    m.get("type") == "eval_metric" for m in trace_config["metrics"]
-                )
-                if has_eval_metrics:
-                    org_projects = dict(
-                        Project.objects.filter(
-                            workspace__organization=request.workspace.organization,
-                        ).values_list("id", "name")
-                    )
-                    for k, v in org_projects.items():
-                        project_name_map.setdefault(str(k), v)
-
-                # Pass workspace + org IDs for eval metrics
-                trace_config["organization_id"] = str(request.workspace.organization_id)
-                trace_config["workspace_id"] = str(request.workspace.id)
-
-                trace_analytics = analytics
-                builder = DashboardQueryBuilderV2(trace_config)
-                query_timeout = self._get_trace_query_timeout_ms(trace_config)
-                all_metric_results.extend(
-                    self._run_metric_queries(
-                        builder,
-                        "traces",
-                        lambda sql, params: (
-                            trace_analytics.execute_ch_query(
-                                sql, params, timeout_ms=query_timeout
-                            ).data
-                        ),
-                    )
-                )
-
-            # --- Dataset metrics via DatasetQueryBuilder ---
-            if dataset_metrics:
-                ds_config = {**query_config, "metrics": dataset_metrics}
-                ds_config["workspace_id"] = str(request.workspace.id)
-
-                # Validate dataset_ids if provided
-                dataset_ids = ds_config.get("dataset_ids", [])
-                if dataset_ids:
-                    from model_hub.models.develop_dataset import Dataset
-
-                    valid_count = Dataset.objects.filter(
-                        id__in=dataset_ids,
-                        workspace=request.workspace,
-                        deleted=False,
-                    ).count()
-                    if valid_count != len(dataset_ids):
-                        return self._gm.bad_request(
-                            "Some dataset_ids are invalid or not in this workspace"
-                        )
-
-                builder = DatasetQueryBuilder(ds_config)
-                all_metric_results.extend(
-                    self._run_metric_queries(
-                        builder,
-                        "datasets",
-                        lambda sql, params: (
-                            analytics.execute_ch_query(
-                                sql, params, timeout_ms=10000
-                            ).data
-                        ),
-                    )
-                )
-
-            # --- Simulation metrics via SimulationQueryBuilder ---
-            if simulation_metrics:
-                sim_config = {**query_config, "metrics": simulation_metrics}
-                sim_config["workspace_id"] = str(request.workspace.id)
-                all_metric_results.extend(
-                    self._run_simulation_analytics_queries(analytics, sim_config)
-                )
-
-            breakdown_names = {
-                (bd.get("name") or bd.get("id") or "").lower()
-                for bd in query_config.get("breakdowns", [])
-            }
-            has_project_breakdown = "project" in breakdown_names
-            if has_project_breakdown and project_name_map:
-                for _metric_info, rows in all_metric_results:
-                    for row in rows:
-                        bv = row.get("breakdown_value")
-                        if bv:
-                            bv_str = str(bv)
-                            if " / " in bv_str:
-                                parts = bv_str.split(" / ")
-                                parts = [project_name_map.get(p, p) for p in parts]
-                                row["breakdown_value"] = " / ".join(parts)
-                            elif bv_str in project_name_map:
-                                row["breakdown_value"] = project_name_map[bv_str]
-
-            has_dataset_breakdown = "dataset" in breakdown_names
-            if has_dataset_breakdown:
-                import uuid as _uuid
-
-                ds_uuids = set()
-                for _metric_info, rows in all_metric_results:
-                    for row in rows:
-                        for part in str(row.get("breakdown_value", "")).split(" / "):
-                            try:
-                                _uuid.UUID(part)
-                                ds_uuids.add(part)
-                            except (ValueError, AttributeError):
-                                pass
-
-                if ds_uuids:
-                    from model_hub.models.develop_dataset import Dataset
-
-                    ds_name_map = dict(
-                        Dataset.objects.filter(
-                            id__in=list(ds_uuids),
-                        ).values_list("id", "name")
-                    )
-                    ds_name_map = {str(k): v for k, v in ds_name_map.items()}
-                    if ds_name_map:
-                        for _metric_info, rows in all_metric_results:
-                            for row in rows:
-                                bv = str(row.get("breakdown_value", ""))
-                                parts = bv.split(" / ")
-                                row["breakdown_value"] = " / ".join(
-                                    ds_name_map.get(part, part) for part in parts
-                                )
-
-            merged_config = {**query_config, "metrics": query_config["metrics"]}
-            if dataset_metrics:
-                merged_config["workspace_id"] = str(request.workspace.id)
-            response = self._format_merged_metric_results(
-                merged_config,
-                all_metric_results,
+            query_config = _materialize_dashboard_query_scope(
+                query_config,
+                request.workspace,
+                trace_metrics=trace_metrics,
+                dataset_metrics=dataset_metrics,
             )
-            return self._gm.success_response(response)
+        except DashboardQueryScopeError as exc:
+            return self._gm.bad_request(str(exc))
 
-        except Exception as exc:
-            if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
-                logger.warning(
-                    "query_read_unavailable",
-                    error_type=type(exc).__name__,
-                )
-                return self._gm.custom_error_response(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "Dashboard data is temporarily unavailable. Please retry.",
-                    code="service_unavailable",
-                )
-            logger.exception(
-                "query_execution_failed",
-                error_type=type(exc).__name__,
+        refresh = str(request.query_params.get("refresh", "false")).lower() in {
+            "1",
+            "true",
+        }
+        cache_identity = {
+            "workspace_id": str(request.workspace.id),
+            "query_config": query_config,
+        }
+        return self._gm.success_response(
+            read_or_schedule_exact_snapshot(
+                "dashboard-query",
+                cache_identity,
+                refresh=refresh,
+                pending_payload=_pending_dashboard_payload(query_config),
             )
-            return self._gm.bad_request("Dashboard query could not be completed")
+        )
 
     # ------------------------------------------------------------------
     # Unified metrics endpoint — all sources, no workflow selector
@@ -1337,6 +1361,149 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     json_attribute_mode="arrays",
                 )
                 try:
+                    page_size = query_params.get("page_size")
+                    cursor_token = query_params.get("cursor")
+                    if page_size is not None:
+                        page_size = int(page_size)
+                        cursor_scope = cursor_scope_for_request(
+                            request,
+                            project_ids=project_ids,
+                        )
+                        cursor_query = {
+                            "metric_name": metric_name,
+                            "metric_type": metric_type,
+                            "source": source,
+                            "project_ids": sorted(str(value) for value in project_ids),
+                            "search": search,
+                        }
+                        if cursor_token:
+                            cursor_state = decode_list_cursor(
+                                cursor_token,
+                                resource="dashboard_filter_values",
+                                scope=cursor_scope,
+                                query=cursor_query,
+                                page_size=page_size,
+                            )
+                            if len(cursor_state.order) != 5:
+                                raise ListCursorError(
+                                    "invalid_cursor",
+                                    "The continuation cursor is invalid.",
+                                )
+                            (
+                                segment_end,
+                                raw_before_identity,
+                                raw_resume_identity,
+                                resume_member_offset,
+                                seen_digests,
+                            ) = cursor_state.order
+                            if (
+                                not isinstance(segment_end, datetime)
+                                or not isinstance(raw_before_identity, tuple)
+                                or len(raw_before_identity) not in {0, 4}
+                                or not isinstance(raw_resume_identity, tuple)
+                                or len(raw_resume_identity) not in {0, 4}
+                                or not isinstance(resume_member_offset, int)
+                                or resume_member_offset < 0
+                                or not isinstance(seen_digests, tuple)
+                                or cursor_state.seen_rows != len(seen_digests)
+                            ):
+                                raise ListCursorError(
+                                    "invalid_cursor",
+                                    "The continuation cursor is invalid.",
+                                )
+                            before_identity = None
+                            if raw_before_identity:
+                                if not all(
+                                    isinstance(value, str)
+                                    for value in raw_before_identity[:3]
+                                ) or not isinstance(raw_before_identity[3], datetime):
+                                    raise ListCursorError(
+                                        "invalid_cursor",
+                                        "The continuation cursor is invalid.",
+                                    )
+                                before_identity = raw_before_identity
+                            resume_identity = None
+                            if raw_resume_identity:
+                                if not all(
+                                    isinstance(value, str)
+                                    for value in raw_resume_identity[:3]
+                                ) or not isinstance(raw_resume_identity[3], datetime):
+                                    raise ListCursorError(
+                                        "invalid_cursor",
+                                        "The continuation cursor is invalid.",
+                                    )
+                                resume_identity = raw_resume_identity
+                            window_start = cursor_state.window_start
+                            window_end = cursor_state.window_end
+                            version_ceiling = cursor_state.version_ceiling
+                        else:
+                            window_end = datetime.now(UTC)
+                            window_start = window_end - timedelta(days=365)
+                            segment_end = window_end
+                            before_identity = None
+                            resume_identity = None
+                            resume_member_offset = 0
+                            seen_digests = ()
+                            version_ceiling = capture_snapshot_version_ceiling(
+                                analytics
+                            )
+
+                        page_read = selector.read_value_cursor_page(
+                            project_ids,
+                            metric_name,
+                            page_size=page_size,
+                            version_ceiling=version_ceiling,
+                            window_start=window_start,
+                            window_end=window_end,
+                            segment_end=segment_end,
+                            before_identity=before_identity,
+                            resume_identity=resume_identity,
+                            resume_member_offset=resume_member_offset,
+                            seen_value_digests=seen_digests,
+                            search=search,
+                        )
+                        values = [
+                            {
+                                "value": row.value,
+                                "type": row.type,
+                                "label": (
+                                    "true"
+                                    if row.value is True
+                                    else "false"
+                                    if row.value is False
+                                    else str(row.value)
+                                ),
+                            }
+                            for row in page_read.rows
+                        ]
+                        next_cursor = None
+                        if page_read.has_more:
+                            next_cursor = encode_list_cursor(
+                                resource="dashboard_filter_values",
+                                scope=cursor_scope,
+                                query=cursor_query,
+                                page_size=page_size,
+                                window_start=window_start,
+                                window_end=window_end,
+                                order=(
+                                    page_read.next_segment_end,
+                                    page_read.next_before_identity or (),
+                                    page_read.next_resume_identity or (),
+                                    page_read.next_resume_member_offset,
+                                    page_read.seen_value_digests,
+                                ),
+                                version_ceiling=version_ceiling,
+                                seen_rows=len(page_read.seen_value_digests),
+                            )
+                        return self._gm.success_response(
+                            {
+                                "values": values,
+                                **page_read.metadata.public_payload(),
+                                "has_more": page_read.has_more,
+                                "next_cursor": next_cursor,
+                            }
+                        )
+
                     read = selector.read_values(
                         project_ids,
                         metric_name,
@@ -1383,6 +1550,12 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             "values": values,
                             **metadata,
                         }
+                    )
+                except ListCursorError as exc:
+                    return self._gm.custom_error_response(
+                        status.HTTP_400_BAD_REQUEST,
+                        str(exc),
+                        code=exc.code,
                     )
                 except InvalidAttributeKey:
                     return self._gm.bad_request("Invalid attribute key")
@@ -1862,7 +2035,15 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             logger.error(f"Failed to duplicate widget: {e}", exc_info=True)
             return self._gm.bad_request("Failed to duplicate widget.")
 
-    def _execute_ch_query_config(self, query_config, workspace):
+    def _execute_ch_query_config(
+        self,
+        query_config,
+        workspace,
+        *,
+        refresh=False,
+        _exact_worker=False,
+        cache_identity_override=None,
+    ):
         """Execute a query_config against ClickHouse and return formatted results.
 
         Routes each metric to the appropriate builder based on source.
@@ -1871,6 +2052,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         if not serializer.is_valid():
             return self._gm.bad_request(f"Invalid query config: {serializer.errors}")
         query_config = _normalize_dashboard_query_filters(serializer.validated_data)
+        query_config["allow_sampled"] = False
 
         query_config["metrics"] = self._normalize_metric_sources(
             query_config["metrics"]
@@ -1888,14 +2070,65 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             m for m in query_config["metrics"] if m.get("source") == "simulation"
         ]
 
-        # The legacy ClickHouse client is only valid for the still-unmigrated
-        # dataset/simulation sources. Do not construct it for a trace-only
-        # observability request.
+        try:
+            query_config = _materialize_dashboard_query_scope(
+                query_config,
+                workspace,
+                trace_metrics=trace_metrics,
+                dataset_metrics=dataset_metrics,
+            )
+        except DashboardQueryScopeError as exc:
+            return self._gm.bad_request(str(exc))
+
+        cache_identity = cache_identity_override or {
+            "workspace_id": str(workspace.id),
+            "query_config": query_config,
+        }
+        previous = read_exact_snapshot("dashboard-query", cache_identity)
+        if not _exact_worker:
+            return self._gm.success_response(
+                read_or_schedule_exact_snapshot(
+                    "dashboard-query",
+                    cache_identity,
+                    refresh=bool(refresh),
+                    pending_payload=_pending_dashboard_payload(query_config),
+                )
+            )
+
+        # Freeze one concrete wall-clock window before any builder prepares its
+        # metric SQL. Preset windows must not drift by microseconds across
+        # concurrent source queries or later response formatting.
+        window_builder = DatasetQueryBuilder(query_config)
+        window_start, window_end = window_builder.parse_time_range()
+        query_config = {
+            **query_config,
+            "time_range": {
+                "custom_start": window_start.isoformat(),
+                "custom_end": window_end.isoformat(),
+            },
+        }
+
         ch_client = None
+        legacy_analytics = None
         metric_results = []
+        trace_version_ceiling = None
+        snapshot_query_count = 0
+        snapshot_tables: set[str] = set()
+        trace_analytics = None
+        trace_builder = None
+        trace_prepared = ()
+        dataset_builder = None
+        dataset_prepared = ()
+        simulation_builder = None
+        simulation_prepared = ()
+        query_timeout = 300_000
 
         if trace_metrics:
-            trace_config = {**query_config, "metrics": trace_metrics}
+            trace_config = {
+                **query_config,
+                "metrics": trace_metrics,
+                "require_versioned_snapshot": True,
+            }
             project_ids = trace_config.get("project_ids", [])
             if not project_ids:
                 project_ids = list(
@@ -1917,44 +2150,150 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             trace_config["organization_id"] = str(workspace.organization_id)
             trace_config["workspace_id"] = str(workspace.id)
             trace_analytics = V2AnalyticsQueryService()
-            builder = DashboardQueryBuilderV2(trace_config)
-            query_timeout = self._get_trace_query_timeout_ms(trace_config)
-
-            def _fetch_trace_rows(sql, params):
-                return trace_analytics.execute_ch_query(
-                    sql, params, timeout_ms=query_timeout
-                ).data
-
-            metric_results.extend(
-                DashboardViewSet._run_metric_queries(
-                    builder, "traces", _fetch_trace_rows
-                )
-            )
+            trace_builder = DashboardQueryBuilderV2(trace_config)
+            trace_prepared = DashboardViewSet._prepare_metric_queries(trace_builder)
 
         if dataset_metrics:
-            ch_client = get_clickhouse_client()
-            ds_config = {**query_config, "metrics": dataset_metrics}
-            ds_config["workspace_id"] = str(workspace.id)
-            builder = DatasetQueryBuilder(ds_config)
+            ds_config = {
+                **query_config,
+                "metrics": dataset_metrics,
+                "workspace_id": str(workspace.id),
+                "exact_snapshot_dimensions": True,
+            }
+            dataset_builder = DatasetQueryBuilder(ds_config)
+            dataset_prepared = DashboardViewSet._prepare_metric_queries(dataset_builder)
 
-            def _fetch_ds_rows(sql, params):
-                rows, column_types, _ = ch_client.execute_read(sql, params)
-                col_names = [ct[0] for ct in column_types]
-                return [dict(zip(col_names, row, strict=True)) for row in rows]
+        if simulation_metrics:
+            sim_config = {
+                **query_config,
+                "metrics": simulation_metrics,
+                "workspace_id": str(workspace.id),
+                "exact_snapshot_dimensions": True,
+            }
+            simulation_builder = SimulationQueryBuilder(sim_config)
+            simulation_prepared = DashboardViewSet._prepare_metric_queries(
+                simulation_builder
+            )
+
+        snapshot_settings = dict(_DASHBOARD_TRACE_READ_SETTINGS)
+        try:
+            if trace_prepared:
+                trace_snapshot = capture_dashboard_relation_snapshot(
+                    analytics=trace_analytics,
+                    sql_statements=[sql for _metric, sql, _params in trace_prepared],
+                    base_settings=snapshot_settings,
+                    timeout_ms=query_timeout,
+                )
+                snapshot_settings = trace_snapshot.settings
+                trace_version_ceiling = trace_snapshot.version_ceilings.get("spans")
+                snapshot_query_count += trace_snapshot.snapshot_query_count
+                snapshot_tables.update(trace_snapshot.tables)
+
+            legacy_prepared = (*dataset_prepared, *simulation_prepared)
+            if legacy_prepared:
+                # Dataset/simulation tables may be on the still-unmigrated
+                # ClickHouse connection. Capture those ceilings through the
+                # same client that will execute their metric statements.
+                ch_client = get_clickhouse_client()
+                legacy_analytics = AnalyticsQueryService()
+                legacy_analytics._ch_client = ch_client
+                legacy_snapshot = capture_dashboard_relation_snapshot(
+                    analytics=legacy_analytics,
+                    sql_statements=[sql for _metric, sql, _params in legacy_prepared],
+                    base_settings=snapshot_settings,
+                    timeout_ms=query_timeout,
+                )
+                snapshot_settings = legacy_snapshot.settings
+                snapshot_query_count += legacy_snapshot.snapshot_query_count
+                snapshot_tables.update(legacy_snapshot.tables)
+        except DashboardRelationSnapshotError as exc:
+            raise DashboardExactReadError(
+                "dashboard relation snapshot could not be captured"
+            ) from exc
+
+        if trace_prepared:
+
+            def _fetch_trace_rows(sql, params):
+                return _fetch_exact_dashboard_rows(
+                    analytics=trace_analytics,
+                    sql=sql,
+                    params=params,
+                    granularity=query_config["granularity"],
+                    timeout_ms=query_timeout,
+                    settings=snapshot_settings,
+                )
 
             metric_results.extend(
                 DashboardViewSet._run_metric_queries(
-                    builder, "datasets", _fetch_ds_rows
+                    trace_builder,
+                    "traces",
+                    _fetch_trace_rows,
+                    max_workers=_DASHBOARD_TRACE_MAX_CONCURRENT_METRICS,
+                    prepared_queries=trace_prepared,
                 )
             )
 
-        if simulation_metrics:
-            if ch_client is None:
-                ch_client = get_clickhouse_client()
-            sim_config = {**query_config, "metrics": simulation_metrics}
-            sim_config["workspace_id"] = str(workspace.id)
+        if dataset_prepared:
+            if legacy_analytics is None:
+                raise DashboardExactReadError(
+                    "dataset snapshot executor is unavailable"
+                )
+
+            def _fetch_ds_rows(sql, params):
+                return _fetch_exact_dashboard_rows(
+                    analytics=legacy_analytics,
+                    sql=sql,
+                    params=params,
+                    granularity=query_config["granularity"],
+                    timeout_ms=query_timeout,
+                    settings=snapshot_settings,
+                )
+
             metric_results.extend(
-                self._run_simulation_clickhouse_queries(ch_client, sim_config)
+                DashboardViewSet._run_metric_queries(
+                    dataset_builder,
+                    "datasets",
+                    _fetch_ds_rows,
+                    prepared_queries=dataset_prepared,
+                )
+            )
+
+        if simulation_prepared:
+            if legacy_analytics is None:
+                raise DashboardExactReadError(
+                    "simulation snapshot executor is unavailable"
+                )
+
+            def _fetch_simulation_rows(sql, params):
+                return _fetch_exact_dashboard_rows(
+                    analytics=legacy_analytics,
+                    sql=sql,
+                    params=params,
+                    granularity=query_config["granularity"],
+                    timeout_ms=query_timeout,
+                    settings=snapshot_settings,
+                )
+
+            metric_results.extend(
+                DashboardViewSet._run_metric_queries(
+                    simulation_builder,
+                    "simulation",
+                    _fetch_simulation_rows,
+                    prepared_queries=simulation_prepared,
+                )
+            )
+
+        if any(
+            metric_info.get("query_complete") is not True
+            or metric_info.get("query_status") != "complete"
+            or metric_info.get("query_sampled") is True
+            or bool(metric_info.get("error"))
+            for metric_info, _rows in metric_results
+        ):
+            if previous is not None and not _exact_worker:
+                return self._gm.success_response(mark_refresh_failed(previous))
+            raise DashboardExactReadError(
+                "one or more dashboard metrics did not complete exactly"
             )
 
         # Format using DatasetQueryBuilder (compatible format_results)
@@ -1975,7 +2314,25 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         else:
             formatted = formatter.format_results(metric_results)
 
-        return self._gm.success_response(formatted)
+        formatted.update(
+            {
+                "query_complete": True,
+                "query_status": "complete",
+                "query_sampled": False,
+                "query_snapshot_capture_count": snapshot_query_count,
+                "query_snapshot_relation_count": len(snapshot_tables),
+            }
+        )
+        if trace_version_ceiling is not None:
+            formatted["query_snapshot_version_ceiling"] = trace_version_ceiling
+        if _exact_worker:
+            return self._gm.success_response(formatted)
+        published = publish_exact_snapshot(
+            "dashboard-query",
+            cache_identity,
+            formatted,
+        )
+        return self._gm.success_response(published)
 
     @validated_request(
         request_serializer=DashboardSampleOptInSerializer,
@@ -2001,10 +2358,18 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 )
             query_config = {
                 **widget.query_config,
-                "allow_sampled": request.validated_data["allow_sampled"],
+                "allow_sampled": False,
             }
 
-            return self._execute_ch_query_config(query_config, request.workspace)
+            refresh = str(request.query_params.get("refresh", "false")).lower() in {
+                "1",
+                "true",
+            }
+            return self._execute_ch_query_config(
+                query_config,
+                request.workspace,
+                refresh=refresh,
+            )
         except Exception as exc:
             if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
                 logger.warning(
@@ -2041,10 +2406,18 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
 
             query_config = {
                 **request.validated_data["query_config"],
-                "allow_sampled": request.validated_data["allow_sampled"],
+                "allow_sampled": False,
             }
 
-            return self._execute_ch_query_config(query_config, request.workspace)
+            refresh = str(request.query_params.get("refresh", "false")).lower() in {
+                "1",
+                "true",
+            }
+            return self._execute_ch_query_config(
+                query_config,
+                request.workspace,
+                refresh=refresh,
+            )
         except Exception as exc:
             if is_read_budget_error(exc) or is_clickhouse_query_error(exc):
                 logger.warning(

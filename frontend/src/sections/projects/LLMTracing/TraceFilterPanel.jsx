@@ -53,8 +53,13 @@ import {
   usesFreeTextValue,
 } from "./filterValuePickerUtils";
 import { ID_ONLY_FIELDS } from "./idFields";
-import { getQueryReadMessage } from "src/utils/queryReadState";
+import {
+  getAttributeLookupMessage,
+  getFilterValueReadMessage,
+  getQueryReadMessage,
+} from "src/utils/queryReadState";
 import { useExactTraceAttributeProperties } from "./useExactTraceAttributeProperties";
+import { VOICE_CALL_FILTER_FIELDS } from "./voiceCallFilterFields";
 
 // ---------------------------------------------------------------------------
 // Trace filter fields (for Query tab via shared FilterPanel)
@@ -99,6 +104,7 @@ const SPAN_ID_FIELD = {
 //                        consumers such as sessions/users).
 // Exported for direct unit testing.
 export const getTraceFilterFields = (tab) => {
+  if (tab === "voiceCalls") return VOICE_CALL_FILTER_FIELDS;
   if (tab === "trace") return [TRACE_ID_FIELD, ...BASE_TRACE_FILTER_FIELDS];
   if (tab === "spans")
     return [TRACE_ID_FIELD, SPAN_ID_FIELD, ...BASE_TRACE_FILTER_FIELDS];
@@ -121,14 +127,19 @@ export const toStaticFilterProperty = (field, isSpansView = false) => {
   return {
     id: field.value,
     name: field.label,
-    category: "system",
+    category: field.category || "system",
     // Pinned so the eval-task wire encoding doesn't have to guess
     // from `category` alone — without this every static field would
     // round-trip through the chain with apiColType=undefined and
     // get coerced to SPAN_ATTRIBUTE downstream.
-    apiColType: "SYSTEM_METRIC",
+    apiColType: field.apiColType || "SYSTEM_METRIC",
     type: field.type === "enum" ? "string" : field.type,
     ...(field.choices ? { choices: field.choices } : {}),
+    ...(field.responseKey ? { responseKey: field.responseKey } : {}),
+    ...(field.searchAliases ? { searchAliases: field.searchAliases } : {}),
+    ...(field.legacyWireValues
+      ? { legacyWireValues: field.legacyWireValues }
+      : {}),
   };
 };
 
@@ -228,6 +239,15 @@ const ARRAY_OPS = [
   { value: "is_not_null", label: "is not empty" },
 ];
 
+const MAP_OPS = [
+  { value: "equals", label: "equals" },
+  { value: "not_equals", label: "not equals" },
+  { value: "contains", label: "contains entries" },
+  { value: "not_contains", label: "does not contain entries" },
+  { value: "is_null", label: "is empty" },
+  { value: "is_not_null", label: "is not empty" },
+];
+
 const CATEGORICAL_OPS = [
   { value: "equals", label: "is" },
   { value: "not_equals", label: "is not" },
@@ -275,6 +295,7 @@ const NUMERIC_TYPES = new Set([
 const DATE_TYPES = new Set(["date", "datetime", "timestamp"]);
 const BOOLEAN_TYPES = new Set(["boolean", "bool"]);
 const ARRAY_TYPES = new Set(["array", "list", "json"]);
+const MAP_TYPES = new Set(["map", "object"]);
 
 const normalizeFieldType = (rawType) => {
   if (!rawType) return "string";
@@ -283,7 +304,50 @@ const normalizeFieldType = (rawType) => {
   if (DATE_TYPES.has(t)) return "date";
   if (BOOLEAN_TYPES.has(t)) return "boolean";
   if (ARRAY_TYPES.has(t)) return "array";
+  if (MAP_TYPES.has(t)) return "map";
   return "string";
+};
+
+const isPlainObject = (value) =>
+  value !== null &&
+  typeof value === "object" &&
+  !Array.isArray(value) &&
+  (Object.getPrototypeOf(value) === Object.prototype ||
+    Object.getPrototypeOf(value) === null);
+
+// Map predicates deliberately accept only the same finite shape as the API:
+// one non-empty, flat JSON object whose values are non-null scalar values.
+// Returning null instead of throwing lets the editor hold partial JSON without
+// firing a broken auto-apply request while the user is still typing.
+export const parseMapFilterValue = (rawValue) => {
+  let value = rawValue;
+  if (typeof rawValue === "string") {
+    const trimmed = rawValue.trim();
+    if (!trimmed) return null;
+    try {
+      value = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(value) || Object.keys(value).length === 0) return null;
+  const entries = Object.entries(value);
+  if (
+    entries.some(
+      ([key, member]) =>
+        !key ||
+        member === null ||
+        member === undefined ||
+        (typeof member === "object" && member !== null) ||
+        (typeof member === "number" && !Number.isFinite(member)) ||
+        !["string", "number", "boolean"].includes(typeof member),
+    )
+  ) {
+    return null;
+  }
+  return Object.fromEntries(
+    entries.sort(([left], [right]) => left.localeCompare(right)),
+  );
 };
 
 export const isValidNumericInput = (v) => {
@@ -330,6 +394,7 @@ const getOperators = (fieldType) => {
   if (t === "date") return DATE_OPS;
   if (t === "boolean") return BOOLEAN_OPS;
   if (t === "array") return ARRAY_OPS;
+  if (t === "map") return MAP_OPS;
   return STRING_OPS;
 };
 
@@ -373,6 +438,7 @@ const DEFAULT_OP_FOR_TYPE = {
   date: "equals",
   boolean: "equals",
   array: "contains",
+  map: "contains",
   string: "in",
   categorical: "equals",
   thumbs: "equals",
@@ -394,16 +460,28 @@ const NO_VALUE_OPS = new Set(["is_null", "is_not_null"]);
 // nothing is applyable. Shared by the debounced auto-apply and the
 // flush-on-close path so both compute the filter set identically.
 const computeValidFilters = (rows) => {
-  const valid = rows.map(normalizeFilterRowOperator).filter((r) => {
-    if (!r.field) return false;
-    if (NO_VALUE_OPS.has(r.operator)) return true;
-    const ops = getOperatorsForFilter(r);
-    const opDef = ops.find((o) => o.value === r.operator);
-    if (opDef?.range)
-      return Array.isArray(r.value) && r.value[0] !== "" && r.value[1] !== "";
-    if (Array.isArray(r.value)) return r.value.length > 0;
-    return r.value !== "" && r.value !== undefined && r.value !== null;
-  });
+  const valid = rows
+    .map(normalizeFilterRowOperator)
+    .map((row) => {
+      if (
+        normalizeFieldType(row.fieldType) === "map" &&
+        !NO_VALUE_OPS.has(row.operator)
+      ) {
+        const value = parseMapFilterValue(row.value);
+        return value ? { ...row, value } : null;
+      }
+      return row;
+    })
+    .filter((r) => {
+      if (!r?.field) return false;
+      if (NO_VALUE_OPS.has(r.operator)) return true;
+      const ops = getOperatorsForFilter(r);
+      const opDef = ops.find((o) => o.value === r.operator);
+      if (opDef?.range)
+        return Array.isArray(r.value) && r.value[0] !== "" && r.value[1] !== "";
+      if (Array.isArray(r.value)) return r.value.length > 0;
+      return r.value !== "" && r.value !== undefined && r.value !== null;
+    });
   return valid.length ? valid : null;
 };
 
@@ -440,6 +518,15 @@ export const hasIncompleteNumericRow = (rows) =>
       r.value !== null &&
       !isCompleteNumericValue(r.value)
     );
+  });
+
+export const hasIncompleteMapRow = (rows) =>
+  rows.some((row) => {
+    if (normalizeFieldType(row.fieldType) !== "map") return false;
+    if (NO_VALUE_OPS.has(row.operator)) return false;
+    if (row.value === "" || row.value === undefined || row.value === null)
+      return false;
+    return parseMapFilterValue(row.value) === null;
   });
 
 // Scalar ops — value picker forces single-select. Multi-value goes via in/not_in.
@@ -499,8 +586,48 @@ export function filterPropertiesForPicker({
   return list.filter((property) => {
     const name = normalizePropertySearchText(property.name);
     const id = normalizePropertySearchText(property.id);
-    return name.includes(query) || id.includes(query);
+    const aliases = (property.searchAliases || []).some((alias) =>
+      normalizePropertySearchText(alias).includes(query),
+    );
+    return name.includes(query) || id.includes(query) || aliases;
   });
+}
+
+// Attribute discovery is deliberately bounded. If the exact lookup cannot
+// find a key (or is temporarily unavailable), users must still be able to
+// enter a known key without broadening the backend read. The fallback is
+// string-typed; a successful exact lookup always wins and preserves the
+// backend-provided number/boolean/array/map type.
+// eslint-disable-next-line react-refresh/only-export-components
+export function buildManualAttributeProperty({
+  search,
+  category,
+  properties,
+  enabled = true,
+  hasCategorySidebar = true,
+}) {
+  const exactName = String(search || "").trim();
+  if (
+    !enabled ||
+    !hasCategorySidebar ||
+    (category !== "all" && category !== "attribute") ||
+    !exactName ||
+    exactName.length > 512
+  ) {
+    return null;
+  }
+  if ((properties || []).some((property) => property.id === exactName)) {
+    return null;
+  }
+  return {
+    id: exactName,
+    name: exactName,
+    category: "attribute",
+    rawCategory: "custom_attribute",
+    type: "string",
+    apiColType: "SPAN_ATTRIBUTE",
+    isManualExactAttribute: true,
+  };
 }
 
 const resolveFieldCategory = (explicitCategory, prop, fallback = "system") => {
@@ -725,6 +852,27 @@ function PropertyPicker({
     filtered.length - PROPERTY_PICKER_RENDER_LIMIT,
     0,
   );
+  const manualAttributeProperty = useMemo(
+    () =>
+      debouncedSearch === search.trim() && !exactAttributeLoading
+        ? buildManualAttributeProperty({
+            search,
+            category,
+            properties: propertiesWithExactAttribute,
+            enabled: enableExactAttributeLookup,
+            hasCategorySidebar,
+          })
+        : null,
+    [
+      category,
+      debouncedSearch,
+      enableExactAttributeLookup,
+      exactAttributeLoading,
+      hasCategorySidebar,
+      propertiesWithExactAttribute,
+      search,
+    ],
+  );
 
   const paperWidth = hasCategorySidebar ? 480 : 320;
 
@@ -786,7 +934,7 @@ function PropertyPicker({
                   role="status"
                   sx={{ mt: 0.75, fontSize: 11, color: "warning.main" }}
                 >
-                  {getQueryReadMessage(exactAttributeReadState)}
+                  {getAttributeLookupMessage(exactAttributeReadState)}
                 </Typography>
               )}
             {!search.trim() && catalogError && (
@@ -868,18 +1016,20 @@ function PropertyPicker({
               </Box>
             )}
             <Box sx={{ flex: 1, overflow: "auto", maxHeight: 280 }}>
-              {filtered.length === 0 && !exactAttributeLoading && (
-                <Typography
-                  sx={{
-                    p: 2,
-                    textAlign: "center",
-                    fontSize: 12,
-                    color: "text.disabled",
-                  }}
-                >
-                  No properties found
-                </Typography>
-              )}
+              {filtered.length === 0 &&
+                !manualAttributeProperty &&
+                !exactAttributeLoading && (
+                  <Typography
+                    sx={{
+                      p: 2,
+                      textAlign: "center",
+                      fontSize: 12,
+                      color: "text.disabled",
+                    }}
+                  >
+                    No properties found
+                  </Typography>
+                )}
               {filtered.length === 0 && exactAttributeLoading && (
                 <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
                   <CircularProgress size={16} />
@@ -947,6 +1097,45 @@ function PropertyPicker({
                   )}
                 </Box>
               ))}
+              {manualAttributeProperty && (
+                <Box
+                  data-filter-property-option={manualAttributeProperty.id}
+                  data-filter-property-manual-exact
+                  onClick={() => {
+                    onSelect(manualAttributeProperty);
+                    onClose();
+                    setSearch("");
+                    setCategory("all");
+                  }}
+                  sx={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 1,
+                    px: 1.5,
+                    py: 0.75,
+                    cursor: "pointer",
+                    borderTop: filtered.length > 0 ? "1px solid" : "none",
+                    borderColor: "divider",
+                    "&:hover": { bgcolor: "action.hover" },
+                  }}
+                >
+                  <Iconify
+                    icon="mdi:plus-circle-outline"
+                    width={16}
+                    sx={{ color: "primary.main", flexShrink: 0 }}
+                  />
+                  <Typography noWrap sx={{ fontSize: 12, flex: 1 }}>
+                    Use exact attribute:{" "}
+                    <strong>{manualAttributeProperty.id}</strong>
+                  </Typography>
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label="text"
+                    sx={{ height: 16, fontSize: 9, flexShrink: 0 }}
+                  />
+                </Box>
+              )}
               {hiddenCount > 0 && (
                 <Typography
                   sx={{
@@ -1036,12 +1225,17 @@ function ValuePicker({
     isLoading: dashLoading,
     isError: dashError,
     queryReadState: dashboardReadState,
+    fetchNextPage: fetchNextDashboardPage,
+    hasNextPage: hasNextDashboardPage,
+    isFetchingNextPage: isFetchingNextDashboardPage,
+    refetch: refetchDashboardOptions,
   } = useDashboardFilterValues({
     metricName: propertyId,
     metricType,
     projectIds: projectId ? [projectId] : [],
     source,
     search: usesBackendSearch ? debouncedSearch : "",
+    pageSize: 10,
     enabled:
       !hasStaticChoices &&
       Boolean(anchorEl) &&
@@ -1053,6 +1247,7 @@ function ValuePicker({
     data: sessionOptions = [],
     isLoading: sessionLoading,
     isError: sessionError,
+    refetch: refetchSessionOptions,
   } = useQuery({
     queryKey: ["session-filter-values", projectId, propertyId, debouncedSearch],
     queryFn: () =>
@@ -1093,7 +1288,25 @@ function ValuePicker({
       : dashError
         ? "error"
         : dashboardReadState;
-  const readMessage = getQueryReadMessage(readState);
+  const readMessage = getFilterValueReadMessage(readState);
+  const refetchOptions = isSessionField
+    ? refetchSessionOptions
+    : refetchDashboardOptions;
+
+  const handleOptionsScroll = useCallback(
+    (event) => {
+      const { scrollTop, clientHeight, scrollHeight } = event.currentTarget;
+      const isNearBottom = scrollHeight - scrollTop - clientHeight <= 40;
+      if (
+        isNearBottom &&
+        hasNextDashboardPage &&
+        !isFetchingNextDashboardPage
+      ) {
+        fetchNextDashboardPage();
+      }
+    },
+    [fetchNextDashboardPage, hasNextDashboardPage, isFetchingNextDashboardPage],
+  );
 
   const filtered = useMemo(() => {
     if (!search || isSessionField || isIdOnlyField) return options;
@@ -1165,13 +1378,13 @@ function ValuePicker({
           <Typography sx={{ fontSize: 12, color: "text.disabled", flex: 1 }}>
             {isLoading
               ? "Loading..."
-              : readMessage
-                ? "Values temporarily unavailable"
-                : options.length === 0
-                  ? "No recent values"
-                  : singleSelect
-                    ? "Select a value..."
-                    : "Select values..."}
+              : options.length === 0
+                ? readState === "error" || readState === "degraded"
+                  ? "Enter an exact value or retry"
+                  : "Search or enter an exact value"
+                : singleSelect
+                  ? "Select a value..."
+                  : "Select values..."}
           </Typography>
         ) : singleSelect ? (
           // Plain text instead of a chip — chips read as "removable token
@@ -1292,24 +1505,47 @@ function ValuePicker({
           </Typography>
         </Box>
         <Divider />
-        <Box sx={{ maxHeight: 220, overflow: "auto" }}>
+        <Box
+          data-filter-value-options-list
+          onScroll={handleOptionsScroll}
+          sx={{ maxHeight: 220, overflow: "auto" }}
+        >
           {isLoading && (
             <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
               <CircularProgress size={16} />
             </Box>
           )}
           {!isLoading && readMessage && (
-            <Typography
+            <Box
               role="status"
               sx={{
-                p: 1.5,
-                textAlign: "center",
-                fontSize: 12,
-                color: "warning.main",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 1,
+                px: 1.5,
+                py: 1,
               }}
             >
-              {readMessage}
-            </Typography>
+              <Typography
+                sx={{
+                  fontSize: 11,
+                  color:
+                    readState === "sampled" ? "text.secondary" : "warning.main",
+                }}
+              >
+                {readMessage}
+              </Typography>
+              {(readState === "error" || readState === "degraded") && (
+                <Button
+                  size="small"
+                  onClick={() => refetchOptions()}
+                  sx={{ minWidth: "auto", fontSize: 11, flexShrink: 0 }}
+                >
+                  Retry
+                </Button>
+              )}
+            </Box>
           )}
           {!isLoading && !readMessage && !search && filtered.length === 0 && (
             <Typography
@@ -1427,6 +1663,22 @@ function ValuePicker({
               </Box>
             </>
           )}
+          {isFetchingNextDashboardPage && (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 1 }}>
+              <CircularProgress size={14} />
+            </Box>
+          )}
+          {hasNextDashboardPage && !isFetchingNextDashboardPage && (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 0.5 }}>
+              <Button
+                size="small"
+                onClick={() => fetchNextDashboardPage()}
+                sx={{ fontSize: 11 }}
+              >
+                Load more
+              </Button>
+            </Box>
+          )}
         </Box>
         {selectedValues.length > 0 && (
           <>
@@ -1490,6 +1742,8 @@ function FilterRow({
   const isNumber = normalizedType === "number";
   const isDate = normalizedType === "date";
   const isBoolean = normalizedType === "boolean";
+  const isArray = normalizedType === "array";
+  const isMap = normalizedType === "map";
   const allOps = getOperatorsForFilter(filter);
   // Optional per-flow allowlist; currentOpDef resolves against the full set.
   const ops = operatorFilter ? allOps.filter(operatorFilter) : allOps;
@@ -1514,6 +1768,13 @@ function FilterRow({
     (Array.isArray(filter.value)
       ? filter.value.some((v) => !isValidNumericInput(v))
       : !isValidNumericInput(filter.value));
+  const rowHasInvalidMap =
+    isMap &&
+    !NO_VALUE_OPS.has(safeOperator) &&
+    filter.value !== "" &&
+    filter.value !== undefined &&
+    filter.value !== null &&
+    parseMapFilterValue(filter.value) === null;
 
   const handlePropertySelect = useCallback(
     (prop) => {
@@ -1533,7 +1794,7 @@ function FilterRow({
         ? "is"
         : defaultOperatorForType?.[nt] || DEFAULT_OP_FOR_TYPE[nt] || "equals";
       let defaultValue;
-      if (nt === "number" || nt === "date") defaultValue = "";
+      if (nt === "number" || nt === "date" || nt === "map") defaultValue = "";
       else if (nt === "boolean") defaultValue = "true";
       else if (nt === "text") defaultValue = "";
       else defaultValue = [];
@@ -1565,6 +1826,7 @@ function FilterRow({
       // Multi → single: drop stale extra picks.
       if (
         SINGLE_VALUE_OPS.has(newOp) &&
+        !isArray &&
         Array.isArray(newVal) &&
         newVal.length > 1
       ) {
@@ -1579,7 +1841,7 @@ function FilterRow({
       }
       onChange(index, { ...filter, operator: newOp, value: newVal });
     },
-    [index, filter, safeOperator, isNumber, isDate, onChange],
+    [index, filter, safeOperator, isNumber, isDate, isArray, onChange],
   );
 
   const renderValueInput = () => {
@@ -1787,6 +2049,37 @@ function FilterRow({
       );
     }
 
+    if (isMap) {
+      const value = isPlainObject(filter.value)
+        ? JSON.stringify(filter.value)
+        : filter.value ?? "";
+      return (
+        <TextField
+          size="small"
+          type="text"
+          placeholder='{"key":"value"}'
+          value={value}
+          error={rowHasInvalidMap}
+          helperText={
+            rowHasInvalidMap
+              ? "Enter a non-empty flat JSON object with scalar values"
+              : undefined
+          }
+          onChange={(event) => updateRow({ value: event.target.value })}
+          sx={{
+            flex: "1 1 220px",
+            minWidth: 0,
+            maxWidth: "100%",
+            position: "relative",
+          }}
+          inputProps={{
+            style: { fontSize: 12, height: 12, padding: "6px 8px" },
+          }}
+          FormHelperTextProps={NUMERIC_HELPER_TEXT_PROPS}
+        />
+      );
+    }
+
     if (usesFreeTextValue(filter.fieldType, source)) {
       return (
         <TextField
@@ -1813,7 +2106,7 @@ function FilterRow({
         source={source}
         property={properties.find((p) => p.id === filter.field)}
         freeSoloValues={rowFreeSoloValues}
-        singleSelect={SINGLE_VALUE_OPS.has(safeOperator)}
+        singleSelect={SINGLE_VALUE_OPS.has(safeOperator) && !isArray}
         onChange={(newVal) => updateRow({ value: newVal })}
       />
     );
@@ -1828,15 +2121,15 @@ function FilterRow({
         width: "100%",
         minWidth: 0,
         flexWrap: "wrap",
-        mb: rowHasInvalidNumeric ? 1.5 : 0,
+        mb: rowHasInvalidNumeric || rowHasInvalidMap ? 1.5 : 0,
       }}
     >
       <CustomTooltip
-        show={!!selectedProp?.name}
+        show={!!(selectedProp?.name || filter.fieldName || filter.field)}
         arrow
         size="small"
         type="black"
-        title={selectedProp?.name || ""}
+        title={selectedProp?.name || filter.fieldName || filter.field || ""}
       >
         <Button
           ref={(el) => el}
@@ -1865,7 +2158,10 @@ function FilterRow({
               textOverflow: "ellipsis",
             }}
           >
-            {selectedProp?.name || "Property"}
+            {selectedProp?.name ||
+              filter.fieldName ||
+              filter.field ||
+              "Property"}
           </Typography>
         </Button>
       </CustomTooltip>
@@ -1978,7 +2274,13 @@ const TraceFilterPanel = ({
     const staticProps = getTraceFilterFields(tab).map((f) =>
       toStaticFilterProperty(f, isSpansView),
     );
-    const knownIds = new Set(staticProps.map((p) => p.id));
+    const knownIds = new Set(
+      staticProps.flatMap((property) => [
+        property.id,
+        property.responseKey,
+        ...(property.legacyWireValues || []),
+      ]),
+    );
     // Add dynamic properties not already covered by static fields
     const dynamicExtras = dynamicProperties.filter((p) => !knownIds.has(p.id));
     // Add any extra filterFields not already covered
@@ -2215,9 +2517,13 @@ const TraceFilterPanel = ({
   // Apply only when the resulting filter set differs from the last one sent.
   const applyIfChanged = useCallback(
     (sourceRows) => {
-      // Hold while a numeric row is mid-edit so partial/invalid values don't
-      // auto-fire and a half-filled range doesn't drop the applied filter.
-      if (hasIncompleteNumericRow(sourceRows)) return;
+      // Hold while a typed editor is incomplete so partial values do not
+      // auto-fire or drop the last valid, already-applied filter.
+      if (
+        hasIncompleteNumericRow(sourceRows) ||
+        hasIncompleteMapRow(sourceRows)
+      )
+        return;
       const next = computeValidFilters(sourceRows);
       const serialized = serializeFilterSet(next);
       if (serialized === lastAppliedRef.current) return;
@@ -2576,7 +2882,7 @@ TraceFilterPanel.propTypes = {
   onApply: PropTypes.func.isRequired,
   filterFields: PropTypes.array,
   source: PropTypes.string,
-  tab: PropTypes.oneOf(["trace", "spans"]),
+  tab: PropTypes.oneOf(["trace", "spans", "voiceCalls"]),
   projectId: PropTypes.string,
   properties: PropTypes.array,
   ValuePickerOverride: PropTypes.elementType,

@@ -2052,13 +2052,13 @@ class TestClickHouseFilterBuilder:
         # No params needed — the subquery is static
         assert params == {}
 
-    def test_translate_has_eval_false_produces_no_condition(self):
-        """has_eval=false should produce no WHERE condition."""
+    def test_translate_has_eval_false_uses_bounded_anti_membership(self):
+        """has_eval=false is exact only inside a finite candidate batch."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
 
-        builder = ClickHouseFilterBuilder()
+        builder = ClickHouseFilterBuilder(candidate_ids_param="candidate_trace_ids")
         filters = [
             {
                 "column_id": "has_eval",
@@ -2070,7 +2070,8 @@ class TestClickHouseFilterBuilder:
             }
         ]
         where, params = builder.translate(filters)
-        assert where == ""
+        assert "trace_id NOT IN" in where
+        assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in where
         assert params == {}
 
     def test_translate_has_eval_string_true(self):
@@ -2095,12 +2096,12 @@ class TestClickHouseFilterBuilder:
         assert "tracer_eval_logger" in where
 
     def test_translate_has_eval_string_false(self):
-        """has_eval='false' (string) should produce no condition."""
+        """has_eval='false' uses the same bounded anti-membership."""
         from tracer.services.clickhouse.query_builders.filters import (
             ClickHouseFilterBuilder,
         )
 
-        builder = ClickHouseFilterBuilder()
+        builder = ClickHouseFilterBuilder(candidate_ids_param="candidate_trace_ids")
         filters = [
             {
                 "column_id": "has_eval",
@@ -2112,7 +2113,8 @@ class TestClickHouseFilterBuilder:
             }
         ]
         where, params = builder.translate(filters)
-        assert where == ""
+        assert "trace_id NOT IN" in where
+        assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in where
 
     def test_translate_has_eval_accepts_camelcase_filter_keys(self):
         from tracer.services.clickhouse.query_builders.filters import (
@@ -2617,6 +2619,64 @@ class TestTimeSeriesQueryBuilder:
         assert "start_time >= %(start_date)s" in query
         assert "start_time < %(end_date)s" in query
         assert "spans_hourly_rollup" not in query
+
+    def test_exact_date_only_trace_graph_does_not_build_full_tenant_id_set(self):
+        """A date-only exact trace graph is a single bounded spans scan.
+
+        Building ``trace_id IN (SELECT DISTINCT trace_id ...)`` without a
+        non-time predicate is semantically redundant and was the dominant
+        timeout/OOM shape on large tenants.
+        """
+        from datetime import UTC, datetime
+
+        from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
+
+        builder = TimeSeriesQueryBuilder(
+            project_id="test-project-id",
+            filters=[],
+            interval="day",
+            exact_snapshot=True,
+            observe_type="trace",
+            start_date=datetime(2026, 7, 1, tzinfo=UTC),
+            end_date=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+        query, _ = builder.build()
+
+        assert "FROM spans FINAL" in query
+        assert "SELECT DISTINCT trace_id" not in query
+        assert query.count("FROM spans FINAL") == 1
+
+    def test_exact_filtered_trace_graph_keeps_full_window_membership(self):
+        """A non-time trace predicate still selects complete trace membership."""
+        from datetime import UTC, datetime
+
+        from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
+
+        builder = TimeSeriesQueryBuilder(
+            project_id="test-project-id",
+            filters=[
+                {
+                    "column_id": "model",
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "gpt-4",
+                        "col_type": "SYSTEM_METRIC",
+                    },
+                }
+            ],
+            interval="day",
+            exact_snapshot=True,
+            observe_type="trace",
+            start_date=datetime(2026, 7, 1, tzinfo=UTC),
+            end_date=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+        query, _ = builder.build()
+
+        assert "trace_id IN" in query
+        assert "SELECT DISTINCT trace_id" in query
+        assert "snapshot_start_date" in query
+        assert "snapshot_end_date" in query
 
 
 @pytest.mark.unit

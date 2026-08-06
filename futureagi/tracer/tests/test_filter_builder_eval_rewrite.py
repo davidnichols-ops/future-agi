@@ -671,11 +671,12 @@ class TestHasEvalHasAnnotationShape:
         assert "ORDER BY eval_scan._version DESC" in where
         assert "latest_eval.is_deleted = 0" in where
 
-    def test_has_eval_false_produces_no_condition(self):
-        where, _ = ClickHouseFilterBuilder(project_id="p1").translate(
-            self._bool_filter("has_eval", False)
-        )
-        assert where == ""
+    def test_has_eval_false_produces_candidate_scoped_anti_membership(self):
+        where, _ = ClickHouseFilterBuilder(
+            project_id="p1", candidate_ids_param="candidate_trace_ids"
+        ).translate(self._bool_filter("has_eval", False))
+        assert "trace_id NOT IN" in where
+        assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in where
 
     def test_has_annotation_true_generates_in_subquery(self):
         where, _ = ClickHouseFilterBuilder(project_id="p1").translate(
@@ -690,3 +691,24 @@ class TestHasEvalHasAnnotationShape:
             self._bool_filter("has_annotation", False)
         )
         assert "trace_id NOT IN" in where
+
+    @pytest.mark.parametrize(
+        "column_id", ["has_eval", "has_annotation", "my_annotations"]
+    )
+    @pytest.mark.parametrize("filter_op", ["not_equals", "is_null", "is_not_null"])
+    def test_boolean_meta_filters_reject_non_equals_operations(
+        self,
+        column_id: str,
+        filter_op: str,
+    ) -> None:
+        filter_item = self._bool_filter(column_id, True)[0]
+        filter_item["filter_config"]["filter_op"] = filter_op
+        if column_id == "my_annotations":
+            filter_item["filter_config"]["user_id"] = (
+                "00000000-0000-4000-8000-000000000002"
+            )
+
+        with pytest.raises(ValueError, match="supports only the equals operation"):
+            ClickHouseFilterBuilder(
+                project_id="p1", candidate_ids_param="candidate_trace_ids"
+            ).translate([filter_item])

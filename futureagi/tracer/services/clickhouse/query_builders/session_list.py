@@ -13,6 +13,11 @@ ID) into every span row, we can compute per-session aggregates in a single
 from datetime import datetime
 from typing import Any
 
+from tracer.services.clickhouse.eval_logger_table import (
+    eval_logger_live_state_columns,
+    eval_logger_source,
+    eval_logger_version_column,
+)
 from tracer.services.clickhouse.query_builders.base import NIL_UUID, BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
@@ -37,7 +42,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
     - ``max(end_time)`` -- session end
     - ``sum(cost)`` -- total cost
     - ``sum(total_tokens)`` -- total tokens
-    - ``uniq(trace_id)`` -- number of traces (HyperLogLog, ~2% error)
+    - ``uniqExact(trace_id)`` -- exact number of traces
     - ``argMin(input, start_time)`` -- first user message
     - ``argMax(input, start_time)`` -- last user message
 
@@ -92,7 +97,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         "dateDiff('second', min(start_time), max(end_time)) AS duration, "
         "sum(cost) AS total_cost, "
         "sum(total_tokens) AS total_tokens, "
-        "uniq(trace_id) AS traces_count"
+        "uniqExact(trace_id) AS traces_count"
     )
 
     _CANDIDATE_SORT_FIELDS: dict[str, str] = {
@@ -179,6 +184,114 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         return partition_span_filter_plans(self._bounded_scalar_span_filters())
 
     @staticmethod
+    def _bounded_has_eval_values(
+        residual_filters: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    ) -> tuple[bool, ...]:
+        """Parse the one relational filter supported by the session classifier.
+
+        ``has_eval`` cannot safely narrow the raw session seed: absence has no
+        positive row witness.  It *can* be evaluated exactly after the seed has
+        produced a finite session batch, because those sessions imply a finite
+        set of tenant/window-scoped root trace IDs.  Keep this parser deliberately
+        strict so malformed or newly introduced relational shapes fail closed.
+        """
+
+        values: list[bool] = []
+        missing = object()
+        for item in residual_filters:
+            if not isinstance(item, dict):
+                raise ValueError("invalid relational session filter")
+            column_id = item.get("column_id") or item.get("columnId")
+            if column_id != "has_eval":
+                raise ValueError("unsupported relational session filter")
+            config = item.get("filter_config") or item.get("filterConfig")
+            if not isinstance(config, dict):
+                raise ValueError("invalid has_eval session filter")
+            filter_type = config.get("filter_type") or config.get("filterType")
+            filter_op = config.get("filter_op") or config.get("filterOp")
+            if str(filter_type or "").lower() != "boolean" or filter_op != "equals":
+                raise ValueError("invalid has_eval session filter")
+            raw_value = config.get("filter_value", config.get("filterValue", missing))
+            if isinstance(raw_value, bool):
+                value = raw_value
+            elif isinstance(raw_value, str) and raw_value.strip().lower() in {
+                "true",
+                "false",
+            }:
+                value = raw_value.strip().lower() == "true"
+            else:
+                raise ValueError("invalid has_eval session filter")
+            values.append(value)
+        return tuple(values)
+
+    @classmethod
+    def _bounded_eval_membership_ctes(
+        cls,
+        *,
+        has_eval_values: tuple[bool, ...],
+        scope_to_request_window: bool,
+    ) -> tuple[str, tuple[str, ...]]:
+        """Return finite latest-eval CTEs and root-trace membership predicates.
+
+        The only eval-table read is keyed by trace IDs derived from the already
+        candidate-scoped ``resolved_root_sessions`` relation.  Latest state is
+        collapsed by eval identity before the live predicate is applied, so a
+        tombstone cannot resurrect an older eval.  The predicate is deliberately
+        applied to root traces before session aggregation: this preserves the
+        established session-list rule that a session matches ``has_eval=false``
+        when it contains at least one root trace without an eval.
+        """
+
+        if not has_eval_values:
+            return "", ()
+        eval_table, _ = eval_logger_source()
+        eval_version = eval_logger_version_column(eval_table)
+        eval_live_columns = eval_logger_live_state_columns(eval_table)
+        _, eval_live_predicate = eval_logger_source(
+            "latest_eval", include_cdc_tombstone_guard=True
+        )
+        live_projection = ",\n                ".join(
+            f"eval_scan.{column}" for column in eval_live_columns
+        )
+        eval_date_scope = (
+            "\n              AND eval_scan.created_at >= "
+            "%(start_date)s - INTERVAL 7 DAY"
+            if scope_to_request_window
+            else ""
+        )
+        ctes = f""",
+        candidate_eval_trace_ids AS (
+            SELECT DISTINCT toUUIDOrNull(trace_id) AS trace_id
+            FROM resolved_root_sessions
+            WHERE isNotNull(toUUIDOrNull(trace_id))
+        ),
+        latest_candidate_evals AS (
+            SELECT
+                eval_scan.id,
+                eval_scan.trace_id,
+                {live_projection}
+            FROM {eval_table} AS eval_scan
+            PREWHERE eval_scan.trace_id IN (
+                SELECT trace_id FROM candidate_eval_trace_ids
+            ){eval_date_scope}
+            ORDER BY eval_scan.{eval_version} DESC
+            LIMIT 1 BY eval_scan.id
+        ),
+        live_candidate_eval_trace_ids AS (
+            SELECT DISTINCT toString(latest_eval.trace_id) AS trace_id
+            FROM latest_candidate_evals AS latest_eval
+            WHERE {eval_live_predicate}
+              AND isNotNull(latest_eval.trace_id)
+        )"""
+        predicates = tuple(
+            "trace_id "
+            + ("IN" if value else "NOT IN")
+            + " (SELECT trace_id FROM live_candidate_eval_trace_ids)"
+            for value in has_eval_values
+        )
+        return ctes, predicates
+
+    @staticmethod
     def _bounded_root_witness_plan(plans: list[Any] | tuple[Any, ...]):
         """Choose the most selective safe raw-row witness deterministically."""
 
@@ -208,10 +321,19 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         except (TypeError, ValueError):
             return "unsupported_filter_shape"
         if residual:
-            # Score-label filters are removed by the caller and intersected in
-            # PG.  Other relational eval/annotation filters do not yet have a
-            # session-keyed finite classifier and must never fall back broad.
-            return "unsupported_relational_session_filter"
+            if any(
+                not isinstance(item, dict)
+                or (item.get("column_id") or item.get("columnId")) != "has_eval"
+                for item in residual
+            ):
+                # Score-label filters are removed by the caller and intersected
+                # in PG. Other relational filters still have no finite session
+                # classifier and must never fall back broad.
+                return "unsupported_relational_session_filter"
+            try:
+                self._bounded_has_eval_values(residual)
+            except ValueError:
+                return "unsupported_filter_shape"
         return None
 
     def supports_bounded_filter_scan(self) -> bool:
@@ -418,6 +540,9 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         candidate_session_ids: tuple[str, ...] = (),
         root_filter_plans: tuple[Any, ...] = (),
         candidate_full_state: bool = False,
+        include_trace_id: bool = False,
+        additional_root_ctes: str = "",
+        root_membership_predicates: tuple[str, ...] = (),
     ) -> str:
         """Build the shared exact session candidate CTEs.
 
@@ -497,9 +622,10 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             )
             resolved_metric_columns.append("latest_total_tokens AS total_tokens")
             session_metric_columns.append("sum(total_tokens) AS total_tokens")
-        if needs_traces:
+        if needs_traces or include_trace_id:
             resolved_metric_columns.append("trace_id")
-            session_metric_columns.append("uniq(trace_id) AS traces_count")
+        if needs_traces:
+            session_metric_columns.append("uniqExact(trace_id) AS traces_count")
         if needs_messages:
             latest_metric_columns.append(
                 "argMax(tuple(input), _peerdb_version).1 AS latest_input"
@@ -750,6 +876,12 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         session_predicate = (
             f"AND {resolved_session_clause}" if resolved_session_clause else ""
         )
+        root_membership = (
+            "\n              AND "
+            + "\n              AND ".join(root_membership_predicates)
+            if root_membership_predicates
+            else ""
+        )
         return f"""
         {ts_map_ctes}
         {candidate_session_cte}
@@ -795,6 +927,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
               {f"AND {root_value_clause}" if root_value_clause else ""}
               {f"AND {' AND '.join(root_filter_predicates)}" if root_filter_predicates else ""}
         )
+        {additional_root_ctes}
         {user_ctes},
         sessions AS (
             SELECT
@@ -805,6 +938,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             WHERE 1 = 1
               {session_predicate}
               {user_membership}
+              {root_membership}
             GROUP BY session_id
             {f"HAVING {aggregate_clause}" if aggregate_clause else ""}
         )
@@ -851,8 +985,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             "filter_seed_limit": int(limit),
         }
         plans, residual = self._bounded_span_filter_parts()
-        if residual:
-            raise ValueError("unsupported relational bounded session filter")
+        self._bounded_has_eval_values(residual)
         root_witness_plan = self._bounded_root_witness_plan(plans)
         root_witness_predicate = (
             root_witness_plan.raw_witness_predicate if root_witness_plan else None
@@ -984,8 +1117,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             raise ValueError("unsupported bounded session filter scan")
 
         plans, residual = self._bounded_span_filter_parts()
-        if residual:
-            raise ValueError("unsupported relational bounded session filter")
+        has_eval_values = self._bounded_has_eval_values(residual)
         start_date, end_date = self.parse_time_range(self.filters)
         params: dict[str, Any] = {
             **self.params,
@@ -993,11 +1125,24 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             "end_date": end_date,
             "bounded_match_limit": len(session_ids),
         }
+        has_explicit_time_filter = any(
+            (item.get("column_id") or item.get("columnId"))
+            in {"created_at", "start_time"}
+            for item in self.filters
+        )
+        scope_to_request_window = not candidate_full_state or has_explicit_time_filter
+        eval_ctes, eval_predicates = self._bounded_eval_membership_ctes(
+            has_eval_values=has_eval_values,
+            scope_to_request_window=scope_to_request_window,
+        )
         candidate_ctes = self._candidate_session_ctes(
             params,
             candidate_session_ids=session_ids,
             root_filter_plans=tuple(plans),
             candidate_full_state=candidate_full_state,
+            include_trace_id=bool(has_eval_values),
+            additional_root_ctes=eval_ctes,
+            root_membership_predicates=eval_predicates,
         )
         query = f"""
         WITH
@@ -1159,7 +1304,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             dateDiff('second', min(start_time), max(end_time)) AS duration,
             sum(cost) AS total_cost,
             sum(total_tokens) AS total_tokens,
-            uniq(trace_id) AS traces_count
+            uniqExact(trace_id) AS traces_count
         FROM resolved_roots
         GROUP BY session_id
         """
@@ -1559,7 +1704,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 dateDiff('second', min(start_time), max(end_time)) AS duration,
                 sum(cost) AS total_cost,
                 sum(total_tokens) AS total_tokens,
-                uniq(trace_id) AS traces_count
+                uniqExact(trace_id) AS traces_count
                 {message_select}
             {from_where}
             GROUP BY trace_session_id
