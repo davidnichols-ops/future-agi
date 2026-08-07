@@ -3416,10 +3416,23 @@ class TestSessionListQueryBuilder:
         query, params = builder.build_content_query(["session-1"])
 
         assert "trace_session_id IN %(content_session_ids)s" in query
-        assert query.count("toDate(%(content_start_date)s)") == 2
-        assert query.count("toDate(%(content_end_date)s)") == 2
-        assert query.count("start_time >= %(content_start_date)s") == 2
-        assert query.count("start_time < %(content_end_date)s") == 2
+        assert (
+            query.count("toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC'))")
+            == 2
+        )
+        assert (
+            query.count("toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))") == 2
+        )
+        assert (
+            query.count(
+                "start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+            )
+            == 2
+        )
+        assert (
+            query.count("start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')")
+            == 2
+        )
         assert query.count("session_content_time_exclusion_0_start") == 2
         assert query.count("session_content_time_exclusion_0_end") == 2
         assert params["content_session_ids"] == ("session-1",)
@@ -3466,8 +3479,13 @@ class TestSessionListQueryBuilder:
 
         assert "s.trace_session_id IN %(attr_session_ids)s" in query
         assert "toDate(s.start_time) BETWEEN" in query
-        assert "s.start_time >= %(attr_start_date)s" in query
-        assert "s.start_time < %(attr_end_date)s" in query
+        assert (
+            "s.start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+            in query
+        )
+        assert (
+            "s.start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')" in query
+        )
         assert "s.start_time < fromUnixTimestamp64Micro(" in query
         assert "s.start_time >= fromUnixTimestamp64Micro(" in query
         assert params["attr_session_ids"] == ("session-1",)
@@ -3512,10 +3530,23 @@ class TestSessionListQueryBuilder:
         query, params = builder.build_span_attributes_query(["session-1"])
 
         assert "trace_session_id IN %(attr_session_ids)s" in query
-        assert query.count("toDate(%(attr_start_date)s)") == 2
-        assert query.count("toDate(%(attr_end_date)s)") == 2
-        assert query.count("start_time >= %(attr_start_date)s") == 2
-        assert query.count("start_time < %(attr_end_date)s") == 2
+        assert (
+            query.count("toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC'))")
+            == 2
+        )
+        assert (
+            query.count("toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))") == 2
+        )
+        assert (
+            query.count(
+                "start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+            )
+            == 2
+        )
+        assert (
+            query.count("start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')")
+            == 2
+        )
         assert query.count("session_attr_v2_time_exclusion_0_start") == 2
         assert query.count("session_attr_v2_time_exclusion_0_end") == 2
         assert "argMax(is_deleted, _version) AS latest_is_deleted" in query

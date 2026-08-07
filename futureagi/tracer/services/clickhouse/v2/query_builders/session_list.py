@@ -74,9 +74,10 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
               AND toDate(start_time) BETWEEN
-                  toDate(%(attr_start_date)s) AND toDate(%(attr_end_date)s)
-              AND start_time >= %(attr_start_date)s
-              AND start_time < %(attr_end_date)s{attr_exclusion_fragment}
+                  toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')) AND
+                  toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))
+              AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+              AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'){attr_exclusion_fragment}
               AND (
                   trace_session_id IN %(attr_session_ids)s
                   OR trace_session_id IN (
@@ -103,9 +104,10 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
               AND toDate(start_time) BETWEEN
-                  toDate(%(attr_start_date)s) AND toDate(%(attr_end_date)s)
-              AND start_time >= %(attr_start_date)s
-              AND start_time < %(attr_end_date)s{attr_exclusion_fragment}
+                  toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')) AND
+                  toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))
+              AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+              AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'){attr_exclusion_fragment}
               AND (project_id, trace_id, id, start_time) IN (
                   SELECT project_id, trace_id, id, start_time
                   FROM candidate_root_identities

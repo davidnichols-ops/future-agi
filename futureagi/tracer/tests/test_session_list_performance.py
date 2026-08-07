@@ -143,15 +143,23 @@ class TestSessionListQueryPerformance:
             created_at_floor=floor, created_at_ceiling=ceil
         )
         # Arrival window replaces the start_time bound on the span scan.
-        assert "created_at >= %(created_at_floor)s" in query
-        assert "created_at < %(created_at_ceiling)s" in query
+        assert (
+            "created_at >= "
+            "fromUnixTimestamp64Micro(%(created_at_floor_us)s, 'UTC')" in query
+        )
+        assert (
+            "created_at < "
+            "fromUnixTimestamp64Micro(%(created_at_ceiling_us)s, 'UTC')" in query
+        )
         assert "start_time >= %(start_date)s" not in query
         assert params["created_at_floor"] == floor
         assert params["created_at_ceiling"] == ceil
 
     def test_id_query_default_keeps_start_time_window(self):
         query, params = self._make_builder().build_id_query()
-        assert "start_time >= %(start_date)s" in query
+        assert (
+            "start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')" in query
+        )
         assert "created_at_ceiling" not in params
 
 

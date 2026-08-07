@@ -19,7 +19,11 @@ from tracer.services.clickhouse.eval_logger_table import (
     eval_logger_source,
     eval_logger_version_column,
 )
-from tracer.services.clickhouse.query_builders.base import NIL_UUID, BaseQueryBuilder
+from tracer.services.clickhouse.query_builders.base import (
+    NIL_UUID,
+    BaseQueryBuilder,
+    _unix_microseconds,
+)
 from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     partition_span_filter_plans,
@@ -167,6 +171,13 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         self._bounded_request_window = BaseQueryBuilder.parse_time_range(
             self.filters, strict=True
         )
+        request_start, request_end = self._bounded_request_window
+        # ``clickhouse-driver`` renders bound datetimes at whole-second
+        # precision.  An exact datetime filter is a one-microsecond half-open
+        # window, so bind the authoritative bounds as epoch microseconds and
+        # reconstruct DateTime64(6) in ClickHouse.
+        self.params["start_date_us"] = _unix_microseconds(request_start)
+        self.params["end_date_us"] = _unix_microseconds(request_end)
 
     def parse_time_range(
         self, filters: list[dict]
@@ -494,7 +505,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         )
         eval_date_scope = (
             "\n              AND eval_scan.created_at >= "
-            "%(start_date)s - INTERVAL 7 DAY"
+            "fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC') - INTERVAL 7 DAY"
             if scope_to_request_window
             else ""
         )
@@ -692,6 +703,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             },
             "filter_anchor_start": anchor_start,
             "filter_anchor_end": anchor_end,
+            "filter_anchor_start_us": _unix_microseconds(anchor_start),
+            "filter_anchor_end_us": _unix_microseconds(anchor_end),
             "filter_anchor_limit": int(limit),
         }
         query = f"""
@@ -701,8 +714,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         FROM {self.TABLE}
         PREWHERE {self.project_filter_sql()}
           AND _peerdb_is_deleted = 0
-          AND start_time >= %(filter_anchor_start)s
-          AND start_time < %(filter_anchor_end)s
+          AND start_time >= fromUnixTimestamp64Micro(%(filter_anchor_start_us)s, 'UTC')
+          AND start_time < fromUnixTimestamp64Micro(%(filter_anchor_end_us)s, 'UTC')
         WHERE isNotNull(trace_session_id)
           AND trace_session_id != toUUID('{NIL_UUID}')
           AND ({witness})
@@ -1023,9 +1036,12 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         scope_to_request_window = not candidate_full_state or has_explicit_time_filter
         span_time_scope = (
             "\n              AND toDate(start_time) BETWEEN "
-            "toDate(%(start_date)s) AND toDate(%(end_date)s)"
-            "\n              AND start_time >= %(start_date)s"
-            "\n              AND start_time < %(end_date)s"
+            "toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')) AND "
+            "toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))"
+            "\n              AND start_time >= "
+            "fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+            "\n              AND start_time < "
+            "fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')"
             if scope_to_request_window
             else ""
         )
@@ -1425,6 +1441,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             **self.params,
             "filter_slice_start": slice_start,
             "filter_slice_end": slice_end,
+            "filter_slice_start_us": _unix_microseconds(slice_start),
+            "filter_slice_end_us": _unix_microseconds(slice_end),
             "filter_seed_limit": int(limit),
         }
         _plans, residual = self._bounded_span_filter_parts()
@@ -1454,10 +1472,15 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             if not slice_start <= before_start_time < slice_end:
                 raise ValueError("session keyset must stay inside its slice")
             params["filter_before_start_time"] = before_start_time
+            params["filter_before_start_time_us"] = _unix_microseconds(
+                before_start_time
+            )
             params["filter_before_session_id"] = str(before_id)
             outer_predicates.append(
-                "(start_time < %(filter_before_start_time)s OR ("
-                "start_time = %(filter_before_start_time)s AND "
+                "(start_time < fromUnixTimestamp64Micro("
+                "%(filter_before_start_time_us)s, 'UTC') OR ("
+                "start_time = fromUnixTimestamp64Micro("
+                "%(filter_before_start_time_us)s, 'UTC') AND "
                 "toString(session_id) < %(filter_before_session_id)s))"
             )
         if self._bounded_sampling_rate is not None:
@@ -1478,8 +1501,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             FROM {self.TABLE} AS seed_spans
             PREWHERE {self.project_filter_sql()}
               AND seed_spans._peerdb_is_deleted = 0
-              AND seed_spans.start_time >= %(filter_slice_start)s
-              AND seed_spans.start_time < %(filter_slice_end)s{datetime_fragment}
+              AND seed_spans.start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s, 'UTC')
+              AND seed_spans.start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s, 'UTC'){datetime_fragment}
             WHERE (seed_spans.parent_span_id IS NULL OR seed_spans.parent_span_id = '')
               AND isNotNull(seed_spans.trace_session_id)
               AND seed_spans.trace_session_id != toUUID('{NIL_UUID}')
@@ -1502,8 +1525,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 FROM {self.TABLE} AS seed_spans
                 PREWHERE {self.project_filter_sql()}
                   AND seed_spans._peerdb_is_deleted = 0
-                  AND seed_spans.start_time >= %(filter_slice_start)s
-                  AND seed_spans.start_time < %(filter_slice_end)s{datetime_fragment}
+                  AND seed_spans.start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s, 'UTC')
+                  AND seed_spans.start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s, 'UTC'){datetime_fragment}
                 WHERE (seed_spans.parent_span_id IS NULL OR seed_spans.parent_span_id = '')
                   AND isNotNull(seed_spans.trace_session_id)
                   AND seed_spans.trace_session_id != toUUID('{NIL_UUID}')
@@ -1697,9 +1720,11 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 start_time
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
-              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
-              AND start_time >= %(start_date)s
-              AND start_time < %(end_date)s
+              AND toDate(start_time) BETWEEN
+                  toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')) AND
+                  toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))
+              AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+              AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')
               AND (
                   trace_session_id IN %(candidate_session_ids)s
                   OR trace_session_id IN (
@@ -1724,9 +1749,11 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
-              AND toDate(start_time) BETWEEN toDate(%(start_date)s) AND toDate(%(end_date)s)
-              AND start_time >= %(start_date)s
-              AND start_time < %(end_date)s
+              AND toDate(start_time) BETWEEN
+                  toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')) AND
+                  toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))
+              AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+              AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')
               AND (project_id, trace_id, id, start_time) IN (
                   SELECT project_id, trace_id, id, start_time
                   FROM candidate_root_identities
@@ -1820,7 +1847,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             f"\n          AND {datetime_predicate}" if datetime_predicate else ""
         )
         time_where = (
-            "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+            "AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC') "
+            "AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')"
             f"{datetime_fragment}"
         )
         from_where = self._session_from_where(
@@ -1889,13 +1917,24 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             # parse_time_range's window — pre-existing residual, tracked as a
             # follow-up.
             self.params["created_at_floor"] = created_at_floor
-            time_where = "AND created_at >= %(created_at_floor)s"
+            self.params["created_at_floor_us"] = _unix_microseconds(created_at_floor)
+            time_where = (
+                "AND created_at >= "
+                "fromUnixTimestamp64Micro(%(created_at_floor_us)s, 'UTC')"
+            )
             if created_at_ceiling is not None:
                 self.params["created_at_ceiling"] = created_at_ceiling
-                time_where += " AND created_at < %(created_at_ceiling)s"
+                self.params["created_at_ceiling_us"] = _unix_microseconds(
+                    created_at_ceiling
+                )
+                time_where += (
+                    " AND created_at < "
+                    "fromUnixTimestamp64Micro(%(created_at_ceiling_us)s, 'UTC')"
+                )
         else:
             time_where = (
-                "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+                "AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC') "
+                "AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')"
             )
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
@@ -1980,9 +2019,10 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
               AND toDate(start_time) BETWEEN
-                  toDate(%(content_start_date)s) AND toDate(%(content_end_date)s)
-              AND start_time >= %(content_start_date)s
-              AND start_time < %(content_end_date)s{content_exclusion_fragment}
+                  toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')) AND
+                  toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))
+              AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+              AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'){content_exclusion_fragment}
               AND (
                   trace_session_id IN %(content_session_ids)s
                   OR trace_session_id IN (
@@ -2006,9 +2046,10 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
               AND toDate(start_time) BETWEEN
-                  toDate(%(content_start_date)s) AND toDate(%(content_end_date)s)
-              AND start_time >= %(content_start_date)s
-              AND start_time < %(content_end_date)s{content_exclusion_fragment}
+                  toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')) AND
+                  toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))
+              AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+              AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'){content_exclusion_fragment}
               AND (project_id, trace_id, id, start_time) IN (
                   SELECT project_id, trace_id, id, start_time
                   FROM candidate_root_identities
@@ -2090,7 +2131,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             f"\n          AND {datetime_predicate}" if datetime_predicate else ""
         )
         time_where = (
-            "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+            "AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC') "
+            "AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')"
             f"{datetime_fragment}"
         )
         from_where = self._session_from_where(
@@ -2140,7 +2182,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             f"\n          AND {datetime_predicate}" if datetime_predicate else ""
         )
         time_where = (
-            "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+            "AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC') "
+            "AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')"
             f"{datetime_fragment}"
         )
         from_where = self._session_from_where(
@@ -2234,9 +2277,10 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         WHERE {self.project_filter_sql()}
           AND is_deleted = 0
           AND toDate(s.start_time) BETWEEN
-              toDate(%(attr_start_date)s) AND toDate(%(attr_end_date)s)
-          AND s.start_time >= %(attr_start_date)s
-          AND s.start_time < %(attr_end_date)s{attr_exclusion_fragment}
+              toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')) AND
+              toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))
+          AND s.start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+          AND s.start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'){attr_exclusion_fragment}
           AND (parent_span_id IS NULL OR parent_span_id = '')
           AND s.trace_session_id IN %(attr_session_ids)s
           AND (
@@ -2461,8 +2505,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                       AND trace_session_id != toUUID('{NIL_UUID}')
                       AND end_user_id IS NOT NULL
                       AND end_user_id != toUUID('{NIL_UUID}')
-                      AND start_time >= %(start_date)s
-                      AND start_time < %(end_date)s
+                      AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+                      AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')
                 ) AS us
                 {ts_join}
             )
@@ -2501,8 +2545,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                       AND trace_session_id IS NOT NULL
                       AND trace_session_id != toUUID('{NIL_UUID}')
                       AND end_user_id IS NOT NULL
-                      AND start_time >= %(start_date)s
-                      AND start_time < %(end_date)s
+                      AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+                      AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')
                 ) AS us
                 {ts_join}
                 {eu_join}

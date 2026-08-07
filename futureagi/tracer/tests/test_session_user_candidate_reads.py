@@ -804,7 +804,10 @@ def test_session_has_eval_is_finite_latest_state_and_page_n_safe(
         "eval_scan.trace_id IN (\n                SELECT trace_id "
         "FROM candidate_eval_trace_ids" in sql
     )
-    assert "eval_scan.created_at >= %(start_date)s - INTERVAL 7 DAY" in sql
+    assert (
+        "eval_scan.created_at >= "
+        "fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC') - INTERVAL 7 DAY" in sql
+    )
     assert "ORDER BY eval_scan._version DESC" in sql
     assert "LIMIT 1 BY eval_scan.id" in sql
     assert "latest_eval.is_deleted = 0" in sql

@@ -41,6 +41,9 @@ from tracer.services.clickhouse.query_builders.session_list import (
 )
 from tracer.services.clickhouse.query_builders.span_list import SpanListQueryBuilder
 from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
+from tracer.services.clickhouse.v2.query_builders.session_list import (
+    SessionListQueryBuilderV2,
+)
 
 LOWER = datetime(2026, 1, 1, 0, 0, 0, 123456)
 VALUE = datetime(2026, 2, 2, 3, 4, 5, 654321)
@@ -725,8 +728,14 @@ def test_direct_list_builders_retain_safe_legacy_datetime_shapes(
 
     query, params = builder.build()
 
-    assert "start_time >= %(start_date)s" in query
-    assert "start_time < %(end_date)s" in query
+    if builder_class is SessionListQueryBuilder:
+        assert (
+            "start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')" in query
+        )
+        assert "start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')" in query
+    else:
+        assert "start_time >= %(start_date)s" in query
+        assert "start_time < %(end_date)s" in query
     assert isinstance(params["start_date"], datetime)
     assert isinstance(params["end_date"], datetime)
 
@@ -746,8 +755,16 @@ def test_trace_span_session_sql_keeps_exact_half_open_window(builder_class):
 
     query, params = builder.build()
 
-    assert "start_time >= %(start_date)s" in query
-    assert "start_time < %(end_date)s" in query
+    if builder_class is SessionListQueryBuilder:
+        assert (
+            "start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')" in query
+        )
+        assert "start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')" in query
+        assert params["start_date_us"] == _micros(LOWER)
+        assert params["end_date_us"] == _micros(UPPER)
+    else:
+        assert "start_time >= %(start_date)s" in query
+        assert "start_time < %(end_date)s" in query
     assert params["start_date"] == LOWER
     assert params["end_date"] == UPPER
     if builder_class is SessionListQueryBuilder:
@@ -756,6 +773,85 @@ def test_trace_span_session_sql_keeps_exact_half_open_window(builder_class):
         # Trace/span list page N prefix-fetches through the requested page and
         # slices after stable physical-identity de-duplication in Python.
         assert params["limit"] == 125
+
+
+@pytest.mark.parametrize(
+    "builder_class", [SessionListQueryBuilder, SessionListQueryBuilderV2]
+)
+def test_session_candidate_equals_keeps_one_microsecond_window(builder_class):
+    builder = builder_class(
+        project_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        filters=[_datetime_filter("equals", _iso(VALUE))],
+        page_size=25,
+    )
+
+    candidate_sql, candidate_params = builder.build_candidate_page_query()
+    metrics_sql, metrics_params = builder.build_page_metrics_query(
+        ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]
+    )
+
+    for query, params in (
+        (candidate_sql, candidate_params),
+        (metrics_sql, metrics_params),
+    ):
+        assert "fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')" in query
+        assert "fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')" in query
+        assert params["start_date_us"] == _micros(VALUE)
+        assert params["end_date_us"] == _micros(VALUE + ONE_MICROSECOND)
+        assert params["start_date_us"] < params["end_date_us"]
+
+
+def test_session_candidate_normalizes_offset_datetime_to_utc_microseconds():
+    builder = SessionListQueryBuilderV2(
+        project_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        filters=[_datetime_filter("equals", "2026-02-02T08:34:05.654321+05:30")],
+        page_size=25,
+    )
+
+    query, params = builder.build_candidate_page_query()
+
+    assert "fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')" in query
+    assert params["start_date_us"] == _micros(VALUE)
+    assert params["end_date_us"] == _micros(VALUE + ONE_MICROSECOND)
+
+
+def test_session_seed_keyset_keeps_same_second_microsecond_tie_break():
+    before_start_time = VALUE + timedelta(microseconds=123)
+    builder = SessionListQueryBuilderV2(
+        project_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        filters=[
+            _datetime_filter("between", [_iso(LOWER), _iso(UPPER)]),
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rejected",
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+    )
+
+    query, params = builder.build_filter_seed_page(
+        slice_start=LOWER,
+        slice_end=UPPER,
+        limit=25,
+        before_start_time=before_start_time,
+        before_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    )
+
+    assert (
+        "start_time < fromUnixTimestamp64Micro("
+        "%(filter_before_start_time_us)s, 'UTC')" in query
+    )
+    assert (
+        "start_time = fromUnixTimestamp64Micro("
+        "%(filter_before_start_time_us)s, 'UTC')" in query
+    )
+    assert "toUnixTimestamp64Micro(start_time)" not in query
+    assert params["filter_before_start_time_us"] == _micros(before_start_time)
 
 
 class _NoQueryAnalytics:

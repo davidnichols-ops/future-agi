@@ -26,7 +26,7 @@ from tracer.services.clickhouse.session_graph import fetch_session_graph_ch
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
 )
-from tracer.views.trace_session import TraceSessionView
+from tracer.views.trace_session import SESSION_LIST_QUERY_TIMEOUT_MS, TraceSessionView
 
 
 def _create_session_with_span(project, name, created_at=None):
@@ -1670,7 +1670,7 @@ class TestTraceSessionWorkspaceScopeAPI:
             assert "sum(total_tokens) AS total_tokens" in sql
             assert "HAVING total_tokens >" in sql
         for call in analytics.execute_ch_query.call_args_list:
-            assert 0 < call.kwargs["timeout_ms"] <= 1_800
+            assert 0 < call.kwargs["timeout_ms"] <= SESSION_LIST_QUERY_TIMEOUT_MS
             settings = call.kwargs["settings"]
             assert settings["max_rows_to_read"] == 10_000_000
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
