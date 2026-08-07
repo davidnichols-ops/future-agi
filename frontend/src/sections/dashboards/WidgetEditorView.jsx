@@ -1792,6 +1792,13 @@ export default function WidgetEditorView() {
       if (m.outputType) base.output_type = m.outputType;
     } else if (backendType === "custom_attribute") {
       base.attribute_key = m.id;
+      // Preserve the typed-Map family returned by the metric catalog. Omitting
+      // this field made the API default numeric attributes (for example
+      // call.total_turns) to string and reject avg/percentile queries before
+      // ClickHouse was reached.
+      base.attribute_type = normalizeDashboardDataType(
+        m.dataType || m.data_type || "string",
+      );
     } else if (backendType === "custom_column") {
       base.column_id = m.id;
       if (m.columnDataType) base.data_type = m.columnDataType;
@@ -1824,7 +1831,9 @@ export default function WidgetEditorView() {
       source: b.source || "traces",
     };
     if (backendType === "custom_attribute") {
-      base.attribute_type = "string";
+      base.attribute_type = normalizeDashboardDataType(
+        b.dataType || b.data_type || "string",
+      );
     }
     if (backendType === "annotation_metric") {
       base.label_id = b.id;

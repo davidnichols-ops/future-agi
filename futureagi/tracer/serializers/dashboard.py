@@ -104,7 +104,6 @@ class DashboardMetricSerializer(StrictInputSerializer):
     attribute_type = serializers.ChoiceField(
         choices=DASHBOARD_DATA_TYPES,
         required=False,
-        default="string",
     )
     column_id = serializers.CharField(required=False, allow_blank=True)
     data_type = serializers.ChoiceField(
@@ -116,6 +115,40 @@ class DashboardMetricSerializer(StrictInputSerializer):
 
     class Meta:
         swagger_schema_fields = {"additionalProperties": False}
+
+    def validate(self, attrs):
+        """Infer the value-map type for legacy custom-metric payloads.
+
+        The dashboard metric picker historically omitted ``attribute_type``.
+        Defaulting that omission to ``string`` makes every numeric aggregation
+        (avg, percentile, sum, and so on) fail before ClickHouse is queried.
+        Dashboard Y-axis aggregations are numeric unless the caller explicitly
+        requests a text-safe count operation; explicit types always win.
+        """
+
+        if not attrs.get("attribute_type"):
+            if attrs.get("type") == "custom_attribute":
+                attrs["attribute_type"] = (
+                    "number"
+                    if attrs.get("aggregation", "avg")
+                    in {
+                        "avg",
+                        "sum",
+                        "median",
+                        "p25",
+                        "p50",
+                        "p75",
+                        "p90",
+                        "p95",
+                        "p99",
+                    }
+                    else "string"
+                )
+            else:
+                # Preserve the historical normalized payload/cache identity for
+                # metric kinds that do not consume this field.
+                attrs["attribute_type"] = "string"
+        return attrs
 
 
 class DashboardBreakdownSerializer(StrictInputSerializer):

@@ -1244,6 +1244,21 @@ function ValuePicker({
   const [anchorEl, setAnchorEl] = useState(null);
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 500);
+  // A touchpad/wheel gesture can keep the options list pinned at the bottom
+  // while a fast continuation response appends the next page. Without a
+  // per-open gate, the remaining inertial scroll events drain every cursor
+  // page and leave a high-cardinality attribute looking permanently busy.
+  // Load one exact continuation automatically; the existing Load more button
+  // remains available for every subsequent page.
+  const autoScrollPageUsedRef = useRef(false);
+
+  useEffect(() => {
+    if (!anchorEl) autoScrollPageUsedRef.current = false;
+  }, [anchorEl]);
+
+  useEffect(() => {
+    autoScrollPageUsedRef.current = false;
+  }, [debouncedSearch, projectId, propertyId, source]);
 
   // If the property declares its own static choices (e.g. the Project filter
   // on the cross-project user-detail page), use them directly. Skips both
@@ -1382,11 +1397,20 @@ function ValuePicker({
     (event) => {
       const { scrollTop, clientHeight, scrollHeight } = event.currentTarget;
       const isNearBottom = scrollHeight - scrollTop - clientHeight <= 40;
+      // Re-arm only after the user leaves the bottom edge. Appending a page
+      // can keep inertial scroll events pinned at the edge; those events must
+      // not drain the remaining cursor chain. A later deliberate scroll back
+      // to the bottom still auto-loads the next exact page.
+      if (!isNearBottom) {
+        autoScrollPageUsedRef.current = false;
+        return;
+      }
       if (
-        isNearBottom &&
+        !autoScrollPageUsedRef.current &&
         hasNextDashboardPage &&
         !isFetchingNextDashboardPage
       ) {
+        autoScrollPageUsedRef.current = true;
         fetchNextDashboardPage();
       }
     },

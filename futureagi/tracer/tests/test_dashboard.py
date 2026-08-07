@@ -6295,6 +6295,59 @@ class TestDashboardQuerySerializer:
         assert opted_in.is_valid(), opted_in.errors
         assert opted_in.validated_data["allow_sampled"] is True
 
+    def test_numeric_custom_metric_infers_number_when_frontend_omits_type(self):
+        data = {
+            "workflow": "observability",
+            "project_ids": ["proj-1"],
+            "time_range": {"preset": "6M"},
+            "granularity": "month",
+            "metrics": [
+                {
+                    "name": "call.total_turns",
+                    "type": "custom_attribute",
+                    "aggregation": "avg",
+                    "attribute_key": "call.total_turns",
+                }
+            ],
+        }
+
+        serializer = DashboardQuerySerializer(data=data)
+
+        assert serializer.is_valid(), serializer.errors
+        metric = serializer.validated_data["metrics"][0]
+        assert metric["attribute_type"] == "number"
+        sql, params = DashboardQueryBuilderV2(
+            serializer.validated_data
+        ).build_metric_query(metric)
+        assert "avg(attrs_number[%(custom_metric_attr_key)s])" in sql
+        assert params["custom_metric_attr_key"] == "call.total_turns"
+
+    def test_text_custom_metric_count_keeps_string_default_when_type_is_omitted(self):
+        data = {
+            "workflow": "observability",
+            "project_ids": ["proj-1"],
+            "time_range": {"preset": "7D"},
+            "granularity": "day",
+            "metrics": [
+                {
+                    "name": "final_status",
+                    "type": "custom_attribute",
+                    "aggregation": "count_distinct",
+                    "attribute_key": "final_status",
+                }
+            ],
+        }
+
+        serializer = DashboardQuerySerializer(data=data)
+
+        assert serializer.is_valid(), serializer.errors
+        metric = serializer.validated_data["metrics"][0]
+        assert metric["attribute_type"] == "string"
+        sql, _params = DashboardQueryBuilderV2(
+            serializer.validated_data
+        ).build_metric_query(metric)
+        assert "uniqExact(attrs_string[%(custom_metric_attr_key)s])" in sql
+
     def test_canonical_filters_with_source_metadata_pass(self):
         data = {
             "workflow": "observability",

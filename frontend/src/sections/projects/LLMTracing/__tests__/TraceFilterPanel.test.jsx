@@ -747,6 +747,58 @@ describe("filter-value picker bounded-read UX", () => {
     document.body.removeChild(anchorEl);
   });
 
+  it("does not drain every value cursor page from one bottom-scroll gesture", () => {
+    const fetchNextPage = vi.fn();
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [{ value: "completed", label: "completed" }],
+      hasNextPage: true,
+      fetchNextPage,
+    });
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+    });
+
+    openValuePicker();
+    const optionsList = document.querySelector(
+      "[data-filter-value-options-list]",
+    );
+    Object.defineProperties(optionsList, {
+      scrollTop: { configurable: true, value: 180 },
+      clientHeight: { configurable: true, value: 220 },
+      scrollHeight: { configurable: true, value: 400 },
+    });
+
+    // Inertial scrolling can emit more bottom events after a fast page has
+    // resolved. Only the first event may auto-advance this open picker.
+    fireEvent.scroll(optionsList);
+    fireEvent.scroll(optionsList);
+    fireEvent.scroll(optionsList);
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+
+    // Leaving the edge and deliberately returning is a new pagination
+    // gesture, so scroll-to-load continues to work page by page.
+    Object.defineProperty(optionsList, "scrollTop", {
+      configurable: true,
+      value: 80,
+    });
+    fireEvent.scroll(optionsList);
+    Object.defineProperty(optionsList, "scrollTop", {
+      configurable: true,
+      value: 180,
+    });
+    fireEvent.scroll(optionsList);
+    expect(fetchNextPage).toHaveBeenCalledTimes(2);
+
+    // Exact continuation remains explicitly available; this is not a result
+    // cap and does not hide later unique values.
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(fetchNextPage).toHaveBeenCalledTimes(3);
+
+    document.body.removeChild(anchorEl);
+  });
+
   it("carries mixed option storage types into the applied filter row", async () => {
     dashboardFilterValuesMock.mockReturnValue({
       ...defaultDashboardFilterValues(),
