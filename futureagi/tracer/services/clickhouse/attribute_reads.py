@@ -561,8 +561,8 @@ _CANDIDATE_SQL = """
         start_time
     FROM spans AS attribute_source
     PREWHERE project_id IN %(project_ids)s
-      AND start_time >= %(segment_start)s
-      AND start_time < %(segment_end)s
+      AND start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)
+      AND start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)
     WHERE is_deleted = 0
       AND ({candidate_predicate})
     ORDER BY
@@ -584,8 +584,8 @@ _STRATIFIED_CANDIDATE_SQL = """
         toUInt64(1) AS sample_size
     FROM spans AS attribute_source
     PREWHERE project_id IN %(project_ids)s
-      AND start_time >= %(segment_start)s
-      AND start_time < %(segment_end)s
+      AND start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)
+      AND start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)
     WHERE is_deleted = 0
       AND ({candidate_predicate})
     ORDER BY
@@ -610,8 +610,8 @@ _ORDERED_CANDIDATE_SQL = """
         start_time
     FROM spans AS attribute_source
     PREWHERE project_id IN %(project_ids)s
-      AND start_time >= %(segment_start)s
-      AND start_time < %(segment_end)s
+      AND start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)
+      AND start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)
     WHERE is_deleted = 0
       AND ({candidate_predicate})
     ORDER BY
@@ -632,8 +632,8 @@ _ORDERED_STRATIFIED_CANDIDATE_SQL = """
         toUInt64(1) AS sample_size
     FROM spans AS attribute_source
     PREWHERE project_id IN %(project_ids)s
-      AND start_time >= %(segment_start)s
-      AND start_time < %(segment_end)s
+      AND start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)
+      AND start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)
     WHERE is_deleted = 0
       AND ({candidate_predicate})
     ORDER BY
@@ -659,8 +659,8 @@ _TYPED_VALUE_CANDIDATE_SQL = """
         toUInt64(_version) AS candidate_version
     FROM spans AS attribute_source
     PREWHERE project_id IN %(project_ids)s
-      AND start_time >= %(segment_start)s
-      AND start_time < %(segment_end)s
+      AND start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)
+      AND start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)
     WHERE is_deleted = 0
       AND ({candidate_predicate})
     ORDER BY
@@ -682,8 +682,8 @@ _ORDERED_TYPED_VALUE_CANDIDATE_SQL = """
         toUInt64(_version) AS candidate_version
     FROM spans AS attribute_source
     PREWHERE project_id IN %(project_ids)s
-      AND start_time >= %(segment_start)s
-      AND start_time < %(segment_end)s
+      AND start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)
+      AND start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)
     WHERE is_deleted = 0
       AND ({candidate_predicate})
     ORDER BY
@@ -1207,6 +1207,14 @@ class AttributeReadSelector:
             "project_ids": project_ids,
             "segment_start": segment_start,
             "segment_end": segment_end,
+            # clickhouse-driver may bind an untyped datetime parameter at
+            # second precision.  A keyset checkpoint can be only a few
+            # microseconds below a segment boundary; allowing that row into
+            # the current segment makes the next signed cursor fail its own
+            # exact boundary invariant.  Integer DateTime64 bounds preserve
+            # adjacent half-open segments without wrapping the indexed column.
+            "segment_start_us": _unix_microseconds(segment_start),
+            "segment_end_us": _unix_microseconds(segment_end),
             "candidate_limit": candidate_limit + 1,
         }
         if attribute_key is not None:
@@ -3390,6 +3398,25 @@ class AttributeReadSelector:
                 raise ValueError("invalid filter-value member cursor")
         elif int(resume_member_offset) != 0:
             raise ValueError("member offset requires a resume identity")
+
+        # Rolling compatibility for cursors issued before candidate segment
+        # bounds preserved DateTime64(6) precision.  Those reads could admit a
+        # checkpoint a few microseconds below the cursor's implied six-hour
+        # lower boundary.  Keep the proven keyset and move only the segment end
+        # backward so the checkpoint is exactly on the next segment's inclusive
+        # lower edge.  The keyset predicate still reaches lower identities at
+        # the same timestamp, and the following adjacent segment starts below
+        # it, so recovery neither repeats nor skips a physical row.
+        incoming_checkpoint = resume_identity or before_identity
+        if (
+            incoming_checkpoint is not None
+            and incoming_checkpoint[3]
+            < current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
+        ):
+            current_segment_end = min(
+                current_segment_end,
+                incoming_checkpoint[3] + ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+            )
 
         seen = tuple(dict.fromkeys(str(value) for value in seen_value_digests))
         if any(

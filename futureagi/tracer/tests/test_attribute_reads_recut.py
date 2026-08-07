@@ -475,8 +475,16 @@ def test_empty_key_inventory_walks_five_bounded_ch25_segments():
             "TOUUID(%(SCOPE_PROJECT_ID)S)" in upper_sql
         )
         assert call.params["scope_project_id"] == PROJECT_A
-        assert "START_TIME >= %(SEGMENT_START)S" in upper_sql
-        assert "START_TIME < %(SEGMENT_END)S" in upper_sql
+        assert (
+            "START_TIME >= FROMUNIXTIMESTAMP64MICRO(%(SEGMENT_START_US)S)" in upper_sql
+        )
+        assert "START_TIME < FROMUNIXTIMESTAMP64MICRO(%(SEGMENT_END_US)S)" in upper_sql
+        assert call.params["segment_start_us"] == _unix_microseconds(
+            call.params["segment_start"]
+        )
+        assert call.params["segment_end_us"] == _unix_microseconds(
+            call.params["segment_end"]
+        )
         assert " FINAL " not in f" {upper_sql} "
         assert "ARRAY JOIN" not in upper_sql
         assert "SELECT DISTINCT" not in upper_sql
@@ -504,10 +512,16 @@ def test_empty_key_inventory_walks_five_bounded_ch25_segments():
 
 
 def test_streaming_candidate_avoids_datetime_bucket_type_coercion():
-    """Bound datetimes stay in native range predicates, never dateDiff."""
+    """Integer DateTime64 bounds preserve precision without dateDiff."""
 
-    assert "start_time >= %(segment_start)s" in _STRATIFIED_CANDIDATE_SQL
-    assert "start_time < %(segment_end)s" in _STRATIFIED_CANDIDATE_SQL
+    assert (
+        "start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)"
+        in _STRATIFIED_CANDIDATE_SQL
+    )
+    assert (
+        "start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)"
+        in _STRATIFIED_CANDIDATE_SQL
+    )
     assert "dateDiff(" not in _STRATIFIED_CANDIDATE_SQL
 
 
@@ -2806,6 +2820,287 @@ def test_filter_value_cursor_widened_checkpoint_is_monotonic_and_unique():
     assert set(first.seen_value_digests).isdisjoint(
         set(second.seen_value_digests[len(first.seen_value_digests) :])
     )
+
+
+def test_filter_value_cursor_keeps_microsecond_rows_in_adjacent_segments():
+    """A driver-coerced second boundary must not poison the next keyset page."""
+
+    old_second = NOW - timedelta(days=40)
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            span_id,
+            trace_id=f"trace-{span_id}",
+            start_time=old_second.replace(microsecond=microsecond),
+        )
+        for span_id, microsecond in (
+            ("newest", 566_461),
+            ("middle", 539_436),
+            ("oldest", 500_000),
+        )
+    ]
+    values = {str(row["id"]): str(row["id"]) for row in candidates}
+    by_id = {str(row["id"]): row for row in candidates}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            # Model the production failure mode: an untyped datetime bound is
+            # coerced to whole seconds, while an integer DateTime64 bound keeps
+            # the selector's exact half-open segment.
+            exact_bounds = "fromUnixTimestamp64Micro" in call.sql
+            if exact_bounds:
+                segment_start = datetime.fromtimestamp(
+                    call.params["segment_start_us"] / 1_000_000,
+                    tz=UTC,
+                )
+                segment_end = datetime.fromtimestamp(
+                    call.params["segment_end_us"] / 1_000_000,
+                    tz=UTC,
+                )
+            else:
+                segment_start = call.params["segment_start"].replace(microsecond=0)
+                segment_end = call.params["segment_end"].replace(microsecond=0)
+            in_segment = [
+                row
+                for row in candidates
+                if segment_start <= row["start_time"] < segment_end
+            ]
+            return _keyset_candidate_page(in_segment, call)
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=by_id[span_id]["trace_id"],
+                start_time=by_id[span_id]["start_time"],
+                string=values[span_id],
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    reads = []
+    cursor: dict[str, Any] = {}
+    for _ in range(3):
+        executor = RecordingExecutor(respond)
+        read = AttributeReadSelector(
+            executor, now=NOW, json_attribute_mode="arrays"
+        ).read_value_cursor_page(
+            [PROJECT_A],
+            "fi.span.kind",
+            page_size=1,
+            window_start=NOW - timedelta(days=365),
+            window_end=NOW,
+            **cursor,
+        )
+        candidate_calls = [
+            call for call in executor.calls if "segment_start" in call.params
+        ]
+        assert candidate_calls
+        assert all(
+            "fromUnixTimestamp64Micro(%(segment_start_us)s)" in call.sql
+            and "fromUnixTimestamp64Micro(%(segment_end_us)s)" in call.sql
+            for call in candidate_calls
+        )
+        reads.append(read)
+        cursor = {
+            "segment_end": read.next_segment_end,
+            "before_identity": read.next_before_identity,
+            "resume_identity": read.next_resume_identity,
+            "resume_member_offset": read.next_resume_member_offset,
+            "seen_value_digests": read.seen_value_digests,
+        }
+
+    assert [[row.value for row in read.rows] for read in reads] == [
+        ["newest"],
+        ["middle"],
+        ["oldest"],
+    ]
+    assert len({read.next_before_identity for read in reads}) == 3
+
+
+def test_filter_value_cursor_recovers_poisoned_before_boundary_without_skip():
+    checkpoint_time = (NOW - timedelta(days=40)).replace(microsecond=566_461)
+    checkpoint = _candidate(
+        PROJECT_A,
+        "z-checkpoint",
+        trace_id="trace-checkpoint",
+        start_time=checkpoint_time,
+    )
+    same_time_lower_id = _candidate(
+        PROJECT_A,
+        "a-same-time",
+        trace_id="trace-same-time",
+        start_time=checkpoint_time,
+    )
+    adjacent_older = _candidate(
+        PROJECT_A,
+        "older-by-one-microsecond",
+        trace_id="trace-adjacent-older",
+        start_time=checkpoint_time - timedelta(microseconds=1),
+    )
+    candidates = [checkpoint, same_time_lower_id, adjacent_older]
+    values = {str(row["id"]): str(row["id"]) for row in candidates}
+    poisoned_segment_end = (
+        checkpoint_time + ATTRIBUTE_READ_EXPLICIT_SEGMENT + timedelta(microseconds=27)
+    )
+    cursor = {
+        "segment_end": poisoned_segment_end,
+        "before_identity": (
+            PROJECT_A,
+            str(checkpoint["trace_id"]),
+            str(checkpoint["id"]),
+            checkpoint_time,
+        ),
+        "seen_value_digests": (
+            attribute_value_cursor_digest("string", values["z-checkpoint"]),
+        ),
+    }
+
+    reads = []
+    for _ in range(2):
+        executor = _value_cursor_executor(candidates, values)
+        read = AttributeReadSelector(
+            executor, now=NOW, json_attribute_mode="arrays"
+        ).read_value_cursor_page(
+            [PROJECT_A],
+            "fi.span.kind",
+            page_size=1,
+            window_start=NOW - timedelta(days=365),
+            window_end=NOW,
+            **cursor,
+        )
+        reads.append(read)
+        cursor = {
+            "segment_end": read.next_segment_end,
+            "before_identity": read.next_before_identity,
+            "resume_identity": read.next_resume_identity,
+            "resume_member_offset": read.next_resume_member_offset,
+            "seen_value_digests": read.seen_value_digests,
+        }
+
+    assert [[row.value for row in read.rows] for read in reads] == [
+        ["a-same-time"],
+        ["older-by-one-microsecond"],
+    ]
+    assert reads[0].next_segment_end == (
+        checkpoint_time + ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    )
+    assert reads[0].next_before_identity is not None
+    assert reads[0].next_before_identity[3] == checkpoint_time
+    assert reads[1].next_before_identity is not None
+    assert reads[1].next_before_identity[3] == (
+        checkpoint_time - timedelta(microseconds=1)
+    )
+
+
+def test_filter_value_cursor_recovers_poisoned_resume_array_boundary():
+    checkpoint_time = (NOW - timedelta(days=40)).replace(microsecond=566_461)
+    resume_identity = (
+        PROJECT_A,
+        "trace-resume",
+        "z-resume-array",
+        checkpoint_time,
+    )
+    same_time_lower_id = _candidate(
+        PROJECT_A,
+        "a-same-time-after-array",
+        trace_id="trace-same-time-after-array",
+        start_time=checkpoint_time,
+    )
+    by_id = {str(same_time_lower_id["id"]): same_time_lower_id}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            in_segment = (
+                [same_time_lower_id]
+                if call.params["segment_start"]
+                <= same_time_lower_id["start_time"]
+                < call.params["segment_end"]
+                else []
+            )
+            return _keyset_candidate_page(in_segment, call)
+        rows = []
+        for span_id in call.params["candidate_ids_0"]:
+            if span_id == resume_identity[2]:
+                rows.append(
+                    _target_row(
+                        PROJECT_A,
+                        span_id,
+                        trace_id=resume_identity[1],
+                        start_time=checkpoint_time,
+                        legacy_raw=json.dumps(
+                            ("prior", "remaining-first", "remaining-second")
+                        ),
+                    )
+                )
+            else:
+                candidate = by_id[span_id]
+                rows.append(
+                    _target_row(
+                        PROJECT_A,
+                        span_id,
+                        trace_id=str(candidate["trace_id"]),
+                        start_time=candidate["start_time"],
+                        string=span_id,
+                    )
+                )
+        return rows
+
+    poisoned_segment_end = (
+        checkpoint_time + ATTRIBUTE_READ_EXPLICIT_SEGMENT + timedelta(microseconds=27)
+    )
+    first = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "fi.span.kind",
+        page_size=1,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        segment_end=poisoned_segment_end,
+        resume_identity=resume_identity,
+        resume_member_offset=1,
+        seen_value_digests=(attribute_value_cursor_digest("array", "prior"),),
+    )
+    second = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "fi.span.kind",
+        page_size=1,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        before_identity=first.next_before_identity,
+        resume_identity=first.next_resume_identity,
+        resume_member_offset=first.next_resume_member_offset,
+        seen_value_digests=first.seen_value_digests,
+    )
+    third = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "fi.span.kind",
+        page_size=1,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        segment_end=second.next_segment_end,
+        before_identity=second.next_before_identity,
+        resume_identity=second.next_resume_identity,
+        resume_member_offset=second.next_resume_member_offset,
+        seen_value_digests=second.seen_value_digests,
+    )
+
+    assert [row.value for row in first.rows] == ["remaining-first"]
+    assert first.next_segment_end == checkpoint_time + ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    assert first.next_resume_identity == resume_identity
+    assert first.next_resume_member_offset == 2
+    assert first.next_before_identity is None
+    assert [row.value for row in second.rows] == ["remaining-second"]
+    assert second.next_resume_identity is None
+    assert second.next_before_identity == resume_identity
+    assert [row.value for row in third.rows] == ["a-same-time-after-array"]
+    assert third.next_before_identity is not None
+    assert third.next_before_identity[3] == checkpoint_time
 
 
 @pytest.mark.parametrize("failure_stage", ["candidate", "replay"])
