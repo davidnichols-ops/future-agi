@@ -35,6 +35,7 @@ from tracer.services.clickhouse.attribute_reads import (
     _STRATIFIED_CANDIDATE_SQL,
     ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES,
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
+    ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS,
     ATTRIBUTE_READ_MAX_PROJECTS,
     ATTRIBUTE_READ_MAX_QUERY_COUNT,
     ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT,
@@ -1810,6 +1811,42 @@ def test_exact_typed_key_read_budget_is_not_published_as_a_sample():
 
     assert len(executor.calls) == 1
     assert "mapKeys(attrs_string)" in executor.calls[0].sql
+    assert executor.calls[0].timeout_ms == ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS
+
+
+def test_exact_typed_key_timeout_keeps_query_safety_caps() -> None:
+    def respond(call, _):
+        if "segment_start" in call.params:
+            return [_candidate(PROJECT_A, "typed-final-status")]
+        return [_target_row(PROJECT_A, "typed-final-status", string="Rejected")]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+    ).discover_keys(
+        [PROJECT_A],
+        exact_key="final_status",
+        horizon_days=7,
+    )
+
+    assert read.rows == (AttributeKeyRow("final_status", "string", 1),)
+    assert len(executor.calls) == 2
+    assert all(
+        call.timeout_ms == ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS
+        for call in executor.calls
+    )
+    assert all(call.settings["max_threads"] == 1 for call in executor.calls)
+    assert all(
+        call.settings["max_memory_usage"] <= 512 * 1024 * 1024
+        for call in executor.calls
+    )
+    assert all(
+        call.settings["max_bytes_to_read"] <= 512 * 1024 * 1024
+        for call in executor.calls
+    )
+    assert all(call.settings["max_rows_to_read"] == 500_000 for call in executor.calls)
 
 
 def test_structured_json_value_picker_is_explicitly_degraded():

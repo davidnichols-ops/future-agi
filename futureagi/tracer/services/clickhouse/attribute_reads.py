@@ -52,11 +52,15 @@ JsonScalar = str | int | float | bool
 AttributeValue = str | int | float | bool | tuple[JsonScalar, ...]
 
 ATTRIBUTE_READ_HORIZON_DAYS = (7, 14, 30, 180, 365)
-# Allow a candidate read and its mandatory latest-state replay to each receive
-# their independent 1.5 s server budget even when the client is briefly
-# descheduled. Row, byte, result, and per-query ceilings remain unchanged.
+# Generic browse/value discovery keeps a short per-statement budget. Exact
+# typed-key lookup gets a little more room because it must build three existing
+# Map-key bloom conditions before the bounded identity seed can begin; the US
+# incident query was cut off at the old 1.5 s client boundary. The independent
+# six-second operation wall and every thread/row/byte/memory ceiling remain
+# unchanged. JSON overflow retains its separate 750 ms cap below.
 ATTRIBUTE_READ_WALL_TIMEOUT_MS = 6_000
 ATTRIBUTE_READ_QUERY_TIMEOUT_MS = 1_500
+ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS = 3_000
 # Keep one operation below the production low-load harness ceiling (32) even
 # when a typed value page needs candidate, version-certificate, and hydration
 # queries. Candidate-page caps bound discovery breadth; this separate ceiling
@@ -978,7 +982,10 @@ class AttributeReadSelector:
             timeout_cap_ms = (
                 ATTRIBUTE_READ_QUERY_TIMEOUT_MS
                 if query_timeout_ms is None
-                else min(max(int(query_timeout_ms), 1), ATTRIBUTE_READ_QUERY_TIMEOUT_MS)
+                else min(
+                    max(int(query_timeout_ms), 1),
+                    ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS,
+                )
             )
             page = self._executor.execute(
                 query,
@@ -1670,7 +1677,11 @@ class AttributeReadSelector:
                 if exact_key is not None
                 else _LATEST_TYPED_BROWSE_SQL,
                 "none",
-                None,
+                (
+                    ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS
+                    if exact_key is not None
+                    else None
+                ),
             )
         ]
         if self._reads_json_overflow:

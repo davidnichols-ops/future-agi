@@ -314,6 +314,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.filter_cursor_seed_keyset_is_safe() is True
     assert builder.recommended_filter_seed_batch_size() == 512
     assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_initial_slice_width() == timedelta(hours=1)
 
 
 def test_graph_trace_key_witness_is_wide_key_only_and_classifier_stays_exact() -> None:
@@ -4151,6 +4152,13 @@ class _ClassifierSettingsFakeBuilder(_FakeBuilder):
         return {"max_block_size": 2_048}
 
 
+@dataclass
+class _WideInitialSliceFakeBuilder(_FakeBuilder):
+    @staticmethod
+    def recommended_filter_initial_slice_width() -> timedelta:
+        return timedelta(hours=1)
+
+
 class _ClassifierSettingsFakeExecutor(_FakeExecutor):
     def __init__(self, builder: _FakeBuilder):
         super().__init__(builder)
@@ -4925,6 +4933,46 @@ def test_bounded_reader_rejects_mechanically_impossible_prefix_before_ch() -> No
     assert page.error_code == "page_depth_exceeded"
     assert page.query_count == 0
     assert executor.calls == []
+
+
+def test_builder_can_widen_only_the_first_exact_seed_slice() -> None:
+    rows = [
+        {
+            "id": "newest",
+            "root_span_id": "root-newest",
+            "start_time": END - timedelta(minutes=10),
+        },
+        {
+            "id": "sentinel",
+            "root_span_id": "root-sentinel",
+            "start_time": END - timedelta(minutes=45),
+        },
+    ]
+    builder = _WideInitialSliceFakeBuilder(
+        rows,
+        start=END - timedelta(days=14),
+        end=END,
+        recommended_batch_size=2,
+        recommended_seed_batch_size=2,
+    )
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.has_more is True
+    assert [row["id"] for row in page.rows] == ["newest"]
+    assert [query for query, _params in executor.calls] == ["seed", "match"]
+    assert executor.calls[0][1]["slice_start"] == END - timedelta(hours=1)
+    assert executor.calls[0][1]["slice_end"] == END
 
 
 def test_session_numbered_page_ceiling_is_deterministic() -> None:

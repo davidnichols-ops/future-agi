@@ -105,6 +105,7 @@ _LONG_WINDOW_ANCHOR_TIMEOUT_MS = 900
 _LONG_WINDOW_ANCHOR_STRATA = 4
 _LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 192 * 1024 * 1024
 _LONG_WINDOW_CANDIDATE_WITNESS_STRATA = 1
+_LONG_WINDOW_ORDERED_ROOT_INITIAL_SLICE = timedelta(hours=1)
 _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH = timedelta(minutes=5)
 _UNINDEXED_POSITIVE_MICRO_SEED_STRATA = 4
 _CANONICAL_TRACE_ID_SEED_PREDICATE = re.compile(
@@ -762,6 +763,32 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 return 512
             return 200
         return 50
+
+    def recommended_filter_initial_slice_width(self) -> timedelta | None:
+        """Avoid under-filled five-minute root reads for long Map filters.
+
+        Normal list pages with a positive typed-Map leaf ultimately fall back
+        to ``build_filter_ordered_seed_page`` whenever the optional witness
+        probe is unavailable or broad.  That seed reads only root identities,
+        is ordered by the indexed ``start_time`` key, and retains a finite
+        LIMIT.  Starting it at one hour removes several serial five/ten/twenty-
+        minute reads on sparse and deep pages without changing membership,
+        pagination order, or the exact latest-state classifier.  Graph, eval,
+        task, population-proof, and other internal modes keep the conservative
+        shared five-minute default.
+        """
+
+        request_start, request_end = self._bounded_request_window
+        if (
+            not self._bounded_identity_only
+            and not self._bounded_internal_scan
+            and not self._bounded_bulk_scan
+            and not self._bounded_population_proof
+            and request_end - request_start > timedelta(hours=1)
+            and self._positive_typed_map_anchor_plan() is not None
+        ):
+            return _LONG_WINDOW_ORDERED_ROOT_INITIAL_SLICE
+        return None
 
     def recommended_filter_classify_batch_size(self) -> int | None:
         """Keep the candidate-trace latest-state scan below CH's memory ceiling."""

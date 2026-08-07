@@ -968,7 +968,27 @@ def read_bounded_filter_page(
         and continuation_before_start_time is not None
         else None
     )
+    # Five minutes remains the conservative default for every selector.  A
+    # builder whose seed is both partition-pruned and newest-first may opt into
+    # a wider first slice to avoid several empty/under-filled round trips on a
+    # long window.  This changes only the acquisition boundary: the same
+    # finite candidates still cross the exact latest-state classifier and the
+    # same result-order proof before publication.
     slice_width = _INITIAL_SLICE
+    initial_slice_width_builder = getattr(
+        builder, "recommended_filter_initial_slice_width", None
+    )
+    if callable(initial_slice_width_builder):
+        raw_initial_slice_width = initial_slice_width_builder()
+        if raw_initial_slice_width is not None:
+            if (
+                not isinstance(raw_initial_slice_width, timedelta)
+                or not _INITIAL_SLICE <= raw_initial_slice_width <= _MAX_SLICE
+            ):
+                raise ValueError(
+                    "recommended initial slice width exceeds bounded contract"
+                )
+            slice_width = raw_initial_slice_width
     before_start_time: datetime | None = (
         continuation_before_start_time
         if continuation_slice_end is not None
