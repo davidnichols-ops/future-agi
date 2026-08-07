@@ -1825,6 +1825,9 @@ class CHSpanReader:
         session_id: str | list[str] | None = None,
         created_at_gte: datetime | None = None,
         created_at_range: tuple[datetime, datetime] | None = None,
+        created_at_half_open_range: tuple[datetime, datetime] | None = None,
+        start_time_gte: datetime | None = None,
+        start_time_range: tuple[datetime, datetime] | None = None,
         roots_only: bool = False,
     ) -> int:
         """Replaces ObservationSpan.objects.filter(<Q-object>).count() for
@@ -1837,6 +1840,12 @@ class CHSpanReader:
         ``roots_only`` counts one row per trace (root span = empty parent),
         turning this into a trace count — used where the PG path counted
         ``Trace`` rows in a window rather than spans.
+
+        ``start_time_*`` is the event-time contract for normal CH25 product
+        windows and enables partition/primary-key pruning. ``created_at_*`` is
+        retained only for callers that deliberately require ingestion-time
+        parity (legacy/arrival reconciliation); the two meanings are never
+        silently remapped.
 
         Codex wave-2 fixes (2026-05-26):
           • P1: created_at_* predicates target the CH `created_at` column
@@ -1896,6 +1905,21 @@ class CHSpanReader:
         if created_at_range:
             where.append("created_at BETWEEN %(cr_s)s AND %(cr_e)s")
             params["cr_s"], params["cr_e"] = created_at_range
+        if created_at_half_open_range:
+            where.append("created_at >= %(chr_s)s")
+            where.append("created_at < %(chr_e)s")
+            params["chr_s"], params["chr_e"] = created_at_half_open_range
+        # Normal CH25 product windows use event time: ``start_time`` is the
+        # partition/primary-key time column. Keep the created_at arguments
+        # above only for the retired/continuous arrival-parity callers that
+        # deliberately mean ingestion time.
+        if start_time_gte:
+            where.append("start_time >= %(stg)s")
+            params["stg"] = start_time_gte
+        if start_time_range:
+            where.append("start_time >= %(str_s)s")
+            where.append("start_time < %(str_e)s")
+            params["str_s"], params["str_e"] = start_time_range
         # roots_only counts distinct traces, not root rows — a trace with more
         # than one parentless span must count once (mirrors the GROUP BY tid /
         # first-root-per-trace dedupe elsewhere in this reader).

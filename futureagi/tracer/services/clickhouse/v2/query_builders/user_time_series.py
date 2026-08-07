@@ -41,44 +41,6 @@ def _latest_start_time_spans_cte(*, table: str, project_predicate: str) -> str:
     """
 
 
-def _latest_created_at_spans_ctes(*, table: str, project_predicate: str) -> str:
-    """Replay candidates selected by latest-row ``created_at`` semantics.
-
-    ``created_at`` is mutable and is not part of the ReplacingMergeTree key.
-    First capture identities with any physical version in the requested range,
-    then fetch every version of only those identities, choose the newest, and
-    apply the range/live predicates outside the replay. This prevents an older
-    in-range/live row from resurfacing after a newer correction or tombstone.
-    """
-
-    return f"""
-    candidate_span_identities AS (
-        SELECT DISTINCT project_id, trace_id, id, start_time
-        FROM {table}
-        PREWHERE {project_predicate}
-        WHERE created_at >= %(start_date)s
-          AND created_at < %(end_date)s
-    ),
-    latest_spans AS (
-        SELECT *
-        FROM (
-            SELECT *
-            FROM {table}
-            PREWHERE {project_predicate}
-              AND (project_id, trace_id, id, start_time) IN (
-                  SELECT project_id, trace_id, id, start_time
-                  FROM candidate_span_identities
-              )
-            ORDER BY project_id, trace_id, id, start_time, _version DESC
-            LIMIT 1 BY project_id, trace_id, id, start_time
-        )
-        WHERE is_deleted = 0
-          AND created_at >= %(start_date)s
-          AND created_at < %(end_date)s
-    )
-    """
-
-
 def _entity_safe_latest_spans_ctes(*, table: str, project_predicate: str) -> str:
     """Hydrate complete traces whose earliest span belongs to this partition."""
 
@@ -292,7 +254,7 @@ class UserDetailTimeSeriesQueryBuilderV2(V2RewriteMixin, BaseQueryBuilder):
         self.params.update(extra_params)
         where_clause = extra_where if extra_where else "1 = 1"
 
-        latest_spans_ctes = _latest_created_at_spans_ctes(
+        latest_spans_ctes = _latest_start_time_spans_cte(
             table=self.TABLE,
             project_predicate=self.project_filter_sql(),
         )
@@ -330,7 +292,7 @@ class UserDetailTimeSeriesQueryBuilderV2(V2RewriteMixin, BaseQueryBuilder):
               AND latest_is_deleted = 0
         )
         SELECT
-            {bucket_fn}(created_at) AS time_bucket,
+            {bucket_fn}(start_time) AS time_bucket,
             uniqExactIf(
                 toString(trace_session_id),
                 isNotNull(trace_session_id)
@@ -344,7 +306,7 @@ class UserDetailTimeSeriesQueryBuilderV2(V2RewriteMixin, BaseQueryBuilder):
                 {eu_resolved} AS end_user_id,
                 rs.trace_id AS trace_id,
                 {ts_resolved} AS trace_session_id,
-                rs.created_at AS created_at,
+                rs.start_time AS start_time,
                 rs.cost AS cost,
                 rs.prompt_tokens AS prompt_tokens,
                 rs.completion_tokens AS completion_tokens

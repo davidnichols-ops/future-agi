@@ -65,7 +65,7 @@ def test_user_aggregate_graph_replays_latest_physical_span_versions():
     assert params["start_date"] < params["end_date"]
 
 
-def test_project_user_detail_graph_replays_created_at_candidates_before_filtering():
+def test_project_user_detail_graph_prunes_and_buckets_on_start_time():
     builder = UserDetailTimeSeriesQueryBuilderV2(
         project_id=PROJECT_ID,
         organization_id=ORGANIZATION_ID,
@@ -77,13 +77,15 @@ def test_project_user_detail_graph_replays_created_at_candidates_before_filterin
     sql, params = builder.build()
 
     _assert_latest_replay_precedes_live_filter(sql)
-    assert "candidate_span_identities AS" in sql
-    assert sql.count("FROM spans") == 2
+    assert "candidate_span_identities AS" not in sql
+    assert sql.count("FROM spans") == 1
     assert "FROM latest_spans AS rs" in sql
-    # Latest-row filtering remains outside the replay, including created_at;
-    # an older in-range version therefore cannot reappear after correction.
-    replay = sql.index("LIMIT 1 BY project_id, trace_id, id, start_time")
-    assert sql.index("AND created_at >= %(start_date)s", replay) > replay
+    assert "toDate(start_time) BETWEEN" in sql
+    assert "AND start_time >= %(start_date)s" in sql
+    assert "AND start_time < %(end_date)s" in sql
+    assert "created_at >= %(start_date)s" not in sql
+    assert "rs.created_at" not in sql
+    assert "toStartOfDay(start_time) AS time_bucket" in sql
     assert "FROM end_users FINAL" not in sql
     assert "argMax(is_deleted, version) AS latest_is_deleted" in sql
     assert "FROM spans AS rs" not in sql
