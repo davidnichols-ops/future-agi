@@ -283,8 +283,9 @@ class TestEndUserDimensionSource:
             self._filter("user", "in", ["bob", "carol"])
         )
         assert "trace_id IN (" in sql
-        assert "SELECT end_user_id FROM end_users FINAL" in sql
-        assert "is_deleted = 0" in sql
+        assert "FROM end_users AS eu FINAL" in sql
+        assert "FROM end_user_id_remap FINAL" in sql
+        assert "eu.is_deleted = 0" in sql
         # The dropped legacy table must NOT appear on the v2 path.
         assert "tracer_enduser" not in sql
         assert "_peerdb_is_deleted" not in sql
@@ -294,7 +295,8 @@ class TestEndUserDimensionSource:
         sql, _ = ClickHouseFilterBuilderV2(table="spans").translate(
             self._filter("user_id_type", "equals", "external")
         )
-        assert "FROM end_users FINAL" in sql
+        assert "FROM end_users AS eu FINAL" in sql
+        assert "FROM end_user_id_remap FINAL" in sql
         assert "tracer_enduser" not in sql
 
     def test_v2_negation_emits_not_in_against_end_users(self):
@@ -303,7 +305,8 @@ class TestEndUserDimensionSource:
             self._filter("user", "not_in", ["bob"])
         )
         assert "trace_id NOT IN (" in sql
-        assert "FROM end_users FINAL" in sql
+        assert "FROM end_users AS eu FINAL" in sql
+        assert "FROM end_user_id_remap FINAL" in sql
         assert "tracer_enduser" not in sql
 
     # ─── No-value path (is_null) — a different branch that skips the dim ──────
