@@ -211,6 +211,13 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
     EVAL_TABLE = "tracer_eval_logger"
     ANNOTATION_TABLE = "model_hub_score"
     _FILTER_BUILDER_CLS = VoiceCallFilterBuilder
+    # Keep the legacy table's arrival-time partition guard. CH25 overrides
+    # this because only ``start_time`` can prune its direct-write spans table.
+    _NORMAL_TIME_WHERE = (
+        "AND created_at >= %(start_date)s - INTERVAL 1 DAY "
+        "AND start_time >= %(start_date)s "
+        "AND start_time < %(end_date)s"
+    )
     # Legacy/default behavior follows the rollout setting. The V2 subclass
     # injects the direct-write helper explicitly.
     _EVAL_LOGGER_SOURCE = staticmethod(eval_logger_source)
@@ -525,9 +532,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         {self.project_where()}
           AND (parent_span_id IS NULL OR parent_span_id = '')
           AND observation_type = 'conversation'
-          AND created_at >= %(start_date)s - INTERVAL 1 DAY
-          AND start_time >= %(start_date)s
-          AND start_time < %(end_date)s
+          {self._NORMAL_TIME_WHERE}
           {filter_fragment}
           {simulation_filter}
         ORDER BY start_time DESC
@@ -561,11 +566,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
                 self.params["created_at_ceiling"] = created_at_ceiling
                 time_where += " AND created_at < %(created_at_ceiling)s"
         else:
-            time_where = (
-                "AND created_at >= %(start_date)s - INTERVAL 1 DAY "
-                "AND start_time >= %(start_date)s "
-                "AND start_time < %(end_date)s"
-            )
+            time_where = self._NORMAL_TIME_WHERE
         self.params["start_date"] = start_date
         self.params["end_date"] = end_date
 
@@ -727,9 +728,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         {self.project_where()}
           AND (parent_span_id IS NULL OR parent_span_id = '')
           AND observation_type = 'conversation'
-          AND created_at >= %(start_date)s - INTERVAL 1 DAY
-          AND start_time >= %(start_date)s
-          AND start_time < %(end_date)s
+          {self._NORMAL_TIME_WHERE}
           {filter_fragment}
           {simulation_filter}
         """

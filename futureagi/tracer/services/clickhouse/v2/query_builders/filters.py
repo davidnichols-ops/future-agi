@@ -436,6 +436,16 @@ class ClickHouseFilterBuilderV2(ClickHouseFilterBuilder):
             " AND start_time < %(end_date)s + INTERVAL 1 DAY"
         )
 
+    def _scoped_spans_date_filter(self) -> str:
+        """Use CH25's indexed event time for Score-to-span resolution."""
+
+        if not self.score_date_scope:
+            return ""
+        return (
+            "AND start_time >= %(start_date)s - INTERVAL 1 DAY "
+            "AND start_time < %(end_date)s + INTERVAL 1 DAY"
+        )
+
     def translate(self, filters):  # type: ignore[override]
         # `translate` returns a WHERE fragment that gets stitched into a larger
         # SELECT statement by callers. Do NOT append SETTINGS here — that

@@ -39,6 +39,9 @@ class SpanListQueryBuilderV2(V2RewriteMixin, SpanListQueryBuilder):
     # Use the v2 filter compiler so filters read the v2 dimension tables
     # (end_users, etc.) instead of the dropped legacy CDC tables.
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
+    _NORMAL_TIME_WHERE = (
+        "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+    )
 
 
 __all__ = ["SpanListQueryBuilderV2"]

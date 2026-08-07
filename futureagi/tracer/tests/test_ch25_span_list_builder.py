@@ -56,6 +56,39 @@ def test_build_count_query_uses_v2_columns():
     assert "is_deleted" in sql
 
 
+def test_normal_v2_span_list_paths_bound_indexed_start_time_only():
+    """Historical/UI span reads must not scan on physical ``created_at``.
+
+    CH25 partitions and orders spans by ``start_time``. ``created_at`` remains
+    valid only for the explicit continuous-arrival ID path tested below.
+    """
+    for end_user_id in (None, "33333333-3333-3333-3333-333333333333"):
+        builder = _make_builder()
+        builder.end_user_id = end_user_id
+        for method_name in ("build", "build_count_query", "build_id_query"):
+            sql, _ = getattr(builder, method_name)()
+            assert "start_time >= %(start_date)s" in sql
+            assert "start_time < %(end_date)s" in sql
+            assert "created_at >= %(start_date)s" not in sql
+
+
+def test_v2_span_continuous_id_path_keeps_arrival_time_bounds():
+    from datetime import datetime
+
+    floor = datetime(2026, 8, 1, 12, 0)
+    ceiling = datetime(2026, 8, 1, 12, 5)
+    sql, params = _make_builder().build_id_query(
+        created_at_floor=floor,
+        created_at_ceiling=ceiling,
+    )
+
+    assert "created_at >= %(created_at_floor)s" in sql
+    assert "created_at < %(created_at_ceiling)s" in sql
+    assert "start_time >= %(start_date)s" not in sql
+    assert params["created_at_floor"] == floor
+    assert params["created_at_ceiling"] == ceiling
+
+
 def test_build_content_query_uses_typed_json_overflow_column():
     # build_content_query reads span_attributes_raw in v1 — v2 must read the
     # typed JSON column (attributes_extra) via toJSONString() wrapping to keep

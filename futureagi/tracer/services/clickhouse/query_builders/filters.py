@@ -570,6 +570,18 @@ class ClickHouseFilterBuilder:
             return ""
         return " AND project_id = toUUID(%(project_id)s)"
 
+    def _scoped_spans_date_filter(self) -> str:
+        """Return the physical time bound for Score-to-span resolution.
+
+        The legacy spans table is partitioned by ``created_at``. CH25 overrides
+        this hook because its direct-write spans table is partitioned and sorted
+        by ``start_time`` instead.
+        """
+
+        if not self.score_date_scope:
+            return ""
+        return "AND created_at >= %(start_date)s - INTERVAL 1 DAY"
+
     def _scoped_spans_subquery(
         self,
         *,
@@ -606,11 +618,7 @@ class ClickHouseFilterBuilder:
             project_pred = "project_id IN %(project_ids)s"
         else:
             project_pred = "project_id = %(project_id)s"
-        date_pred = (
-            "AND created_at >= %(start_date)s - INTERVAL 1 DAY"
-            if self.score_date_scope
-            else ""
-        )
+        date_pred = self._scoped_spans_date_filter()
         extra = f" AND {extra_where}" if extra_where else ""
         candidate_filter = (
             self._candidate_span_entity_filter("trace_id", "id")

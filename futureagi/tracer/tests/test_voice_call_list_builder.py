@@ -118,7 +118,6 @@ def test_build_sets_time_window_params():
     s = _squash(sql)
     assert "start_time >= %(start_date)s" in s
     assert "start_time < %(end_date)s" in s
-    # created_at pre-window widens partition pruning by one day.
     assert "created_at >= %(start_date)s - INTERVAL 1 DAY" in s
     assert params["start_date"] is not None
     assert params["end_date"] is not None
@@ -217,6 +216,21 @@ def test_count_query_respects_project_scope():
     qb.build()
     _, params = qb.build_count_query()
     assert params["project_id"] == PROJECT_ID
+
+
+@pytest.mark.unit
+def test_v2_voice_normal_list_count_and_id_use_start_time_only():
+    from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+        VoiceCallListQueryBuilderV2,
+    )
+
+    qb = VoiceCallListQueryBuilderV2(project_id=PROJECT_ID)
+    for method_name in ("build", "build_count_query", "build_id_query"):
+        sql, _ = getattr(qb, method_name)()
+        s = _squash(sql)
+        assert "start_time >= %(start_date)s" in s
+        assert "start_time < %(end_date)s" in s
+        assert "created_at >= %(start_date)s" not in s
 
 
 # ---------------------------------------------------------------------------

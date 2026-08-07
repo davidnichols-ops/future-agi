@@ -37,6 +37,9 @@ class VoiceCallListQueryBuilderV2(V2RewriteMixin, VoiceCallListQueryBuilder):
 
     _v2_rewrite_exclude = frozenset({"build_eval_query", "build_annotation_query"})
     _FILTER_BUILDER_CLS = VoiceCallFilterBuilderV2
+    _NORMAL_TIME_WHERE = (
+        "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
+    )
 
 
 __all__ = ["VoiceCallFilterBuilderV2", "VoiceCallListQueryBuilderV2"]

@@ -963,14 +963,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         its fixed request budget before ordered candidate acquisition.
         """
 
-        if self.supports_filter_candidate_witness_prefilter_without_hydration():
-            return None
-        request_start, request_end = self._bounded_request_window
-        if (
-            request_end - request_start > timedelta(hours=1)
-            and self._positive_typed_map_anchor_plan() is not None
-        ):
-            return _LONG_WINDOW_ANCHOR_SENTINEL
+        # The production product-path gate showed that even partitioned long-
+        # window probes routinely hit their deliberately tight row/byte caps
+        # before the ordered-root reader.  They are optional and their failure
+        # cannot prove membership, so spending that request budget only delays
+        # the unchanged exact identity classifier.  Returning ``None`` makes
+        # ``skip_full_window_filter_anchor_probe`` select the ordered path.
+        # Short-window callers still use the selector's ordinary 513-row probe;
+        # graph callers pass an explicit per-stratum limit and are unaffected.
         return None
 
     def recommended_filter_anchor_probe_timeout_ms(self) -> int | None:
@@ -1189,11 +1189,21 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         )
 
     def prefer_filter_candidate_witness_probe_first(self) -> bool:
-        """Prefer the indexed witness superset before a long-window argMax scan."""
+        """Use the finite witness prefilter only for unhydrated bulk reads.
+
+        Normal interactive lists already classify membership/order identities
+        and hydrate only the final page.  On the largest production tenants,
+        their optional witness collapse exceeded its row/byte cap and forced a
+        twenty-identity fallback even though the same identity classifier is
+        qualified for one hundred candidates.  Bypass that redundant probe for
+        hydrated lists; the historical membership-only bulk reader retains it
+        because it buffers candidates across slices before one exact replay.
+        """
 
         request_start, request_end = self._bounded_request_window
         return bool(
-            request_end - request_start > timedelta(hours=1)
+            self.supports_filter_candidate_witness_prefilter_without_hydration()
+            and request_end - request_start > timedelta(hours=1)
             and self._candidate_witness_anchor_plan() is not None
         )
 
@@ -1231,15 +1241,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Return the production-safe exact batch behind optional witnesses.
 
         The probe may be unavailable on a locked profile, fail one temporal
-        stratum, or find a broad value. Normal hydrated lists retain their
-        independently qualified 20-trace fallback. Membership-only bulk eval
-        already classifies 100 identities safely without witness projections,
-        so optional-probe fallback must preserve that existing envelope.
+        stratum, or find a broad value. Normal hydrated lists and
+        membership-only bulk evals both use the independently qualified
+        100-identity classifier when that exact projection is safe. Other
+        internal any-span shapes retain the smaller 20-identity envelope.
         """
 
         if self._candidate_witness_anchor_plan() is None:
             return None
-        if self.supports_filter_candidate_witness_prefilter_without_hydration():
+        if self.supports_filter_candidate_witness_prefilter_without_hydration() or (
+            not self._bounded_identity_only and not self._bounded_internal_scan
+        ):
             return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
         return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
 

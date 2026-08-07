@@ -2517,6 +2517,54 @@ def test_filter_value_cursor_pushes_key_and_search_into_candidate_query():
     assert candidate.params["attribute_search"] == "Rechazado"
 
 
+def test_filter_value_cursor_search_yields_verified_prefix_without_filling_page():
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"match-{index}",
+            start_time=NOW - timedelta(seconds=index + 1),
+        )
+        for index in range(3)
+    ]
+    by_id = {str(row["id"]): row for row in candidates}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            return _keyset_candidate_page(candidates, call)
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=by_id[span_id]["trace_id"],
+                start_time=by_id[span_id]["start_time"],
+                string="Rechazado",
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="rechazado",
+        attribute_type="string",
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+    )
+
+    assert read.rows == (AttributeValueRow("Rechazado", "string", 3),)
+    assert read.metadata.query_complete is True
+    assert read.metadata.query_status == "complete"
+    assert read.has_more is True
+    assert read.browse_status == "continuation"
+    assert read.next_segment_end == NOW - timedelta(hours=6)
+    assert read.next_before_identity is None
+    assert len(executor.calls) == 2
+
+
 def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation():
     candidates = [
         _candidate(
@@ -2553,8 +2601,9 @@ def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation()
             for span_id in call.params["candidate_ids_0"]
         ]
 
+    executor = RecordingExecutor(respond)
     read = AttributeReadSelector(
-        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+        executor, now=NOW, json_attribute_mode="arrays"
     ).read_value_cursor_page(
         [PROJECT_A],
         "call.status",
@@ -2574,6 +2623,8 @@ def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation()
     assert read.metadata.query_complete is True
     assert read.metadata.query_status == "complete"
     assert read.metadata.query_error_code is None
+    assert read.metadata.query_count == (2 * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES)
+    assert len(executor.calls) == 2 * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
     assert read.has_more is True
     assert read.next_before_identity == (
         PROJECT_A,
@@ -2599,14 +2650,7 @@ def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation()
 
 
 def test_filter_value_cursor_resumed_low_diversity_page_respects_query_ceiling():
-    """A resume replay must leave room for candidate/latest-state pairs.
-
-    Fifteen candidate pages normally consume the selector's full 30-query
-    allowance. A resumed row adds one verification first, so the last pair
-    must be deferred to the next continuation instead of attempting query 31.
-    Dense status-like data reproduces the production shape: every replayed row
-    has a value the cursor has already emitted.
-    """
+    """A resumed low-diversity page stays inside its finite request ceiling."""
 
     resume_time = NOW - timedelta(seconds=1)
     resume_identity = (
@@ -2682,8 +2726,9 @@ def test_filter_value_cursor_resumed_low_diversity_page_respects_query_ceiling()
     assert read.rows == ()
     assert read.has_more is True
     assert read.browse_status == "continuation"
-    assert read.metadata.query_count == ATTRIBUTE_READ_MAX_QUERY_COUNT - 1
-    assert len(executor.calls) == ATTRIBUTE_READ_MAX_QUERY_COUNT - 1
+    expected_queries = 1 + (2 * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES)
+    assert read.metadata.query_count == expected_queries
+    assert len(executor.calls) == expected_queries
 
 
 def test_filter_value_cursor_reports_truthful_server_state_limit():

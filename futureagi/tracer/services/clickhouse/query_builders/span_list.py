@@ -104,6 +104,15 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     # Filter compiler class; the v2 list builder overrides this to the v2
     # builder so it reads the v2 dimension tables (end_users, etc.).
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilder
+    # Legacy spans are partitioned by arrival time, so retain that pruning
+    # guard in addition to the public event-time window. The CH25 subclass
+    # overrides this fragment because its direct-write table is partitioned
+    # and ordered by ``start_time`` and has no useful ``created_at`` index.
+    _NORMAL_TIME_WHERE = (
+        "AND created_at >= %(start_date)s - INTERVAL 1 DAY "
+        "AND start_time >= %(start_date)s "
+        "AND start_time < %(end_date)s"
+    )
 
     @staticmethod
     def _normalize_span_entities(
@@ -1441,9 +1450,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 created_at
             FROM {self.TABLE}
             {self.project_where()}
-              AND created_at >= %(start_date)s - INTERVAL 1 DAY
-              AND start_time >= %(start_date)s
-              AND start_time < %(end_date)s
+              {self._NORMAL_TIME_WHERE}
               {slice_fragment}
               {pv_fragment}
               {filter_fragment}
@@ -1513,9 +1520,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             created_at
         FROM {self.TABLE}
         {self.project_where()}
-          AND created_at >= %(start_date)s - INTERVAL 1 DAY
-          AND start_time >= %(start_date)s
-          AND start_time < %(end_date)s{datetime_fragment}
+          {self._NORMAL_TIME_WHERE}{datetime_fragment}
           {slice_fragment}
           {end_user_fragment}
           {pv_fragment}
@@ -1553,11 +1558,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 self.params["created_at_ceiling"] = created_at_ceiling
                 time_where += " AND created_at < %(created_at_ceiling)s"
         else:
-            time_where = (
-                "AND created_at >= %(start_date)s - INTERVAL 1 DAY "
-                "AND start_time >= %(start_date)s "
-                "AND start_time < %(end_date)s"
-            )
+            time_where = self._NORMAL_TIME_WHERE
         self.params["start_date"] = start_date
         self.params["end_date"] = end_date
 
@@ -1751,9 +1752,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                     SELECT id, end_user_id
                     FROM {self.TABLE}
                     {self.project_where()}
-                      AND created_at >= %(start_date)s - INTERVAL 1 DAY
-                      AND start_time >= %(start_date)s
-                      AND start_time < %(end_date)s{datetime_fragment}
+                      {self._NORMAL_TIME_WHERE}{datetime_fragment}
                       {pv_fragment}
                       {filter_fragment}
                 ) AS rs
@@ -1767,9 +1766,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         SELECT count() AS total
         FROM {self.TABLE}
         {self.project_where()}
-          AND created_at >= %(start_date)s - INTERVAL 1 DAY
-          AND start_time >= %(start_date)s
-          AND start_time < %(end_date)s{datetime_outer_fragment}
+          {self._NORMAL_TIME_WHERE}{datetime_outer_fragment}
           {end_user_fragment}
           {pv_fragment}
           {filter_fragment}

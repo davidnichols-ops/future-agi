@@ -111,7 +111,13 @@ ATTRIBUTE_READ_MAX_PROJECTS = 64
 # an unbounded distinct scan.
 ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE = 50
 ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT = 64
-ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 15
+# One cursor request is a responsive, exact prefix read rather than a request
+# to exhaust the vocabulary.  Four candidate/latest-state pairs cover up to
+# 256 newest matching physical spans, then publish a continuation.  The former
+# 15-pair ceiling let low-cardinality values (for example one status repeated
+# across every call) consume the whole five-second API wall while trying to
+# fill ten distinct options that did not exist.
+ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 4
 # De-duplication state lives in immutable server-side chunks.  The signed URL
 # therefore remains fixed width while pagination can continue until the frozen
 # physical window is exhausted; there is no vocabulary-count ceiling.
@@ -3282,9 +3288,21 @@ class AttributeReadSelector:
                 break
             if segment_truncated and candidate_ids:
                 cursor_before = candidate_ids[-1]
-                continue
-            current_segment_end = segment_start
-            cursor_before = None
+            else:
+                current_segment_end = segment_start
+                cursor_before = None
+
+            # Search is an interactive narrowing operation.  Once one bounded
+            # physical batch has produced verified matches, return that exact
+            # newest-first prefix immediately and let the signed continuation
+            # browse older matches.  Continuing merely to fill ``page_size``
+            # is especially harmful for exact/manual searches with one unique
+            # value: it cannot improve the current prefix but can consume the
+            # request wall.  No global exhaustion is inferred here; unless the
+            # frozen window was actually exhausted, ``browse_status`` below is
+            # ``continuation``.
+            if needle and emitted:
+                break
 
         exhausted = current_segment_end <= start and next_resume_identity is None
         seen_after = (*seen, *emitted_digests)

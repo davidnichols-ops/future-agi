@@ -405,12 +405,15 @@ def test_long_window_trace_uses_exact_latest_anchor_over_full_root_batch() -> No
 
     assert builder.recommended_filter_seed_batch_size() == 512
     assert builder.recommended_filter_classify_batch_size() == 100
-    assert builder.skip_full_window_filter_anchor_probe() is False
-    assert builder.recommended_filter_anchor_probe_limit() == 64
-    assert builder.recommended_filter_anchor_probe_timeout_ms() == 900
-    assert builder.recommended_filter_anchor_probe_strata() == 4
+    assert builder.skip_full_window_filter_anchor_probe() is True
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
+    assert builder.recommended_filter_anchor_probe_strata() is None
+    assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
     assert (
-        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 192 * 1024 * 1024
+        builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
+        == 100
     )
     assert builder.recommended_filter_classify_read_settings() is None
 
@@ -584,17 +587,14 @@ def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
     assert params["filter_candidate_start_us"] == 1_735_689_600_000_000
     assert params["filter_candidate_end_us"] == 1_767_225_600_000_000
     assert params["latest_filter_key_0"] == "final_status"
-    assert builder.prefer_filter_candidate_witness_probe_first() is True
-    assert builder.recommended_filter_candidate_witness_probe_strata() == 1
-    assert builder.recommended_filter_candidate_witness_probe_timeout_ms() == 1_500
-    assert (
-        builder.recommended_filter_candidate_witness_probe_max_bytes()
-        == 256 * 1024 * 1024
-    )
-    assert builder.recommended_filter_candidate_witness_probe_total_ms() == 4_500
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
+    assert builder.recommended_filter_candidate_witness_probe_strata() is None
+    assert builder.recommended_filter_candidate_witness_probe_timeout_ms() is None
+    assert builder.recommended_filter_candidate_witness_probe_max_bytes() is None
+    assert builder.recommended_filter_candidate_witness_probe_total_ms() is None
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
-        == 20
+        == 100
     )
 
     slice_start = START + timedelta(days=100)
@@ -735,7 +735,7 @@ def test_trace_candidate_latest_anchor_prefilters_multi_filter_and() -> None:
         [{"trace_id": "trace-a"}]
     )
 
-    assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
     assert "latest_filter_key_0" in probe_sql
     assert "latest_filter_key_1" not in probe_sql
     assert "latest_filter_key_0" in classifier_sql
@@ -790,11 +790,11 @@ def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
     # the high-read phase and must be split independently.
     assert builder.recommended_filter_seed_batch_size() == 200
     assert builder.recommended_filter_classify_batch_size() == 20
-    assert builder.recommended_filter_anchor_probe_limit() == 64
-    assert builder.recommended_filter_anchor_probe_timeout_ms() == 900
-    assert (
-        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 192 * 1024 * 1024
-    )
+    assert builder.skip_full_window_filter_anchor_probe() is True
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
+    assert builder.recommended_filter_anchor_probe_strata() is None
+    assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
     assert (
         builder.supports_filter_candidate_witness_prefilter_without_hydration() is False
     )
