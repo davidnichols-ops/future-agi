@@ -313,7 +313,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.filter_seed_proves_result_order() is False
     assert builder.filter_cursor_seed_keyset_is_safe() is True
     assert builder.recommended_filter_seed_batch_size() == 512
-    assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_classify_batch_size() == 80
     assert builder.recommended_filter_initial_slice_width() == timedelta(hours=1)
 
 
@@ -404,7 +404,7 @@ def test_long_window_trace_uses_exact_latest_anchor_over_full_root_batch() -> No
     )
 
     assert builder.recommended_filter_seed_batch_size() == 512
-    assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_classify_batch_size() == 80
     assert builder.skip_full_window_filter_anchor_probe() is True
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
@@ -413,8 +413,9 @@ def test_long_window_trace_uses_exact_latest_anchor_over_full_root_batch() -> No
     assert builder.prefer_filter_candidate_witness_probe_first() is False
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
-        == 100
+        == 80
     )
+    assert builder.recommended_filter_page_hydration_reserve_ms() == 750
     assert builder.recommended_filter_classify_read_settings() is None
 
 
@@ -494,7 +495,7 @@ def test_extreme_structured_multifilter_keeps_scalar_fast_path_independent() -> 
         ],
     )
 
-    assert simple_builder.recommended_filter_classify_batch_size() == 100
+    assert simple_builder.recommended_filter_classify_batch_size() == 80
     assert simple_builder.recommended_filter_classify_read_settings() is None
     assert structured_builder.recommended_filter_classify_batch_size() == 20
     assert structured_builder.recommended_filter_classify_read_settings() == {
@@ -594,7 +595,7 @@ def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
     assert builder.recommended_filter_candidate_witness_probe_total_ms() is None
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
-        == 100
+        == 80
     )
 
     slice_start = START + timedelta(days=100)
@@ -8478,6 +8479,46 @@ def test_candidate_witness_read_failure_falls_back_to_exact_classifier() -> None
         "classify",
         "classify",
     ]
+
+
+def test_disabled_candidate_witness_stays_disabled_after_empty_classifier() -> None:
+    class DisabledWitnessBuilder(_CandidateWitnessHydrationFakeBuilder):
+        @staticmethod
+        def prefer_filter_candidate_witness_probe_first():
+            return False
+
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(4)
+    ]
+    builder = DisabledWitnessBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=2,
+        recommended_seed_batch_size=2,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.rows == []
+    assert "prefilter" not in [query for query, _ in executor.calls]
+    assert len([query for query, _ in executor.calls if query == "match_identity"]) == 2
 
 
 def test_candidate_witness_skips_probe_without_enforced_query_limits() -> None:

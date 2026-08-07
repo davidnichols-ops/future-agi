@@ -1488,12 +1488,16 @@ def read_bounded_filter_page(
                 if (
                     identity_only_classification
                     and callable(candidate_witness_probe_builder)
+                    and callable(candidate_witness_probe_preference)
+                    and candidate_witness_probe_preference()
                     and not candidate_witness_probe_abandoned
                     and not match_result.data
                 ):
                     # Keep the prefilter enabled after an exact zero-yield
-                    # batch. This also covers builders that elect to expose a
-                    # safe probe only after observing their first batch.
+                    # batch only for builders that explicitly prefer it. This
+                    # also covers builders that elect to expose a safe probe
+                    # only after observing their first batch without
+                    # re-enabling a disabled interactive-list optimization.
                     candidate_witness_probe_enabled = True
 
                 if (

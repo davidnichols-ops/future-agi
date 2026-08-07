@@ -74,18 +74,22 @@ _INDEXED_TRACE_ANY_SPAN_ANCHOR_COLUMNS = frozenset(
 # remain independently capped and may still acquire 200 identities at once.
 _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE = 20
 
+# Historical task/eval population proofs classify membership only and replay
+# witnesses separately.  The 100-identity envelope is production-qualified for
+# that internal bulk shape and keeps 10k+sentinel proofs within 128 queries.
+_BULK_IDENTITY_CLASSIFY_BATCH_SIZE = 100
+
 # Normal trace pages classify identities only and hydrate at most the final
-# public page in a separate bounded statement. Classifying 100 identities per
-# statement halves sparse long-window round trips. The witness-free historical
-# eval membership phase independently qualified the same 100-identity envelope;
-# graph, navigation, witness-carrying, and other explicitly identity-only modes
-# keep their separate limits. Every selector still enforces its independent
-# 256 MiB/512 MiB memory/read caps and fails closed on either limit.
-_NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE = 100
+# public page in a separate bounded statement.  Production replay showed that
+# 100 candidates can cross the interactive statement deadline on the largest
+# tenant; 80 keeps the same exact membership/order semantics while leaving the
+# page hydration query enough wall time.  Bulk population proofs retain their
+# independently qualified 100-identity envelope above.
+_NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE = 80
 
 # Structured span attributes are decoded from ``span_attributes_raw`` during
 # latest-state replay.  They can also be combined with the native typed Maps,
-# so the normal 100-trace identity batch can make ClickHouse materialize too
+# so even the normal 80-trace identity batch can make ClickHouse materialize too
 # many ColumnMap/JSON vectors at once.  Keep those classifiers on the existing
 # production-safe twenty-trace envelope and reduce their input block fourfold.
 # This changes only physical query chunking; every candidate still goes through
@@ -796,7 +800,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         if self._structured_attribute_filter_count() and not self._bounded_bulk_scan:
             # Interactive trace lists and graphs otherwise widen identity-only
-            # classification to 100. Structured JSON/Map replay must stay on
+            # classification to 80. Structured JSON/Map replay must stay on
             # the twenty-trace envelope even when a scalar leaf supplies an
             # indexed seed. Internal eval/task bulk scans retain their
             # separately qualified 100-identity population-proof envelope so
@@ -809,7 +813,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             # A call-type classifier parses JSON for every physical span of
             # each candidate trace. Keep the same twenty-trace envelope already
             # qualified by the bounded graph union instead of allowing the
-            # identity-only list/eval fast path to widen it to one hundred.
+            # identity-only list/eval fast paths to widen it beyond twenty.
             return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
         # Explicit identity-only consumers retain their established envelopes.
         # A historical task can opt into membership-only classification and
@@ -821,9 +825,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     # Population-proof classifiers may attach witnesses in the
                     # same exact pass. Production-qualified 100-trace batches
                     # keep the complete 10k+sentinel proof within 128 queries.
-                    return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
+                    return _BULK_IDENTITY_CLASSIFY_BATCH_SIZE
                 if not self._bounded_include_filter_witnesses:
-                    return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
+                    return _BULK_IDENTITY_CLASSIFY_BATCH_SIZE
                 return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
             return 200
         request_start, request_end = self._bounded_request_window
@@ -863,7 +867,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def recommended_filter_page_hydration_reserve_ms() -> int:
         """Reserve one bounded statement for exact-root page hydration."""
 
-        return 300
+        return 750
 
     def bounded_filter_seed_identity(
         self, row: dict[str, Any]
@@ -1194,8 +1198,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         Normal interactive lists already classify membership/order identities
         and hydrate only the final page.  On the largest production tenants,
         their optional witness collapse exceeded its row/byte cap and forced a
-        twenty-identity fallback even though the same identity classifier is
-        qualified for one hundred candidates.  Bypass that redundant probe for
+        twenty-identity fallback even though the interactive identity classifier
+        is qualified for 80 candidates.  Bypass that redundant probe for
         hydrated lists; the historical membership-only bulk reader retains it
         because it buffers candidates across slices before one exact replay.
         """
@@ -1242,16 +1246,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         The probe may be unavailable on a locked profile, fail one temporal
         stratum, or find a broad value. Normal hydrated lists and
-        membership-only bulk evals both use the independently qualified
-        100-identity classifier when that exact projection is safe. Other
-        internal any-span shapes retain the smaller 20-identity envelope.
+        membership-only bulk evals use the independently qualified
+        100-identity classifier; normal hydrated lists use the safer
+        80-identity interactive envelope. Other internal any-span shapes
+        retain the smaller 20-identity envelope.
         """
 
         if self._candidate_witness_anchor_plan() is None:
             return None
-        if self.supports_filter_candidate_witness_prefilter_without_hydration() or (
-            not self._bounded_identity_only and not self._bounded_internal_scan
-        ):
+        if self.supports_filter_candidate_witness_prefilter_without_hydration():
+            return _BULK_IDENTITY_CLASSIFY_BATCH_SIZE
+        if not self._bounded_identity_only and not self._bounded_internal_scan:
             return _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE
         return _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
 
