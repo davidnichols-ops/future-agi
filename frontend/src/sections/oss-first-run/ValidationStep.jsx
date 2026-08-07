@@ -24,6 +24,7 @@ import {
   CHECK_STATUS,
   CHECK_REVEAL_STAGGER_MS,
   CONNECTION_STATE,
+  LAUNCH_MODE,
 } from "./constants";
 
 const { PENDING, PASSED, WARNING, FAILED, SKIPPED } = CHECK_STATUS;
@@ -35,6 +36,10 @@ const FAST_POLL_WINDOW_MS = 30000;
 
 // The server caches a snapshot for 3s, so anything faster is wasted.
 const UNSETTLED_POLL_MS = 5000;
+
+// A cached snapshot comes back in milliseconds, so a spinner tied purely to the
+// request would flash and read as a dead button. Hold it for one full turn.
+const REVALIDATE_MIN_SPIN_MS = 900;
 
 // How long a snapshot may go unchanged before polling gives up and leaves it
 // to the re-run controls.
@@ -84,16 +89,17 @@ export default function ValidationStep({
   const [expanded, setExpanded] = useState(true);
   const [revealCount, setRevealCount] = useState(0);
   const [pollInterval, setPollInterval] = useState(FAST_POLL_MS);
+  const [revalidating, setRevalidating] = useState(false);
   const unreachableSince = useRef(null);
   const timers = useRef([]);
   const hasStaggered = useRef(false);
   const lastSignature = useRef(null);
   const stalledSince = useRef(null);
+  const spinTimer = useRef(null);
 
-  const { data, isError, isFetching, refetch, errorUpdatedAt } = useSetupChecks(
-    mode,
-    { refetchInterval: pollInterval },
-  );
+  const { data, isError, refetch, errorUpdatedAt } = useSetupChecks(mode, {
+    refetchInterval: pollInterval,
+  });
 
   const checks = useMemo(() => data?.checks ?? [], [data]);
 
@@ -150,6 +156,21 @@ export default function ValidationStep({
     timers.current.forEach(clearTimeout);
     timers.current = [];
   }, []);
+
+  const handleRevalidate = useCallback(() => {
+    setRevalidating(true);
+    const startedAt = performance.now();
+    const stopSpinning = () => {
+      const elapsed = performance.now() - startedAt;
+      spinTimer.current = setTimeout(
+        () => setRevalidating(false),
+        Math.max(0, REVALIDATE_MIN_SPIN_MS - elapsed),
+      );
+    };
+    refetch().then(stopSpinning, stopSpinning);
+  }, [refetch]);
+
+  useEffect(() => () => clearTimeout(spinTimer.current), []);
 
   // First response only — re-animating every poll would restart the rows under
   // the reader.
@@ -243,10 +264,24 @@ export default function ValidationStep({
     };
   }
 
-  // No check result blocks; the only bar is having a snapshot at all.
-  const blocked = !reachable || !checks.length;
+  // Only live mode blocks on results, and only on FAILED: in that mode the
+  // server downgrades every non-required check to a warning, so this is exactly
+  // its required set.
+  const hasFailure = useMemo(
+    () => checks.some((check) => check.status === FAILED),
+    [checks],
+  );
+  const blockedByFailure = mode === LAUNCH_MODE.LIVE && hasFailure;
 
-  const rerunDisabled = isFetching || stillRevealing;
+  const blocked =
+    !reachable || !checks.length || stillRevealing || blockedByFailure;
+
+  const rerunDisabled = stillRevealing || revalidating;
+
+  const spinSx = {
+    "@keyframes revalidateSpin": { to: { transform: "rotate(360deg)" } },
+    animation: revalidating ? "revalidateSpin 0.8s linear infinite" : "none",
+  };
 
   const renderHead = (
     <Stack sx={{ mb: 2.5 }}>
@@ -327,10 +362,10 @@ export default function ValidationStep({
               <IconButton
                 size="small"
                 disabled={rerunDisabled}
-                onClick={() => refetch()}
+                onClick={handleRevalidate}
                 sx={{ color: "text.primary", flexShrink: 0 }}
               >
-                <Iconify icon="solar:refresh-linear" width={16} />
+                <Iconify icon="solar:refresh-linear" width={16} sx={spinSx} />
               </IconButton>
             </span>
           </Tooltip>
@@ -410,7 +445,7 @@ export default function ValidationStep({
           alignItems="center"
           justifyContent="center"
           spacing={1}
-          onClick={rerunDisabled ? undefined : () => refetch()}
+          onClick={rerunDisabled ? undefined : handleRevalidate}
           sx={{
             px: 2,
             py: 1.5,
@@ -418,14 +453,16 @@ export default function ValidationStep({
             borderColor: "divider",
             cursor: rerunDisabled ? "default" : "pointer",
             color: rerunDisabled ? "text.disabled" : "text.primary",
+            userSelect: "none",
+            transition: "background-color 0.2s ease",
             "&:hover": {
               bgcolor: rerunDisabled ? "transparent" : "action.hover",
             },
           }}
         >
-          <Iconify icon="solar:refresh-linear" width={16} />
+          <Iconify icon="solar:refresh-linear" width={16} sx={spinSx} />
           <Typography variant="s2_1" fontWeight="fontWeightSemiBold">
-            Validate requirements
+            {revalidating ? "Validating…" : "Validate requirements"}
           </Typography>
         </Stack>
       </Collapse>
@@ -448,6 +485,14 @@ export default function ValidationStep({
         >
           Continue
         </LoadingButton>
+        {blockedByFailure && !stillRevealing && (
+          <Typography
+            variant="s2_1"
+            sx={{ color: "error.main", textAlign: "center", pt: 0.5 }}
+          >
+            Resolve the failed checks to continue in live mode.
+          </Typography>
+        )}
         <LoadingButton
           fullWidth
           variant="text"
