@@ -3337,3 +3337,170 @@ def test_org_trace_candidate_identity_tuple_executes_on_ch25(
         (project_a, trace_id),
         (project_b, trace_id),
     }
+
+
+def test_trace_candidate_typed_map_prefilter_executes_exact_latest_state_on_ch25(
+    ch_client, bounded_span_table
+) -> None:
+    """The finite witness prefilter is tenant/time scoped and latest-state exact."""
+
+    project_id = "00000000-0000-4000-8000-000000000601"
+    other_project_id = "00000000-0000-4000-8000-000000000602"
+    window_start = datetime(2025, 1, 2, 10, 0, tzinfo=UTC)
+    window_end = window_start + timedelta(hours=1)
+
+    def span_version(
+        trace_id: str,
+        span_id: str,
+        start_time: datetime,
+        version: int,
+        *,
+        value: str | None,
+        deleted: int = 0,
+        tenant: str = project_id,
+    ) -> tuple[object, ...]:
+        return (
+            span_id,
+            tenant,
+            trace_id,
+            None,
+            start_time,
+            start_time,
+            deleted,
+            version,
+            {"final_status": value} if value is not None else {},
+        )
+
+    ch_client.execute(
+        f"""
+        INSERT INTO {bounded_span_table}
+            (id, project_id, trace_id, parent_span_id, start_time, created_at,
+             is_deleted, _version, attrs_string)
+        VALUES
+        """,
+        [
+            # A historical matching value is not sufficient once the latest
+            # version of the same physical span clears the key.
+            span_version(
+                "trace-cleared",
+                "span-cleared",
+                window_start + timedelta(minutes=10),
+                1,
+                value="Rejected",
+            ),
+            span_version(
+                "trace-cleared",
+                "span-cleared",
+                window_start + timedelta(minutes=10),
+                2,
+                value=None,
+            ),
+            # A latest tombstone removes an otherwise matching span.
+            span_version(
+                "trace-tombstoned",
+                "span-tombstoned",
+                window_start + timedelta(minutes=20),
+                1,
+                value="Rejected",
+            ),
+            span_version(
+                "trace-tombstoned",
+                "span-tombstoned",
+                window_start + timedelta(minutes=20),
+                2,
+                value="Rejected",
+                deleted=1,
+            ),
+            # A corrected latest value is included.
+            span_version(
+                "trace-live",
+                "span-live",
+                window_start + timedelta(minutes=30),
+                1,
+                value="Pending",
+            ),
+            span_version(
+                "trace-live",
+                "span-live",
+                window_start + timedelta(minutes=30),
+                2,
+                value="Rejected",
+            ),
+            # The lower bound is inclusive.
+            span_version(
+                "trace-at-start",
+                "span-at-start",
+                window_start,
+                1,
+                value="Rejected",
+            ),
+            # The upper bound is exclusive.
+            span_version(
+                "trace-at-end",
+                "span-at-end",
+                window_end,
+                1,
+                value="Rejected",
+            ),
+            # A matching row under another tenant cannot leak through even
+            # when its trace id was supplied as a candidate.
+            span_version(
+                "trace-foreign",
+                "span-foreign",
+                window_start + timedelta(minutes=40),
+                1,
+                value="Rejected",
+                tenant=other_project_id,
+            ),
+        ],
+    )
+
+    filters = [
+        {
+            "column_id": "created_at",
+            "filter_config": {
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [window_start.isoformat(), window_end.isoformat()],
+            },
+        },
+        {
+            "column_id": "final_status",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "Rejected",
+            },
+        },
+    ]
+
+    class LocalTraceBuilder(TraceListQueryBuilderV2):
+        TABLE = bounded_span_table
+
+    candidate_rows = [
+        {"trace_id": trace_id}
+        for trace_id in (
+            "trace-cleared",
+            "trace-tombstoned",
+            "trace-live",
+            "trace-at-start",
+            "trace-at-end",
+            "trace-foreign",
+        )
+    ]
+    query, params = LocalTraceBuilder(
+        project_id=project_id,
+        filters=filters,
+    ).build_filter_candidate_witness_probe(candidate_rows)
+
+    # These are v2-only names. Their presence proves the inherited v1 builder
+    # crossed the V2RewriteMixin boundary before the statement was executed.
+    assert "attrs_string" in query
+    assert "_version" in query
+    assert "span_attr_str" not in query
+    assert "_peerdb_version" not in query
+
+    rows = ch_client.execute(query, params)
+
+    assert {row[0] for row in rows} == {"trace-live", "trace-at-start"}

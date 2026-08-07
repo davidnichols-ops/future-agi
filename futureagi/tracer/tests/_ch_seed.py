@@ -336,6 +336,7 @@ _SCORE_INSERT_COLUMNS = [
     "prototype_run_id",
     "queue_item_id",
     "project_id",
+    "tracer_project_id",
     "label_id",
     "value",
     "annotator_id",
@@ -365,7 +366,9 @@ def _score_row_from_django(score: Any) -> tuple:
 
     now = datetime.now(UTC)
 
-    # Resolve project_id — try Score.project_id first, then walk source FKs.
+    # ``project_id`` belongs to model_hub.DevelopAI. Keep its existing fallback
+    # for legacy test rows, but derive the tracer tenant fence independently:
+    # a non-null DevelopAI id is not interchangeable with tracer.Project.id.
     project_id = getattr(score, "project_id", None)
     if project_id is None:
         for attr in ("trace", "observation_span", "trace_session", "call_execution"):
@@ -373,6 +376,15 @@ def _score_row_from_django(score: Any) -> tuple:
             if source is not None:
                 project_id = getattr(source, "project_id", None)
                 if project_id is not None:
+                    break
+
+    tracer_project_id = getattr(score, "tracer_project_id", None)
+    if tracer_project_id is None:
+        for attr in ("trace", "observation_span", "trace_session"):
+            source = getattr(score, attr, None)
+            if source is not None:
+                tracer_project_id = getattr(source, "project_id", None)
+                if tracer_project_id is not None:
                     break
 
     def _uuid_or_none(val: Any) -> Any:
@@ -395,6 +407,7 @@ def _score_row_from_django(score: Any) -> tuple:
         _uuid_or_none(score.prototype_run_id),
         _uuid_or_none(score.queue_item_id),
         _uuid_or_none(project_id),
+        _uuid_or_none(tracer_project_id),
         str(score.label_id),
         value_json,
         _uuid_or_none(score.annotator_id),

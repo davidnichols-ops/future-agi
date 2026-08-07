@@ -13,6 +13,7 @@ faked so the *wiring* is asserted deterministically without a live ClickHouse.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 from structlog.testing import capture_logs
@@ -30,6 +31,30 @@ from model_hub.services.bulk_selection import (
     resolve_filtered_trace_ids,
 )
 from tracer.models.project import Project
+
+
+def _patched_empty_eval_metadata():
+    empty_configs = mock.MagicMock()
+    empty_configs.exists.return_value = False
+    empty_configs.filter.return_value = empty_configs
+    empty_configs.values_list.return_value = []
+    config_manager = mock.MagicMock()
+    config_manager.filter.return_value = empty_configs
+
+    empty_templates = mock.MagicMock()
+    empty_templates.values.return_value.first.return_value = None
+    template_manager = mock.MagicMock()
+    template_manager.filter.return_value = empty_templates
+    return (
+        mock.patch(
+            "tracer.models.custom_eval_config.CustomEvalConfig.objects",
+            config_manager,
+        ),
+        mock.patch(
+            "model_hub.models.evals_metric.EvalTemplate.no_workspace_objects",
+            template_manager,
+        ),
+    )
 
 
 class _FakeResult:
@@ -520,9 +545,11 @@ def test_real_trace_builder_keeps_candidate_scoped_residual_filters(
         bounded_bulk_scan=True,
     )
 
-    assert builder.supports_bounded_filter_scan() is True
-    assert builder.recommended_filter_classify_batch_size() == 200
-    query, params = builder.build_filter_match_query(["trace-candidate"])
+    config_patch, template_patch = _patched_empty_eval_metadata()
+    with config_patch, template_patch:
+        assert builder.supports_bounded_filter_scan() is True
+        assert builder.recommended_filter_classify_batch_size() == 200
+        query, params = builder.build_filter_match_query(["trace-candidate"])
     assert expected_fragment in query
     assert "candidate_trace_ids" in query
     assert params["candidate_trace_ids"] == ("trace-candidate",)

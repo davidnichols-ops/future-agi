@@ -104,7 +104,7 @@ _LONG_WINDOW_ANCHOR_SENTINEL = 64
 _LONG_WINDOW_ANCHOR_TIMEOUT_MS = 900
 _LONG_WINDOW_ANCHOR_STRATA = 4
 _LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 192 * 1024 * 1024
-_LONG_WINDOW_CANDIDATE_WITNESS_STRATA = 8
+_LONG_WINDOW_CANDIDATE_WITNESS_STRATA = 1
 _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH = timedelta(minutes=5)
 _UNINDEXED_POSITIVE_MICRO_SEED_STRATA = 4
 _CANONICAL_TRACE_ID_SEED_PREDICATE = re.compile(
@@ -748,6 +748,18 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if request_end - request_start > timedelta(hours=1) and any(
             plan.scope == "any" for plan in plans
         ):
+            # A positive typed-Map leaf can first resolve its latest state for
+            # the complete finite root batch.  Acquire the selector's full
+            # working set so a sparse value does not pay three root reads before
+            # that exact prefilter can remove stale historical witnesses.
+            if (
+                not self._bounded_identity_only
+                and not self._bounded_internal_scan
+                and not self.search
+                and len(self._active_non_time_filters()) == 1
+                and self._positive_typed_map_anchor_plan() is not None
+            ):
+                return 512
             return 200
         return 50
 
@@ -1092,7 +1104,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return query, params
 
     def _candidate_witness_anchor_plan(self) -> LatestFilterPredicate | None:
-        """Return the raw predicate that is a complete candidate superset."""
+        """Return one exact-positive anchor that every final match must satisfy."""
 
         unsupported_internal_mode = (
             self._bounded_identity_only or self._bounded_internal_scan
@@ -1105,37 +1117,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             return None
 
         try:
-            plans, residual_filters = self._partition_trace_filter_plans(
-                self._bounded_filters()
-            )
+            anchor = self._positive_typed_map_anchor_plan()
         except (TypeError, ValueError):
             return None
-        active_filters = self._active_non_time_filters()
-        if len(active_filters) != 1 or len(plans) != 1 or residual_filters:
-            return None
-
-        item = active_filters[0]
-        config = item.get("filter_config") or item.get("filterConfig") or {}
-        if not isinstance(config, dict):
-            return None
-        column_type = str(config.get("col_type") or config.get("colType") or "").upper()
-        operation = normalize_filter_op(
-            str(config.get("filter_op") or config.get("filterOp") or "")
-        )
-        anchor = plans[0]
-        seed_predicate = " ".join(str(anchor.seed_predicate or "").split())
-        if (
-            column_type != "SPAN_ATTRIBUTE"
-            or operation not in {"equals", "in"}
-            or anchor.scope != "any"
-            or not self._plan_uses_indexed_anchor(anchor)
-            or "JSONExtract" in seed_predicate
-            or not re.search(
-                r"\bmapContains\(span_attr_(?:str|num|bool),",
-                seed_predicate,
-            )
-        ):
-            return None
+        # The full classifier still applies every other scalar, JSON, eval, and
+        # annotation leaf.  A single positive typed-Map equality/IN leaf is a
+        # necessary condition even in a multi-filter AND, so it is safe to use
+        # as an exact negative prefilter without changing public semantics.
         return anchor
 
     def supports_filter_candidate_witness_prefilter_without_hydration(self) -> bool:
@@ -1183,11 +1171,32 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         )
 
     def recommended_filter_candidate_witness_probe_strata(self) -> int | None:
-        """Split a long-window raw witness superset into finite time strata."""
+        """Resolve the finite candidate batch in one partition-pruned query."""
 
         if not self.prefer_filter_candidate_witness_probe_first():
             return None
         return _LONG_WINDOW_CANDIDATE_WITNESS_STRATA
+
+    def recommended_filter_candidate_witness_probe_timeout_ms(self) -> int | None:
+        """Give the finite latest-state anchor one normal CH statement budget."""
+
+        if not self.prefer_filter_candidate_witness_probe_first():
+            return None
+        return 1_500
+
+    def recommended_filter_candidate_witness_probe_max_bytes(self) -> int | None:
+        """Bound the wider finite candidate collapse below the list read cap."""
+
+        if not self.prefer_filter_candidate_witness_probe_first():
+            return None
+        return 256 * 1024 * 1024
+
+    def recommended_filter_candidate_witness_probe_total_ms(self) -> int | None:
+        """Reserve enough wall time for three sparse candidate batches."""
+
+        if not self.prefer_filter_candidate_witness_probe_first():
+            return None
+        return 4_500
 
     def recommended_filter_candidate_witness_fallback_classify_batch_size(
         self,
@@ -1214,14 +1223,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         slice_start: datetime | None = None,
         slice_end: datetime | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Return raw positive-Map witnesses for a finite trace batch.
+        """Return candidates satisfying one positive Map leaf at latest state.
 
-        This optional probe is deliberately narrower than the general latest-
-        state classifier. It remains finite at 512 identities and is a
-        complete *superset* only when the request has one positive typed-Map
-        equality/IN leaf: a trace whose latest live span satisfies that leaf
-        must have at least one raw live row satisfying the same leaf. Returned
-        identities still require latest-state classification.
+        Raw witnesses are not selective on update-heavy tenants: an old value
+        can admit nearly every trace even after a later version cleared it.
+        Collapse only the finite root-candidate batch by immutable physical span
+        identity and apply the anchor after ``argMax``.  This is an exact
+        negative prefilter for the anchor, not a final result: surviving traces
+        still pass the complete classifier (all leaves, live root, residual
+        relations) before publication.
         """
 
         if not isinstance(seed_rows, list) or not seed_rows or len(seed_rows) > 512:
@@ -1251,7 +1261,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             candidate_params: dict[str, Any] = {
                 "filter_candidate_trace_identities": candidate_identities,
             }
-            select_fragment = "project_id, trace_id"
             candidate_count = len(candidate_identities)
         else:
             if not self.project_id:
@@ -1274,7 +1283,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             candidate_params = {
                 "filter_candidate_trace_ids": candidate_trace_ids,
             }
-            select_fragment = "trace_id"
             candidate_count = len(candidate_trace_ids)
 
         request_start, request_end = self._bounded_request_window
@@ -1288,14 +1296,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             raise ValueError(
                 "candidate witness slice must stay inside the request window"
             )
-        witness_predicate = anchor.raw_witness_predicate
-        if not witness_predicate:
+        if not anchor.aggregates or not anchor.predicate:
             return "", {}
-        anchor_params = {
-            key: value
-            for key, value in anchor.params.items()
-            if f"%({key})s" in witness_predicate
-        }
+        anchor_params = dict(anchor.params)
         params: dict[str, Any] = {
             **self.params,
             **anchor_params,
@@ -1309,16 +1312,46 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             params["project_version_id"] = self.project_version_id
             project_version_fragment = "AND project_version_id = %(project_version_id)s"
 
+        grouped_project_select = (
+            "project_id AS grouped_project_id," if org_scope else ""
+        )
+        grouped_project_public = (
+            "grouped_project_id AS project_id," if org_scope else ""
+        )
+        physical_group_by = (
+            "project_id, trace_id, id, start_time"
+            if org_scope
+            else "trace_id, id, start_time"
+        )
+        aggregate_fragment = ",\n                    ".join(anchor.aggregates)
+        candidate_result_fragment = (
+            "AND (grouped_project_id, grouped_trace_id) "
+            "IN %(filter_candidate_trace_identities)s"
+            if org_scope
+            else "AND grouped_trace_id IN %(filter_candidate_trace_ids)s"
+        )
         query = f"""
-        SELECT DISTINCT {select_fragment}
-        FROM {self.TABLE}
-        PREWHERE {self.project_filter_sql()}
-          AND is_deleted = 0
-          {project_version_fragment}
-          {candidate_fragment}
-          AND start_time >= fromUnixTimestamp64Micro(%(filter_candidate_start_us)s)
-          AND start_time < fromUnixTimestamp64Micro(%(filter_candidate_end_us)s)
-        WHERE {witness_predicate}
+        SELECT DISTINCT
+            {grouped_project_public} grouped_trace_id AS trace_id
+        FROM (
+            SELECT
+                {grouped_project_select}
+                trace_id AS grouped_trace_id,
+                argMax(is_deleted, _peerdb_version) AS latest_is_deleted,
+                {aggregate_fragment}
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              {project_version_fragment}
+              {candidate_fragment}
+              AND toDate(start_time) >= toDate(fromUnixTimestamp64Micro(%(filter_candidate_start_us)s))
+              AND toDate(start_time) <= toDate(fromUnixTimestamp64Micro(%(filter_candidate_end_us)s))
+              AND start_time >= fromUnixTimestamp64Micro(%(filter_candidate_start_us)s)
+              AND start_time < fromUnixTimestamp64Micro(%(filter_candidate_end_us)s)
+            GROUP BY {physical_group_by}
+        ) AS latest_anchor_spans
+        WHERE latest_is_deleted = 0
+          {candidate_result_fragment}
+          AND ({anchor.predicate})
         LIMIT %(filter_candidate_witness_limit)s
         """
         return query, params

@@ -142,9 +142,16 @@ from tracer.utils.session import get_session_navigation
 logger = structlog.get_logger(__name__)
 session_logger = structlog.get_logger(__name__)
 
-SESSION_LIST_WALL_DEADLINE_MS = 3_000
-SESSION_LIST_QUERY_TIMEOUT_MS = 1_800
-SESSION_LIST_ENRICHMENT_TIMEOUT_MS = 900
+# Filtered sessions need one root seed plus finite all-span latest-state replay.
+# Keep the user-accepted 3-5 second envelope while reserving a full second for
+# page-scoped enrichments.  The selector remains independently bounded by the
+# finite statement/count/row/byte caps below; this is not a broad CH timeout.
+SESSION_LIST_WALL_DEADLINE_MS = 5_000
+SESSION_LIST_QUERY_TIMEOUT_MS = 3_800
+SESSION_LIST_ENRICHMENT_TIMEOUT_MS = 1_000
+SESSION_LIST_FILTER_MAX_CANDIDATES = 200
+SESSION_LIST_FILTER_MAX_SEED_ATTEMPTS = 24
+SESSION_LIST_FILTER_MAX_QUERIES = 48
 SESSION_LIST_READ_SETTINGS = {
     "max_threads": 2,
     "max_block_size": 8192,
@@ -1433,11 +1440,15 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 and bounded_numbered_page_depth_exceeded(
                     page_number=page_number,
                     page_size=page_size,
-                    max_candidates=200,
+                    max_candidates=SESSION_LIST_FILTER_MAX_CANDIDATES,
                     classify_batch_size=(
                         SessionListQueryBuilderV2.recommended_filter_classify_batch_size()
                     ),
-                    seed_batch_size=200,
+                    seed_batch_size=(
+                        SessionListQueryBuilderV2.recommended_filter_seed_batch_size()
+                    ),
+                    max_seed_attempts=SESSION_LIST_FILTER_MAX_SEED_ATTEMPTS,
+                    max_query_count=SESSION_LIST_FILTER_MAX_QUERIES,
                 )
             ):
                 session_logger.info(
@@ -2683,9 +2694,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 deadline_ms=read_deadline.remaining_ms(SESSION_LIST_QUERY_TIMEOUT_MS),
                 # Seed acquisition stays broad; exact attribute replay uses the
                 # builder's smaller production-safe classifier recommendation.
-                max_candidates=200,
+                max_candidates=SESSION_LIST_FILTER_MAX_CANDIDATES,
+                max_seed_attempts=SESSION_LIST_FILTER_MAX_SEED_ATTEMPTS,
+                max_query_count=SESSION_LIST_FILTER_MAX_QUERIES,
                 classify_batch_size=builder.recommended_filter_classify_batch_size(),
-                read_settings=_page_read_settings(200),
+                read_settings=_page_read_settings(SESSION_LIST_FILTER_MAX_CANDIDATES),
                 cursor_start_time=(
                     cursor_state.order[0] if cursor_state is not None else None
                 ),

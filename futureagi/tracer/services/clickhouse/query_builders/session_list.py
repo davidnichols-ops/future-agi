@@ -34,6 +34,11 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
     survivor_map_subquery,
 )
 
+_SESSION_FILTER_ANCHOR_SENTINEL = 64
+_SESSION_FILTER_ANCHOR_TIMEOUT_MS = 900
+_SESSION_FILTER_ANCHOR_STRATA = 4
+_SESSION_FILTER_ANCHOR_MAX_BYTES = 192 * 1024 * 1024
+
 
 class SessionListQueryBuilder(BaseQueryBuilder):
     """Build queries for the paginated session list view.
@@ -495,9 +500,9 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         )
         ctes = f""",
         candidate_eval_trace_ids AS (
-            SELECT DISTINCT toUUIDOrNull(trace_id) AS trace_id
+            SELECT DISTINCT trace_id
             FROM resolved_root_sessions
-            WHERE isNotNull(toUUIDOrNull(trace_id))
+            WHERE isNotNull(trace_id)
         ),
         latest_candidate_evals AS (
             SELECT
@@ -527,7 +532,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
 
     @staticmethod
     def _bounded_root_witness_plan(plans: list[Any] | tuple[Any, ...]):
-        """Choose the most selective safe raw-row witness deterministically."""
+        """Choose the most selective safe any-span witness deterministically."""
 
         candidates = [
             (
@@ -599,6 +604,119 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         """
 
         return True
+
+    def supports_filter_anchor_probe(self) -> bool:
+        """Use one positive any-span leaf only as an optional sparse probe.
+
+        The ordinary seed is deliberately root ordered so it can prove the
+        newest public page.  A positive raw witness cannot provide that order,
+        but an exhausted finite sentinel *does* provide the complete candidate
+        set.  The selector still replays every returned session through exact
+        latest state before publication; a full/slow sentinel is discarded and
+        falls back to the unchanged root-ordered path.
+        """
+
+        if self._bounded_sampling_rate is not None:
+            # Sampling is defined on the remap-resolved public session ID.  A
+            # raw-alias witness must not change that internal hash population.
+            return False
+        try:
+            plans, residual = self._bounded_span_filter_parts()
+            self._validate_bounded_relational_filters(residual)
+        except (TypeError, ValueError):
+            return False
+        return self._bounded_root_witness_plan(plans) is not None
+
+    def recommended_filter_anchor_probe_limit(self) -> int | None:
+        if not self.supports_filter_anchor_probe():
+            return None
+        return _SESSION_FILTER_ANCHOR_SENTINEL
+
+    def recommended_filter_anchor_probe_timeout_ms(self) -> int | None:
+        if not self.supports_filter_anchor_probe():
+            return None
+        return _SESSION_FILTER_ANCHOR_TIMEOUT_MS
+
+    def recommended_filter_anchor_probe_strata(self) -> int | None:
+        if not self.supports_filter_anchor_probe():
+            return None
+        return _SESSION_FILTER_ANCHOR_STRATA
+
+    def recommended_filter_anchor_probe_max_bytes_to_read(self) -> int | None:
+        if not self.supports_filter_anchor_probe():
+            return None
+        return _SESSION_FILTER_ANCHOR_MAX_BYTES
+
+    def build_filter_anchor_probe(
+        self,
+        *,
+        limit: int,
+        slice_start: datetime | None = None,
+        slice_end: datetime | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return a finite raw any-span witness sentinel for sparse filters.
+
+        Every latest-live match necessarily has a physical live row satisfying
+        the chosen positive witness.  Historical matches are harmless false
+        positives because ``build_filter_match_query`` remains authoritative.
+        """
+
+        if limit <= 0 or limit > 512:
+            # Partitioned probes share one aggregate sentinel.  Earlier strata
+            # may consume all but its final slot, so the last statement must be
+            # allowed to ask for exactly one row; returning it means the shared
+            # sentinel was reached and the exact ordered fallback takes over.
+            raise ValueError(
+                "session anchor limit must stay inside the bounded sentinel"
+            )
+        request_start, request_end = self.parse_time_range(self.filters)
+        if (slice_start is None) != (slice_end is None):
+            raise ValueError("session anchor slice values must be provided together")
+        anchor_start = request_start if slice_start is None else slice_start
+        anchor_end = request_end if slice_end is None else slice_end
+        if not request_start <= anchor_start < anchor_end <= request_end:
+            raise ValueError("session anchor slice must stay inside request window")
+
+        plans, residual = self._bounded_span_filter_parts()
+        self._validate_bounded_relational_filters(residual)
+        anchor = self._bounded_root_witness_plan(plans)
+        if anchor is None or not anchor.raw_witness_predicate:
+            raise ValueError("session anchor requires a positive scalar witness")
+        witness = anchor.raw_witness_predicate
+        params: dict[str, Any] = {
+            **self.params,
+            **{
+                key: value
+                for key, value in anchor.params.items()
+                if f"%({key})s" in witness
+            },
+            "filter_anchor_start": anchor_start,
+            "filter_anchor_end": anchor_end,
+            "filter_anchor_limit": int(limit),
+        }
+        query = f"""
+        SELECT
+            trace_session_id AS session_id,
+            start_time
+        FROM {self.TABLE}
+        PREWHERE {self.project_filter_sql()}
+          AND _peerdb_is_deleted = 0
+          AND start_time >= %(filter_anchor_start)s
+          AND start_time < %(filter_anchor_end)s
+        WHERE isNotNull(trace_session_id)
+          AND trace_session_id != toUUID('{NIL_UUID}')
+          AND ({witness})
+        ORDER BY
+            observation_type DESC,
+            service_name DESC,
+            toStartOfHour(start_time) DESC,
+            trace_id DESC,
+            id DESC,
+            start_time DESC
+        LIMIT 1 BY trace_session_id
+        LIMIT %(filter_anchor_limit)s
+        """
+        return query, params
 
     def supports_candidate_first_page(self) -> bool:
         """Return true for the exact root-time ordered fast path.
@@ -813,23 +931,18 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         latest_metric_columns: list[str] = []
         resolved_metric_columns: list[str] = []
         session_metric_columns: list[str] = []
-        root_filter_predicates: list[str] = []
+        scalar_filter_aggregates: list[str] = []
+        scalar_filter_aliases: list[str] = []
         for plan in root_filter_plans:
             params.update(plan.params)
-            root_filter_predicates.append(plan.predicate)
             for aggregate in plan.aggregates:
-                latest_metric_columns.append(aggregate)
+                scalar_filter_aggregates.append(aggregate)
                 alias = aggregate.rsplit(" AS ", 1)[-1].strip()
                 if not alias or alias == aggregate:
-                    raise ValueError("latest-state session aggregate requires an alias")
-                resolved_metric_columns.append(alias)
-        # A raw witness is only a candidate superset.  It narrows expensive
-        # attribute argMax replay to matching physical roots; exact latest-state
-        # predicates below remain authoritative.
-        root_witness_plan = self._bounded_root_witness_plan(root_filter_plans)
-        root_witness_predicate = (
-            root_witness_plan.raw_witness_predicate if root_witness_plan else None
-        )
+                    raise ValueError(
+                        "latest-state span filter aggregate requires an alias"
+                    )
+                scalar_filter_aliases.append(alias)
         if needs_end_time:
             latest_metric_columns.append(
                 "argMax(tuple(end_time), _peerdb_version).1 AS latest_end_time"
@@ -974,6 +1087,76 @@ class SessionListQueryBuilder(BaseQueryBuilder):
               )
             """
 
+        scalar_filter_ctes = ""
+        scalar_filter_membership = ""
+        if root_filter_plans:
+            scalar_aggregate_select = (
+                ",\n                "
+                + ",\n                ".join(scalar_filter_aggregates)
+            )
+            scalar_alias_select = ",\n                " + ",\n                ".join(
+                scalar_filter_aliases
+            )
+            resolved_scalar_session = resolved_id_expr(
+                "latest_trace_session_id", "scalar_ts_remap"
+            )
+            scalar_filter_having = " AND ".join(
+                f"countIf({plan.predicate}) > 0" for plan in root_filter_plans
+            )
+            scalar_filter_ctes = f""",
+        candidate_scalar_span_identities AS (
+            SELECT DISTINCT project_id, trace_id, id, start_time
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}{span_time_scope}
+            WHERE 1 = 1
+              {root_session_seed}
+        ),
+        latest_candidate_scalar_spans AS (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(tuple(trace_session_id), _peerdb_version).1
+                    AS latest_trace_session_id,
+                argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
+                {scalar_aggregate_select}
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}{span_time_scope}
+              AND (project_id, trace_id, id, start_time) IN (
+                  SELECT project_id, trace_id, id, start_time
+                  FROM candidate_scalar_span_identities
+              )
+            GROUP BY project_id, trace_id, id, start_time
+        ),
+        resolved_candidate_scalar_spans AS (
+            SELECT
+                project_id,
+                {resolved_scalar_session} AS session_id
+                {scalar_alias_select}
+            FROM latest_candidate_scalar_spans
+            LEFT JOIN ts_survivor_map AS scalar_ts_remap
+                ON latest_trace_session_id = scalar_ts_remap.any_id
+            WHERE latest_is_deleted = 0
+              AND isNotNull(latest_trace_session_id)
+              AND latest_trace_session_id != toUUID('{NIL_UUID}')
+        ),
+        matching_scalar_sessions AS (
+            SELECT project_id, session_id
+            FROM resolved_candidate_scalar_spans
+            GROUP BY project_id, session_id
+            HAVING {scalar_filter_having}
+        )"""
+            if self.project_ids is not None:
+                scalar_filter_membership = (
+                    "(project_id, session_id) IN ("
+                    "SELECT project_id, session_id FROM matching_scalar_sessions)"
+                )
+            else:
+                scalar_filter_membership = (
+                    "session_id IN (SELECT session_id FROM matching_scalar_sessions)"
+                )
+
         user_filter_items = [
             item
             for item in self.filters
@@ -1108,10 +1291,13 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         session_predicate = (
             f"AND {resolved_session_clause}" if resolved_session_clause else ""
         )
+        all_root_membership_predicates = tuple(root_membership_predicates) + (
+            (scalar_filter_membership,) if scalar_filter_membership else ()
+        )
         root_membership = (
             "\n              AND "
-            + "\n              AND ".join(root_membership_predicates)
-            if root_membership_predicates
+            + "\n              AND ".join(all_root_membership_predicates)
+            if all_root_membership_predicates
             else ""
         )
         org_project_count_cte = ""
@@ -1146,7 +1332,6 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             PREWHERE {self.project_filter_sql()}{span_time_scope}
             WHERE (parent_span_id IS NULL OR parent_span_id = '')
               {root_session_seed}
-              {f"AND ({root_witness_predicate})" if root_witness_predicate else ""}
         ),
         latest_roots AS (
             SELECT
@@ -1180,8 +1365,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
               AND isNotNull(latest_trace_session_id)
               AND latest_trace_session_id != toUUID('{NIL_UUID}')
               {f"AND {root_value_clause}" if root_value_clause else ""}
-              {f"AND {' AND '.join(root_filter_predicates)}" if root_filter_predicates else ""}
         )
+        {scalar_filter_ctes}
         {additional_root_ctes}
         {user_ctes}
         {org_project_count_cte},
@@ -1242,25 +1427,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             "filter_slice_end": slice_end,
             "filter_seed_limit": int(limit),
         }
-        plans, residual = self._bounded_span_filter_parts()
+        _plans, residual = self._bounded_span_filter_parts()
         self._validate_bounded_relational_filters(residual)
-        root_witness_plan = self._bounded_root_witness_plan(plans)
-        root_witness_predicate = (
-            root_witness_plan.raw_witness_predicate if root_witness_plan else None
-        )
-        if root_witness_plan is not None:
-            params.update(
-                {
-                    key: value
-                    for key, value in root_witness_plan.params.items()
-                    if f"%({key})s" in root_witness_predicate
-                }
-            )
-        root_witness_clause = (
-            f"\n                  AND ({root_witness_predicate})"
-            if root_witness_predicate
-            else ""
-        )
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
                 self.filters,
@@ -1314,7 +1482,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
               AND seed_spans.start_time < %(filter_slice_end)s{datetime_fragment}
             WHERE (seed_spans.parent_span_id IS NULL OR seed_spans.parent_span_id = '')
               AND isNotNull(seed_spans.trace_session_id)
-              AND seed_spans.trace_session_id != toUUID('{NIL_UUID}'){root_witness_clause}
+              AND seed_spans.trace_session_id != toUUID('{NIL_UUID}')
             GROUP BY seed_spans.trace_session_id
         """
         if self._bounded_sampling_rate is not None:
@@ -1338,7 +1506,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                   AND seed_spans.start_time < %(filter_slice_end)s{datetime_fragment}
                 WHERE (seed_spans.parent_span_id IS NULL OR seed_spans.parent_span_id = '')
                   AND isNotNull(seed_spans.trace_session_id)
-                  AND seed_spans.trace_session_id != toUUID('{NIL_UUID}'){root_witness_clause}
+                  AND seed_spans.trace_session_id != toUUID('{NIL_UUID}')
             ) AS raw_roots
             LEFT JOIN ({ts_map}) AS seed_ts_remap
                 ON raw_trace_session_id = seed_ts_remap.any_id

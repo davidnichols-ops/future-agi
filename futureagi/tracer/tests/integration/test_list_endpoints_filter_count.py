@@ -33,6 +33,16 @@ def _expected_count(case, seeded: list[SeededRow]) -> int:
     if case.target_type in ("spans", "voiceCalls"):
         return sum(1 for r in seeded if case.expected_predicate(r))
     if case.target_type == "traces":
+        if case.col_type == "SYSTEM_METRIC" and case.filter_type == "datetime":
+            # Trace datetime filters bind to the displayed root timestamp,
+            # not to any child span in the trace.  Counting every matching
+            # child and then de-duplicating trace ids would incorrectly include
+            # a trace whose root is exactly on a strict greater-than boundary.
+            return sum(
+                1
+                for r in seeded
+                if r.parent_span_id is None and case.expected_predicate(r)
+            )
         return len({r.trace_id for r in seeded if case.expected_predicate(r)})
     if case.target_type == "sessions":
         return len({r.session_id for r in seeded if case.expected_predicate(r)})

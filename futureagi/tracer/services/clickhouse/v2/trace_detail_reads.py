@@ -217,7 +217,7 @@ class TraceDetailReadBuilder:
                 latest_tags AS tags,
                 latest_span_events AS span_events,
                 latest_provider AS provider,
-                toJSONString(latest_attributes_extra) AS span_attributes,
+                latest_attributes_extra AS span_attributes,
                 latest_project_version_id AS project_version_id,
                 latest_custom_eval_config_id AS custom_eval_config_id,
                 toString(latest_trace_session_id) AS trace_session_id,
@@ -374,6 +374,8 @@ class TraceDetailReadBuilder:
     ) -> tuple[str, dict[str, Any]]:
         if not span_ids:
             return "", {}
+        if str(project_id) not in self.project_ids:
+            raise TraceDetailReadUnavailable("annotation_project_out_of_scope")
         return (
             f"""
             SELECT

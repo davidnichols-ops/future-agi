@@ -182,8 +182,8 @@ def _sm_datetime_leaves():
         ("not_equals", _NOW.isoformat(), lambda r: r.created_at != _NOW, gap),
         (
             "greater_than_or_equal",
-            _NOW.isoformat(),
-            lambda r: r.created_at >= _NOW,
+            day1.isoformat(),
+            lambda r: r.created_at >= day1,
             {},
         ),
         ("less_than_or_equal", end.isoformat(), lambda r: r.created_at <= end, gap),

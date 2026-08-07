@@ -30,6 +30,7 @@ from tracer.services.clickhouse.v2.query_builders.trace_detail import (
     retrieve_trace_detail_ch,
 )
 from tracer.services.clickhouse.v2.trace_detail_reads import (
+    PhysicalSpanIdentity,
     TraceDetailNotFound,
     TraceDetailRead,
     TraceDetailReadBuilder,
@@ -50,6 +51,26 @@ except Exception:  # pragma: no cover - import shape guard
 class _FakeResult:
     def __init__(self, data):
         self.data = data
+
+
+@pytest.mark.unit
+def test_trace_detail_content_does_not_double_encode_attributes_extra():
+    builder = TraceDetailReadBuilder(project_ids=["P1"], trace_id="T1")
+
+    query, _params = builder.build_content_query(
+        [
+            PhysicalSpanIdentity(
+                project_id="P1",
+                trace_id="T1",
+                span_id="S1",
+                start_time=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        ]
+    )
+
+    assert "latest_attributes_extra AS span_attributes" in query
+    assert "toJSONString(latest_attributes_extra)" not in query
+    assert "toJSONString(latest_metadata) AS metadata_json" in query
 
 
 @pytest.mark.unit

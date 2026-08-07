@@ -871,6 +871,57 @@ def read_bounded_filter_page(
                 raise ValueError(
                     "candidate witness probe strata exceeds bounded contract"
                 )
+    candidate_witness_probe_timeout_ms = _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS
+    candidate_witness_probe_timeout_builder = getattr(
+        builder, "recommended_filter_candidate_witness_probe_timeout_ms", None
+    )
+    if candidate_witness_probe_enabled and callable(
+        candidate_witness_probe_timeout_builder
+    ):
+        raw_probe_timeout_ms = candidate_witness_probe_timeout_builder()
+        if raw_probe_timeout_ms is not None:
+            requested_probe_timeout_ms = int(raw_probe_timeout_ms)
+            if not 25 <= requested_probe_timeout_ms <= _QUERY_TIMEOUT_MS:
+                raise ValueError("candidate witness probe timeout exceeds contract")
+            candidate_witness_probe_timeout_ms = min(
+                requested_probe_timeout_ms,
+                max(25, deadline_ms - _CANDIDATE_WITNESS_EXACT_RESERVE_MS),
+            )
+    candidate_witness_probe_max_bytes = _CANDIDATE_WITNESS_PREFILTER_MAX_BYTES
+    candidate_witness_probe_bytes_builder = getattr(
+        builder, "recommended_filter_candidate_witness_probe_max_bytes", None
+    )
+    if candidate_witness_probe_enabled and callable(
+        candidate_witness_probe_bytes_builder
+    ):
+        raw_probe_max_bytes = candidate_witness_probe_bytes_builder()
+        if raw_probe_max_bytes is not None:
+            candidate_witness_probe_max_bytes = int(raw_probe_max_bytes)
+            if not (
+                _CANDIDATE_WITNESS_PREFILTER_MAX_BYTES
+                <= candidate_witness_probe_max_bytes
+                <= _READ_SETTINGS["max_bytes_to_read"]
+            ):
+                raise ValueError("candidate witness probe bytes exceed contract")
+    candidate_witness_probe_total_ms = _CANDIDATE_WITNESS_PREFILTER_TOTAL_MS
+    candidate_witness_probe_total_builder = getattr(
+        builder, "recommended_filter_candidate_witness_probe_total_ms", None
+    )
+    if candidate_witness_probe_enabled and callable(
+        candidate_witness_probe_total_builder
+    ):
+        raw_probe_total_ms = candidate_witness_probe_total_builder()
+        if raw_probe_total_ms is not None:
+            requested_probe_total_ms = int(raw_probe_total_ms)
+            if requested_probe_total_ms < candidate_witness_probe_timeout_ms:
+                raise ValueError("candidate witness total time exceeds contract")
+            candidate_witness_probe_total_ms = min(
+                requested_probe_total_ms,
+                max(
+                    candidate_witness_probe_timeout_ms,
+                    deadline_ms - _CANDIDATE_WITNESS_EXACT_RESERVE_MS,
+                ),
+            )
     candidate_witness_probe_abandoned = not probe_limits_enforced
     candidate_witness_probe_attempt_count = 0
     candidate_witness_probe_attempt_limit = min(
@@ -1155,7 +1206,6 @@ def read_bounded_filter_page(
         if not candidate_identities:
             return False
 
-        probe_classified_tail: Hashable | None = None
         # A stratified witness probe can require several full-window slices.
         # When the complete candidate set already fits in one bounded exact
         # classifier, that speculation cannot reduce the physical classifier
@@ -1172,9 +1222,9 @@ def read_bounded_filter_page(
             + reserved_hydration_queries
         )
         prefilter_time_reserve_ms = (
-            _CANDIDATE_WITNESS_PREFILTER_TOTAL_MS
+            candidate_witness_probe_total_ms
             if candidate_witness_probe_strata > 1
-            else _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS
+            else candidate_witness_probe_timeout_ms
         ) + _CANDIDATE_WITNESS_EXACT_RESERVE_MS
         if (
             candidate_witness_probe_enabled
@@ -1232,7 +1282,7 @@ def read_bounded_filter_page(
                     (monotonic() - candidate_witness_probe_started) * 1000
                 )
                 total_probe_remaining_ms = (
-                    _CANDIDATE_WITNESS_PREFILTER_TOTAL_MS - total_probe_elapsed_ms
+                    candidate_witness_probe_total_ms - total_probe_elapsed_ms
                 )
                 if (
                     candidate_witness_probe_attempt_count
@@ -1276,10 +1326,10 @@ def read_bounded_filter_page(
                         active_end=probe_end,
                         result_limit=len(remaining_probe_identities),
                         timeout_cap_ms=min(
-                            _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS,
+                            candidate_witness_probe_timeout_ms,
                             total_probe_remaining_ms,
                         ),
-                        max_bytes_to_read_cap=(_CANDIDATE_WITNESS_PREFILTER_MAX_BYTES),
+                        max_bytes_to_read_cap=candidate_witness_probe_max_bytes,
                     )
                 except _BudgetExceeded as exc:
                     probe_duration_us = (
@@ -1337,7 +1387,13 @@ def read_bounded_filter_page(
                 # The union covered the entire half-open request window (or
                 # every candidate already has a positive witness). Only now is
                 # raw absence a valid exact-classifier prefilter.
-                probe_classified_tail = probe_candidates[-1]
+                # ``candidate_identities`` retains the ordered seed insertion
+                # order.  Therefore, after each surviving classifier chunk,
+                # every earlier root is resolved: it either failed this
+                # necessary prefilter or crossed the full classifier.  The
+                # ordinary last-classified-seed cutoff remains a valid exact
+                # prefix proof; there is no need to classify every surviving
+                # root in a broad 512-row batch before returning 25 rows.
                 if len(candidate_identities) * 4 >= len(probe_candidates) * 3:
                     # A broad raw superset cannot amortize another speculative
                     # batch. The exact 20-identity fallback remains bounded.
@@ -1430,11 +1486,7 @@ def read_bounded_filter_page(
                     if monotonic() > classification_deadline:
                         raise _BudgetExceeded("deadline_exceeded")
 
-            if (
-                probe_classified_tail is None
-                and stop_on_ordered_prefix
-                and len(matched_by_id) >= prefix_needed
-            ):
+            if stop_on_ordered_prefix and len(matched_by_id) >= prefix_needed:
                 ordered_matches = sorted(
                     matched_by_id.values(), key=result_row_key, reverse=True
                 )
@@ -1444,17 +1496,6 @@ def read_bounded_filter_page(
                 ]
                 if cutoff >= seed_row_key(last_classified_seed):
                     return True
-        if (
-            probe_classified_tail is not None
-            and stop_on_ordered_prefix
-            and len(matched_by_id) >= prefix_needed
-        ):
-            ordered_matches = sorted(
-                matched_by_id.values(), key=result_row_key, reverse=True
-            )
-            cutoff = result_row_key(ordered_matches[prefix_needed - 1])
-            if cutoff >= seed_row_key(candidate_seed_rows[probe_classified_tail]):
-                return True
         return False
 
     def classify_or_buffer_seed_rows(

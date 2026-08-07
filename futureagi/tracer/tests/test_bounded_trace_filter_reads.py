@@ -312,7 +312,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert "%(candidate_end_date)s + INTERVAL 1 DAY" not in match_sql
     assert builder.filter_seed_proves_result_order() is False
     assert builder.filter_cursor_seed_keyset_is_safe() is True
-    assert builder.recommended_filter_seed_batch_size() == 200
+    assert builder.recommended_filter_seed_batch_size() == 512
     assert builder.recommended_filter_classify_batch_size() == 100
 
 
@@ -393,7 +393,7 @@ def test_graph_numeric_equality_retains_value_indexed_witness() -> None:
     assert probe_params["latest_filter_param_0"] == 7
 
 
-def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
+def test_long_window_trace_uses_exact_latest_anchor_over_full_root_batch() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[
@@ -402,7 +402,7 @@ def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
         ],
     )
 
-    assert builder.recommended_filter_seed_batch_size() == 200
+    assert builder.recommended_filter_seed_batch_size() == 512
     assert builder.recommended_filter_classify_batch_size() == 100
     assert builder.skip_full_window_filter_anchor_probe() is False
     assert builder.recommended_filter_anchor_probe_limit() == 64
@@ -412,6 +412,20 @@ def test_long_window_trace_skips_speculation_and_uses_ordered_roots() -> None:
         builder.recommended_filter_anchor_probe_max_bytes_to_read() == 192 * 1024 * 1024
     )
     assert builder.recommended_filter_classify_read_settings() is None
+
+
+def test_long_window_attribute_plus_search_keeps_bounded_root_batch() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(days=14), END),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+        ],
+        search="checkout",
+    )
+
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
+    assert builder.recommended_filter_seed_batch_size() == 200
 
 
 @pytest.mark.parametrize(
@@ -525,7 +539,7 @@ def test_structured_eval_bulk_retains_population_proof_batch_and_block_cap(
         ("boolean", "in", [True, False], "span_attr_bool"),
     ],
 )
-def test_trace_candidate_witness_probe_is_finite_typed_map_superset(
+def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
     filter_type: str,
     operation: str,
     value: object,
@@ -548,24 +562,35 @@ def test_trace_candidate_witness_probe_is_finite_typed_map_superset(
         [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
     )
 
-    assert "SELECT DISTINCT trace_id" in sql
+    assert "SELECT DISTINCT" in sql
+    assert "grouped_trace_id AS trace_id" in sql
     assert "project_id = %(project_id)s" in sql
-    assert "is_deleted = 0" in sql
+    assert "argMax(is_deleted, _peerdb_version) AS latest_is_deleted" in sql
+    assert "latest_is_deleted = 0" in sql
     assert "trace_id IN %(filter_candidate_trace_ids)s" in sql
+    assert "grouped_trace_id IN %(filter_candidate_trace_ids)s" in sql
     assert (
         "start_time >= fromUnixTimestamp64Micro(%(filter_candidate_start_us)s)" in sql
     )
     assert "start_time < fromUnixTimestamp64Micro(%(filter_candidate_end_us)s)" in sql
-    assert f"mapContains({map_column}, %(latest_filter_key_0)s)" in sql
+    assert (
+        f"argMax(mapContains({map_column}, %(latest_filter_key_0)s), "
+        "_peerdb_version)" in sql
+    )
     assert " FINAL" not in sql
-    assert "argMax(" not in sql
     assert params["filter_candidate_trace_ids"] == ("trace-a", "trace-b")
     assert params["filter_candidate_witness_limit"] == 2
     assert params["filter_candidate_start_us"] == 1_735_689_600_000_000
     assert params["filter_candidate_end_us"] == 1_767_225_600_000_000
     assert params["latest_filter_key_0"] == "final_status"
     assert builder.prefer_filter_candidate_witness_probe_first() is True
-    assert builder.recommended_filter_candidate_witness_probe_strata() == 8
+    assert builder.recommended_filter_candidate_witness_probe_strata() == 1
+    assert builder.recommended_filter_candidate_witness_probe_timeout_ms() == 1_500
+    assert (
+        builder.recommended_filter_candidate_witness_probe_max_bytes()
+        == 256 * 1024 * 1024
+    )
+    assert builder.recommended_filter_candidate_witness_probe_total_ms() == 4_500
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
         == 20
@@ -611,7 +636,8 @@ def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
         ]
     )
 
-    assert "SELECT DISTINCT project_id, trace_id" in sql
+    assert "grouped_project_id AS project_id" in sql
+    assert "grouped_trace_id AS trace_id" in sql
     assert "project_id IN %(project_ids)s" in sql
     assert "(project_id, trace_id) IN %(filter_candidate_trace_identities)s" in sql
     assert params["filter_candidate_trace_identities"] == (
@@ -655,14 +681,6 @@ def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
             filters=[
                 _time_filter(),
                 _attribute_filter("final_status", "Rejected"),
-                _attribute_filter("country", "ES"),
-            ],
-        ),
-        TraceListQueryBuilder(
-            project_id=PROJECT_ID,
-            filters=[
-                _time_filter(),
-                _attribute_filter("final_status", "Rejected"),
             ],
             bounded_identity_only=True,
         ),
@@ -680,7 +698,6 @@ def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
         "json-map",
         "root",
         "residual",
-        "multi-filter",
         "identity-only",
         "internal",
     ],
@@ -698,6 +715,30 @@ def test_trace_candidate_witness_probe_is_unavailable_for_unsafe_shapes(
         "",
         {},
     )
+
+
+def test_trace_candidate_latest_anchor_prefilters_multi_filter_and() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("country", "ES"),
+        ],
+    )
+
+    probe_sql, _ = builder.build_filter_candidate_witness_probe(
+        [{"trace_id": "trace-a"}]
+    )
+    classifier_sql, _ = builder.build_filter_identity_match_query_from_seed_rows(
+        [{"trace_id": "trace-a"}]
+    )
+
+    assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert "latest_filter_key_0" in probe_sql
+    assert "latest_filter_key_1" not in probe_sql
+    assert "latest_filter_key_0" in classifier_sql
+    assert "latest_filter_key_1" in classifier_sql
 
 
 def test_trace_candidate_witness_probe_rejects_unbounded_or_invalid_candidates() -> (
@@ -785,7 +826,7 @@ def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() ->
     assert builder.recommended_filter_anchor_probe_strata() is None
     assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
     assert builder.prefer_filter_candidate_witness_probe_first() is True
-    assert builder.recommended_filter_candidate_witness_probe_strata() == 8
+    assert builder.recommended_filter_candidate_witness_probe_strata() == 1
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
         == 100
@@ -793,10 +834,10 @@ def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() ->
     probe_sql, probe_params = builder.build_filter_candidate_witness_probe(
         [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
     )
-    assert "SELECT DISTINCT trace_id" in probe_sql
+    assert "grouped_trace_id AS trace_id" in probe_sql
     assert "trace_id IN %(filter_candidate_trace_ids)s" in probe_sql
     assert "mapContains(span_attr_str, %(latest_filter_key_0)s)" in probe_sql
-    assert "argMax(" not in probe_sql
+    assert "argMax(is_deleted, _peerdb_version)" in probe_sql
     assert probe_params["filter_candidate_trace_ids"] == ("trace-a", "trace-b")
 
 
@@ -814,14 +855,6 @@ def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() ->
             [
                 _time_filter(),
                 _attribute_filter("payload", {"state": "Rejected"}, filter_type="map"),
-            ],
-            {},
-        ),
-        (
-            [
-                _time_filter(),
-                _attribute_filter("final_status", "Rejected"),
-                _attribute_filter("country", "ES"),
             ],
             {},
         ),
@@ -843,7 +876,6 @@ def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() ->
     ids=[
         "negative",
         "json",
-        "multifilter",
         "root",
         "residual",
         "search",

@@ -161,11 +161,11 @@ class _Analytics:
         self.client = client
 
     def execute_ch_query(self, query, params, *, timeout_ms, settings):
-        # The integration table models JSON columns as their wire-format
-        # String representation; production uses JSON and needs toJSONString.
-        query = query.replace(
-            "toJSONString(latest_attributes_extra)", "latest_attributes_extra"
-        ).replace("toJSONString(latest_metadata)", "latest_metadata")
+        # The integration table models production's typed-JSON metadata column
+        # as its wire-format String representation. ``attributes_extra`` is
+        # already a String in production (schema 013), so its query must run
+        # unchanged to catch accidental double encoding.
+        query = query.replace("toJSONString(latest_metadata)", "latest_metadata")
         rows, columns = self.client.execute(
             query,
             params,

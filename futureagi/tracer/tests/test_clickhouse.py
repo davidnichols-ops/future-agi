@@ -16,6 +16,37 @@ from unittest import mock
 import pytest
 
 
+def _patched_empty_eval_metadata():
+    """Keep SQL-shape unit tests independent of the Django database.
+
+    These tests intentionally use unknown eval ids and assert the fail-closed
+    no-match predicate.  Model that metadata result explicitly so a genuine
+    metadata outage remains visible in production instead of being swallowed
+    by the filter builder.
+    """
+    empty_configs = mock.MagicMock()
+    empty_configs.exists.return_value = False
+    empty_configs.filter.return_value = empty_configs
+    empty_configs.values_list.return_value = []
+    config_manager = mock.MagicMock()
+    config_manager.filter.return_value = empty_configs
+
+    empty_templates = mock.MagicMock()
+    empty_templates.values.return_value.first.return_value = None
+    template_manager = mock.MagicMock()
+    template_manager.filter.return_value = empty_templates
+    return (
+        mock.patch(
+            "tracer.models.custom_eval_config.CustomEvalConfig.objects",
+            config_manager,
+        ),
+        mock.patch(
+            "model_hub.models.evals_metric.EvalTemplate.no_workspace_objects",
+            template_manager,
+        ),
+    )
+
+
 @pytest.mark.unit
 class TestNonTerminalEvalMarker:
     """The shared list-builder resolver for non-completed eval cell state."""
@@ -1564,7 +1595,9 @@ class TestClickHouseFilterBuilder:
                 },
             }
         ]
-        where, params = builder.translate(filters)
+        config_patch, template_patch = _patched_empty_eval_metadata()
+        with config_patch, template_patch:
+            where, params = builder.translate(filters)
         assert "trace_id IN" in where
         assert "00000000-0000-0000-0000-000000000000" in where
 
@@ -4866,7 +4899,9 @@ class TestTraceListQueryBuilderComprehensive:
                 }
             ],
         )
-        query, params = builder.build()
+        config_patch, template_patch = _patched_empty_eval_metadata()
+        with config_patch, template_patch:
+            query, params = builder.build()
         assert "trace_id IN" in query
         assert "00000000-0000-0000-0000-000000000000" in query
 
@@ -4928,7 +4963,9 @@ class TestTraceListQueryBuilderComprehensive:
                 },
             ],
         )
-        query, params = builder.build()
+        config_patch, template_patch = _patched_empty_eval_metadata()
+        with config_patch, template_patch:
+            query, params = builder.build()
         assert "model" in query
         assert "span_attr_str" in query
         assert "00000000-0000-0000-0000-000000000000" in query
@@ -6512,7 +6549,9 @@ class TestFilterBuilderEdgeCases:
                 },
             }
         ]
-        where, _ = builder.translate(filters)
+        config_patch, template_patch = _patched_empty_eval_metadata()
+        with config_patch, template_patch:
+            where, _ = builder.translate(filters)
         assert "trace_id IN (" in where
         assert "00000000-0000-0000-0000-000000000000" in where
 
@@ -7664,7 +7703,9 @@ class TestVoiceCallListQueryBuilderComprehensive:
                 }
             ],
         )
-        query, _ = builder.build()
+        config_patch, template_patch = _patched_empty_eval_metadata()
+        with config_patch, template_patch:
+            query, _ = builder.build()
         assert "00000000-0000-0000-0000-000000000000" in query
         assert "trace_id IN" in query
 

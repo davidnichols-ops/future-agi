@@ -1,4 +1,4 @@
-"""Regression contracts for bounded session attribute witness reads."""
+"""Regression contracts for bounded session latest-state attribute reads."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def _builder(*attribute_filters: dict) -> SessionListQueryBuilderV2:
 
 
 @pytest.mark.unit
-def test_session_seed_pushes_indexed_scalar_witness_before_group_and_limit() -> None:
+def test_session_seed_stays_root_ordered_and_exact_scalar_replay_is_bounded() -> None:
     builder = _builder(_attribute_filter("final_status", ["Rechazado"], operation="in"))
 
     sql, params = builder.build_filter_seed_page(
@@ -63,25 +63,24 @@ def test_session_seed_pushes_indexed_scalar_witness_before_group_and_limit() -> 
         limit=200,
     )
 
-    witness = "has(attrs_string.keys, %(latest_filter_key_0)s)"
-    index_companion = "indexHint(has(mapKeys(attrs_string), %(latest_filter_key_0)s))"
-    value_bloom = "hasAny(arrayMap(x -> lower(x), mapValues(attrs_string))"
-    assert witness in sql
-    assert index_companion in sql
-    assert value_bloom not in sql
-    assert sql.index(witness) < sql.index("GROUP BY seed_spans.trace_session_id")
-    assert sql.index(witness) < sql.index("LIMIT %(filter_seed_limit)s")
-    assert params["latest_filter_key_0"] == "final_status"
-    assert params["latest_filter_param_0"] == ("rechazado",)
-    assert "latest_filter_index_0_0" not in params
+    # A qualifying attribute may live on any child span.  Filtering the root
+    # seed by a raw attribute witness would therefore create false negatives.
+    assert "attrs_string" not in sql
+    assert "mapValues" not in sql
+    assert not any(key.startswith("latest_filter_") for key in params)
+    assert "GROUP BY seed_spans.trace_session_id" in sql
+    assert "LIMIT %(filter_seed_limit)s" in sql
 
     match_sql, match_params = builder.build_filter_match_query([CANDIDATE_SESSION_ID])
+    assert "candidate_scalar_span_identities AS" in match_sql
+    assert "matching_scalar_sessions AS" in match_sql
+    assert "HAVING countIf(latest_attr_exists_0 AND" in match_sql
     assert "lowerUTF8(toString(latest_attr_value_0)) IN" in match_sql
     assert match_params["latest_filter_param_0"] == ("rechazado",)
 
 
 @pytest.mark.unit
-def test_session_seed_prefers_indexed_scalar_when_json_filter_comes_first() -> None:
+def test_session_seed_defers_json_and_scalar_filters_to_exact_all_span_replay() -> None:
     builder = _builder(
         _attribute_filter(
             "customer_context",
@@ -98,17 +97,15 @@ def test_session_seed_prefers_indexed_scalar_when_json_filter_comes_first() -> N
         limit=200,
     )
 
-    assert "has(attrs_string.keys, %(latest_filter_key_1)s)" in sql
-    assert "mapValues(attrs_string)" not in sql
-    assert "%(latest_filter_key_0)s" not in sql
-    assert params["latest_filter_key_1"] == "final_status"
-    assert params["latest_filter_param_1"] == ("rechazado",)
-    assert "latest_filter_index_1_0" not in params
-    assert "latest_filter_key_0" not in params
+    assert "attrs_string" not in sql
+    assert "attributes_extra" not in sql
+    assert not any(key.startswith("latest_filter_") for key in params)
 
     match_sql, match_params = builder.build_filter_match_query([CANDIDATE_SESSION_ID])
     assert "latest_json_map_exists_0" in match_sql
     assert "latest_attr_exists_1" in match_sql
+    assert match_sql.count("countIf(") == 2
+    assert "matching_scalar_sessions AS" in match_sql
     assert match_params["latest_filter_key_0"] == "customer_context"
     assert match_params["latest_filter_key_1"] == "final_status"
 
@@ -247,7 +244,7 @@ def test_negative_only_session_filter_does_not_claim_a_raw_witness() -> None:
 
 
 @pytest.mark.unit
-def test_session_match_keeps_exact_filter_on_roots_before_session_grouping() -> None:
+def test_session_match_applies_exact_all_span_filters_before_session_page() -> None:
     builder = _builder(_attribute_filter("final_status", ["Rechazado"], operation="in"))
 
     sql, _ = builder.build_filter_match_query([CANDIDATE_SESSION_ID])
@@ -255,8 +252,16 @@ def test_session_match_keeps_exact_filter_on_roots_before_session_grouping() -> 
     resolved_roots = sql.split("resolved_root_sessions AS (", 1)[1].split(
         "\n        )", 1
     )[0]
+    scalar_spans = sql.split("latest_candidate_scalar_spans AS (", 1)[1].split(
+        "resolved_candidate_scalar_spans AS (", 1
+    )[0]
+    matching_sessions = sql.split("matching_scalar_sessions AS (", 1)[1].split(
+        "sessions AS (", 1
+    )[0]
     sessions = sql.split("sessions AS (", 1)[1]
-    assert "latest_attr_exists_0" in resolved_roots
-    assert "lowerUTF8(toString(latest_attr_value_0)) IN" in resolved_roots
+    assert "latest_attr_exists_0" not in resolved_roots
+    assert "latest_attr_exists_0" in scalar_spans
+    assert "lowerUTF8(toString(latest_attr_value_0)) IN" in matching_sessions
+    assert "HAVING countIf(" in matching_sessions
     assert "FROM resolved_root_sessions" in sessions
-    assert "session_id IN (SELECT session_id FROM matching_root_sessions)" not in sql
+    assert "session_id IN (SELECT session_id FROM matching_scalar_sessions)" in sessions

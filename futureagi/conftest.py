@@ -456,6 +456,58 @@ def _drop_legacy_ch_spans_mvs():
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _ensure_test_score_tenant_column():
+    """Mirror the deployed Score tenant column in disposable CH25 tests only.
+
+    Production and dev already have ``model_hub_score.tracer_project_id``.
+    The legacy schema constant used to bootstrap a fresh CI sidecar does not,
+    and changing that production bootstrap is outside this no-schema-change
+    release. This fixture runs only under pytest and inherits the same
+    fail-closed test-target policy as all other ClickHouse test mutations.
+    """
+    try:
+        import clickhouse_connect
+
+        from tracer.services.clickhouse.schema import CDC_MODEL_HUB_SCORE
+        from tracer.services.clickhouse.v2 import get_v2_config
+
+        cfg = get_v2_config()
+        host = cfg["host"]
+        if host == "clickhouse":
+            host = "localhost"
+        _require_safe_ch25_test_target(host=host, database=cfg["database"])
+        client = clickhouse_connect.get_client(
+            host=host,
+            port=cfg["http_port"],
+            username=cfg["user"],
+            password=cfg["password"],
+            database=cfg["database"],
+        )
+        try:
+            # The CH25 SQL set owns direct-write span tables only; a pristine
+            # CI sidecar therefore needs the legacy CDC Score table bootstrapped
+            # explicitly before its deployed tenant column can be mirrored.
+            client.command(CDC_MODEL_HUB_SCORE)
+            client.command(
+                "ALTER TABLE model_hub_score "
+                "ADD COLUMN IF NOT EXISTS tracer_project_id UUID"
+            )
+        finally:
+            client.close()
+    except UnsafeClickHouseTestTarget:
+        raise
+    except Exception as exc:
+        # A missing sidecar is handled by the tests that require ClickHouse;
+        # the integration fixture repeats this parity ALTER after its schema
+        # bootstrap so fixture ordering cannot hide a missing column.
+        print(
+            f"⚠️  Score tenant-column test parity skipped: {exc}",
+            file=sys.stderr,
+        )
+    yield
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _force_flush_cascade():
     """Force TRUNCATE ... CASCADE in TransactionTestCase teardown.
 

@@ -231,16 +231,24 @@ def test_attribute_bulk_filter_uses_bounded_seed_and_latest_candidate_classifier
     assert "argMax(is_deleted, _version) AS latest_is_deleted" in match_sql
     assert "argMax(mapContains(attrs_string" in match_sql
     assert "latest_attr_value_0" in match_sql
-    assert "indexHint(has(mapKeys(attrs_string)" in seed_sql
-    assert "has(attrs_string.keys" in seed_sql
+    assert "latest_filter_key_0" not in seed_params
+    assert "mapKeys(attrs_string)" not in seed_sql
     candidate_roots = match_sql.split("candidate_root_identities AS (", 1)[1].split(
         "latest_roots AS (", 1
     )[0]
-    assert "indexHint(has(mapKeys(attrs_string)" in candidate_roots
-    assert "has(attrs_string.keys" in candidate_roots
-    # The witness only narrows physical identities. Exact latest-state replay
-    # and matching-root ordering retain the existing classifier semantics.
+    assert "mapKeys(attrs_string)" not in candidate_roots
+    assert "candidate_scalar_span_identities AS" in match_sql
+    assert "latest_candidate_scalar_spans AS" in match_sql
+    assert "resolved_candidate_scalar_spans AS" in match_sql
+    assert "matching_scalar_sessions AS" in match_sql
+    # Root replay remains the source of session ordering/aggregates. Scalar
+    # filters replay every span in the finite candidate sessions, then roll
+    # each independently up to session membership.
     assert "latest_attr_exists_0 AND" in match_sql
+    assert "HAVING countIf(latest_attr_exists_0 AND" in match_sql
+    assert (
+        "session_id IN (SELECT session_id FROM matching_scalar_sessions)" in match_sql
+    )
     assert "min(start_time) AS session_start" in match_sql
     assert "candidate_filter_session_id_array" in match_sql
     assert match_params["candidate_filter_session_ids"] == (session_id,)
@@ -289,10 +297,11 @@ def test_raw_new_session_seed_classifier_expands_group_and_keeps_all_filters():
     )
     match_sql, match_params = builder.build_filter_match_query([new_session_id])
 
-    # The per-slice query is a raw superset: no remap FINAL can repeat for
-    # every empty/adjacent slice. Only one safe witness narrows the seed.
+    # The per-slice query is an ordered root superset: no remap FINAL or scalar
+    # witness can hide a session whose qualifying value lives on a child span.
     assert "trace_session_id_remap" not in seed_sql
-    assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in seed_sql
+    assert "attrs_string" not in seed_sql
+    assert "latest_filter_key_0" not in seed_params
     assert "latest_filter_key_1" not in seed_params
 
     # Exact classification resolves a raw new/old candidate to its survivor,
@@ -316,9 +325,256 @@ def test_raw_new_session_seed_classifier_expands_group_and_keeps_all_filters():
     assert "SELECT session_id FROM candidate_filter_sessions" in match_sql
     assert "latest_attr_exists_0 AND" in match_sql
     assert "latest_attr_exists_1 AND" in match_sql
+    assert "countIf(latest_attr_exists_0 AND" in match_sql
+    assert "countIf(latest_attr_exists_1 AND" in match_sql
+    assert (
+        "session_id IN (SELECT session_id FROM matching_scalar_sessions)" in match_sql
+    )
     assert match_params["candidate_filter_session_id_array"] == [new_session_id]
     assert match_params["latest_filter_param_0"] == "rejected"
     assert match_params["latest_filter_param_1"] == "us"
+
+
+@pytest.mark.unit
+def test_session_scalar_filters_match_any_latest_span_independently():
+    now = datetime(2026, 7, 31, 12, 0)
+    session_id = str(uuid.uuid4())
+    filters = [
+        *_window(now),
+        {
+            "column_id": "status",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "categorical",
+                "filter_op": "equals",
+                "filter_value": "OK",
+            },
+        },
+        {
+            "column_id": "node_type",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "categorical",
+                "filter_op": "equals",
+                "filter_value": "llm",
+            },
+        },
+        {
+            "column_id": "retries",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "number",
+                "filter_op": "equals",
+                "filter_value": 2,
+            },
+        },
+    ]
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=filters,
+        bounded_internal_scan=True,
+    )
+
+    seed_sql, seed_params = builder.build_filter_seed_page(
+        slice_start=now - timedelta(minutes=5),
+        slice_end=now,
+        limit=200,
+    )
+    match_sql, match_params = builder.build_filter_match_query([session_id])
+
+    assert "status" not in seed_sql
+    assert "attrs_number" not in seed_sql
+    assert not any(key.startswith("latest_filter_") for key in seed_params)
+    root_scan = match_sql.split("candidate_root_identities AS (", 1)[1].split(
+        "latest_roots AS (", 1
+    )[0]
+    assert "attrs_number" not in root_scan
+    scalar_scan = match_sql.split("latest_candidate_scalar_spans AS (", 1)[1].split(
+        "resolved_candidate_scalar_spans AS (", 1
+    )[0]
+    assert "argMax(tuple(status), _version).1 AS latest_column_value_0" in scalar_scan
+    assert "argMax(observation_type, _version) AS latest_column_value_1" in scalar_scan
+    assert "argMax(mapContains(attrs_number" in scalar_scan
+    assert "HAVING countIf(" in match_sql
+    assert match_sql.count("countIf(") == 3
+    assert (
+        "session_id IN (SELECT session_id FROM matching_scalar_sessions)" in match_sql
+    )
+    assert match_params["latest_filter_param_0"] == "ok"
+    assert match_params["latest_filter_param_1"] == "llm"
+    assert match_params["latest_filter_param_2"] == 2.0
+
+
+@pytest.mark.unit
+def test_session_positive_attribute_exposes_bounded_any_span_anchor():
+    now = datetime(2026, 7, 31, 12, 0)
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            *_window(now),
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rejected",
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+    )
+
+    assert builder.supports_filter_anchor_probe() is True
+    assert builder.recommended_filter_anchor_probe_limit() == 64
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 900
+    assert builder.recommended_filter_anchor_probe_strata() == 4
+    assert builder.recommended_filter_anchor_probe_max_bytes_to_read() == (
+        192 * 1024 * 1024
+    )
+
+    sql, params = builder.build_filter_anchor_probe(
+        limit=64,
+        slice_start=now - timedelta(days=1),
+        slice_end=now,
+    )
+    assert "parent_span_id" not in sql
+    assert "LIMIT 1 BY trace_session_id" in sql
+    assert "LIMIT %(filter_anchor_limit)s" in sql
+    assert "has(attrs_string.keys, %(latest_filter_key_0)s)" in sql
+    assert params["filter_anchor_limit"] == 64
+    assert params["latest_filter_key_0"] == "final_status"
+    assert params["latest_filter_param_0"] == "rejected"
+
+    # A partitioned 64-row probe can enter its final stratum with one shared
+    # sentinel slot left.  That one-row statement is valid and reaching it
+    # forces the exact ordered fallback.
+    _one_row_sql, one_row_params = builder.build_filter_anchor_probe(
+        limit=1,
+        slice_start=now - timedelta(hours=1),
+        slice_end=now,
+    )
+    assert one_row_params["filter_anchor_limit"] == 1
+
+
+@pytest.mark.unit
+def test_sparse_session_any_span_anchor_exhausts_then_classifies_exactly():
+    now = datetime(2026, 7, 31, 12, 0)
+    session_id = str(uuid.uuid4())
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            *_window(now),
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rejected",
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+    )
+
+    class _SparseAnchorExecutor:
+        def __init__(self):
+            self.anchor_calls = 0
+            self.seed_calls = 0
+            self.classify_calls = 0
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            if "LIMIT 1 BY trace_session_id" in query:
+                self.anchor_calls += 1
+                rows = (
+                    [{"session_id": session_id, "start_time": now - timedelta(hours=1)}]
+                    if self.anchor_calls == 1
+                    else []
+                )
+                return SimpleNamespace(data=rows)
+            if "matching_scalar_sessions AS" in query:
+                self.classify_calls += 1
+                assert params["candidate_filter_session_ids"] == (session_id,)
+                return SimpleNamespace(
+                    data=[
+                        {
+                            "session_id": session_id,
+                            "start_time": now - timedelta(hours=2),
+                        }
+                    ]
+                )
+            if "WITH seed_sessions AS" in query:
+                self.seed_calls += 1
+            raise AssertionError("sparse exhaustive anchor must not run broad roots")
+
+    executor = _SparseAnchorExecutor()
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=builder.filters,
+        key_field="session_id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        max_candidates=200,
+        classify_batch_size=50,
+    )
+
+    assert page.complete is True
+    assert [row["session_id"] for row in page.rows] == [session_id]
+    assert executor.anchor_calls == 4
+    assert executor.classify_calls == 1
+    assert executor.seed_calls == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("operation", ["not_equals", "is_null"])
+def test_session_negative_attribute_does_not_use_raw_anchor(operation):
+    now = datetime(2026, 7, 31, 12, 0)
+    config = {
+        "col_type": "SPAN_ATTRIBUTE",
+        "filter_type": "text",
+        "filter_op": operation,
+    }
+    if operation != "is_null":
+        config["filter_value"] = "Rejected"
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            *_window(now),
+            {"column_id": "final_status", "filter_config": config},
+        ],
+        bounded_internal_scan=True,
+    )
+
+    assert builder.supports_filter_anchor_probe() is False
+    assert builder.recommended_filter_anchor_probe_limit() is None
+
+
+@pytest.mark.unit
+def test_session_sampled_internal_lane_does_not_anchor_raw_aliases():
+    now = datetime(2026, 7, 31, 12, 0)
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            *_window(now),
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "Rejected",
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+        bounded_sampling_salt="stable-salt",
+        bounded_sampling_rate=50,
+    )
+
+    assert builder.supports_filter_anchor_probe() is False
 
 
 class _RawAliasSessionBuilder:
@@ -540,7 +796,9 @@ def test_session_has_eval_is_finite_latest_state_and_page_n_safe(
     assert seed_params["filter_before_start_time"] == now
     assert "candidate_filter_sessions AS" in sql
     assert "candidate_eval_trace_ids AS" in sql
-    assert "SELECT DISTINCT toUUIDOrNull(trace_id) AS trace_id" in sql
+    assert "SELECT DISTINCT trace_id" in sql
+    assert "WHERE isNotNull(trace_id)" in sql
+    assert "toUUIDOrNull(trace_id)" not in sql
     assert "FROM tracer_eval_logger_v2 AS eval_scan" in sql
     assert (
         "eval_scan.trace_id IN (\n                SELECT trace_id "
