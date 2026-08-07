@@ -326,9 +326,9 @@ class AttributeKeyCursorPageRead:
     next_resume_identity: PhysicalSpanIdentity | None
     next_resume_key_offset: int
     seen_key_digests: tuple[str, ...]
-    # A checkpoint may belong to an adaptively widened segment.  Preserve that
-    # segment's lower bound so a continuation cannot silently jump forward to
-    # the default six-hour slice and reject or skip the older checkpoint.
+    # Accepted only for rolling compatibility with cursors published by pods
+    # that preserved an adaptively widened segment. New reads compress proven
+    # progress into the legacy six-hour checkpoint shape instead.
     next_segment_start: datetime | None = None
 
 
@@ -2863,6 +2863,39 @@ class AttributeReadSelector:
         next_resume_identity: PhysicalSpanIdentity | None = None
         next_resume_key_offset = 0
 
+        def anchor_checkpoint_window(
+            checkpoint: PhysicalSpanIdentity,
+            *,
+            width: timedelta = ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+        ) -> None:
+            """Resume proven progress through a bounded checkpoint slice.
+
+            An ordered candidate page proves that every physical identity
+            above ``checkpoint`` was consumed. Moving the public segment end
+            to at most ``width`` above that identity therefore cannot skip an
+            older row: the first legacy slice handles same-timestamp keyset
+            ties, then adjacent slices continue below the checkpoint.
+
+            This also lets a new pod recover a six-field cursor emitted during
+            a rolling deploy without retrying its potentially huge segment.
+            Re-anchoring is required whenever a later budget fallback shrinks
+            the width again; changing only the lower bound would leave the
+            keyset checkpoint outside the segment.
+            """
+
+            nonlocal active_segment_start
+            nonlocal candidate_limit
+            nonlocal current_segment_end
+            nonlocal empty_segment_width
+
+            current_segment_end = min(
+                current_segment_end,
+                checkpoint[3] + width,
+            )
+            active_segment_start = None
+            empty_segment_width = min(width, max_empty_segment_width)
+            candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+
         def row_keys(row: dict[str, Any]) -> tuple[tuple[str, AttributeType], ...]:
             keys, _unsupported = self._browse_row_keys(
                 row,
@@ -3056,6 +3089,18 @@ class AttributeReadSelector:
                     candidate_query_settings={"use_skip_indexes": 0},
                 )
             except Exception as exc:
+                if (
+                    is_read_budget_error(exc)
+                    and active_segment_start is not None
+                    and cursor_before is not None
+                    and current_segment_end - active_segment_start
+                    > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                ):
+                    # A prior ordered page already proved this checkpoint. Do
+                    # not let a wide cursor from another pod strand the browse
+                    # by requiring the same large statement to succeed again.
+                    anchor_checkpoint_window(cursor_before)
+                    continue
                 if is_read_budget_error(exc) and candidate_limit > (
                     ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
                 ):
@@ -3081,14 +3126,19 @@ class AttributeReadSelector:
                     continue
                 if (
                     is_read_budget_error(exc)
-                    and active_segment_start is None
                     and empty_segment_width > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
                 ):
                     max_empty_segment_width = min(
                         max_empty_segment_width,
                         ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
                     )
-                    empty_segment_width = max_empty_segment_width
+                    if cursor_before is not None:
+                        anchor_checkpoint_window(
+                            cursor_before,
+                            width=max_empty_segment_width,
+                        )
+                    else:
+                        empty_segment_width = max_empty_segment_width
                     continue
                 raise
             candidate_pages += 1
@@ -3104,6 +3154,17 @@ class AttributeReadSelector:
                     ),
                 )
             except Exception as exc:
+                if (
+                    is_read_budget_error(exc)
+                    and active_segment_start is not None
+                    and cursor_before is not None
+                    and current_segment_end - active_segment_start
+                    > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                ):
+                    # The expanded batch was not verified, so discard it and
+                    # retry from the last already-proven checkpoint only.
+                    anchor_checkpoint_window(cursor_before)
+                    continue
                 if is_read_budget_error(exc) and candidate_limit > (
                     ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
                 ):
@@ -3135,6 +3196,15 @@ class AttributeReadSelector:
                 break
             if segment_truncated and candidate_ids:
                 cursor_before = candidate_ids[-1]
+                if (
+                    current_segment_start
+                    < current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                ):
+                    # The ordered page proves all identities above this point
+                    # were consumed. Continue through an ordinary keyset slice
+                    # instead of issuing another statement over the wide range.
+                    anchor_checkpoint_window(cursor_before)
+                    continue
                 active_segment_start = current_segment_start
                 if not emitted:
                     candidate_limit = min(
@@ -3159,6 +3229,18 @@ class AttributeReadSelector:
                     max_empty_segment_width,
                 )
 
+        next_checkpoint = next_resume_identity or cursor_before
+        if (
+            next_checkpoint is not None
+            and active_segment_start is not None
+            and current_segment_end - active_segment_start
+            > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+        ):
+            # Page-size and request-budget exits can occur directly after a
+            # successful widened candidate/replay pair. Publish that proven
+            # point in the rolling-compatible five-field cursor shape.
+            anchor_checkpoint_window(next_checkpoint)
+
         # A positive exact search is terminal even when older physical rows
         # remain: one verified latest-state occurrence proves the selectable
         # key exists, and consumers deliberately do not treat its observed type
@@ -3174,7 +3256,6 @@ class AttributeReadSelector:
             "exhausted" if exhausted else "continuation"
         )
         has_more = browse_status == "continuation"
-        next_checkpoint = next_resume_identity or cursor_before
         next_segment_start = (
             active_segment_start if has_more and next_checkpoint is not None else None
         )
@@ -3183,10 +3264,11 @@ class AttributeReadSelector:
                 start,
                 current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
             )
-            if next_segment_start == legacy_segment_start:
-                # Keep ordinary six-hour cursors on the five-field rolling
-                # deploy format.  Only widened checkpoints require the new
-                # explicit lower bound.
+            if next_segment_start >= legacy_segment_start:
+                # A six-hour legacy slice contains this checkpoint even when
+                # the in-request budget fallback narrowed its active query to
+                # five minutes. Publish the five-field rolling-deploy format;
+                # re-reading the larger prefix is safe under before_identity.
                 next_segment_start = None
         # A successful cursor page is a complete request, not a sampled
         # aggregate. Endpoint-specific browse_status communicates whether the

@@ -36,6 +36,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT,
     ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES,
     ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES,
+    ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
     ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS,
@@ -4980,7 +4981,7 @@ def test_span_attribute_key_cursor_reaches_retained_key_older_than_one_year(
     )
 
 
-def test_span_attribute_key_cursor_preserves_widened_dense_segment_across_pages(
+def test_span_attribute_key_cursor_compresses_widened_checkpoint_and_continues(
     monkeypatch,
 ):
     identities = tuple(
@@ -4988,7 +4989,7 @@ def test_span_attribute_key_cursor_preserves_widened_dense_segment_across_pages(
             PROJECT_A,
             f"trace-wide-{index}",
             f"span-wide-{index}",
-            NOW - timedelta(hours=7 + index * 2),
+            NOW - timedelta(days=130 + index * 10),
         )
         for index in range(5)
     )
@@ -5040,7 +5041,7 @@ def test_span_attribute_key_cursor_preserves_widened_dense_segment_across_pages(
     first = selector.read_key_cursor_page(
         [PROJECT_A],
         page_size=3,
-        window_start=NOW - timedelta(hours=48),
+        window_start=NOW - timedelta(days=400),
         window_end=NOW,
     )
 
@@ -5049,18 +5050,21 @@ def test_span_attribute_key_cursor_preserves_widened_dense_segment_across_pages(
         "wide_key_1",
         "wide_key_2",
     ]
-    assert first.next_segment_end == NOW - timedelta(hours=6)
-    assert first.next_segment_start == NOW - timedelta(hours=18)
+    assert any(
+        segment_end - segment_start > timedelta(days=60)
+        for (segment_start, segment_end), _checkpoint in attempted_segments
+    )
+    assert first.next_segment_end == identities[2][3] + timedelta(hours=6)
+    assert first.next_segment_start is None
     assert first.next_before_identity == identities[2]
 
     attempted_segments.clear()
     second = selector.read_key_cursor_page(
         [PROJECT_A],
         page_size=3,
-        window_start=NOW - timedelta(hours=48),
+        window_start=NOW - timedelta(days=400),
         window_end=NOW,
         segment_end=first.next_segment_end,
-        segment_start=first.next_segment_start,
         before_identity=first.next_before_identity,
         resume_identity=first.next_resume_identity,
         resume_key_offset=first.next_resume_key_offset,
@@ -5068,14 +5072,17 @@ def test_span_attribute_key_cursor_preserves_widened_dense_segment_across_pages(
     )
 
     assert attempted_segments[0] == (
-        (first.next_segment_start, first.next_segment_end),
+        (
+            first.next_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+            first.next_segment_end,
+        ),
         first.next_before_identity,
     )
     assert [row.key for row in second.rows] == ["wide_key_3", "wide_key_4"]
     assert len({row.key for row in (*first.rows, *second.rows)}) == 5
 
 
-def test_span_attribute_key_cursor_preserves_widened_truncated_segment(
+def test_span_attribute_key_cursor_compresses_widened_truncated_segment(
     monkeypatch,
 ):
     recent_identities = [
@@ -5166,25 +5173,115 @@ def test_span_attribute_key_cursor_preserves_widened_truncated_segment(
     )
 
     assert [row.key for row in first.rows] == ["shared_key"]
-    assert first.next_segment_end == NOW - timedelta(hours=6)
-    assert first.next_segment_start == NOW - timedelta(hours=18)
-    assert first.next_before_identity is not None
+    assert first.next_segment_start is None
 
-    second = selector.read_key_cursor_page(
-        [PROJECT_A],
-        page_size=10,
-        window_start=NOW - timedelta(hours=48),
-        window_end=NOW,
-        segment_end=first.next_segment_end,
-        segment_start=first.next_segment_start,
-        before_identity=first.next_before_identity,
-        resume_identity=first.next_resume_identity,
-        resume_key_offset=first.next_resume_key_offset,
-        seen_key_digests=first.seen_key_digests,
+    page = first
+    for _attempt in range(10):
+        if not page.has_more:
+            break
+        page = selector.read_key_cursor_page(
+            [PROJECT_A],
+            page_size=10,
+            window_start=NOW - timedelta(hours=48),
+            window_end=NOW,
+            segment_end=page.next_segment_end,
+            segment_start=page.next_segment_start,
+            before_identity=page.next_before_identity,
+            resume_identity=page.next_resume_identity,
+            resume_key_offset=page.next_resume_key_offset,
+            seen_key_digests=page.seen_key_digests,
+        )
+        assert page.metadata.query_complete is True
+        assert page.next_segment_start is None
+
+    assert page.has_more is False
+    assert set(returned_identities) == set(identities)
+
+
+def test_span_attribute_key_cursor_recovers_old_wide_checkpoint_after_budget_cascade(
+    monkeypatch,
+):
+    checkpoint = (
+        PROJECT_A,
+        "trace-wide-checkpoint",
+        "span-z-wide-checkpoint",
+        NOW - timedelta(days=90),
+    )
+    older = (
+        PROJECT_A,
+        checkpoint[1],
+        "span-a-after-wide-budget",
+        checkpoint[3],
+    )
+    row = {
+        "project_id": PROJECT_A,
+        "trace_id": older[1],
+        "id": older[2],
+        "start_time": older[3],
+        "is_deleted": 0,
+        "string_keys": ["reachable_after_wide_budget"],
+        "number_keys": [],
+        "boolean_keys": [],
+        "attributes_extra": "{}",
+    }
+    attempted_widths: list[timedelta] = []
+
+    def candidates(_projects, segment, **kwargs):
+        attempted_widths.append(segment[1] - segment[0])
+        before_identity = kwargs.get("before_identity")
+        if before_identity is not None and not (
+            segment[0] <= before_identity[3] < segment[1]
+        ):
+            raise ValueError("candidate keyset must stay inside its segment")
+        if segment[1] - segment[0] > timedelta(days=60):
+            raise ReadDeadlineExceeded("old widened cursor exceeded read budget")
+        if segment[1] - segment[0] == ATTRIBUTE_READ_EXPLICIT_SEGMENT:
+            raise ReadDeadlineExceeded("legacy six-hour retry exceeded read budget")
+        matches = (
+            (older,)
+            if segment[0] <= older[3] < segment[1]
+            and (
+                before_identity is None
+                or (older[3], older[2], older[1], older[0])
+                < (
+                    before_identity[3],
+                    before_identity[2],
+                    before_identity[1],
+                    before_identity[0],
+                )
+            )
+            else ()
+        )
+        return matches, False, {}
+
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **kwargs: [row] if kwargs.get("candidate_ids") else [],
     )
 
-    assert second.metadata.query_complete is True
-    assert set(returned_identities) == set(identities)
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=1,
+        window_start=NOW - timedelta(days=180),
+        window_end=NOW,
+        segment_end=NOW,
+        segment_start=NOW - timedelta(days=120),
+        before_identity=checkpoint,
+    )
+
+    assert attempted_widths[0] == timedelta(days=120)
+    assert attempted_widths[1] == ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    assert attempted_widths[2] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+    assert [item.key for item in page.rows] == ["reachable_after_wide_budget"]
+    assert page.next_segment_start is None
 
 
 def test_span_attribute_key_cursor_empty_retained_window_terminates_in_one_request():
