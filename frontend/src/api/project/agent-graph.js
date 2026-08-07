@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import {
@@ -7,20 +7,33 @@ import {
   getExactAggregationReadState,
 } from "src/utils/queryReadState";
 
-export const getAgentGraphPresentationState = (query) => {
+export const AGENT_GRAPH_PENDING_TIMEOUT_MS = 60_000;
+
+export const getAgentGraphPresentationState = (
+  query,
+  { pendingTimedOut = false } = {},
+) => {
   const readState = query.data
     ? getExactAggregationReadState(query.data)
     : null;
   const { refreshFailed } = getAggregationRefreshState(query.data);
-  const failedPendingRefresh = readState === "pending" && refreshFailed;
+  const failedPendingRefresh =
+    readState === "pending" && (refreshFailed || query.isError);
+  const timedOutPendingRefresh = readState === "pending" && pendingTimedOut;
   const hasUnreadablePayload =
     Boolean(query.data) && readState !== "complete" && readState !== "pending";
 
   return {
     data: readState === "complete" ? query.data : undefined,
     isLoading:
-      query.isLoading || (readState === "pending" && !failedPendingRefresh),
-    isError: query.isError || hasUnreadablePayload || failedPendingRefresh,
+      !query.isError &&
+      !timedOutPendingRefresh &&
+      (query.isLoading || (readState === "pending" && !failedPendingRefresh)),
+    isError:
+      query.isError ||
+      hasUnreadablePayload ||
+      failedPendingRefresh ||
+      timedOutPendingRefresh,
     queryReadState: readState,
   };
 };
@@ -40,6 +53,8 @@ export const useAgentGraph = (
 ) => {
   const forceRefreshRef = useRef(false);
   const pollAttemptRef = useRef(0);
+  const [pendingTimedOut, setPendingTimedOut] = useState(false);
+  const [pollEpoch, setPollEpoch] = useState(0);
 
   const query = useQuery({
     queryKey: ["agent-graph", projectId, filters],
@@ -60,6 +75,7 @@ export const useAgentGraph = (
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
     refetchInterval: (activeQuery) => {
+      if (pendingTimedOut) return false;
       const payload = activeQuery.state.data;
       const { isRefreshing, refreshFailed } =
         getAggregationRefreshState(payload);
@@ -93,13 +109,35 @@ export const useAgentGraph = (
       }
       forceRefreshRef.current = true;
       pollAttemptRef.current = 0;
+      setPendingTimedOut(false);
+      setPollEpoch((value) => value + 1);
       refetch({ cancelRefetch: true });
     };
     window.addEventListener("observe-refresh", handleRefresh);
     return () => window.removeEventListener("observe-refresh", handleRefresh);
   }, [enabled, projectId, refetch]);
 
-  const presentationState = getAgentGraphPresentationState(query);
+  const rawPresentationState = getAgentGraphPresentationState(query);
+  const isLivePending =
+    rawPresentationState.queryReadState === "pending" &&
+    !rawPresentationState.isError;
+  const pendingIdentity = JSON.stringify([projectId, filters || []]);
+
+  useEffect(() => {
+    pollAttemptRef.current = 0;
+    setPendingTimedOut(false);
+    if (!enabled || !projectId || !isLivePending) return undefined;
+
+    const timeout = setTimeout(
+      () => setPendingTimedOut(true),
+      AGENT_GRAPH_PENDING_TIMEOUT_MS,
+    );
+    return () => clearTimeout(timeout);
+  }, [enabled, projectId, pendingIdentity, isLivePending, pollEpoch]);
+
+  const presentationState = getAgentGraphPresentationState(query, {
+    pendingTimedOut,
+  });
 
   return {
     ...query,

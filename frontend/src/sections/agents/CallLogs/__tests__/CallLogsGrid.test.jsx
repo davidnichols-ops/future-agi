@@ -133,6 +133,7 @@ describe("CallLogsGrid bounded-read state", () => {
     await waitFor(() => expect(prefetchCallLogsMock).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(agGridState.props.rowData).toEqual(completeData.results);
+    expect(agGridState.props.loading).toBe(false);
     expect(
       screen.getByRole("button", { name: /go to page 2/i }),
     ).toBeInTheDocument();
@@ -184,5 +185,42 @@ describe("CallLogsGrid bounded-read state", () => {
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(agGridState.props.rowData).toEqual(completeData.results);
     expect(screen.getByText("Next").closest("button")).not.toBeDisabled();
+  });
+
+  it("disables AG Grid's stale loading announcement for an exact empty result", () => {
+    useCallLogsMock.mockReturnValue({
+      data: {
+        ...completeData,
+        count: 0,
+        count_is_lower_bound: false,
+        total_pages: 1,
+        results: [],
+        has_more: false,
+        next_cursor: null,
+      },
+      isLoading: false,
+      error: null,
+      queryKey: ["callLogs", "project", "project-1", 15, {}, 1],
+    });
+
+    render(<CallLogsGrid id="project-1" module="project" hideDrawer />);
+
+    expect(screen.getByText("No calls found")).toBeInTheDocument();
+    expect(agGridState.props.rowData).toEqual([]);
+    expect(agGridState.props.loading).toBe(false);
+  });
+
+  it("uses skeleton rows without enabling AG Grid's built-in loading overlay", () => {
+    useCallLogsMock.mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      error: null,
+      queryKey: ["callLogs", "project", "project-1", 15, {}, 1],
+    });
+
+    render(<CallLogsGrid id="project-1" module="project" hideDrawer />);
+
+    expect(agGridState.props.rowData).toHaveLength(10);
+    expect(agGridState.props.loading).toBe(false);
   });
 });

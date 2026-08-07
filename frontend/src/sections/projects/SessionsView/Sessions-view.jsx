@@ -21,8 +21,6 @@ import { useParams, useNavigate } from "react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { enqueueSnackbar } from "notistack";
 import { Helmet } from "react-helmet-async";
-import { formatDate } from "src/utils/report-utils";
-import { endOfToday, sub } from "date-fns";
 import { Events, trackEvent } from "src/utils/Mixpanel";
 import { useUrlState } from "src/routes/hooks/use-url-state";
 import { useObserveHeader } from "src/sections/project/context/ObserveHeaderContext";
@@ -78,6 +76,7 @@ import {
   isColumnOrderDirty,
 } from "../LLMTracing/savedViewColumns";
 import { filtersContentEqual } from "../saved-view-utils";
+import { getDefaultDateRangeForMode } from "../dateRangeDefaults";
 
 // ---------------------------------------------------------------------------
 // Base session filter fields (always available)
@@ -137,14 +136,6 @@ const defaultFilterBase = [
   },
 ];
 
-const getDefaultDateRange = () => ({
-  dateFilter: [
-    formatDate(sub(new Date(), { months: 6 })),
-    formatDate(endOfToday()),
-  ],
-  dateOption: "6M",
-});
-
 // Date label helper — mirrors LLMTracingView so the toolbar button reflects
 // the restored URL state (shows picked dates for Custom, "Past N" for presets).
 const PRESET_DATE_LABELS = {
@@ -190,7 +181,10 @@ const SessionsView = ({ mode = "project", userIdForUserMode = null }) => {
   } = useObserveHeader();
 
   // --- Filter & date state (reuse trace filter hook) ---
-  const defaultDateFilter = useMemo(() => getDefaultDateRange(), []);
+  const defaultDateFilter = useMemo(
+    () => getDefaultDateRangeForMode(isUserMode, "6M"),
+    [isUserMode],
+  );
   const [sessionColumns, setSessionColumns] = useState([]);
 
   const { validatedFilters, setDateFilter, dateFilter } = useLLMTracingFilters(

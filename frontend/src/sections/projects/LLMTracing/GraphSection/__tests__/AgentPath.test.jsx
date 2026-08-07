@@ -16,4 +16,19 @@ describe("AgentPath failure state", () => {
       screen.queryByText("No agent path data available for this time range"),
     ).not.toBeInTheDocument();
   });
+
+  it("shows the exact empty state after a completed query", () => {
+    render(
+      <AgentPath
+        data={{ nodes: [], edges: [], path_edges: [] }}
+        isLoading={false}
+        isError={false}
+      />,
+    );
+
+    expect(
+      screen.getByText("No agent path data available for this time range"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
 });

@@ -131,13 +131,7 @@ const convertGraphSelectionsToFilters = (
 import { ShowComponent } from "src/components/show";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import { formatDate } from "src/utils/report-utils";
-import {
-  endOfToday,
-  startOfToday,
-  startOfTomorrow,
-  startOfYesterday,
-  sub,
-} from "date-fns";
+import { startOfToday, startOfTomorrow, startOfYesterday, sub } from "date-fns";
 import { Events, PropertyName, trackEvent } from "src/utils/Mixpanel";
 import { useUrlState } from "src/routes/hooks/use-url-state";
 import { Helmet } from "react-helmet-async";
@@ -212,6 +206,7 @@ import {
   useCreateSavedView,
   useUpdateWorkspaceSavedView,
 } from "src/api/project/saved-views";
+import { getDefaultDateRangeForMode } from "../dateRangeDefaults";
 
 const USER_DETAIL_TAB_TYPE = "user_detail";
 
@@ -273,18 +268,6 @@ const defaultFilterBase = {
     filter_value: "",
   },
 };
-const getDefaultDateRange = (dateOption = "7D") => {
-  const start =
-    dateOption === "6M"
-      ? sub(new Date(), { months: 6 })
-      : sub(new Date(), { days: 7 });
-
-  return {
-    dateFilter: [formatDate(start), formatDate(endOfToday())],
-    dateOption,
-  };
-};
-
 const getDefaultFilter = () => {
   return [{ ...defaultFilterBase, id: getRandomId() }];
 };
@@ -1052,7 +1035,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       : viewMode;
 
   const defaultDateFilter = useMemo(
-    () => getDefaultDateRange(isUserMode ? "6M" : "7D"),
+    () => getDefaultDateRangeForMode(isUserMode, "7D"),
     [isUserMode],
   );
 

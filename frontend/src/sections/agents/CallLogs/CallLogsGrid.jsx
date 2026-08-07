@@ -584,6 +584,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
             onColumnMoved={onColumnMoved}
             defaultColDef={defaultColDef}
             rowData={rows}
+            loading={false}
             suppressServerSideFullWidthLoadingRow={true}
             rowSelection={
               onSelectionChanged
