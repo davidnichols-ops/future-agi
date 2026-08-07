@@ -820,10 +820,16 @@ CLICKHOUSE_V2 = {
     "CH25_USER": os.getenv("CH25_USER"),
     "CH25_PASSWORD": os.getenv("CH25_PASSWORD"),
     "CH25_DATABASE": os.getenv("CH25_DATABASE"),
-    "CH25_SERVER_ENFORCED_READONLY": os.getenv(
-        "CH25_SERVER_ENFORCED_READONLY", "false"
-    ).lower()
-    in ("true", "1", "yes"),
+    # ``None`` means the v2-specific flag was not configured and lets
+    # ``get_v2_config`` inherit the legacy single-cluster setting.  A concrete
+    # False must be reserved for an explicit CH25 override; defaulting to False
+    # here silently disabled inheritance for server-locked read profiles.
+    "CH25_SERVER_ENFORCED_READONLY": (
+        None
+        if os.getenv("CH25_SERVER_ENFORCED_READONLY") is None
+        else os.getenv("CH25_SERVER_ENFORCED_READONLY", "").lower()
+        in ("true", "1", "yes")
+    ),
     # ─── Per-query-type routing for the shadow-mode rollout ──────────────────
     # Comma-separated query type names. See tracer/services/clickhouse/v2/shadow.py
     # for RoutingMode definitions. Anything not listed defaults to V1_ONLY.

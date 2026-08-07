@@ -3,6 +3,7 @@
 from unittest.mock import Mock, call
 
 import pytest
+from django.test import override_settings
 
 from tracer.services.clickhouse import client as client_module
 from tracer.services.clickhouse import server_readonly as server_readonly_module
@@ -13,6 +14,32 @@ from tracer.services.clickhouse.server_readonly import (
     without_query_settings,
 )
 from tracer.services.clickhouse.v2.span_reader import CHSpanReader
+
+
+@override_settings(
+    CLICKHOUSE={"CH_SERVER_ENFORCED_READONLY": True},
+    CLICKHOUSE_V2={"CH25_SERVER_ENFORCED_READONLY": None},
+)
+def test_v2_config_inherits_legacy_server_locked_profile(monkeypatch):
+    from tracer.services.clickhouse.v2 import get_v2_config
+
+    monkeypatch.delenv("CH25_SERVER_ENFORCED_READONLY", raising=False)
+
+    assert get_v2_config()["server_enforced_readonly"] is True
+
+
+@override_settings(
+    CLICKHOUSE={"CH_SERVER_ENFORCED_READONLY": True},
+    CLICKHOUSE_V2={"CH25_SERVER_ENFORCED_READONLY": False},
+)
+def test_v2_config_explicit_false_overrides_legacy_server_locked_profile(
+    monkeypatch,
+):
+    from tracer.services.clickhouse.v2 import get_v2_config
+
+    monkeypatch.delenv("CH25_SERVER_ENFORCED_READONLY", raising=False)
+
+    assert get_v2_config()["server_enforced_readonly"] is False
 
 
 def _client(*, server_enforced_readonly: bool) -> ClickHouseClient:
