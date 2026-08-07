@@ -11,6 +11,7 @@ probabilistic, as every streaming sampler is.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,8 @@ NAIVE_MAX_K = 10_000_000
 
 # Top 16 bits of the 63-bit hash → 65536 histogram buckets.
 _BUCKET_SHIFT = 47
+
+logger = logging.getLogger(__name__)
 
 
 def derive_threshold(task: EvalTask) -> int:
@@ -58,6 +61,27 @@ def derive_threshold(task: EvalTask) -> int:
     if k <= NAIVE_MAX_K:
         return _naive_threshold(sql, params, hash_sql, k)
     return _histogram_threshold(sql, params, hash_sql, k)
+
+
+def refresh_sample_threshold(task: EvalTask) -> int | None:
+    """Derive the task's threshold and persist it, returning what was stored.
+
+    Fails open: if ClickHouse is unreachable the threshold is left as-is and the
+    task still runs, sampling on whatever predicate it already had. Losing exact
+    counts is a far smaller harm than refusing to create or edit the task.
+    """
+    from tracer.models.eval_task import EvalTask as EvalTaskModel
+
+    try:
+        threshold = derive_threshold(task)
+    except Exception:
+        logger.exception(
+            "eval_task_threshold_derivation_failed", extra={"eval_task_id": task.id}
+        )
+        return None
+    task.sample_threshold = threshold
+    EvalTaskModel.objects.filter(id=task.id).update(sample_threshold=threshold)
+    return threshold
 
 
 def _naive_threshold(sql: str, params: dict[str, Any], hash_sql: str, k: int) -> int:
