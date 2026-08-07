@@ -3210,6 +3210,12 @@ class AttributeReadSelector:
             and len(emitted) < effective_page_size
             and next_resume_identity is None
             and candidate_pages < ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
+            # Every walk iteration issues one candidate query and one
+            # latest-state verification query. A resumed array row consumes
+            # one verification before this loop, so reserve capacity for the
+            # pair instead of letting the last iteration cross the selector's
+            # global per-operation query ceiling.
+            and self._query_count + 2 <= ATTRIBUTE_READ_MAX_QUERY_COUNT
         ):
             segment_start = max(
                 start, current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT

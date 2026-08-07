@@ -14,6 +14,8 @@ from tracer.serializers.trace import UsersTableRowSerializer
 from tracer.services.clickhouse.query_service import AnalyticsQueryService
 from tracer.services.users_list_manager import (
     MAX_EXPORT_ROWS,
+    USER_LIST_QUERY_TIMEOUT_MS,
+    USER_LIST_WALL_DEADLINE_MS,
     USERS_EXPORT_COLUMNS,
     UsersListManager,
 )
@@ -579,10 +581,13 @@ class TestUsersExportStreaming:
         assert payload["total_count"] == 1
         assert payload["table"][0]["user_id"] == "u1"
         # Conservative physical-span presence proof, exact page, then three
-        # concurrent finite enrichments (metrics, attributes, evals).
+        # concurrent finite enrichments (metrics, attributes, evals). Every
+        # statement remains below both the per-query cap and the shared wall
+        # deadline; the old 2.2s assertion predated the exact-list budget.
         assert execute_mock.call_count == 5
         for call in execute_mock.call_args_list:
-            assert 0 < call.kwargs["timeout_ms"] <= 2_200
+            assert 0 < call.kwargs["timeout_ms"] <= USER_LIST_QUERY_TIMEOUT_MS
+            assert call.kwargs["timeout_ms"] < USER_LIST_WALL_DEADLINE_MS
             settings = call.kwargs["settings"]
             assert settings["max_rows_to_read"] == 10_000_000
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024

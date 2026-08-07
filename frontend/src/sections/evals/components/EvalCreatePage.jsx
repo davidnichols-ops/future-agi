@@ -43,6 +43,7 @@ import {
 import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
 import { buildDataInjection } from "src/sections/common/EvalPicker/evalPickerConfigUtils";
+import { getSafeActionErrorMessage } from "src/utils/errorUtils";
 
 const ERROR_LOCALIZER_OSS_TOOLTIP =
   "Error Localization is not available on self-hosted (OSS) deployments.";
@@ -474,15 +475,9 @@ const EvalCreatePage = () => {
       enqueueSnackbar("Evaluation saved successfully", { variant: "success" });
       navigate(`/dashboard/evaluations/${draftId}`);
     } catch (error) {
-      const message =
-        error?.response?.data?.result ||
-        error?.message ||
-        "Failed to save evaluation";
       enqueueSnackbar(
-        typeof message === "string" ? message : JSON.stringify(message),
-        {
-          variant: "error",
-        },
+        getSafeActionErrorMessage(error, "Failed to save evaluation"),
+        { variant: "error" },
       );
     }
   }, [
@@ -533,15 +528,12 @@ const EvalCreatePage = () => {
       });
       navigate(`/dashboard/evaluations/${result.id}`);
     } catch (error) {
-      const message =
-        error?.response?.data?.result ||
-        error?.message ||
-        "Failed to create composite evaluation";
       enqueueSnackbar(
-        typeof message === "string" ? message : JSON.stringify(message),
-        {
-          variant: "error",
-        },
+        getSafeActionErrorMessage(
+          error,
+          "Failed to create composite evaluation",
+        ),
+        { variant: "error" },
       );
     }
   }, [
@@ -563,7 +555,7 @@ const EvalCreatePage = () => {
     // needed since the composite hasn't been (and won't be) saved as a
     // single-eval draft. Single evals still need their draft up to date
     // so the playground sees the latest instructions/code/config.
- 
+
     if (isOSS && evalType !== "code" && !model) {
       enqueueSnackbar("Please select a model.", { variant: "error" });
       setOpenModelMenuSignal((n) => n + 1);
@@ -592,9 +584,10 @@ const EvalCreatePage = () => {
       }
       setTimeout(() => setIsTesting((v) => (v ? false : v)), 60000);
     } catch (error) {
-      const message =
-        error?.response?.data?.result || error?.message || "Failed to run test";
-      handleTestResult(false, message);
+      handleTestResult(
+        false,
+        getSafeActionErrorMessage(error, "Failed to run test"),
+      );
       setIsTesting(false);
     }
   }, [
@@ -667,7 +660,6 @@ const EvalCreatePage = () => {
   // and can be tested individually.
   const canSave =
     canEditEvals && (mode === "single" ? canSaveSingle : canSaveComposite);
-
 
   if (deploymentModeLoading) {
     return null;
@@ -929,10 +921,7 @@ const EvalCreatePage = () => {
                                   }}
                                 >
                                   {tab.label}
-                                  <Iconify
-                                    icon="mdi:lock-outline"
-                                    width={14}
-                                  />
+                                  <Iconify icon="mdi:lock-outline" width={14} />
                                 </Box>
                               </CustomTooltip>
                             ) : (

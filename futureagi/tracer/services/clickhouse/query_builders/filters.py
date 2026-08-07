@@ -383,6 +383,7 @@ class ClickHouseFilterBuilder:
         candidate_ids_param: str | None = None,
         candidate_entities_param: str | None = None,
         strict_trace_project_correlation: bool = False,
+        annotation_label_set_known: bool = False,
     ) -> None:
         self.table = table
         self.annotation_label_ids = annotation_label_ids or []
@@ -437,6 +438,14 @@ class ClickHouseFilterBuilder:
         # trace/span identity.  Keep the default off: existing single-project
         # callers retain byte-for-byte SQL and behaviour.
         self.strict_trace_project_correlation = bool(strict_trace_project_correlation)
+        # ``annotation_label_ids=[]`` historically meant "metadata was not
+        # supplied", so has_annotation fell back to a simple score-existence
+        # check.  Org residual branches resolve each project's label set
+        # authoritatively and need to distinguish a known empty set from that
+        # legacy unknown state.  For a known empty set, completeness over all
+        # configured labels is vacuously true and must never widen to scores
+        # from an unrelated/legacy label.
+        self.annotation_label_set_known = bool(annotation_label_set_known)
         self._param_counter: int = 0
         self._params: dict[str, Any] = {}
 
@@ -484,9 +493,16 @@ class ClickHouseFilterBuilder:
             return ""
         observation_id = f"{alias}.observation_span_id"
         if self.query_mode == self.QUERY_MODE_SPAN:
-            return self._candidate_span_entity_filter(
-                f"{alias}.trace_id", observation_id
-            )
+            # Span-backed Score rows commonly leave ``trace_id`` NULL and
+            # carry only ``observation_span_id``.  Filtering those raw score
+            # rows by a (trace_id, span_id) tuple would therefore discard the
+            # very annotations this join is meant to resolve.  The span-id
+            # check is a safe candidate superset; ``_score_span_select`` joins
+            # it back to the project-scoped spans table and applies the exact
+            # trace/span tuple after resolution.
+            if self.candidate_ids_param is not None:
+                return self._candidate_filter(observation_id)
+            return ""
         return (
             f" AND toString({observation_id}) IN ("
             f"SELECT toString(id) FROM {self.table} "
@@ -519,11 +535,33 @@ class ClickHouseFilterBuilder:
         return f" AND {alias}.created_at >= %(start_date)s - INTERVAL 1 DAY"
 
     def _score_project_filter(self, alias: str = "s") -> str:
-        """Correlate score rows to one tracer project when explicitly required."""
+        """Fence every Score read to the same tracer project as its span.
 
-        if not self.strict_trace_project_correlation:
-            return ""
+        Span IDs and trace IDs are tenant-local, so the project-scoped spans
+        join is not sufficient by itself: a Score from another project can
+        carry the same textual identity. ``tracer_project_id`` is the
+        authoritative denormalized tenant key for tracer Scores. Historic NULL
+        rows deliberately fail closed until the existing backfill stamps them.
+        """
+
+        if not self.project_ids:
+            return " AND 0"
+        if self._org_scoped:
+            return f" AND {alias}.tracer_project_id IN %(project_ids)s"
         return f" AND {alias}.tracer_project_id = toUUID(%(project_id)s)"
+
+    @staticmethod
+    def _score_live_predicate(alias: str = "s") -> str:
+        """Require both application and CDC live state for a Score row.
+
+        ``model_hub_score`` is a legacy PeerDB-backed ReplacingMergeTree. A
+        hard-delete CDC version can retain ``deleted = false`` from the source
+        payload, so the application soft-delete flag alone resurrects that row
+        after ``FINAL`` selects the higher version. Keep both predicates at
+        every Score filter read boundary.
+        """
+
+        return f"{alias}.deleted = false AND {alias}._peerdb_is_deleted = 0"
 
     def _strict_span_project_filter(self) -> str:
         """Scope an org residual's span-side membership to its branch project."""
@@ -586,10 +624,7 @@ class ClickHouseFilterBuilder:
             id_filter = (
                 f" AND id IN ("
                 f"SELECT observation_span_id FROM model_hub_score AS s FINAL "
-                # model_hub_score keeps the legacy `_peerdb_is_deleted` column;
-                # the v2 SQL rewriter renames it to `is_deleted` (which this table
-                # lacks). `s.deleted = false` is the real soft-delete filter.
-                f"WHERE s.deleted = false "
+                f"WHERE {self._score_live_predicate('s')} "
                 f"AND notEmpty(s.observation_span_id)"
                 f"{score_date}"
                 f"{score_project}"
@@ -696,7 +731,7 @@ class ClickHouseFilterBuilder:
             f"FROM model_hub_score AS s FINAL "
             f"LEFT JOIN {spans_subq} AS sp "
             f"ON sp.id = s.observation_span_id "
-            f"WHERE s.deleted = false "
+            f"WHERE {self._score_live_predicate('s')} "
             f"AND isNotNull({score_trace_expr}) "
             f"AND {score_trace_expr} != ''"
             f"{candidate_filter}"
@@ -708,9 +743,20 @@ class ClickHouseFilterBuilder:
     @staticmethod
     def _score_span_id_expr() -> str:
         """Resolve a Score row to the span id it should filter in span mode."""
+        return "if(ifNull(s.observation_span_id, '') != '', scored_sp.id, root_sp.id)"
+
+    @staticmethod
+    def _score_span_trace_expr() -> str:
+        """Resolve the trace half of a span-scoped Score identity.
+
+        Inline annotations often have only ``observation_span_id``.  For
+        those rows the authoritative trace is the one on the joined span;
+        trace-scoped scores instead retain their own trace and map to its
+        root span.
+        """
         return (
             "if(ifNull(s.observation_span_id, '') != '', "
-            "s.observation_span_id, root_sp.id)"
+            "scored_sp.trace_id, toString(s.trace_id))"
         )
 
     def _project_scope_predicate(self, table_alias: str | None = None) -> str:
@@ -753,34 +799,39 @@ class ClickHouseFilterBuilder:
         trace into the result.
         """
         score_span_expr = self._score_span_id_expr()
+        score_trace_expr = self._score_span_trace_expr()
         score_span_entity_expr = (
-            f"tuple(toString(s.trace_id), toString({score_span_expr}))"
+            f"tuple(toString({score_trace_expr}), toString({score_span_expr}))"
         )
         select_keyword = "SELECT DISTINCT" if distinct else "SELECT"
         extra_clause = f" {extra_where}" if extra_where else ""
         date_clause = self._score_date_filter("s")
         project_clause = self._score_project_filter("s")
         candidate_filter = self._candidate_span_entity_filter(
-            "s.trace_id", score_span_expr
+            score_trace_expr, score_span_expr
         )
-        # Same rationale as ``_score_trace_select``: pre-filter spans via a
-        # subquery so the root-span lookup actually prunes partitions.
-        # Restrict to root spans (parent_span_id IS NULL/'') inside the
-        # subquery so the LEFT JOIN's ``trace_id =`` match doesn't have to
-        # scan every span row for that trace.
-        spans_subq = self._scoped_spans_subquery(
+        # Resolve span-backed scores through an exact project/date/candidate
+        # span lookup.  Keep trace-backed scores on a separate root-only join:
+        # applying the score-side observation-id gate to that join would make
+        # every trace-only score disappear because its observation id is NULL.
+        scored_spans_subq = self._scoped_spans_subquery(
+            select_cols="id, trace_id",
+            score_side_where=extra_where,
+        )
+        root_spans_subq = self._scoped_spans_subquery(
             select_cols="id, trace_id",
             extra_where="(parent_span_id IS NULL OR parent_span_id = '')",
-            score_side_where=extra_where,
         )
         return (
             f"{select_keyword} {score_span_entity_expr} AS {alias} "
             f"FROM model_hub_score AS s FINAL "
-            f"LEFT JOIN {spans_subq} AS root_sp "
+            f"LEFT JOIN {scored_spans_subq} AS scored_sp "
+            f"ON scored_sp.id = s.observation_span_id "
+            f"LEFT JOIN {root_spans_subq} AS root_sp "
             f"ON root_sp.trace_id = toString(s.trace_id) "
-            f"WHERE s.deleted = false "
-            f"AND NOT isNull(s.trace_id) "
-            "AND s.trace_id != toUUID('00000000-0000-0000-0000-000000000000') "
+            f"WHERE {self._score_live_predicate('s')} "
+            f"AND isNotNull({score_trace_expr}) "
+            f"AND {score_trace_expr} != '' "
             f"AND isNotNull({score_span_expr}) "
             f"AND {score_span_expr} != ''"
             f"{candidate_filter}"
@@ -1492,6 +1543,7 @@ class ClickHouseFilterBuilder:
             "trace_session_id",
         }
     )
+    _UUID_COLUMNS = _NULLABLE_UUID_COLUMNS | frozenset({"project_id"})
     # Ops that compare a nullable UUID column against a string value. For
     # these the column is wrapped in toString(...) so literal substring,
     # equality, and membership work — ClickHouse rejects direct UUID-vs-String
@@ -1528,7 +1580,7 @@ class ClickHouseFilterBuilder:
         )
 
         if filter_op == "is_null":
-            if column in self._NULLABLE_UUID_COLUMNS:
+            if column in self._UUID_COLUMNS:
                 return f"{column} IS NULL"
             # Empty-string fallback is text-only; comparing a numeric/datetime
             # column to '' raises a ClickHouse cast error.
@@ -1536,7 +1588,7 @@ class ClickHouseFilterBuilder:
                 return f"({column} IS NULL OR {column} = '')"
             return f"{column} IS NULL"
         elif filter_op == "is_not_null":
-            if column in self._NULLABLE_UUID_COLUMNS:
+            if column in self._UUID_COLUMNS:
                 return f"{column} IS NOT NULL"
             if filter_type == FilterType.TEXT.value:
                 return f"({column} IS NOT NULL AND {column} != '')"
@@ -1686,6 +1738,8 @@ class ClickHouseFilterBuilder:
         dispatches on the template's output type (SCORE / PASS_FAIL / CHOICE)
         to compare the correct column in ``tracer_eval_logger``.
         """
+        from django.core.exceptions import ValidationError
+
         from model_hub.models.evals_metric import EvalTemplate
         from tracer.models.custom_eval_config import CustomEvalConfig
 
@@ -1724,8 +1778,13 @@ class ClickHouseFilterBuilder:
                 )
                 if ot in ("PASS_FAIL", "CHOICE", "CHOICES", "SCORE"):
                     output_type = ot
-        except Exception:
-            pass
+        except (TypeError, ValueError, ValidationError):
+            # A malformed legacy/saved identifier is a valid no-match.  Do
+            # not catch database/infrastructure failures here: converting a
+            # transient metadata outage into ``0 = 1`` publishes a successful
+            # but false-empty list/graph, which is materially worse than a
+            # retryable sanitized API error.
+            config_ids = []
 
         if not config_ids:
             # No matching config — build a condition that matches nothing so
@@ -2439,6 +2498,8 @@ class ClickHouseFilterBuilder:
 
         label_ids = self.annotation_label_ids
         if not label_ids:
+            if self.annotation_label_set_known:
+                return "1 = 1" if wants_annotation else "0 = 1"
             # Fallback: simple existence check
             op = "IN" if wants_annotation else "NOT IN"
             return f"{target_column} {op} ({score_entity_sq})"

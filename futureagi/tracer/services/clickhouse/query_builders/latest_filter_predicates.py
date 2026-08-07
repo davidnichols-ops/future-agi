@@ -1053,6 +1053,7 @@ def compile_exact_graph_filter_predicates(
     *,
     project_id: str,
     observe_type: str,
+    annotation_label_ids: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Compile exact graph filters, including overflow JSON arrays/maps.
 
@@ -1117,6 +1118,8 @@ def compile_exact_graph_filter_predicates(
         project_id=project_id,
         query_mode=query_mode,
         span_date_scope=True,
+        annotation_label_ids=list(annotation_label_ids or ()),
+        annotation_label_set_known=annotation_label_ids is not None,
     )
     ordinary_clause, params = builder.translate(ordinary_filters)
     clauses = [ordinary_clause] if ordinary_clause else []
@@ -1188,6 +1191,28 @@ def _column_plan(
         value_type=value_type,
         index=index,
     )
+    operation = normalize_filter_op(
+        str(config.get("filter_op") or config.get("filterOp") or "")
+    )
+    if (
+        value_type == "text"
+        and column not in ClickHouseFilterBuilder._UUID_COLUMNS
+        and operation in {"is_null", "is_not_null"}
+    ):
+        # The public direct-column text contract treats the empty-string
+        # sentinel as null (see ClickHouseFilterBuilder._build_column_condition).
+        # CH25 stores hot text columns such as ``model`` as non-Nullable String,
+        # so a bare ``IS NULL`` can never match them. UUID columns (nullable or
+        # not) must keep their native null predicate: comparing UUID to ``''``
+        # is a ClickHouse type error. Keep the bounded latest-state compiler
+        # semantically identical to the direct compiler for both the ordered
+        # seed and replay predicates.
+        if operation == "is_null":
+            predicate = f"({alias} IS NULL OR {alias} = '')"
+            seed_predicate = f"({column} IS NULL OR {column} = '')"
+        else:
+            predicate = f"({alias} IS NOT NULL AND {alias} != '')"
+            seed_predicate = f"({column} IS NOT NULL AND {column} != '')"
     if column == "trace_session_id" or (column == "trace_id" and scope == "root"):
         seed_predicate = (
             _raw_uuid_seed_predicate(

@@ -1252,20 +1252,111 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     {"values": values, **value_read.metadata()}
                 )
 
-            elif metric_type in ("annotation_metric", "eval_metric"):
-                # Annotation / eval filter values are derived from the label
+            elif metric_type == "eval_metric":
+                # Observe exposes CustomEvalConfig ids while older dashboard
+                # widgets can still carry EvalTemplate ids. Resolve either id
+                # through a config attached to the already-authorized project
+                # set; a guessed config/template UUID from another tenant or
+                # project must not reveal its output definition or choices.
+                from django.core.exceptions import ValidationError
+                from django.db.models import Q
+
+                try:
+                    eval_config = (
+                        CustomEvalConfig.no_workspace_objects.filter(
+                            project_id__in=project_ids,
+                            project__workspace=request.workspace,
+                            project__organization=request.workspace.organization,
+                            eval_template__deleted=False,
+                        )
+                        .filter(Q(id=metric_name) | Q(eval_template_id=metric_name))
+                        .select_related("eval_template")
+                        .first()
+                    )
+                except (TypeError, ValueError, ValidationError):
+                    eval_config = None
+
+                if eval_config is None:
+                    return self._gm.success_response({"values": []})
+
+                eval_template = eval_config.eval_template
+                template_config = eval_template.config or {}
+                output_type = "SCORE"
+                if isinstance(template_config, dict):
+                    normalized_output = (
+                        (template_config.get("output") or "")
+                        .upper()
+                        .replace("/", "_")
+                        .replace(" ", "_")
+                    )
+                    if normalized_output in {
+                        "PASS_FAIL",
+                        "CHOICE",
+                        "CHOICES",
+                        "SCORE",
+                    }:
+                        output_type = normalized_output
+
+                if output_type == "PASS_FAIL":
+                    values = [
+                        {"value": "Passed", "label": "Passed"},
+                        {"value": "Failed", "label": "Failed"},
+                    ]
+                elif output_type in {"CHOICE", "CHOICES"}:
+                    values = []
+                    seen_values = set()
+                    for choice in eval_template.choices or []:
+                        raw_value = choice
+                        raw_label = choice
+                        if isinstance(choice, dict):
+                            raw_value = (
+                                choice.get("value")
+                                or choice.get("label")
+                                or choice.get("name")
+                            )
+                            raw_label = (
+                                choice.get("label") or choice.get("name") or raw_value
+                            )
+                        if raw_value in (None, ""):
+                            continue
+                        value = str(raw_value)
+                        if value in seen_values:
+                            continue
+                        seen_values.add(value)
+                        values.append({"value": value, "label": str(raw_label)})
+                else:
+                    # Score evals use numeric entry rather than a misleading
+                    # categorical vocabulary.
+                    values = []
+
+            elif metric_type == "annotation_metric":
+                # Annotation filter values are derived from the label
                 # definition (settings) and, for categorical annotations, from
                 # stored scores. Older imported/backfilled labels can have
                 # real choices in Score.value without settings.options; relying
                 # only on settings makes the value dropdown empty even though
                 # the annotation metric itself is available.
+                from django.core.exceptions import ValidationError
+                from django.db.models import Q
+
                 from model_hub.models.develop_annotations import AnnotationsLabels
 
                 try:
-                    label = AnnotationsLabels.no_workspace_objects.get(
-                        pk=metric_name, deleted=False
-                    )
-                except AnnotationsLabels.DoesNotExist:
+                    label_queryset = AnnotationsLabels.no_workspace_objects.filter(
+                        pk=metric_name,
+                        organization=request.workspace.organization,
+                        deleted=False,
+                    ).filter(Q(workspace=request.workspace) | Q(workspace__isnull=True))
+                    if project_ids:
+                        label_queryset = label_queryset.filter(
+                            Q(project_id__in=project_ids) | Q(project__isnull=True)
+                        )
+                    else:
+                        label_queryset = label_queryset.filter(project__isnull=True)
+                    label = label_queryset.first()
+                except (TypeError, ValueError, ValidationError):
+                    label = None
+                if label is None:
                     return self._gm.success_response({"values": []})
 
                 label_type = label.type

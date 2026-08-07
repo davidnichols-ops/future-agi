@@ -130,6 +130,8 @@ from tracer.utils.helper import (
     FieldConfig,
     format_datetime_fields_to_iso,
     format_datetime_to_iso,
+    get_annotation_labels_by_project,
+    get_annotation_labels_for_project,
     get_default_project_session_config,
 )
 from tracer.utils.session import get_session_navigation
@@ -2201,8 +2203,10 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
         eu_by_canonical: dict[str, str] = {}
         for row in result.data:
-            sid = str(row.get("session_id", "") if isinstance(row, dict) else row[0])
-            euid = str(row.get("end_user_id", "") if isinstance(row, dict) else row[1])
+            raw_sid = row.get("session_id") if isinstance(row, dict) else row[0]
+            raw_euid = row.get("end_user_id") if isinstance(row, dict) else row[1]
+            sid = str(raw_sid) if raw_sid else ""
+            euid = str(raw_euid) if raw_euid else ""
             if sid and euid and euid != NIL_UUID:
                 eu_by_canonical[sid] = euid
 
@@ -2580,6 +2584,27 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             filters.append(frozen_window_filter(cursor_state))
             page_number = 0
 
+        needs_annotation_completeness = any(
+            (item.get("column_id") or item.get("columnId")) == "has_annotation"
+            for item in filters
+            if isinstance(item, dict)
+        )
+        annotation_label_ids = []
+        annotation_label_ids_by_project = None
+        if needs_annotation_completeness:
+            if org_scope:
+                labels_by_project = get_annotation_labels_by_project(
+                    [str(value) for value in org_project_ids],
+                    organization=org,
+                )
+                annotation_label_ids_by_project = {
+                    project_key: [str(label.id) for label in labels]
+                    for project_key, labels in labels_by_project.items()
+                }
+            else:
+                annotation_labels = get_annotation_labels_for_project(project_id)
+                annotation_label_ids = [str(label.id) for label in annotation_labels]
+
         builder = SessionListQueryBuilderV2(
             project_id=None if org_scope else str(project_id),
             project_ids=[str(p) for p in org_project_ids] if org_scope else None,
@@ -2588,6 +2613,8 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             page_size=page_size,
             sort_params=sort_params,
             user_id=None,
+            annotation_label_ids=annotation_label_ids,
+            annotation_label_ids_by_project=annotation_label_ids_by_project,
             bounded_internal_scan=cursor_enabled,
         )
         if cursor_enabled and not builder.supports_bounded_filter_scan():
@@ -2720,6 +2747,34 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 + bounded_page.total_rows_lower_bound
                 if cursor_enabled
                 else bounded_page.total_rows_lower_bound
+            )
+
+        if org_scope and any(
+            max(
+                int(row.get("project_count", 1) or 1),
+                int(row.get("max_project_count", 1) or 1),
+            )
+            > 1
+            for row in page_candidates
+        ):
+            # Session IDs are the public/enrichment key.  Never merge data from
+            # two projects if a malformed import reused that UUID; relational
+            # classification reports the collision before any ID-only hydration.
+            session_logger.warning(
+                "organization_session_identity_collision",
+                collision_count=sum(
+                    max(
+                        int(row.get("project_count", 1) or 1),
+                        int(row.get("max_project_count", 1) or 1),
+                    )
+                    > 1
+                    for row in page_candidates
+                ),
+            )
+            return self._gm.custom_error_response(
+                drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Session data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
             )
 
         candidate_ids = [
@@ -2879,6 +2934,21 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             total_count = candidate_total_count
         else:
             count_result = completed.get("count")
+            if (
+                org_scope
+                and count_result is not None
+                and count_result.data
+                and int(count_result.data[0].get("max_project_count", 1) or 1) > 1
+            ):
+                session_logger.warning(
+                    "organization_session_identity_collision",
+                    collision_count=1,
+                )
+                return self._gm.custom_error_response(
+                    drf_status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Session data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
             total_count = (
                 count_result.data[0].get("total", 0)
                 if count_result is not None and count_result.data

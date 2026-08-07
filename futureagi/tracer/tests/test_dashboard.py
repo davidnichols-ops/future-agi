@@ -4880,7 +4880,6 @@ class TestDashboardQueryExecution:
     @pytest.mark.django_db
     def test_query_action_eval_metric_runs_against_real_ch(
         self,
-        auth_client,
         observe_project,
         isolated_eval_usage_analytics,
     ):
@@ -4890,32 +4889,44 @@ class TestDashboardQueryExecution:
         there; pre-fix this 500'd with "Identifier 'e.is_deleted' cannot be
         resolved". Hits real ClickHouse (no mock) so the SQL is actually parsed.
         """
-        with patch(
-            "tracer.views.dashboard.V2AnalyticsQueryService",
-            return_value=isolated_eval_usage_analytics,
-        ):
-            response = auth_client.post(
-                "/tracer/dashboard/query/",
+        query_config = {
+            "project_ids": [str(observe_project.id)],
+            "granularity": "month",
+            "time_range": {"preset": "6M"},
+            "metrics": [
                 {
-                    "project_ids": [str(observe_project.id)],
-                    "granularity": "month",
-                    "time_range": {"preset": "6M"},
-                    "metrics": [
-                        {
-                            "id": str(uuid.uuid4()),
-                            "name": "conversation_hallucination",
-                            "type": "eval_metric",
-                            "source": "all",
-                            "config_id": str(uuid.uuid4()),  # UUID → no DB lookup
-                            "output_type": "SCORE",
-                            "aggregation": "count",
-                        }
-                    ],
+                    "id": str(uuid.uuid4()),
+                    "name": "conversation_hallucination",
+                    "type": "eval_metric",
+                    "source": "all",
+                    "config_id": str(uuid.uuid4()),  # UUID → no DB lookup
+                    "output_type": "SCORE",
+                    "aggregation": "count",
+                }
+            ],
+        }
+        with (
+            patch(
+                "tracer.views.dashboard.V2AnalyticsQueryService",
+                return_value=isolated_eval_usage_analytics,
+            ),
+            patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        ):
+            # Public dashboard polls intentionally return a non-chartable
+            # pending envelope while the exact worker runs out of band. Drive
+            # that worker path directly so this integration test still proves
+            # the generated eval SQL parses on real CH25.
+            response = DashboardWidgetViewSet()._execute_ch_query_config(
+                query_config,
+                observe_project.workspace,
+                _exact_worker=True,
+                cache_identity_override={
+                    "workspace_id": str(observe_project.workspace_id),
+                    "query_config": query_config,
                 },
-                format="json",
             )
         assert response.status_code == 200
-        metrics = response.json()["result"]["metrics"]
+        metrics = response.data["result"]["metrics"]
         assert len(metrics) == 1
         # Query parsed + executed cleanly; no per-widget error attached.
         assert "error" not in metrics[0]
@@ -8621,6 +8632,224 @@ class TestFilterValuesAnnotationBranches:
         )
         assert response.status_code == 200
         assert response.json()["result"]["values"] == []
+
+    @pytest.mark.django_db
+    def test_label_from_unrequested_project_does_not_expose_settings(
+        self,
+        auth_client,
+        project,
+        organization,
+        workspace,
+    ):
+        from model_hub.models.develop_annotations import AnnotationsLabels
+
+        other_project = Project.objects.create(
+            name="Other project",
+            organization=organization,
+            workspace=workspace,
+            model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+            trace_type="observe",
+        )
+        foreign_label = AnnotationsLabels.no_workspace_objects.create(
+            name="Other project choices",
+            type="categorical",
+            organization=organization,
+            workspace=workspace,
+            project=other_project,
+            settings={
+                "options": [
+                    {"label": "must-not-leak"},
+                    {"label": "also-private"},
+                ],
+                "strategy": None,
+                "auto_annotate": False,
+                "multi_choice": False,
+                "rule_prompt": "",
+            },
+        )
+
+        response = auth_client.get(
+            self.URL,
+            {
+                "source": "traces",
+                "metric_type": "annotation_metric",
+                "metric_name": str(foreign_label.id),
+                "project_ids": str(project.id),
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["result"]["values"] == []
+
+    @pytest.mark.django_db
+    def test_label_from_another_workspace_does_not_expose_settings(
+        self,
+        auth_client,
+        project,
+        user,
+    ):
+        from accounts.models.organization import Organization
+        from model_hub.models.develop_annotations import AnnotationsLabels
+
+        other_organization = Organization.objects.create(name="Other organization")
+        other_workspace = Workspace.objects.create(
+            name="Other workspace",
+            organization=other_organization,
+            created_by=user,
+        )
+        foreign_label = AnnotationsLabels.no_workspace_objects.create(
+            name="Foreign choices",
+            type="categorical",
+            organization=other_organization,
+            workspace=other_workspace,
+            settings={
+                "options": [
+                    {"label": "tenant-secret"},
+                    {"label": "also-secret"},
+                ],
+                "strategy": None,
+                "auto_annotate": False,
+                "multi_choice": False,
+                "rule_prompt": "",
+            },
+        )
+
+        response = auth_client.get(
+            self.URL,
+            {
+                "source": "traces",
+                "metric_type": "annotation_metric",
+                "metric_name": str(foreign_label.id),
+                "project_ids": str(project.id),
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["result"]["values"] == []
+
+
+class TestFilterValuesEvalBranches:
+    URL = "/tracer/dashboard/filter_values/"
+
+    @staticmethod
+    def _eval_config(project, organization, workspace, *, output, choices=None):
+        from model_hub.models.evals_metric import EvalTemplate
+        from tracer.models.custom_eval_config import CustomEvalConfig
+
+        template = EvalTemplate.no_workspace_objects.create(
+            name=f"{output} eval",
+            organization=organization,
+            workspace=workspace,
+            config={"output": output},
+            choices=choices or [],
+        )
+        config = CustomEvalConfig.no_workspace_objects.create(
+            name=f"{output} config",
+            project=project,
+            eval_template=template,
+        )
+        return config, template
+
+    @pytest.mark.django_db
+    def test_config_and_template_ids_resolve_choice_values(
+        self,
+        auth_client,
+        project,
+        organization,
+        workspace,
+    ):
+        config, template = self._eval_config(
+            project,
+            organization,
+            workspace,
+            output="choices",
+            choices=["Accepted", "Rejected"],
+        )
+
+        for metric_name in (str(config.id), str(template.id)):
+            response = auth_client.get(
+                self.URL,
+                {
+                    "source": "traces",
+                    "metric_type": "eval_metric",
+                    "metric_name": metric_name,
+                    "project_ids": str(project.id),
+                },
+            )
+
+            assert response.status_code == 200
+            assert response.json()["result"]["values"] == [
+                {"value": "Accepted", "label": "Accepted"},
+                {"value": "Rejected", "label": "Rejected"},
+            ]
+
+    @pytest.mark.django_db
+    def test_pass_fail_config_returns_canonical_values(
+        self,
+        auth_client,
+        project,
+        organization,
+        workspace,
+    ):
+        config, _template = self._eval_config(
+            project,
+            organization,
+            workspace,
+            output="Pass/Fail",
+        )
+
+        response = auth_client.get(
+            self.URL,
+            {
+                "source": "traces",
+                "metric_type": "eval_metric",
+                "metric_name": str(config.id),
+                "project_ids": str(project.id),
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["result"]["values"] == [
+            {"value": "Passed", "label": "Passed"},
+            {"value": "Failed", "label": "Failed"},
+        ]
+
+    @pytest.mark.django_db
+    def test_eval_from_unrequested_project_does_not_expose_choices(
+        self,
+        auth_client,
+        project,
+        organization,
+        workspace,
+    ):
+        other_project = Project.objects.create(
+            name="Other eval project",
+            organization=organization,
+            workspace=workspace,
+            model_type=AIModel.ModelTypes.GENERATIVE_LLM,
+            trace_type="observe",
+        )
+        config, template = self._eval_config(
+            other_project,
+            organization,
+            workspace,
+            output="choices",
+            choices=["must-not-leak"],
+        )
+
+        for metric_name in (str(config.id), str(template.id)):
+            response = auth_client.get(
+                self.URL,
+                {
+                    "source": "traces",
+                    "metric_type": "eval_metric",
+                    "metric_name": metric_name,
+                    "project_ids": str(project.id),
+                },
+            )
+
+            assert response.status_code == 200
+            assert response.json()["result"]["values"] == []
 
 
 class TestSimulationAgents:

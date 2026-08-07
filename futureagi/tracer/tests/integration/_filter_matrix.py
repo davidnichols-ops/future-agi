@@ -52,10 +52,9 @@ class FilterCase:
     late_bound: Callable[[list[SeededRow]], tuple[Any, Callable]] | None = None
     # Extra filter items ANDed with the primary one (multi-filter combos).
     extra_filters: tuple[dict, ...] = ()
-    # has_eval / has_annotation cases are trace/session-scoped in the backend
-    # (a trace matches if ANY child span qualifies). When set to "has_eval" or
-    # "has_annotation", _expected_count rolls the per-span flag up to the target
-    # grain instead of counting spans directly.
+    # has_eval / has_annotation cases use exact span identity on span/voice
+    # grids and any-child rollup on trace/session grids.  _expected_count uses
+    # this marker to apply the target-specific grain.
     meta_kind: str | None = None
     # Session/trace aggregate cases: predicate over a target group's root spans
     # (list[SeededRow]) — used by _expected_count's aggregate branch.
@@ -81,7 +80,7 @@ class FilterCase:
 
 # ---------- SYSTEM_METRIC leaves (per filter_type × filter_op) ---------------
 
-_DATETIME_GAP = "parse_time_range supports gt/lt/between only"
+_DATETIME_GAP = "finite default window excludes the fixed historical corpus"
 _AGG_GAP = "session/trace aggregate HAVING supports comparison ops only"
 
 
@@ -164,8 +163,9 @@ def _sm_datetime_leaves():
     # upper-bound differences between the span and trace list don't matter.
     mid = _NOW + timedelta(hours=12)
     gap = {"contract_gap": _DATETIME_GAP}
-    # parse_time_range applies start_time >= start (inclusive), and only honours
-    # gt / lt / between.
+    # parse_time_range converts direct DateTime64(6) comparisons to an exact
+    # half-open request window.  In particular, greater_than is strict: its
+    # lower bound is value + 1 microsecond.
     leaves = [
         (
             "between",
@@ -173,20 +173,18 @@ def _sm_datetime_leaves():
             lambda r: _NOW <= r.created_at <= mid,
             {},
         ),
-        # greater_than → start bound (inclusive). Pick day1 to discriminate.
-        ("greater_than", day1.isoformat(), lambda r: r.created_at >= day1, {}),
+        ("greater_than", day1.isoformat(), lambda r: r.created_at > day1, {}),
         # less_than defaults the (missing) start to utcnow-30d, which is AFTER
         # the fixed corpus window → the endpoint returns 0. Real backend gap.
         ("less_than", end.isoformat(), lambda r: r.created_at < end, gap),
-        # All other datetime ops are silently dropped by parse_time_range → the
-        # corpus falls outside the default window and the endpoint returns 0.
-        ("equals", _NOW.isoformat(), lambda r: r.created_at == _NOW, gap),
+        # Equality and inclusive lower bounds are represented exactly.
+        ("equals", _NOW.isoformat(), lambda r: r.created_at == _NOW, {}),
         ("not_equals", _NOW.isoformat(), lambda r: r.created_at != _NOW, gap),
         (
             "greater_than_or_equal",
             _NOW.isoformat(),
             lambda r: r.created_at >= _NOW,
-            gap,
+            {},
         ),
         ("less_than_or_equal", end.isoformat(), lambda r: r.created_at <= end, gap),
         (
@@ -1142,9 +1140,54 @@ def _voice_number_leaves():
     return leaves
 
 
-def _v_str_pred(seed_key, op, val):
+def _v_str_decode(col_id, raw_value):
+    """Decode stored voice strings to the value exposed by list filters."""
+    if col_id != "call_status":
+        return raw_value
+    if raw_value is None:
+        # A call without provider raw_log/status is treated as completed by
+        # the normalized voice-list contract.
+        return "completed"
+    token = str(raw_value).strip().lower()
+    if token in {
+        "ended",
+        "done",
+        "complete",
+        "completed",
+        "success",
+        "succeeded",
+        "ok",
+    }:
+        return "completed"
+    if token in {
+        "in-progress",
+        "in_progress",
+        "ongoing",
+        "started",
+        "ringing",
+        "queued",
+        "pending",
+    }:
+        return "in-progress"
+    if token in {"failed", "failure", "error", "errored"}:
+        return "failed"
+    if token in {"dropped", "cancelled", "canceled", "aborted", "hung-up", "hung_up"}:
+        return "dropped"
+    if token in {
+        "not-connected",
+        "not_connected",
+        "no-answer",
+        "no_answer",
+        "unanswered",
+        "busy",
+    }:
+        return "not-connected"
+    return token
+
+
+def _v_str_pred(col_id, seed_key, op, val):
     def s(r):
-        return r.span_attr_str.get(seed_key)
+        return _v_str_decode(col_id, r.span_attr_str.get(seed_key))
 
     return {
         "in": lambda r: s(r) in val,
@@ -1175,7 +1218,7 @@ def _voice_text_leaves():
     for col_id, seed_key, formula in VOICE_STR_SPEC:
         if col_id == "call_type":
             continue  # filter reads raw_log.type, not this key (known bug)
-        sample = formula(0)
+        sample = _v_str_decode(col_id, formula(0))
         for op in _V_STR_OPS:
             for val, suf in _v_str_values(op, sample):
                 ex = {"only_targets": ("voiceCalls",)}
@@ -1188,7 +1231,7 @@ def _voice_text_leaves():
                         op,
                         col_id,
                         val,
-                        _v_str_pred(seed_key, op, val),
+                        _v_str_pred(col_id, seed_key, op, val),
                         ex,
                     )
                 )

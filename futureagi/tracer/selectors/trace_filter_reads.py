@@ -19,6 +19,14 @@ _MAX_SEED_ATTEMPTS = 24
 _MAX_CANDIDATES = 512
 _ABSOLUTE_MAX_CANDIDATES = 512
 _ABSOLUTE_MAX_QUERIES = 128
+# HTTP list/graph reads intentionally retain the 128-statement contract above.
+# Historical eval reconciliation runs as a heartbeating Temporal activity and
+# may need to select a genuine 100k-row prefix.  Its larger envelope is opt-in,
+# still finite, and keeps every physical statement on the same 512-row,
+# single-threaded, 1.5-second ClickHouse limits.
+_WORKFLOW_MAX_SEED_ATTEMPTS = 16_384
+_WORKFLOW_MAX_QUERIES = 32_768
+_WORKFLOW_MAX_DEADLINE_MS = 75 * 60 * 1000
 _SELECTIVE_ANCHOR_SENTINEL = 513
 _MAX_OPTIONAL_ANCHOR_STRATA = 4
 # Keep one slow-but-bounded statement within the client deadline so the next
@@ -198,6 +206,7 @@ def bounded_numbered_page_depth_exceeded(
     classify_batch_size: int = 200,
     seed_batch_size: int = 200,
     reserved_query_count: int = 0,
+    query_contract_limit: int = _ABSOLUTE_MAX_QUERIES,
 ) -> bool:
     """Return whether page N cannot fit inside the finite selector contract.
 
@@ -210,13 +219,15 @@ def bounded_numbered_page_depth_exceeded(
 
     if page_number < 0 or page_size <= 0:
         raise ValueError("page_number must be non-negative and page_size positive")
-    if not 1 <= max_seed_attempts <= _ABSOLUTE_MAX_QUERIES:
+    if not 1 <= query_contract_limit <= _WORKFLOW_MAX_QUERIES:
+        raise ValueError("query_contract_limit exceeds the hard read contract")
+    if not 1 <= max_seed_attempts <= query_contract_limit:
         raise ValueError("max_seed_attempts exceeds the bounded read contract")
     if not 1 <= max_candidates <= _ABSOLUTE_MAX_CANDIDATES:
         raise ValueError("max_candidates exceeds the bounded read contract")
     if max_query_count is None:
-        max_query_count = min(max_seed_attempts * 2, _ABSOLUTE_MAX_QUERIES)
-    if not 1 <= max_query_count <= _ABSOLUTE_MAX_QUERIES:
+        max_query_count = min(max_seed_attempts * 2, query_contract_limit)
+    if not 1 <= max_query_count <= query_contract_limit:
         raise ValueError("max_query_count exceeds the bounded read contract")
     if not 0 <= reserved_query_count <= max_query_count:
         raise ValueError("reserved_query_count exceeds max_query_count")
@@ -276,6 +287,7 @@ def read_bounded_filter_page(
     anchor_probe_limit: int | None = None,
     defer_classification: bool = False,
     graph_key_witness_probe: bool = False,
+    workflow_exact: bool = False,
 ) -> BoundedFilterPage:
     """Return one exact numbered page or an explicit sanitized degradation.
 
@@ -305,6 +317,29 @@ def read_bounded_filter_page(
 
     if page_number < 0 or page_size <= 0 or deadline_ms <= 0:
         raise ValueError("page_number, page_size and deadline_ms must be positive")
+    query_contract_limit = (
+        _WORKFLOW_MAX_QUERIES if workflow_exact else _ABSOLUTE_MAX_QUERIES
+    )
+    seed_contract_limit = (
+        _WORKFLOW_MAX_SEED_ATTEMPTS if workflow_exact else _ABSOLUTE_MAX_QUERIES
+    )
+    if workflow_exact:
+        if (
+            page_number != 0
+            or cursor_start_time is not None
+            or continuation_slice_end is not None
+            or include_incomplete_rows
+            or bounded_continuation
+            or anchor_probe_only
+            or anchor_probe_limit is not None
+            or defer_classification
+            or graph_key_witness_probe
+        ):
+            raise ValueError(
+                "workflow exact reads require one fully buffered page-zero proof"
+            )
+        if deadline_ms > _WORKFLOW_MAX_DEADLINE_MS:
+            raise ValueError("workflow exact deadline exceeds the hard read contract")
     if (cursor_start_time is None) != (cursor_order_token is None):
         raise ValueError("cursor order values must be provided together")
     if (continuation_before_start_time is None) != (continuation_before_id is None):
@@ -327,7 +362,7 @@ def read_bounded_filter_page(
         raise ValueError(
             "deferred classification requires graph page-zero incomplete rows"
         )
-    if not 1 <= max_seed_attempts <= _ABSOLUTE_MAX_QUERIES:
+    if not 1 <= max_seed_attempts <= seed_contract_limit:
         raise ValueError("max_seed_attempts exceeds the bounded read contract")
     if not 1 <= max_candidates <= _ABSOLUTE_MAX_CANDIDATES:
         raise ValueError("max_candidates exceeds the bounded read contract")
@@ -363,8 +398,8 @@ def read_bounded_filter_page(
                 "deferred classification requires one bounded graph acquisition"
             )
     if max_query_count is None:
-        max_query_count = min(max_seed_attempts * 2, _ABSOLUTE_MAX_QUERIES)
-    if not 1 <= max_query_count <= _ABSOLUTE_MAX_QUERIES:
+        max_query_count = min(max_seed_attempts * 2, query_contract_limit)
+    if not 1 <= max_query_count <= query_contract_limit:
         raise ValueError("max_query_count exceeds the bounded read contract")
 
     recommended_batch_size: int | None = None
@@ -677,7 +712,8 @@ def read_bounded_filter_page(
         and bool(skip_full_anchor_builder())
     )
     anchor_can_run = (
-        not seed_proves_population_bound
+        not workflow_exact
+        and not seed_proves_population_bound
         and not bounded_continuation
         and cursor_key is None
         and (
@@ -754,6 +790,7 @@ def read_bounded_filter_page(
         # request's finite query budget.
         "classify_batch_size": candidate_witness_fallback_batch_size,
         "seed_batch_size": candidate_floor,
+        "query_contract_limit": query_contract_limit,
     }
     if bounded_numbered_page_depth_exceeded(
         **page_depth_kwargs,
@@ -1526,7 +1563,8 @@ def read_bounded_filter_page(
         micro_width = (
             micro_width_builder()
             if (
-                not graph_key_witness_probe
+                not workflow_exact
+                and not graph_key_witness_probe
                 and not bounded_continuation
                 and callable(micro_width_builder)
                 and callable(micro_seed_builder)
@@ -1975,14 +2013,18 @@ def read_bounded_filter_page(
                 break
 
             slice_exhausted = len(seed_rows) < candidate_limit
-            ordered_matches = sorted(
-                matched_by_id.values(), key=result_row_key, reverse=True
-            )
             if (
                 not pending_identity_candidates
                 and seed_proves_result_order
-                and len(ordered_matches) >= prefix_needed
+                and len(matched_by_id) >= prefix_needed
             ):
+                # A 100k background selection can require hundreds of finite
+                # seed pages. Sorting the growing prefix after every page is
+                # quadratic work; no cutoff can be proven before the sentinel
+                # exists, so sort exactly once when it can affect control flow.
+                ordered_matches = sorted(
+                    matched_by_id.values(), key=result_row_key, reverse=True
+                )
                 cutoff = result_row_key(ordered_matches[prefix_needed - 1])
                 prefix_is_proven = (
                     cutoff[0] >= slice_start

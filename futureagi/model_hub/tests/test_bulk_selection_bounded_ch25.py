@@ -26,11 +26,19 @@ pytestmark = pytest.mark.integration
 
 CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
 CH_NATIVE_PORT = int(os.environ.get("CH25_NATIVE_PORT", "19000"))
+CH_USER = os.environ.get("CH25_USER", "default")
+CH_PASSWORD = os.environ.get("CH25_PASSWORD", "")
 
 
 @pytest.fixture(scope="module")
 def ch_client():
-    client = Client(host=CH_HOST, port=CH_NATIVE_PORT, connect_timeout=3)
+    client = Client(
+        host=CH_HOST,
+        port=CH_NATIVE_PORT,
+        user=CH_USER,
+        password=CH_PASSWORD,
+        connect_timeout=3,
+    )
     try:
         client.execute("SELECT 1")
     except Exception as exc:
@@ -224,7 +232,10 @@ def test_identity_only_trace_classifier_accepts_200_but_rejects_201(
     )
 
     assert len(result) == 200
-    assert builder.recommended_filter_classify_batch_size() == 200
+    # The builder accepts a finite 200-identity input, but the production
+    # scheduler deliberately chunks any-span replay into the qualified
+    # twenty-trace memory envelope.
+    assert builder.recommended_filter_classify_batch_size() == 20
     assert "project_id = %(project_id)s" in query
     assert "candidate_start_date" in query and "candidate_end_date" in query
     with pytest.raises(ValueError, match="candidate trace batch exceeds bounded limit"):
@@ -311,6 +322,17 @@ def test_content_hydration_preserves_microsecond_root_version_and_tombstone(
     class LocalTraceBuilder(TraceListQueryBuilderV2):
         TABLE = spans_table
 
+        @staticmethod
+        def _trace_tags_select_sql() -> str:
+            # This fixture owns only a spans table. Trace-tag enrichment is an
+            # independent page-bounded read and is irrelevant to the root
+            # identity/version contract under test.
+            return "'[]' AS trace_tags"
+
+        @staticmethod
+        def _trace_tags_join_sql() -> str:
+            return ""
+
     builder = LocalTraceBuilder(
         project_id=project_id,
         project_version_id=selected_version,
@@ -329,10 +351,6 @@ def test_content_hydration_preserves_microsecond_root_version_and_tombstone(
             (project_id, "trace-tombstoned", "tombstoned-root", tombstone_time),
         ],
     )
-    query = query.replace(
-        "dictGetOrDefault('trace_dict', 'tags', toUUID(trace_id), '[]') AS trace_tags",
-        "'[]' AS trace_tags",
-    )
     result = ch_client.execute(
         query,
         params,
@@ -340,10 +358,9 @@ def test_content_hydration_preserves_microsecond_root_version_and_tombstone(
         settings={"max_execution_time": 10, "max_threads": 1},
     )
     values, columns = result
-    rows_by_trace = {
-        row[0]: dict(zip((name for name, _ in columns), row, strict=True))
-        for row in values
-    }
+    column_names = [name for name, _ in columns]
+    mapped_rows = [dict(zip(column_names, row, strict=True)) for row in values]
+    rows_by_trace = {row["trace_id"]: row for row in mapped_rows}
 
     assert set(rows_by_trace) == {"trace-cross-version"}
     assert rows_by_trace["trace-cross-version"]["input"] == "selected-latest"

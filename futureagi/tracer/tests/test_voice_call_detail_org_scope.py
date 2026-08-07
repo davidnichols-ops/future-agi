@@ -106,6 +106,7 @@ def test_detail_allows_project_in_active_org_not_user_home_org(
         assert kwargs["analytics"] is direct_write_analytics
         assert kwargs["project_ids"] == [str(project.id)]
         assert kwargs["trace_id"] == trace_id
+        assert kwargs["include_annotations"] is False
         assert kwargs["deadline_ms"] == 6000
         kwargs["eval_config_ids_resolver"](str(project.id))
         return _detail(project.id, trace_id)

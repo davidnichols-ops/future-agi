@@ -9,6 +9,7 @@ from tracer.models.eval_task import RowType, RunType
 from tracer.selectors.eval_tasks import row_resolver
 from tracer.selectors.trace_filter_reads import (
     BoundedFilterPage,
+    bounded_numbered_page_depth_exceeded,
     read_bounded_filter_page,
 )
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
@@ -58,6 +59,17 @@ def _attribute_filter(key: str, value: str) -> dict:
 def _has_eval_filter(value: bool | str) -> dict:
     return {
         "column_id": "has_eval",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
+
+
+def _has_annotation_filter(value: bool | str) -> dict:
+    return {
+        "column_id": "has_annotation",
         "filter_config": {
             "filter_type": "boolean",
             "filter_op": "equals",
@@ -154,29 +166,163 @@ def test_internal_bounded_span_scan_supports_time_only_tasks() -> None:
     assert "AND 1 = 1" in match_sql
 
 
-@pytest.mark.parametrize("row_type", [RowType.SPANS, RowType.TRACES])
-def test_time_only_eval_resolution_preserves_legacy_id_prefix(
+@pytest.mark.parametrize(
+    "row_type",
+    [RowType.SPANS, RowType.TRACES, RowType.SESSIONS, RowType.VOICE_CALLS],
+)
+def test_eval_task_annotation_completeness_threads_all_project_labels(
     monkeypatch: pytest.MonkeyPatch,
     row_type: str,
 ) -> None:
-    class CompatibilityReader:
-        closed = False
+    labels = [SimpleNamespace(id="label-a"), SimpleNamespace(id="label-b")]
+    captured: dict = {}
 
-        def stream_query(self, sql, params, *, batch_size, settings):
-            assert sql == "SELECT exact_id_prefix"
-            assert batch_size == 11
-            assert settings["max_execution_time"] == 10
-            yield ["id-a", "id-b"]
+    def fake_labels(project_id):
+        assert str(project_id) == PROJECT_ID
+        return labels
 
-        def close(self):
-            self.closed = True
+    def fake_read(**kwargs):
+        captured.update(kwargs)
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
 
-    reader = CompatibilityReader()
-    monkeypatch.setattr(row_resolver, "get_reader", lambda: reader)
+    monkeypatch.setattr(
+        "tracer.utils.helper.get_annotation_labels_for_project", fake_labels
+    )
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    assert (
+        row_resolver._resolve_bounded_historical_span_ids(
+            object(),
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "date_range": [START, END],
+                "filters": [_has_annotation_filter(False)],
+            },
+            limit=25,
+            batch_size=256,
+            row_type=row_type,
+        )
+        == []
+    )
+
+    assert captured["builder"].annotation_label_ids == ["label-a", "label-b"]
+
+
+def test_eval_task_missing_one_of_two_labels_uses_completeness_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        "tracer.utils.helper.get_annotation_labels_for_project",
+        lambda _project_id: [
+            SimpleNamespace(id="label-a"),
+            SimpleNamespace(id="label-b"),
+        ],
+    )
+
+    def fake_read(**kwargs):
+        captured.update(kwargs)
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+    row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={
+            "date_range": [START, END],
+            "filters": [_has_annotation_filter(False)],
+        },
+        limit=25,
+        batch_size=256,
+        row_type=RowType.TRACES,
+    )
+
+    sql, params = captured["builder"].build_filter_match_query(["trace-a"])
+    assert "NOT IN" in sql
+    assert "HAVING uniqExact(s.label_id) >= 2" in sql
+    assert "label-a" in params.values()
+    assert "label-b" in params.values()
+
+
+@pytest.mark.parametrize("row_type", [RowType.SPANS, RowType.TRACES])
+def test_time_only_eval_resolution_uses_list_parity_newest_first_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+) -> None:
+    captured: dict = {}
+
+    def fake_read(**kwargs):
+        captured.update(kwargs)
+        rows = [
+            {
+                "trace_id": "newest",
+                "start_time": END,
+            },
+            {
+                "trace_id": "older",
+                "start_time": END - timedelta(seconds=1),
+            },
+        ]
+        if row_type == RowType.SPANS:
+            rows = [{**row, "id": row["trace_id"]} for row in rows]
+        return BoundedFilterPage(
+            rows=rows,
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=2,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=2,
+            result_payload_bytes=20,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
 
     ids = row_resolver._resolve_bounded_historical_span_ids(
         object(),
-        sql="SELECT exact_id_prefix",
+        sql="must-not-run-legacy-id-order",
         params={"start_date": START, "end_date": END},
         project_id=PROJECT_ID,
         salt="task-salt",
@@ -187,8 +333,9 @@ def test_time_only_eval_resolution_preserves_legacy_id_prefix(
         row_type=row_type,
     )
 
-    assert ids == ["id-a", "id-b"]
-    assert reader.closed is True
+    assert ids == ["newest", "older"]
+    assert captured["page_size"] == 25
+    assert captured["builder"].filters[0]["column_id"] == "created_at"
 
 
 def test_task_filters_merge_legacy_and_canonical_lists() -> None:
@@ -364,7 +511,7 @@ def test_bounded_historical_voice_returns_canonical_root_span_ids(
     assert match_params["candidate_trace_ids"] == ("trace-a",)
 
 
-def test_bounded_historical_session_selector_proves_and_sorts_full_population(
+def test_bounded_historical_session_selector_keeps_exact_newest_first_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict = {}
@@ -414,7 +561,7 @@ def test_bounded_historical_session_selector_proves_and_sorts_full_population(
         row_type=RowType.SESSIONS,
     )
 
-    assert ids == ["session-a", "session-b"]
+    assert ids == ["session-b", "session-a"]
     assert captured["key_field"] == "session_id"
     assert captured["page_size"] == 25
     assert captured["deadline_ms"] == 10_000
@@ -426,7 +573,7 @@ def test_bounded_historical_session_selector_proves_and_sorts_full_population(
     assert captured["builder"]._bounded_sampling_rate == 25.0
 
 
-def test_bounded_historical_session_selector_rejects_capped_population(
+def test_bounded_historical_session_selector_accepts_exact_capped_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_read(**_kwargs):
@@ -448,10 +595,165 @@ def test_bounded_historical_session_selector_rejects_capped_population(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
     )
 
-    with pytest.raises(
-        row_resolver.EvalTaskReadBudgetExceeded,
-        match="too large",
-    ):
+    assert row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={
+            "filters": [_attribute_filter("final_status", "Rejected")],
+            "date_range": [START, END],
+        },
+        limit=25,
+        batch_size=256,
+        row_type=RowType.SESSIONS,
+    ) == ["must-not-escape"]
+
+
+@pytest.mark.parametrize(
+    ("row_type", "row"),
+    [
+        (
+            RowType.SESSIONS,
+            {"session_id": "session-a", "start_time": END - timedelta(minutes=1)},
+        ),
+        (
+            RowType.VOICE_CALLS,
+            {
+                "trace_id": "trace-a",
+                "root_span_id": "voice-root-a",
+                "start_time": END - timedelta(minutes=1),
+            },
+        ),
+    ],
+)
+def test_high_limit_workflow_uses_finite_exact_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+    row: dict,
+) -> None:
+    captured: dict = {}
+
+    def fake_read(**kwargs):
+        captured.update(kwargs)
+        return BoundedFilterPage(
+            rows=[row],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=1,
+            elapsed_ms=10,
+            query_count=2,
+            rows_returned=2,
+            result_payload_bytes=100,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    ids = row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={"date_range": [START, END]},
+        limit=1_000_000,
+        batch_size=256,
+        row_type=row_type,
+    )
+
+    expected_id = row.get("session_id") or row.get("root_span_id")
+    assert ids == [expected_id]
+    assert captured["classify_batch_size"] == 50
+    assert captured["page_size"] == 1_000_000
+    assert captured["workflow_exact"] is True
+    assert captured["deadline_ms"] == 75 * 60 * 1000
+    assert captured["max_seed_attempts"] == 16_384
+    assert captured["max_query_count"] == 32_768
+    assert (
+        bounded_numbered_page_depth_exceeded(
+            page_number=0,
+            page_size=captured["page_size"],
+            max_seed_attempts=captured["max_seed_attempts"],
+            max_candidates=captured["max_candidates"],
+            max_query_count=captured["max_query_count"],
+            classify_batch_size=captured["classify_batch_size"],
+            seed_batch_size=200,
+            query_contract_limit=32_768,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("row_type", [RowType.SESSIONS, RowType.VOICE_CALLS])
+def test_high_limit_workflow_reaches_clickhouse_for_empty_corpus(
+    row_type: str,
+) -> None:
+    class EmptyAnalytics:
+        calls = 0
+
+        def execute_ch_query(self, _query, _params, **_kwargs):
+            self.calls += 1
+            return QueryResult([], 0, "clickhouse", 0.0)
+
+    analytics = EmptyAnalytics()
+    ids = row_resolver._resolve_bounded_historical_span_ids(
+        analytics,
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={"date_range": [START, END]},
+        limit=1_000_000,
+        batch_size=256,
+        row_type=row_type,
+    )
+
+    assert ids == []
+    # The workflow covers the frozen window in adjacent slices. It remains
+    # finite even when no row is available to close an ordered prefix early.
+    assert 1 <= analytics.calls <= 16_384
+
+
+@pytest.mark.parametrize(
+    "row_type",
+    [RowType.SPANS, RowType.TRACES, RowType.SESSIONS, RowType.VOICE_CALLS],
+)
+def test_exactly_10k_uses_workflow_query_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+) -> None:
+    captured: dict = {}
+
+    def fake_read(**kwargs):
+        captured.update(kwargs)
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            elapsed_ms=1,
+            query_count=1,
+            rows_returned=0,
+            result_payload_bytes=2,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    assert (
         row_resolver._resolve_bounded_historical_span_ids(
             object(),
             sql=None,
@@ -463,10 +765,17 @@ def test_bounded_historical_session_selector_rejects_capped_population(
                 "filters": [_attribute_filter("final_status", "Rejected")],
                 "date_range": [START, END],
             },
-            limit=25,
-            batch_size=256,
-            row_type=RowType.SESSIONS,
+            limit=10_000,
+            batch_size=1_000,
+            row_type=row_type,
         )
+        == []
+    )
+    assert captured["workflow_exact"] is True
+    assert captured["page_size"] == 10_000
+    assert captured["max_query_count"] == 32_768
+    assert captured["max_seed_attempts"] == 16_384
+    assert captured["deadline_ms"] == 75 * 60 * 1000
 
 
 @pytest.mark.parametrize(
@@ -699,9 +1008,9 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
 ) -> None:
     """Exercise the real 100k wire limit through the real bounded reader.
 
-    The population is deliberately smaller than the 10k executable buffer. The
-    direct child-span seed is unordered, so success also proves the reader
-    exhausted the complete request window before returning the ID-sorted set.
+    The population is deliberately sparse. Success proves the background
+    workflow exhausts the frozen window and then replays exact any-span
+    witnesses only for the selected newest-first prefix.
     """
 
     window_start = END - timedelta(minutes=10)
@@ -728,16 +1037,17 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
             self.calls.append((query, params))
             assert timeout_ms <= 1_500
             assert settings["max_threads"] == 1
-            assert settings["max_rows_to_read"] == 5_000_000
             assert settings["max_memory_usage"] == 256 * 1024 * 1024
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
 
             candidate_ids = params.get("candidate_trace_ids")
             if candidate_ids is not None:
-                # Population-proof mode is one phase: each exact membership
-                # classifier carries the physical witness and there is no
-                # post-page replay query.
-                assert "filter_witness_0" in query
+                if "filter_witness_0" not in query:
+                    assert "argMinIf(tuple(grouped_id, latest_start_time)" not in query
+                    rows = [source_rows[trace_id] for trace_id in candidate_ids]
+                    return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+                assert settings["max_rows_to_read"] == 5_000_000
                 rows = [
                     {
                         **source_rows[trace_id],
@@ -750,13 +1060,12 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
                 ]
                 return QueryResult(rows, len(rows), "clickhouse", 1.0)
 
-            assert "id AS matched_span_id" in query
-            assert "parent_span_id IS NULL" not in query
+            assert "id AS root_span_id" in query
+            assert "parent_span_id IS NULL" in query
             rows = [
                 {
-                    "project_id": PROJECT_ID,
                     "trace_id": row["trace_id"],
-                    "matched_span_id": row["matched_span_id"],
+                    "root_span_id": row["root_span_id"],
                     "start_time": row["start_time"],
                 }
                 for row in source_rows.values()
@@ -795,7 +1104,7 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
         include_trace_filter_witnesses=True,
     )
 
-    assert result.ids == ("trace-a", "trace-b")
+    assert result.ids == ("trace-b", "trace-a")
     assert {
         (witness.trace_id, witness.span_id) for witness in result.trace_filter_witnesses
     } == {("trace-a", "status-a"), ("trace-b", "status-b")}
@@ -804,13 +1113,22 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
         for query, params in analytics.calls
         if "candidate_trace_ids" not in params
     ]
-    classifier_queries = [
-        query for query, params in analytics.calls if "candidate_trace_ids" in params
+    membership_queries = [
+        query
+        for query, params in analytics.calls
+        if "candidate_trace_ids" in params and "filter_witness_0" not in query
+    ]
+    witness_queries = [
+        query
+        for query, params in analytics.calls
+        if "candidate_trace_ids" in params and "filter_witness_0" in query
     ]
     assert len(seed_queries) == 2
-    assert len(classifier_queries) == 1
+    assert len(membership_queries) == 1
+    assert len(witness_queries) == 1
     assert captured["classify_batch_size"] == 100
-    assert captured["builder"]._bounded_include_filter_witnesses is True
+    assert captured["workflow_exact"] is True
+    assert captured["builder"]._bounded_include_filter_witnesses is False
 
 
 def test_trace_eval_witness_replay_uses_hundred_id_batches_with_hard_caps(
@@ -899,31 +1217,23 @@ def test_trace_eval_witness_replay_uses_hundred_id_batches_with_hard_caps(
     assert len(result.trace_filter_witnesses) == len(rows)
 
 
-def test_trace_eval_witness_replay_preflights_total_query_cap_without_partial_read(
+def test_trace_eval_witness_routes_to_workflow_before_interactive_replay_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rows = [
-        {
-            "trace_id": f"trace-{index:04d}",
-            "root_span_id": f"root-{index:04d}",
-            "start_time": END - timedelta(seconds=index),
-        }
-        for index in range(1_601)
-    ]
-
     def fake_read(**kwargs):
-        assert kwargs["max_query_count"] == 112
+        assert kwargs["max_query_count"] == 32_768
+        assert kwargs["workflow_exact"] is True
         return BoundedFilterPage(
-            rows=rows,
+            rows=[],
             has_more=False,
             complete=True,
             status="complete",
             error_code=None,
-            total_rows_lower_bound=len(rows),
+            total_rows_lower_bound=0,
             elapsed_ms=1,
-            query_count=112,
-            rows_returned=len(rows),
-            result_payload_bytes=10_000,
+            query_count=1,
+            rows_returned=0,
+            result_payload_bytes=0,
             attempts=(),
         )
 
@@ -931,30 +1241,24 @@ def test_trace_eval_witness_replay_preflights_total_query_cap_without_partial_re
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
     )
 
-    class MustNotReplay:
-        def execute_ch_query(self, *_args, **_kwargs):
-            raise AssertionError("replay must be rejected before the first CH read")
+    result = row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={
+            "filters": [_attribute_filter("final_status", "Rejected")],
+            "date_range": [START, END],
+        },
+        limit=2_000,
+        batch_size=2_000,
+        row_type=RowType.TRACES,
+        include_trace_filter_witnesses=True,
+    )
 
-    with pytest.raises(
-        row_resolver.EvalTaskReadBudgetExceeded,
-        match="Narrow the time range",
-    ):
-        row_resolver._resolve_bounded_historical_span_ids(
-            MustNotReplay(),
-            sql=None,
-            params=None,
-            project_id=PROJECT_ID,
-            salt="task-salt",
-            sampling_rate=100.0,
-            filters={
-                "filters": [_attribute_filter("final_status", "Rejected")],
-                "date_range": [START, END],
-            },
-            limit=2_000,
-            batch_size=2_000,
-            row_type=RowType.TRACES,
-            include_trace_filter_witnesses=True,
-        )
+    assert result.ids == ()
 
 
 def test_trace_eval_witness_replay_never_returns_a_partial_second_phase(
@@ -1232,7 +1536,7 @@ def test_task_over_10k_proves_population_without_legacy_query(
     assert captured["limit"] == 10_001
 
 
-def test_task_over_10k_rejects_actual_oversized_population_without_partial_ids(
+def test_task_over_10k_accepts_exact_newest_prefix_with_more_rows_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict = {}
@@ -1264,24 +1568,21 @@ def test_task_over_10k_rejects_actual_oversized_population_without_partial_ids(
         "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
     )
 
-    with pytest.raises(
-        row_resolver.EvalTaskReadBudgetExceeded,
-        match="too large",
-    ):
-        row_resolver._resolve_bounded_historical_span_ids(
-            object(),
-            sql=None,
-            params=None,
-            project_id=PROJECT_ID,
-            salt="task-salt",
-            sampling_rate=100.0,
-            filters={"date_range": [START, END]},
-            limit=10_001,
-            batch_size=256,
-            row_type=RowType.SPANS,
-        )
+    assert row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql=None,
+        params=None,
+        project_id=PROJECT_ID,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={"date_range": [START, END]},
+        limit=10_001,
+        batch_size=256,
+        row_type=RowType.SPANS,
+    ) == ["must-not-escape"]
 
-    assert captured["page_size"] == 10_000
+    assert captured["page_size"] == 10_001
+    assert captured["workflow_exact"] is True
 
 
 def test_configured_1m_task_returns_complete_small_population_deterministically(
@@ -1335,8 +1636,9 @@ def test_configured_1m_task_returns_complete_small_population_deterministically(
         row_type=RowType.SPANS,
     )
 
-    assert ids == ["span-a", "span-b"]
-    assert captured["page_size"] == 10_000
+    assert ids == ["span-b", "span-a"]
+    assert captured["page_size"] == 1_000_000
+    assert captured["workflow_exact"] is True
 
 
 @pytest.mark.parametrize(
@@ -1382,6 +1684,126 @@ def test_task_at_10k_routes_directly_to_bounded_selector_without_legacy_sql(
     assert captured["sql"] is None
     assert captured["params"] is None
     assert captured["limit"] == 10_000
+
+
+@pytest.mark.parametrize(
+    ("row_type", "include_witnesses", "interactive_limit", "workflow_limit"),
+    [
+        (RowType.SESSIONS, False, 5_799, 5_800),
+        (RowType.VOICE_CALLS, False, 5_799, 5_800),
+        (RowType.TRACES, True, 1_600, 1_601),
+    ],
+)
+def test_eval_task_switches_envelope_at_exact_mechanical_query_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    row_type: str,
+    include_witnesses: bool,
+    interactive_limit: int,
+    workflow_limit: int,
+) -> None:
+    calls: list[dict] = []
+
+    def fake_read(**kwargs):
+        calls.append(kwargs)
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+    task_filters = {
+        "date_range": [START, END],
+        "filters": [_attribute_filter("final_status", "Rejected")],
+    }
+
+    for limit in (interactive_limit, workflow_limit):
+        result = row_resolver._resolve_bounded_historical_span_ids(
+            object(),
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters=task_filters,
+            limit=limit,
+            batch_size=256,
+            row_type=row_type,
+            include_trace_filter_witnesses=include_witnesses,
+        )
+        assert (result.ids if include_witnesses else tuple(result)) == ()
+
+    assert calls[0]["workflow_exact"] is False
+    assert calls[0]["max_query_count"] == (112 if row_type == RowType.TRACES else 128)
+    assert calls[1]["workflow_exact"] is True
+    assert calls[1]["max_query_count"] == 32_768
+    assert calls[1]["max_seed_attempts"] == 16_384
+
+
+def test_time_only_limit_transition_preserves_newest_first_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+    ordered_rows = [
+        {
+            "id": f"span-{index}",
+            "trace_id": f"trace-{index}",
+            "start_time": END - timedelta(seconds=index),
+        }
+        for index in range(4)
+    ]
+
+    def fake_read(**kwargs):
+        calls.append(kwargs)
+        row_count = 3 if kwargs["page_size"] == 9_999 else 4
+        return BoundedFilterPage(
+            rows=ordered_rows[:row_count],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=row_count,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=row_count,
+            result_payload_bytes=100,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+    common = {
+        "sql": "must-not-run-legacy-id-order",
+        "params": {"start_date": START, "end_date": END},
+        "project_id": PROJECT_ID,
+        "salt": "task-salt",
+        "sampling_rate": 100.0,
+        "filters": {"date_range": [START, END]},
+        "batch_size": 256,
+        "row_type": RowType.SPANS,
+    }
+
+    first = row_resolver._resolve_bounded_historical_span_ids(
+        object(), limit=9_999, **common
+    )
+    second = row_resolver._resolve_bounded_historical_span_ids(
+        object(), limit=10_000, **common
+    )
+
+    assert first == second[: len(first)]
+    assert calls[0]["workflow_exact"] is False
+    assert calls[1]["workflow_exact"] is True
 
 
 def test_bounded_resolver_rejects_incomplete_page_without_partial_ids(
@@ -1784,6 +2206,144 @@ def test_shared_candidate_reader_proves_large_eval_prefix_within_query_cap(
     assert len(page.rows) == limit
     assert page.has_more is True
     assert page.query_count <= 102
+
+
+def test_workflow_reader_proves_exact_100k_same_timestamp_prefix() -> None:
+    """The advertised 100k task size is a real executable contract.
+
+    All rows deliberately share one timestamp, so the stable identity token is
+    the only ordering boundary across 512-row keyset pages. The 100001st row is
+    an exact has-more sentinel and must never displace the selected prefix.
+    """
+
+    started_at = END - timedelta(minutes=1)
+    rows = [
+        {
+            "id": f"span-{index:06d}",
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index:06d}",
+            "start_time": started_at,
+        }
+        for index in range(100_000, -1, -1)
+    ]
+    row_index = {row["id"]: index for index, row in enumerate(rows)}
+
+    class WorkflowBuilder:
+        @staticmethod
+        def parse_time_range(_filters):
+            return START, END
+
+        @staticmethod
+        def filter_seed_proves_result_order():
+            return True
+
+        @staticmethod
+        def recommended_filter_seed_batch_size():
+            return 512
+
+        @staticmethod
+        def recommended_filter_classify_batch_size():
+            return 200
+
+        @staticmethod
+        def bounded_filter_row_identity(row):
+            return row["project_id"], row["trace_id"], row["id"], row["start_time"]
+
+        @staticmethod
+        def bounded_filter_row_order_token(row):
+            return row["id"]
+
+        bounded_filter_seed_identity = bounded_filter_row_identity
+        bounded_filter_seed_order_token = bounded_filter_row_order_token
+
+        @staticmethod
+        def build_filter_seed_page(
+            *,
+            slice_start,
+            slice_end,
+            limit,
+            before_start_time=None,
+            before_id=None,
+        ):
+            return "seed", {
+                "slice_start": slice_start,
+                "slice_end": slice_end,
+                "limit": limit,
+                "before_start_time": before_start_time,
+                "before_id": before_id,
+            }
+
+        @staticmethod
+        def build_filter_match_query_from_seed_rows(candidate_rows):
+            return "classify", {"candidate_rows": candidate_rows}
+
+    class WorkflowAnalytics:
+        calls = 0
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.calls += 1
+            assert timeout_ms <= 1_500
+            assert settings["max_threads"] == 1
+            assert settings["max_result_rows"] <= 512
+            if query == "classify":
+                return QueryResult(
+                    list(params["candidate_rows"]),
+                    len(params["candidate_rows"]),
+                    "clickhouse",
+                    0.0,
+                )
+
+            if not (params["slice_start"] <= started_at < params["slice_end"]):
+                result_rows = []
+            else:
+                before_id = params["before_id"]
+                start_index = 0 if before_id is None else row_index[before_id] + 1
+                result_rows = rows[start_index : start_index + params["limit"]]
+            return QueryResult(
+                result_rows,
+                len(result_rows),
+                "clickhouse",
+                0.0,
+            )
+
+    analytics = WorkflowAnalytics()
+    page = read_bounded_filter_page(
+        builder=WorkflowBuilder(),
+        analytics=analytics,
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+        key_field="id",
+        page_number=0,
+        page_size=100_000,
+        deadline_ms=75 * 60 * 1000,
+        max_seed_attempts=4_096,
+        max_candidates=512,
+        max_query_count=32_768,
+        classify_batch_size=200,
+        workflow_exact=True,
+    )
+
+    assert page.complete is True
+    assert page.has_more is True
+    assert len(page.rows) == 100_000
+    assert page.rows[0]["id"] == "span-100000"
+    assert page.rows[-1]["id"] == "span-000001"
+    assert all(row["id"] != "span-000000" for row in page.rows)
+    assert page.query_count == analytics.calls
+    assert page.query_count < 1_000
+
+
+def test_workflow_query_envelope_is_not_available_to_http_reads() -> None:
+    with pytest.raises(ValueError, match="max_query_count"):
+        read_bounded_filter_page(
+            builder=object(),
+            analytics=object(),
+            filters=[],
+            key_field="id",
+            page_number=0,
+            page_size=25,
+            max_seed_attempts=128,
+            max_query_count=129,
+        )
 
 
 def test_population_proof_buffers_dense_10k_sentinel_within_128_queries() -> None:

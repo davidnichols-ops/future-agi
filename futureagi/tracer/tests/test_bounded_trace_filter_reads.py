@@ -66,6 +66,17 @@ def _has_eval_filter(value: bool | str) -> dict[str, Any]:
     }
 
 
+def _has_annotation_filter(value: bool | str) -> dict[str, Any]:
+    return {
+        "column_id": "has_annotation",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
+
+
 def _attribute_filter(
     key: str,
     value: object,
@@ -1620,7 +1631,7 @@ def test_mixed_attribute_and_annotation_stays_in_one_bounded_trace_classifier() 
     assert "model_hub_score" not in seed_sql
     assert "has(span_attr_str.keys, %(latest_filter_key_0)s)" in seed_sql
     assert "model_hub_score AS s FINAL" in match_sql
-    assert "tracer_project_id" not in match_sql
+    assert "s.tracer_project_id = toUUID(%(project_id)s)" in match_sql
     assert "latest_attr_exists_0" in match_sql
     assert "%(candidate_trace_ids)s" in match_sql
     assert "toString(if(" in match_sql
@@ -1720,6 +1731,58 @@ def test_org_annotation_residual_correlates_shared_trace_by_project() -> None:
     assert params["org_residual_1_project_id"] == project_b
     assert params["org_residual_0_outer_project_id"] == PROJECT_ID
     assert params["org_residual_1_outer_project_id"] == project_b
+
+
+def test_org_trace_has_annotation_uses_each_projects_disjoint_labels() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    label_a = "00000000-0000-4000-8000-000000000091"
+    label_b = "00000000-0000-4000-8000-000000000092"
+    builder = TraceListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        annotation_label_ids=[label_a, label_b],
+        annotation_label_ids_by_project={
+            PROJECT_ID: [label_a],
+            project_b: [label_b],
+        },
+        filters=[_time_filter(), _has_annotation_filter(True)],
+    )
+
+    sql, params = builder.build_filter_match_query_from_seed_rows(
+        _org_collision_seed_rows(project_b)
+    )
+
+    assert params["org_residual_0_lbl_1"] == label_a
+    assert params["org_residual_1_lbl_1"] == label_b
+    assert "org_residual_0_lbl_2" not in params
+    assert "org_residual_1_lbl_2" not in params
+    assert sql.count("HAVING uniqExact(s.label_id) >= 1") == 2
+    assert sql.count("outer_project_id)s) AND") == 2
+    assert params["org_residual_0_project_id"] == PROJECT_ID
+    assert params["org_residual_1_project_id"] == project_b
+
+
+def test_known_empty_project_label_set_never_falls_back_to_score_existence() -> None:
+    from tracer.services.clickhouse.query_builders.filters import (
+        ClickHouseFilterBuilder,
+    )
+
+    positive = ClickHouseFilterBuilder(
+        project_id=PROJECT_ID,
+        annotation_label_ids=[],
+        annotation_label_set_known=True,
+    )
+    negative = ClickHouseFilterBuilder(
+        project_id=PROJECT_ID,
+        annotation_label_ids=[],
+        annotation_label_set_known=True,
+    )
+
+    positive_sql, _ = positive.translate([_has_annotation_filter(True)])
+    negative_sql, _ = negative.translate([_has_annotation_filter(False)])
+
+    assert positive_sql == "1 = 1"
+    assert negative_sql == "0 = 1"
+    assert "model_hub_score" not in positive_sql + negative_sql
 
 
 def test_org_eval_residual_does_not_admit_same_trace_from_other_project() -> None:
@@ -1963,10 +2026,12 @@ def test_span_annotation_classifier_scopes_score_and_span_sides_to_candidates() 
 
     assert builder.supports_bounded_filter_scan() is True
     assert "toString(if(" in sql
-    assert (
-        "(toString(s.trace_id), toString(if(" in sql
-        and "IN %(candidate_span_entities)s" in sql
-    )
+    assert "scored_sp.id = s.observation_span_id" in sql
+    assert "scored_sp.trace_id" in sql
+    assert "IN %(candidate_span_entities)s" in sql
+    # Raw Score rows can lack trace_id, so their pre-join candidate probe uses
+    # span ids as a safe superset; the resolved tuple above is the exact guard.
+    assert "toString(s.observation_span_id) IN %(candidate_span_ids)s" in sql
     assert "(toString(trace_id), toString(id)) IN %(candidate_span_entities)s" in sql
     assert params["candidate_span_ids"] == ("span-a", "span-b")
     assert params["candidate_span_entities"] == (
@@ -1974,6 +2039,73 @@ def test_span_annotation_classifier_scopes_score_and_span_sides_to_candidates() 
         ("trace-b", "span-b"),
     )
     assert params["ann_label_1"] == label_id
+
+
+def _org_span_collision_seed_rows(project_b: str) -> list[dict[str, Any]]:
+    started = END - timedelta(minutes=1)
+    return [
+        {
+            "project_id": project_id,
+            "trace_id": "shared-trace",
+            "id": "shared-span",
+            "start_time": started,
+        }
+        for project_id in (PROJECT_ID, project_b)
+    ]
+
+
+def test_org_span_annotation_residual_isolates_same_textual_identity() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    label_id = "00000000-0000-4000-8000-000000000077"
+    builder = SpanListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[_time_filter(), _annotation_filter(label_id, "approved")],
+    )
+
+    sql, params = builder.build_filter_match_query_from_seed_rows(
+        _org_span_collision_seed_rows(project_b)
+    )
+
+    assert sql.count("tracer_project_id = toUUID(") >= 2
+    assert sql.count("outer_project_id)s) AND") == 2
+    assert params["org_span_residual_0_project_id"] == PROJECT_ID
+    assert params["org_span_residual_1_project_id"] == project_b
+    assert params["org_span_residual_0_candidate_span_ids"] == ("shared-span",)
+    assert params["org_span_residual_1_candidate_span_ids"] == ("shared-span",)
+    assert params["org_span_residual_0_candidate_span_entities"] == (
+        ("shared-trace", "shared-span"),
+    )
+    assert params["org_span_residual_1_candidate_span_entities"] == (
+        ("shared-trace", "shared-span"),
+    )
+    assert not re.search(r"%\(project_id\)s", sql)
+
+
+def test_org_span_has_annotation_uses_each_projects_disjoint_labels() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    label_a = "00000000-0000-4000-8000-000000000091"
+    label_b = "00000000-0000-4000-8000-000000000092"
+    builder = SpanListQueryBuilder(
+        project_ids=[PROJECT_ID, project_b],
+        annotation_label_ids=[label_a, label_b],
+        annotation_label_ids_by_project={
+            PROJECT_ID: [label_a],
+            project_b: [label_b],
+        },
+        filters=[_time_filter(), _has_annotation_filter(True)],
+    )
+
+    sql, params = builder.build_filter_match_query_from_seed_rows(
+        _org_span_collision_seed_rows(project_b)
+    )
+
+    assert params["org_span_residual_0_lbl_1"] == label_a
+    assert params["org_span_residual_1_lbl_1"] == label_b
+    assert "org_span_residual_0_lbl_2" not in params
+    assert "org_span_residual_1_lbl_2" not in params
+    assert sql.count("HAVING uniqExact(s.label_id) >= 1") == 2
+    assert params["org_span_residual_0_project_id"] == PROJECT_ID
+    assert params["org_span_residual_1_project_id"] == project_b
 
 
 def test_has_eval_span_residual_matches_candidate_span_not_its_whole_trace() -> None:
@@ -2968,7 +3100,8 @@ def test_org_trace_content_same_trace_id_is_merged_by_project_identity() -> None
     with (
         mock.patch("tracer.views.trace.CustomEvalConfig") as eval_config,
         mock.patch(
-            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+            "tracer.views.trace.get_annotation_labels_by_project",
+            return_value={PROJECT_ID: [], project_b: []},
         ),
         mock.patch(
             "tracer.views.trace._build_annotation_map_from_scores", return_value={}

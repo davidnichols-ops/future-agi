@@ -19,7 +19,6 @@ from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession, TraceSessionOverlay
 from tracer.services.clickhouse.bounded_graph_reads import (
     BoundedGraphReadError,
-    GraphCandidateSample,
 )
 from tracer.services.clickhouse.filter_value_reads import FilterValueRead
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
@@ -515,17 +514,19 @@ class TestTraceSessionGraphAPI:
 
     def test_session_filter_uses_clickhouse_graph(self, auth_client, observe_project):
         session_id = "003b76f1-2b4a-4af5-b0dc-224d687374d4"
-        analytics = mock.Mock()
-        analytics.execute_ch_query.return_value = mock.Mock(data=[], columns=[])
+        graph = {
+            "metric_name": "session_count",
+            "data": [],
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+        }
 
         with (
             mock.patch(
-                "tracer.views.trace_session.V2AnalyticsQueryService",
-                return_value=analytics,
-            ) as v2_service,
-            mock.patch(
-                "tracer.services.clickhouse.query_service.AnalyticsQueryService"
-            ) as legacy_service,
+                "tracer.views.trace_session.fetch_session_graph_ch",
+                return_value=graph,
+            ) as graph_read,
             mock.patch.object(Trace, "objects") as pg_trace_manager,
         ):
             response = auth_client.post(
@@ -570,212 +571,83 @@ class TestTraceSessionGraphAPI:
         assert payload["metric_name"] == "session_count"
         assert payload["query_complete"] is True
         assert payload["query_status"] == "complete"
-        assert payload["data"]
-        assert all(point["value"] == 0 for point in payload["data"])
-        query_text = "\n".join(
-            call.args[0] for call in analytics.execute_ch_query.call_args_list
-        )
-        assert "trace_session_id" in query_text
-        assert "SessionTimeSeriesQueryBuilder" not in query_text
-        for query_call in analytics.execute_ch_query.call_args_list:
-            assert 0 < query_call.kwargs["timeout_ms"] <= 1_200
-            settings = query_call.kwargs["settings"]
-            assert settings["max_threads"] == 1
-            assert settings["max_rows_to_read"] == 10_000_000
-            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
-            assert settings["max_memory_usage"] == 256 * 1024 * 1024
-            assert settings["timeout_overflow_mode"] == "throw"
-        v2_service.assert_called_once_with()
-        legacy_service.assert_not_called()
+        assert payload["query_sampled"] is False
+        filters = graph_read.call_args.kwargs["filters"]
+        assert filters[-1]["column_id"] == "session"
+        assert filters[-1]["filter_config"]["filter_value"] == [session_id]
         pg_trace_manager.assert_not_called()
 
-    def test_session_system_graph_groups_only_proven_latest_trace_candidates(self):
-        window_start = datetime(2026, 1, 1, tzinfo=UTC)
-        window_end = window_start + timedelta(days=1)
+    def test_session_system_graph_dispatches_exact_snapshot(self):
         project_id = str(uuid.uuid4())
-        survivor = "10000000-0000-0000-0000-000000000000"
-        duplicate_old = "20000000-0000-0000-0000-000000000000"
-        consolidated_new = "30000000-0000-0000-0000-000000000000"
-        other_session = "40000000-0000-0000-0000-000000000000"
-        rows = (
-            {
-                "project_id": project_id,
-                "root_span_id": "root-corrected",
-                "trace_id": "trace-corrected",
-                "trace_session_id": consolidated_new,
-                "start_time": window_start + timedelta(hours=1),
-                "end_time": window_start + timedelta(hours=1, seconds=4),
-                "latency_ms": 10,
-                "cost": 2,
-                "total_tokens": 10,
-                "prompt_tokens": 6,
-                "completion_tokens": 4,
-                "status": "OK",
-            },
-            {
-                "project_id": project_id,
-                "root_span_id": "root-same-session",
-                "trace_id": "trace-same-session",
-                "trace_session_id": duplicate_old,
-                "start_time": window_start + timedelta(hours=2),
-                "end_time": window_start + timedelta(hours=2, seconds=8),
-                "latency_ms": 30,
-                "cost": 3,
-                "total_tokens": 20,
-                "prompt_tokens": 12,
-                "completion_tokens": 8,
-                "status": "ERROR",
-            },
-            {
-                "project_id": project_id,
-                "root_span_id": "root-other-session",
-                "trace_id": "trace-other-session",
-                "trace_session_id": other_session,
-                "start_time": window_start + timedelta(hours=3),
-                "end_time": window_start + timedelta(hours=3, seconds=2),
-                "latency_ms": 50,
-                "cost": 7,
-                "total_tokens": 5,
-                "prompt_tokens": 3,
-                "completion_tokens": 2,
-                "status": "OK",
-            },
-        )
-        sample = GraphCandidateSample(
-            rows=rows,
-            query_complete=True,
-            query_status="complete",
-            query_error_code=None,
-            window_start=window_start,
-            window_end=window_end,
-            elapsed_ms=1,
-            query_count=2,
-            rows_returned=3,
-            result_payload_bytes=500,
-            total_rows_lower_bound=3,
-        )
         analytics = mock.Mock()
-        analytics.execute_ch_query.side_effect = [
-            mock.Mock(data=list(rows), columns=[]),
-            mock.Mock(
-                data=[
-                    {"old_id": survivor, "new_id": consolidated_new},
-                    {"old_id": duplicate_old, "new_id": consolidated_new},
-                ],
-                columns=["old_id", "new_id"],
-            ),
-        ]
+        filters = [{"column_id": "created_at", "filter_config": {}}]
+        exact_graph = {
+            "metric_name": "cost",
+            "data": [{"timestamp": "2026-01-01T00:00:00Z", "value": 6}],
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+        }
 
         with mock.patch(
-            "tracer.services.clickhouse.session_graph.read_graph_candidates",
-            return_value=sample,
-        ) as candidate_read:
+            "tracer.services.clickhouse.session_graph.read_or_schedule_exact_snapshot",
+            return_value=exact_graph,
+        ) as exact_read:
             graph = fetch_session_graph_ch(
                 analytics=analytics,
                 project_id=project_id,
-                filters=[],
+                filters=filters,
                 interval="day",
                 req_data_config={"id": "cost", "type": "SYSTEM_METRIC"},
             )
 
-        assert graph["query_complete"] is True
-        assert graph["query_status"] == "complete"
-        # The two old/new IDs are one canonical session: its corrected latest
-        # traces sum to 5. The other session sums to 7; cost is their average.
-        assert graph["data"][0]["value"] == 6
-        assert graph["data"][0]["primary_traffic"] == 2
-        candidate_kwargs = candidate_read.call_args.kwargs
-        assert candidate_kwargs["observe_type"] == "trace"
-        assert candidate_kwargs["filters"][-1]["column_id"] == "trace_session_id"
-        remap_sql = analytics.execute_ch_query.call_args.args[0]
-        assert "trace_session_id_remap FINAL" in remap_sql
-        assert "relevant_new_ids" in remap_sql
+        assert graph == exact_graph
+        namespace, identity = exact_read.call_args.args
+        assert namespace == "observe-session-system-graph"
+        assert identity == {
+            "project_id": project_id,
+            "filters": filters,
+            "interval": "day",
+            "metric_id": "cost",
+        }
+        assert exact_read.call_args.kwargs["refresh"] is False
+        pending = exact_read.call_args.kwargs["pending_payload"]
+        assert pending == {
+            "metric_name": "cost",
+            "data": [],
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+            "query_refreshing": True,
+        }
+        analytics.execute_ch_query.assert_not_called()
 
-    @pytest.mark.parametrize("sampled", [False, True], ids=["exact", "sampled"])
     @pytest.mark.parametrize(
-        ("metric_id", "expected_value"),
+        "metric_id",
         [
-            ("latency", 20),
-            ("cost", 5),
-            ("tokens", 30),
-            ("error_rate", 100),
-            ("avg_duration", 3_608),
+            "latency",
+            "cost",
+            "tokens",
+            "error_rate",
+            "avg_duration",
         ],
     )
-    def test_session_system_graph_hydrates_exact_and_sampled_candidate_metrics(
-        self,
-        sampled,
-        metric_id,
-        expected_value,
-    ):
-        window_start = datetime(2026, 1, 1, tzinfo=UTC)
-        window_end = window_start + timedelta(days=1)
+    def test_session_system_graph_dispatches_all_supported_metrics(self, metric_id):
         project_id = str(uuid.uuid4())
-        session_id = "003b76f1-2b4a-4af5-b0dc-224d687374d4"
-        candidate_rows = (
-            {
-                "root_span_id": "root-first",
-                "trace_id": "trace-first",
-                "trace_session_id": session_id,
-                "start_time": window_start + timedelta(hours=1),
-            },
-            {
-                "root_span_id": "root-second",
-                "trace_id": "trace-second",
-                "trace_session_id": session_id,
-                "start_time": window_start + timedelta(hours=2),
-            },
-        )
-        hydrated_rows = (
-            {
-                **candidate_rows[0],
-                "project_id": project_id,
-                "end_time": window_start + timedelta(hours=1, seconds=4),
-                "latency_ms": 10,
-                "cost": 2,
-                "total_tokens": 10,
-                "prompt_tokens": 6,
-                "completion_tokens": 4,
-                "status": "OK",
-            },
-            {
-                **candidate_rows[1],
-                "project_id": project_id,
-                "end_time": window_start + timedelta(hours=2, seconds=8),
-                "latency_ms": 30,
-                "cost": 3,
-                "total_tokens": 20,
-                "prompt_tokens": 12,
-                "completion_tokens": 8,
-                "status": "ERROR",
-            },
-        )
-        sample = GraphCandidateSample(
-            rows=candidate_rows,
-            query_complete=not sampled,
-            query_status="sampled" if sampled else "complete",
-            query_error_code="sample_limit" if sampled else None,
-            window_start=window_start,
-            window_end=window_end,
-            elapsed_ms=1,
-            query_count=4 if sampled else 2,
-            rows_returned=2,
-            result_payload_bytes=100,
-            total_rows_lower_bound=2,
-            sampling_strategy=("time_stratified_latest_state" if sampled else None),
-            sampling_strata=4 if sampled else 0,
-            sampling_strata_completed=4 if sampled else 0,
-        )
         analytics = mock.Mock()
-        analytics.execute_ch_query.side_effect = [
-            mock.Mock(data=list(hydrated_rows), columns=[]),
-            mock.Mock(data=[], columns=[]),
-        ]
+        pending = {
+            "metric_name": metric_id,
+            "data": [],
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+            "query_refreshing": True,
+        }
 
         with mock.patch(
-            "tracer.services.clickhouse.session_graph.read_graph_candidates",
-            return_value=sample,
-        ):
+            "tracer.services.clickhouse.session_graph.read_or_schedule_exact_snapshot",
+            return_value=pending,
+        ) as exact_read:
             graph = fetch_session_graph_ch(
                 analytics=analytics,
                 project_id=project_id,
@@ -784,36 +656,9 @@ class TestTraceSessionGraphAPI:
                 req_data_config={"id": metric_id, "type": "SYSTEM_METRIC"},
             )
 
-        populated_point = next(
-            point for point in graph["data"] if point["primary_traffic"]
-        )
-        assert populated_point["value"] == pytest.approx(expected_value)
-        assert graph["query_complete"] is (not sampled)
-        assert graph["query_status"] == ("sampled" if sampled else "complete")
-        assert graph["query_sampled"] is sampled
-        assert graph["query_count"] == sample.query_count + 2
-        assert graph["query_rows_returned"] == sample.rows_returned + 2
-        assert graph["query_result_bytes"] > sample.result_payload_bytes
-        if sampled:
-            assert graph["query_error_code"] == "sample_limit"
-            assert graph["query_sampling_strategy"] == ("time_stratified_latest_state")
-            assert graph["query_sampling_strata_completed"] == 4
-
-        assert analytics.execute_ch_query.call_count == 2
-        hydration_call = analytics.execute_ch_query.call_args_list[0]
-        hydration_sql = hydration_call.args[0]
-        hydration_params = hydration_call.args[1]
-        assert "page_hydration_root_identities" in hydration_sql
-        assert "latest_is_deleted = 0" in hydration_sql
-        assert "latest_parent_span_id IS NULL" in hydration_sql
-        assert hydration_params["page_hydration_trace_ids"] == (
-            "trace-first",
-            "trace-second",
-        )
-        assert len(hydration_params["page_hydration_root_identities"]) == 2
-        assert hydration_call.kwargs["settings"]["max_result_rows"] == 2
-        remap_sql = analytics.execute_ch_query.call_args_list[1].args[0]
-        assert "trace_session_id_remap FINAL" in remap_sql
+        assert graph == pending
+        assert exact_read.call_args.args[1]["metric_id"] == metric_id
+        analytics.execute_ch_query.assert_not_called()
 
     def test_session_system_candidate_sql_replays_v2_updates_and_tombstones(self):
         builder = TraceListQueryBuilderV2(
@@ -850,19 +695,27 @@ class TestTraceSessionGraphAPI:
         assert "WHERE latest_is_deleted = 0" in query
         assert "HAVING countIf" in query
 
-    def test_session_system_graph_incomplete_candidate_set_is_typed_503(
+    def test_session_system_graph_cold_snapshot_returns_publishable_pending_state(
         self,
         auth_client,
         observe_project,
     ):
+        pending_graph = {
+            "metric_name": "session_count",
+            "data": [],
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+            "query_refreshing": True,
+        }
         with (
             mock.patch(
                 "tracer.views.trace_session.V2AnalyticsQueryService",
                 return_value=mock.Mock(),
             ),
             mock.patch(
-                "tracer.services.clickhouse.session_graph.read_graph_candidates",
-                side_effect=BoundedGraphReadError("sample_limit"),
+                "tracer.views.trace_session.fetch_session_graph_ch",
+                return_value=pending_graph,
             ),
         ):
             response = auth_client.post(
@@ -880,10 +733,13 @@ class TestTraceSessionGraphAPI:
                 format="json",
             )
 
-        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.status_code == status.HTTP_200_OK
         payload = get_result(response)
         assert payload["query_complete"] is False
-        assert payload["query_error_code"] == "sample_limit"
+        assert payload["query_status"] == "pending"
+        assert payload["query_sampled"] is False
+        assert payload["query_refreshing"] is True
+        assert payload["data"] == []
 
     @pytest.mark.parametrize(
         ("error_code", "expected_status", "error_type"),
@@ -936,87 +792,25 @@ class TestTraceSessionGraphAPI:
             assert response.data["code"] == "server_error"
             assert "could not be loaded" in response.data["message"]
 
-    def test_session_system_graph_rejects_returned_candidate_sample_before_remap(
-        self,
-    ):
-        window_start = datetime(2026, 1, 1, tzinfo=UTC)
-        sample = GraphCandidateSample(
-            rows=(
-                {
-                    "trace_id": "trace-proven-match",
-                    "trace_session_id": "003b76f1-2b4a-4af5-b0dc-224d687374d4",
-                    "start_time": window_start,
-                },
-            ),
-            query_complete=False,
-            query_status="degraded",
-            query_error_code="sample_limit",
-            window_start=window_start,
-            window_end=window_start + timedelta(days=1),
-            elapsed_ms=1,
-            query_count=2,
-            rows_returned=50,
-            result_payload_bytes=100,
-            total_rows_lower_bound=51,
-        )
+    def test_session_system_graph_does_not_read_bounded_candidates(self):
         analytics = mock.Mock()
+        pending = {
+            "metric_name": "session_count",
+            "data": [],
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+            "query_refreshing": True,
+        }
 
         with (
             mock.patch(
-                "tracer.services.clickhouse.session_graph.read_graph_candidates",
-                return_value=sample,
+                "tracer.services.clickhouse.session_graph.read_or_schedule_exact_snapshot",
+                return_value=pending,
             ),
-            pytest.raises(BoundedGraphReadError) as caught,
-        ):
-            fetch_session_graph_ch(
-                analytics=analytics,
-                project_id=str(uuid.uuid4()),
-                filters=[],
-                interval="day",
-                req_data_config={"id": "session_count", "type": "SYSTEM_METRIC"},
-            )
-
-        assert caught.value.error_code == "sample_limit"
-        analytics.execute_ch_query.assert_not_called()
-
-    def test_session_system_graph_renders_only_a_fully_executed_labelled_sample(self):
-        window_start = datetime(2026, 1, 1, tzinfo=UTC)
-        session_id = "003b76f1-2b4a-4af5-b0dc-224d687374d4"
-        sample = GraphCandidateSample(
-            rows=(
-                {
-                    "trace_id": "trace-proven-match",
-                    "trace_session_id": session_id,
-                    "start_time": window_start + timedelta(hours=1),
-                    "end_time": window_start + timedelta(hours=1, seconds=2),
-                    "latency_ms": 25,
-                    "cost": 1,
-                    "total_tokens": 10,
-                    "prompt_tokens": 6,
-                    "completion_tokens": 4,
-                    "status": "OK",
-                },
-            ),
-            query_complete=False,
-            query_status="sampled",
-            query_error_code="sample_limit",
-            window_start=window_start,
-            window_end=window_start + timedelta(days=14),
-            elapsed_ms=1,
-            query_count=16,
-            rows_returned=16,
-            result_payload_bytes=100,
-            total_rows_lower_bound=1,
-            sampling_strategy="time_stratified_latest_state",
-            sampling_strata=8,
-            sampling_strata_completed=8,
-        )
-        analytics = mock.Mock()
-        analytics.execute_ch_query.return_value = mock.Mock(data=[], columns=[])
-
-        with mock.patch(
-            "tracer.services.clickhouse.session_graph.read_graph_candidates",
-            return_value=sample,
+            mock.patch(
+                "tracer.services.clickhouse.session_graph.read_graph_candidates"
+            ) as candidate_read,
         ):
             graph = fetch_session_graph_ch(
                 analytics=analytics,
@@ -1026,15 +820,37 @@ class TestTraceSessionGraphAPI:
                 req_data_config={"id": "session_count", "type": "SYSTEM_METRIC"},
             )
 
-        assert graph["query_complete"] is False
-        assert graph["query_status"] == "sampled"
-        assert graph["query_error_code"] == "sample_limit"
-        assert graph["query_sampled"] is True
-        assert graph["query_sampling_strategy"] == "time_stratified_latest_state"
-        assert graph["query_sampling_strata"] == 8
-        assert graph["query_sampling_strata_completed"] == 8
-        assert any(point["value"] == 1 for point in graph["data"])
-        analytics.execute_ch_query.assert_called_once()
+        assert graph == pending
+        candidate_read.assert_not_called()
+        analytics.execute_ch_query.assert_not_called()
+
+    def test_session_system_graph_forwards_explicit_refresh(self):
+        analytics = mock.Mock()
+        pending = {
+            "metric_name": "session_count",
+            "data": [],
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+            "query_refreshing": True,
+        }
+
+        with mock.patch(
+            "tracer.services.clickhouse.session_graph.read_or_schedule_exact_snapshot",
+            return_value=pending,
+        ) as exact_read:
+            graph = fetch_session_graph_ch(
+                analytics=analytics,
+                project_id=str(uuid.uuid4()),
+                filters=[],
+                interval="day",
+                req_data_config={"id": "session_count", "type": "SYSTEM_METRIC"},
+                refresh=True,
+            )
+
+        assert graph == pending
+        assert exact_read.call_args.kwargs["refresh"] is True
+        analytics.execute_ch_query.assert_not_called()
 
     @pytest.mark.parametrize(
         ("failure", "error_code"),
@@ -1057,13 +873,14 @@ class TestTraceSessionGraphAPI:
         failure,
         error_code,
     ):
-        analytics = mock.Mock()
-        analytics.execute_ch_query.side_effect = failure
-
         with (
             mock.patch(
                 "tracer.views.trace_session.V2AnalyticsQueryService",
-                return_value=analytics,
+                return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "tracer.views.trace_session.fetch_session_graph_ch",
+                side_effect=failure,
             ),
             mock.patch.object(Trace, "objects") as pg_trace_manager,
         ):
@@ -1111,13 +928,14 @@ class TestTraceSessionGraphAPI:
         observe_project,
         failure,
     ):
-        analytics = mock.Mock()
-        analytics.execute_ch_query.side_effect = failure
-
         with (
             mock.patch(
                 "tracer.views.trace_session.V2AnalyticsQueryService",
-                return_value=analytics,
+                return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "tracer.views.trace_session.fetch_session_graph_ch",
+                side_effect=failure,
             ),
             mock.patch.object(Trace, "objects") as pg_trace_manager,
         ):
@@ -1147,7 +965,7 @@ class TestTraceSessionGraphAPI:
         assert "compiler state" not in rendered
         pg_trace_manager.assert_not_called()
 
-    def test_session_eval_graph_uses_same_deadline_caps_and_session_scope(
+    def test_session_eval_graph_forwards_exact_session_scope(
         self,
         auth_client,
         observe_project,
@@ -1160,33 +978,22 @@ class TestTraceSessionGraphAPI:
             project=observe_project,
             eval_template=eval_template,
         )
-        analytics = mock.Mock()
-        analytics.execute_ch_query.return_value = mock.Mock(data=[], columns=[])
         helper_calls = []
 
         def fake_eval_graph(**kwargs):
             helper_calls.append(kwargs)
-            kwargs["analytics"].execute_ch_query(
-                "SELECT 1",
-                {},
-                timeout_ms=9_000,
-                settings={
-                    "max_threads": 8,
-                    "max_rows_to_read": 100_000_000,
-                    "max_bytes_to_read": 2 * 1024 * 1024 * 1024,
-                },
-            )
             return {
                 "metric_name": str(eval_config.id),
                 "data": [],
                 "query_complete": True,
                 "query_status": "complete",
+                "query_sampled": False,
             }
 
         with (
             mock.patch(
                 "tracer.views.trace_session.V2AnalyticsQueryService",
-                return_value=analytics,
+                return_value=mock.Mock(),
             ),
             mock.patch(
                 "tracer.services.clickhouse.session_graph.fetch_eval_graph_ch",
@@ -1214,11 +1021,9 @@ class TestTraceSessionGraphAPI:
         session_filter = helper_calls[0]["filters"][-1]
         assert session_filter["column_id"] == "trace_session_id"
         assert session_filter["filter_config"]["filter_op"] == "is_not_null"
-        query_call = analytics.execute_ch_query.call_args
-        assert 0 < query_call.kwargs["timeout_ms"] <= 1_200
-        assert query_call.kwargs["settings"]["max_threads"] == 1
-        assert query_call.kwargs["settings"]["max_rows_to_read"] == 10_000_000
-        assert query_call.kwargs["settings"]["max_bytes_to_read"] == 512 * 1024 * 1024
+        assert helper_calls[0]["observe_type"] == "trace"
+        assert helper_calls[0]["aggregation_context"] == "session"
+        assert helper_calls[0]["refresh"] is False
 
     def test_session_annotation_incomplete_graph_is_typed_503(
         self,
@@ -1276,7 +1081,7 @@ class TestTraceSessionGraphAPI:
         assert payload["query_error_code"] == "sample_limit"
         assert helper_calls[0]["filters"][-1]["column_id"] == "trace_session_id"
 
-    def test_session_annotation_fully_executed_sample_is_a_labelled_200(
+    def test_session_annotation_rejects_sample_even_with_legacy_opt_in(
         self,
         auth_client,
         observe_project,
@@ -1335,13 +1140,12 @@ class TestTraceSessionGraphAPI:
         legacy_payload = get_result(legacy_response)
         assert legacy_payload["data"] == []
         assert legacy_payload["query_status"] == "degraded"
-        assert response.status_code == status.HTTP_200_OK
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
         payload = get_result(response)
-        assert payload["data"] == sampled_annotation["data"]
+        assert payload["data"] == []
         assert payload["query_complete"] is False
-        assert payload["query_status"] == "sampled"
-        assert payload["query_sampled"] is True
-        assert payload["query_sampling_strata_completed"] == 8
+        assert payload["query_status"] == "degraded"
+        assert payload["query_sampled"] is False
 
     def test_session_graph_rejects_unsupported_type_without_any_ch_read(
         self,

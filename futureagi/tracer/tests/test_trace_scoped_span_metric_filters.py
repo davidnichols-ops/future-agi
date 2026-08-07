@@ -132,7 +132,7 @@ def test_span_has_eval_filter_joins_and_returns_exact_pair():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("present", [True, False])
-def test_span_annotation_filter_is_pair_scoped_and_rejects_untrusted_trace(present):
+def test_span_annotation_filter_resolves_span_backed_scores_to_exact_pair(present):
     where, _ = _span_builder().translate(
         [
             {
@@ -148,7 +148,9 @@ def test_span_annotation_filter_is_pair_scoped_and_rejects_untrusted_trace(prese
 
     expected_op = "IN" if present else "NOT IN"
     assert f"tuple(trace_id, id) {expected_op} (" in where
-    assert "tuple(toString(s.trace_id), toString(" in where
-    assert "AND NOT isNull(s.trace_id)" in where
-    assert "s.trace_id != toUUID('00000000-0000-0000-0000-000000000000')" in where
+    assert "scored_sp.id = s.observation_span_id" in where
+    assert "scored_sp.trace_id" in where
+    assert "ifNull(s.observation_span_id, '') != ''" in where
+    # Score.trace_id may legitimately be NULL for inline/span annotations.
+    assert "AND NOT isNull(s.trace_id)" not in where
     assert "IN %(candidate_span_entities)s" in where

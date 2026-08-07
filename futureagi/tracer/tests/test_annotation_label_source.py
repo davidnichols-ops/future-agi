@@ -120,6 +120,46 @@ class TestDiscoveryQueryContract:
             mock.call("project-b"),
         ]
 
+    def test_org_label_helper_preserves_disjoint_project_sets(self):
+        from tracer.utils.helper import get_annotation_labels_by_project
+
+        project_a = "00000000-0000-4000-8000-000000000001"
+        project_b = "00000000-0000-4000-8000-000000000002"
+        label_a = mock.Mock(id="label-a", project_id=project_a)
+        label_b = mock.Mock(id="label-b", project_id=project_b)
+        shared_a = mock.Mock(id="shared-a", project_id=None)
+        source = mock.MagicMock()
+        source.label_ids_by_project.return_value = {
+            project_a: ["shared-a"],
+            project_b: [],
+        }
+        label_query = mock.MagicMock()
+        label_query.filter.return_value = label_query
+        label_query.distinct.return_value = [label_a, label_b, shared_a]
+        organization = object()
+
+        with (
+            mock.patch(
+                "tracer.services.annotation_label_source.AnnotationLabelScoresProjectPG",
+                return_value=source,
+            ),
+            mock.patch(
+                "tracer.utils.helper.AnnotationsLabels.objects.filter",
+                return_value=label_query,
+            ),
+        ):
+            result = get_annotation_labels_by_project(
+                [project_a, project_b], organization=organization
+            )
+
+        assert [str(label.id) for label in result[project_a]] == [
+            "label-a",
+            "shared-a",
+        ]
+        assert [str(label.id) for label in result[project_b]] == ["label-b"]
+        source.label_ids_by_project.assert_called_once_with([project_a, project_b])
+        label_query.filter.assert_called_once_with(organization=organization)
+
 
 # --------------------------------------------------------------------------- #
 # Behavior tests (Postgres + ClickHouse): seed both stores, run the sources.

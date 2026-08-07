@@ -938,7 +938,10 @@ def test_attribute_detail_executes_latest_state_and_tombstones_on_ch25(
     assert read.attribute_type == "string"
     assert [(item.value, item.count) for item in read.rows] == [("Rejected", 4)]
     assert read.metadata.query_complete is True
-    assert read.metadata.query_count == 2
+    # Typed values use a light version certificate between candidate discovery
+    # and heavy value hydration, so stale/tombstoned candidates cannot force
+    # unnecessary Map reads.
+    assert read.metadata.query_count == 3
 
 
 def test_exact_attribute_discovery_exclusion_pages_past_stale_sample_on_ch25(
@@ -1403,7 +1406,9 @@ def test_bounded_reader_handles_duplicates_tombstone_and_latest_updates(
 
     assert page.complete is True
     assert [item["id"] for item in page.rows] == ["duplicate", "stable", "moved"]
-    assert page.attempts[0].kind == "seed"
+    # A selective typed-Map equality now uses the bounded raw-witness anchor
+    # before exact latest-state classification.
+    assert page.attempts[0].kind == "anchor"
     assert page.attempts[0].rows_returned == 5
 
 
@@ -3032,7 +3037,7 @@ def test_direct_write_map_types_execute_and_overflow_json_degrades_explicitly(
 
 
 def test_candidate_scoped_annotation_residual_executes_on_ch25(
-    ch_client, bounded_span_table, bounded_score_table
+    ch_client, bounded_span_table, production_score_table
 ) -> None:
     project_id = "00000000-0000-4000-8000-000000000005"
     label_id = "00000000-0000-4000-8000-000000000105"
@@ -3060,21 +3065,29 @@ def test_candidate_scoped_annotation_residual_executes_on_ch25(
     )
     ch_client.execute(
         f"""
-        INSERT INTO {bounded_score_table}
-            (id, trace_id, observation_span_id, label_id, annotator_id, value,
-             deleted, created_at, _peerdb_version)
+        INSERT INTO {production_score_table}
+            (id, source_type, trace_id, observation_span_id,
+             tracer_project_id, label_id, annotator_id, value,
+             organization_id, deleted, created_at, updated_at,
+             _peerdb_synced_at, _peerdb_is_deleted, _peerdb_version)
         VALUES
         """,
         [
             (
                 "00000000-0000-4000-8000-000000000305",
+                "OBSERVATION_SPAN",
                 trace_id,
                 "annotated-span",
+                project_id,
                 label_id,
                 None,
                 '{"text":"approved"}',
+                "00000000-0000-4000-8000-000000000405",
                 False,
                 started_at,
+                started_at,
+                started_at,
+                0,
                 1,
             )
         ],
@@ -3119,7 +3132,7 @@ def test_candidate_scoped_annotation_residual_executes_on_ch25(
             }
         ]
     )
-    query = query.replace("model_hub_score", bounded_score_table).replace(
+    query = query.replace("model_hub_score", production_score_table).replace(
         "FROM spans ", f"FROM {bounded_span_table} "
     )
 
@@ -3129,6 +3142,114 @@ def test_candidate_scoped_annotation_residual_executes_on_ch25(
     assert rows[0][1] == "annotated-span"
     assert params["candidate_span_ids"] == ("annotated-span",)
     assert params["candidate_span_entities"] == ((trace_id, "annotated-span"),)
+
+
+def test_span_annotation_filter_rejects_same_id_score_from_other_project_ch25(
+    ch_client, bounded_span_table, production_score_table
+) -> None:
+    """A foreign tenant's Score cannot match a project-local span identity."""
+
+    project_a = "00000000-0000-4000-8000-000000000515"
+    project_b = "00000000-0000-4000-8000-000000000516"
+    trace_id = "00000000-0000-4000-8000-000000000517"
+    label_id = "00000000-0000-4000-8000-000000000518"
+    organization_id = "00000000-0000-4000-8000-000000000519"
+    shared_span_id = "tenant-local-span"
+    started_at = datetime(2025, 1, 1, 10, 30, tzinfo=UTC)
+    ch_client.execute(
+        f"""
+        INSERT INTO {bounded_span_table}
+            (id, project_id, trace_id, parent_span_id, start_time, created_at,
+             is_deleted, _version)
+        VALUES
+        """,
+        [
+            (
+                shared_span_id,
+                project_id,
+                trace_id,
+                None,
+                started_at,
+                started_at,
+                0,
+                1,
+            )
+            for project_id in (project_a, project_b)
+        ],
+    )
+    ch_client.execute(
+        f"""
+        INSERT INTO {production_score_table}
+            (id, source_type, trace_id, observation_span_id,
+             tracer_project_id, label_id, value, organization_id,
+             created_at, updated_at, _peerdb_synced_at,
+             _peerdb_is_deleted, _peerdb_version)
+        VALUES
+        """,
+        [
+            (
+                "00000000-0000-4000-8000-000000000520",
+                "OBSERVATION_SPAN",
+                trace_id,
+                shared_span_id,
+                project_b,
+                label_id,
+                '{"text":"approved"}',
+                organization_id,
+                started_at,
+                started_at,
+                started_at,
+                0,
+                1,
+            )
+        ],
+    )
+    filters = [
+        {
+            "column_id": "created_at",
+            "filter_config": {
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [
+                    (started_at - timedelta(minutes=1)).isoformat(),
+                    (started_at + timedelta(minutes=1)).isoformat(),
+                ],
+            },
+        },
+        {
+            "column_id": label_id,
+            "filter_config": {
+                "col_type": "ANNOTATION",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "approved",
+            },
+        },
+    ]
+
+    class LocalSpanBuilder(SpanListQueryBuilderV2):
+        TABLE = bounded_span_table
+
+    query, params = LocalSpanBuilder(
+        project_id=project_a,
+        filters=filters,
+    ).build_filter_match_query_from_seed_rows(
+        [
+            {
+                "project_id": project_a,
+                "trace_id": trace_id,
+                "id": shared_span_id,
+                "start_time": started_at,
+            }
+        ]
+    )
+    query = query.replace("model_hub_score", production_score_table).replace(
+        "FROM spans ", f"FROM {bounded_span_table} "
+    )
+
+    assert ch_client.execute(query, params) == []
+    assert params["project_id"] == project_a
+    assert "s.tracer_project_id = toUUID(%(project_id)s)" in query
 
 
 def test_org_trace_candidate_identity_tuple_executes_on_ch25(

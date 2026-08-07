@@ -521,6 +521,21 @@ class TestTraceGraphMethodsAPI:
         """Trace graph filters can apply trace-level system metric annotations."""
         from tracer.models.observation_span import ObservationSpan
 
+        dispatched = []
+        monkeypatch.setattr(
+            "tracer.views.trace.fetch_system_metric_graph_ch",
+            lambda **kwargs: (
+                dispatched.append(kwargs)
+                or {
+                    "metric_name": "latency",
+                    "data": [],
+                    "query_complete": True,
+                    "query_status": "complete",
+                    "query_sampled": False,
+                }
+            ),
+        )
+
         trace = Trace.objects.create(
             project=observe_project,
             name="Latency Filter Trace",
@@ -563,6 +578,7 @@ class TestTraceGraphMethodsAPI:
         )
 
         assert response.status_code == status.HTTP_200_OK
+        assert dispatched[0]["filters"][0]["column_id"] == "latency"
 
     def test_get_graph_methods_rejects_foreign_eval_config_before_ch_read(
         self,

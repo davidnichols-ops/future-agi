@@ -8,8 +8,11 @@ from unittest.mock import patch
 import pytest
 from clickhouse_driver.errors import ServerException
 from django.core.cache import cache
+from django.db import DatabaseError
 
 from tracer.services.clickhouse.exact_graph_reads import (
+    ExactGraphReadError,
+    _annotation_label_ids_for_filters,
     _filter_relation_requirements,
     output_bucket_partitions,
     read_exact_all_system_metrics,
@@ -107,6 +110,90 @@ def test_output_partitions_only_cut_on_bucket_boundaries():
         (start, datetime(2026, 8, 1, 3, 0)),
         (datetime(2026, 8, 1, 3, 0), datetime(2026, 8, 1, 6, 0)),
         (datetime(2026, 8, 1, 6, 0), end),
+    )
+
+
+@pytest.mark.unit
+def test_annotation_completeness_labels_are_sorted_and_metadata_failure_is_retryable(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    has_annotation = {
+        "column_id": "has_annotation",
+        "filter_config": {"filter_op": "equals", "filter_value": True},
+    }
+    monkeypatch.setattr(
+        exact_module,
+        "get_annotation_labels_for_project",
+        lambda _project_id: [
+            SimpleNamespace(id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            SimpleNamespace(id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        ],
+    )
+    assert _annotation_label_ids_for_filters("project", [has_annotation]) == (
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    )
+
+    def unavailable(_project_id):
+        raise DatabaseError("private backend details")
+
+    monkeypatch.setattr(
+        exact_module,
+        "get_annotation_labels_for_project",
+        unavailable,
+    )
+    with pytest.raises(
+        ExactGraphReadError,
+        match="Annotation metadata is temporarily unavailable",
+    ):
+        _annotation_label_ids_for_filters("project", [has_annotation])
+
+
+@pytest.mark.unit
+def test_annotation_metadata_is_not_read_without_completeness_filter(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    monkeypatch.setattr(
+        exact_module,
+        "get_annotation_labels_for_project",
+        lambda _project_id: pytest.fail("metadata should not be queried"),
+    )
+    assert (
+        _annotation_label_ids_for_filters(
+            "project",
+            [
+                _time_filter(
+                    datetime(2026, 1, 1),
+                    datetime(2026, 1, 2),
+                )
+            ],
+        )
+        is None
+    )
+
+
+@pytest.mark.unit
+def test_annotation_completeness_preserves_authoritative_empty_label_set(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    monkeypatch.setattr(
+        exact_module,
+        "get_annotation_labels_for_project",
+        lambda _project_id: [],
+    )
+    assert (
+        _annotation_label_ids_for_filters(
+            "project",
+            [
+                {
+                    "column_id": "has_annotation",
+                    "filter_config": {"filter_op": "equals", "filter_value": True},
+                }
+            ],
+        )
+        == ()
     )
 
 
@@ -1573,6 +1660,16 @@ def _combined_relation_filters(start: datetime, end: datetime) -> list[dict]:
     ]
 
 
+def _stub_annotation_label_ids(monkeypatch, exact_module) -> None:
+    """Keep SQL-shape tests independent of the PostgreSQL label catalog."""
+
+    monkeypatch.setattr(
+        exact_module,
+        "_annotation_label_ids_for_filters",
+        lambda _project_id, _filters: ("55555555-5555-4555-8555-555555555555",),
+    )
+
+
 class _RelationSnapshotAnalytics:
     def __init__(self, *, fail_table: str | None = None):
         self.fail_table = fail_table
@@ -1712,8 +1809,10 @@ def test_exact_system_graph_compiles_relations_in_one_project_scoped_statement(
     observe_type,
 ):
     from tracer.models.custom_eval_config import CustomEvalConfig
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     analytics = _RelationSnapshotAnalytics()
+    _stub_annotation_label_ids(monkeypatch, exact_module)
     start = datetime(2026, 1, 1)
     end = datetime(2026, 4, 15)
 
@@ -1790,8 +1889,10 @@ def test_system_graph_does_not_issue_separate_relation_snapshot_queries(
     monkeypatch,
 ):
     from tracer.models.custom_eval_config import CustomEvalConfig
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     analytics = _RelationSnapshotAnalytics(fail_table="model_hub_score")
+    _stub_annotation_label_ids(monkeypatch, exact_module)
 
     class _ProjectConfigs:
         @staticmethod
@@ -2017,6 +2118,36 @@ def test_exact_structured_null_domain_covers_missing_null_and_type_mismatch(
     assert f"= '{expected_type}'" in clause
     assert ("NOT (" in clause) is negated
     assert params["latest_filter_key_0"] == "payload"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("wants_complete", "expected_clause"),
+    [(True, "(1 = 1)"), (False, "(0 = 1)")],
+)
+def test_exact_membership_preserves_known_empty_annotation_label_set(
+    wants_complete,
+    expected_clause,
+):
+    clause, params = compile_exact_graph_filter_predicates(
+        [
+            {
+                "column_id": "has_annotation",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "boolean",
+                    "filter_op": "equals",
+                    "filter_value": wants_complete,
+                },
+            }
+        ],
+        project_id="11111111-1111-4111-8111-111111111111",
+        observe_type="trace",
+        annotation_label_ids=[],
+    )
+
+    assert clause == expected_clause
+    assert params == {}
 
 
 @pytest.mark.unit
@@ -2406,6 +2537,7 @@ def test_exact_session_graph_freezes_combined_filter_relations(monkeypatch):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     analytics = _RelationSnapshotAnalytics()
+    _stub_annotation_label_ids(monkeypatch, exact_module)
     start = datetime(2026, 1, 1)
     end = datetime(2026, 3, 15)
     monkeypatch.setattr(
@@ -2732,6 +2864,7 @@ def test_exact_eval_reader_uses_one_current_state_statement(
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     analytics = _RelationSnapshotAnalytics()
+    _stub_annotation_label_ids(monkeypatch, exact_module)
     start = datetime(2026, 1, 1)
     end = datetime(2026, 4, 15)
     eval_config_id = "33333333-3333-4333-8333-333333333333"
@@ -2821,6 +2954,7 @@ def test_annotation_membership_batches_use_current_state_without_ceilings(
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     analytics = _RelationSnapshotAnalytics()
+    _stub_annotation_label_ids(monkeypatch, exact_module)
     start = datetime(2026, 1, 1)
     end = datetime(2026, 1, 3)
     scores = [
@@ -3241,6 +3375,7 @@ def test_exact_user_graph_does_not_apply_unsafe_relation_ceilings(
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     analytics = _RelationSnapshotAnalytics()
+    _stub_annotation_label_ids(monkeypatch, exact_module)
     start = datetime(2026, 1, 1)
     end = datetime(2026, 3, 15)
     monkeypatch.setattr(

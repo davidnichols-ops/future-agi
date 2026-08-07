@@ -42,7 +42,6 @@ _BUILDER_BY_ROW_TYPE = {
 
 _EVAL_TASK_TOTAL_READ_SECONDS = 10.0
 _EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS = 22.0
-_EVAL_TASK_HISTORICAL_TRACE_POPULATION_SECONDS = 60.0
 _EVAL_TASK_MAX_READ_ATTEMPTS = 128
 # Seed pages are identity-only and capped at the shared production-proven 512
 # rows. Classifiers remain separately chunked to 200 physical identities.
@@ -55,6 +54,11 @@ _EVAL_TASK_TRACE_WITNESS_SECONDS_RESERVE = 10.0
 _EVAL_TASK_TRACE_WITNESS_QUERY_TIMEOUT_MS = 1_500
 _EVAL_TASK_TRACE_WITNESS_PREFLIGHT_MS_PER_BATCH = 500
 _EVAL_TASK_BUFFERED_ID_LIMIT = 10_000
+_EVAL_TASK_WORKFLOW_EXACT_THRESHOLD = 10_000
+_EVAL_TASK_WORKFLOW_EXACT_SECONDS = 75 * 60.0
+_EVAL_TASK_WORKFLOW_TOTAL_SECONDS = 150 * 60.0
+_EVAL_TASK_WORKFLOW_MAX_SEED_ATTEMPTS = 16_384
+_EVAL_TASK_WORKFLOW_MAX_QUERY_COUNT = 32_768
 _EVAL_TASK_STREAM_READ_SETTINGS = {
     "max_execution_time": 10,
     "timeout_overflow_mode": "throw",
@@ -90,10 +94,48 @@ _SAFE_UNSUPPORTED_FILTER_MESSAGE = (
     "Evaluation task row selection contains a filter that cannot be resolved "
     "safely. Update the filters and retry."
 )
+_SAFE_ANNOTATION_METADATA_MESSAGE = (
+    "Evaluation task annotation metadata is temporarily unavailable. Retry."
+)
 
 
 class EvalTaskReadBudgetExceeded(RuntimeError):
     """Safe error used when exact task membership cannot be proven in budget."""
+
+
+def _annotation_label_ids_for_filters(
+    project_id: str,
+    ui_filters: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    """Return project labels required by annotation-completeness filters.
+
+    All public tracing surfaces define ``has_annotation=false`` as "missing at
+    least one configured label". Without the label ids the shared compiler
+    falls back to "has no Score", which would make eval-task membership differ
+    from the list the user filtered.
+    """
+
+    needs_completeness = any(
+        (item.get("column_id") or item.get("columnId")) == "has_annotation"
+        for item in ui_filters
+        if isinstance(item, dict)
+    )
+    if not needs_completeness:
+        return ()
+
+    from django.db import DatabaseError
+
+    from tracer.services.annotation_label_source import AnnotationScoreReadUnavailable
+    from tracer.utils.helper import get_annotation_labels_for_project
+
+    try:
+        return tuple(
+            str(label.id)
+            for label in get_annotation_labels_for_project(project_id)
+            if getattr(label, "id", None)
+        )
+    except (AnnotationScoreReadUnavailable, DatabaseError):
+        raise RuntimeError(_SAFE_ANNOTATION_METADATA_MESSAGE) from None
 
 
 @dataclass(frozen=True)
@@ -266,6 +308,8 @@ def _replay_historical_trace_filter_witnesses(
     read_started: float,
     ui_filters: list[dict[str, Any]],
     project_id: str,
+    max_query_count: int = _EVAL_TASK_MAX_READ_ATTEMPTS,
+    total_deadline_seconds: float = _EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS,
 ) -> list[dict[str, Any]]:
     """Replay only proven traces to attach exact any-span filter witnesses.
 
@@ -282,7 +326,7 @@ def _replay_historical_trace_filter_witnesses(
         return rows
 
     required_queries = ceil(len(rows) / _EVAL_TASK_TRACE_WITNESS_BATCH_SIZE)
-    if phase_one_query_count + required_queries > _EVAL_TASK_MAX_READ_ATTEMPTS:
+    if phase_one_query_count + required_queries > max_query_count:
         raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
 
     expected_by_trace: dict[str, tuple[str, str, str, datetime]] = {}
@@ -292,7 +336,7 @@ def _replay_historical_trace_filter_witnesses(
             raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
         expected_by_trace[identity[1]] = identity
 
-    total_deadline = read_started + _EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS
+    total_deadline = read_started + total_deadline_seconds
     # The largest production tenant completed a 100-trace exact replay in
     # 429 ms. Reserve 500 ms per batch before the first replay read, so the
     # default 1,000-row task has a realistic 5 s preflight inside its separately
@@ -666,7 +710,10 @@ def _resolve_bounded_historical_span_ids(
     if not 0 <= float(sampling_rate) <= 100:
         raise ValueError("sampling_rate must be between 0 and 100")
 
-    from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+    from tracer.selectors.trace_filter_reads import (
+        bounded_numbered_page_depth_exceeded,
+        read_bounded_filter_page,
+    )
     from tracer.services.clickhouse.v2.dispatch import get_v2_class
 
     ui_filters = _task_ui_filters(
@@ -679,45 +726,14 @@ def _resolve_bounded_historical_span_ids(
         (item.get("column_id") or item.get("columnId")) in time_columns
         for item in ui_filters
     )
-    has_non_time_filter = any(
-        (item.get("column_id") or item.get("columnId")) not in time_columns
-        for item in ui_filters
+    annotation_label_ids = _annotation_label_ids_for_filters(
+        str(project_id), ui_filters
     )
-    bounded_limit = min(limit, _EVAL_TASK_BUFFERED_ID_LIMIT)
-    # Historical session tasks have always selected a deterministic ID-sorted
-    # population before LIMIT.  The bounded reader is newest-first, so a
-    # session task may use it only as a complete-population proof: exhaust the
-    # sampled set, sort the IDs below, and fail closed when the sentinel proves
-    # that the configured limit would truncate it.
-    requires_population_proof = (
-        row_type == RowType.SESSIONS or limit > _EVAL_TASK_BUFFERED_ID_LIMIT
-    )
-    if not has_non_time_filter and not requires_population_proof:
-        # The historical contract caps an ID-ascending deterministic prefix.
-        # The bounded reader is newest-first so it can prove a filtered UI
-        # page without scanning the whole window.  Keep unfiltered/time-only
-        # tasks on the compatibility query; otherwise changing the row limit
-        # across the bounded threshold would change the selected population.
-        compatibility_sql, compatibility_params = (
-            (sql, params)
-            if sql is not None and params is not None
-            else _build_sample_query(
-                project_id=str(project_id),
-                row_type=row_type,
-                salt=str(salt),
-                sampling_rate=float(sampling_rate),
-                filters=filters,
-                limit=limit,
-            )
-        )
-        return resolved_result(
-            _resolve_buffered_legacy_ids(
-                compatibility_sql,
-                compatibility_params,
-                batch_size=batch_size,
-                limit=limit,
-            )
-        )
+    # Exactly 10k already exceeds the interactive 128-query proof for the
+    # 50-row session/voice classifiers (and for trace witness replay). Route
+    # the boundary value through the background-workflow contract as well.
+    workflow_exact = limit >= _EVAL_TASK_WORKFLOW_EXACT_THRESHOLD
+    bounded_limit = int(limit)
 
     query_type, key_field = _BUILDER_BY_ROW_TYPE[row_type]
     # Voice classifiers are candidate-scoped by trace, but the public task
@@ -730,10 +746,7 @@ def _resolve_bounded_historical_span_ids(
         and include_trace_filter_witnesses
         and _trace_any_span_filter_descriptors(ui_filters)
     )
-    trace_population_proof = bool(
-        trace_any_span_witnesses and requires_population_proof
-    )
-    trace_witness_replay = bool(trace_any_span_witnesses and not trace_population_proof)
+    trace_witness_replay = trace_any_span_witnesses
     builder = get_v2_class(query_type)(
         project_id=str(project_id),
         filters=ui_filters,
@@ -745,28 +758,23 @@ def _resolve_bounded_historical_span_ids(
         bounded_bulk_scan=row_type == RowType.TRACES,
         # Normal historical trace tasks first prove membership/order in 100-ID
         # batches, then replay witnesses only for the final matched prefix.
-        # High-limit population proofs attach witnesses in one pass below.
+        # Large tasks remain membership-only in phase one and replay witnesses
+        # only for the final exact prefix below.
         **(
             {
-                # Attach witness projections in phase one only when a high-limit
-                # population proof must finish in one pass.  Callers that do not
-                # request witnesses and normal two-phase tasks both need the
-                # lightweight membership classifier; treating "no replay" as
-                # "include witnesses" shrank those batches from 100 traces to 20
-                # and repeated the expensive argMinIf projections unnecessarily.
-                "bounded_include_filter_witnesses": trace_population_proof
+                # Keep phase one identity-only. Witness projections shrink the
+                # classifier batch and are replayed only for selected traces.
+                "bounded_include_filter_witnesses": False
             }
             if row_type == RowType.TRACES
             else {}
         ),
-        # A configured limit above the 10k executable buffer needs a population
-        # proof, not a newest-first trace page. For any-span trace filters this
-        # lets the bounded reader exhaust the directly filtered physical seed
-        # stream (or stop at the exact 10k+1 sentinel) instead of scanning every
-        # tenant root. Accepted sets are still fully exhausted and ID-sorted.
-        **({"bounded_population_proof": True} if trace_population_proof else {}),
+        # Population-proof mode is deliberately disabled here. Historical
+        # tasks select the exact newest matching prefix, matching the list
+        # surface, and can therefore stop once that ordered prefix is proven.
         bounded_sampling_salt=str(salt),
         bounded_sampling_rate=float(sampling_rate),
+        annotation_label_ids=list(annotation_label_ids),
     )
     if not builder.supports_bounded_filter_scan():
         # Never fall back to the broad compatibility statement for a filter
@@ -817,7 +825,63 @@ def _resolve_bounded_historical_span_ids(
             classify_batch_size,
             _EVAL_TASK_TRACE_MEMBERSHIP_BATCH_SIZE,
         )
+        # Interactive trace selection has a fixed 16-statement/10-second
+        # witness reserve. Route before the requested prefix can require a
+        # seventeenth 100-trace witness batch; otherwise phase one can succeed
+        # only for replay to fail deterministically without contacting CH.
+        workflow_exact = workflow_exact or (
+            ceil(bounded_limit / _EVAL_TASK_TRACE_WITNESS_BATCH_SIZE)
+            > _EVAL_TASK_TRACE_WITNESS_QUERY_RESERVE
+        )
 
+    # Move to the background-workflow envelope at the exact mechanical point
+    # where page zero plus its sentinel cannot fit the interactive statement
+    # budget. This removes the old medium-limit cliff (5.8k session/voice and
+    # 9.2k trace-any-span rows) while keeping one newest-first ordering contract
+    # on both sides of the transition.
+    interactive_query_count = _EVAL_TASK_MAX_READ_ATTEMPTS
+    if trace_witness_replay:
+        interactive_query_count -= _EVAL_TASK_TRACE_WITNESS_QUERY_RESERVE
+    seed_batch_size = min(200, _EVAL_TASK_MAX_CANDIDATES)
+    seed_batch_recommendation = getattr(
+        builder, "recommended_filter_seed_batch_size", None
+    )
+    if callable(seed_batch_recommendation):
+        recommended_seed_batch_size = seed_batch_recommendation()
+        if recommended_seed_batch_size is not None:
+            seed_batch_size = min(
+                _EVAL_TASK_MAX_CANDIDATES,
+                max(1, int(recommended_seed_batch_size)),
+            )
+    preflight_classify_batch_size = classify_batch_size
+    fallback_batch_recommendation = getattr(
+        builder,
+        "recommended_filter_candidate_witness_fallback_classify_batch_size",
+        None,
+    )
+    if callable(fallback_batch_recommendation):
+        fallback_batch_size = fallback_batch_recommendation()
+        if fallback_batch_size is not None:
+            preflight_classify_batch_size = min(
+                preflight_classify_batch_size,
+                max(1, int(fallback_batch_size)),
+            )
+    identity_only_capability = getattr(
+        builder, "use_identity_only_filter_classification", None
+    )
+    hydration_query_reserve = int(
+        callable(identity_only_capability) and identity_only_capability()
+    )
+    workflow_exact = workflow_exact or bounded_numbered_page_depth_exceeded(
+        page_number=0,
+        page_size=bounded_limit,
+        max_seed_attempts=_EVAL_TASK_MAX_READ_ATTEMPTS,
+        max_candidates=_EVAL_TASK_MAX_CANDIDATES,
+        max_query_count=interactive_query_count,
+        classify_batch_size=preflight_classify_batch_size,
+        seed_batch_size=seed_batch_size,
+        reserved_query_count=hydration_query_reserve,
+    )
     read_started = time.monotonic()
     phase_one_deadline_seconds = _EVAL_TASK_TOTAL_READ_SECONDS
     phase_one_query_count = _EVAL_TASK_MAX_READ_ATTEMPTS
@@ -831,21 +895,14 @@ def _resolve_bounded_historical_span_ids(
         # replay. The replay preflights the actual phase-one query count plus
         # its exact number of 100-trace batches before reading.
         phase_one_query_count -= _EVAL_TASK_TRACE_WITNESS_QUERY_RESERVE
-    elif trace_population_proof:
-        # Population-proof classification attaches exact witnesses in the same
-        # production-qualified 100-trace query. There is no second pass to
-        # reserve. At the production-qualified 522 ms ceiling,
-        # all 101 classifier batches for a complete 10k set need about 53 s;
-        # this workflow-only path therefore has its own finite 60 s wall cap.
-        phase_one_deadline_seconds = _EVAL_TASK_HISTORICAL_TRACE_POPULATION_SECONDS
-        # Reserve the worst-case exact classifiers before scheduling adjacent
-        # time slices. With a 10k+1 sentinel and 100-trace batches this leaves
-        # 27 physical-seed attempts, so the adaptive scheduler covers even a
-        # year-long request with broad bounded slices instead of planning 128
-        # narrow seeds that later classifier queries could crowd out.
-        phase_one_seed_attempts = _EVAL_TASK_MAX_READ_ATTEMPTS - ceil(
-            (bounded_limit + 1) / classify_batch_size
-        )
+    if workflow_exact:
+        # Reconciliation is a heartbeating workflow activity, not an HTTP
+        # request. Let it prove a real 100k prefix in finite 512-row seeds while
+        # every individual ClickHouse statement retains the production-safe
+        # 1.5-second/single-thread/read-byte limits.
+        phase_one_deadline_seconds = _EVAL_TASK_WORKFLOW_EXACT_SECONDS
+        phase_one_query_count = _EVAL_TASK_WORKFLOW_MAX_QUERY_COUNT
+        phase_one_seed_attempts = _EVAL_TASK_WORKFLOW_MAX_SEED_ATTEMPTS
 
     try:
         page = read_bounded_filter_page(
@@ -861,11 +918,8 @@ def _resolve_bounded_historical_span_ids(
             max_query_count=phase_one_query_count,
             classify_batch_size=classify_batch_size,
             retry_wide_read_budget=True,
-            read_settings=(
-                _EVAL_TASK_TRACE_WITNESS_READ_SETTINGS
-                if trace_population_proof
-                else None
-            ),
+            read_settings=None,
+            workflow_exact=workflow_exact,
         )
     except Exception as exc:
         if not is_read_budget_error(exc) and not isinstance(
@@ -876,11 +930,6 @@ def _resolve_bounded_historical_span_ids(
 
     if not page.complete:
         raise EvalTaskReadBudgetExceeded(_SAFE_READ_BUDGET_MESSAGE)
-    if requires_population_proof and page.has_more:
-        # The configured public limit may pre-date the executable safety cap.
-        # A bounded 10k+sentinel read proves whether the complete sampled set
-        # fits. Never materialize a partial prefix when it does not.
-        raise EvalTaskReadBudgetExceeded(_SAFE_ROW_LIMIT_MESSAGE)
     resolved_rows = page.rows
     if trace_witness_replay:
         resolved_rows = _replay_historical_trace_filter_witnesses(
@@ -891,6 +940,17 @@ def _resolve_bounded_historical_span_ids(
             read_started=read_started,
             ui_filters=ui_filters,
             project_id=str(project_id),
+            max_query_count=(
+                _EVAL_TASK_WORKFLOW_MAX_QUERY_COUNT
+                + ceil(bounded_limit / _EVAL_TASK_TRACE_WITNESS_BATCH_SIZE)
+                if workflow_exact
+                else _EVAL_TASK_MAX_READ_ATTEMPTS
+            ),
+            total_deadline_seconds=(
+                _EVAL_TASK_WORKFLOW_TOTAL_SECONDS
+                if workflow_exact
+                else _EVAL_TASK_HISTORICAL_TRACE_READ_SECONDS
+            ),
         )
     if row_type == RowType.SPANS:
         identities_by_span_id: dict[str, set[tuple[str, Any]]] = {}
@@ -914,8 +974,7 @@ def _resolve_bounded_historical_span_ids(
                 if row.get(key_field) not in (None, "")
             )
         )
-        final_ids = sorted(resolved) if requires_population_proof else resolved
-        return resolved_result(final_ids, resolved_rows, ui_filters=ui_filters)
+        return resolved_result(resolved, resolved_rows, ui_filters=ui_filters)
     if row_type == RowType.VOICE_CALLS:
         resolved = list(
             dict.fromkeys(
@@ -924,15 +983,13 @@ def _resolve_bounded_historical_span_ids(
                 if row.get("root_span_id") not in (None, "")
             )
         )
-        final_ids = sorted(resolved) if requires_population_proof else resolved
-        return resolved_result(final_ids, resolved_rows, ui_filters=ui_filters)
+        return resolved_result(resolved, resolved_rows, ui_filters=ui_filters)
     resolved = [
         str(row[key_field])
         for row in resolved_rows
         if row.get(key_field) not in (None, "")
     ]
-    final_ids = sorted(resolved) if requires_population_proof else resolved
-    return resolved_result(final_ids, resolved_rows, ui_filters=ui_filters)
+    return resolved_result(resolved, resolved_rows, ui_filters=ui_filters)
 
 
 def _resolve_buffered_legacy_ids(

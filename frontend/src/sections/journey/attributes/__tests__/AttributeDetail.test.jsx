@@ -48,9 +48,7 @@ describe("AttributeDetail", () => {
       { wrapper: Wrapper },
     );
 
-    expect(
-      await screen.findByText("Loading attribute details…"),
-    ).toBeVisible();
+    expect(await screen.findByText("Loading attribute details…")).toBeVisible();
     expect(
       screen.queryByText(/incomplete|sample-limited/i),
     ).not.toBeInTheDocument();

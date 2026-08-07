@@ -10,7 +10,7 @@ Comprehensive tests covering:
 - Base query builder utilities
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from unittest import mock
 
 import pytest
@@ -634,9 +634,10 @@ class TestClickHouseFilterBuilder:
         )
 
         assert where.strip().startswith("tuple(trace_id, id) IN")
-        assert "SELECT DISTINCT tuple(toString(s.trace_id)" in where
-        assert "AND NOT isNull(s.trace_id)" in where
-        assert "s.trace_id != toUUID('00000000-0000-0000-0000-000000000000')" in where
+        assert "SELECT DISTINCT tuple(toString(if(" in where
+        assert "scored_sp.id = s.observation_span_id" in where
+        assert "scored_sp.trace_id" in where
+        assert "AND NOT isNull(s.trace_id)" not in where
         assert "s.annotator_id IN (toUUID(%(uid_1)s))" in where
         assert "FROM spans WHERE" in where
         assert params == {"uid_1": user_id}
@@ -1068,9 +1069,10 @@ class TestClickHouseFilterBuilder:
         )
 
         assert where.strip().startswith("tuple(trace_id, id) IN")
-        assert "SELECT DISTINCT tuple(toString(s.trace_id)" in where
-        assert "AND NOT isNull(s.trace_id)" in where
-        assert "s.trace_id != toUUID('00000000-0000-0000-0000-000000000000')" in where
+        assert "SELECT DISTINCT tuple(toString(if(" in where
+        assert "scored_sp.id = s.observation_span_id" in where
+        assert "scored_sp.trace_id" in where
+        assert "AND NOT isNull(s.trace_id)" not in where
         assert "s.annotator_id = toUUID(%(uid_1)s)" in where
         assert params == {"uid_1": user_id}
 
@@ -1939,9 +1941,10 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
 
         assert where.strip().startswith("tuple(trace_id, id) IN")
-        assert "SELECT DISTINCT tuple(toString(s.trace_id)" in where
-        assert "AND NOT isNull(s.trace_id)" in where
-        assert "s.trace_id != toUUID('00000000-0000-0000-0000-000000000000')" in where
+        assert "SELECT DISTINCT tuple(toString(if(" in where
+        assert "scored_sp.id = s.observation_span_id" in where
+        assert "scored_sp.trace_id" in where
+        assert "AND NOT isNull(s.trace_id)" not in where
         assert "model_hub_score AS s FINAL" in where
         assert "s.observation_span_id" in where
         assert "FROM spans WHERE" in where
@@ -1972,7 +1975,8 @@ class TestClickHouseFilterBuilder:
         )
 
         assert where.strip().startswith("tuple(trace_id, id) IN")
-        assert "SELECT DISTINCT tuple(toString(s.trace_id)" in where
+        assert "SELECT DISTINCT tuple(toString(if(" in where
+        assert "scored_sp.id = s.observation_span_id" in where
         assert "lower(JSONExtractString(s.value, 'text')) IN" in where
         assert params["ann_2"] == ("good", "bad")
 
@@ -2192,11 +2196,12 @@ class TestClickHouseFilterBuilder:
         where, params = builder.translate(filters)
 
         assert where.strip().startswith("tuple(trace_id, id) IN")
-        assert "SELECT tuple(toString(s.trace_id)" in where
-        assert "AND NOT isNull(s.trace_id)" in where
-        assert "s.trace_id != toUUID('00000000-0000-0000-0000-000000000000')" in where
+        assert "SELECT tuple(toString(if(" in where
+        assert "scored_sp.id = s.observation_span_id" in where
+        assert "scored_sp.trace_id" in where
+        assert "AND NOT isNull(s.trace_id)" not in where
         assert "GROUP BY entity_id" in where
-        assert "uniq(s.label_id) >= 2" in where
+        assert "uniqExact(s.label_id) >= 2" in where
         assert "parent_span_id" in where
         assert params["lbl_1"] == "00000000-0000-0000-0000-000000000011"
         assert params["lbl_2"] == "00000000-0000-0000-0000-000000000022"
@@ -3066,7 +3071,7 @@ class TestSessionListQueryBuilder:
         query, params = builder.build()
         assert "min(start_time)" in query.lower() or "MIN(start_time)" in query
         assert "max(end_time)" in query.lower() or "MAX(end_time)" in query
-        assert "uniq(trace_id)" in query
+        assert "uniqExact(trace_id)" in query
 
     def test_build_count_query_simple(self):
         """build_count_query() without HAVING filters uses count(DISTINCT ...)."""
@@ -3488,8 +3493,8 @@ class TestSessionListQueryBuilder:
         assert "session_attr_v2_time_exclusion_0_start" in params
         assert "session_attr_v2_time_exclusion_0_end" in params
 
-    def test_build_uses_uniq_not_uniqExact(self):
-        """build() should use approximate uniq() instead of expensive uniqExact()."""
+    def test_build_uses_uniqExact_for_deterministic_totals(self):
+        """Session trace counts are exact; approximation is not publishable."""
         from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
 
         builder = SessionListQueryBuilder(
@@ -3499,8 +3504,7 @@ class TestSessionListQueryBuilder:
             page_size=10,
         )
         query, params = builder.build()
-        assert "uniq(trace_id)" in query
-        assert "uniqExact" not in query
+        assert "uniqExact(trace_id)" in query
 
     def test_has_having_filters_false_for_no_aggregate_filters(self):
         """has_having_filters() returns False when no aggregate column filters."""
@@ -3710,8 +3714,8 @@ class TestUserListQueryBuilder:
         builder.build()
         query, _ = builder.build_eval_query(["00000000-0000-0000-0000-000000000003"])
 
-        assert "e.trace_id = toUUIDOrNull(ut.trace_id)" in query
-        assert "toString(e.trace_id)" not in query
+        assert "eval_scan.trace_id = toUUIDOrNull(ut.trace_id)" in query
+        assert "toString(eval_scan.trace_id)" not in query
 
     def test_build_excludes_eval_pass_rate_cte(self):
         from tracer.services.clickhouse.query_builders.user_list import (
@@ -5674,7 +5678,7 @@ class TestSpanListQueryBuilderComprehensive:
 
         assert "AND id IN" in query
         assert "GROUP BY entity_id" in query
-        assert "uniq(s.label_id) >= 2" in query
+        assert "uniqExact(s.label_id) >= 2" in query
         assert params["lbl_1"] == "00000000-0000-0000-0000-000000000011"
         assert params["lbl_2"] == "00000000-0000-0000-0000-000000000022"
 
@@ -8171,7 +8175,7 @@ class TestAnnotationGraphQueryBuilder:
     def test_fetch_annotation_graph_uses_score_backed_label_lookup(self):
         """Annotation graph labels should resolve through the project score union."""
         from model_hub.models.choices import AnnotationTypeChoices
-        from tracer.services.clickhouse import graph_dispatch
+        from tracer.services.clickhouse import exact_graph_reads
 
         class LabelQuery:
             def get(self, **kwargs):
@@ -8182,63 +8186,38 @@ class TestAnnotationGraphQueryBuilder:
                 label.type = AnnotationTypeChoices.NUMERIC.value
                 return label
 
-        class Result:
-            data = []
-            columns = []
-
-        class Analytics:
-            def execute_ch_query(self, query, params, *, timeout_ms, settings):
-                self.query = query
-                self.params = params
-                return Result()
-
         self_label_id = self.LABEL_ID
         project_id = "00000000-0000-4000-8000-000000000901"
         window_start = datetime(2026, 1, 1)
-        sample = graph_dispatch.GraphCandidateSample(
-            rows=(
-                {
-                    "id": "span-1",
-                    "trace_id": "trace-1",
-                    "start_time": window_start,
-                },
-            ),
-            query_complete=True,
-            query_status="complete",
-            query_error_code=None,
-            window_start=window_start,
-            window_end=window_start + timedelta(hours=1),
-            elapsed_ms=1,
-            query_count=2,
-            rows_returned=2,
-            result_payload_bytes=1,
-            total_rows_lower_bound=1,
-        )
-        analytics = Analytics()
         with (
             mock.patch.object(
-                graph_dispatch,
+                exact_graph_reads,
                 "get_annotation_labels_for_project",
                 return_value=LabelQuery(),
             ) as lookup,
-            mock.patch.object(
-                graph_dispatch,
-                "read_graph_candidates",
-                return_value=sample,
-            ),
         ):
-            result = graph_dispatch.fetch_annotation_graph_ch(
-                analytics=analytics,
+            result = exact_graph_reads.read_exact_annotation_graph(
+                analytics=mock.Mock(),
                 project_id=project_id,
-                filters=[],
+                filters=[
+                    {
+                        "column_id": "created_at",
+                        "filter_config": {
+                            "filter_type": "datetime",
+                            "filter_op": "between",
+                            "filter_value": [window_start, window_start],
+                        },
+                    }
+                ],
                 interval="month",
                 req_data_config={"id": self.LABEL_ID, "type": "ANNOTATION"},
                 observe_type="span",
             )
 
         lookup.assert_called_once_with(project_id)
-        assert analytics.params["graph_label_id"] == self.LABEL_ID
         assert result["name"] == "Score-backed label"
+        assert result["query_complete"] is True
+        assert result["query_sampled"] is False
 
     def test_build_bool_query(self):
         """Bool output type should produce CASE WHEN on JSON-extracted value."""
@@ -8628,6 +8607,11 @@ class TestMonitorMetricsQueryBuilder:
         """EVALUATION_METRICS with SCORE should use avg(output_float)."""
         from datetime import datetime
 
+        from tracer.services.clickhouse.eval_logger_table import (
+            eval_logger_source,
+            eval_logger_version_column,
+        )
+
         builder = self._make_builder(
             eval_config_id="eval-cfg-123",
             eval_output_type="SCORE",
@@ -8635,11 +8619,15 @@ class TestMonitorMetricsQueryBuilder:
         query, params = builder.build_metric_value_query(
             "evaluation_metrics", datetime(2024, 1, 1), datetime(2024, 1, 31)
         )
+        eval_table, live_predicate = eval_logger_source(
+            "latest_eval", include_cdc_tombstone_guard=True
+        )
+        version_column = eval_logger_version_column(eval_table)
         assert "avg(output_float)" in query
-        assert "tracer_eval_logger" in query
-        assert "ORDER BY eval_scan._peerdb_version DESC" in query
+        assert eval_table in query
+        assert f"ORDER BY eval_scan.{version_column} DESC" in query
         assert "LIMIT 1 BY eval_scan.id" in query
-        assert "latest_eval._peerdb_is_deleted = 0" in query
+        assert live_predicate in query
         assert "FINAL" not in query
         assert params["eval_config_id"] == "eval-cfg-123"
 

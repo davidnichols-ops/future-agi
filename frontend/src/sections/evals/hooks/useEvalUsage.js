@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { startOfDay, endOfDay, startOfMinute, subDays } from "date-fns";
 import axios, { endpoints } from "src/utils/axios";
 import {
@@ -206,7 +206,9 @@ export function useEvalUsageLogs(
     enabled:
       !!templateId &&
       !(dateOption === "Custom" && !(dateFilter?.[0] && dateFilter?.[1])),
-    keepPreviousData: true,
+    // TanStack Query v5 replaced the boolean v4 option with placeholderData.
+    // Keep the exact previous page visible while the next exact page loads.
+    placeholderData: keepPreviousData,
     staleTime: Infinity,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,

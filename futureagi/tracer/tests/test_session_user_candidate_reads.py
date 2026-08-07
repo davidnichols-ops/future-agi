@@ -8,6 +8,7 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 from django.test import override_settings
@@ -44,6 +45,17 @@ def _window(now: datetime) -> list[dict]:
 def _has_eval_filter(value: bool | str) -> dict:
     return {
         "column_id": "has_eval",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
+
+
+def _has_annotation_filter(value: bool | str) -> dict:
+    return {
+        "column_id": "has_annotation",
         "filter_config": {
             "filter_type": "boolean",
             "filter_op": "equals",
@@ -599,6 +611,298 @@ def test_session_has_eval_false_combines_before_exact_session_aggregation():
     assert "eval_scan._version" not in sql
     assert "latest_eval._peerdb_is_deleted = 0" in sql
     assert "rejected" in params.values()
+
+
+@pytest.mark.unit
+def test_session_has_annotation_uses_only_candidate_session_trace_ids():
+    now = datetime(2026, 7, 31, 12, 0)
+    candidate_session_id = str(uuid.uuid4())
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[*_window(now), _has_annotation_filter(False)],
+        bounded_internal_scan=True,
+    )
+
+    seed_sql, _ = builder.build_filter_seed_page(
+        slice_start=now - timedelta(days=1),
+        slice_end=now + timedelta(days=1),
+        limit=50,
+    )
+    sql, params = builder.build_filter_match_query([candidate_session_id])
+
+    assert builder.supports_bounded_filter_scan() is True
+    assert builder.bounded_filter_degraded_error_code() is None
+    assert "model_hub_score" not in seed_sql
+    assert "candidate_relational_trace_ids AS" in sql
+    assert "SELECT DISTINCT toString(trace_id) AS trace_id" in sql
+    assert "FROM model_hub_score AS s FINAL" in sql
+    assert "(SELECT trace_id FROM candidate_relational_trace_ids)" in sql
+    assert "%(session_relational_trace_ids)s" not in sql
+    sessions_cte = sql.split("sessions AS (", 1)[1]
+    assert "trace_id NOT IN" in sessions_cte
+    assert sessions_cte.index("trace_id NOT IN") < sessions_cte.index(
+        "GROUP BY session_id"
+    )
+    assert params["candidate_filter_session_ids"] == (candidate_session_id,)
+
+
+@pytest.mark.unit
+def test_session_annotation_leaves_combine_with_namespaced_params():
+    now = datetime(2026, 7, 31, 12, 0)
+    label_id = str(uuid.uuid4())
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            *_window(now),
+            _has_annotation_filter(True),
+            {
+                "column_id": label_id,
+                "filter_config": {
+                    "col_type": "ANNOTATION",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "helpful",
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+    )
+
+    sql, params = builder.build_filter_match_query([str(uuid.uuid4())])
+
+    assert sql.count("(SELECT trace_id FROM candidate_relational_trace_ids)") >= 2
+    assert sql.count("FROM model_hub_score AS s FINAL") >= 2
+    assert "%(session_relational_trace_ids)s" not in sql
+    assert label_id in params.values()
+    assert "helpful" in params.values()
+    assert any(key.startswith("session_relational_1_ann_label_") for key in params)
+    assert any(key.startswith("session_relational_1_ann_") for key in params)
+
+
+@pytest.mark.unit
+@override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
+def test_session_eval_value_filter_uses_candidate_trace_cte(monkeypatch):
+    from model_hub.models.evals_metric import EvalTemplate
+    from tracer.models.custom_eval_config import CustomEvalConfig
+
+    class _Values(list):
+        def first(self):
+            return self[0] if self else None
+
+    config_id = str(uuid.uuid4())
+    template_id = str(uuid.uuid4())
+    config_query = mock.Mock()
+    config_query.exists.return_value = True
+    config_query.filter.return_value = config_query
+    config_query.values_list.side_effect = lambda field, **_kwargs: _Values(
+        [template_id] if field == "eval_template_id" else [config_id]
+    )
+    config_manager = mock.Mock()
+    config_manager.filter.return_value = config_query
+
+    template_values = mock.Mock()
+    template_values.first.return_value = {"config": {"output": "SCORE"}}
+    template_query = mock.Mock()
+    template_query.values.return_value = template_values
+    template_manager = mock.Mock()
+    template_manager.filter.return_value = template_query
+    monkeypatch.setattr(CustomEvalConfig, "objects", config_manager)
+    monkeypatch.setattr(EvalTemplate, "no_workspace_objects", template_manager)
+
+    now = datetime(2026, 7, 31, 12, 0)
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            *_window(now),
+            {
+                "column_id": config_id,
+                "filter_config": {
+                    "col_type": "EVAL_METRIC",
+                    "filter_type": "number",
+                    "filter_op": "greater_than",
+                    "filter_value": 50,
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+    )
+
+    sql, params = builder.build_filter_match_query([str(uuid.uuid4())])
+
+    assert "candidate_relational_trace_ids AS" in sql
+    assert "FROM tracer_eval_logger_v2 AS eval_scan" in sql
+    assert "toString(eval_scan.trace_id) IN (" in sql
+    assert "SELECT trace_id FROM candidate_relational_trace_ids" in sql
+    assert "%(session_relational_trace_ids)s" not in sql
+    assert params["session_relational_0_eval_cfg_1"] == (config_id,)
+    assert params["session_relational_0_eval_2"] == 0.5
+
+
+@pytest.mark.unit
+def test_org_session_has_annotation_branches_by_project_and_disjoint_labels():
+    now = datetime(2026, 7, 31, 12, 0)
+    project_a = str(uuid.uuid4())
+    project_b = str(uuid.uuid4())
+    label_a = str(uuid.uuid4())
+    label_b = str(uuid.uuid4())
+    builder = SessionListQueryBuilderV2(
+        project_ids=[project_a, project_b],
+        annotation_label_ids_by_project={
+            project_a: [label_a],
+            project_b: [label_b],
+        },
+        filters=[*_window(now), _has_annotation_filter(True)],
+        bounded_internal_scan=True,
+    )
+
+    sql, params = builder.build_filter_match_query([str(uuid.uuid4())])
+
+    assert builder.supports_bounded_filter_scan() is True
+    assert builder.bounded_filter_degraded_error_code() is None
+    assert "SELECT DISTINCT project_id, toString(trace_id) AS trace_id" in sql
+    assert sql.count("FROM model_hub_score AS s FINAL") >= 2
+    assert sql.count("outer_project_id)s) AND") == 2
+    assert (
+        sql.count(
+            "SELECT trace_id FROM candidate_relational_trace_ids WHERE project_id ="
+        )
+        >= 2
+    )
+    assert params["session_relational_0_0_lbl_1"] == label_a
+    assert params["session_relational_1_0_lbl_1"] == label_b
+    assert "session_relational_0_0_lbl_2" not in params
+    assert "session_relational_1_0_lbl_2" not in params
+    assert params["session_relational_0_0_project_id"] == project_a
+    assert params["session_relational_1_0_project_id"] == project_b
+    assert params["session_relational_0_outer_project_id"] == project_a
+    assert params["session_relational_1_outer_project_id"] == project_b
+    assert "candidate_session_project_counts AS" in sql
+    assert "uniqExact(project_id) AS project_count" in sql
+    assert "max(project_count) AS project_count" in sql
+    assert "SELECT session_id, session_start AS start_time" in sql
+    assert ", project_count" in sql
+    # The OR-ed project branches are one membership unit and cannot bypass
+    # session/user predicates through SQL AND/OR precedence.
+    assert "AND ((project_id =" in sql
+
+
+@pytest.mark.unit
+def test_default_org_session_page_exposes_global_collision_guard():
+    now = datetime(2026, 7, 31, 12, 0)
+    builder = SessionListQueryBuilderV2(
+        project_ids=[str(uuid.uuid4()), str(uuid.uuid4())],
+        filters=_window(now),
+    )
+
+    page_sql, _ = builder.build_candidate_page_query()
+    count_sql, _ = builder.build_candidate_count_query()
+
+    assert "candidate_session_project_counts AS" in page_sql
+    assert "uniqExact(project_id) AS project_count" in page_sql
+    assert "max(project_count) OVER() AS max_project_count" in page_sql
+    assert "max(project_count) AS max_project_count" in count_sql
+
+
+@pytest.mark.unit
+def test_org_session_has_annotation_without_project_label_map_fails_closed():
+    now = datetime(2026, 7, 31, 12, 0)
+    builder = SessionListQueryBuilderV2(
+        project_ids=[str(uuid.uuid4()), str(uuid.uuid4())],
+        filters=[*_window(now), _has_annotation_filter(True)],
+        bounded_internal_scan=True,
+    )
+
+    assert builder.supports_bounded_filter_scan() is False
+    assert (
+        builder.bounded_filter_degraded_error_code()
+        == "unsupported_relational_session_filter"
+    )
+    with pytest.raises(ValueError, match="unsupported bounded session filter scan"):
+        builder.build_filter_match_query([str(uuid.uuid4())])
+
+
+@pytest.mark.unit
+def test_org_session_has_eval_branches_colliding_trace_ids_by_project(monkeypatch):
+    from tracer.models.custom_eval_config import CustomEvalConfig
+
+    now = datetime(2026, 7, 31, 12, 0)
+    project_a = str(uuid.uuid4())
+    project_b = str(uuid.uuid4())
+    config_by_project = {
+        project_a: str(uuid.uuid4()),
+        project_b: str(uuid.uuid4()),
+    }
+
+    class _ConfigQuery:
+        def __init__(self, config_ids):
+            self.config_ids = config_ids
+
+        def values_list(self, *_args, **_kwargs):
+            return list(self.config_ids)
+
+    def _filter_configs(**kwargs):
+        project_ids = tuple(str(value) for value in kwargs["project_id__in"])
+        return _ConfigQuery([config_by_project[value] for value in project_ids])
+
+    monkeypatch.setattr(CustomEvalConfig.objects, "filter", _filter_configs)
+    builder = SessionListQueryBuilderV2(
+        project_ids=[project_a, project_b],
+        filters=[*_window(now), _has_eval_filter(True)],
+        bounded_internal_scan=True,
+    )
+
+    sql, params = builder.build_filter_match_query([str(uuid.uuid4())])
+
+    assert "candidate_eval_trace_ids AS" not in sql
+    assert sql.count("INNER JOIN spans AS sp") == 2
+    assert sql.count("outer_project_id)s) AND") == 2
+    assert params["session_relational_0_0_project_eval_cfg_1"] == (
+        config_by_project[project_a],
+    )
+    assert params["session_relational_1_0_project_eval_cfg_1"] == (
+        config_by_project[project_b],
+    )
+    assert params["session_relational_0_0_project_id"] == project_a
+    assert params["session_relational_1_0_project_id"] == project_b
+
+
+@pytest.mark.unit
+def test_session_relational_source_without_candidate_guard_is_rejected():
+    class _UnsafeRelationalCompiler:
+        QUERY_MODE_TRACE = "trace"
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def translate(self, _filters):
+            return (
+                "trace_id IN (SELECT trace_id FROM model_hub_score)",
+                {},
+            )
+
+    class _UnsafeSessionBuilder(SessionListQueryBuilderV2):
+        _FILTER_BUILDER_CLS = _UnsafeRelationalCompiler
+
+    now = datetime(2026, 7, 31, 12, 0)
+    builder = _UnsafeSessionBuilder(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            *_window(now),
+            {
+                "column_id": str(uuid.uuid4()),
+                "filter_config": {
+                    "col_type": "ANNOTATION",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "helpful",
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+    )
+
+    with pytest.raises(ValueError, match="missing finite candidate scope"):
+        builder.build_filter_match_query([str(uuid.uuid4())])
 
 
 @pytest.mark.unit

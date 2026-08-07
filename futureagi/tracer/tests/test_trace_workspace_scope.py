@@ -225,11 +225,14 @@ class TestTraceWorkspaceScopeAPI:
         # The legacy "CH fails → silently rebuild graph from PG" path was
         # removed because PG is no longer the source of truth — falling back
         # would return a partial graph that operators wrongly trust. Programming
-        # failures now preserve the sanitized 400 boundary instead of silently
+        # failures now preserve the sanitized 500 boundary instead of silently
         # degrading or exposing private query details.
+        # The public endpoint now schedules exact CH aggregation out of band.
+        # Patch the view's CH service boundary so this remains an HTTP error
+        # classification test rather than accidentally exercising eager-task
+        # wrappers used only by the Django test settings.
         monkeypatch.setattr(
-            "tracer.services.clickhouse.v2.query_service."
-            "V2AnalyticsQueryService.execute_ch_query",
+            "tracer.views.trace.fetch_agent_graph_ch",
             lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ch down")),
         )
 
@@ -316,8 +319,7 @@ class TestTraceWorkspaceScopeAPI:
         expected_status,
     ):
         monkeypatch.setattr(
-            "tracer.services.clickhouse.v2.query_service."
-            "V2AnalyticsQueryService.execute_ch_query",
+            "tracer.views.trace.fetch_agent_graph_ch",
             lambda *args, **kwargs: (_ for _ in ()).throw(failure),
         )
 

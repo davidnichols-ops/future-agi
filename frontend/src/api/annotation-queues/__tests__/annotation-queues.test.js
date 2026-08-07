@@ -19,6 +19,8 @@ import {
   useCreateDiscussionComment,
   useDeleteDiscussionComment,
   useGetOrCreateDefaultQueue,
+  useAddLabelToQueue,
+  useRemoveLabelFromQueue,
   useAnnotateDetail,
   useAssignQueueItems,
   useCompleteItem,
@@ -246,6 +248,58 @@ describe("Annotation Queues API", () => {
       expect(enqueueSnackbar).not.toHaveBeenCalled();
       const mutation = queryClient.getMutationCache().getAll().at(-1);
       expect(mutation?.options.meta).toEqual({ errorHandled: true });
+    });
+  });
+
+  describe("default queue label mutations", () => {
+    const infrastructureError = {
+      response: {
+        status: 503,
+        data: {
+          detail:
+            "Code: 159. DB::Exception: Timeout exceeded\nStack trace: SELECT secret FROM spans",
+        },
+      },
+    };
+
+    it("sanitizes add-label failures and owns the global error policy", async () => {
+      axios.post.mockRejectedValueOnce(infrastructureError);
+      const queryClient = createTestQueryClient();
+      const { result } = renderHook(() => useAddLabelToQueue(), {
+        wrapper: createQueryWrapper(queryClient),
+      });
+
+      result.current.mutate({ queueId: "queue-1", labelId: "label-1" });
+
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(enqueueSnackbar).toHaveBeenCalledWith(
+        "Failed to add label to queue",
+        { variant: "error" },
+      );
+      expect(enqueueSnackbar).toHaveBeenCalledTimes(1);
+      expect(
+        queryClient.getMutationCache().getAll().at(-1)?.options.meta,
+      ).toEqual({ errorHandled: true });
+    });
+
+    it("sanitizes remove-label failures and owns the global error policy", async () => {
+      axios.post.mockRejectedValueOnce(infrastructureError);
+      const queryClient = createTestQueryClient();
+      const { result } = renderHook(() => useRemoveLabelFromQueue(), {
+        wrapper: createQueryWrapper(queryClient),
+      });
+
+      result.current.mutate({ queueId: "queue-1", labelId: "label-1" });
+
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(enqueueSnackbar).toHaveBeenCalledWith(
+        "Failed to remove label from queue",
+        { variant: "error" },
+      );
+      expect(enqueueSnackbar).toHaveBeenCalledTimes(1);
+      expect(
+        queryClient.getMutationCache().getAll().at(-1)?.options.meta,
+      ).toEqual({ errorHandled: true });
     });
   });
 

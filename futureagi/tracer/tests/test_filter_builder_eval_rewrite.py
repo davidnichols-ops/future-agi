@@ -29,6 +29,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from django.db import DatabaseError
 
 from tracer.services.clickhouse.eval_logger_table import (
     eval_logger_live_state_columns,
@@ -555,6 +556,28 @@ class TestEvalModeAndConfig:
         assert where == (
             "trace_id IN (SELECT toUUID('00000000-0000-0000-0000-000000000000'))"
         )
+
+    def test_metadata_database_failure_propagates_instead_of_false_empty(
+        self,
+        monkeypatch,
+    ):
+        from tracer.models.custom_eval_config import CustomEvalConfig
+
+        class _UnavailableConfigManager:
+            @staticmethod
+            def filter(**_kwargs):
+                raise DatabaseError("metadata backend unavailable")
+
+        monkeypatch.setattr(
+            CustomEvalConfig,
+            "objects",
+            _UnavailableConfigManager(),
+        )
+        with pytest.raises(DatabaseError, match="metadata backend unavailable"):
+            _translate(
+                ClickHouseFilterBuilder,
+                _eval_filter(str(uuid.uuid4()), "greater_than", 50),
+            )
 
 
 # ===========================================================================

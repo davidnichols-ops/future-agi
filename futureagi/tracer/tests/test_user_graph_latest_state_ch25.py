@@ -334,12 +334,14 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
             [
                 row("root", "", "agent", 100, 0, 1, 0),
                 row("root", "", "agent", 10, 0, 2, 0),
-                # Two overlapping direct siblings are both recorded children
-                # of root. Timestamps alone must not invent sibling causality.
+                # Two overlapping direct siblings start at the same instant
+                # and are both recorded children of root. Agent Path uses span
+                # id as its deterministic tie-break, not as a claim that lookup
+                # caused search.
                 row("lookup", "root", "lookup", 20, 0, 1, 1, 4, "tool"),
-                row("search", "root", "search", 25, 0, 1, 2, 2, "retriever"),
-                # A later sibling is still a direct child of root; its start
-                # time does not prove lookup/search -> answer transitions.
+                row("search", "root", "search", 25, 0, 1, 1, 2, "retriever"),
+                # A later sibling remains a direct child in Agent Graph and is
+                # the next chronological event in Agent Path.
                 row("answer", "root", "answer", 30, 0, 1, 6, 1, "llm"),
                 # The newest physical version is a tombstone and contributes
                 # neither a node nor a transition.
@@ -384,10 +386,10 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
         }
         assert {(edge["source"], edge["target"]) for edge in payload["path_edges"]} == {
             ("agent:agent", "tool:lookup"),
-            ("agent:agent", "retriever:search"),
-            ("agent:agent", "llm:answer"),
+            ("tool:lookup", "retriever:search"),
+            ("retriever:search", "llm:answer"),
         }
-        assert payload["path_edges"] == payload["edges"]
+        assert payload["path_edges"] != payload["edges"]
     finally:
         ch_client.execute(f"DROP TABLE {table}")
 

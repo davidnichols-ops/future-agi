@@ -2561,6 +2561,94 @@ def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation()
     )
 
 
+def test_filter_value_cursor_resumed_low_diversity_page_respects_query_ceiling():
+    """A resume replay must leave room for candidate/latest-state pairs.
+
+    Fifteen candidate pages normally consume the selector's full 30-query
+    allowance. A resumed row adds one verification first, so the last pair
+    must be deferred to the next continuation instead of attempting query 31.
+    Dense status-like data reproduces the production shape: every replayed row
+    has a value the cursor has already emitted.
+    """
+
+    resume_time = NOW - timedelta(seconds=1)
+    resume_identity = (
+        PROJECT_A,
+        "trace-resume",
+        "resume",
+        resume_time,
+    )
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"span-{index:04d}",
+            start_time=NOW - timedelta(seconds=index + 2),
+        )
+        for index in range(
+            ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+            * (ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES - 1)
+            + 1
+        )
+    ]
+    by_id = {str(row["id"]): row for row in candidates}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            in_segment = [
+                row
+                for row in candidates
+                if call.params["segment_start"]
+                <= row["start_time"]
+                < call.params["segment_end"]
+            ]
+            return _keyset_candidate_page(in_segment, call)
+        rows = []
+        for span_id in call.params["candidate_ids_0"]:
+            if span_id == "resume":
+                rows.append(
+                    _target_row(
+                        PROJECT_A,
+                        "resume",
+                        trace_id="trace-resume",
+                        start_time=resume_time,
+                        string="completed",
+                    )
+                )
+                continue
+            candidate = by_id[span_id]
+            rows.append(
+                _target_row(
+                    PROJECT_A,
+                    span_id,
+                    trace_id=candidate["trace_id"],
+                    start_time=candidate["start_time"],
+                    string="completed",
+                )
+            )
+        return rows
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        json_attribute_mode="arrays",
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=10,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        resume_identity=resume_identity,
+        seen_value_digests=(attribute_value_cursor_digest("string", "completed"),),
+    )
+
+    assert read.rows == ()
+    assert read.has_more is True
+    assert read.browse_status == "continuation"
+    assert read.metadata.query_count == ATTRIBUTE_READ_MAX_QUERY_COUNT - 1
+    assert len(executor.calls) == ATTRIBUTE_READ_MAX_QUERY_COUNT - 1
+
+
 def test_filter_value_cursor_reports_truthful_server_state_limit():
     seen = tuple(
         attribute_value_cursor_digest("string", f"prior-{index}")

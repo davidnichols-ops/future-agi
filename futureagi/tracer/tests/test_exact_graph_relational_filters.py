@@ -11,6 +11,7 @@ from unittest import mock
 
 import pytest
 
+from tracer.services.clickhouse.query_builders.agent_graph import AgentGraphQueryBuilder
 from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
     compile_exact_graph_row_predicates,
 )
@@ -21,6 +22,7 @@ from tracer.services.clickhouse.query_builders.time_series import (
 PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 EVAL_CONFIG_ID = "22222222-2222-4222-8222-222222222222"
 ANNOTATION_LABEL_ID = "33333333-3333-4333-8333-333333333333"
+SECOND_ANNOTATION_LABEL_ID = "55555555-5555-4555-8555-555555555555"
 ANNOTATOR_ID = "44444444-4444-4444-8444-444444444444"
 START = datetime(2026, 1, 1)
 END = datetime(2026, 2, 1)
@@ -139,10 +141,150 @@ def test_annotation_filter_uses_one_strictly_project_scoped_score_read(observe_t
     predicate = plan.predicates[0]
     assert predicate.count("FROM model_hub_score AS s FINAL") == 1
     assert "s.tracer_project_id = toUUID(" in predicate
+    assert "s._peerdb_is_deleted = 0" in predicate
     assert "graph_relation_entity_key" in predicate
     assert "FROM spans" not in predicate
     assert plan.params["graph_filter_1_relation_project_id"] == PROJECT_ID
     assert plan.params["graph_filter_1_annotation_text_1"] == "approved"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("observe_type", ["trace", "span"])
+@pytest.mark.parametrize("wants_complete", [True, False])
+def test_has_annotation_uses_all_configured_labels_with_correct_boolean_algebra(
+    observe_type,
+    wants_complete,
+):
+    has_annotation = {
+        "column_id": "has_annotation",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": wants_complete,
+        },
+    }
+    plan = compile_exact_graph_row_predicates(
+        [_time_filter(), has_annotation],
+        project_id=PROJECT_ID,
+        observe_type=observe_type,
+        annotation_label_ids=[ANNOTATION_LABEL_ID, SECOND_ANNOTATION_LABEL_ID],
+    )
+
+    assert len(plan.predicates) == 2
+    assert all("s.label_id = toUUID(" in predicate for predicate in plan.predicates)
+    assert all("s._peerdb_is_deleted = 0" in predicate for predicate in plan.predicates)
+    assert plan.required_matches == (wants_complete, wants_complete)
+    if wants_complete:
+        assert plan.match_condition_groups == (((0, True),), ((1, True),))
+    else:
+        # Incomplete means at least one configured label is missing, not that
+        # every label must be missing.
+        assert plan.match_condition_groups == (((0, False), (1, False)),)
+    assert plan.params["graph_filter_1_annotation_label_1"] == ANNOTATION_LABEL_ID
+    assert (
+        plan.params["graph_filter_1_requirement_1_annotation_label_1"]
+        == SECOND_ANNOTATION_LABEL_ID
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("observe_type", ["trace", "span"])
+@pytest.mark.parametrize("wants_complete", [True, False])
+def test_has_annotation_with_no_configured_labels_is_exact(
+    observe_type,
+    wants_complete,
+):
+    has_annotation = {
+        "column_id": "has_annotation",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": wants_complete,
+        },
+    }
+    plan = compile_exact_graph_row_predicates(
+        [_time_filter(), has_annotation],
+        project_id=PROJECT_ID,
+        observe_type=observe_type,
+        annotation_label_ids=[],
+    )
+
+    assert plan.predicates == ("1 = 1",)
+    assert plan.required_matches == (wants_complete,)
+    assert plan.match_condition_groups == (((0, wants_complete),),)
+    assert plan.params == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("observe_type", ["trace", "span"])
+def test_has_annotation_incomplete_renders_or_of_missing_labels(observe_type):
+    has_annotation = {
+        "column_id": "has_annotation",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": False,
+        },
+    }
+    query, _params = TimeSeriesQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), has_annotation],
+        interval="day",
+        exact_snapshot=True,
+        observe_type=observe_type,
+        start_date=START,
+        end_date=END,
+        annotation_label_ids=[ANNOTATION_LABEL_ID, SECOND_ANNOTATION_LABEL_ID],
+    ).build()
+
+    if observe_type == "trace":
+        assert "(graph_match_0 = 0 OR graph_match_1 = 0)" in query
+    else:
+        assert "(graph_row_match_0 = 0 OR graph_row_match_1 = 0)" in query
+
+
+@pytest.mark.unit
+def test_agent_graph_uses_the_same_missing_label_or_contract():
+    has_annotation = {
+        "column_id": "has_annotation",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": False,
+        },
+    }
+    query, _params = AgentGraphQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), has_annotation],
+        annotation_label_ids=[ANNOTATION_LABEL_ID, SECOND_ANNOTATION_LABEL_ID],
+    ).build()
+
+    assert "(graph_match_0 = 0 OR graph_match_1 = 0)" in query
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("observe_type", ["trace", "span"])
+def test_score_identity_prefers_the_view_authoritative_key(observe_type):
+    plan = compile_exact_graph_row_predicates(
+        [_time_filter(), _annotation_filter()],
+        project_id=PROJECT_ID,
+        observe_type=observe_type,
+    )
+
+    predicate = plan.predicates[0]
+    has_span = "notEmpty(ifNull(s.observation_span_id, ''))"
+    valid_trace = "NOT isNull(s.trace_id)"
+    if observe_type == "span":
+        assert f"if({has_span}, concat('span:'" in predicate
+        assert f"if(NOT ({has_span}) AND ({valid_trace}" in predicate
+    else:
+        assert f"if({valid_trace}" in predicate
+        assert "if(NOT (NOT isNull(s.trace_id)" in predicate
+        assert f"AND ({has_span}), concat('span:'" in predicate
 
 
 @pytest.mark.unit

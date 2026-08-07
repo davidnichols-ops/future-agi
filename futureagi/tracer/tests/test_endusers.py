@@ -346,7 +346,9 @@ class TestUsersViewAPI(APITestCase):
 
         response = self.client.get(self.url, data)
 
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        # An arbitrary executor defect is a sanitized server failure, not a
+        # client validation error. The response must still hide CH internals.
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
         self.assertEqual(
             response.data["result"],
             "User data could not be loaded",

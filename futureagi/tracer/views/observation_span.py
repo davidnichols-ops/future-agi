@@ -151,6 +151,7 @@ from tracer.utils.eval import (
 from tracer.utils.filters import FilterEngine
 from tracer.utils.helper import (
     FieldConfig,
+    get_annotation_labels_by_project,
     get_annotation_labels_for_project,
     get_default_span_config,
     update_column_config_based_on_eval_config,
@@ -1811,12 +1812,28 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
             eval_config_ids = [str(c.id) for c in eval_configs]
 
-        # Labels can be project-local or org/shared labels that are referenced
-        # by span scores. Use the score-backed helper so span columns and
-        # annotation filters match the actual data returned from ClickHouse.
-        annotation_labels = get_annotation_labels_for_project(
-            project_id, project_ids=org_project_ids if org_scope else None
-        )
+        # Labels can be project-local or org/shared labels referenced by span
+        # scores. Completeness is project-local, so retain that mapping for the
+        # residual classifier instead of feeding it an org-wide union.
+        annotation_label_ids_by_project = None
+        if org_scope:
+            labels_by_project = get_annotation_labels_by_project(
+                [str(project_id) for project_id in org_project_ids],
+                organization=org,
+            )
+            annotation_label_ids_by_project = {
+                project_key: [str(label.id) for label in labels]
+                for project_key, labels in labels_by_project.items()
+            }
+            annotation_labels = list(
+                {
+                    str(label.id): label
+                    for labels in labels_by_project.values()
+                    for label in labels
+                }.values()
+            )
+        else:
+            annotation_labels = list(get_annotation_labels_for_project(project_id))
         annotation_label_ids = [str(lbl.id) for lbl in annotation_labels]
         label_types = {str(lbl.id): lbl.type for lbl in annotation_labels}
 
@@ -1838,6 +1855,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             page_size=page_size,
             eval_config_ids=eval_config_ids,
             annotation_label_ids=annotation_label_ids,
+            annotation_label_ids_by_project=annotation_label_ids_by_project,
             bounded_internal_scan=cursor_enabled,
         )
         # Custom-sort/time-only legacy reads do not apply the bounded

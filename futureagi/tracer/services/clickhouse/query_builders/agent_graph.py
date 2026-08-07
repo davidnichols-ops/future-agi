@@ -3,8 +3,8 @@
 The graph and path are two views of the same current span set:
 
 * ``edges`` are exact parent -> child topology transitions;
-* ``path_edges`` are the same exact recorded parent -> child relationships,
-  projected separately for the Agent Path renderer.
+* ``path_edges`` are exact adjacent chronological start-event transitions
+  inside each trace.
 
 Both, together with node metrics, are produced by one ClickHouse statement and
 one physical ``spans`` reference.  This matters on ClickHouse 25.3: named CTEs
@@ -52,10 +52,14 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         self,
         project_id: str,
         filters: list[dict] | None = None,
+        annotation_label_ids: list[str] | tuple[str, ...] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id, **kwargs)
         self.filters = list(filters or [])
+        self.annotation_label_ids = (
+            None if annotation_label_ids is None else tuple(annotation_label_ids)
+        )
         analyzed = self.analyze_bounded_datetime_filters(self.filters, strict=True)
         self.start_date = analyzed.start
         self.end_date = analyzed.end
@@ -151,6 +155,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
             # The historical Agent Graph endpoint filters traces, then graphs
             # every contributing child of each matched trace.
             observe_type="trace",
+            annotation_label_ids=self.annotation_label_ids,
         )
         self.params.update(plan.params)
 
@@ -171,7 +176,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         )
         match_columns = []
         match_having = []
-        for index, required in enumerate(plan.required_matches):
+        for index in range(len(plan.predicates)):
             match_condition = f"graph_row_match_{index} = 1"
             if plan.output_window_only[index]:
                 match_condition = f"({match_condition}) AND ({output_window})"
@@ -179,7 +184,17 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                 "            max(toUInt8(ifNull(("
                 f"{match_condition}), 0))) AS graph_match_{index}"
             )
-            match_having.append(f"graph_match_{index} = {1 if required else 0}")
+        for group in plan.match_condition_groups:
+            match_having.append(
+                f"graph_match_{group[0][0]} = {1 if group[0][1] else 0}"
+                if len(group) == 1
+                else "("
+                + " OR ".join(
+                    f"graph_match_{index} = {1 if required else 0}"
+                    for index, required in group
+                )
+                + ")"
+            )
 
         trace_projection = ""
         if match_columns:
@@ -209,22 +224,20 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                     graph_spans
                 )"""
 
-        def direct_edge_events(kind: str) -> str:
-            """Return exact recorded parent -> child events for one wire view.
+        def hierarchy_edge_events() -> str:
+            """Return exact recorded parent -> child hierarchy events.
 
             A span's timestamps do not prove causality between siblings.  In
-            particular, connecting every member of adjacent concurrent groups
-            creates an unbounded F x G Cartesian product and invents edges that
-            were never recorded.  Both graph views therefore use only the
-            explicit ``parent_span_id`` topology.
+            particular, hierarchy must use only the explicit
+            ``parent_span_id`` topology.
             """
 
-            return f"""arrayFlatten(arrayMap(
+            return """arrayFlatten(arrayMap(
                     graph_sibling_set -> if(
                         tupleElement(graph_sibling_set, 2) > 0,
                         arrayMap(
                             graph_child -> tuple(
-                                '{kind}',
+                                'hierarchy',
                                 tupleElement(graph_id_sorted_spans[
                                     tupleElement(graph_sibling_set, 2)
                                 ], 3),
@@ -246,8 +259,43 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                     graph_sibling_sets
                 ))"""
 
-        hierarchy_events = direct_edge_events("hierarchy")
-        path_events = direct_edge_events("path")
+        hierarchy_events = hierarchy_edge_events()
+        # Agent Path is a temporal projection rather than another hierarchy
+        # rendering. It records adjacent observed span-start events in each
+        # trace. Overlapping spans are not labelled causal: their start events
+        # still have a deterministic order, with span id breaking exact
+        # timestamp ties. Metrics belong to the destination event, matching
+        # the established path wire contract.
+        path_events = """arrayMap(
+                    graph_index -> tuple(
+                        'path',
+                        tupleElement(
+                            graph_chronological_spans[graph_index], 3
+                        ),
+                        tupleElement(
+                            graph_chronological_spans[graph_index], 4
+                        ),
+                        tupleElement(
+                            graph_chronological_spans[graph_index + 1], 3
+                        ),
+                        tupleElement(
+                            graph_chronological_spans[graph_index + 1], 4
+                        ),
+                        tupleElement(
+                            graph_chronological_spans[graph_index + 1], 7
+                        ),
+                        tupleElement(
+                            graph_chronological_spans[graph_index + 1], 8
+                        ),
+                        tupleElement(
+                            graph_chronological_spans[graph_index + 1], 9
+                        ),
+                        toUInt8(upper(tupleElement(
+                            graph_chronological_spans[graph_index + 1], 10
+                        )) IN ('ERROR', 'ERRORED', 'FAILED'))
+                    ),
+                    range(1, length(graph_chronological_spans))
+                )"""
 
         query = f"""
         WITH graph_latest_spans AS (
@@ -307,7 +355,14 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                         tupleElement(graph_span, 1)
                     ),
                     graph_spans
-                ) AS graph_sibling_sorted_spans
+                ) AS graph_sibling_sorted_spans,
+                arraySort(
+                    graph_span -> tuple(
+                        tupleElement(graph_span, 5),
+                        tupleElement(graph_span, 1)
+                    ),
+                    graph_spans
+                ) AS graph_chronological_spans
             FROM graph_traces
         ),
         graph_indexed_traces AS (
@@ -315,6 +370,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                 trace_id,
                 graph_spans,
                 graph_id_sorted_spans,
+                graph_chronological_spans,
                 arrayMap(
                     graph_span -> tupleElement(graph_span, 1),
                     graph_id_sorted_spans
@@ -334,6 +390,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                 trace_id,
                 graph_spans,
                 graph_id_sorted_spans,
+                graph_chronological_spans,
                 arrayMap(
                     graph_siblings -> tuple(
                         graph_siblings,

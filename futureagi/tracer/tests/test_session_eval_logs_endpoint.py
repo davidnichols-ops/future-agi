@@ -47,7 +47,7 @@ AUTH_REQUIRED_STATUS_CODES = (
 @pytest.fixture(autouse=True)
 def _ch_eval_logger(settings):
     """Seed only the direct-write table read by the production endpoint."""
-    settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
+    settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger_v2"
     truncate_ch_eval_logger_v2()
     yield
     truncate_ch_eval_logger_v2()

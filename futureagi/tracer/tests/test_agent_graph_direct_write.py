@@ -65,7 +65,7 @@ def _call_agent_graph(monkeypatch, *, side_effect=None, refresh=False):
     monkeypatch.setattr(
         trace_view,
         "bind_request_my_annotations_principal",
-        lambda filters, *, request: filters,
+        lambda _request, filters: filters,
     )
 
     request = SimpleNamespace(
@@ -111,7 +111,7 @@ def test_agent_graph_cache_identity_invalidates_retired_path_payloads(monkeypatc
     assert identity == {
         "project_id": PROJECT_ID,
         "filters": [FINAL_STATUS_FILTER],
-        "payload_version": 2,
+        "payload_version": 3,
     }
 
 
@@ -142,6 +142,8 @@ def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
     assert "indexOfAssumeSorted(" in query
     assert "arrayFold(" not in query
     assert "graph_execution_groups" not in query
+    assert "graph_chronological_spans" in query
+    assert "range(1, length(graph_chronological_spans))" in query
     assert "uniqExact(trace_id)" not in query
     assert "graph_trace_events AS" in query
     assert "graph_ranked_events AS" in query
@@ -167,7 +169,7 @@ def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
 
 
 @pytest.mark.unit
-def test_agent_graph_formatter_separates_two_exact_topology_projections():
+def test_agent_graph_formatter_separates_hierarchy_and_chronological_path():
     builder = AgentGraphQueryBuilderV2(project_id=PROJECT_ID, filters=[])
     payload = builder.format_result(
         [
@@ -199,10 +201,10 @@ def test_agent_graph_formatter_separates_two_exact_topology_projections():
             },
             {
                 "row_kind": "path",
-                "source_node": "agent",
-                "source_type": "agent",
-                "target_node": "lookup",
-                "target_type": "tool",
+                "source_node": "lookup",
+                "source_type": "tool",
+                "target_node": "answer",
+                "target_type": "llm",
                 "item_count": 2,
                 "avg_latency_ms": 10,
                 "total_tokens": 8,
@@ -229,8 +231,8 @@ def test_agent_graph_formatter_separates_two_exact_topology_projections():
     ]
     assert payload["edges"][0]["source"] == "agent:agent"
     assert payload["edges"][0]["target"] == "tool:lookup"
-    assert payload["path_edges"][0]["source"] == "agent:agent"
-    assert payload["path_edges"][0]["target"] == "tool:lookup"
+    assert payload["path_edges"][0]["source"] == "tool:lookup"
+    assert payload["path_edges"][0]["target"] == "llm:answer"
     assert payload["graph_collapsed"] is False
 
 

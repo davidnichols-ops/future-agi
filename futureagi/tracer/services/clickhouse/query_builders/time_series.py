@@ -68,6 +68,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         observe_type: str = "span",
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        annotation_label_ids: list[str] | tuple[str, ...] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project_id, **kwargs)
@@ -80,6 +81,9 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             raise ValueError("observe_type must be trace or span")
         self.start_date = start_date
         self.end_date = end_date
+        self.annotation_label_ids = (
+            None if annotation_label_ids is None else tuple(annotation_label_ids)
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -115,6 +119,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
                 self.filters,
                 project_id=str(self.project_id),
                 observe_type=self.observe_type,
+                annotation_label_ids=self.annotation_label_ids,
             )
             extra_params = exact_filter_plan.params
         else:
@@ -133,6 +138,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
                 exact_filter_plan.predicates,
                 exact_filter_plan.output_window_only,
                 exact_filter_plan.required_matches,
+                exact_filter_plan.match_condition_groups,
                 exact_filter_plan.contribution_predicates,
             )
         if extra_where:
@@ -452,6 +458,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         row_predicates: tuple[str, ...],
         output_window_only: tuple[bool, ...],
         required_matches: tuple[bool, ...],
+        match_condition_groups: tuple[tuple[tuple[int, bool], ...], ...],
         contribution_predicates: tuple[str, ...],
     ) -> tuple[str, dict[str, Any]]:
         """Aggregate the complete latest-live raw row set.
@@ -483,6 +490,12 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             len(row_predicates) == len(output_window_only) == len(required_matches)
         ):
             raise AssertionError("exact graph predicate scopes must align")
+        if any(
+            not group
+            or any(index < 0 or index >= len(row_predicates) for index, _ in group)
+            for group in match_condition_groups
+        ):
+            raise AssertionError("exact graph match groups must reference predicates")
         bucket_fn = self.time_bucket_expr(self.interval)
         output_window = "start_time >= %(start_date)s AND start_time < %(end_date)s"
         contribution_terms = [
@@ -514,8 +527,17 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
                 for index in range(len(row_predicates))
             )
             match_having = "\n              AND ".join(
-                f"graph_match_{index} = {1 if required_matches[index] else 0}"
-                for index in range(len(row_predicates))
+                (
+                    f"graph_match_{group[0][0]} = {1 if group[0][1] else 0}"
+                    if len(group) == 1
+                    else "("
+                    + " OR ".join(
+                        f"graph_match_{index} = {1 if required else 0}"
+                        for index, required in group
+                    )
+                    + ")"
+                )
+                for group in match_condition_groups
             )
             sentinel_bucket = (
                 f"{bucket_fn}(toDateTime64('1970-01-01 00:00:00', 6, 'UTC'))"
@@ -607,11 +629,16 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
 
         row_filter = " AND ".join(
             (
-                f"graph_row_match_{index} = 1"
-                if required_matches[index]
-                else f"graph_row_match_{index} = 0"
+                f"graph_row_match_{group[0][0]} = {1 if group[0][1] else 0}"
+                if len(group) == 1
+                else "("
+                + " OR ".join(
+                    f"graph_row_match_{index} = {1 if required else 0}"
+                    for index, required in group
+                )
+                + ")"
             )
-            for index in range(len(row_predicates))
+            for group in match_condition_groups
         )
         filters = [contribution_condition]
         if row_filter:

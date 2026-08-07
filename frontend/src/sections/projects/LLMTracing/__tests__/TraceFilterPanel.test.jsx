@@ -88,6 +88,7 @@ function renderPanel({
   onApply = vi.fn(),
   onClose = vi.fn(),
   open = true,
+  showQueryTab = false,
 }) {
   const anchorEl = document.createElement("button");
   document.body.appendChild(anchorEl);
@@ -103,12 +104,24 @@ function renderPanel({
         onApply={onApply}
         currentFilters={currentFilters}
         properties={properties}
-        showQueryTab={false}
+        showQueryTab={showQueryTab}
       />
     </QueryClientProvider>,
   );
   return { anchorEl, onApply, onClose, ...utils };
 }
+
+const selectQueryPhaseOption = async (typed, nextPlaceholder) => {
+  const input = screen.getByRole("combobox");
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: typed } });
+  fireEvent.keyDown(input, { key: "ArrowDown" });
+  fireEvent.keyDown(input, { key: "Enter" });
+  await waitFor(() =>
+    expect(input).toHaveAttribute("placeholder", nextPlaceholder),
+  );
+  return input;
+};
 
 describe("TraceFilterPanel AI apply (#577)", () => {
   beforeEach(() => {
@@ -404,7 +417,7 @@ describe("voice-call property search aliases", () => {
     );
   });
 
-  it("requests provider-normalized status suggestions from the system alias", () => {
+  it("keeps canonical voice statuses available without a values request", () => {
     renderPanel({
       properties,
       currentFilters: [
@@ -424,13 +437,20 @@ describe("voice-call property search aliases", () => {
       document.querySelector('[data-filter-value-trigger="call_status"]'),
     );
 
+    ["completed", "in-progress", "failed", "dropped", "not-connected"].forEach(
+      (status) => {
+        expect(
+          document.querySelector(`[data-filter-value-option="${status}"]`),
+        ).toBeInTheDocument();
+      },
+    );
     expect(dashboardFilterValuesMock).toHaveBeenLastCalledWith(
       expect.objectContaining({
         metricName: "call_status",
         metricType: "system_metric",
         source: "traces",
         pageSize: 10,
-        enabled: true,
+        enabled: false,
       }),
     );
   });
@@ -582,6 +602,37 @@ describe("exact manual attribute fallback", () => {
     ).not.toBeInTheDocument();
     document.body.removeChild(anchorEl);
   });
+
+  it("offers an explicit fallback when attribute scrolling cannot advance", () => {
+    const fetchNextPage = vi.fn();
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [
+        {
+          id: "recent_attribute",
+          name: "recent_attribute",
+          category: "attribute",
+          rawCategory: "custom_attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      isFetching: false,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      queryReadState: "complete",
+      debouncedSearch: "",
+    });
+    const { anchorEl } = renderPanel({ properties: [] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Load more attributes" }),
+    );
+
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+    document.body.removeChild(anchorEl);
+  });
 });
 
 describe("filter-value picker bounded-read UX", () => {
@@ -721,6 +772,346 @@ describe("filter-value picker bounded-read UX", () => {
     const applied = onApply.mock.calls.at(-1)[0][0];
     expect(applied.value).toEqual(["1", 1, true]);
     expect(applied.valueTypes).toEqual(["string", "number", "boolean"]);
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps Query-tab storage type and sends custom-attribute search", async () => {
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [
+        { value: "1", label: "string one", type: "string" },
+        { value: 1, label: "number one", type: "number" },
+      ],
+    });
+    const onApply = vi.fn();
+    const { anchorEl } = renderPanel({
+      properties: [statusProperty],
+      onApply,
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    const input = screen.getByRole("combobox");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "Status" } });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(input).toHaveAttribute("placeholder", "pick operator..."),
+    );
+
+    fireEvent.change(input, { target: { value: "equals" } });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(input).toHaveAttribute("placeholder", "type or pick value..."),
+    );
+
+    fireEvent.change(input, { target: { value: "number" } });
+    await waitFor(
+      () =>
+        expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            metricName: "call.status",
+            metricType: "custom_attribute",
+            search: "number",
+            pageSize: 10,
+          }),
+        ),
+      { timeout: 1_200 },
+    );
+    fireEvent.click(await screen.findByText("number one"));
+
+    await waitFor(() => expect(onApply).toHaveBeenCalled());
+    expect(onApply.mock.calls.at(-1)[0][0]).toMatchObject({
+      field: "call.status",
+      value: [1],
+      valueTypes: ["number"],
+    });
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps an existing Query-tab token active through edit and commit", async () => {
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [{ value: 2, label: "2", type: "number" }],
+    });
+    const onApply = vi.fn();
+    const { anchorEl } = renderPanel({
+      currentFilters: [
+        {
+          field: "call.status",
+          fieldName: "Status",
+          fieldCategory: "attribute",
+          fieldType: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "contains",
+          value: [1],
+          valueTypes: ["number"],
+        },
+      ],
+      properties: [statusProperty],
+      onApply,
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    fireEvent.click(screen.getByText("Status contains 1"));
+
+    const input = screen.getByRole("combobox");
+    expect(input).toHaveValue("1");
+    await waitFor(
+      () =>
+        expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            metricName: "call.status",
+            search: "1",
+          }),
+        ),
+      { timeout: 1_200 },
+    );
+    fireEvent.change(input, { target: { value: "2" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(onApply).toHaveBeenCalled());
+    expect(onApply.mock.calls.at(-1)[0][0]).toMatchObject({
+      field: "call.status",
+      value: [2],
+      valueTypes: ["number"],
+    });
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("preserves existing scalar zero and false values with their storage types", async () => {
+    const onApply = vi.fn();
+    const { anchorEl } = renderPanel({
+      currentFilters: [
+        {
+          field: "numeric_zero",
+          fieldName: "Numeric zero",
+          fieldCategory: "attribute",
+          fieldType: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "contains",
+          value: 0,
+          valueTypes: ["number"],
+        },
+        {
+          field: "boolean_false",
+          fieldName: "Boolean false",
+          fieldCategory: "attribute",
+          fieldType: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "contains",
+          value: false,
+          valueTypes: ["boolean"],
+        },
+      ],
+      properties: [
+        {
+          id: "numeric_zero",
+          name: "Numeric zero",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+        {
+          id: "boolean_false",
+          name: "Boolean false",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      onApply,
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    const zeroToken = await screen.findByText("Numeric zero contains 0");
+    expect(
+      screen.getByText("Boolean false contains false"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(zeroToken);
+    const input = screen.getByRole("combobox");
+    expect(input).toHaveValue("0");
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(onApply).toHaveBeenCalled());
+    expect(onApply.mock.calls.at(-1)[0]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          field: "numeric_zero",
+          value: [0],
+          valueTypes: ["number"],
+        }),
+        expect.objectContaining({
+          field: "boolean_false",
+          value: [false],
+          valueTypes: ["boolean"],
+        }),
+      ]),
+    );
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps map values scalar while preserving array-valued text filters", async () => {
+    const onApply = vi.fn();
+    const { anchorEl } = renderPanel({
+      currentFilters: [
+        {
+          field: "metadata",
+          fieldName: "Metadata",
+          fieldCategory: "attribute",
+          fieldType: "map",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "contains",
+          value: { z: 3, region: "us" },
+        },
+        {
+          field: "tags",
+          fieldName: "Tags",
+          fieldCategory: "attribute",
+          fieldType: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+          operator: "in",
+          value: ["alpha", "beta"],
+          valueTypes: ["string", "string"],
+        },
+      ],
+      properties: [
+        {
+          id: "metadata",
+          name: "Metadata",
+          category: "attribute",
+          type: "map",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+        {
+          id: "tags",
+          name: "Tags",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      onApply,
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    const mapToken = await screen.findByText(
+      'Metadata contains entries {"z":3,"region":"us"}',
+    );
+    expect(screen.getByText("Tags equals alpha – beta")).toBeInTheDocument();
+
+    fireEvent.click(mapToken);
+    const input = screen.getByRole("combobox");
+    expect(input).toHaveValue('{"z":3,"region":"us"}');
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(onApply).toHaveBeenCalled());
+    expect(onApply.mock.calls.at(-1)[0]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          field: "metadata",
+          value: { region: "us", z: 3 },
+        }),
+        expect.objectContaining({
+          field: "tags",
+          value: ["alpha", "beta"],
+          valueTypes: ["string", "string"],
+        }),
+      ]),
+    );
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("does not fetch or show an error for Query fields with static choices", async () => {
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      isError: true,
+      queryReadState: "error",
+    });
+    const fixedProperty = {
+      id: "status",
+      name: "Status",
+      category: "system",
+      type: "enum",
+      choices: ["OK", "ERROR"],
+    };
+    const { anchorEl } = renderPanel({
+      properties: [fixedProperty],
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    await selectQueryPhaseOption("Status", "pick operator...");
+
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "status",
+        enabled: false,
+      }),
+    );
+    expect(
+      screen.queryByText("Some results could not be loaded. Please try again."),
+    ).not.toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("never applies the previous field's search to a newly selected field", async () => {
+    const properties = [
+      {
+        id: "alpha",
+        name: "Alpha",
+        category: "attribute",
+        type: "string",
+      },
+      {
+        id: "beta",
+        name: "Beta",
+        category: "attribute",
+        type: "string",
+      },
+    ];
+    const { anchorEl } = renderPanel({
+      properties,
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    const input = await selectQueryPhaseOption("Alpha", "pick operator...");
+    await selectQueryPhaseOption("contains", "type or pick value...");
+    fireEvent.change(input, { target: { value: "needle" } });
+    await waitFor(
+      () =>
+        expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+          expect.objectContaining({ metricName: "alpha", search: "needle" }),
+        ),
+      { timeout: 1_200 },
+    );
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await selectQueryPhaseOption("Beta", "pick operator...");
+    await waitFor(() =>
+      expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+        expect.objectContaining({ metricName: "beta", search: "" }),
+      ),
+    );
+    const betaCalls = dashboardFilterValuesMock.mock.calls.filter(
+      ([request]) => request.metricName === "beta",
+    );
+    expect(betaCalls.length).toBeGreaterThan(0);
+    expect(betaCalls.every(([request]) => request.search !== "needle")).toBe(
+      true,
+    );
 
     document.body.removeChild(anchorEl);
   });

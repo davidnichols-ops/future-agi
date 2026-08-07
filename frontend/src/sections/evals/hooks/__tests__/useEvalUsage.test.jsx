@@ -201,6 +201,58 @@ describe("useEvalUsageLogs response mapping", () => {
     expect(result.current.data.pagination).toEqual({ total: 5, page: 0 });
   });
 
+  it("keeps the previous exact page visible while the next page loads", async () => {
+    let resolveNextPage;
+    const nextPageRequest = new Promise((resolve) => {
+      resolveNextPage = resolve;
+    });
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: exactResult({
+            table: [{ row_id: "page-0" }],
+            logs: { total: 2, page: 0 },
+          }),
+        },
+      })
+      .mockImplementationOnce(() => nextPageRequest);
+
+    const wrapper = createQueryWrapper();
+    const { result, rerender } = renderHook(
+      ({ page }) =>
+        useEvalUsageLogs("t1", {
+          page,
+          pageSize: 1,
+          dateOption: "30D",
+        }),
+      { wrapper, initialProps: { page: 0 } },
+    );
+
+    await waitFor(() =>
+      expect(result.current.data?.table?.[0]?.row_id).toBe("page-0"),
+    );
+    rerender({ page: 1 });
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+
+    expect(result.current.isPlaceholderData).toBe(true);
+    expect(result.current.data?.table?.[0]?.row_id).toBe("page-0");
+
+    await act(async () => {
+      resolveNextPage({
+        data: {
+          result: exactResult({
+            table: [{ row_id: "page-1" }],
+            logs: { total: 2, page: 1 },
+          }),
+        },
+      });
+    });
+    await waitFor(() =>
+      expect(result.current.data?.table?.[0]?.row_id).toBe("page-1"),
+    );
+    expect(result.current.isPlaceholderData).toBe(false);
+  });
+
   it("polls the logs identity independently until its exact page is ready", async () => {
     vi.useFakeTimers();
     const exactRows = Array.from({ length: 24 }, (_, index) => ({

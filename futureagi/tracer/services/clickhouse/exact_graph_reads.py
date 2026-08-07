@@ -16,11 +16,12 @@ from time import monotonic
 from typing import Any
 
 import structlog
-from django.db import connection, transaction
+from django.db import DatabaseError, connection, transaction
 
 from model_hub.models.choices import AnnotationTypeChoices
 from model_hub.models.score import Score
 from tracer.models.custom_eval_config import CustomEvalConfig
+from tracer.services.annotation_label_source import AnnotationScoreReadUnavailable
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
 from tracer.services.clickhouse.query_builders.agent_graph import (
@@ -160,6 +161,39 @@ def _snapshot_window(
     return analyzed.start, analyzed.end, analyzed.empty
 
 
+def _annotation_label_ids_for_filters(
+    project_id: str,
+    filters: list[dict[str, Any]],
+) -> tuple[str, ...] | None:
+    """Resolve the authoritative label set only for completeness filters.
+
+    ``has_annotation`` means all configured project labels on every public
+    tracing surface.  Falling back to mere Score existence makes exact graphs
+    disagree with trace/span/task lists.  Metadata outages must also fail the
+    refresh instead of publishing a plausible but false empty result.
+    """
+
+    needs_completeness = any(
+        isinstance(item, dict)
+        and (item.get("column_id") or item.get("columnId")) == "has_annotation"
+        for item in filters or []
+    )
+    if not needs_completeness:
+        return None
+    try:
+        return tuple(
+            sorted(
+                str(label.id)
+                for label in get_annotation_labels_for_project(project_id)
+                if getattr(label, "id", None)
+            )
+        )
+    except (AnnotationScoreReadUnavailable, DatabaseError):
+        raise ExactGraphReadError(
+            "Annotation metadata is temporarily unavailable. Retry."
+        ) from None
+
+
 def _metadata(
     *,
     started: float,
@@ -259,6 +293,7 @@ def read_exact_system_graph(
         observe_type=observe_type,
         start_date=start_date,
         end_date=end_date,
+        annotation_label_ids=_annotation_label_ids_for_filters(project_id, filters),
     )
     query, params = builder.build()
     result = analytics.execute_ch_query(
@@ -299,6 +334,7 @@ def read_exact_agent_graph(
     builder = AgentGraphQueryBuilderV2(
         project_id=str(project_id),
         filters=list(filters or []),
+        annotation_label_ids=_annotation_label_ids_for_filters(project_id, filters),
     )
     if builder.empty_window:
         return {
@@ -367,6 +403,7 @@ def read_exact_all_system_metrics(
         observe_type="span",
         start_date=start_date,
         end_date=end_date,
+        annotation_label_ids=_annotation_label_ids_for_filters(project_id, filters),
     )
     query, params = builder.build()
     result = analytics.execute_ch_query(
@@ -580,6 +617,11 @@ def read_exact_eval_graph(
         session_trace_membership_params=session_membership_params,
         user_trace_membership_sql=user_membership_sql,
         user_trace_membership_params=user_membership_params,
+        annotation_label_ids=(
+            _annotation_label_ids_for_filters(project_id, filters)
+            if aggregation_context == "trace" and not empty
+            else ()
+        ),
     )
     if empty:
         formatted = builder.format_result([], [])
@@ -654,11 +696,17 @@ def _compile_membership_filter(
     project_id: str,
     filters: list[dict[str, Any]],
     observe_type: str,
+    annotation_label_ids: tuple[str, ...] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     return compile_exact_graph_filter_predicates(
         filters,
         project_id=project_id,
         observe_type=observe_type,
+        annotation_label_ids=(
+            _annotation_label_ids_for_filters(project_id, filters)
+            if annotation_label_ids is None
+            else annotation_label_ids
+        ),
     )
 
 
@@ -859,15 +907,18 @@ def read_exact_annotation_graph(
         span_predicate = f"trace_id IN ({user_span_sql})"
         span_params = user_span_params
     else:
+        annotation_label_ids = _annotation_label_ids_for_filters(project_id, filters)
         trace_predicate, trace_params = _compile_membership_filter(
             project_id=project_id,
             filters=filters,
             observe_type="trace",
+            annotation_label_ids=annotation_label_ids,
         )
         span_predicate, span_params = _compile_membership_filter(
             project_id=project_id,
             filters=filters,
             observe_type="span",
+            annotation_label_ids=annotation_label_ids,
         )
     bucket_values: dict[datetime, list[float]] = defaultdict(list)
     query_count = 0
@@ -1144,6 +1195,10 @@ def _session_aggregate_source_sql(
         span_filters,
         project_id=project_id,
         observe_type="trace",
+        annotation_label_ids=_annotation_label_ids_for_filters(
+            project_id,
+            span_filters,
+        ),
     )
     filter_clause = f"AND {extra_where}" if extra_where else ""
     session_survivor_map = survivor_map_subquery("trace_session_id_remap")
@@ -1420,11 +1475,17 @@ def _user_filter_clauses(
 
     span_clauses: list[str] = []
     if ordinary_span_filters:
+        annotation_label_ids = _annotation_label_ids_for_filters(
+            project_id,
+            ordinary_span_filters,
+        )
         filter_builder = ClickHouseFilterBuilderV2(
             table="spans",
             project_id=project_id,
             query_mode=ClickHouseFilterBuilderV2.QUERY_MODE_SPAN,
             span_date_scope=True,
+            annotation_label_ids=list(annotation_label_ids or ()),
+            annotation_label_set_known=annotation_label_ids is not None,
         )
         ordinary_clause, ordinary_params = filter_builder.translate(
             ordinary_span_filters

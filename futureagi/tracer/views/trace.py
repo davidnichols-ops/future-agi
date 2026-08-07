@@ -144,6 +144,7 @@ from tracer.utils.filters import FilterEngine
 from tracer.utils.helper import (
     eval_output_type_for_config,
     flatten_eval_score_into_entry,
+    get_annotation_labels_by_project,
     get_annotation_labels_for_project,
     get_default_trace_config,
     get_project_eval_configs,
@@ -3184,6 +3185,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 project_ids=project_ids,
                 trace_id=str(trace_id),
                 eval_config_ids_resolver=resolve_eval_config_ids,
+                # Voice detail renders call/provider fields and eval outputs;
+                # it never consumes annotation rows.  Avoid coupling this
+                # endpoint to the legacy score table (and spending an extra
+                # query) when annotations cannot affect the response.
+                include_annotations=False,
                 deadline_ms=6000,
             )
             eval_configs = eval_configs_by_project.get(str(detail.project_id), [])
@@ -4015,8 +4021,23 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
             eval_config_ids = [str(c.id) for c in eval_configs]
 
-        # Annotation labels — skip in org-scoped mode (deferred enhancement)
+        annotation_label_ids_by_project = None
         if org_scope:
+            if any(
+                (item.get("column_id") or item.get("columnId")) == "has_annotation"
+                for item in filters
+            ):
+                labels_by_project = get_annotation_labels_by_project(
+                    [str(project_id) for project_id in org_project_ids],
+                    organization=org,
+                )
+                annotation_label_ids_by_project = {
+                    project_key: [str(label.id) for label in labels]
+                    for project_key, labels in labels_by_project.items()
+                }
+            # Organization user-detail rows intentionally retain their
+            # existing presentation columns; the per-project map above is the
+            # authoritative metadata used by residual has_annotation filters.
             annotation_labels = []
         else:
             annotation_labels = get_annotation_labels_for_project(project_id)
@@ -4038,6 +4059,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             page_size=page_size,
             eval_config_ids=eval_config_ids,
             annotation_label_ids=annotation_label_ids,
+            annotation_label_ids_by_project=annotation_label_ids_by_project,
         )
         # Continuations freeze only the request window and ordered scan
         # checkpoint. ReplacingMergeTree version predicates are not snapshots:
@@ -5918,17 +5940,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         try:
             query = request.validated_query_data
             project_id = str(query["project_id"])
-            filters = bind_request_my_annotations_principal(
-                list(query.get("filters") or []),
-                request=request,
-            )
-            refresh = bool(query.get("refresh", False))
-
             project = (
                 _project_queryset_for_request(request).filter(id=project_id).first()
             )
             if not project:
                 return self._gm.bad_request("Project not found")
+
+            filters = bind_request_my_annotations_principal(
+                request,
+                list(query.get("filters") or []),
+            )
+            refresh = bool(query.get("refresh", False))
 
             result = fetch_agent_graph_ch(
                 project_id=project_id,

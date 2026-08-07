@@ -42,6 +42,7 @@ class EvalMetricsQueryBuilderV2(V2RewriteMixin, EvalMetricsQueryBuilder):
         session_trace_membership_params: dict | None = None,
         user_trace_membership_sql: str | None = None,
         user_trace_membership_params: dict | None = None,
+        annotation_label_ids: list[str] | tuple[str, ...] | None = None,
         **kwargs,
     ):
         if session_trace_membership_sql and user_trace_membership_sql:
@@ -52,6 +53,9 @@ class EvalMetricsQueryBuilderV2(V2RewriteMixin, EvalMetricsQueryBuilder):
         )
         self.user_trace_membership_sql = user_trace_membership_sql
         self.user_trace_membership_params = dict(user_trace_membership_params or {})
+        self.annotation_label_ids = (
+            None if annotation_label_ids is None else tuple(annotation_label_ids)
+        )
         super().__init__(*args, **kwargs)
         self.use_preaggregated = False
         self.observe_type = str(observe_type or "trace").strip().lower()
@@ -84,6 +88,7 @@ class EvalMetricsQueryBuilderV2(V2RewriteMixin, EvalMetricsQueryBuilder):
             self.filters,
             project_id=str(self.project_id),
             observe_type=self.observe_type,
+            annotation_label_ids=self.annotation_label_ids,
         )
         self.params.update(extra_params)
         if not extra_where:

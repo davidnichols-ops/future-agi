@@ -607,7 +607,11 @@ const QueryInput = forwardRef(function QueryInput(
     initialTokens = [],
     valueOptions = [],
     valueLoading = false,
+    valueLoadingMore = false,
     onFieldChange,
+    onValueSearchChange,
+    onLoadMoreValues,
+    hasMoreValues = false,
     getOperators: getOperatorsProp,
   },
   ref,
@@ -615,6 +619,8 @@ const QueryInput = forwardRef(function QueryInput(
   const [tokens, setTokens] = useState(initialTokens);
   const [partialField, setPartialField] = useState(null);
   const [partialOp, setPartialOp] = useState(null);
+  const [partialValueTypes, setPartialValueTypes] = useState([]);
+  const [partialOriginalValue, setPartialOriginalValue] = useState(undefined);
   const [inputValue, setInputValue] = useState("");
   const [rangeFrom, setRangeFrom] = useState("");
   const [rangeTo, setRangeTo] = useState("");
@@ -637,6 +643,8 @@ const QueryInput = forwardRef(function QueryInput(
     setTokens(parsedTokens);
     setPartialField(null);
     setPartialOp(null);
+    setPartialValueTypes([]);
+    setPartialOriginalValue(undefined);
     setInputValue("");
     setRangeFrom("");
     setRangeTo("");
@@ -701,7 +709,12 @@ const QueryInput = forwardRef(function QueryInput(
         return valueOptions.map((o) => {
           const val = typeof o === "string" ? o : o.value ?? o.label;
           const label = typeof o === "string" ? o : o.label ?? o.value;
-          return { id: val, label: String(label ?? ""), type: "value" };
+          return {
+            id: val,
+            label: String(label ?? ""),
+            type: "value",
+            storageType: typeof o === "object" ? o.type : undefined,
+          };
         });
       }
     }
@@ -736,22 +749,42 @@ const QueryInput = forwardRef(function QueryInput(
     );
   }, [inputValue, options]);
 
+  const partialOriginalDisplayValue = useMemo(
+    () =>
+      Array.isArray(partialOriginalValue)
+        ? partialOriginalValue.join(", ")
+        : partialOriginalValue === null || partialOriginalValue === undefined
+          ? ""
+          : String(partialOriginalValue),
+    [partialOriginalValue],
+  );
+  const originalInputUnchanged =
+    partialOriginalValue !== undefined &&
+    partialOriginalDisplayValue === inputValue.trim();
+
   const commitFilter = useCallback(
-    (field, op, value) => {
-      const updated = [...tokens, { field, operator: op, value }];
+    (field, op, value, valueTypes) => {
+      const token = { field, operator: op, value };
+      if (Array.isArray(valueTypes) && valueTypes.some(Boolean)) {
+        token.valueTypes = valueTypes;
+      }
+      const updated = [...tokens, token];
       setTokens(updated);
       setPartialField(null);
       setPartialOp(null);
+      setPartialValueTypes([]);
+      setPartialOriginalValue(undefined);
       setInputValue("");
       setRangeFrom("");
       setRangeTo("");
+      onValueSearchChange?.("", field);
       setTimeout(() => {
         inputRef.current?.focus();
         setDropdownOpen(true);
       }, 0);
       onApply(updated);
     },
-    [tokens, onApply],
+    [tokens, onApply, onValueSearchChange],
   );
 
   const commitRange = useCallback(() => {
@@ -802,6 +835,8 @@ const QueryInput = forwardRef(function QueryInput(
           setTokens(updated);
           setPartialField(null);
           setPartialOp(null);
+          setPartialValueTypes([]);
+          setPartialOriginalValue(undefined);
           setInputValue("");
           setRangeFrom("");
           setRangeTo("");
@@ -812,17 +847,35 @@ const QueryInput = forwardRef(function QueryInput(
         if (hasStaticValueChoices && !exactInputOption) return null;
         // Don't commit a partial/invalid numeric on close (TH-5195).
         if (isNumericScalar && !isCompleteNumericInput(v)) return null;
-        const updated = [
-          ...tokens,
-          {
-            field: partialField,
-            operator: partialOp,
-            value: hasStaticValueChoices ? exactInputOption.id : v,
-          },
-        ];
+        const selectedValue = hasStaticValueChoices
+          ? exactInputOption.id
+          : exactInputOption
+            ? exactInputOption.id
+            : originalInputUnchanged
+              ? partialOriginalValue
+              : v;
+        const selectedValueTypes = exactInputOption?.storageType
+          ? [exactInputOption.storageType]
+          : originalInputUnchanged
+            ? partialValueTypes
+            : undefined;
+        const token = {
+          field: partialField,
+          operator: partialOp,
+          value: selectedValue,
+        };
+        if (
+          Array.isArray(selectedValueTypes) &&
+          selectedValueTypes.some(Boolean)
+        ) {
+          token.valueTypes = selectedValueTypes;
+        }
+        const updated = [...tokens, token];
         setTokens(updated);
         setPartialField(null);
         setPartialOp(null);
+        setPartialValueTypes([]);
+        setPartialOriginalValue(undefined);
         setInputValue("");
         return updated;
       },
@@ -841,6 +894,9 @@ const QueryInput = forwardRef(function QueryInput(
       inputValue,
       hasStaticValueChoices,
       exactInputOption,
+      partialValueTypes,
+      partialOriginalValue,
+      originalInputUnchanged,
     ],
   );
 
@@ -877,6 +933,8 @@ const QueryInput = forwardRef(function QueryInput(
       }
       if (phase === "field") {
         setPartialField(option.id);
+        setPartialValueTypes([]);
+        setPartialOriginalValue(undefined);
         setInputValue("");
         onFieldChange?.(option.id);
         reopenDropdown();
@@ -886,12 +944,19 @@ const QueryInput = forwardRef(function QueryInput(
           return;
         }
         setPartialOp(option.id);
+        setPartialValueTypes([]);
+        setPartialOriginalValue(undefined);
         setInputValue("");
         setRangeFrom("");
         setRangeTo("");
         reopenDropdown();
       } else if (phase === "value") {
-        commitFilter(partialField, partialOp, option.id);
+        commitFilter(
+          partialField,
+          partialOp,
+          option.id,
+          option.storageType ? [option.storageType] : undefined,
+        );
       }
     },
     [
@@ -913,6 +978,12 @@ const QueryInput = forwardRef(function QueryInput(
       const updated = tokens.filter((_, i) => i !== index);
       setTokens(updated);
       setPartialField(token.field);
+      setPartialOriginalValue(token.value);
+      const tokenValueTypes = Array.isArray(token.valueTypes)
+        ? token.valueTypes
+        : [];
+      setPartialValueTypes(tokenValueTypes);
+      onFieldChange?.(token.field);
       if (opDefFor(token.field, token.operator)?.noValue) {
         // No-value op: re-pick operator, no value phase.
         setPartialOp(null);
@@ -937,16 +1008,27 @@ const QueryInput = forwardRef(function QueryInput(
           setInputValue(
             Array.isArray(token.value)
               ? token.value.join(", ")
-              : typeof token.value === "string"
-                ? token.value
-                : "",
+              : token.value === null || token.value === undefined
+                ? ""
+                : String(token.value),
+          );
+          onValueSearchChange?.(
+            Array.isArray(token.value)
+              ? token.value.join(", ")
+              : token.value === null || token.value === undefined
+                ? ""
+                : String(token.value),
+            token.field,
           );
         }
       }
       setTimeout(() => setDropdownOpen(true), 0);
-      onApply(updated.length > 0 ? updated : []);
+      // Keep the parent filter set stable while this token is being edited.
+      // Publishing the temporary removal makes controlled parents rebuild
+      // initialTokens, which clears this partial editor before it can commit.
+      // The completed edit is published by commitFilter/flushPartial instead.
     },
-    [tokens, onApply, opDefFor],
+    [tokens, onFieldChange, onValueSearchChange, opDefFor],
   );
 
   const handleKeyDown = useCallback(
@@ -968,7 +1050,13 @@ const QueryInput = forwardRef(function QueryInput(
         commitFilter(
           partialField,
           partialOp,
-          exactInputOption?.id ?? inputValue.trim(),
+          exactInputOption?.id ??
+            (originalInputUnchanged ? partialOriginalValue : inputValue.trim()),
+          exactInputOption?.storageType
+            ? [exactInputOption.storageType]
+            : originalInputUnchanged
+              ? partialValueTypes
+              : undefined,
         );
         return;
       }
@@ -976,11 +1064,15 @@ const QueryInput = forwardRef(function QueryInput(
         e.preventDefault();
         if (partialOp) {
           setPartialOp(null);
+          setPartialValueTypes([]);
+          setPartialOriginalValue(undefined);
           setRangeFrom("");
           setRangeTo("");
           setDropdownOpen(true);
         } else if (partialField) {
           setPartialField(null);
+          setPartialValueTypes([]);
+          setPartialOriginalValue(undefined);
           setDropdownOpen(true);
         } else if (tokens.length > 0) {
           editToken(tokens.length - 1);
@@ -999,6 +1091,9 @@ const QueryInput = forwardRef(function QueryInput(
       editToken,
       hasStaticValueChoices,
       exactInputOption,
+      partialValueTypes,
+      partialOriginalValue,
+      originalInputUnchanged,
     ],
   );
 
@@ -1010,6 +1105,17 @@ const QueryInput = forwardRef(function QueryInput(
       onApply(updated.length > 0 ? updated : []);
     },
     [tokens, onApply],
+  );
+
+  const handleValuesScroll = useCallback(
+    (event) => {
+      if (phase !== "value" || !hasMoreValues || valueLoadingMore) return;
+      const { scrollTop, clientHeight, scrollHeight } = event.currentTarget;
+      if (scrollHeight - scrollTop - clientHeight <= 40) {
+        onLoadMoreValues?.();
+      }
+    },
+    [hasMoreValues, onLoadMoreValues, phase, valueLoadingMore],
   );
 
   const inlinePrefix = useMemo(() => {
@@ -1185,7 +1291,14 @@ const QueryInput = forwardRef(function QueryInput(
       getOptionLabel={(o) => (typeof o === "string" ? o : o.label)}
       inputValue={inputValue}
       onInputChange={(_, v, reason) => {
-        if (reason !== "reset") setInputValue(v);
+        if (reason !== "reset") {
+          if (v !== inputValue) {
+            setPartialValueTypes([]);
+            setPartialOriginalValue(undefined);
+          }
+          setInputValue(v);
+          if (phase === "value") onValueSearchChange?.(v, partialField);
+        }
       }}
       onChange={handleSelect}
       open={!isRangePhase && dropdownOpen && focused && filtered.length > 0}
@@ -1195,6 +1308,10 @@ const QueryInput = forwardRef(function QueryInput(
       clearOnBlur={false}
       disableClearable
       value={null}
+      ListboxProps={{
+        "data-query-value-options-list": phase === "value" ? "" : undefined,
+        onScroll: handleValuesScroll,
+      }}
       slotProps={{
         popper: { sx: { zIndex: 1500 } },
         paper: {
@@ -1298,7 +1415,7 @@ const QueryInput = forwardRef(function QueryInput(
               </>
             ),
             endAdornment:
-              valueLoading && phase === "value" ? (
+              (valueLoading || valueLoadingMore) && phase === "value" ? (
                 <CircularProgress size={14} sx={{ mr: 1 }} />
               ) : (
                 params.InputProps.endAdornment
@@ -1324,7 +1441,11 @@ QueryInput.propTypes = {
   initialTokens: PropTypes.array,
   valueOptions: PropTypes.array,
   valueLoading: PropTypes.bool,
+  valueLoadingMore: PropTypes.bool,
   onFieldChange: PropTypes.func,
+  onValueSearchChange: PropTypes.func,
+  onLoadMoreValues: PropTypes.func,
+  hasMoreValues: PropTypes.bool,
   getOperators: PropTypes.func,
 };
 

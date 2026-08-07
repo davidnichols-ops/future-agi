@@ -66,6 +66,7 @@ import { FAGI_MODEL_VALUES } from "./ModelSelector";
 import { buildDataInjection } from "src/sections/common/EvalPicker/evalPickerConfigUtils";
 import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
+import { getSafeActionErrorMessage } from "src/utils/errorUtils";
 
 const ERROR_LOCALIZER_OSS_TOOLTIP =
   "Error Localization is not available on self-hosted (OSS) deployments.";
@@ -872,10 +873,8 @@ const EvalDetailPage = () => {
         setViewingVersion(null);
       }
     } catch (err) {
-      const message =
-        err?.response?.data?.result || err?.message || "Failed to save version";
       enqueueSnackbar(
-        typeof message === "string" ? message : JSON.stringify(message),
+        getSafeActionErrorMessage(err, "Failed to save version"),
         { variant: "error" },
       );
     }
@@ -937,12 +936,8 @@ const EvalDetailPage = () => {
       );
       setIsDirty(false);
     } catch (err) {
-      const message =
-        err?.response?.data?.result ||
-        err?.message ||
-        "Failed to save composite";
       enqueueSnackbar(
-        typeof message === "string" ? message : JSON.stringify(message),
+        getSafeActionErrorMessage(err, "Failed to save composite"),
         { variant: "error" },
       );
     }
@@ -1022,9 +1017,10 @@ const EvalDetailPage = () => {
       }
       testPlaygroundRef.current?.runTest?.(evalId);
     } catch (error) {
-      const message =
-        error?.response?.data?.result || error?.message || "Failed to run test";
-      handleTestResult(false, message);
+      handleTestResult(
+        false,
+        getSafeActionErrorMessage(error, "Failed to run test"),
+      );
       setIsTesting(false);
     }
   }, [
@@ -1089,9 +1085,7 @@ const EvalDetailPage = () => {
   }, [evalId, enqueueSnackbar, navigate]);
 
   if (isLoading) {
-    return (
-      <LoadingScreen sx={{ height: "100%", minHeight: "60vh" }} />
-    );
+    return <LoadingScreen sx={{ height: "100%", minHeight: "60vh" }} />;
   }
 
   if (fetchError || !evalData) {

@@ -164,6 +164,7 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         sort_params: list[dict] | None = None,
         eval_config_ids: list[str] | None = None,
         annotation_label_ids: list[str] | None = None,
+        annotation_label_ids_by_project: dict[str, list[str]] | None = None,
         end_user_id: str | None = None,
         project_version_id: str | None = None,
         bounded_internal_scan: bool = False,
@@ -180,6 +181,16 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         self.sort_params = sort_params or []
         self.eval_config_ids = eval_config_ids or []
         self.annotation_label_ids = annotation_label_ids or []
+        self.annotation_label_ids_by_project = (
+            {
+                str(project_key): list(
+                    dict.fromkeys(str(label_id) for label_id in label_ids if label_id)
+                )
+                for project_key, label_ids in annotation_label_ids_by_project.items()
+            }
+            if annotation_label_ids_by_project is not None
+            else None
+        )
         self.end_user_id = end_user_id
         self.project_version_id = project_version_id
         self._bounded_internal_scan = bool(bounded_internal_scan)
@@ -1063,22 +1074,137 @@ class SpanListQueryBuilder(BaseQueryBuilder):
 
         residual_predicate = "1 = 1"
         if residual_filters:
-            residual_builder = self._FILTER_BUILDER_CLS(
-                table=self.TABLE,
-                query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_SPAN,
-                annotation_label_ids=self.annotation_label_ids,
-                project_id=self.project_id,
-                project_ids=self.project_ids,
-                score_date_scope=scope_to_request_window,
-                span_date_scope=scope_to_request_window,
-                candidate_ids_param="candidate_span_ids",
-                candidate_entities_param=candidate_entities_param,
-            )
-            residual_predicate, residual_params = residual_builder.translate(
-                residual_filters
-            )
-            params.update(residual_params)
-            residual_predicate = residual_predicate or "1 = 1"
+            org_scope = self.project_ids is not None
+            if org_scope:
+                requires_project_label_sets = any(
+                    (item.get("column_id") or item.get("columnId")) == "has_annotation"
+                    for item in residual_filters
+                )
+                if (
+                    requires_project_label_sets
+                    and self.annotation_label_ids_by_project is None
+                ):
+                    raise ValueError(
+                        "organization has_annotation requires per-project labels"
+                    )
+                # OTel trace/span ids are tenant-local. Compile one finite
+                # candidate branch per project so a Score/eval/end-user row in
+                # project A cannot satisfy the same textual identity in B.
+                identities_by_project: dict[str, list[tuple[str, str, str, Any]]] = {}
+                if candidate_identities is not None:
+                    for identity in candidate_identities:
+                        identities_by_project.setdefault(identity[0], []).append(
+                            identity
+                        )
+                else:
+                    for candidate_project_id in self.project_ids or ():
+                        identities_by_project[str(candidate_project_id)] = []
+
+                residual_branches: list[str] = []
+                for branch_index, (
+                    candidate_project_id,
+                    project_identities,
+                ) in enumerate(identities_by_project.items()):
+                    branch_span_ids = (
+                        tuple(
+                            dict.fromkeys(
+                                identity[2] for identity in project_identities
+                            )
+                        )
+                        or span_ids
+                    )
+                    branch_entities = tuple(
+                        dict.fromkeys(
+                            (identity[1], identity[2])
+                            for identity in project_identities
+                        )
+                    )
+                    branch_label_ids = self.annotation_label_ids
+                    branch_label_set_known = False
+                    if self.annotation_label_ids_by_project is not None:
+                        if (
+                            candidate_project_id
+                            not in self.annotation_label_ids_by_project
+                        ):
+                            raise ValueError(
+                                "missing annotation label scope for organization project"
+                            )
+                        branch_label_ids = self.annotation_label_ids_by_project[
+                            candidate_project_id
+                        ]
+                        branch_label_set_known = True
+                    branch_builder = self._FILTER_BUILDER_CLS(
+                        table=self.TABLE,
+                        query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_SPAN,
+                        annotation_label_ids=branch_label_ids,
+                        project_id=candidate_project_id,
+                        score_date_scope=scope_to_request_window,
+                        span_date_scope=scope_to_request_window,
+                        candidate_ids_param="candidate_span_ids",
+                        candidate_entities_param=(
+                            "candidate_span_entities" if branch_entities else None
+                        ),
+                        strict_trace_project_correlation=True,
+                        annotation_label_set_known=branch_label_set_known,
+                    )
+                    branch_predicate, branch_filter_params = branch_builder.translate(
+                        residual_filters
+                    )
+                    branch_predicate = branch_predicate or "1 = 1"
+                    branch_sources = {
+                        **params,
+                        **branch_filter_params,
+                        "project_id": candidate_project_id,
+                        "candidate_span_ids": branch_span_ids,
+                        "candidate_span_entities": branch_entities,
+                    }
+                    placeholder_names = set(
+                        re.findall(
+                            r"%\(([A-Za-z_][A-Za-z0-9_]*)\)s",
+                            branch_predicate,
+                        )
+                    )
+                    for placeholder_name in sorted(placeholder_names):
+                        if placeholder_name not in branch_sources:
+                            raise AssertionError(
+                                "unbound organization span residual parameter "
+                                f"{placeholder_name!r}"
+                            )
+                        namespaced_name = (
+                            f"org_span_residual_{branch_index}_{placeholder_name}"
+                        )
+                        branch_predicate = branch_predicate.replace(
+                            f"%({placeholder_name})s",
+                            f"%({namespaced_name})s",
+                        )
+                        params[namespaced_name] = branch_sources[placeholder_name]
+                    branch_project_param = (
+                        f"org_span_residual_{branch_index}_outer_project_id"
+                    )
+                    params[branch_project_param] = candidate_project_id
+                    residual_branches.append(
+                        "(project_id = "
+                        f"toUUID(%({branch_project_param})s) "
+                        f"AND ({branch_predicate}))"
+                    )
+                residual_predicate = " OR ".join(residual_branches) or "0 = 1"
+            else:
+                residual_builder = self._FILTER_BUILDER_CLS(
+                    table=self.TABLE,
+                    query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_SPAN,
+                    annotation_label_ids=self.annotation_label_ids,
+                    project_id=self.project_id,
+                    project_ids=self.project_ids,
+                    score_date_scope=scope_to_request_window,
+                    span_date_scope=scope_to_request_window,
+                    candidate_ids_param="candidate_span_ids",
+                    candidate_entities_param=candidate_entities_param,
+                )
+                residual_predicate, residual_params = residual_builder.translate(
+                    residual_filters
+                )
+                params.update(residual_params)
+                residual_predicate = residual_predicate or "1 = 1"
 
         if self._bounded_identity_only:
             select_fragment = (

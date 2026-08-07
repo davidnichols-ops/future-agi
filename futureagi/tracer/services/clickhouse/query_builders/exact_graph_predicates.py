@@ -59,6 +59,13 @@ class ExactGraphRowPredicatePlan:
     # predicate and changing only the required flag avoids the classic
     # ``any(NOT predicate)`` bug on traces with mixed children.
     required_matches: tuple[bool, ...]
+    # Boolean requirements over the positive row predicates.  The outer tuple
+    # is an AND; every inner tuple is an OR of ``(predicate index, required)``
+    # conditions.  Most filters therefore contribute one singleton group.
+    # ``has_annotation=false`` with configured labels is the important
+    # exception: a row/trace is incomplete when *any* required label is
+    # missing, so its missing-label checks belong to one OR group.
+    match_condition_groups: tuple[tuple[tuple[int, bool], ...], ...]
     # Datetime complements constrain rows that contribute to the aggregate;
     # they are not trace-membership witnesses.  Applying ``not_between`` as a
     # window flag would select a trace because one sibling was outside the
@@ -148,15 +155,32 @@ def _score_row_entity_keys(observe_type: str) -> str:
     )
 
 
-def _score_relation_entity_keys() -> str:
-    return (
-        "arrayFilter(graph_key -> graph_key != '', ["
-        "if(NOT isNull(s.trace_id) AND "
-        f"s.trace_id != toUUID('{_ZERO_UUID}'), "
-        "concat('trace:', toString(s.trace_id)), ''), "
-        "if(notEmpty(ifNull(s.observation_span_id, '')), "
-        "concat('span:', toString(s.observation_span_id)), '')])"
-    )
+def _score_relation_entity_keys(observe_type: str) -> str:
+    """Return one authoritative Score identity for the requested view.
+
+    New span annotations can carry both ``trace_id`` and
+    ``observation_span_id``.  Emitting both keys made a child annotation match
+    the root row in a span graph.  Span mode therefore prefers the observation
+    key and falls back to a trace key only for a genuinely trace-level score.
+    Trace mode does the inverse, while retaining the historic span-only
+    fallback that the any-sibling trace fold promotes to its owning trace.
+    """
+
+    valid_trace = f"NOT isNull(s.trace_id) AND s.trace_id != toUUID('{_ZERO_UUID}')"
+    has_span = "notEmpty(ifNull(s.observation_span_id, ''))"
+    trace_key = "concat('trace:', toString(s.trace_id))"
+    span_key = "concat('span:', toString(s.observation_span_id))"
+    if observe_type == "span":
+        keys = (
+            f"if({has_span}, {span_key}, ''), "
+            f"if(NOT ({has_span}) AND ({valid_trace}), {trace_key}, '')"
+        )
+    else:
+        keys = (
+            f"if({valid_trace}, {trace_key}, ''), "
+            f"if(NOT ({valid_trace}) AND ({has_span}), {span_key}, '')"
+        )
+    return f"arrayFilter(graph_key -> graph_key != '', [{keys}])"
 
 
 def _score_entity_membership_predicate(
@@ -187,10 +211,11 @@ def _score_entity_membership_predicate(
     relation = (
         "SELECT graph_relation_entity_key "
         "FROM model_hub_score AS s FINAL "
-        f"ARRAY JOIN {_score_relation_entity_keys()} "
+        f"ARRAY JOIN {_score_relation_entity_keys(observe_type)} "
         "AS graph_relation_entity_key "
         "WHERE s.tracer_project_id = toUUID(%(relation_project_id)s) "
-        "AND s.deleted = false"
+        "AND s.deleted = false "
+        "AND s._peerdb_is_deleted = 0"
         f"{condition_sql}{grouping_sql}"
     )
     predicate = (
@@ -399,6 +424,7 @@ def _compile_annotation_filter(
     config: dict[str, Any],
     project_id: str,
     observe_type: str,
+    annotation_label_ids: tuple[str, ...] | None = None,
 ) -> list[tuple[str, bool, dict[str, Any]]]:
     """Compile one annotation leaf to one project-scoped Score scan."""
 
@@ -409,6 +435,30 @@ def _compile_annotation_filter(
 
     if column_id == "has_annotation":
         required = _parse_boolean_filter(column_id, filter_value, filter_op)
+        if annotation_label_ids is not None:
+            if not annotation_label_ids:
+                # Completeness across an authoritative empty label set is
+                # vacuously true.  Keep this as a normal graph predicate so
+                # the existing required-match algebra yields all rows for
+                # ``true`` and no rows for ``false`` without touching Score.
+                return [("1 = 1", required, {})]
+            requirements: list[tuple[str, bool, dict[str, Any]]] = []
+            for label_id in annotation_label_ids:
+                label_params = {
+                    "annotation_label_1": _validated_uuid(
+                        label_id,
+                        field="annotation label_id",
+                    )
+                }
+                predicate, relation_params = _score_entity_membership_predicate(
+                    project_id=project_id,
+                    observe_type=observe_type,
+                    score_condition=("s.label_id = toUUID(%(annotation_label_1)s)"),
+                )
+                requirements.append(
+                    (predicate, required, {**label_params, **relation_params})
+                )
+            return requirements
         predicate, relation_params = _score_entity_membership_predicate(
             project_id=project_id,
             observe_type=observe_type,
@@ -739,6 +789,7 @@ def compile_exact_graph_row_predicates(
     *,
     project_id: str,
     observe_type: str,
+    annotation_label_ids: list[str] | tuple[str, ...] | None = None,
 ) -> ExactGraphRowPredicatePlan:
     """Compile graph filters without adding another physical ``spans`` read.
 
@@ -763,6 +814,7 @@ def compile_exact_graph_row_predicates(
     predicates: list[str] = []
     output_window_only: list[bool] = []
     required_matches: list[bool] = []
+    match_condition_groups: list[tuple[tuple[int, bool], ...]] = []
     contribution_predicates: list[str] = []
     bound_params: dict[str, Any] = {}
     for filter_index, original_item in enumerate(filters or []):
@@ -797,6 +849,11 @@ def compile_exact_graph_row_predicates(
                 config=config,
                 project_id=project_id,
                 observe_type=normalized_observe_type,
+                annotation_label_ids=(
+                    None
+                    if annotation_label_ids is None
+                    else tuple(annotation_label_ids)
+                ),
             )
         elif column_id in {"user", "user_id", "user_id_type"}:
             relation_predicate, required, relation_params = _compile_end_user_filter(
@@ -807,6 +864,7 @@ def compile_exact_graph_row_predicates(
             relation_requirements = [(relation_predicate, required, relation_params)]
 
         if relation_requirements is not None:
+            requirement_predicate_indexes: list[int] = []
             for requirement_index, (
                 predicate,
                 required,
@@ -833,9 +891,37 @@ def compile_exact_graph_row_predicates(
                         f"duplicate graph bind params: {duplicate_params}"
                     )
                 bound_params.update(predicate_params)
+                requirement_predicate_indexes.append(len(predicates))
                 predicates.append(predicate)
                 output_window_only.append(False)
                 required_matches.append(required)
+            if (
+                column_id == "has_annotation"
+                and annotation_label_ids
+                and requirement_predicate_indexes
+            ):
+                wants_complete = _parse_boolean_filter(
+                    column_id,
+                    raw_value,
+                    config.get("filter_op") or config.get("filterOp"),
+                )
+                if wants_complete:
+                    match_condition_groups.extend(
+                        ((predicate_index, True),)
+                        for predicate_index in requirement_predicate_indexes
+                    )
+                else:
+                    match_condition_groups.append(
+                        tuple(
+                            (predicate_index, False)
+                            for predicate_index in requirement_predicate_indexes
+                        )
+                    )
+            else:
+                match_condition_groups.extend(
+                    ((predicate_index, required_matches[predicate_index]),)
+                    for predicate_index in requirement_predicate_indexes
+                )
             continue
 
         if col_type == ClickHouseFilterBuilderV2.SPAN_ATTRIBUTE:
@@ -916,6 +1002,7 @@ def compile_exact_graph_row_predicates(
         predicates.append(predicate)
         output_window_only.append(structured_attribute)
         required_matches.append(True)
+        match_condition_groups.append(((len(predicates) - 1, True),))
 
     datetime_predicate, datetime_params = (
         BaseQueryBuilder.bounded_datetime_exclusion_sql(
@@ -932,11 +1019,12 @@ def compile_exact_graph_row_predicates(
         contribution_predicates.append(datetime_predicate)
 
     return ExactGraphRowPredicatePlan(
-        tuple(predicates),
-        tuple(output_window_only),
-        tuple(required_matches),
-        tuple(contribution_predicates),
-        bound_params,
+        predicates=tuple(predicates),
+        output_window_only=tuple(output_window_only),
+        required_matches=tuple(required_matches),
+        match_condition_groups=tuple(match_condition_groups),
+        contribution_predicates=tuple(contribution_predicates),
+        params=bound_params,
     )
 
 

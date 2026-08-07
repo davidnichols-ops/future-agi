@@ -192,6 +192,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         search: str | None = None,
         columns: list[str] | None = None,
         annotation_label_ids: list[str] | None = None,
+        annotation_label_ids_by_project: dict[str, list[str]] | None = None,
         bounded_internal_scan: bool = False,
         bounded_identity_only: bool = False,
         bounded_membership_filters: list[dict] | None = None,
@@ -212,6 +213,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         self.search = search.strip() if search else None
         self.columns = columns
         self.annotation_label_ids = annotation_label_ids or []
+        self.annotation_label_ids_by_project = (
+            {
+                str(project_key): list(
+                    dict.fromkeys(str(label_id) for label_id in label_ids if label_id)
+                )
+                for project_key, label_ids in annotation_label_ids_by_project.items()
+            }
+            if annotation_label_ids_by_project is not None
+            else None
+        )
         self._bounded_internal_scan = bool(bounded_internal_scan)
         self._bounded_identity_only = bool(bounded_identity_only)
         # Graph sampling may narrow root seeding/order to one temporal
@@ -1999,6 +2010,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         residual_predicate = "1 = 1"
         if residual_filters:
             if org_scope:
+                requires_project_label_sets = any(
+                    (item.get("column_id") or item.get("columnId")) == "has_annotation"
+                    for item in residual_filters
+                )
+                if (
+                    requires_project_label_sets
+                    and self.annotation_label_ids_by_project is None
+                ):
+                    raise ValueError(
+                        "organization has_annotation requires per-project labels"
+                    )
                 # A trace id is tenant-local, not globally unique.  Compile the
                 # finite candidate batch into one project-scoped relational
                 # branch per tenant so an eval, annotation, or end-user match
@@ -2016,15 +2038,30 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     candidate_project_id,
                     project_trace_ids,
                 ) in enumerate(identities_by_project.items()):
+                    branch_label_ids = self.annotation_label_ids
+                    branch_label_set_known = False
+                    if self.annotation_label_ids_by_project is not None:
+                        if (
+                            candidate_project_id
+                            not in self.annotation_label_ids_by_project
+                        ):
+                            raise ValueError(
+                                "missing annotation label scope for organization project"
+                            )
+                        branch_label_ids = self.annotation_label_ids_by_project[
+                            candidate_project_id
+                        ]
+                        branch_label_set_known = True
                     residual_builder = self._FILTER_BUILDER_CLS(
                         table=self.TABLE,
                         query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
-                        annotation_label_ids=self.annotation_label_ids,
+                        annotation_label_ids=branch_label_ids,
                         project_id=candidate_project_id,
                         score_date_scope=scope_to_request_window,
                         span_date_scope=scope_to_request_window,
                         candidate_ids_param="candidate_trace_ids",
                         strict_trace_project_correlation=True,
+                        annotation_label_set_known=branch_label_set_known,
                     )
                     branch_predicate, branch_filter_params = residual_builder.translate(
                         residual_filters

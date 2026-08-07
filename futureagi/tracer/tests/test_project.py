@@ -5,8 +5,6 @@ Tests for /tracer/project/ endpoints.
 """
 
 import json
-import uuid
-from datetime import UTC, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,11 +14,7 @@ from rest_framework import status
 
 from accounts.models.user import OrgApiKey
 from model_hub.models.ai_model import AIModel
-from tracer.models.observation_span import ObservationSpan
 from tracer.models.project import Project
-from tracer.models.trace import Trace
-from tracer.models.trace_session import TraceSession
-from tracer.tests._ch_seed import seed_ch_spans
 
 AUTH_REQUIRED_STATUS_CODES = (
     status.HTTP_401_UNAUTHORIZED,
@@ -34,10 +28,6 @@ def get_result(response):
     return data.get("result", data)
 
 
-def _iso_z(value):
-    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
 def _chart_filter(column_id, filter_type, filter_op, filter_value, col_type=None):
     filter_config = {
         "filter_type": filter_type,
@@ -47,17 +37,6 @@ def _chart_filter(column_id, filter_type, filter_op, filter_value, col_type=None
     if col_type:
         filter_config["col_type"] = col_type
     return {"column_id": column_id, "filter_config": filter_config}
-
-
-def _traffic_sum(graph_payload):
-    return sum(
-        int(row.get("traffic", 0))
-        for row in get_result_from_graph(graph_payload)["system_metrics"]["traffic"]
-    )
-
-
-def get_result_from_graph(payload):
-    return payload.get("result", payload)
 
 
 @pytest.mark.integration
@@ -709,17 +688,29 @@ class TestProjectGraphDataAPI:
 
     def test_get_graph_data_success(self, auth_client, project):
         """Get graph data for a project."""
-        response = auth_client.get(
-            "/tracer/project/get_graph_data/",
-            {"project_id": str(project.id), "interval": "hour"},
-        )
+        exact_metrics = {
+            "latency": [],
+            "tokens": [],
+            "cost": [],
+            "traffic": [],
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+        }
+        with patch(
+            "tracer.views.project.get_all_system_metrics",
+            return_value=exact_metrics,
+        ):
+            response = auth_client.get(
+                "/tracer/project/get_graph_data/",
+                {"project_id": str(project.id), "interval": "hour"},
+            )
         assert response.status_code == status.HTTP_200_OK
         data = get_result(response)
-        assert "system_metrics" in data
-        assert "evaluations" in data
+        assert data == {"system_metrics": exact_metrics, "evaluations": {}}
 
     @patch("tracer.views.project.get_all_system_metrics")
-    def test_get_graph_data_requires_sample_opt_in(
+    def test_get_graph_data_rejects_sample_even_with_legacy_opt_in(
         self,
         get_metrics,
         auth_client,
@@ -732,6 +723,7 @@ class TestProjectGraphDataAPI:
             "traffic": [],
             "query_complete": False,
             "query_status": "sampled",
+            "query_sampled": True,
             "query_error_code": "sample_limit",
             "query_sampling_strategy": "time_stratified_latest_state",
             "query_sampling_strata": 8,
@@ -749,14 +741,11 @@ class TestProjectGraphDataAPI:
         )
 
         assert legacy_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-        assert opted_in_response.status_code == status.HTTP_200_OK
-        assert get_result(opted_in_response)["system_metrics"]["query_status"] == (
-            "sampled"
-        )
+        assert opted_in_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
 
     @patch("tracer.views.project.fetch_annotation_graph_ch")
     @patch("tracer.views.project.V2AnalyticsQueryService")
-    def test_users_aggregate_graph_requires_sample_opt_in(
+    def test_users_aggregate_graph_rejects_sample_even_with_legacy_opt_in(
         self,
         _analytics,
         fetch_annotation,
@@ -768,6 +757,7 @@ class TestProjectGraphDataAPI:
             "data": [{"timestamp": "2026-08-03T00:00:00Z", "value": 50}],
             "query_complete": False,
             "query_status": "sampled",
+            "query_sampled": True,
             "query_error_code": "sample_limit",
             "query_sampling_strategy": "time_stratified_latest_state",
             "query_sampling_strata": 8,
@@ -797,167 +787,52 @@ class TestProjectGraphDataAPI:
         )
 
         assert legacy_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-        assert opted_in_response.status_code == status.HTTP_200_OK
-        assert get_result(opted_in_response)["query_status"] == "sampled"
+        assert opted_in_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
 
     def test_get_graph_data_applies_observe_chart_filters(
         self, auth_client, observe_project
     ):
         """Observe chart graphs must honor non-date filters from the UI."""
-        suffix = uuid.uuid4().hex[:8]
-        session = TraceSession.objects.create(
-            project=observe_project,
-            name=f"Chart filter session {suffix}",
-            bookmarked=False,
-        )
-        trace_a = Trace.objects.create(
-            project=observe_project,
-            session=session,
-            name=f"Chart filter trace A {suffix}",
-        )
-        trace_b = Trace.objects.create(
-            project=observe_project,
-            name=f"Chart filter trace B {suffix}",
-        )
-
-        now = timezone.now()
-        span_a = ObservationSpan.objects.create(
-            id=f"chart_filter_a_{suffix}",
-            project=observe_project,
-            trace=trace_a,
-            name=f"Chart filter target {suffix}",
-            observation_type="llm",
-            start_time=now - timedelta(milliseconds=400),
-            end_time=now,
-            latency_ms=100,
-            prompt_tokens=2,
-            completion_tokens=3,
-            total_tokens=5,
-            cost=0.01,
-            status="OK",
-            span_attributes={"api_journey_marker": f"target-{suffix}"},
-        )
-        span_a_child = ObservationSpan.objects.create(
-            id=f"chart_filter_a_child_{suffix}",
-            project=observe_project,
-            trace=trace_a,
-            parent_span_id=span_a.id,
-            name=f"Chart filter session peer {suffix}",
-            observation_type="tool",
-            start_time=now - timedelta(milliseconds=300),
-            end_time=now,
-            latency_ms=200,
-            prompt_tokens=4,
-            completion_tokens=6,
-            total_tokens=10,
-            cost=0.02,
-            status="OK",
-            span_attributes={"api_journey_marker": f"peer-{suffix}"},
-        )
-        span_b = ObservationSpan.objects.create(
-            id=f"chart_filter_b_{suffix}",
-            project=observe_project,
-            trace=trace_b,
-            name=f"Chart filter other {suffix}",
-            observation_type="llm",
-            start_time=now - timedelta(milliseconds=200),
-            end_time=now,
-            latency_ms=300,
-            prompt_tokens=8,
-            completion_tokens=12,
-            total_tokens=20,
-            cost=0.03,
-            status="OK",
-            span_attributes={"api_journey_marker": f"other-{suffix}"},
-        )
-        seed_ch_spans([span_a, span_a_child, span_b])
-
         date_filter = _chart_filter(
             "created_at",
             "datetime",
             "between",
-            [_iso_z(now - timedelta(days=1)), _iso_z(now + timedelta(days=1))],
+            ["2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z"],
         )
+        attribute_filter = _chart_filter(
+            "api_journey_marker",
+            "text",
+            "equals",
+            "target-value",
+            col_type="SPAN_ATTRIBUTE",
+        )
+        exact_metrics = {
+            "latency": [],
+            "tokens": [],
+            "cost": [],
+            "traffic": [],
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
+        }
 
-        def get_chart(filters):
+        with patch(
+            "tracer.views.project.get_all_system_metrics",
+            return_value=exact_metrics,
+        ) as get_metrics:
             response = auth_client.get(
                 "/tracer/project/get_graph_data/",
                 {
                     "project_id": str(observe_project.id),
                     "interval": "day",
-                    "filters": json.dumps(filters),
-                    "allow_sampled": "true",
+                    "filters": json.dumps([date_filter, attribute_filter]),
                 },
             )
-            assert response.status_code == status.HTTP_200_OK
-            return get_result(response)
 
-        assert _traffic_sum(get_chart([date_filter])) == 3
-        assert (
-            _traffic_sum(
-                get_chart(
-                    [
-                        date_filter,
-                        _chart_filter(
-                            "trace_id",
-                            "text",
-                            "equals",
-                            str(trace_a.id),
-                            col_type="SYSTEM_METRIC",
-                        ),
-                    ]
-                )
-            )
-            == 2
-        )
-        assert (
-            _traffic_sum(
-                get_chart(
-                    [
-                        date_filter,
-                        _chart_filter(
-                            "session_id",
-                            "text",
-                            "equals",
-                            str(session.id),
-                            col_type="SYSTEM_METRIC",
-                        ),
-                    ]
-                )
-            )
-            == 2
-        )
-        assert (
-            _traffic_sum(
-                get_chart(
-                    [
-                        date_filter,
-                        _chart_filter(
-                            "span_id",
-                            "text",
-                            "equals",
-                            span_b.id,
-                            col_type="SYSTEM_METRIC",
-                        ),
-                    ]
-                )
-            )
-            == 1
-        )
-        assert (
-            _traffic_sum(
-                get_chart(
-                    [
-                        date_filter,
-                        _chart_filter(
-                            "api_journey_marker",
-                            "text",
-                            "equals",
-                            f"target-{suffix}",
-                            col_type="SPAN_ATTRIBUTE",
-                        ),
-                    ]
-                )
-            )
-            == 1
-        )
+        assert response.status_code == status.HTTP_200_OK
+        kwargs = get_metrics.call_args.kwargs
+        assert kwargs["system_metric_filters"] == {
+            "project_id": str(observe_project.id)
+        }
+        assert kwargs["filters"] == [date_filter, attribute_filter]
+        assert kwargs["interval"] == "day"

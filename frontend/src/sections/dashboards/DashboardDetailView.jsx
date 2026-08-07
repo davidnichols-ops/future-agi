@@ -1171,9 +1171,7 @@ export default function DashboardDetailView() {
   // --- Render ---
 
   if (isLoading) {
-    return (
-      <LoadingScreen sx={{ height: "60vh" }} />
-    );
+    return <LoadingScreen sx={{ height: "60vh" }} />;
   }
 
   if (!dashboard) {

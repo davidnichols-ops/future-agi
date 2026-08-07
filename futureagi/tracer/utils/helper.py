@@ -632,6 +632,59 @@ def get_annotation_labels_for_project(project_id, organization=None, project_ids
     ).distinct()
 
 
+def get_annotation_labels_by_project(
+    project_ids: list[str], organization=None
+) -> dict[str, list[AnnotationsLabels]]:
+    """Resolve annotation labels independently for each authorized project.
+
+    Trace/span ids are tenant-local and annotation completeness is a
+    per-project contract.  Returning a project-keyed mapping prevents org
+    readers from treating the union of disjoint label sets as though every
+    project required every label.  The Score relation is fetched once for the
+    finite authorized project list; label metadata is fetched once and remains
+    organization-scoped when the caller supplies the request organization.
+    """
+
+    from django.db.models import Q
+
+    from tracer.services.annotation_label_source import AnnotationLabelScoresProjectPG
+
+    normalized = tuple(dict.fromkeys(str(value) for value in project_ids if value))
+    result: dict[str, list[AnnotationsLabels]] = {
+        project_id: [] for project_id in normalized
+    }
+    if not normalized:
+        return result
+
+    score_label_ids = AnnotationLabelScoresProjectPG().label_ids_by_project(
+        list(normalized)
+    )
+    referenced_ids = {
+        label_id for values in score_label_ids.values() for label_id in values
+    }
+    label_query = AnnotationsLabels.objects.filter(
+        Q(project_id__in=normalized) | Q(id__in=referenced_ids),
+        deleted=False,
+    )
+    if organization is not None:
+        label_query = label_query.filter(organization=organization)
+    labels = list(label_query.distinct())
+    labels_by_id = {str(label.id): label for label in labels}
+
+    for label in labels:
+        owner_project_id = str(label.project_id) if label.project_id else None
+        if owner_project_id in result:
+            result[owner_project_id].append(label)
+    for project_id, label_ids in score_label_ids.items():
+        seen = {str(label.id) for label in result[project_id]}
+        for label_id in label_ids:
+            label = labels_by_id.get(str(label_id))
+            if label is not None and str(label.id) not in seen:
+                result[project_id].append(label)
+                seen.add(str(label.id))
+    return result
+
+
 def update_span_column_config_based_on_annotations(
     column_config: list[FieldConfig], annotation_labels: list[AnnotationsLabels]
 ):

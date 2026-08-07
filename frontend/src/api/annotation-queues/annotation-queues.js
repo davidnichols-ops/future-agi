@@ -12,6 +12,7 @@ import { scoreKeys } from "src/api/scores/scores";
 import { selectContractedList } from "src/api/contract-validation";
 import { ModelHubAnnotationQueuesForSourceResponse } from "src/generated/api-contracts/api.zod";
 import { paramsSerializer } from "src/utils/utils";
+import { getSafeActionErrorMessage } from "src/utils/errorUtils";
 
 const QUEUE_ENTRY_CONSUMED_FIELDS = [
   "queue",
@@ -1618,6 +1619,9 @@ export const useGetOrCreateDefaultQueue = ({ notifyOnError = true } = {}) => {
 export const useAddLabelToQueue = () => {
   const queryClient = useQueryClient();
   return useMutation({
+    // This mutation owns its user-facing failure state. Suppress the global
+    // MutationCache toast so one request cannot render two error messages.
+    meta: { errorHandled: true },
     mutationFn: ({ queueId, labelId }) =>
       axios.post(annotationQueueEndpoints.addLabel(queueId), {
         label_id: labelId,
@@ -1629,8 +1633,11 @@ export const useAddLabelToQueue = () => {
       });
     },
     onError: (error) => {
-      const msg = extractErrorMessage(error, "Failed to add label to queue");
-      enqueueSnackbar(typeof msg === "string" ? msg : JSON.stringify(msg), {
+      const msg = getSafeActionErrorMessage(
+        error,
+        "Failed to add label to queue",
+      );
+      enqueueSnackbar(msg, {
         variant: "error",
       });
     },
@@ -1640,6 +1647,7 @@ export const useAddLabelToQueue = () => {
 export const useRemoveLabelFromQueue = () => {
   const queryClient = useQueryClient();
   return useMutation({
+    meta: { errorHandled: true },
     mutationFn: ({ queueId, labelId }) =>
       axios.post(annotationQueueEndpoints.removeLabel(queueId), {
         label_id: labelId,
@@ -1651,11 +1659,11 @@ export const useRemoveLabelFromQueue = () => {
       });
     },
     onError: (error) => {
-      const msg = extractErrorMessage(
+      const msg = getSafeActionErrorMessage(
         error,
         "Failed to remove label from queue",
       );
-      enqueueSnackbar(typeof msg === "string" ? msg : JSON.stringify(msg), {
+      enqueueSnackbar(msg, {
         variant: "error",
       });
     },

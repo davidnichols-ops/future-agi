@@ -36,6 +36,17 @@ def _has_eval_filter(value: bool | str) -> dict:
     }
 
 
+def _has_annotation_filter(value: bool | str) -> dict:
+    return {
+        "column_id": "has_annotation",
+        "filter_config": {
+            "filter_type": "boolean",
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
+
+
 def _bounded_page(
     *,
     rows: list[dict] | None = None,
@@ -86,6 +97,175 @@ def _view_and_request():
         user=SimpleNamespace(organization=organization),
     )
     return view, request
+
+
+@pytest.mark.unit
+def test_org_session_relational_collision_fails_before_id_only_hydration():
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    project_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    session_id = str(uuid.uuid4())
+    builder = mock.MagicMock()
+    builder.supports_candidate_first_page.return_value = False
+    builder.supports_bounded_filter_scan.return_value = True
+    builder.recommended_filter_classify_batch_size.return_value = 50
+    builder_cls = mock.MagicMock(return_value=builder)
+    analytics = mock.MagicMock()
+    bounded = _bounded_page(
+        rows=[
+            {
+                "session_id": session_id,
+                "start_time": datetime(2026, 7, 31, 12, 0),
+                # The classifier computes this over roots *before* applying
+                # relational membership, so a matching A row cannot hide the
+                # colliding session UUID that also exists in project B.
+                "project_count": 2,
+            }
+        ],
+        total_rows_lower_bound=1,
+    )
+
+    with (
+        mock.patch("tracer.views.trace_session.SessionListQueryBuilderV2", builder_cls),
+        mock.patch(
+            "tracer.views.trace_session.read_bounded_filter_page",
+            return_value=bounded,
+        ),
+    ):
+        response = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=None,
+            project=None,
+            analytics=analytics,
+            validated_data={
+                "filters": [_attribute_filter()],
+                "sort_params": [],
+                "page_number": 0,
+                "page_size": 25,
+            },
+            org_project_ids=project_ids,
+        )
+
+    assert response == (
+        "error",
+        503,
+        "Session data is temporarily unavailable. Please retry.",
+        "service_unavailable",
+    )
+    builder.build_page_metrics_query.assert_not_called()
+    builder.build_content_query.assert_not_called()
+    builder.build_span_attributes_query.assert_not_called()
+    analytics.execute_ch_query.assert_not_called()
+
+
+@pytest.mark.unit
+def test_default_org_session_collision_fails_before_id_only_hydration():
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    project_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    session_id = str(uuid.uuid4())
+    builder = mock.MagicMock()
+    builder.supports_candidate_first_page.return_value = True
+    builder.build_candidate_page_query.return_value = ("candidate page", {})
+    builder_cls = mock.MagicMock(return_value=builder)
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.return_value = SimpleNamespace(
+        data=[
+            {
+                "session_id": session_id,
+                "session_start": datetime(2026, 7, 31, 12, 0),
+                "project_count": 2,
+                "max_project_count": 2,
+                "total_count": 1,
+            }
+        ]
+    )
+
+    with mock.patch(
+        "tracer.views.trace_session.SessionListQueryBuilderV2", builder_cls
+    ):
+        response = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=None,
+            project=None,
+            analytics=analytics,
+            validated_data={
+                "filters": [],
+                "sort_params": [],
+                "page_number": 0,
+                "page_size": 25,
+            },
+            org_project_ids=project_ids,
+        )
+
+    assert response == (
+        "error",
+        503,
+        "Session data is temporarily unavailable. Please retry.",
+        "service_unavailable",
+    )
+    builder.build_page_metrics_query.assert_not_called()
+    builder.build_content_query.assert_not_called()
+    builder.build_span_attributes_query.assert_not_called()
+
+
+@pytest.mark.unit
+def test_org_session_view_passes_disjoint_annotation_label_sets_to_builder():
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    project_a = str(uuid.uuid4())
+    project_b = str(uuid.uuid4())
+    label_a = SimpleNamespace(id=uuid.uuid4())
+    label_b = SimpleNamespace(id=uuid.uuid4())
+    builder = mock.MagicMock()
+    builder.supports_candidate_first_page.return_value = True
+    builder.build_candidate_page_query.return_value = ("candidate page", {})
+    builder.build_candidate_count_query.return_value = ("candidate count", {})
+    builder_cls = mock.MagicMock(return_value=builder)
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.side_effect = [
+        SimpleNamespace(data=[]),
+        SimpleNamespace(data=[{"total": 0}]),
+    ]
+
+    with (
+        mock.patch("tracer.views.trace_session.SessionListQueryBuilderV2", builder_cls),
+        mock.patch(
+            "tracer.views.trace_session.get_annotation_labels_by_project",
+            return_value={project_a: [label_a], project_b: [label_b]},
+        ) as label_source,
+    ):
+        status, payload = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=None,
+            project=None,
+            analytics=analytics,
+            validated_data={
+                "filters": [_has_annotation_filter(True)],
+                "sort_params": [],
+                "page_number": 0,
+                "page_size": 25,
+            },
+            org_project_ids=[project_a, project_b],
+        )
+
+    assert status == "ok"
+    assert payload["metadata"] == {"total_rows": 0}
+    label_source.assert_called_once_with(
+        [project_a, project_b], organization=request.organization
+    )
+    kwargs = builder_cls.call_args.kwargs
+    assert kwargs["annotation_label_ids"] == []
+    assert kwargs["annotation_label_ids_by_project"] == {
+        project_a: [str(label_a.id)],
+        project_b: [str(label_b.id)],
+    }
 
 
 @pytest.mark.unit
@@ -144,6 +324,34 @@ def test_direct_write_session_attribute_merge_unions_scalar_and_json_sources():
         "approved": True,
         "rejected": False,
     }
+
+
+@pytest.mark.unit
+def test_session_end_user_enrichment_drops_clickhouse_null_before_uuid_lookup():
+    from tracer.views.trace_session import TraceSessionView
+
+    session_id = str(uuid.uuid4())
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.return_value = SimpleNamespace(
+        data=[{"session_id": session_id, "end_user_id": None}]
+    )
+
+    with (
+        mock.patch(
+            "tracer.views.trace_session._resolve_session_ids_to_canonical",
+            return_value={session_id: session_id},
+        ),
+        mock.patch(
+            "tracer.services.clickhouse.v2.end_user_dict_reader.resolve_end_user_fields"
+        ) as resolve_end_user_fields,
+    ):
+        result = TraceSessionView._fetch_end_user_info(
+            [session_id],
+            analytics,
+        )
+
+    assert result == {}
+    resolve_end_user_fields.assert_not_called()
 
 
 @pytest.mark.unit

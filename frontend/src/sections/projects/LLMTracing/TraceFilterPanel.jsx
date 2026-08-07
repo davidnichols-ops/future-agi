@@ -1177,6 +1177,20 @@ function PropertyPicker({
                   <CircularProgress size={14} />
                 </Box>
               )}
+              {hasNextAttributePage && !isFetchingNextAttributePage && (
+                <Box
+                  sx={{ display: "flex", justifyContent: "center", py: 0.5 }}
+                >
+                  <Button
+                    data-filter-property-load-more
+                    size="small"
+                    onClick={() => fetchNextAttributePage()}
+                    sx={{ fontSize: 11 }}
+                  >
+                    Load more attributes
+                  </Button>
+                </Box>
+              )}
               {hiddenCount > 0 && (
                 <Typography
                   sx={{
@@ -1559,7 +1573,9 @@ function ValuePicker({
                 onDelete={(e) => {
                   e.stopPropagation();
                   onChange(
-                    selectedValues.filter((_, index) => index !== selectedIndex),
+                    selectedValues.filter(
+                      (_, index) => index !== selectedIndex,
+                    ),
                     selectedValueTypes.filter(
                       (_, index) => index !== selectedIndex,
                     ),
@@ -1805,7 +1821,12 @@ function ValuePicker({
             metricType === "custom_attribute" && (
               <Typography
                 role="status"
-                sx={{ px: 1.5, py: 0.75, fontSize: 11, color: "text.secondary" }}
+                sx={{
+                  px: 1.5,
+                  py: 0.75,
+                  fontSize: 11,
+                  color: "text.secondary",
+                }}
               >
                 Recent value limit reached. Search or enter an exact value.
               </Typography>
@@ -2531,6 +2552,11 @@ const TraceFilterPanel = ({
 
   // Query tab — fetch values for the selected field
   const [queryField, setQueryField] = useState(null);
+  const [queryValueSearch, setQueryValueSearch] = useState({
+    field: null,
+    value: "",
+  });
+  const debouncedQueryValueSearch = useDebounce(queryValueSearch, 500);
   const queryFieldProp = properties.find((p) => p.id === queryField);
   const queryMetricType = (() => {
     const cat = queryFieldProp?.category || "system";
@@ -2540,16 +2566,31 @@ const TraceFilterPanel = ({
     if (cat === "attribute") return "custom_attribute";
     return "system_metric";
   })();
+  const shouldFetchQueryValues = Boolean(
+    open &&
+      activeTab === "query" &&
+      queryField &&
+      !queryFieldProp?.choices?.length,
+  );
+  const effectiveQueryValueSearch =
+    debouncedQueryValueSearch?.field === queryField
+      ? debouncedQueryValueSearch.value
+      : "";
   const {
     data: queryValueOptions = [],
     isLoading: queryValuesLoading,
     isError: queryValuesError,
     queryReadState: queryValuesReadState,
+    fetchNextPage: fetchNextQueryValuesPage,
+    hasNextPage: hasNextQueryValuesPage,
+    isFetchingNextPage: isFetchingNextQueryValuesPage,
   } = useDashboardFilterValues({
     metricName: queryField || "",
     metricType: queryMetricType,
     projectIds: observeId ? [observeId] : [],
     source,
+    search:
+      queryMetricType === "custom_attribute" ? effectiveQueryValueSearch : "",
     pageSize: queryMetricType === "custom_attribute" ? 10 : undefined,
     attributeType:
       queryMetricType === "custom_attribute"
@@ -2562,6 +2603,7 @@ const TraceFilterPanel = ({
               : queryFieldProp?.type
           : undefined
         : undefined,
+    enabled: shouldFetchQueryValues,
   });
   const queryValuesMessage = getQueryReadMessage(
     queryValuesError ? "error" : queryValuesReadState,
@@ -2639,23 +2681,28 @@ const TraceFilterPanel = ({
       tokens.map((t) => {
         const queryFieldDef = queryFieldMap[t.field];
         const prop = propertyById[t.field];
+        const fieldType =
+          prop?.type ||
+          queryFieldDef?.panelType ||
+          (queryFieldDef?.type === "enum" ? "categorical" : "string");
+        const value = NO_VALUE_OPS.has(t.operator)
+          ? ""
+          : normalizeFieldType(fieldType) === "map"
+            ? t.value
+            : Array.isArray(t.value)
+              ? t.value
+              : [t.value];
         return {
           field: t.field,
           fieldName: prop?.name || queryFieldDef?.label,
           fieldCategory: resolveFieldCategory(undefined, prop || queryFieldDef),
-          fieldType:
-            prop?.type ||
-            queryFieldDef?.panelType ||
-            (queryFieldDef?.type === "enum" ? "categorical" : "string"),
+          fieldType,
           attributeTypes: prop?.attributeTypes,
           attributeTypesExact: prop?.attributeTypesExact,
           apiColType: prop?.apiColType || queryFieldDef?.apiColType,
           operator: QUERY_TO_BASIC_OP[t.operator] || t.operator,
-          value: NO_VALUE_OPS.has(t.operator)
-            ? ""
-            : Array.isArray(t.value)
-              ? t.value
-              : [t.value],
+          valueTypes: t.valueTypes,
+          value,
         };
       }),
     [propertyById, queryFieldMap],
@@ -3011,18 +3058,38 @@ const TraceFilterPanel = ({
                         r.value !== undefined &&
                         r.value !== null;
                 })
-                .map((r) => ({
-                  field: r.field,
-                  operator:
-                    BASIC_TO_QUERY_OP[normalizeFilterRowOperator(r).operator] ||
-                    normalizeFilterRowOperator(r).operator,
-                  value: Array.isArray(r.value) ? r.value : r.value || "",
-                }))}
+                .map((r) => {
+                  const normalizedRow = normalizeFilterRowOperator(r);
+                  const value =
+                    normalizeFieldType(r.fieldType) === "map" &&
+                    isPlainObject(r.value)
+                      ? JSON.stringify(r.value)
+                      : Array.isArray(r.value)
+                        ? r.value
+                        : r.value ?? "";
+                  return {
+                    field: r.field,
+                    operator:
+                      BASIC_TO_QUERY_OP[normalizedRow.operator] ||
+                      normalizedRow.operator,
+                    value,
+                    valueTypes: r.valueTypes,
+                  };
+                })}
               valueOptions={queryValueOptions}
               valueLoading={queryValuesLoading}
-              onFieldChange={setQueryField}
+              valueLoadingMore={isFetchingNextQueryValuesPage}
+              hasMoreValues={Boolean(hasNextQueryValuesPage)}
+              onLoadMoreValues={() => fetchNextQueryValuesPage?.()}
+              onValueSearchChange={(value, field) =>
+                setQueryValueSearch({ field: field ?? queryField, value })
+              }
+              onFieldChange={(field) => {
+                setQueryValueSearch({ field, value: "" });
+                setQueryField(field);
+              }}
             />
-            {queryField && queryValuesMessage && (
+            {shouldFetchQueryValues && queryValuesMessage && (
               <Typography
                 role="status"
                 sx={{ fontSize: 11, color: "warning.main", mt: 0.75, px: 0.5 }}

@@ -81,6 +81,40 @@ _EVAL_LEGACY_COLUMN_MARKERS = {
     "latest_eval._peerdb_version": "latest_eval.__eval_legacy_version__",
 }
 
+# ``model_hub_score`` is not part of the spans migration and retains PeerDB's
+# CDC columns on the CH25 connection. Filter fragments can mix migrated spans
+# with one or more nested Score subqueries, so protect only aliases proven to
+# originate from that physical table while the global span-column rewrite runs.
+_SCORE_LEGACY_ALIAS_RE = re.compile(
+    r"\bmodel_hub_score\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\b",
+    re.IGNORECASE,
+)
+
+
+def _protect_score_legacy_columns(sql: str) -> tuple[str, tuple[str, ...]]:
+    aliases = tuple(dict.fromkeys(_SCORE_LEGACY_ALIAS_RE.findall(sql)))
+    for alias in aliases:
+        sql = sql.replace(
+            f"{alias}._peerdb_is_deleted",
+            f"{alias}.__score_legacy_cdc_deleted__",
+        ).replace(
+            f"{alias}._peerdb_version",
+            f"{alias}.__score_legacy_version__",
+        )
+    return sql, aliases
+
+
+def _restore_score_legacy_columns(sql: str, aliases: tuple[str, ...]) -> str:
+    for alias in aliases:
+        sql = sql.replace(
+            f"{alias}.__score_legacy_cdc_deleted__",
+            f"{alias}._peerdb_is_deleted",
+        ).replace(
+            f"{alias}.__score_legacy_version__",
+            f"{alias}._peerdb_version",
+        )
+    return sql
+
 
 # ─── JSON-overflow access rewrites ────────────────────────────────────────────
 # Schema 013 stores attributes_extra as String JSON. Preserve JSONExtract*/
@@ -252,6 +286,7 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
     # span SQL uses CH25. Preserve eval aliases' version/tombstone columns
     # through the global span-column rewrite. A v2 eval source never emits
     # these tokens, so this is a no-op for that table shape.
+    sql, score_legacy_aliases = _protect_score_legacy_columns(sql)
     for source, marker in _EVAL_LEGACY_COLUMN_MARKERS.items():
         sql = sql.replace(source, marker)
 
@@ -327,6 +362,7 @@ def rewrite_v1_sql_to_v2(sql: str) -> str:
     sql = _DICT_RENAME_RE.sub(lambda m: _DICT_RENAMES[m.group(1)], sql)
     for source, marker in _EVAL_LEGACY_COLUMN_MARKERS.items():
         sql = sql.replace(marker, source)
+    sql = _restore_score_legacy_columns(sql, score_legacy_aliases)
     # NOTE: this function does NOT append the v2 SETTINGS clause. The settings
     # are appended at the BUILDER boundary (v2 `build()`/`build_count_query()` etc)
     # via `_append_v2_settings()` — see ClickHouseFilterBuilderV2.translate.

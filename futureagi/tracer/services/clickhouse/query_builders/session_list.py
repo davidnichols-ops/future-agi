@@ -10,6 +10,7 @@ ID) into every span row, we can compute per-session aggregates in a single
 ``GROUP BY`` without JOINs.
 """
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -118,6 +119,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         filters: list[dict] | None = None,
         sort_params: list[dict] | None = None,
         user_id: str | None = None,
+        annotation_label_ids: list[str] | None = None,
+        annotation_label_ids_by_project: dict[str, list[str]] | None = None,
         bounded_internal_scan: bool = False,
         bounded_sampling_salt: str | None = None,
         bounded_sampling_rate: float | None = None,
@@ -129,6 +132,17 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         self.filters = filters or []
         self.sort_params = sort_params or []
         self.user_id = user_id
+        self.annotation_label_ids = annotation_label_ids or []
+        self.annotation_label_ids_by_project = (
+            {
+                str(project_key): list(
+                    dict.fromkeys(str(label_id) for label_id in label_ids if label_id)
+                )
+                for project_key, label_ids in annotation_label_ids_by_project.items()
+            }
+            if annotation_label_ids_by_project is not None
+            else None
+        )
         self._bounded_internal_scan = bool(bounded_internal_scan)
         if (bounded_sampling_salt is None) != (bounded_sampling_rate is None):
             raise ValueError(
@@ -223,6 +237,226 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 raise ValueError("invalid has_eval session filter")
             values.append(value)
         return tuple(values)
+
+    @staticmethod
+    def _bounded_relational_filter_groups(
+        residual_filters: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split the legacy ``has_eval`` lane from other relational leaves.
+
+        ``has_eval`` already has a purpose-built finite latest-state compiler
+        whose SQL contract is pinned by the session-list tests.  Annotation,
+        annotator, ``has_annotation`` and eval-value leaves share the canonical
+        trace relational compiler, but are applied only after a finite session
+        batch has yielded its trace IDs.
+        """
+
+        has_eval_filters: list[dict[str, Any]] = []
+        generic_filters: list[dict[str, Any]] = []
+        for item in residual_filters:
+            if not isinstance(item, dict):
+                raise ValueError("invalid relational session filter")
+            column_id = item.get("column_id") or item.get("columnId")
+            if column_id == "has_eval":
+                has_eval_filters.append(item)
+            else:
+                generic_filters.append(item)
+        return has_eval_filters, generic_filters
+
+    def _validate_bounded_relational_filters(
+        self,
+        residual_filters: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Validate relational leaves without issuing a ClickHouse read.
+
+        Organization-wide session pages are accepted only when every
+        ``has_annotation`` branch has an authoritative project-local label set.
+        The membership compiler below keeps every other relational leaf inside
+        a finite per-project branch, so tenant-local trace ids never cross-match.
+        """
+
+        has_eval_filters, generic_filters = self._bounded_relational_filter_groups(
+            residual_filters
+        )
+        self._bounded_has_eval_values(has_eval_filters)
+
+        allowed_keys = {"annotator", "has_annotation", "my_annotations"}
+        allowed_types = {"ANNOTATION", "EVAL_METRIC"}
+        for item in generic_filters:
+            column_id = item.get("column_id") or item.get("columnId")
+            config = item.get("filter_config") or item.get("filterConfig")
+            if not column_id or not isinstance(config, dict):
+                raise ValueError("invalid relational session filter")
+            column_type = str(
+                config.get("col_type") or config.get("colType") or ""
+            ).upper()
+            if column_id not in allowed_keys and column_type not in allowed_types:
+                raise ValueError("unsupported relational session filter")
+            if column_id == "has_annotation":
+                self._FILTER_BUILDER_CLS._parse_boolean_meta_filter(
+                    "has_annotation",
+                    config.get("filter_value", config.get("filterValue")),
+                    config.get("filter_op") or config.get("filterOp"),
+                )
+                if self.project_ids is not None:
+                    if self.annotation_label_ids_by_project is None:
+                        raise ValueError(
+                            "organization has_annotation requires per-project labels"
+                        )
+                    missing_projects = set(self.project_ids) - set(
+                        self.annotation_label_ids_by_project
+                    )
+                    if missing_projects:
+                        raise ValueError(
+                            "missing annotation label scope for organization project"
+                        )
+        return has_eval_filters, generic_filters
+
+    def _bounded_relational_membership_plan(
+        self,
+        relational_filters: list[dict[str, Any]],
+        *,
+        scope_to_request_window: bool,
+        available_params: dict[str, Any],
+    ) -> tuple[str, tuple[str, ...], dict[str, Any]]:
+        """Compile exact trace predicates over a finite derived trace set.
+
+        The shared trace filter compiler normally receives candidate trace IDs
+        as a Python parameter.  Session classification starts from session IDs,
+        so those trace IDs exist only inside ``resolved_root_sessions``.  This
+        method replaces the compiler's trusted internal candidate placeholder
+        with a CTE over that already-bounded relation.  Any relational leaf
+        containing a table read but lacking that candidate guard is rejected;
+        this prevents an accidental whole-project score/eval scan.
+        """
+
+        if not relational_filters:
+            return "", (), {}
+        candidate_param = "session_relational_trace_ids"
+        candidate_placeholder = f"%({candidate_param})s"
+        merged_params: dict[str, Any] = {}
+        needs_candidate_cte = False
+        org_scope = self.project_ids is not None
+        branch_projects = self.project_ids if org_scope else [self.project_id]
+        branch_predicates: list[str] = []
+
+        for branch_index, branch_project_id in enumerate(branch_projects):
+            if not branch_project_id:
+                raise ValueError("relational session filter requires a project scope")
+            branch_label_ids = self.annotation_label_ids
+            branch_label_set_known = False
+            if org_scope and self.annotation_label_ids_by_project is not None:
+                if branch_project_id not in self.annotation_label_ids_by_project:
+                    raise ValueError(
+                        "missing annotation label scope for organization project"
+                    )
+                branch_label_ids = self.annotation_label_ids_by_project[
+                    branch_project_id
+                ]
+                branch_label_set_known = True
+
+            leaf_predicates: list[str] = []
+            for leaf_index, item in enumerate(relational_filters):
+                filter_builder = self._FILTER_BUILDER_CLS(
+                    table=self.TABLE,
+                    annotation_label_ids=branch_label_ids,
+                    query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
+                    project_id=branch_project_id,
+                    score_date_scope=scope_to_request_window,
+                    span_date_scope=scope_to_request_window,
+                    candidate_ids_param=candidate_param,
+                    strict_trace_project_correlation=org_scope,
+                    annotation_label_set_known=branch_label_set_known,
+                )
+                predicate, leaf_params = filter_builder.translate([item])
+                if not predicate:
+                    raise ValueError("relational session filter compiled no predicate")
+
+                normalized_sql = f" {' '.join(predicate.upper().split())} "
+                used_candidate_scope = candidate_placeholder in predicate
+                if " FROM " in normalized_sql and not used_candidate_scope:
+                    raise ValueError(
+                        "relational session filter is missing finite candidate scope"
+                    )
+                if used_candidate_scope:
+                    candidate_select = (
+                        "(SELECT trace_id FROM candidate_relational_trace_ids)"
+                    )
+                    if org_scope:
+                        candidate_select = (
+                            "(SELECT trace_id FROM candidate_relational_trace_ids "
+                            "WHERE project_id = toUUID(%(project_id)s))"
+                        )
+                    predicate = predicate.replace(
+                        candidate_placeholder, candidate_select
+                    )
+                    needs_candidate_cte = True
+
+                # Each leaf compiler starts its deterministic parameter counter
+                # at one. Namespace branch-local values before combining leaves;
+                # request window values intentionally remain shared.
+                branch_sources = {
+                    **available_params,
+                    **leaf_params,
+                    "project_id": branch_project_id,
+                }
+                for placeholder_name in sorted(
+                    set(re.findall(r"%\(([A-Za-z_][A-Za-z0-9_]*)\)s", predicate))
+                ):
+                    if placeholder_name in leaf_params or (
+                        org_scope and placeholder_name == "project_id"
+                    ):
+                        if org_scope:
+                            namespaced_name = (
+                                f"session_relational_{branch_index}_{leaf_index}_"
+                                f"{placeholder_name}"
+                            )
+                        else:
+                            namespaced_name = (
+                                f"session_relational_{leaf_index}_{placeholder_name}"
+                            )
+                        predicate = predicate.replace(
+                            f"%({placeholder_name})s", f"%({namespaced_name})s"
+                        )
+                        merged_params[namespaced_name] = branch_sources[
+                            placeholder_name
+                        ]
+                    elif placeholder_name not in branch_sources:
+                        raise AssertionError(
+                            f"unbound session relational parameter {placeholder_name!r}"
+                        )
+                leaf_predicates.append(f"({predicate})")
+
+            branch_predicate = " AND ".join(leaf_predicates) or "1 = 1"
+            if org_scope:
+                outer_project_param = (
+                    f"session_relational_{branch_index}_outer_project_id"
+                )
+                merged_params[outer_project_param] = branch_project_id
+                branch_predicate = (
+                    "(project_id = "
+                    f"toUUID(%({outer_project_param})s) "
+                    f"AND ({branch_predicate}))"
+                )
+            branch_predicates.append(branch_predicate)
+
+        ctes = ""
+        if needs_candidate_cte:
+            candidate_project_select = ""
+            if org_scope:
+                candidate_project_select = "project_id, "
+            ctes = f""",
+        candidate_relational_trace_ids AS (
+            SELECT DISTINCT {candidate_project_select}toString(trace_id) AS trace_id
+            FROM resolved_root_sessions
+            WHERE notEmpty(toString(trace_id))
+        )"""
+        combined_predicate = (
+            " OR ".join(branch_predicates)
+            if org_scope
+            else " AND ".join(branch_predicates)
+        )
+        return ctes, (f"({combined_predicate})",), merged_params
 
     @classmethod
     def _bounded_eval_membership_ctes(
@@ -321,18 +555,15 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         except (TypeError, ValueError):
             return "unsupported_filter_shape"
         if residual:
-            if any(
-                not isinstance(item, dict)
-                or (item.get("column_id") or item.get("columnId")) != "has_eval"
-                for item in residual
-            ):
-                # Score-label filters are removed by the caller and intersected
-                # in PG. Other relational filters still have no finite session
-                # classifier and must never fall back broad.
-                return "unsupported_relational_session_filter"
             try:
-                self._bounded_has_eval_values(residual)
-            except ValueError:
+                self._validate_bounded_relational_filters(residual)
+            except ValueError as exc:
+                if (
+                    "unsupported relational" in str(exc)
+                    or "per-project labels" in str(exc)
+                    or "annotation label scope" in str(exc)
+                ):
+                    return "unsupported_relational_session_filter"
                 return "unsupported_filter_shape"
         return None
 
@@ -662,6 +893,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         if end_time_filters:
             filter_builder = ClickHouseFilterBuilder(
                 table=self.TABLE,
+                annotation_label_ids=self.annotation_label_ids,
                 project_id=self.project_id,
                 project_ids=self.project_ids,
             )
@@ -882,6 +1114,28 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             if root_membership_predicates
             else ""
         )
+        org_project_count_cte = ""
+        org_project_count_join = ""
+        org_project_count_select = ""
+        if self.project_ids is not None:
+            # Session UUIDs are generated globally, but an imported/direct-write
+            # tenant can still reuse one.  Detect that impossible-to-represent
+            # org identity before page hydration: every enrichment API is keyed
+            # by the public UUID alone, so merging two projects would be worse
+            # than a sanitized retryable failure.  The view rejects project_count
+            # > 1 before issuing those hydration reads.
+            org_project_count_cte = """,
+        candidate_session_project_counts AS (
+            SELECT
+                session_id,
+                uniqExact(project_id) AS project_count
+            FROM resolved_root_sessions
+            GROUP BY session_id
+        )"""
+            org_project_count_join = (
+                "INNER JOIN candidate_session_project_counts USING (session_id)"
+            )
+            org_project_count_select = ", max(project_count) AS project_count"
         return f"""
         {ts_map_ctes}
         {candidate_session_cte}
@@ -915,6 +1169,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         resolved_root_sessions AS (
             SELECT
                 {resolved_session} AS session_id,
+                project_id,
                 start_time
                 {resolved_metric_select}
             FROM latest_roots
@@ -928,13 +1183,16 @@ class SessionListQueryBuilder(BaseQueryBuilder):
               {f"AND {' AND '.join(root_filter_predicates)}" if root_filter_predicates else ""}
         )
         {additional_root_ctes}
-        {user_ctes},
+        {user_ctes}
+        {org_project_count_cte},
         sessions AS (
             SELECT
                 session_id,
                 min(start_time) AS session_start
                 {session_metric_select}
+                {org_project_count_select}
             FROM resolved_root_sessions
+            {org_project_count_join}
             WHERE 1 = 1
               {session_predicate}
               {user_membership}
@@ -985,7 +1243,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             "filter_seed_limit": int(limit),
         }
         plans, residual = self._bounded_span_filter_parts()
-        self._bounded_has_eval_values(residual)
+        self._validate_bounded_relational_filters(residual)
         root_witness_plan = self._bounded_root_witness_plan(plans)
         root_witness_predicate = (
             root_witness_plan.raw_witness_predicate if root_witness_plan else None
@@ -1117,7 +1375,18 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             raise ValueError("unsupported bounded session filter scan")
 
         plans, residual = self._bounded_span_filter_parts()
-        has_eval_values = self._bounded_has_eval_values(residual)
+        has_eval_filters, relational_filters = (
+            self._validate_bounded_relational_filters(residual)
+        )
+        if self.project_ids is not None:
+            # The eval log has no project column.  Org reads therefore compile
+            # has_eval through the same project-branched trace predicate as the
+            # other relational leaves, where config ids and a spans join bind
+            # each textual trace id back to its tenant.
+            relational_filters = [*has_eval_filters, *relational_filters]
+            has_eval_values: tuple[bool, ...] = ()
+        else:
+            has_eval_values = self._bounded_has_eval_values(has_eval_filters)
         start_date, end_date = self.parse_time_range(self.filters)
         params: dict[str, Any] = {
             **self.params,
@@ -1135,19 +1404,31 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             has_eval_values=has_eval_values,
             scope_to_request_window=scope_to_request_window,
         )
+        relational_ctes, relational_predicates, relational_params = (
+            self._bounded_relational_membership_plan(
+                relational_filters,
+                scope_to_request_window=scope_to_request_window,
+                available_params=params,
+            )
+        )
+        params.update(relational_params)
         candidate_ctes = self._candidate_session_ctes(
             params,
             candidate_session_ids=session_ids,
             root_filter_plans=tuple(plans),
             candidate_full_state=candidate_full_state,
-            include_trace_id=bool(has_eval_values),
-            additional_root_ctes=eval_ctes,
-            root_membership_predicates=eval_predicates,
+            include_trace_id=bool(has_eval_values or relational_filters),
+            additional_root_ctes=f"{eval_ctes}{relational_ctes}",
+            root_membership_predicates=(
+                *eval_predicates,
+                *relational_predicates,
+            ),
         )
         query = f"""
         WITH
         {candidate_ctes}
         SELECT session_id, session_start AS start_time
+            {", project_count" if self.project_ids is not None else ""}
         FROM sessions
         ORDER BY start_time DESC, toString(session_id) DESC
         LIMIT %(bounded_match_limit)s
@@ -1183,6 +1464,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         SELECT
             session_id,
             session_start,
+            {"project_count," if self.project_ids is not None else ""}
+            {"max(project_count) OVER() AS max_project_count," if self.project_ids is not None else ""}
             count() OVER() AS total_count
         FROM sessions
         {order_clause}
@@ -1211,7 +1494,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         query = f"""
         WITH
         {candidate_ctes}
-        SELECT count() AS total
+        SELECT count() AS total{", max(project_count) AS max_project_count" if self.project_ids is not None else ""}
         FROM sessions
         """
         return query, params
@@ -1325,6 +1608,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         span_filters = self._extract_span_filters()
         fb = ClickHouseFilterBuilder(
             table=self.TABLE,
+            annotation_label_ids=self.annotation_label_ids,
             project_id=self.project_id,
             project_ids=self.project_ids,
         )
@@ -1416,6 +1700,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         span_filters = self._extract_span_filters()
         fb = ClickHouseFilterBuilder(
             table=self.TABLE,
+            annotation_label_ids=self.annotation_label_ids,
             project_id=self.project_id,
             project_ids=self.project_ids,
         )
@@ -1610,6 +1895,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         span_filters = self._extract_span_filters()
         fb = ClickHouseFilterBuilder(
             table=self.TABLE,
+            annotation_label_ids=self.annotation_label_ids,
             project_id=self.project_id,
             project_ids=self.project_ids,
         )
@@ -1656,6 +1942,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         span_filters = self._extract_span_filters()
         fb = ClickHouseFilterBuilder(
             table=self.TABLE,
+            annotation_label_ids=self.annotation_label_ids,
             project_id=self.project_id,
             project_ids=self.project_ids,
         )

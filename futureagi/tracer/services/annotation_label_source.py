@@ -115,6 +115,38 @@ class AnnotationLabelScoresProjectPG:
         )
         return [str(lid) for lid in rows if lid]
 
+    def label_ids_by_project(self, project_ids: list[str]) -> dict[str, list[str]]:
+        """Return label ids grouped by their authoritative tracer project.
+
+        Organization list endpoints must not flatten this relation into one
+        label union: ``has_annotation`` means completeness against the labels
+        configured for *that row's* project.  Reading all requested projects
+        in one finite metadata query avoids an N+1 while preserving that
+        tenant boundary.
+        """
+
+        normalized = tuple(dict.fromkeys(str(value) for value in project_ids if value))
+        grouped: dict[str, list[str]] = {project_id: [] for project_id in normalized}
+        if not normalized:
+            return grouped
+
+        from model_hub.models.score import Score
+
+        rows = _materialize_score_rows(
+            Score.no_workspace_objects.filter(
+                self._trace_span_scope(),
+                tracer_project_id__in=normalized,
+            )
+            .order_by()
+            .values_list("tracer_project_id", "label_id")
+            .distinct()
+        )
+        for project_id, label_id in rows:
+            project_key = str(project_id)
+            if project_key in grouped and label_id:
+                grouped[project_key].append(str(label_id))
+        return grouped
+
     def annotator_ids_for_projects(self, project_ids: list[str]) -> list[str]:
         """Return distinct annotators for the requested tracer projects only."""
 

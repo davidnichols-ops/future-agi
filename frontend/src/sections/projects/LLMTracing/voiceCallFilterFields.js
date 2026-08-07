@@ -3,6 +3,14 @@
  * filters use canonical span/system metric ids. Keep that mapping in one
  * place so tracing and eval-task filters cannot silently diverge.
  */
+export const VOICE_CALL_STATUS_CHOICES = [
+  "completed",
+  "in-progress",
+  "failed",
+  "dropped",
+  "not-connected",
+];
+
 export const VOICE_CALL_FILTER_FIELDS = [
   {
     value: "call_status",
@@ -11,6 +19,10 @@ export const VOICE_CALL_FILTER_FIELDS = [
     type: "string",
     category: "system",
     apiColType: "SYSTEM_METRIC",
+    // Status is a closed canonical vocabulary in the list API. Supplying it
+    // locally keeps this critical filter usable even when the optional recent-
+    // values query is unavailable on a very large project.
+    choices: VOICE_CALL_STATUS_CHOICES,
     // The voice-list alias matches the normalized status rendered in Live
     // Preview (for example provider `ended` becomes `completed`). Generic
     // call.status remains a raw span attribute everywhere else.
