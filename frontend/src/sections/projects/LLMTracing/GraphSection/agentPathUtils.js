@@ -242,10 +242,10 @@ export const computeNaturalSize = (layout) => {
 export const computeSankeyLayout = (graphData) => {
   if (!graphData?.nodes?.length) return null;
 
-  // Agent Graph and Agent Path are separate wire projections of the same exact
-  // recorded parent -> child topology. Falling back keeps compatibility with
-  // an older cached payload during a rolling deploy, but an explicit empty path
-  // stays empty (it must not silently turn back into topology).
+  // Agent Path is the exact chronological adjacency projection; Agent Graph
+  // separately renders recorded parent_span_id hierarchy. Falling back to
+  // `edges` keeps compatibility with older cached payloads that predate
+  // `path_edges`, while an explicit empty path stays empty.
   const graphEdges =
     graphData.path_edges ?? graphData.pathEdges ?? graphData.edges ?? [];
 

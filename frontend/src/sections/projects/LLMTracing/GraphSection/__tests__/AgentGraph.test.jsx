@@ -101,15 +101,14 @@ describe("buildFlowData metric mapping", () => {
     );
   });
 
-  it("uses exact execution edges instead of recorded nesting for aggregate graphs", () => {
+  it("uses recorded parent-span topology instead of chronological path edges", () => {
     const graph = buildFlowData({
       nodes: [
         { id: "chain:root", name: "root", type: "chain" },
         { id: "chain:query", name: "query", type: "chain" },
         { id: "retriever:lookup", name: "lookup", type: "retriever" },
       ],
-      // These are authoritative parent_span_id relationships. They describe
-      // nesting, but not the execution transition between the two siblings.
+      // These are authoritative parent_span_id relationships.
       edges: [
         { source: "chain:root", target: "chain:query" },
         { source: "chain:root", target: "retriever:lookup" },
@@ -126,18 +125,17 @@ describe("buildFlowData metric mapping", () => {
 
     expect(
       graph.edges.map(({ source, target }) => `${source}->${target}`),
-    ).toEqual(["chain:root->chain:query", "chain:query->retriever:lookup"]);
-    expect(graph.edges[1]).toEqual(expect.objectContaining({ label: "×3" }));
+    ).toEqual(["chain:root->chain:query", "chain:root->retriever:lookup"]);
   });
 
-  it("does not replace an explicitly empty execution path with hierarchy", () => {
+  it("does not replace an explicitly empty hierarchy with chronological edges", () => {
     const graph = buildFlowData({
       nodes: [
         { id: "chain:root", name: "root", type: "chain" },
         { id: "tool:child", name: "child", type: "tool" },
       ],
-      edges: [{ source: "chain:root", target: "tool:child" }],
-      path_edges: [],
+      edges: [],
+      path_edges: [{ source: "chain:root", target: "tool:child" }],
     });
 
     expect(graph.edges).toEqual([]);

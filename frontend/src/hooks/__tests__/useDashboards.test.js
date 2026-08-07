@@ -305,6 +305,308 @@ describe("useDashboardFilterValues bounded-read state", () => {
     );
   });
 
+  it("stops after an exact empty terminal page", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "CONVERSATION", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "terminal-page",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [],
+            query_complete: true,
+            query_status: "complete",
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      });
+    const { result } = renderValues({ pageSize: 10 });
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(result.current.data).toEqual([
+      { value: "CONVERSATION", type: "string" },
+    ]);
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.get.mock.calls[1][1].params.cursor).toBe("terminal-page");
+  });
+
+  it("follows a duplicate-only continuation until a new value arrives", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "CONVERSATION", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "duplicate-page",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "CONVERSATION", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "unique-page",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "SPAN", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            browse_status: "exhausted",
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      });
+    const { result } = renderValues({ pageSize: 10 });
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(result.current.data).toEqual([
+      { value: "CONVERSATION", type: "string" },
+      { value: "SPAN", type: "string" },
+    ]);
+    expect(mocks.get).toHaveBeenCalledTimes(3);
+    expect(mocks.get.mock.calls[1][1].params.cursor).toBe("duplicate-page");
+    expect(mocks.get.mock.calls[2][1].params.cursor).toBe("unique-page");
+  });
+
+  it("finishes the d9d sparse value chain after pages 4-7 are empty", async () => {
+    const pageValues = [
+      ["page-1-a", "page-1-b", "page-1-c", "page-1-d"],
+      ["page-2-a"],
+      ["page-3-a", "page-3-b"],
+      [],
+      [],
+      [],
+      [],
+    ];
+    pageValues.forEach((values, index) => {
+      const terminal = index === pageValues.length - 1;
+      mocks.get.mockResolvedValueOnce({
+        data: {
+          result: {
+            values: values.map((value) => ({ value, type: "string" })),
+            query_complete: true,
+            query_status: "complete",
+            ...(terminal ? { browse_status: "exhausted" } : {}),
+            has_more: !terminal,
+            next_cursor: terminal ? null : `page-${index + 2}`,
+          },
+        },
+      });
+    });
+    const { result } = renderValues({ pageSize: 10 });
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+    expect(result.current.hasNextPage).toBe(true);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(3));
+    expect(result.current.hasNextPage).toBe(true);
+
+    // The next deliberate action lands on page 4. Pages 4-6 add no exact
+    // value, so the hook transparently advances through terminal page 7.
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(mocks.get).toHaveBeenCalledTimes(7);
+    expect(result.current.data).toHaveLength(7);
+    expect(mocks.get.mock.calls[3][1].params.cursor).toBe("page-4");
+    expect(mocks.get.mock.calls[6][1].params.cursor).toBe("page-7");
+  });
+
+  it("stops a repeated cursor instead of leaving another continuation", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "CONVERSATION", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "repeated-page",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "repeated-page",
+          },
+        },
+      });
+    const { result } = renderValues({ pageSize: 10 });
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(result.current.data).toEqual([
+      { value: "CONVERSATION", type: "string" },
+    ]);
+    expect(result.current.isError).toBe(false);
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not follow a cursor consumed inside an earlier fetch action", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "internal-page",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "CONVERSATION", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "outer-page",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "internal-page",
+          },
+        },
+      });
+    const { result } = renderValues({ pageSize: 10 });
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(result.current.data).toEqual([
+      { value: "CONVERSATION", type: "string" },
+    ]);
+    expect(result.current.isError).toBe(false);
+    expect(mocks.get).toHaveBeenCalledTimes(3);
+    expect(mocks.get.mock.calls[2][1].params.cursor).toBe("outer-page");
+  });
+
+  it.each(["exhausted", "limit_reached"])(
+    "treats %s as terminal even when has_more is malformed",
+    async (browseStatus) => {
+      mocks.get.mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [],
+            query_complete: true,
+            query_status: "complete",
+            browse_status: browseStatus,
+            has_more: true,
+            next_cursor: "must-not-be-requested",
+          },
+        },
+      });
+      const { result } = renderValues({ pageSize: 10 });
+
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(result.current.hasNextPage).toBe(false);
+      expect(mocks.get).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("bounds empty auto-follow and resumes until an exact value arrives", async () => {
+    let responseIndex = 0;
+    mocks.get.mockImplementation(async () => {
+      const current = responseIndex;
+      responseIndex += 1;
+      if (current >= 48) {
+        return {
+          data: {
+            result: {
+              values: [{ value: "eventually-found", type: "string" }],
+              query_complete: true,
+              query_status: "complete",
+              browse_status: "exhausted",
+              has_more: false,
+              next_cursor: null,
+            },
+          },
+        };
+      }
+      return {
+        data: {
+          result: {
+            values: [],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: `cursor-${current + 1}`,
+          },
+        },
+      };
+    });
+    const { result } = renderValues({ pageSize: 10 });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mocks.get).toHaveBeenCalledTimes(13);
+    expect(result.current.hasNextPage).toBe(true);
+
+    for (const expectedRequestCount of [26, 39]) {
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() =>
+        expect(mocks.get).toHaveBeenCalledTimes(expectedRequestCount),
+      );
+      expect(result.current.hasNextPage).toBe(true);
+    }
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+    expect(mocks.get).toHaveBeenCalledTimes(49);
+    expect(result.current.data).toEqual([
+      { value: "eventually-found", type: "string" },
+    ]);
+    expect(mocks.get.mock.calls[13][1].params.cursor).toBe("cursor-13");
+    expect(mocks.get.mock.calls[26][1].params.cursor).toBe("cursor-26");
+    expect(mocks.get.mock.calls[39][1].params.cursor).toBe("cursor-39");
+  });
+
   it("starts a searched result set without reusing the previous cursor", async () => {
     mocks.get.mockResolvedValue({
       data: {

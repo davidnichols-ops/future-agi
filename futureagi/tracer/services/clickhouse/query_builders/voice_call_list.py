@@ -102,11 +102,39 @@ def _raw_log_number(path: tuple[str, ...]) -> str:
     )
 
 
+def _raw_log_string(path: tuple[str, ...]) -> str:
+    """Read one provider string from object or encoded-string raw_log."""
+
+    quoted_path = ", ".join(f"'{part}'" for part in path)
+    nested_path = f"'raw_log', {quoted_path}"
+    encoded_raw_log = "JSONExtractString(span_attributes_raw, 'raw_log')"
+    map_raw_log = "span_attr_str['raw_log']"
+    return (
+        "coalesce("
+        f"nullIf(JSONExtractString(span_attributes_raw, {nested_path}), ''), "
+        f"nullIf(JSONExtractString({encoded_raw_log}, {quoted_path}), ''), "
+        f"nullIf(JSONExtractString({map_raw_log}, {quoted_path}), '')"
+        ")"
+    )
+
+
 _RAW_RETELL_COST_CENTS = _raw_log_number(("call_cost", "combined_cost"))
 _RAW_VAPI_COST_DOLLARS = _raw_log_number(("cost",))
 _RAW_ELEVEN_LABS_COST_CENTS = _raw_log_number(("metadata", "cost"))
 _RAW_PRICE_DOLLARS = _raw_log_number(("price",))
 _VOICE_PROVIDER = "lowerUTF8(toString(provider))"
+_VOICE_GEN_AI_SYSTEM = (
+    "lowerUTF8(toString(if(mapContains(span_attr_str, 'gen_ai.system'), "
+    "span_attr_str['gen_ai.system'], '')))"
+)
+_VOICE_RESOLVED_PROVIDER = (
+    "multiIf("
+    f"{_VOICE_PROVIDER} IN ('vapi', 'retell', 'eleven_labs', 'bland', 'twilio'), "
+    f"{_VOICE_PROVIDER}, "
+    f"{_VOICE_GEN_AI_SYSTEM} IN "
+    "('vapi', 'retell', 'eleven_labs', 'bland', 'twilio'), "
+    f"{_VOICE_GEN_AI_SYSTEM}, 'vapi')"
+)
 _VOICE_COST_CENTS_EXPR = (
     "coalesce("
     f"({_RAW_RETELL_COST_CENTS}), "
@@ -149,11 +177,32 @@ _VOICE_CANONICAL_RAW_STATUS = (
 _VOICE_HAS_RAW_LOG = (
     "(JSONHas(span_attributes_raw, 'raw_log') OR mapContains(span_attr_str, 'raw_log'))"
 )
+_VOICE_HAS_NONEMPTY_RAW_LOG = (
+    "((JSONHas(span_attributes_raw, 'raw_log') AND "
+    "JSONExtractRaw(span_attributes_raw, 'raw_log') NOT IN "
+    "('', '{}', 'null', '\"\"', '\"{}\"', '\"null\"')) OR "
+    "(mapContains(span_attr_str, 'raw_log') AND "
+    "span_attr_str['raw_log'] NOT IN ('', '{}', 'null')))"
+)
 _VOICE_IS_RETELL = _raw_log_has_key("call_status")
 _VOICE_IS_ELEVEN_LABS = _raw_log_has_key("conversation_id")
 _VOICE_IS_BLAND = _raw_log_has_key("call_length")
 _VOICE_IS_TWILIO = _raw_log_has_key("sid")
 _VOICE_IS_VAPI = f"({_raw_log_has_key('startedAt')} OR {_raw_log_has_key('createdAt')})"
+_VOICE_OTLP_CALL_ID = (
+    "nullIf(JSONExtractString(span_attributes_raw, 'metadata', "
+    "'call_execution_id'), '')"
+)
+_VOICE_CALL_ID_EXPR = (
+    "multiIf("
+    f"NOT {_VOICE_HAS_NONEMPTY_RAW_LOG}, {_VOICE_OTLP_CALL_ID}, "
+    f"({_VOICE_RESOLVED_PROVIDER}) = 'retell', {_raw_log_string(('call_id',))}, "
+    f"({_VOICE_RESOLVED_PROVIDER}) = 'eleven_labs', "
+    f"{_raw_log_string(('conversation_id',))}, "
+    f"({_VOICE_RESOLVED_PROVIDER}) = 'bland', {_raw_log_string(('call_id',))}, "
+    f"({_VOICE_RESOLVED_PROVIDER}) = 'twilio', {_raw_log_string(('sid',))}, "
+    f"{_raw_log_string(('id',))})"
+)
 _VOICE_CALL_STATUS_EXPR = (
     "multiIf("
     f"NOT {_VOICE_HAS_RAW_LOG}, "
@@ -175,6 +224,7 @@ _VOICE_CALL_STATUS_EXPR = (
 # compiler rewrites those tokens once at its normal schema boundary.
 VOICE_CALL_STATUS_FILTER_EXPRESSION = _VOICE_CALL_STATUS_EXPR
 VOICE_COST_CENTS_FILTER_EXPRESSION = _VOICE_COST_CENTS_EXPR
+VOICE_CALL_ID_FILTER_EXPRESSION = _VOICE_CALL_ID_EXPR
 
 
 class VoiceCallFilterBuilder(ClickHouseFilterBuilder):
@@ -192,6 +242,7 @@ class VoiceCallFilterBuilder(ClickHouseFilterBuilder):
     VOICE_SYSTEM_METRIC_STR_EXPRS = {
         **ClickHouseFilterBuilder.VOICE_SYSTEM_METRIC_STR_EXPRS,
         "call_status": VOICE_CALL_STATUS_FILTER_EXPRESSION,
+        "call_id": VOICE_CALL_ID_FILTER_EXPRESSION,
     }
 
 

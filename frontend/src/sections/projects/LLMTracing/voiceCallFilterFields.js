@@ -13,6 +13,17 @@ export const VOICE_CALL_STATUS_CHOICES = [
 
 export const VOICE_CALL_FILTER_FIELDS = [
   {
+    value: "call_id",
+    responseKey: "call_id",
+    label: "Call ID",
+    // Provider call ids are high-cardinality exact values.  Render a direct
+    // text input instead of issuing a broad distinct-values query.
+    type: "text",
+    category: "system",
+    apiColType: "SYSTEM_METRIC",
+    searchAliases: ["provider_call_id", "voice_call_id"],
+  },
+  {
     value: "call_status",
     responseKey: "status",
     label: "Status",

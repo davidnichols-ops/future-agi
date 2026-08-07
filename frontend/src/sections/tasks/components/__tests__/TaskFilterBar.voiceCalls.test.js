@@ -156,6 +156,35 @@ describe("TaskFilterBar voice-call filter contract", () => {
     ]);
   });
 
+  it("maps the displayed provider Call ID to the voice-list system alias", () => {
+    const formRows = convertNewToOld(
+      [
+        {
+          field: "call_id",
+          fieldName: "Call ID",
+          fieldCategory: "system",
+          fieldType: "text",
+          apiColType: "SYSTEM_METRIC",
+          operator: "in",
+          value: "call_384d399921cd470931481ef565c",
+        },
+      ],
+      { rowType: "voiceCalls" },
+    );
+
+    expect(buildApiFilterArray(formRows)).toEqual([
+      {
+        column_id: "call_id",
+        filter_config: {
+          filter_type: "text",
+          filter_op: "in",
+          filter_value: ["call_384d399921cd470931481ef565c"],
+          col_type: "SYSTEM_METRIC",
+        },
+      },
+    ]);
+  });
+
   it("hydrates legacy total_cost drafts back to their displayed cents value", () => {
     const legacyRows = [
       {

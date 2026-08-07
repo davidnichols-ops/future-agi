@@ -156,17 +156,48 @@ def test_voice_cost_cents_alias_normalizes_every_supported_provider():
 
 
 @pytest.mark.unit
+def test_voice_call_id_alias_matches_the_processed_list_value_for_every_provider():
+    where, params = VoiceCallFilterBuilder().translate(
+        [_system_filter("call_id", "text", "equals", "provider-call-123")]
+    )
+
+    # process_raw_logs provider dispatch: Vapi / Retell / ElevenLabs / Bland /
+    # Twilio read these exact provider payload keys.  OTLP roots without a
+    # raw_log use metadata.call_execution_id.
+    assert "'raw_log', 'id'" in where
+    assert "'raw_log', 'call_id'" in where
+    assert "'raw_log', 'conversation_id'" in where
+    assert "'raw_log', 'sid'" in where
+    assert "'metadata', 'call_execution_id'" in where
+    assert "gen_ai.system" in where
+    assert "'vapi', 'retell', 'eleven_labs', 'bland', 'twilio'" in where
+    assert "provider-call-123" in params.values()
+
+    # This alias is intentionally voice-list-only.  Generic trace filters must
+    # not reinterpret an arbitrary span attribute named call_id.
+    generic_where, _ = ClickHouseFilterBuilder().translate(
+        [_system_filter("call_id", "text", "equals", "provider-call-123")]
+    )
+    assert "span_attr_str['call_id']" in generic_where
+    assert "'conversation_id'" not in generic_where
+
+
+@pytest.mark.unit
 def test_voice_normalized_aliases_rewrite_to_ch25_columns():
     where, _ = VoiceCallFilterBuilderV2().translate(
         [
             _system_filter("call_status", "text", "equals", "completed"),
             _system_filter("cost_cents", "number", "greater_than", 1),
+            _system_filter("call_id", "text", "equals", "provider-call-123"),
         ]
     )
 
     assert "attrs_string['call.status']" in where
     assert "attrs_number['combined_cost']" in where
     assert "attributes_extra" in where
+    assert "attrs_string['gen_ai.system']" in where
+    assert "'metadata', 'call_execution_id'" in where
+    assert "'conversation_id'" in where
     assert "span_attr_str" not in where
     assert "span_attr_num" not in where
     assert "span_attributes_raw" not in where
@@ -195,6 +226,19 @@ def test_voice_normalized_aliases_rewrite_to_ch25_columns():
                 "'vapi', 'bland', 'twilio'",
             ),
             "attrs_number['cost_cents']",
+        ),
+        (
+            _system_filter(
+                "call_id", "text", "in", ["provider-call-123", "provider-call-456"]
+            ),
+            (
+                "'raw_log', 'id'",
+                "'raw_log', 'call_id'",
+                "'raw_log', 'conversation_id'",
+                "'raw_log', 'sid'",
+                "'metadata', 'call_execution_id'",
+            ),
+            "attrs_string['call_id']",
         ),
     ],
 )

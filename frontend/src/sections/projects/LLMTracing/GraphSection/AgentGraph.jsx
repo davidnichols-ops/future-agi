@@ -596,17 +596,11 @@ export const buildFlowData = (graphData, direction = "LR", theme = null) => {
 
   const nodeIdSet = new Set(graphData.nodes.map((n) => n.id));
 
-  // Aggregate Agent Graph payloads contain two exact projections:
-  //   - `edges`: recorded parent_span_id nesting
-  //   - `path_edges`: adjacent chronological execution inside each trace
-  //
-  // This visualization answers "how did the agent move?", matching the
-  // per-trace Agent Graph below the trace tree. Prefer the execution projection
-  // when the API supplies it; trace-detail graphs and rolling-deploy payloads
-  // only carry `edges`, so they retain their existing behavior. An explicit
-  // empty path remains empty instead of being replaced with hierarchy.
-  const graphEdges =
-    graphData.path_edges ?? graphData.pathEdges ?? graphData.edges ?? [];
+  // Agent Graph renders the recorded parent_span_id topology. Agent Path is
+  // the separate chronological projection and consumes `path_edges` itself.
+  // Using path_edges here invents parent/child relationships between adjacent
+  // sibling starts and can turn an otherwise acyclic span tree into a cycle.
+  const graphEdges = graphData.edges ?? [];
 
   const flowNodes = graphData.nodes.map((node) => ({
     id: node.id,

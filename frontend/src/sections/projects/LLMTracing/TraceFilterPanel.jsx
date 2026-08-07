@@ -589,7 +589,10 @@ export function filterPropertiesForPicker({
 }) {
   const query = normalizePropertySearchText(search);
   let list = properties || [];
-  if (hasCategorySidebar && category !== "all") {
+  // Text search is global.  A category selected during an earlier browse must
+  // not hide an exact system field (for example the Voice Calls `call_id`)
+  // while showing unrelated nested attributes with the same leaf name.
+  if (!query && hasCategorySidebar && category !== "all") {
     list = list.filter((property) => property.category === category);
   }
   if (!query) return list;
@@ -888,7 +891,11 @@ function PropertyPicker({
   });
 
   useEffect(() => {
-    if (!open) autoAttributeScrollPageUsedRef.current = false;
+    if (!open) {
+      autoAttributeScrollPageUsedRef.current = false;
+      setSearch("");
+      setCategory("all");
+    }
   }, [open]);
 
   useEffect(() => {
@@ -1045,7 +1052,11 @@ function PropertyPicker({
               fullWidth
               placeholder="Search properties..."
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => {
+                const nextSearch = e.target.value;
+                setSearch(nextSearch);
+                if (nextSearch.trim()) setCategory("all");
+              }}
               autoFocus
               InputProps={{
                 startAdornment: (

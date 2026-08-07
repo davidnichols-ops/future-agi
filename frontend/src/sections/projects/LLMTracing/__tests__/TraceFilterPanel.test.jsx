@@ -393,6 +393,14 @@ describe("getTraceFilterFields (TH-4571)", () => {
     expect(
       fields.find((field) => field.responseKey === "duration_seconds"),
     ).toMatchObject({ value: "duration", type: "number" });
+    expect(
+      fields.find((field) => field.responseKey === "call_id"),
+    ).toMatchObject({
+      value: "call_id",
+      type: "text",
+      category: "system",
+      apiColType: "SYSTEM_METRIC",
+    });
 
     // Normal trace/spans surfaces retain the OTel status column.
     expect(
@@ -428,6 +436,58 @@ describe("voice-call property search aliases", () => {
         }),
       ],
     );
+  });
+
+  it("finds the provider Call ID globally even after browsing Attributes", () => {
+    const nestedAttribute = {
+      id: "conversation.transcript.0.tool_calls.0.tool_call.id",
+      name: "conversation.transcript.0.tool_calls.0.tool_call.id",
+      category: "attribute",
+      type: "string",
+      apiColType: "SPAN_ATTRIBUTE",
+    };
+
+    expect(
+      filterPropertiesForPicker({
+        properties: [...properties, nestedAttribute],
+        category: "attribute",
+        search: "call_id",
+      }),
+    ).toEqual([
+      expect.objectContaining({
+        id: "call_id",
+        name: "Call ID",
+        category: "system",
+        apiColType: "SYSTEM_METRIC",
+      }),
+      nestedAttribute,
+    ]);
+  });
+
+  it("resets a browsed category when property search starts", () => {
+    const { anchorEl } = renderPanel({
+      properties: [
+        ...properties,
+        {
+          id: "conversation.transcript.0.tool_calls.0.tool_call.id",
+          name: "conversation.transcript.0.tool_calls.0.tool_call.id",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.click(screen.getByText("Attributes"));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "call_id" },
+    });
+
+    expect(
+      document.querySelector('[data-filter-property-option="call_id"]'),
+    ).toBeInTheDocument();
+    document.body.removeChild(anchorEl);
   });
 
   it("keeps canonical voice statuses available without a values request", () => {
