@@ -17,6 +17,7 @@ import re
 import threading
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -73,7 +74,9 @@ class VapiBackfillInput:
     ce_cursor_id: str | None = None
     snap_cursor_time: str | None = None
     snap_cursor_id: str | None = None
-    run_id: str = "vapi_recording_backfill"
+    run_id: str = field(
+        default_factory=lambda: f"vapi_recording_backfill_{uuid.uuid4().hex[:12]}"
+    )
     batch_seq: int = 0
     proof_gate: int | None = None
     min_records_per_second: float = 0.0
@@ -232,8 +235,6 @@ def _system_vapi_api_key() -> str | None:
     return os.getenv("VAPI_API_KEY") or None
 
 
-
-
 def _api_key(row: Any, project_id: str) -> str | None:
     """Match live simulation key selection, with system key as backup.
 
@@ -262,12 +263,6 @@ def _api_key(row: Any, project_id: str) -> str | None:
     if system_key:
         return system_key
     return VapiRecordingService.get_api_key_for_project(project_id)
-
-
-
-
-
-
 
 
 def _wait_for_api_slot(rate: int) -> None:
@@ -353,9 +348,6 @@ def _api_key_for_attributes(attrs: dict[str, str], project_id: str) -> str | Non
     if project_key:
         return project_key
     return _system_vapi_api_key()
-
-
-
 
 
 def _validate_storage_stat(stat: Any) -> None:
@@ -473,10 +465,6 @@ def _download(
     )
 
 
-
-
-
-
 def _object_key_from_existing_url(base: str, url: str) -> str | None:
     """Map a durable storage URL back to its object key without re-stat."""
     from simulate.temporal.utils.async_storage import (
@@ -532,7 +520,6 @@ def _stored(
     return url
 
 
-
 def _update_pg(row: Any, kind: str, old: str, new: str) -> bool:
     """Rewrite recording URLs on a fresh locked row.
 
@@ -571,7 +558,6 @@ def _update_pg(row: Any, kind: str, old: str, new: str) -> bool:
         if "provider_call_data" in fields:
             row.provider_call_data = locked.provider_call_data
         return True
-
 
 
 def _pg_pending_q():
@@ -756,8 +742,10 @@ def vapi_simulation_backfill_batch(inp: VapiBackfillInput) -> VapiBackfillResult
                 row, project_id
             )
             for kind, old in artifacts.items():
+                activity.heartbeat(out.processed, out.changed, out.fatal)
                 if inp.dry_run:
                     out.changed += 1
+                    activity.heartbeat(out.processed, out.changed, out.fatal)
                     continue
                 try:
                     base = _rehost_object_key_base(call_id, kind, project_id, "vapi")
@@ -791,6 +779,7 @@ def vapi_simulation_backfill_batch(inp: VapiBackfillInput) -> VapiBackfillResult
                     out.errors.append(
                         f"{type(row).__name__}:{row.pk}:{kind}: {type(exc).__name__}: {exc}"
                     )
+                activity.heartbeat(out.processed, out.changed, out.fatal)
             out.processed += 1
             activity.heartbeat(out.processed, out.changed, out.fatal)
         remaining = (
@@ -804,8 +793,8 @@ def vapi_simulation_backfill_batch(inp: VapiBackfillInput) -> VapiBackfillResult
         close_old_connections()
 
 
-def _json_replace(raw: str, replacements: dict[str, str]) -> str:
-    """Exact URL replace inside String JSON.
+def _json_replace(raw: str, replacements: dict[str, str]) -> tuple[str, bool]:
+    """Replace exact URL values inside String JSON and report whether it changed.
 
     Raises if rewrite is required but the payload is not valid JSON, so we never
     write a half-broken attributes_extra (fail closed → original span kept).
@@ -818,16 +807,30 @@ def _json_replace(raw: str, replacements: dict[str, str]) -> str:
             "refusing to rewrite"
         ) from exc
 
-    def walk(item: Any) -> Any:
+    def walk(item: Any) -> tuple[Any, bool]:
         if isinstance(item, str):
-            return replacements.get(item, item)
+            replacement = replacements.get(item, item)
+            return replacement, replacement != item
         if isinstance(item, dict):
-            return {key: walk(val) for key, val in item.items()}
+            changed = False
+            rewritten = {}
+            for key, val in item.items():
+                rewritten_val, val_changed = walk(val)
+                rewritten[key] = rewritten_val
+                changed = val_changed or changed
+            return rewritten, changed
         if isinstance(item, list):
-            return [walk(val) for val in item]
-        return item
+            changed = False
+            rewritten = []
+            for val in item:
+                rewritten_val, val_changed = walk(val)
+                rewritten.append(rewritten_val)
+                changed = val_changed or changed
+            return rewritten, changed
+        return item, False
 
-    return json.dumps(walk(value), separators=(",", ":"), ensure_ascii=False)
+    rewritten, changed = walk(value)
+    return json.dumps(rewritten, separators=(",", ":"), ensure_ascii=False), changed
 
 
 def _mapping_table(run_id: str, shard: int) -> str:
@@ -870,7 +873,6 @@ def _ch_shape(ch: Any) -> tuple[str, str | None, str, str, str]:
     )
 
 
-
 def _ch_map_predicate(active: str) -> str:
     """Pending Vapi/R2 URLs in the active string Map only (cheap, no wide JSON)."""
     keys = [key for group in CH_KEYS.values() for key in group]
@@ -904,7 +906,9 @@ def _ch_scan_settings(*, max_memory_bytes: int | None = None) -> dict[str, Any]:
         os.getenv("BACKFILL_CH_MAX_MEMORY_BYTES", str(2 * 1024**3))
     )
     return {
-        "max_execution_time": int(os.getenv("BACKFILL_CH_MAX_EXECUTION_SECONDS", "120")),
+        "max_execution_time": int(
+            os.getenv("BACKFILL_CH_MAX_EXECUTION_SECONDS", "120")
+        ),
         "max_memory_usage": memory,
         "max_threads": int(os.getenv("BACKFILL_CH_MAX_THREADS", "2")),
         # Prefer external spill over abort when possible.
@@ -992,9 +996,7 @@ def _proof_light_select(
     ignored = set(light)
     others = [col for col in stored if col not in ignored]
     # Hash remaining wide columns server-side so Python never materializes them.
-    other_hash = (
-        f"cityHash64(tuple({', '.join(others)}))" if others else "toUInt64(0)"
-    )
+    other_hash = f"cityHash64(tuple({', '.join(others)}))" if others else "toUInt64(0)"
     return light, other_hash
 
 
@@ -1014,9 +1016,10 @@ def _proof_rows(
     light, other_hash = _proof_light_select(stored, active, extra, version_col)
     rows = ch.execute(
         f"SELECT {', '.join(light)}, {other_hash} AS other_hash "
-        f"FROM spans FINAL WHERE project_id=%(project)s AND id IN %(ids)s",
+        f"FROM spans FINAL "
+        f"PREWHERE project_id=%(project)s AND id IN %(ids)s",
         {"project": project_id, "ids": tuple(span_ids)},
-        settings={"max_execution_time": 120},
+        settings=_ch_scan_settings(),
     )
     # row layout: light... + other_hash
     return {str(row[0]): row for row in rows}
@@ -1143,8 +1146,11 @@ def vapi_observability_backfill_batch(inp: VapiBackfillInput) -> VapiBackfillRes
     scan_settings = _ch_scan_settings()
 
     def _keyset(params: dict[str, Any]) -> str:
-        if inp.cursor_time and inp.cursor_trace_id and inp.cursor_id and (
-            phase == "map" or cursor_day is not None
+        if (
+            inp.cursor_time
+            and inp.cursor_trace_id
+            and inp.cursor_id
+            and (phase == "map" or cursor_day is not None)
         ):
             # Only apply keyset when staying inside the same phase/day.
             params.update(
@@ -1186,9 +1192,7 @@ def vapi_observability_backfill_batch(inp: VapiBackfillInput) -> VapiBackfillRes
             )
 
     if phase == "extra" and extra and remaining > 0 and not rows:
-        days = _ch_project_days(
-            ch, project_id=inp.project_id, deleted_col=deleted_col
-        )
+        days = _ch_project_days(ch, project_id=inp.project_id, deleted_col=deleted_col)
         if cursor_day is not None:
             # Resume from current day inclusive, then older days.
             days = [day for day in days if day <= cursor_day]
@@ -1263,6 +1267,7 @@ def vapi_observability_backfill_batch(inp: VapiBackfillInput) -> VapiBackfillRes
         replacements: dict[str, str] = {}
         patch_map: dict[str, str] = {}
         for kind, keys in CH_KEYS.items():
+            activity.heartbeat(out.processed, out.changed, out.fatal)
             old = next(
                 (attrs[key] for key in keys if _is_vapi_url(attrs.get(key))), None
             ) or extra_urls.get(kind)
@@ -1271,9 +1276,11 @@ def vapi_observability_backfill_batch(inp: VapiBackfillInput) -> VapiBackfillRes
             if not call_id:
                 out.fatal += 1
                 out.errors.append(f"span:{span_id}:{kind}: missing Vapi call ID")
+                activity.heartbeat(out.processed, out.changed, out.fatal)
                 continue
             if inp.dry_run:
                 out.changed += 1
+                activity.heartbeat(out.processed, out.changed, out.fatal)
                 continue
             try:
                 base = _rehost_object_key_base(
@@ -1314,21 +1321,23 @@ def vapi_observability_backfill_batch(inp: VapiBackfillInput) -> VapiBackfillRes
                     raise
                 out.fatal += 1
                 out.errors.append(f"span:{span_id}:{kind}: {type(exc).__name__}: {exc}")
+            activity.heartbeat(out.processed, out.changed, out.fatal)
         if replacements and not inp.dry_run:
             raw_extra_text = raw_extra or "{}"
-            # attributes_extra is String JSON (migration 013). Rewrite only when
-            # an exact old URL appears in the text; otherwise keep s.extra.
-            extra_changed = any(old in raw_extra_text for old in replacements)
+            # attributes_extra is String JSON. Only rewrite exact URL values;
+            # URLs embedded in non-target strings remain unchanged.
+            rewritten_extra = ""
+            extra_changed = False
+            if any(old in raw_extra_text for old in replacements):
+                rewritten_extra, extra_changed = _json_replace(
+                    raw_extra_text, replacements
+                )
             mappings.append(
                 {
                     "batch_seq": inp.batch_seq,
                     "span_id": str(span_id),
                     "patch_map": patch_map,
-                    "extra": (
-                        _json_replace(raw_extra_text, replacements)
-                        if extra_changed
-                        else ""
-                    ),
+                    "extra": rewritten_extra if extra_changed else "",
                     "extra_changed": 1 if extra_changed else 0,
                     "version": max(time.time_ns(), int(version) + 1),
                 }
@@ -1502,7 +1511,8 @@ def reconcile_backfill_sample(inp: VapiBackfillInput) -> dict[str, Any]:
         report["projects"] = len(by_project)
         report["map_pending_total"] = sum(count for _, count in by_project)
         report["by_project"] = [
-            {"project_id": project, "map_pending": count} for project, count in by_project
+            {"project_id": project, "map_pending": count}
+            for project, count in by_project
         ]
         report["note"] = (
             "extra_pending requires --project-id (day-chunked). "

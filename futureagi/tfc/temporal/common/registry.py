@@ -343,6 +343,7 @@ def _ensure_workflows_registered() -> None:
         from ee.voice.temporal.workflows.phone_number_dispatcher_workflow import (
             PhoneNumberDispatcherWorkflow,
         )
+
         from simulate.temporal.workflows.rerun_coordinator_workflow import (
             RerunCoordinatorWorkflow,
         )
@@ -866,7 +867,6 @@ def get_all_queues() -> list[str]:
     queues = set(list(_workflow_registry.keys()) + list(_activity_registry.keys()))
     queues.discard("backfill")
     return list(queues)
-
 
 
 def get_all_workflows() -> list[type]:

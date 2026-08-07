@@ -4,6 +4,7 @@ import pytest
 import requests
 
 from tfc.temporal.backfill.minimal_backfill import (
+    VapiBackfillInput,
     VapiMinimalBackfillWorkflow,
     _artifacts,
     _canonical_call_id,
@@ -19,11 +20,12 @@ from tfc.temporal.backfill.minimal_backfill import (
     _is_vapi_url,
     _json_replace,
     _mapping_table,
+    _proof_rows,
     _row_artifacts,
     _stored,
     _update_pg,
-    _validate_storage_stat,
     _valid_direct_audio,
+    _validate_storage_stat,
     _verify_proof_gate,
     get_activities,
     get_workflows,
@@ -159,24 +161,39 @@ def test_update_pg_replaces_all_exact_paths_and_preserves_unrelated_data(monkeyp
     assert set(row.saved) == {"recording_url", "provider_call_data"}
 
 
-
 def test_json_replace_only_changes_exact_urls():
     old, new = "https://storage.vapi.ai/a.wav", "https://s3/a.wav"
-    value = _json_replace(
+    value, changed = _json_replace(
         '{"nested":["https://storage.vapi.ai/a.wav","keep"]}', {old: new}
     )
+    assert changed
     assert new in value and "keep" in value
 
 
+def test_json_replace_ignores_embedded_non_exact_urls():
+    old, new = "https://storage.vapi.ai/a.wav", "https://s3/a.wav"
+    raw = '{"raw_log":"prefix https://storage.vapi.ai/a.wav suffix"}'
+    value, changed = _json_replace(raw, {old: new})
+    assert not changed
+    assert old in value
+    assert new not in value
+
 
 def test_json_replace_errors_on_invalid_json_when_rewrite_required():
-    import pytest
-    from tfc.temporal.backfill.minimal_backfill import _json_replace
-
     with pytest.raises(ValueError, match="not valid JSON"):
-        _json_replace('not-json https://storage.vapi.ai/x.wav', {
-            "https://storage.vapi.ai/x.wav": "https://s3.example/x.wav"
-        })
+        _json_replace(
+            "not-json https://storage.vapi.ai/x.wav",
+            {"https://storage.vapi.ai/x.wav": "https://s3.example/x.wav"},
+        )
+
+
+def test_run_id_default_is_unique_per_input():
+    first = VapiBackfillInput()
+    second = VapiBackfillInput()
+    assert first.run_id != second.run_id
+    assert first.run_id.startswith("vapi_recording_backfill_")
+    assert second.run_id.startswith("vapi_recording_backfill_")
+
 
 def test_url_classification_and_registration_factories():
     assert _is_vapi_url("https://storage.vapi.ai/a.wav")
@@ -415,7 +432,15 @@ def test_proof_light_select_never_includes_wide_columns():
     from tfc.temporal.backfill.minimal_backfill import _proof_light_select
 
     light, hash_expr = _proof_light_select(
-        ["id", "attrs_string", "attributes_extra", "_version", "input", "output", "name"],
+        [
+            "id",
+            "attrs_string",
+            "attributes_extra",
+            "_version",
+            "input",
+            "output",
+            "name",
+        ],
         "attrs_string",
         "attributes_extra",
         "_version",
@@ -460,7 +485,6 @@ def test_clickhouse_shape_requires_v2_and_refuses_v1(monkeypatch):
     )[0:2] == ("attrs_string", "attributes_extra")
 
 
-
 def test_reconcile_map_only_all_projects_and_day_chunked_extra(monkeypatch):
     """Reconcile must never issue a project-wide attributes_extra cold scan."""
     from tfc.temporal.backfill import minimal_backfill as mb
@@ -497,7 +521,13 @@ def test_reconcile_map_only_all_projects_and_day_chunked_extra(monkeypatch):
     monkeypatch.setattr(
         mb,
         "_ch_shape",
-        lambda ch: ("attrs_string", "attributes_extra", "Map(String, String)", "_version", "is_deleted"),
+        lambda ch: (
+            "attrs_string",
+            "attributes_extra",
+            "Map(String, String)",
+            "_version",
+            "is_deleted",
+        ),
     )
 
     all_projects = mb.reconcile_backfill_sample(
@@ -688,7 +718,6 @@ def test_api_key_inbound_uses_system_env_key(monkeypatch):
     assert mb._api_key(row, "proj") == "system-fagi-key"
 
 
-
 def test_api_key_outbound_uses_agent_definition(monkeypatch):
     from tfc.temporal.backfill import minimal_backfill as mb
 
@@ -765,12 +794,6 @@ def test_api_key_for_attributes_falls_back_to_system(monkeypatch):
     assert mb._api_key_for_attributes({}, "p1") == "system-fagi-key"
 
 
-
-
-
-
-
-
 def test_stored_resolves_existing_webm_without_restat(monkeypatch):
     from simulate.temporal.utils import async_storage as storage_helpers
     from tracer.utils.vapi_recording import VapiRecordingService
@@ -810,7 +833,9 @@ def test_stored_resolves_existing_webm_without_restat(monkeypatch):
         VapiRecordingService, "is_fagi_s3_url", staticmethod(lambda url: True)
     )
 
-    url = _stored("p", "call-1", "mono_combined", "https://storage.vapi.ai/old.wav", None)
+    url = _stored(
+        "p", "call-1", "mono_combined", "https://storage.vapi.ai/old.wav", None
+    )
     assert url == webm_url
 
 
@@ -877,7 +902,9 @@ def test_run_worker_rejects_backfill_multi_slot():
     from tfc.temporal.common.worker import run_worker
 
     with pytest.raises(ValueError, match="max_concurrent_activities=1"):
-        asyncio.run(run_worker("backfill", max_concurrent_activities=2, skip_otel_init=True))
+        asyncio.run(
+            run_worker("backfill", max_concurrent_activities=2, skip_otel_init=True)
+        )
 
 
 def test_simulation_activity_skips_bad_artifact_and_continues(monkeypatch):
@@ -981,3 +1008,236 @@ def test_get_all_queues_excludes_backfill(monkeypatch):
     assert "default" in queues
     assert "tasks_s" in queues
 
+
+def test_simulation_activity_heartbeats_per_artifact(monkeypatch):
+    from tfc.temporal.backfill import minimal_backfill as mb
+
+    class Row:
+        pk = "row-1"
+        provider_call_data = {
+            "vapi": {
+                "id": "call-1",
+                "artifact": {
+                    "recording": {
+                        "mono": {
+                            "combinedUrl": "https://storage.vapi.ai/a.wav",
+                            "customerUrl": "https://storage.vapi.ai/b.wav",
+                        }
+                    }
+                },
+            }
+        }
+        recording_url = None
+        stereo_recording_url = None
+        service_provider_call_id = "call-1"
+
+    row = Row()
+    events: list[tuple[str, object]] = []
+
+    monkeypatch.setattr("django.db.close_old_connections", lambda: None)
+    monkeypatch.setattr(
+        mb,
+        "_pg_rows",
+        lambda inp: (
+            [row],
+            {
+                "ce_cursor_time": None,
+                "ce_cursor_id": None,
+                "snap_cursor_time": None,
+                "snap_cursor_id": None,
+            },
+        ),
+    )
+    monkeypatch.setattr(mb, "_project_id", lambda r: "proj-1")
+    monkeypatch.setattr(
+        "simulate.temporal.utils.async_storage._existing_rehosted_audio",
+        lambda base: None,
+    )
+    monkeypatch.setattr(
+        "simulate.temporal.utils.async_storage._rehost_object_key_base",
+        lambda *a, **k: "base",
+    )
+
+    def download(url, call_id, kind, api_key_provider=None):
+        events.append(("download", kind))
+        return b"ok", "wav"
+
+    def stored(project_id, call_id, kind, original, audio, audio_ext=None):
+        events.append(("stored", kind))
+        return f"https://fi-content.s3.amazonaws.com/{kind}.wav"
+
+    monkeypatch.setattr(mb, "_download", download)
+    monkeypatch.setattr(mb, "_stored", stored)
+    monkeypatch.setattr(mb, "_update_pg", lambda *a, **k: True)
+    monkeypatch.setattr(
+        mb.activity,
+        "heartbeat",
+        lambda *args, **kwargs: events.append(("heartbeat", args)),
+    )
+
+    out = mb.vapi_simulation_backfill_batch(
+        mb.VapiBackfillInput(source="simulation", batch_size=10, limit=10)
+    )
+    assert out.processed == 1
+    assert out.changed == 2
+    assert [event for event, _ in events] == [
+        "heartbeat",
+        "download",
+        "stored",
+        "heartbeat",
+        "heartbeat",
+        "download",
+        "stored",
+        "heartbeat",
+        "heartbeat",
+    ]
+    assert [value for event, value in events if event == "download"] == [
+        "mono_combined",
+        "mono_customer",
+    ]
+    assert [value for event, value in events if event == "stored"] == [
+        "mono_combined",
+        "mono_customer",
+    ]
+
+
+def test_proof_rows_uses_prewhere_and_scan_settings(monkeypatch):
+    captured = {}
+
+    class FakeCH:
+        def execute(self, query, params=None, settings=None):
+            captured["query"] = query
+            captured["params"] = params
+            captured["settings"] = settings
+            return [("s1", {"recording_url": "old"}, 1, "{}", 111)]
+
+    monkeypatch.setattr(
+        "tfc.temporal.backfill.minimal_backfill._ch_scan_settings",
+        lambda: {"max_memory_usage": 123, "max_threads": 1, "max_execution_time": 30},
+    )
+    rows = _proof_rows(
+        FakeCH(),
+        stored=["id", "attrs_string", "attributes_extra", "_version", "name"],
+        active="attrs_string",
+        extra="attributes_extra",
+        version_col="_version",
+        project_id="p1",
+        span_ids=["s1"],
+    )
+    assert "s1" in rows
+    assert "PREWHERE project_id=%(project)s AND id IN %(ids)s" in captured["query"]
+    assert captured["settings"]["max_memory_usage"] == 123
+    assert captured["params"]["project"] == "p1"
+
+
+def test_observability_activity_builds_mapping_and_mutation(monkeypatch):
+    from datetime import datetime, timezone
+
+    from tfc.temporal.backfill import minimal_backfill as mb
+
+    old = "https://storage.vapi.ai/call.wav"
+    new = "https://fi-content.s3.amazonaws.com/mono_combined.wav"
+    start = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    queries = []
+    inserts = []
+
+    class FakeCH:
+        def execute(self, query, params=None, settings=None):
+            queries.append((query, params, settings))
+            if query.startswith("SELECT id,project_id,trace_id"):
+                return [
+                    (
+                        "span-1",
+                        "proj-1",
+                        "trace-1",
+                        start,
+                        7,
+                        {"recording_url": old, "keep_me": "yes"},
+                        '{"recording_url":"%s","note":"keep"}' % old,
+                    )
+                ]
+            if "system.columns" in query and "default_kind" in query:
+                return [
+                    ("id",),
+                    ("project_id",),
+                    ("attrs_string",),
+                    ("attributes_extra",),
+                    ("_version",),
+                    ("name",),
+                ]
+            return []
+
+        def insert(self, table, rows, columns):
+            inserts.append((table, rows, columns))
+
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.client.get_clickhouse_client", lambda: FakeCH()
+    )
+    monkeypatch.setattr(
+        mb,
+        "_ch_shape",
+        lambda ch: (
+            "attrs_string",
+            "attributes_extra",
+            "Map(String, String)",
+            "_version",
+            "is_deleted",
+        ),
+    )
+    monkeypatch.setattr(
+        "simulate.temporal.utils.async_storage._existing_rehosted_audio",
+        lambda base: None,
+    )
+    monkeypatch.setattr(
+        "simulate.temporal.utils.async_storage._rehost_object_key_base",
+        lambda *a, **k: "base",
+    )
+    monkeypatch.setattr(
+        mb,
+        "_download",
+        lambda url, call_id, kind, api_key_provider=None: (b"ok", "wav"),
+    )
+    monkeypatch.setattr(
+        mb,
+        "_stored",
+        lambda project_id, call_id, kind, original, audio, audio_ext=None: (
+            new
+            if kind == "mono_combined"
+            else f"https://fi-content.s3.amazonaws.com/{kind}.wav"
+        ),
+    )
+    monkeypatch.setattr(mb, "_ch_call_id", lambda attrs, extra_call_id=None: "call-1")
+    monkeypatch.setattr(mb.activity, "heartbeat", lambda *a, **k: None)
+
+    out = mb.vapi_observability_backfill_batch(
+        mb.VapiBackfillInput(
+            source="observability",
+            project_id="proj-1",
+            batch_size=10,
+            limit=10,
+            run_id="obs_run_1",
+            batch_seq=3,
+        )
+    )
+
+    assert out.processed == 1
+    assert out.changed == 1
+    assert out.done is False
+    assert out.ch_scan_phase == "extra"
+    assert inserts
+    table, rows, columns = inserts[0]
+    assert table == "backfill_mapping_obs_run_1_0"
+    assert columns == [
+        "batch_seq",
+        "span_id",
+        "patch_map",
+        "extra",
+        "extra_changed",
+        "version",
+    ]
+    assert rows[0]["span_id"] == "span-1"
+    assert rows[0]["patch_map"]["recording_url"] == new
+    assert rows[0]["extra_changed"] == 1
+    assert new in rows[0]["extra"]
+    assert any("INSERT INTO spans" in q for q, _, _ in queries)
+    assert any("mapUpdate(s.attrs_string, m.patch_map)" in q for q, _, _ in queries)
