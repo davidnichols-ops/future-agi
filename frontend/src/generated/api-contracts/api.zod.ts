@@ -9486,6 +9486,10 @@ export const ApiTracesSpanAttributeDetailListQueryParams = zod.object({
 })
 
 
+export const apiTracesSpanAttributeDetailListResponseTypesItemCountMin = 0;
+
+export const apiTracesSpanAttributeDetailListResponseTypesItemUniqueValuesMin = 0;
+
 export const apiTracesSpanAttributeDetailListResponseQueryCountMin = 0;
 
 export const apiTracesSpanAttributeDetailListResponseQueryElapsedMsMin = 0;
@@ -9517,8 +9521,14 @@ export const ApiTracesSpanAttributeDetailListResponse = zod.object({
   "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']),
   "count": zod.number(),
   "unique_values": zod.number().optional(),
+  "types": zod.array(zod.object({
+  "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']),
+  "count": zod.number().min(apiTracesSpanAttributeDetailListResponseTypesItemCountMin),
+  "unique_values": zod.number().min(apiTracesSpanAttributeDetailListResponseTypesItemUniqueValuesMin)
+})).optional(),
   "top_values": zod.array(zod.object({
   "value": spanAttributeJsonValueSchema,
+  "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']).optional(),
   "count": zod.number(),
   "percentage": zod.number()
 })).optional(),
@@ -9582,7 +9592,9 @@ export const ApiTracesSpanAttributeKeysListResponse = zod.object({
   "result": zod.array(zod.object({
   "key": zod.string().min(1),
   "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']),
-  "count": zod.number()
+  "count": zod.number(),
+  "count_exact": zod.boolean().optional(),
+  "types": zod.array(zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json'])).optional()
 })),
   "query_complete": zod.boolean(),
   "query_status": zod.enum(['complete', 'sampled', 'degraded']),
@@ -12747,7 +12759,8 @@ export const ModelHubAnnotationQueuesAutomationRulesListResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "scope": zod.object({
@@ -12799,7 +12812,8 @@ export const ModelHubAnnotationQueuesAutomationRulesCreateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "scope": zod.object({
@@ -12848,7 +12862,8 @@ export const ModelHubAnnotationQueuesAutomationRulesReadResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "scope": zod.object({
@@ -12900,7 +12915,8 @@ export const ModelHubAnnotationQueuesAutomationRulesUpdateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "scope": zod.object({
@@ -12943,7 +12959,8 @@ export const ModelHubAnnotationQueuesAutomationRulesUpdateResponse = zod.object(
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "scope": zod.object({
@@ -12995,7 +13012,8 @@ export const ModelHubAnnotationQueuesAutomationRulesPartialUpdateBody = zod.obje
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "scope": zod.object({
@@ -13038,7 +13056,8 @@ export const ModelHubAnnotationQueuesAutomationRulesPartialUpdateResponse = zod.
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "scope": zod.object({
@@ -13258,7 +13277,8 @@ export const ModelHubAnnotationQueuesItemsAddItemsBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(modelHubAnnotationQueuesItemsAddItemsBodySelectionFilterDefault),
   "exclude_ids": zod.array(zod.string().min(1)).default(modelHubAnnotationQueuesItemsAddItemsBodySelectionExcludeIdsDefault),
@@ -18306,7 +18326,8 @@ export const ModelHubDevelopsGetRowDataCreateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(modelHubDevelopsGetRowDataCreateBodyFiltersDefault),
   "sort": zod.array(zod.object({
@@ -19514,6 +19535,7 @@ export const ModelHubEvalTemplatesListChartsCreateResponse = zod.object({
 })),
   "query_complete": zod.boolean(),
   "query_status": zod.enum(['complete', 'stale', 'degraded']),
+  "query_sampled": zod.boolean(),
   "query_error_code": zod.enum(['read_budget_exceeded', 'template_limit_exceeded', 'query_failed']).optional(),
   "data_stale": zod.boolean()
 })
@@ -22240,7 +22262,8 @@ export const ModelHubGetEvalMetricsCreateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(modelHubGetEvalMetricsCreateBodyFiltersDefault)
 })
@@ -30351,7 +30374,8 @@ export const SimulateApiRunTestsListResponseItem = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateApiRunTestsListResponseSimulateEvalConfigsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -30374,7 +30398,8 @@ export const SimulateApiRunTestsListResponseItem = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateApiRunTestsListResponseEvalsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31273,7 +31298,8 @@ export const SimulatePromptTemplatesSimulationsListResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulatePromptTemplatesSimulationsListResponseResultResultsItemSimulateEvalConfigsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31296,7 +31322,8 @@ export const SimulatePromptTemplatesSimulationsListResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulatePromptTemplatesSimulationsListResponseResultResultsItemEvalsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31369,7 +31396,8 @@ export const SimulatePromptTemplatesSimulationsCreateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulatePromptTemplatesSimulationsCreateBodyEvaluationsConfigItemFiltersDefault).describe('Canonical filter list to restrict which test results are evaluated.'),
   "error_localizer": zod.boolean().default(simulatePromptTemplatesSimulationsCreateBodyEvaluationsConfigItemErrorLocalizerDefault).describe('Enables granular error localization on evaluation failures.'),
@@ -31450,7 +31478,8 @@ export const SimulatePromptTemplatesSimulationsReadResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulatePromptTemplatesSimulationsReadResponseResultSimulateEvalConfigsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31473,7 +31502,8 @@ export const SimulatePromptTemplatesSimulationsReadResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulatePromptTemplatesSimulationsReadResponseResultEvalsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31576,7 +31606,8 @@ export const SimulatePromptTemplatesSimulationsPartialUpdateResponse = zod.objec
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulatePromptTemplatesSimulationsPartialUpdateResponseResultSimulateEvalConfigsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31599,7 +31630,8 @@ export const SimulatePromptTemplatesSimulationsPartialUpdateResponse = zod.objec
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulatePromptTemplatesSimulationsPartialUpdateResponseResultEvalsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31750,7 +31782,8 @@ export const SimulateRunTestsListResponseItem = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsListResponseSimulateEvalConfigsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31773,7 +31806,8 @@ export const SimulateRunTestsListResponseItem = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsListResponseEvalsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31838,7 +31872,8 @@ export const SimulateRunTestsCreateCreateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsCreateCreateBodyEvaluationsConfigItemFiltersDefault).describe('Canonical filter list to restrict which test results are evaluated.'),
   "error_localizer": zod.boolean().default(simulateRunTestsCreateCreateBodyEvaluationsConfigItemErrorLocalizerDefault).describe('Enables granular error localization on evaluation failures.'),
@@ -31937,7 +31972,8 @@ export const SimulateRunTestsReadResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsReadResponseSimulateEvalConfigsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -31960,7 +31996,8 @@ export const SimulateRunTestsReadResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsReadResponseEvalsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -32060,7 +32097,8 @@ export const SimulateRunTestsPartialUpdateResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsPartialUpdateResponseSimulateEvalConfigsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -32083,7 +32121,8 @@ export const SimulateRunTestsPartialUpdateResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsPartialUpdateResponseEvalsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -32260,7 +32299,8 @@ export const SimulateRunTestsComponentsPartialUpdateResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsComponentsPartialUpdateResponseSimulateEvalConfigsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -32283,7 +32323,8 @@ export const SimulateRunTestsComponentsPartialUpdateResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsComponentsPartialUpdateResponseEvalsDetailItemFiltersDefault),
   "error_localizer": zod.boolean().optional(),
@@ -32365,7 +32406,8 @@ export const SimulateRunTestsEvalConfigsCreateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(simulateRunTestsEvalConfigsCreateBodyEvaluationsConfigItemFiltersDefault).describe('Canonical filter list to restrict which test results are evaluated.'),
   "error_localizer": zod.boolean().default(simulateRunTestsEvalConfigsCreateBodyEvaluationsConfigItemErrorLocalizerDefault).describe('Enables granular error localization on evaluation failures.'),
@@ -32480,7 +32522,8 @@ export const SimulateRunTestsEvalConfigsUpdateCreateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional().describe('Updated canonical filter list to restrict which test results are evaluated.'),
   "name": zod.string().min(1).optional().describe('Updated name for the evaluation configuration.'),
@@ -33965,7 +34008,8 @@ export const TracerChartsFetchGraphResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerChartsFetchGraphResponseResultsItemFiltersDefault),
   "property": zod.string().default(tracerChartsFetchGraphResponseResultsItemPropertyDefault),
@@ -34456,7 +34500,7 @@ export const TracerDashboardFilterValuesResponse = zod.object({
   "values": zod.array(zod.object({
   "value": spanAttributeJsonValueSchema,
   "label": zod.string().min(1),
-  "type": zod.enum(['string', 'number', 'boolean', 'array']).optional(),
+  "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']).optional(),
   "name": zod.string().min(1).optional(),
   "email": zod.string().min(1).optional(),
   "description": zod.string().min(1).optional()
@@ -34467,6 +34511,7 @@ export const TracerDashboardFilterValuesResponse = zod.object({
   "query_window_start": zod.string().datetime({"offset":true}).optional(),
   "query_window_end": zod.string().datetime({"offset":true}).optional(),
   "has_more": zod.boolean().optional(),
+  "browse_status": zod.enum(['continuation', 'exhausted', 'limit_reached']).optional(),
   "next_cursor": zod.string().min(1).optional(),
   "attribute_type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']).optional()
 })
@@ -34569,7 +34614,8 @@ export const TracerDashboardQueryBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerDashboardQueryBodyMetricsItemFiltersDefault)
 })),
@@ -34582,7 +34628,8 @@ export const TracerDashboardQueryBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerDashboardQueryBodyFiltersDefault),
   "breakdowns": zod.array(zod.object({
@@ -34903,7 +34950,8 @@ export const TracerDashboardWidgetsPreviewQueryBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigMetricsItemFiltersDefault)
 })),
@@ -34916,7 +34964,8 @@ export const TracerDashboardWidgetsPreviewQueryBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigFiltersDefault),
   "breakdowns": zod.array(zod.object({
@@ -35636,7 +35685,8 @@ export const TracerEvalTaskListResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -35648,7 +35698,8 @@ export const TracerEvalTaskListResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskListResponseResultsItemFiltersDefault),
@@ -35706,7 +35757,8 @@ export const TracerEvalTaskCreateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -35718,7 +35770,8 @@ export const TracerEvalTaskCreateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskCreateBodyFiltersDefault),
@@ -35791,7 +35844,8 @@ export const TracerEvalTaskGetEvalDetailsResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -35803,7 +35857,8 @@ export const TracerEvalTaskGetEvalDetailsResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskGetEvalDetailsResponseResultsItemFiltersDefault),
@@ -35871,7 +35926,8 @@ export const TracerEvalTaskGetEvalTaskLogsResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -35883,7 +35939,8 @@ export const TracerEvalTaskGetEvalTaskLogsResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskGetEvalTaskLogsResponseResultsItemFiltersDefault),
@@ -35951,7 +36008,8 @@ export const TracerEvalTaskGetUsageResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -35963,7 +36021,8 @@ export const TracerEvalTaskGetUsageResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskGetUsageResponseResultsItemFiltersDefault),
@@ -36046,7 +36105,8 @@ export const TracerEvalTaskListEvalTasksResponseItem = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -36058,7 +36118,8 @@ export const TracerEvalTaskListEvalTasksResponseItem = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskListEvalTasksResponseFiltersDefault),
@@ -36141,7 +36202,8 @@ export const TracerEvalTaskListEvalTasksWithProjectNameResponseItem = zod.object
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -36153,7 +36215,8 @@ export const TracerEvalTaskListEvalTasksWithProjectNameResponseItem = zod.object
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskListEvalTasksWithProjectNameResponseFiltersDefault),
@@ -36267,7 +36330,8 @@ export const TracerEvalTaskUpdateEvalTaskBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -36279,7 +36343,8 @@ export const TracerEvalTaskUpdateEvalTaskBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).optional(),
@@ -36343,7 +36408,8 @@ export const TracerEvalTaskReadResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -36355,7 +36421,8 @@ export const TracerEvalTaskReadResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskReadResponseFiltersDefault),
@@ -36416,7 +36483,8 @@ export const TracerEvalTaskUpdateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -36428,7 +36496,8 @@ export const TracerEvalTaskUpdateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskUpdateBodyFiltersDefault),
@@ -36482,7 +36551,8 @@ export const TracerEvalTaskUpdateResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -36494,7 +36564,8 @@ export const TracerEvalTaskUpdateResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskUpdateResponseFiltersDefault),
@@ -36555,7 +36626,8 @@ export const TracerEvalTaskPartialUpdateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -36567,7 +36639,8 @@ export const TracerEvalTaskPartialUpdateBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskPartialUpdateBodyFiltersDefault),
@@ -36621,7 +36694,8 @@ export const TracerEvalTaskPartialUpdateResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional(),
   "span_attributes_filters": zod.array(zod.object({
@@ -36633,7 +36707,8 @@ export const TracerEvalTaskPartialUpdateResponse = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).optional()
 }).default(tracerEvalTaskPartialUpdateResponseFiltersDefault),
@@ -38167,7 +38242,8 @@ export const TracerObservationSpanGetGraphMethodsBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerObservationSpanGetGraphMethodsBodyFiltersDefault).describe('On trace, span, session, graph, and eval-task bounded reads, created_at\/start_time datetime filters support equals, greater_than, greater_than_or_equal, less_than, less_than_or_equal, between, not_equals, not_between, is_null, and is_not_null. Missing bounds retain the finite default window: 30 days ago for the lower bound and request-time now for the upper bound. Between and not_between use half-open [start, end) ranges; not_equals excludes one DateTime64(6) microsecond. Because the physical created_at\/start_time field is non-null, is_null returns an exact empty result without a ClickHouse read and is_not_null preserves the base window. Valid contradictions also return an exact empty result.'),
   "interval": zod.enum(['hour', 'day', 'week', 'month']).default(tracerObservationSpanGetGraphMethodsBodyIntervalDefault),
@@ -40119,7 +40195,8 @@ export const TracerProjectGetUserGraphDataBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerProjectGetUserGraphDataBodyFiltersDefault)
 })
@@ -40142,7 +40219,8 @@ export const TracerProjectGetUserMetricsBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerProjectGetUserMetricsBodyFiltersDefault)
 })
@@ -40180,7 +40258,8 @@ export const TracerProjectGetUsersAggregateGraphDataBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerProjectGetUsersAggregateGraphDataBodyFiltersDefault),
   "property": zod.string().min(1).default(tracerProjectGetUsersAggregateGraphDataBodyPropertyDefault),
@@ -41737,7 +41816,8 @@ export const TracerTraceSessionGetSessionGraphDataBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerTraceSessionGetSessionGraphDataBodyFiltersDefault).describe('On trace, span, session, graph, and eval-task bounded reads, created_at\/start_time datetime filters support equals, greater_than, greater_than_or_equal, less_than, less_than_or_equal, between, not_equals, not_between, is_null, and is_not_null. Missing bounds retain the finite default window: 30 days ago for the lower bound and request-time now for the upper bound. Between and not_between use half-open [start, end) ranges; not_equals excludes one DateTime64(6) microsecond. Because the physical created_at\/start_time field is non-null, is_null returns an exact empty result without a ClickHouse read and is_not_null preserves the base window. Valid contradictions also return an exact empty result.'),
   "interval": zod.enum(['hour', 'day', 'week', 'month']).default(tracerTraceSessionGetSessionGraphDataBodyIntervalDefault),
@@ -42109,19 +42189,18 @@ export const TracerTraceCreateBody = zod.object({
 
 
 /**
- * Computes nodes (distinct span types/names) and edges (parent→child
-transitions) across all traces in the given time window.
- * @summary Return the aggregate agent graph for a project.
+ * Return one cached exact Agent Graph and chronological Agent Path.
  */
 export const tracerTraceAgentGraphQueryFiltersDefault = `[]`;
 
-
+export const tracerTraceAgentGraphQueryRefreshDefault = false;
 
 export const TracerTraceAgentGraphQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
   "limit": zod.number().optional().describe('Number of results to return per page.'),
   "project_id": zod.string().uuid(),
-  "filters": zod.string().min(1).default(tracerTraceAgentGraphQueryFiltersDefault)
+  "filters": zod.string().min(1).default(tracerTraceAgentGraphQueryFiltersDefault),
+  "refresh": zod.boolean().default(tracerTraceAgentGraphQueryRefreshDefault).describe('Recompute and atomically replace the last exact graph snapshot.')
 })
 
 export const tracerTraceAgentGraphResponseResultsItemNameMax = 2000;
@@ -42293,7 +42372,8 @@ export const TracerTraceGetGraphMethodsBody = zod.object({
   "filter_type": zod.string().describe('Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map.'),
   "filter_op": zod.string().describe('Canonical operator from api_contracts\/filter_contract.json, for example equals, not_equals, in, not_in, between, not_between, is_null, or is_not_null.'),
   "filter_value": zod.unknown().optional().describe('Scalar, list, range tuple, boolean, or null depending on filter_op and filter_type.'),
-  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.')
+  "col_type": zod.string().optional().describe('Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.'),
+  "attribute_value_types": zod.array(zod.enum(['string', 'number', 'boolean'])).optional().describe('Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in\/not_in filters. Null entries retain filter_type semantics for manually entered values.')
 })
 })).default(tracerTraceGetGraphMethodsBodyFiltersDefault).describe('On trace, span, session, graph, and eval-task bounded reads, created_at\/start_time datetime filters support equals, greater_than, greater_than_or_equal, less_than, less_than_or_equal, between, not_equals, not_between, is_null, and is_not_null. Missing bounds retain the finite default window: 30 days ago for the lower bound and request-time now for the upper bound. Between and not_between use half-open [start, end) ranges; not_equals excludes one DateTime64(6) microsecond. Because the physical created_at\/start_time field is non-null, is_null returns an exact empty result without a ClickHouse read and is_not_null preserves the base window. Valid contradictions also return an exact empty result.'),
   "interval": zod.enum(['hour', 'day', 'week', 'month']).default(tracerTraceGetGraphMethodsBodyIntervalDefault),

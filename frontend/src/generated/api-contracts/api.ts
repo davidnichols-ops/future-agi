@@ -66748,9 +66748,7 @@ export const getTracerTraceAgentGraphUrl = (params: TracerTraceAgentGraphParams,
 }
 
 /**
- * Computes nodes (distinct span types/names) and edges (parent→child
-transitions) across all traces in the given time window.
- * @summary Return the aggregate agent graph for a project.
+ * Return one cached exact Agent Graph and chronological Agent Path.
  */
 export const tracerTraceAgentGraph = async (params: TracerTraceAgentGraphParams, options?: RequestInit): Promise<tracerTraceAgentGraphResponse> => {
 

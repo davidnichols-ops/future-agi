@@ -3903,6 +3903,38 @@ export const SpanAttributeDetailResponseApiQueryErrorCode = {
   query_failed: 'query_failed',
 } as const;
 
+export type SpanAttributeTypeSummaryApiType = typeof SpanAttributeTypeSummaryApiType[keyof typeof SpanAttributeTypeSummaryApiType];
+
+
+export const SpanAttributeTypeSummaryApiType = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+  array: 'array',
+  map: 'map',
+  json: 'json',
+} as const;
+
+export interface SpanAttributeTypeSummaryApi {
+  type: SpanAttributeTypeSummaryApiType;
+  /** @minimum 0 */
+  count: number;
+  /** @minimum 0 */
+  unique_values: number;
+}
+
+export type SpanAttributeTopValueApiType = typeof SpanAttributeTopValueApiType[keyof typeof SpanAttributeTopValueApiType];
+
+
+export const SpanAttributeTopValueApiType = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+  array: 'array',
+  map: 'map',
+  json: 'json',
+} as const;
+
 export type SpanAttributeJsonValueApi =
   | string
   | number
@@ -3919,6 +3951,7 @@ export type SpanAttributeTopValueApiValue = SpanAttributeJsonValueApi;
 export interface SpanAttributeTopValueApi {
   /** Any valid JSON value. */
   value: SpanAttributeTopValueApiValue;
+  type?: SpanAttributeTopValueApiType;
   count: number;
   percentage: number;
 }
@@ -3937,6 +3970,7 @@ export interface SpanAttributeDetailResponseApi {
   type: SpanAttributeDetailResponseApiType;
   count: number;
   unique_values?: number;
+  types?: SpanAttributeTypeSummaryApi[];
   top_values?: SpanAttributeTopValueApi[];
   min?: number;
   max?: number;
@@ -4013,11 +4047,25 @@ export const SpanAttributeKeyApiType = {
   json: 'json',
 } as const;
 
+export type SpanAttributeKeyApiTypesItem = typeof SpanAttributeKeyApiTypesItem[keyof typeof SpanAttributeKeyApiTypesItem];
+
+
+export const SpanAttributeKeyApiTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+  array: 'array',
+  map: 'map',
+  json: 'json',
+} as const;
+
 export interface SpanAttributeKeyApi {
   /** @minLength 1 */
   key: string;
   type: SpanAttributeKeyApiType;
   count: number;
+  count_exact?: boolean;
+  types?: SpanAttributeKeyApiTypesItem[];
 }
 
 export interface SpanAttributeKeysResponseApi {
@@ -6070,6 +6118,15 @@ export const AutomationRuleConditionsApiOperator = {
   and: 'and',
 } as const;
 
+export type AutomationRuleConditionsApiFilterItemFilterConfigAttributeValueTypesItem = typeof AutomationRuleConditionsApiFilterItemFilterConfigAttributeValueTypesItem[keyof typeof AutomationRuleConditionsApiFilterItemFilterConfigAttributeValueTypesItem];
+
+
+export const AutomationRuleConditionsApiFilterItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export interface AutomationRuleScopeApi {
   dataset_id?: string;
   project_id?: string;
@@ -6086,6 +6143,8 @@ export type AutomationRuleConditionsApiFilterItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: AutomationRuleConditionsApiFilterItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type AutomationRuleConditionsApiFilterItem = {
@@ -6259,6 +6318,15 @@ export const SelectionApiSourceType = {
   trace_session: 'trace_session',
 } as const;
 
+export type SelectionApiFilterItemFilterConfigAttributeValueTypesItem = typeof SelectionApiFilterItemFilterConfigAttributeValueTypesItem[keyof typeof SelectionApiFilterItemFilterConfigAttributeValueTypesItem];
+
+
+export const SelectionApiFilterItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type SelectionApiFilterItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -6268,6 +6336,8 @@ export type SelectionApiFilterItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: SelectionApiFilterItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type SelectionApiFilterItem = {
@@ -9237,6 +9307,15 @@ export interface DatasetTableResponseApi {
   result: DatasetTableResultApi;
 }
 
+export type DatasetRowDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = typeof DatasetRowDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof DatasetRowDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const DatasetRowDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type DatasetRowDataRequestApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -9246,6 +9325,8 @@ export type DatasetRowDataRequestApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: DatasetRowDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type DatasetRowDataRequestApiFiltersItem = {
@@ -10056,6 +10137,7 @@ export interface EvalTemplateListChartsResponseResultApi {
   charts: EvalTemplateListChartsResponseResultApiCharts;
   query_complete: boolean;
   query_status: EvalTemplateListChartsResponseResultApiQueryStatus;
+  query_sampled: boolean;
   query_error_code?: EvalTemplateListChartsResponseResultApiQueryErrorCode;
   data_stale: boolean;
 }
@@ -11848,6 +11930,15 @@ export interface EvalMetricResponseApi {
   result: EvalMetricResponseResultApi;
 }
 
+export type EvalMetricRequestApiFiltersItemFilterConfigAttributeValueTypesItem = typeof EvalMetricRequestApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof EvalMetricRequestApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const EvalMetricRequestApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type EvalMetricRequestApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -11857,6 +11948,8 @@ export type EvalMetricRequestApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: EvalMetricRequestApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type EvalMetricRequestApiFiltersItem = {
@@ -16461,6 +16554,15 @@ export type RunTestResponseApiScenariosDetailItem = { [key: string]: unknown };
 
 export type RunTestResponseApiSimulatorAgentDetail = { [key: string]: unknown };
 
+export type SimulateEvalConfigResponseApiFiltersItemFilterConfigAttributeValueTypesItem = typeof SimulateEvalConfigResponseApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof SimulateEvalConfigResponseApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const SimulateEvalConfigResponseApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type SimulateEvalConfigResponseApiConfig = { [key: string]: unknown };
 
 export type SimulateEvalConfigResponseApiMapping = { [key: string]: unknown };
@@ -16474,6 +16576,8 @@ export type SimulateEvalConfigResponseApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: SimulateEvalConfigResponseApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type SimulateEvalConfigResponseApiFiltersItem = {
@@ -17192,6 +17296,15 @@ export interface PromptSimulationListResponseApi {
   result: PromptSimulationListResultApi;
 }
 
+export type EvalConfigDefinitionApiFiltersItemFilterConfigAttributeValueTypesItem = typeof EvalConfigDefinitionApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof EvalConfigDefinitionApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const EvalConfigDefinitionApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 /**
  * Template-specific configuration parameters.
  */
@@ -17211,6 +17324,8 @@ export type EvalConfigDefinitionApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: EvalConfigDefinitionApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type EvalConfigDefinitionApiFiltersItem = {
@@ -17582,6 +17697,15 @@ export type EvalConfigUpdateRequestApiConfig = { [key: string]: unknown };
  */
 export type EvalConfigUpdateRequestApiMapping = { [key: string]: unknown };
 
+export type EvalConfigUpdateRequestApiFiltersItemFilterConfigAttributeValueTypesItem = typeof EvalConfigUpdateRequestApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof EvalConfigUpdateRequestApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const EvalConfigUpdateRequestApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type EvalConfigUpdateRequestApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -17591,6 +17715,8 @@ export type EvalConfigUpdateRequestApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: EvalConfigUpdateRequestApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type EvalConfigUpdateRequestApiFiltersItem = {
@@ -18667,6 +18793,15 @@ export interface ApiErrorResponseApi {
   details?: ApiErrorResponseApiDetails;
 }
 
+export type FetchGraphApiFiltersItemFilterConfigAttributeValueTypesItem = typeof FetchGraphApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof FetchGraphApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const FetchGraphApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type FetchGraphApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -18676,6 +18811,8 @@ export type FetchGraphApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: FetchGraphApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type FetchGraphApiFiltersItem = {
@@ -18758,6 +18895,8 @@ export const DashboardFilterValueOptionApiType = {
   number: 'number',
   boolean: 'boolean',
   array: 'array',
+  map: 'map',
+  json: 'json',
 } as const;
 
 /**
@@ -18797,6 +18936,15 @@ export const DashboardFilterValuesResultApiQueryErrorCode = {
   query_failed: 'query_failed',
 } as const;
 
+export type DashboardFilterValuesResultApiBrowseStatus = typeof DashboardFilterValuesResultApiBrowseStatus[keyof typeof DashboardFilterValuesResultApiBrowseStatus];
+
+
+export const DashboardFilterValuesResultApiBrowseStatus = {
+  continuation: 'continuation',
+  exhausted: 'exhausted',
+  limit_reached: 'limit_reached',
+} as const;
+
 export type DashboardFilterValuesResultApiAttributeType = typeof DashboardFilterValuesResultApiAttributeType[keyof typeof DashboardFilterValuesResultApiAttributeType];
 
 
@@ -18817,6 +18965,7 @@ export interface DashboardFilterValuesResultApi {
   query_window_start?: string;
   query_window_end?: string;
   has_more?: boolean;
+  browse_status?: DashboardFilterValuesResultApiBrowseStatus;
   /** @minLength 1 */
   next_cursor?: string;
   attribute_type?: DashboardFilterValuesResultApiAttributeType;
@@ -18876,6 +19025,15 @@ export const DashboardQueryApiGranularity = {
   month: 'month',
 } as const;
 
+export type DashboardQueryApiFiltersItemFilterConfigAttributeValueTypesItem = typeof DashboardQueryApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof DashboardQueryApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const DashboardQueryApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type DashboardQueryApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -18885,6 +19043,8 @@ export type DashboardQueryApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: DashboardQueryApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type DashboardQueryApiFiltersItem = {
@@ -18994,6 +19154,15 @@ export const DashboardMetricApiDataType = {
   date: 'date',
 } as const;
 
+export type DashboardMetricApiFiltersItemFilterConfigAttributeValueTypesItem = typeof DashboardMetricApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof DashboardMetricApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const DashboardMetricApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type DashboardMetricApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -19003,6 +19172,8 @@ export type DashboardMetricApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: DashboardMetricApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type DashboardMetricApiFiltersItem = {
@@ -19347,6 +19518,15 @@ export interface ObserveDatasetApi {
   readonly user?: string;
 }
 
+export type EvalTaskApiFiltersFiltersItemFilterConfigAttributeValueTypesItem = typeof EvalTaskApiFiltersFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof EvalTaskApiFiltersFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const EvalTaskApiFiltersFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type EvalTaskApiFiltersFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -19356,6 +19536,8 @@ export type EvalTaskApiFiltersFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: EvalTaskApiFiltersFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type EvalTaskApiFiltersFiltersItem = {
@@ -19370,6 +19552,15 @@ export type EvalTaskApiFiltersFiltersItem = {
   filter_config: EvalTaskApiFiltersFiltersItemFilterConfig;
 };
 
+export type EvalTaskApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem = typeof EvalTaskApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof EvalTaskApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const EvalTaskApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type EvalTaskApiFiltersSpanAttributesFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -19379,6 +19570,8 @@ export type EvalTaskApiFiltersSpanAttributesFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: EvalTaskApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type EvalTaskApiFiltersSpanAttributesFiltersItem = {
@@ -19506,6 +19699,15 @@ export interface EvalTaskMessageResponseApi {
   result: EvalTaskMessageResultApi;
 }
 
+export type EvalTaskUpdateRequestApiFiltersFiltersItemFilterConfigAttributeValueTypesItem = typeof EvalTaskUpdateRequestApiFiltersFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof EvalTaskUpdateRequestApiFiltersFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const EvalTaskUpdateRequestApiFiltersFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type EvalTaskUpdateRequestApiFiltersFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -19515,6 +19717,8 @@ export type EvalTaskUpdateRequestApiFiltersFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: EvalTaskUpdateRequestApiFiltersFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type EvalTaskUpdateRequestApiFiltersFiltersItem = {
@@ -19529,6 +19733,15 @@ export type EvalTaskUpdateRequestApiFiltersFiltersItem = {
   filter_config: EvalTaskUpdateRequestApiFiltersFiltersItemFilterConfig;
 };
 
+export type EvalTaskUpdateRequestApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem = typeof EvalTaskUpdateRequestApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof EvalTaskUpdateRequestApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const EvalTaskUpdateRequestApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type EvalTaskUpdateRequestApiFiltersSpanAttributesFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -19538,6 +19751,8 @@ export type EvalTaskUpdateRequestApiFiltersSpanAttributesFiltersItemFilterConfig
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: EvalTaskUpdateRequestApiFiltersSpanAttributesFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type EvalTaskUpdateRequestApiFiltersSpanAttributesFiltersItem = {
@@ -20459,6 +20674,15 @@ export interface ObservationAttributeListResponseApi {
   query_window_end?: string;
 }
 
+export type ObserveGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = typeof ObserveGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof ObserveGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const ObserveGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type ObserveGraphDataRequestApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -20468,6 +20692,8 @@ export type ObserveGraphDataRequestApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: ObserveGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type ObserveGraphDataRequestApiFiltersItem = {
@@ -20833,6 +21059,15 @@ export interface ProjectApi {
   tags?: ProjectApiTags;
 }
 
+export type ProjectUserGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = typeof ProjectUserGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof ProjectUserGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const ProjectUserGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type ProjectUserGraphDataRequestApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -20842,6 +21077,8 @@ export type ProjectUserGraphDataRequestApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: ProjectUserGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type ProjectUserGraphDataRequestApiFiltersItem = {
@@ -20862,6 +21099,15 @@ export interface ProjectUserGraphDataRequestApi {
   filters?: ProjectUserGraphDataRequestApiFiltersItem[];
 }
 
+export type ProjectUserMetricsRequestApiFiltersItemFilterConfigAttributeValueTypesItem = typeof ProjectUserMetricsRequestApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof ProjectUserMetricsRequestApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const ProjectUserMetricsRequestApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type ProjectUserMetricsRequestApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -20871,6 +21117,8 @@ export type ProjectUserMetricsRequestApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: ProjectUserMetricsRequestApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type ProjectUserMetricsRequestApiFiltersItem = {
@@ -20893,6 +21141,15 @@ export interface ProjectUserMetricsRequestApi {
   filters?: ProjectUserMetricsRequestApiFiltersItem[];
 }
 
+export type ProjectUsersAggregateGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = typeof ProjectUsersAggregateGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof ProjectUsersAggregateGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const ProjectUsersAggregateGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type ProjectUsersAggregateGraphDataRequestApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -20902,6 +21159,8 @@ export type ProjectUsersAggregateGraphDataRequestApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: ProjectUsersAggregateGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type ProjectUsersAggregateGraphDataRequestApiFiltersItem = {
@@ -21789,6 +22048,15 @@ export interface TraceSessionApi {
   readonly created_at?: string;
 }
 
+export type TraceSessionGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = typeof TraceSessionGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[keyof typeof TraceSessionGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem];
+
+
+export const TraceSessionGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+} as const;
+
 export type TraceSessionGraphDataRequestApiFiltersItemFilterConfig = {
   /** Canonical field type, for example text, number, boolean, datetime, categorical, thumbs, annotator, array, or map. Legacy json is value-sensitive for SPAN_ATTRIBUTE filters: list values become array and object values become map. */
   filter_type: string;
@@ -21798,6 +22066,8 @@ export type TraceSessionGraphDataRequestApiFiltersItemFilterConfig = {
   filter_value?: unknown;
   /** Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL. */
   col_type?: string;
+  /** Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values. */
+  attribute_value_types?: TraceSessionGraphDataRequestApiFiltersItemFilterConfigAttributeValueTypesItem[];
 };
 
 export type TraceSessionGraphDataRequestApiFiltersItem = {
@@ -27539,6 +27809,10 @@ project_id: string;
  * @minLength 1
  */
 filters?: string;
+/**
+ * Recompute and atomically replace the last exact graph snapshot.
+ */
+refresh?: boolean;
 };
 
 export type TracerTraceAgentGraph200 = {

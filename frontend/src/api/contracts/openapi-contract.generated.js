@@ -35661,6 +35661,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "minLength": 1,
               "default": "[]"
             }
+          },
+          "refresh": {
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         },
         "responses": {
@@ -51384,6 +51391,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -52158,6 +52178,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -53301,6 +53334,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -53714,6 +53760,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -54157,6 +54216,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                       "col_type": {
                         "type": "string",
                         "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                      },
+                      "attribute_value_types": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "string",
+                            "number",
+                            "boolean"
+                          ],
+                          "x-nullable": true
+                        },
+                        "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                       }
                     },
                     "required": [
@@ -54211,6 +54283,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                       "col_type": {
                         "type": "string",
                         "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                      },
+                      "attribute_value_types": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "string",
+                            "number",
+                            "boolean"
+                          ],
+                          "x-nullable": true
+                        },
+                        "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                       }
                     },
                     "required": [
@@ -54479,6 +54564,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                       "col_type": {
                         "type": "string",
                         "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                      },
+                      "attribute_value_types": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "string",
+                            "number",
+                            "boolean"
+                          ],
+                          "x-nullable": true
+                        },
+                        "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                       }
                     },
                     "required": [
@@ -54533,6 +54631,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                       "col_type": {
                         "type": "string",
                         "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                      },
+                      "attribute_value_types": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "string",
+                            "number",
+                            "boolean"
+                          ],
+                          "x-nullable": true
+                        },
+                        "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                       }
                     },
                     "required": [
@@ -56674,6 +56785,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -61692,6 +61816,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -64812,6 +64949,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -64892,6 +65042,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -64966,6 +65129,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -70068,6 +70244,12 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Unique values",
           "type": "integer"
         },
+        "types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SpanAttributeTypeSummary"
+          }
+        },
         "top_values": {
           "type": "array",
           "items": {
@@ -72122,6 +72304,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -76120,6 +76315,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -76336,6 +76544,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -77559,6 +77780,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -79376,6 +79610,15 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Has more",
           "type": "boolean"
         },
+        "browse_status": {
+          "title": "Browse status",
+          "type": "string",
+          "enum": [
+            "continuation",
+            "exhausted",
+            "limit_reached"
+          ]
+        },
         "next_cursor": {
           "title": "Next cursor",
           "type": "string",
@@ -79670,6 +79913,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -81688,6 +81944,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "charts",
         "query_complete",
         "query_status",
+        "query_sampled",
         "data_stale"
       ],
       "type": "object",
@@ -81711,6 +81968,10 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "stale",
             "degraded"
           ]
+        },
+        "query_sampled": {
+          "title": "Query sampled",
+          "type": "boolean"
         },
         "query_error_code": {
           "title": "Query error code",
@@ -88997,6 +89258,19 @@ export const OPENAPI_CONTRACT = Object.freeze({
                   "col_type": {
                     "type": "string",
                     "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL."
+                  },
+                  "attribute_value_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "x-nullable": true
+                    },
+                    "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values."
                   }
                 },
                 "required": [
@@ -90598,6 +90872,18 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "x-json-value": true,
           "description": "Any valid JSON value."
         },
+        "type": {
+          "title": "Type",
+          "type": "string",
+          "enum": [
+            "string",
+            "number",
+            "boolean",
+            "array",
+            "map",
+            "json"
+          ]
+        },
         "count": {
           "title": "Count",
           "type": "integer"
@@ -90605,6 +90891,38 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "percentage": {
           "title": "Percentage",
           "type": "number"
+        }
+      }
+    },
+    "SpanAttributeTypeSummary": {
+      "required": [
+        "type",
+        "count",
+        "unique_values"
+      ],
+      "type": "object",
+      "properties": {
+        "type": {
+          "title": "Type",
+          "type": "string",
+          "enum": [
+            "string",
+            "number",
+            "boolean",
+            "array",
+            "map",
+            "json"
+          ]
+        },
+        "count": {
+          "title": "Count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "unique_values": {
+          "title": "Unique values",
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -90636,6 +90954,24 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "count": {
           "title": "Count",
           "type": "integer"
+        },
+        "count_exact": {
+          "title": "Count exact",
+          "type": "boolean"
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "string",
+              "number",
+              "boolean",
+              "array",
+              "map",
+              "json"
+            ]
+          }
         }
       }
     },
@@ -93906,7 +94242,9 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "string",
             "number",
             "boolean",
-            "array"
+            "array",
+            "map",
+            "json"
           ]
         },
         "name": {
