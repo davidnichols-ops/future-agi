@@ -1477,6 +1477,7 @@ function ValuePicker({
     isLoading: dashLoading,
     isError: dashError,
     queryReadState: dashboardReadState,
+    browseStatus: dashboardBrowseStatus,
     browseLimitReached: dashboardBrowseLimitReached,
     fetchNextPage: fetchNextDashboardPage,
     hasNextPage: hasNextDashboardPage,
@@ -1505,6 +1506,14 @@ function ValuePicker({
       Boolean(anchorEl) &&
       (!isIdOnlyField || Boolean(debouncedSearch)),
   });
+  // `browse_status` is the authoritative cursor contract. Never leave a no-op
+  // Load more control visible once the backend has proved that no later
+  // distinct values exist, even if a stale consumer state or an older API pod
+  // still reports `has_more=true` alongside that terminal status.
+  const hasMoreDashboardValues =
+    Boolean(hasNextDashboardPage) &&
+    dashboardBrowseStatus !== "exhausted" &&
+    dashboardBrowseStatus !== "limit_reached";
 
   // Fallback: session filter values endpoint (for session-specific fields)
   const {
@@ -1587,14 +1596,18 @@ function ValuePicker({
       }
       if (
         !autoScrollPageUsedRef.current &&
-        hasNextDashboardPage &&
+        hasMoreDashboardValues &&
         !isFetchingNextDashboardPage
       ) {
         autoScrollPageUsedRef.current = true;
         fetchNextDashboardPage();
       }
     },
-    [fetchNextDashboardPage, hasNextDashboardPage, isFetchingNextDashboardPage],
+    [
+      fetchNextDashboardPage,
+      hasMoreDashboardValues,
+      isFetchingNextDashboardPage,
+    ],
   );
 
   const filtered = useMemo(() => {
@@ -2035,7 +2048,7 @@ function ValuePicker({
                 Recent value limit reached. Search or enter an exact value.
               </Typography>
             )}
-          {hasNextDashboardPage && !isFetchingNextDashboardPage && (
+          {hasMoreDashboardValues && !isFetchingNextDashboardPage && (
             <Box sx={{ display: "flex", justifyContent: "center", py: 0.5 }}>
               <Button
                 size="small"
