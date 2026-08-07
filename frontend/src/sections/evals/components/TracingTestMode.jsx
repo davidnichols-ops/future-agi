@@ -2,6 +2,7 @@
 import {
   Autocomplete,
   Box,
+  Button,
   Chip,
   CircularProgress,
   IconButton,
@@ -416,6 +417,10 @@ const TracingTestMode = React.forwardRef(
       data: exactAttributeFields,
       queryReadState: exactAttributeReadState,
       isFetching: isFetchingExactAttributes,
+      fetchNextPage: fetchNextAttributePage,
+      hasNextPage: hasNextAttributePage,
+      isFetchingNextPage: isFetchingNextAttributePage,
+      isFetchNextPageError: isNextAttributePageError,
     } = useExactEvalAttributeFields({
       projectId: selectedProjectId,
       rowType,
@@ -1828,6 +1833,23 @@ const TracingTestMode = React.forwardRef(
                     <Typography variant="caption" color="warning.main">
                       {exactAttributeReadMessage}
                     </Typography>
+                  </Box>
+                )}
+                {allowCustomFieldPath && hasNextAttributePage && (
+                  <Box sx={{ mb: 0.75 }}>
+                    <Button
+                      size="small"
+                      variant="text"
+                      disabled={isFetchingNextAttributePage}
+                      onClick={() => fetchNextAttributePage?.()}
+                      sx={{ px: 0, minWidth: 0, fontSize: 11 }}
+                    >
+                      {isFetchingNextAttributePage
+                        ? "Loading more attributes…"
+                        : isNextAttributePageError
+                          ? "Retry loading attributes"
+                          : "Load more attributes"}
+                    </Button>
                   </Box>
                 )}
                 <Box

@@ -8,7 +8,7 @@ Endpoints:
 """
 
 from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import structlog
 from rest_framework.permissions import IsAuthenticated
@@ -27,7 +27,6 @@ from tracer.serializers.span_attributes import (
     SpanAttributeValuesResponseSerializer,
 )
 from tracer.services.clickhouse.attribute_cursor_state import (
-    ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
     AttributeCursorStateError,
     load_attribute_cursor_seen_state,
     persist_attribute_cursor_seen_state,
@@ -54,6 +53,17 @@ ERROR_RESPONSES = {
     500: ApiTextErrorResponseSerializer,
     503: ApiTextErrorResponseSerializer,
 }
+
+# Attribute-name discovery is project metadata, not a preview of the task or
+# dashboard time window.  Freeze cursor walks at the earliest timestamp the
+# spans contract accepts so pagination can reach every retained project row.
+# Per-request candidate/query ceilings in ``AttributeReadSelector`` keep each
+# continuation bounded; retention jobs decide which rows still exist.
+# The table is partitioned by ``toDate(start_time)``. Although DateTime64 can
+# represent pre-1970 instants, Date cannot; a 1900 predicate can be folded into
+# a wrapped partition bound and incorrectly prune current data. No telemetry
+# predates Unix time, so epoch is the earliest lossless retained-data bound.
+SPAN_ATTRIBUTE_RETAINED_DATA_START = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _project_is_in_request_scope(request, project_id: str) -> bool:
@@ -92,8 +102,8 @@ class SpanAttributeKeysView(APIView):
     """
     Discover span attribute keys for a project.
 
-    Cursor mode returns recent distinct keys newest-first in bounded pages;
-    exact ``q`` lookup remains available for keys outside that recent browse.
+    Cursor mode walks retained project data newest-first in bounded pages;
+    exact ``q`` lookup remains available for direct key discovery.
     The no-page-size form is retained for older clients.
 
     GET /api/traces/span-attribute-keys/?project_id=<uuid>&page_size=10
@@ -133,6 +143,11 @@ class SpanAttributeKeysView(APIView):
                     "project_id": project_id,
                     "mode": "recent_attribute_keys",
                 }
+                if exact_key is not None:
+                    # Signed cursor and server-side seen state are scoped to
+                    # the normalized exact key. A continuation for one search
+                    # can therefore never be replayed under another key.
+                    cursor_query["q"] = exact_key
                 if cursor_token:
                     cursor_state = decode_list_cursor(
                         cursor_token,
@@ -141,7 +156,7 @@ class SpanAttributeKeysView(APIView):
                         query=cursor_query,
                         page_size=page_size,
                     )
-                    if len(cursor_state.order) != 5:
+                    if len(cursor_state.order) not in {5, 6}:
                         raise ListCursorError(
                             "invalid_cursor",
                             "The continuation cursor is invalid.",
@@ -152,7 +167,10 @@ class SpanAttributeKeysView(APIView):
                         raw_resume_identity,
                         resume_key_offset,
                         seen_reference,
-                    ) = cursor_state.order
+                    ) = cursor_state.order[:5]
+                    raw_segment_start = (
+                        cursor_state.order[5] if len(cursor_state.order) == 6 else None
+                    )
                     if (
                         not isinstance(segment_end, datetime)
                         or not isinstance(raw_before_identity, tuple)
@@ -162,6 +180,14 @@ class SpanAttributeKeysView(APIView):
                         or (raw_before_identity and raw_resume_identity)
                         or not isinstance(resume_key_offset, int)
                         or resume_key_offset < 0
+                        or (
+                            raw_segment_start is not None
+                            and not isinstance(raw_segment_start, datetime)
+                        )
+                        or (
+                            raw_segment_start is not None
+                            and not (raw_before_identity or raw_resume_identity)
+                        )
                     ):
                         raise ListCursorError(
                             "invalid_cursor",
@@ -182,12 +208,14 @@ class SpanAttributeKeysView(APIView):
 
                     before_identity = restore_identity(raw_before_identity)
                     resume_identity = restore_identity(raw_resume_identity)
+                    segment_start = raw_segment_start
                     window_start = cursor_state.window_start
                     window_end = cursor_state.window_end
                 else:
                     window_end = datetime.now(UTC)
-                    window_start = window_end - timedelta(days=365)
+                    window_start = SPAN_ATTRIBUTE_RETAINED_DATA_START
                     segment_end = window_end
+                    segment_start = None
                     before_identity = None
                     resume_identity = None
                     resume_key_offset = 0
@@ -221,10 +249,12 @@ class SpanAttributeKeysView(APIView):
                     window_start=window_start,
                     window_end=window_end,
                     segment_end=segment_end,
+                    segment_start=segment_start,
                     before_identity=before_identity,
                     resume_identity=resume_identity,
                     resume_key_offset=resume_key_offset,
                     seen_key_digests=seen_state.digests,
+                    exact_key=exact_key,
                 )
                 next_cursor = None
                 published_has_more = page_read.has_more
@@ -243,6 +273,15 @@ class SpanAttributeKeysView(APIView):
                             and all(char in "0123456789abcdef" for char in value)
                         ),
                     )
+                    next_order = (
+                        page_read.next_segment_end,
+                        page_read.next_before_identity or (),
+                        page_read.next_resume_identity or (),
+                        page_read.next_resume_key_offset,
+                        seen_reference,
+                    )
+                    if page_read.next_segment_start is not None:
+                        next_order = (*next_order, page_read.next_segment_start)
                     next_cursor = encode_list_cursor(
                         resource="span_attribute_keys",
                         scope=cursor_scope,
@@ -250,13 +289,7 @@ class SpanAttributeKeysView(APIView):
                         page_size=page_size,
                         window_start=window_start,
                         window_end=window_end,
-                        order=(
-                            page_read.next_segment_end,
-                            page_read.next_before_identity or (),
-                            page_read.next_resume_identity or (),
-                            page_read.next_resume_key_offset,
-                            seen_reference,
-                        ),
+                        order=next_order,
                         seen_rows=len(page_read.seen_key_digests),
                     )
                 return Response(
@@ -271,13 +304,31 @@ class SpanAttributeKeysView(APIView):
                         **page_read.metadata.public_payload(),
                         "has_more": published_has_more,
                         "next_cursor": next_cursor,
+                        # Preserve the rolling-deploy response enum. Despite
+                        # this legacy label, the frozen cursor window now spans
+                        # all retained project data, not a UI date range.
                         "browse_mode": "recent_suggestions",
                         "browse_status": published_browse_status,
-                        "browse_limit": ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
+                        **(
+                            {
+                                "lookup_mode": "exact",
+                                "exact_match": any(
+                                    row.key == exact_key for row in page_read.rows
+                                ),
+                            }
+                            if exact_key is not None
+                            else {}
+                        ),
                     },
                     status=200,
                 )
 
+            # The retained-data cursor above is the exhaustive path. Keep this
+            # compatibility exact-q endpoint on its production-qualified
+            # adaptive windows: one unsegmented 1970-to-now Map probe scanned
+            # hundreds of millions of rows on the incident tenant and could
+            # recreate the original 503. UI consumers paginate the retained
+            # catalog and filter those verified typed names locally.
             read = selector.discover_keys([project_id], exact_key=exact_key)
             return Response(
                 {

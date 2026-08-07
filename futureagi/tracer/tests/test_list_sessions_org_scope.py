@@ -188,6 +188,15 @@ class TestListSessionsClickHouseOrgScope:
         cfg = synthetic[0]["filter_config"]
         assert cfg["filter_op"] == "in"
         assert set(cfg["filter_value"]) == {str(_id) for _id in eu_ids}
+        candidate_sql = analytics.execute_ch_query.call_args_list[0].args[0]
+        assert candidate_sql.index("matching_user_sessions AS") < candidate_sql.index(
+            "candidate_root_identities AS"
+        )
+        root_seed_sql = candidate_sql.split("candidate_root_identities AS (", 1)[
+            1
+        ].split("),\n        latest_roots AS (", 1)[0]
+        assert "SELECT session_id FROM matching_user_root_ids" in root_seed_sql
+        assert "LEFT JOIN ts_survivor_map AS user_session_aliases" in candidate_sql
 
     def test_user_id_filter_preserves_multi_value_list(self):
         from tracer.services.clickhouse.v2.query_builders.session_list import (

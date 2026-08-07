@@ -396,6 +396,32 @@ class ClickHouseFilterBuilderV2(ClickHouseFilterBuilder):
     _ENDUSER_DIM_ID_COL = "end_user_id"
     _ENDUSER_DIM_NOT_DELETED = "is_deleted = 0"
 
+    def _enduser_dimension_id_subquery(self, inner: str) -> str:
+        """Expand a curated user to every old/new ID stored on spans.
+
+        ``end_users`` remains keyed by the deterministic group's survivor old
+        ID while spans can straddle the old-ID/new-ID cutover.  Expand only the
+        matching dimension rows through the small remap table; the surrounding
+        membership query can then keep its indexed ``end_user_id`` predicate.
+        """
+
+        project_scope = self._project_scope_predicate("eu")
+        return (
+            "SELECT expanded_end_user_id FROM ("
+            "SELECT arrayJoin(arrayFilter(end_user_key -> "
+            "end_user_key != toUUID('00000000-0000-0000-0000-000000000000'), "
+            "arrayConcat([eu.end_user_id], groupUniqArray(remap.old_id), "
+            "groupUniqArray(remap.new_id)))) AS expanded_end_user_id "
+            "FROM end_users AS eu FINAL "
+            "LEFT JOIN ("
+            "SELECT old_id, new_id, "
+            "argMin(old_id, toString(old_id)) OVER (PARTITION BY new_id) "
+            "AS survivor_id FROM end_user_id_remap FINAL"
+            ") AS remap ON eu.end_user_id = remap.survivor_id "
+            f"WHERE {project_scope} AND ({inner}) AND eu.is_deleted = 0 "
+            "GROUP BY eu.end_user_id)"
+        )
+
     @staticmethod
     def _rewrite_filter_fragment(sql: str) -> str:
         """Rewrite a V2 spans/filter fragment at the schema boundary."""

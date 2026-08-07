@@ -6,7 +6,9 @@ import TraceFilterPanel, {
   buildTraceFilterProperties,
   filterPropertiesForPicker,
   getTraceFilterFields,
+  mergeRetainedAttributeProperties,
   normalizeFilterRowOperator,
+  shouldUseRetainedAttributePages,
   toStaticFilterProperty,
 } from "../TraceFilterPanel";
 import {
@@ -38,8 +40,12 @@ beforeEach(() => {
     fetchNextPage: vi.fn(),
     hasNextPage: false,
     isFetchingNextPage: false,
+    isFetchNextPageError: false,
     queryReadState: "complete",
+    browseStatus: "exhausted",
+    pageCount: 1,
     debouncedSearch: "",
+    refetch: vi.fn(),
   });
 });
 
@@ -95,20 +101,27 @@ function renderPanel({
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  const utils = render(
+  const panel = () => (
     <QueryClientProvider client={queryClient}>
       <TraceFilterPanel
         anchorEl={anchorEl}
         open={open}
         onClose={onClose}
         onApply={onApply}
-        currentFilters={currentFilters}
+        currentFilters={[...currentFilters]}
         properties={properties}
         showQueryTab={showQueryTab}
       />
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { anchorEl, onApply, onClose, ...utils };
+  const utils = render(panel());
+  return {
+    anchorEl,
+    onApply,
+    onClose,
+    ...utils,
+    rerenderPanel: () => utils.rerender(panel()),
+  };
 }
 
 const selectQueryPhaseOption = async (typed, nextPlaceholder) => {
@@ -496,6 +509,83 @@ describe("voice-call property search aliases", () => {
 });
 
 describe("exact manual attribute fallback", () => {
+  it("uses cursor-discovered attributes as the canonical paginated inventory", () => {
+    const systemProperty = {
+      id: "status",
+      name: "Status",
+      category: "system",
+    };
+    const catalogDuplicate = {
+      id: "first_page_key",
+      name: "first_page_key",
+      category: "attribute",
+    };
+    const catalogOnly = {
+      id: "catalog_sample_key",
+      name: "catalog_sample_key",
+      category: "attribute",
+    };
+    const retainedPage = [
+      {
+        id: "first_page_key",
+        name: "first_page_key",
+        category: "attribute",
+      },
+      {
+        id: "next_page_key",
+        name: "next_page_key",
+        category: "attribute",
+      },
+    ];
+
+    expect(
+      mergeRetainedAttributeProperties(
+        [systemProperty, catalogDuplicate, catalogOnly],
+        retainedPage,
+        { canonical: true },
+      ).map((property) => property.id),
+    ).toEqual(["status", "first_page_key", "next_page_key"]);
+    expect(
+      mergeRetainedAttributeProperties(
+        [systemProperty, catalogDuplicate, catalogOnly],
+        retainedPage.slice(0, 1),
+        { canonical: false },
+      ).map((property) => property.id),
+    ).toEqual(["status", "first_page_key", "catalog_sample_key"]);
+  });
+
+  it("keeps sampled catalog attributes through an empty cursor continuation", () => {
+    expect(
+      shouldUseRetainedAttributePages({
+        enabled: true,
+        source: "spans",
+        readState: "complete",
+        attributes: [],
+        browseStatus: "continuation",
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldUseRetainedAttributePages({
+        enabled: true,
+        source: "spans",
+        readState: "complete",
+        attributes: [],
+        browseStatus: "exhausted",
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldUseRetainedAttributePages({
+        enabled: true,
+        source: "traces",
+        readState: "complete",
+        attributes: [{ id: "retained_key" }],
+        browseStatus: "continuation",
+      }),
+    ).toBe(true);
+  });
+
   it("offers an exact text attribute only after bounded discovery has no exact key", () => {
     expect(
       buildManualAttributeProperty({
@@ -564,10 +654,57 @@ describe("exact manual attribute fallback", () => {
     ).toBeNull();
   });
 
-  it("loads the next recent attribute page when the property list is scrolled", () => {
-    const fetchNextPage = vi.fn();
+  it("keeps properties beyond the first 500 browseable and selectable", () => {
     exactAttributePropertiesMock.mockReturnValue({
-      data: Array.from({ length: 10 }, (_, index) => ({
+      data: Array.from({ length: 510 }, (_, index) => ({
+        id: `retained_${index}`,
+        name: `retained_${index}`,
+        category: "attribute",
+        rawCategory: "custom_attribute",
+        type: "string",
+        apiColType: "SPAN_ATTRIBUTE",
+      })),
+      isFetching: false,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      browseStatus: "exhausted",
+      pageCount: 51,
+      debouncedSearch: "",
+    });
+    const { anchorEl } = renderPanel({ properties: [] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    expect(
+      document.querySelector('[data-filter-property-option="retained_499"]'),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-filter-property-option="retained_500"]'),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show 10 more properties" }),
+    );
+    const finalLoadedProperty = document.querySelector(
+      '[data-filter-property-option="retained_509"]',
+    );
+    expect(finalLoadedProperty).toBeInTheDocument();
+    fireEvent.click(finalLoadedProperty);
+    expect(
+      screen.getByRole("button", { name: /retained_509/i }),
+    ).toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("loads one cursor page per natural downward gesture without draining or requiring an up-scroll", () => {
+    const fetchNextPage = vi.fn();
+    let attributeCount = 10;
+    let pageCount = 1;
+    exactAttributePropertiesMock.mockImplementation(() => ({
+      data: Array.from({ length: attributeCount }, (_, index) => ({
         id: `recent_${index}`,
         name: `recent_${index}`,
         category: "attribute",
@@ -579,10 +716,13 @@ describe("exact manual attribute fallback", () => {
       fetchNextPage,
       hasNextPage: true,
       isFetchingNextPage: false,
-      queryReadState: "sampled",
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      browseStatus: "continuation",
+      pageCount,
       debouncedSearch: "",
-    });
-    const { anchorEl } = renderPanel({ properties: [] });
+    }));
+    const { anchorEl, rerenderPanel } = renderPanel({ properties: [] });
 
     fireEvent.click(screen.getByRole("button", { name: "Property" }));
     const propertyList = document.querySelector(
@@ -595,8 +735,34 @@ describe("exact manual attribute fallback", () => {
       scrollHeight: { configurable: true, value: 400 },
     });
     fireEvent.scroll(propertyList);
+    fireEvent.scroll(propertyList);
 
     expect(fetchNextPage).toHaveBeenCalledOnce();
+
+    // A successful page adds rows. The next downward gesture may advance from
+    // the new bottom directly; no artificial up-scroll is needed.
+    attributeCount = 20;
+    pageCount = 2;
+    rerenderPanel();
+    Object.defineProperty(propertyList, "scrollTop", {
+      configurable: true,
+      value: 380,
+    });
+    Object.defineProperty(propertyList, "scrollHeight", {
+      configurable: true,
+      value: 600,
+    });
+    fireEvent.scroll(propertyList);
+    fireEvent.scroll(propertyList);
+    expect(fetchNextPage).toHaveBeenCalledTimes(2);
+
+    // An exact empty continuation still increments the page revision. It must
+    // unlock one further gesture without auto-draining every remaining page.
+    pageCount = 3;
+    rerenderPanel();
+    fireEvent.scroll(propertyList);
+    fireEvent.scroll(propertyList);
+    expect(fetchNextPage).toHaveBeenCalledTimes(3);
     expect(
       screen.queryByText(/results are incomplete/i),
     ).not.toBeInTheDocument();
@@ -620,6 +786,7 @@ describe("exact manual attribute fallback", () => {
       fetchNextPage,
       hasNextPage: true,
       isFetchingNextPage: false,
+      isFetchNextPageError: false,
       queryReadState: "complete",
       debouncedSearch: "",
     });
@@ -631,6 +798,72 @@ describe("exact manual attribute fallback", () => {
     );
 
     expect(fetchNextPage).toHaveBeenCalledOnce();
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps a failed continuation retryable instead of silently breaking", () => {
+    const fetchNextPage = vi.fn();
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [
+        {
+          id: "retained_attribute",
+          name: "retained_attribute",
+          category: "attribute",
+          rawCategory: "custom_attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      isFetching: false,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      isFetchNextPageError: true,
+      queryReadState: "complete",
+      debouncedSearch: "",
+    });
+    const { anchorEl } = renderPanel({ properties: [] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    expect(
+      screen.getByText("More attributes could not be loaded. Please retry."),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry loading attributes" }),
+    );
+
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+    document.body.removeChild(anchorEl);
+  });
+
+  it("offers a sanitized retry when the initial attribute read is unavailable", () => {
+    const refetch = vi.fn();
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [],
+      isFetching: false,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "error",
+      browseStatus: undefined,
+      pageCount: 0,
+      debouncedSearch: "",
+      refetch,
+    });
+    const { anchorEl } = renderPanel({});
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    expect(
+      screen.getByText(
+        "Attribute suggestions are temporarily unavailable. Enter an exact attribute name.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry attribute suggestions" }),
+    );
+
+    expect(refetch).toHaveBeenCalledOnce();
     document.body.removeChild(anchorEl);
   });
 });

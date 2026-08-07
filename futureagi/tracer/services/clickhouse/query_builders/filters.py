@@ -383,6 +383,7 @@ class ClickHouseFilterBuilder:
         candidate_ids_param: str | None = None,
         candidate_entities_param: str | None = None,
         strict_trace_project_correlation: bool = False,
+        strict_enduser_project_correlation: bool = False,
         annotation_label_set_known: bool = False,
     ) -> None:
         self.table = table
@@ -438,6 +439,12 @@ class ClickHouseFilterBuilder:
         # trace/span identity.  Keep the default off: existing single-project
         # callers retain byte-for-byte SQL and behaviour.
         self.strict_trace_project_correlation = bool(strict_trace_project_correlation)
+        # End-user membership can be project-scoped independently of eval
+        # metadata.  User seeds need this fence without triggering the strict
+        # eval-config discovery used by organization residual branches.
+        self.strict_enduser_project_correlation = bool(
+            strict_enduser_project_correlation
+        )
         # ``annotation_label_ids=[]`` historically meant "metadata was not
         # supplied", so has_annotation fell back to a simple score-existence
         # check.  Org residual branches resolve each project's label set
@@ -564,10 +571,15 @@ class ClickHouseFilterBuilder:
         return f"{alias}.deleted = false AND {alias}._peerdb_is_deleted = 0"
 
     def _strict_span_project_filter(self) -> str:
-        """Scope an org residual's span-side membership to its branch project."""
+        """Scope end-user span membership to the caller's project boundary."""
 
-        if not self.strict_trace_project_correlation:
+        if not (
+            self.strict_trace_project_correlation
+            or self.strict_enduser_project_correlation
+        ):
             return ""
+        if self._org_scoped:
+            return " AND project_id IN %(project_ids)s"
         return " AND project_id = toUUID(%(project_id)s)"
 
     def _scoped_spans_date_filter(self) -> str:
@@ -1084,6 +1096,20 @@ class ClickHouseFilterBuilder:
     _ENDUSER_DIM_ID_COL = "id"
     _ENDUSER_DIM_NOT_DELETED = "_peerdb_is_deleted = 0 AND deleted = 0"
 
+    def _enduser_dimension_id_subquery(self, inner: str) -> str:
+        """Return physical end-user IDs matching one dimension predicate.
+
+        The legacy dimension has no ID-remap bridge.  CH25 overrides this hook
+        so a curated survivor expands to every physical ID that spans may carry
+        during the dual-ID cutover.
+        """
+
+        return (
+            f"SELECT {self._ENDUSER_DIM_ID_COL} "
+            f"FROM {self._ENDUSER_DIM_TABLE} FINAL "
+            f"WHERE {inner} AND {self._ENDUSER_DIM_NOT_DELETED}"
+        )
+
     def _build_enduser_string_subquery(
         self,
         enduser_column: str,
@@ -1131,15 +1157,14 @@ class ClickHouseFilterBuilder:
             return None
         candidate_filter = self._candidate_trace_filter()
         project_filter = self._strict_span_project_filter()
+        dimension_ids = self._enduser_dimension_id_subquery(inner)
 
-        # Curated EndUser dimension is the ``end_users`` RMT.
+        # Resolve the curated dimension identity before probing physical spans.
         return (
             f"trace_id {outer_op} ("
             f"SELECT trace_id FROM {self.table} "
             f"WHERE end_user_id IN ("
-            f"SELECT {self._ENDUSER_DIM_ID_COL} FROM {self._ENDUSER_DIM_TABLE} FINAL "
-            f"WHERE {inner} "
-            f"AND {self._ENDUSER_DIM_NOT_DELETED}"
+            f"{dimension_ids}"
             f") AND _peerdb_is_deleted = 0{self._span_membership_date_filter()}"
             f"{project_filter}"
             f"{candidate_filter})"

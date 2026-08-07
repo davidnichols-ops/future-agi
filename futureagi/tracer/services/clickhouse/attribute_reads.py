@@ -1,8 +1,9 @@
 """Bounded ClickHouse 25.3 selectors for span attribute picker APIs.
 
 The picker surfaces in this module are discovery aids, not accounting reads.
-They walk a fixed one-year horizon in adjacent half-open bands, cap every
-physical read, and replay every selected physical span identity through
+Non-cursor compatibility reads walk a fixed one-year horizon in adjacent
+half-open bands. Cursor callers can freeze a broader retained-data window;
+every physical read remains capped and every selected span is replayed through
 ``argMax(_version)`` before accepting a key or value.  That keeps tombstones
 and cleared attributes from leaking stale data even when span ids are reused.
 
@@ -104,7 +105,7 @@ ATTRIBUTE_READ_MAX_KEY_BYTES = 512
 ATTRIBUTE_READ_MAX_SEARCH_BYTES = 512
 ATTRIBUTE_READ_MAX_PROJECTS = 64
 
-# Cursor-mode filter-value pickers walk a frozen one-year snapshot in small,
+# Cursor-mode pickers walk a caller-frozen retained-data window in small,
 # newest-first physical batches.  The public page is intentionally small while
 # the larger internal batch amortizes duplicate values (for example thousands
 # of consecutive ``completed`` calls) without allowing one request to become
@@ -123,13 +124,22 @@ ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 4
 # physical window is exhausted; there is no vocabulary-count ceiling.
 
 # Attribute-key browse cursors use the same frozen newest-first physical walk
-# as value cursors. Keep full 128-bit key identities and a lower suggestion cap
+# as value cursors. Keep full 128-bit key identities and a lower page-size cap
 # so the worst reachable continuation (including one 255-byte trace id and one
-# 255-byte span id) stays below common 8 KiB request-line limits. This is a
-# recent-suggestion vocabulary; exact key lookup is a separate endpoint mode.
+# 255-byte span id) stays below common 8 KiB request-line limits. Exact-key
+# searches reuse this physical cursor and bind their key into its signed state.
 ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE = 50
 ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT = 64
 ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES = 15
+ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT = timedelta(minutes=5)
+# A missing candidate proves the whole queried slice has no selectable key, so
+# the next adjacent slice may widen.  Dense attribute-free intervals can still
+# exceed the read envelope. On a typed budget failure, jump directly to a
+# five-minute slice instead of spending the six-second request wall on several
+# doomed halvings. No cursor progress is published until that retry succeeds.
+# Every successful statement therefore stays inside the same row/byte/time
+# ceilings while sparse retained history remains reachable in practical pages.
+ATTRIBUTE_KEY_CURSOR_MAX_EMPTY_SEGMENT = timedelta(days=60)
 ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES = 16
 # The absolute returned-token guard covers unexpected high-entropy identity
 # shapes as well as the modeled 255-byte trace/span maximum. The endpoint adds
@@ -288,6 +298,10 @@ class AttributeKeyCursorPageRead:
     next_resume_identity: PhysicalSpanIdentity | None
     next_resume_key_offset: int
     seen_key_digests: tuple[str, ...]
+    # A checkpoint may belong to an adaptively widened segment.  Preserve that
+    # segment's lower bound so a continuation cannot silently jump forward to
+    # the default six-hour slice and reject or skip the older checkpoint.
+    next_segment_start: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -2677,23 +2691,29 @@ class AttributeReadSelector:
         window_start: datetime,
         window_end: datetime,
         segment_end: datetime | None = None,
+        segment_start: datetime | None = None,
         before_identity: PhysicalSpanIdentity | None = None,
         resume_identity: PhysicalSpanIdentity | None = None,
         resume_key_offset: int = 0,
         seen_key_digests: Iterable[str] = (),
+        exact_key: str | None = None,
     ) -> AttributeKeyCursorPageRead:
         """Return a bounded newest-first page of verified unique keys.
 
-        The public cursor freezes the one-year browse window and advances over
-        physical spans, not an offset into a changing ``DISTINCT`` result. Each
-        candidate is replayed through latest state before a key is emitted. A
+        The public cursor freezes the caller's retained-data browse window and
+        advances over physical spans, not an offset into a changing
+        ``DISTINCT`` result. Each candidate is replayed through latest state
+        before a key is emitted. A
         cursor also records compact digests of keys already returned, so keys
-        repeated on older spans do not reappear on later pages. Exact manual
-        key lookup remains the separate ``discover_keys(exact_key=...)`` path.
+        repeated on older spans do not reappear on later pages. Exact lookup
+        uses an indexed typed-Map accelerator before this same cursor performs
+        the generic latest-state fallback.
         """
 
         self._begin_operation()
         projects = self._project_ids(project_ids)
+        if exact_key is not None:
+            exact_key = validate_attribute_key(exact_key)
         page_size = int(page_size)
         if not 1 <= page_size <= ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE:
             raise ValueError("attribute-key page_size is out of range")
@@ -2745,6 +2765,31 @@ class AttributeReadSelector:
         resume_identity = normalize_identity(resume_identity, label="resume")
         if before_identity is not None and resume_identity is not None:
             raise ValueError("attribute-key cursor checkpoints are mutually exclusive")
+        has_physical_checkpoint = (
+            before_identity is not None or resume_identity is not None
+        )
+        active_segment_start = (
+            _utc(segment_start) if segment_start is not None else None
+        )
+        if active_segment_start is not None and (
+            not has_physical_checkpoint
+            or not start <= active_segment_start < current_segment_end
+        ):
+            raise ValueError("invalid attribute-key segment cursor")
+        if has_physical_checkpoint and active_segment_start is None:
+            # Five-field cursors from older pods always checkpointed inside the
+            # fixed six-hour slice.  Derive that legacy lower bound while new
+            # widened checkpoints carry an explicit sixth field.
+            active_segment_start = max(
+                start,
+                current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+            )
+        checkpoint_identity = before_identity or resume_identity
+        if checkpoint_identity is not None and not (
+            active_segment_start is not None
+            and active_segment_start <= checkpoint_identity[3] < current_segment_end
+        ):
+            raise ValueError("invalid attribute-key physical cursor")
         resume_key_offset = int(resume_key_offset)
         if resume_key_offset < 0:
             raise ValueError("invalid attribute-key resume offset")
@@ -2759,32 +2804,33 @@ class AttributeReadSelector:
         ):
             raise ValueError("invalid attribute-key seen state")
         seen_set = set(seen)
-        publication_budget = ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - len(seen)
-        if publication_budget < 0:
+        tracked_key_budget = ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - len(seen)
+        if tracked_key_budget < 0:
             raise ValueError("invalid attribute-key seen state")
-        effective_page_size = min(page_size, publication_budget)
-        if effective_page_size == 0:
-            return AttributeKeyCursorPageRead(
-                (),
-                self._metadata(
-                    complete=True,
-                    error_code=None,
-                    window_start=start,
-                    window_end=end,
-                    query_count=self._query_count,
-                ),
-                False,
-                "limit_reached",
-                current_segment_end,
-                before_identity,
-                resume_identity,
-                resume_key_offset,
-                seen,
-            )
+        # The cache tracks a finite exact de-duplication prefix, not a result
+        # ceiling.  Once that prefix is full the physical cursor keeps moving
+        # and may repeat later keys; API consumers already merge keys by exact
+        # name.  This keeps the cursor token/cache bounded while guaranteeing
+        # that a key after the 4,096th distinct name remains reachable.
+        # An exact search is satisfied by the first verified occurrence. The
+        # row remains conservatively multi-typed to downstream filters unless a
+        # separate exact-coverage read certifies otherwise.
+        effective_page_size = 1 if exact_key is not None else page_size
         emitted_digests: list[str] = []
         emitted: dict[str, AttributeKeyRow] = {}
         candidate_pages = 0
         cursor_before = before_identity
+        empty_segment_width = (
+            current_segment_end - active_segment_start
+            if active_segment_start is not None
+            else ATTRIBUTE_READ_EXPLICIT_SEGMENT
+        )
+        # Once ClickHouse rejects a widened empty slice, remember that ceiling
+        # for the rest of this request.  Re-doubling immediately after the
+        # successful narrower retry would repeatedly spend the six-second wall
+        # budget on the same known-failing shape while walking sparse history.
+        max_empty_segment_width = ATTRIBUTE_KEY_CURSOR_MAX_EMPTY_SEGMENT
+        exact_probe_segment_end: datetime | None = None
         next_resume_identity: PhysicalSpanIdentity | None = None
         next_resume_key_offset = 0
 
@@ -2795,7 +2841,11 @@ class AttributeReadSelector:
             )
             return tuple(
                 sorted(
-                    keys.items(),
+                    (
+                        item
+                        for item in keys.items()
+                        if exact_key is None or item[0] == exact_key
+                    ),
                     key=lambda item: (item[0].casefold(), item[0], item[1]),
                 )
             )
@@ -2860,6 +2910,14 @@ class AttributeReadSelector:
             "OR length(attrs_number.keys) > 0 "
             "OR length(attrs_bool.keys) > 0"
         )
+        exact_typed_predicate = (
+            "(indexHint(has(mapKeys(attrs_string), %(attribute_key)s)) "
+            "AND has(attrs_string.keys, %(attribute_key)s)) "
+            "OR (indexHint(has(mapKeys(attrs_number), %(attribute_key)s)) "
+            "AND has(attrs_number.keys, %(attribute_key)s)) "
+            "OR (indexHint(has(mapKeys(attrs_bool), %(attribute_key)s)) "
+            "AND has(attrs_bool.keys, %(attribute_key)s))"
+        )
         if self._reads_json_overflow:
             browse_predicate = (
                 f"({browse_predicate}) OR attributes_extra NOT IN ('', '{{}}', 'null')"
@@ -2870,26 +2928,109 @@ class AttributeReadSelector:
             and len(emitted) < effective_page_size
             and next_resume_identity is None
             and candidate_pages < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
-            # Every walk iteration issues one candidate query and one
-            # latest-state verification query.  A resumed wide row consumes
-            # one query before this loop, so leave room for the pair instead
-            # of crossing the selector's global per-operation ceiling.
-            and self._query_count + 2 <= ATTRIBUTE_READ_MAX_QUERY_COUNT
+            # Generic browsing needs a candidate/replay pair. An exact search
+            # may first spend another pair on the typed Map bloom indexes; it
+            # must still leave room for the generic structured-JSON fallback.
+            and self._query_count
+            + (
+                4
+                if exact_key is not None
+                and cursor_before is None
+                and active_segment_start is None
+                and exact_probe_segment_end != current_segment_end
+                else 2
+            )
+            <= ATTRIBUTE_READ_MAX_QUERY_COUNT
         ):
-            segment_start = max(
-                start, current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
+            current_segment_start = (
+                active_segment_start
+                if active_segment_start is not None
+                else max(start, current_segment_end - empty_segment_width)
             )
-            segment = (segment_start, current_segment_end)
-            candidate_ids, segment_truncated, _ = self._candidate_ids(
-                projects,
-                segment,
-                predicate=browse_predicate,
-                attribute_key=None,
-                ordered=True,
-                before_identity=cursor_before,
-                candidate_limit=ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT,
-                candidate_query_settings={"use_skip_indexes": 0},
-            )
+            segment = (current_segment_start, current_segment_end)
+
+            # Exact searches get one cheap typed-Map probe at the start of each
+            # physical segment.  Keep this lane independent from the generic
+            # predicate: OR-ing JSON overflow into it would prevent ClickHouse
+            # from using the existing Map-key bloom indexes.  A miss, stale
+            # version, or typed-lane budget failure changes no cursor state;
+            # the ordinary physical walk below remains the deterministic
+            # fallback for JSON-only keys and exact continuation.
+            if (
+                exact_key is not None
+                and cursor_before is None
+                and active_segment_start is None
+                and exact_probe_segment_end != current_segment_end
+            ):
+                try:
+                    exact_candidate_ids, _exact_truncated, _ = self._candidate_ids(
+                        projects,
+                        segment,
+                        predicate=exact_typed_predicate,
+                        attribute_key=exact_key,
+                        # This is an existence accelerator, not a published
+                        # cursor. Read in MergeTree order and let the generic
+                        # lane below own deterministic newest-first progress.
+                        ordered=False,
+                        before_identity=None,
+                        candidate_limit=ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT,
+                        query_timeout_ms=ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
+                    )
+                    candidate_pages += 1
+                    exact_rows = self._verify_latest(
+                        sql=_LATEST_TYPED_BROWSE_SQL,
+                        project_ids=projects,
+                        candidate_ids=exact_candidate_ids,
+                        query_timeout_ms=ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
+                    )
+                    exact_rows_by_identity = {
+                        self._physical_identity(row): row for row in exact_rows
+                    }
+                    for identity in exact_candidate_ids:
+                        row = exact_rows_by_identity.get(identity)
+                        if row is None or not self._row_is_active_in_window(
+                            row, start, end
+                        ):
+                            continue
+                        consume_keys(row_keys(row))
+                        if emitted:
+                            break
+                    exact_probe_segment_end = current_segment_end
+                except Exception as exc:
+                    if not is_read_budget_error(exc):
+                        raise
+                    # The generic lane covers typed Maps too. If this wider
+                    # accelerator times out, do not spend the remaining wall
+                    # retrying it after a fallback shrink; let the five-minute
+                    # generic slice make deterministic progress instead.
+                    exact_probe_segment_end = current_segment_end
+                if emitted:
+                    break
+
+            try:
+                candidate_ids, segment_truncated, _ = self._candidate_ids(
+                    projects,
+                    segment,
+                    predicate=browse_predicate,
+                    attribute_key=None,
+                    ordered=True,
+                    before_identity=cursor_before,
+                    candidate_limit=ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT,
+                    candidate_query_settings={"use_skip_indexes": 0},
+                )
+            except Exception as exc:
+                if (
+                    is_read_budget_error(exc)
+                    and active_segment_start is None
+                    and empty_segment_width > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                ):
+                    max_empty_segment_width = min(
+                        max_empty_segment_width,
+                        ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+                    )
+                    empty_segment_width = max_empty_segment_width
+                    continue
+                raise
             candidate_pages += 1
             rows = self._verify_latest(
                 sql=_LATEST_BROWSE_SQL,
@@ -2914,29 +3055,60 @@ class AttributeReadSelector:
 
             cursor_before = fully_processed_identity
             if next_resume_identity is not None or len(emitted) >= effective_page_size:
+                active_segment_start = current_segment_start
                 break
             if segment_truncated and candidate_ids:
                 cursor_before = candidate_ids[-1]
+                active_segment_start = current_segment_start
                 continue
-            current_segment_end = segment_start
+            current_segment_end = current_segment_start
             cursor_before = None
+            active_segment_start = None
+            if candidate_ids:
+                empty_segment_width = min(
+                    ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+                    max_empty_segment_width,
+                )
+            else:
+                empty_segment_width = min(
+                    empty_segment_width * 2,
+                    max_empty_segment_width,
+                )
 
-        exhausted = current_segment_end <= start and next_resume_identity is None
-        seen_after = (*seen, *emitted_digests)
-        limit_reached = len(seen_after) >= ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
+        # A positive exact search is terminal even when older physical rows
+        # remain: one verified latest-state occurrence proves the selectable
+        # key exists, and consumers deliberately do not treat its observed type
+        # set as complete tenant-wide coverage.
+        exhausted = (
+            (exact_key is not None and bool(emitted))
+            or current_segment_end <= start
+            and next_resume_identity is None
+        )
+        tracked_emitted_digests = emitted_digests[:tracked_key_budget]
+        seen_after = (*seen, *tracked_emitted_digests)
         browse_status: AttributeKeyBrowseStatus = (
-            "limit_reached"
-            if limit_reached
-            else "exhausted"
-            if exhausted
-            else "continuation"
+            "exhausted" if exhausted else "continuation"
         )
         has_more = browse_status == "continuation"
+        next_checkpoint = next_resume_identity or cursor_before
+        next_segment_start = (
+            active_segment_start if has_more and next_checkpoint is not None else None
+        )
+        if next_segment_start is not None:
+            legacy_segment_start = max(
+                start,
+                current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+            )
+            if next_segment_start == legacy_segment_start:
+                # Keep ordinary six-hour cursors on the five-field rolling
+                # deploy format.  Only widened checkpoints require the new
+                # explicit lower bound.
+                next_segment_start = None
         # A successful cursor page is a complete request, not a sampled
         # aggregate. Endpoint-specific browse_status communicates whether the
-        # recent-suggestion walk can continue, exhausted its frozen window, or
-        # reached the published vocabulary cap without manufacturing a generic
-        # sample-limit error.
+        # retained-data walk can continue or exhausted its frozen window. The
+        # finite de-duplication prefix is an implementation bound, never a
+        # published vocabulary/result bound.
         metadata = self._metadata(
             complete=True,
             error_code=None,
@@ -2954,6 +3126,7 @@ class AttributeReadSelector:
             next_resume_identity,
             next_resume_key_offset,
             seen_after,
+            next_segment_start,
         )
 
     def read_value_cursor_page(

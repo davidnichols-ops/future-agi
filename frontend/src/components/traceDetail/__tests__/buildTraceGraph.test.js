@@ -96,6 +96,48 @@ describe("buildTraceGraph inferred execution", () => {
     expect(edgePairs(graph)).not.toContain("agent:branch-b->agent:branch-a");
   });
 
+  it("joins the next sibling from the prior subtree terminal", () => {
+    const graph = buildTraceGraph([
+      entry(
+        "root",
+        "root",
+        "2026-08-06T10:00:00.000Z",
+        "2026-08-06T10:00:10.000Z",
+        [
+          entry(
+            "generation",
+            "generation",
+            "2026-08-06T10:00:01.000Z",
+            "2026-08-06T10:00:06.000Z",
+            [
+              entry(
+                "llm",
+                "answer",
+                "2026-08-06T10:00:02.000Z",
+                "2026-08-06T10:00:05.000Z",
+              ),
+            ],
+          ),
+          entry(
+            "evaluation",
+            "evaluation",
+            "2026-08-06T10:00:07.000Z",
+            "2026-08-06T10:00:08.000Z",
+          ),
+        ],
+      ),
+    ]);
+
+    expect(edgePairs(graph)).toEqual([
+      "agent:answer->agent:evaluation",
+      "agent:generation->agent:answer",
+      "agent:root->agent:generation",
+    ]);
+    expect(edgePairs(graph)).not.toContain(
+      "agent:generation->agent:evaluation",
+    );
+  });
+
   it("fails closed to hierarchy when a sibling timestamp is malformed", () => {
     const graph = buildTraceGraph([
       entry("root", "root", "bad", "bad", [

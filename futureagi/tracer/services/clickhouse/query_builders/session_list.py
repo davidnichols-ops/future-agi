@@ -1194,6 +1194,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         )
         user_ctes = ""
         user_membership = ""
+        user_root_seed = ""
+        user_root_ids_cte = ""
         eu_map_cte = ""
         if resolved_user_clause or user_null_op:
             eu_map = survivor_map_subquery("end_user_id_remap")
@@ -1247,6 +1249,30 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                   )
               )
                 """
+                # ``matching_user_sessions`` is a selective, remap-aware
+                # superset for the exact positive user filter.  Reuse it when
+                # acquiring root identities so an organization user page does
+                # not replay every root in the requested window before applying
+                # the membership it has already computed.
+                user_root_seed = """
+              AND trace_session_id IN (
+                  SELECT session_id FROM matching_user_root_ids
+              )
+                """
+                user_root_ids_cte = f""",
+        matching_user_root_ids AS (
+            SELECT arrayJoin(arrayFilter(
+                session_key -> session_key != toUUID('{NIL_UUID}'),
+                arrayPushBack(
+                    groupUniqArray(user_session_aliases.any_id),
+                    matching_user_sessions.session_id
+                )
+            )) AS session_id
+            FROM matching_user_sessions
+            LEFT JOIN ts_survivor_map AS user_session_aliases
+                ON matching_user_sessions.session_id = user_session_aliases.survivor_id
+            GROUP BY matching_user_sessions.session_id
+        )"""
             else:
                 # NOT IN / null-presence predicates cannot be seeded by the
                 # requested user IDs without changing their meaning.  The scan
@@ -1297,7 +1323,8 @@ class SessionListQueryBuilder(BaseQueryBuilder):
               AND end_user_id != toUUID('{NIL_UUID}')
               {f"AND {resolved_user_clause}" if resolved_user_clause else ""}
             GROUP BY session_id
-        )"""
+        )
+        {user_root_ids_cte}"""
             membership_op = "NOT IN" if user_null_op == "is_null" else "IN"
             user_membership = (
                 f"AND session_id {membership_op} "
@@ -1341,13 +1368,15 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         return f"""
         {ts_map_ctes}
         {candidate_session_cte}
-        {eu_map_cte},
+        {eu_map_cte}
+        {user_ctes},
         candidate_root_identities AS (
             SELECT DISTINCT project_id, trace_id, id, start_time
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}{span_time_scope}
             WHERE (parent_span_id IS NULL OR parent_span_id = '')
               {root_session_seed}
+              {user_root_seed}
         ),
         latest_roots AS (
             SELECT
@@ -1384,7 +1413,6 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         )
         {scalar_filter_ctes}
         {additional_root_ctes}
-        {user_ctes}
         {org_project_count_cte},
         sessions AS (
             SELECT

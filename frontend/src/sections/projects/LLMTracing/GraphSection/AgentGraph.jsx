@@ -596,6 +596,18 @@ export const buildFlowData = (graphData, direction = "LR", theme = null) => {
 
   const nodeIdSet = new Set(graphData.nodes.map((n) => n.id));
 
+  // Aggregate Agent Graph payloads contain two exact projections:
+  //   - `edges`: recorded parent_span_id nesting
+  //   - `path_edges`: adjacent chronological execution inside each trace
+  //
+  // This visualization answers "how did the agent move?", matching the
+  // per-trace Agent Graph below the trace tree. Prefer the execution projection
+  // when the API supplies it; trace-detail graphs and rolling-deploy payloads
+  // only carry `edges`, so they retain their existing behavior. An explicit
+  // empty path remains empty instead of being replaced with hierarchy.
+  const graphEdges =
+    graphData.path_edges ?? graphData.pathEdges ?? graphData.edges ?? [];
+
   const flowNodes = graphData.nodes.map((node) => ({
     id: node.id,
     type: "agentNode",
@@ -618,12 +630,12 @@ export const buildFlowData = (graphData, direction = "LR", theme = null) => {
   // Find max transition count for scaling edge thickness
   const maxTransitions = Math.max(
     1,
-    ...graphData.edges.map(
+    ...graphEdges.map(
       (edge) => edge.transition_count ?? edge.transitionCount ?? 1,
     ),
   );
 
-  const flowEdges = graphData.edges
+  const flowEdges = graphEdges
     .filter((edge) => nodeIdSet.has(edge.source) && nodeIdSet.has(edge.target))
     .map((edge, idx) => {
       const count = edge.transition_count ?? edge.transitionCount ?? 1;

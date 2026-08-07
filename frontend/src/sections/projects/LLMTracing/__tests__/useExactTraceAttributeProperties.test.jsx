@@ -40,7 +40,7 @@ function createWrapper() {
 describe("useExactTraceAttributeProperties", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("loads ten recent keys first and de-duplicates cursor pages", async () => {
+  it("loads ten retained keys first and de-duplicates cursor pages", async () => {
     mocks.get
       .mockResolvedValueOnce({
         data: {
@@ -154,7 +154,7 @@ describe("useExactTraceAttributeProperties", () => {
     ).toBe("complete");
   });
 
-  it("keeps degraded exact matches scoped to the selected project and source", async () => {
+  it("keeps degraded retained matches scoped to the selected project and source", async () => {
     mocks.get.mockResolvedValue({
       data: {
         result: [{ key: "final_status", type: "string", count: 1 }],
@@ -169,7 +169,6 @@ describe("useExactTraceAttributeProperties", () => {
           projectId: "project-synthetic",
           search: "final_status",
           source: "traces",
-          contextKey: "past-7-days",
         }),
       { wrapper: createWrapper() },
     );
@@ -181,6 +180,7 @@ describe("useExactTraceAttributeProperties", () => {
         signal: expect.any(AbortSignal),
         params: {
           project_id: "project-synthetic",
+          page_size: 10,
           q: "final_status",
         },
       }),
@@ -196,45 +196,173 @@ describe("useExactTraceAttributeProperties", () => {
     expect(result.current.queryReadState).toBe("degraded");
   });
 
-  it("cancels the stale exact lookup when the search context changes", async () => {
-    const requests = [];
-    mocks.get.mockImplementation(
-      (_url, config) =>
-        new Promise((resolve) => {
-          requests.push({ config, resolve });
-        }),
-    );
-
-    const { rerender } = renderHook(
-      ({ search }) =>
-        useExactTraceAttributeProperties({
-          projectId: "project-synthetic",
-          search,
-          source: "traces",
-          contextKey: "past-7-days",
-        }),
-      {
-        initialProps: { search: "final_status" },
-        wrapper: createWrapper(),
-      },
-    );
-
-    await waitFor(() => expect(requests).toHaveLength(1));
-    rerender({ search: "prompt_slug" });
-    await waitFor(() => expect(requests).toHaveLength(2));
-
-    expect(requests[0].config.signal.aborted).toBe(true);
-    expect(requests[1].config.params.q).toBe("prompt_slug");
-
-    await act(async () => {
-      requests[1].resolve({
+  it("retries a degraded initial retained read without stranding the picker", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
         data: {
-          result: [{ key: "prompt_slug", type: "string", count: 1 }],
+          result: [],
+          query_complete: false,
+          query_status: "degraded",
+          query_error_code: "read_budget_exceeded",
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: [{ key: "recovered_attribute", type: "string", count: 1 }],
           query_complete: true,
           query_status: "complete",
+          browse_mode: "recent_suggestions",
+          browse_status: "exhausted",
+          has_more: false,
+          next_cursor: null,
+        },
+      });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.queryReadState).toBe("degraded"));
+    await act(async () => result.current.refetch());
+    await waitFor(() => expect(result.current.queryReadState).toBe("complete"));
+
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(result.current.data[0]).toEqual(
+      expect.objectContaining({ id: "recovered_attribute" }),
+    );
+  });
+
+  it("preserves the loaded catalog while continuing supplemental exact search", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (!params.q) {
+        if (params.cursor === "catalog-page-2") {
+          return Promise.resolve({
+            data: {
+              result: [{ key: "final_archive", type: "string", count: 1 }],
+              query_complete: true,
+              query_status: "complete",
+              browse_mode: "recent_suggestions",
+              browse_status: "exhausted",
+              has_more: false,
+              next_cursor: null,
+            },
+          });
+        }
+        return Promise.resolve({
+          data: {
+            result: [{ key: "final_category", type: "string", count: 1 }],
+            query_complete: true,
+            query_status: "complete",
+            browse_mode: "recent_suggestions",
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: "catalog-page-2",
+          },
+        });
+      }
+      if (!params.cursor) {
+        return Promise.resolve({
+          data: {
+            result: [],
+            query_complete: true,
+            query_status: "complete",
+            browse_mode: "recent_suggestions",
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: "search-page-2",
+            lookup_mode: "exact",
+            exact_match: false,
+          },
+        });
+      }
+      return Promise.resolve({
+        data: {
+          result: [{ key: "final_status", type: "string", count: 1 }],
+          query_complete: true,
+          query_status: "complete",
+          browse_mode: "recent_suggestions",
+          browse_status: "exhausted",
+          has_more: false,
+          next_cursor: null,
+          lookup_mode: "exact",
+          exact_match: true,
         },
       });
     });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "final_status",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data.map((item) => item.id)).toEqual([
+      "final_category",
+    ]);
+    expect(result.current.hasNextPage).toBe(true);
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.data).toHaveLength(3));
+
+    expect(mocks.get).toHaveBeenCalledWith(
+      "/api/traces/span-attribute-keys/",
+      expect.objectContaining({
+        params: {
+          project_id: "project-synthetic",
+          page_size: 10,
+          cursor: "catalog-page-2",
+        },
+      }),
+    );
+    expect(mocks.get).toHaveBeenCalledWith(
+      "/api/traces/span-attribute-keys/",
+      expect.objectContaining({
+        params: {
+          project_id: "project-synthetic",
+          page_size: 10,
+        },
+      }),
+    );
+    expect(mocks.get).toHaveBeenCalledWith(
+      "/api/traces/span-attribute-keys/",
+      expect.objectContaining({
+        params: {
+          project_id: "project-synthetic",
+          page_size: 10,
+          q: "final_status",
+        },
+      }),
+    );
+    expect(mocks.get).toHaveBeenCalledWith(
+      "/api/traces/span-attribute-keys/",
+      expect.objectContaining({
+        params: {
+          project_id: "project-synthetic",
+          page_size: 10,
+          q: "final_status",
+          cursor: "search-page-2",
+        },
+      }),
+    );
+    expect(result.current.data.map((item) => item.id)).toEqual([
+      "final_category",
+      "final_archive",
+      "final_status",
+    ]);
+    expect(result.current.data[2]).toEqual(
+      expect.objectContaining({ id: "final_status", type: "string" }),
+    );
+    expect(result.current.hasNextPage).toBe(false);
   });
 
   it("does not query without a project or for an unsupported source", () => {

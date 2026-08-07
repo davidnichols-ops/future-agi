@@ -282,41 +282,53 @@ function buildInferredGraph(flatSpans) {
     edgeMap[edgeKey].transitionCount += 1;
   };
 
-  const spanById = new Map(
-    flatSpans
-      .filter((item) => item.span.id)
-      .map((item) => [String(item.span.id), item]),
-  );
-  const siblingSets = new Map();
-  flatSpans.forEach((item) => {
-    const parentKey = item.parentSpanId
-      ? String(item.parentSpanId)
-      : "__trace_roots__";
-    if (!siblingSets.has(parentKey)) siblingSets.set(parentKey, []);
-    siblingSets.get(parentKey).push(item);
-  });
+  const itemByEntry = new Map(flatSpans.map((item) => [item.entry, item]));
+  const childrenOf = (item) =>
+    (item?.entry?.children || [])
+      .map((childEntry) => itemByEntry.get(childEntry))
+      .filter(Boolean);
 
-  siblingSets.forEach((siblings, parentId) => {
-    const parentItem =
-      parentId === "__trace_roots__" ? null : spanById.get(parentId);
+  // Return the terminal span(s) of each subtree while building its local
+  // execution edges. Connecting the next sibling group from subtree terminals
+  // is important: when `generation` contains an LLM child and `evaluation`
+  // follows generation, the real transition is LLM -> evaluation, not a fork
+  // generation -> {LLM, evaluation}.
+  const processItem = (item) => {
+    const children = childrenOf(item);
+    if (children.length === 0) return [item];
+    return processSiblingSet(children, item);
+  };
+
+  const processSiblingSet = (siblings, parentItem) => {
     const groups = localSiblingGroups(siblings);
 
     // Missing/malformed timing is not a license to invent execution order.
     // Fall back to the authoritative hierarchy for this local sibling set.
     if (!groups) {
       if (parentItem) siblings.forEach((child) => addEdge(parentItem, child));
-      return;
+      return siblings.flatMap((child) => processItem(child));
     }
 
     if (parentItem) {
       groups[0].forEach((child) => addEdge(parentItem, child));
     }
-    for (let index = 1; index < groups.length; index++) {
-      groups[index - 1].forEach((source) => {
-        groups[index].forEach((target) => addEdge(source, target));
-      });
-    }
-  });
+
+    let previousTerminals = [];
+    groups.forEach((group, index) => {
+      if (index > 0) {
+        previousTerminals.forEach((source) => {
+          group.forEach((target) => addEdge(source, target));
+        });
+      }
+      previousTerminals = group.flatMap((child) => processItem(child));
+    });
+    return previousTerminals;
+  };
+
+  processSiblingSet(
+    flatSpans.filter((item) => item.depth === 0),
+    null,
+  );
 
   // Compute averages
   const nodes = Object.values(nodeMap).map((n) => ({

@@ -403,6 +403,62 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             not in {"created_at", "start_time"}
         ]
 
+    def _positive_exact_end_user_seed_filter(self) -> dict[str, Any] | None:
+        """Return the sole exact user alias filter eligible for root seeding.
+
+        User-detail trace pages add one ``user``/``user_id`` equality while
+        retaining a separate time predicate.  Other relational shapes stay on
+        the candidate classifier path: negation, substring matching, and
+        combinations can be common enough that they are not safe selective
+        seeds.
+        """
+
+        active_filters = self._active_non_time_filters()
+        if self.search or len(active_filters) != 1:
+            return None
+        item = active_filters[0]
+        key = item.get("column_id") or item.get("columnId")
+        if key not in {"user", "user_id"}:
+            return None
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        if not isinstance(config, dict):
+            return None
+        operation = normalize_filter_op(
+            config.get("filter_op") or config.get("filterOp")
+        )
+        value = config.get("filter_value", config.get("filterValue"))
+        if operation == "equals":
+            if not isinstance(value, str) or not value:
+                return None
+        elif operation == "in":
+            if (
+                not isinstance(value, list)
+                or not value
+                or any(not isinstance(member, str) or not member for member in value)
+            ):
+                return None
+        else:
+            return None
+        return item
+
+    def _positive_exact_end_user_seed(self) -> tuple[str, dict[str, Any]]:
+        """Compile an indexed, project/time-scoped trace-membership superset."""
+
+        filter_item = self._positive_exact_end_user_seed_filter()
+        if filter_item is None:
+            return "", {}
+        filter_builder = self._FILTER_BUILDER_CLS(
+            table=self.TABLE,
+            query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
+            project_id=self.project_id,
+            project_ids=self.project_ids,
+            score_date_scope=False,
+            span_date_scope=True,
+            strict_enduser_project_correlation=True,
+        )
+        predicate, params = filter_builder.translate([filter_item])
+        return predicate or "", params
+
     def _structured_attribute_filter_count(self) -> int:
         """Count canonical array/object leaves evaluated from JSON overflow."""
 
@@ -783,6 +839,20 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """
 
         request_start, request_end = self._bounded_request_window
+        request_width = request_end - request_start
+        if (
+            not self._bounded_identity_only
+            and not self._bounded_internal_scan
+            and not self._bounded_bulk_scan
+            and not self._bounded_population_proof
+            and request_width >= timedelta(minutes=5)
+            and self._positive_exact_end_user_seed_filter() is not None
+        ):
+            # The root seed is constrained by a project/time-scoped
+            # ``end_user_id`` membership subquery.  Read the requested window
+            # once instead of serially proving dozens of empty two-day slices
+            # for a sparse organization user.
+            return request_width
         if (
             not self._bounded_identity_only
             and not self._bounded_internal_scan
@@ -792,6 +862,22 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and self._positive_typed_map_anchor_plan() is not None
         ):
             return _LONG_WINDOW_ORDERED_ROOT_INITIAL_SLICE
+        return None
+
+    def recommended_filter_max_slice_width(self) -> timedelta | None:
+        """Permit one full-window seed only for an exact positive user alias."""
+
+        request_start, request_end = self._bounded_request_window
+        request_width = request_end - request_start
+        if (
+            not self._bounded_identity_only
+            and not self._bounded_internal_scan
+            and not self._bounded_bulk_scan
+            and not self._bounded_population_proof
+            and request_width >= timedelta(minutes=5)
+            and self._positive_exact_end_user_seed_filter() is not None
+        ):
+            return request_width
         return None
 
     def recommended_filter_classify_batch_size(self) -> int | None:
@@ -1427,6 +1513,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         if not request_start <= slice_start < slice_end <= request_end:
             raise ValueError("trace seed slice must stay inside the request window")
         self.start_date, self.end_date = request_start, request_end
+        self.params.update({"start_date": request_start, "end_date": request_end})
         plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         root_plans = [plan for plan in plans if plan.scope == "root"]
         root_seed_plan_predicates = [
@@ -1463,6 +1550,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     if f"%({key})s" in seed_predicate
                 }
             )
+        end_user_seed_predicate, end_user_seed_params = (
+            self._positive_exact_end_user_seed()
+        )
+        params.update(end_user_seed_params)
+        if end_user_seed_predicate:
+            root_seed_predicates.append(end_user_seed_predicate)
         root_predicate = " AND ".join(root_seed_predicates)
         predicate_fragment = f"AND {root_predicate}" if root_predicate else ""
         trace_id_prewhere_predicate = " AND ".join(trace_id_prewhere_predicates)
@@ -1680,6 +1773,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     if f"%({key})s" in seed_predicate
                 }
             )
+
+        end_user_seed_predicate, end_user_seed_params = (
+            self._positive_exact_end_user_seed()
+        )
+        params.update(end_user_seed_params)
+        if end_user_seed_predicate:
+            seed_predicates.append(end_user_seed_predicate)
 
         predicate = " AND ".join(seed_predicates)
         predicate_fragment = f"AND {predicate}" if predicate else ""
@@ -2187,6 +2287,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     score_date_scope=scope_to_request_window,
                     span_date_scope=scope_to_request_window,
                     candidate_ids_param="candidate_trace_ids",
+                    strict_enduser_project_correlation=True,
                 )
                 residual_predicate, residual_params = residual_builder.translate(
                     residual_filters

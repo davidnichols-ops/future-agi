@@ -568,7 +568,11 @@ const EXCLUDED_METRICS = new Set([
   // duplicate of node_type — both map to observation_type
   "span_kind",
 ]);
-const PROPERTY_PICKER_RENDER_LIMIT = 500;
+// Keep the initial DOM bounded, then reveal already-fetched properties in
+// deliberate batches. This is a render batch, not a result ceiling: every
+// retained key remains reachable without forcing thousands of menu rows into
+// the first paint.
+const PROPERTY_PICKER_RENDER_BATCH_SIZE = 500;
 
 const normalizePropertySearchText = (value) =>
   String(value || "")
@@ -797,6 +801,54 @@ export function useTraceFilterProperties(
 // ---------------------------------------------------------------------------
 // PropertyPicker — dashboard-style two-column picker
 // ---------------------------------------------------------------------------
+export function mergeRetainedAttributeProperties(
+  properties,
+  retainedAttributeProperties,
+  { canonical = false } = {},
+) {
+  const catalog = properties || [];
+  const nonAttributes = catalog.filter(
+    (property) => property.category !== "attribute",
+  );
+  const reservedIds = new Set(nonAttributes.map((property) => property.id));
+  const retainedAttributes = (retainedAttributeProperties || []).filter(
+    (property) => !reservedIds.has(property.id),
+  );
+  const retainedIds = new Set(
+    retainedAttributes.map((property) => property.id),
+  );
+  const catalogAttributeFallback = canonical
+    ? []
+    : catalog.filter(
+        (property) =>
+          property.category === "attribute" && !retainedIds.has(property.id),
+      );
+  return [...nonAttributes, ...retainedAttributes, ...catalogAttributeFallback];
+}
+
+export function shouldUseRetainedAttributePages({
+  enabled,
+  source,
+  readState,
+  attributes,
+  browseStatus,
+}) {
+  const supportedSource = source === "traces" || source === "spans";
+  const hasAuthoritativeKeys = (attributes?.length || 0) > 0;
+  const inventoryIsTerminal =
+    browseStatus === "exhausted" || browseStatus === "limit_reached";
+
+  // An empty continuation page only proves that its bounded physical slices
+  // contained no attributes. Keep the compatibility catalog visible until
+  // the retained-data walk yields a key or reaches a terminal state.
+  return (
+    enabled &&
+    supportedSource &&
+    readState === "complete" &&
+    (hasAuthoritativeKeys || inventoryIsTerminal)
+  );
+}
+
 function PropertyPicker({
   anchorEl,
   open,
@@ -806,12 +858,15 @@ function PropertyPicker({
   categories = CATEGORIES,
   projectId,
   source = "traces",
-  attributeLookupContext = "",
   enableExactAttributeLookup = true,
   catalogError = false,
 }) {
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("all");
+  const autoAttributeScrollPageUsedRef = useRef(false);
+  const [visiblePropertyLimit, setVisiblePropertyLimit] = useState(
+    PROPERTY_PICKER_RENDER_BATCH_SIZE,
+  );
   const hasCategorySidebar = categories && categories.length > 0;
   const {
     data: exactAttributeProperties,
@@ -819,35 +874,61 @@ function PropertyPicker({
     fetchNextPage: fetchNextAttributePage,
     hasNextPage: hasNextAttributePage,
     isFetchingNextPage: isFetchingNextAttributePage,
+    isFetchNextPageError: isNextAttributePageError,
     queryReadState: exactAttributeReadState,
+    browseStatus: exactAttributeBrowseStatus,
+    pageCount: exactAttributePageCount,
     debouncedSearch,
+    refetch: refetchAttributePages,
   } = useExactTraceAttributeProperties({
     projectId,
     search,
     source,
     enabled: enableExactAttributeLookup && open,
-    contextKey: attributeLookupContext,
+  });
+
+  useEffect(() => {
+    if (!open) autoAttributeScrollPageUsedRef.current = false;
+  }, [open]);
+
+  useEffect(() => {
+    autoAttributeScrollPageUsedRef.current = false;
+  }, [debouncedSearch, projectId, source]);
+
+  useEffect(() => {
+    setVisiblePropertyLimit(PROPERTY_PICKER_RENDER_BATCH_SIZE);
+  }, [open, search, category, projectId, source]);
+
+  useEffect(() => {
+    // A completed cursor page (including an empty one), a continuation error,
+    // or a locally revealed render batch finishes the prior scroll action.
+    // The next natural downward gesture may therefore advance once without
+    // requiring the user to scroll upward merely to clear a permanent latch.
+    autoAttributeScrollPageUsedRef.current = false;
+  }, [exactAttributePageCount, isNextAttributePageError, visiblePropertyLimit]);
+
+  const usesRetainedAttributePages = shouldUseRetainedAttributePages({
+    enabled: enableExactAttributeLookup,
+    source,
+    readState: exactAttributeReadState,
+    attributes: exactAttributeProperties,
+    browseStatus: exactAttributeBrowseStatus,
   });
 
   const propertiesWithExactAttribute = useMemo(() => {
-    const catalog = properties || [];
-    const nonAttributes = catalog.filter(
-      (property) => property.category !== "attribute",
+    // `/tracer/dashboard/metrics/` still carries a bounded compatibility
+    // sample of attributes for older consumers.  Once the cursor endpoint is
+    // healthy, it is the canonical picker inventory: re-appending the metrics
+    // sample makes a continuation look broken because newly fetched keys were
+    // already rendered.  Keep the sample only as a degraded-read fallback.
+    return mergeRetainedAttributeProperties(
+      properties,
+      exactAttributeProperties,
+      {
+        canonical: usesRetainedAttributePages,
+      },
     );
-    const reservedIds = new Set(nonAttributes.map((property) => property.id));
-    const recentAttributes = exactAttributeProperties.filter(
-      (property) => !reservedIds.has(property.id),
-    );
-    const exactIds = new Set(recentAttributes.map((property) => property.id));
-    return [
-      ...nonAttributes,
-      ...recentAttributes,
-      ...catalog.filter(
-        (property) =>
-          property.category === "attribute" && !exactIds.has(property.id),
-      ),
-    ];
-  }, [properties, exactAttributeProperties]);
+  }, [properties, exactAttributeProperties, usesRetainedAttributePages]);
 
   const filtered = useMemo(
     () =>
@@ -866,11 +947,8 @@ function PropertyPicker({
       c[p.category] = (c[p.category] || 0) + 1;
     return c;
   }, [propertiesWithExactAttribute]);
-  const visibleProperties = filtered.slice(0, PROPERTY_PICKER_RENDER_LIMIT);
-  const hiddenCount = Math.max(
-    filtered.length - PROPERTY_PICKER_RENDER_LIMIT,
-    0,
-  );
+  const visibleProperties = filtered.slice(0, visiblePropertyLimit);
+  const hiddenCount = Math.max(filtered.length - visiblePropertyLimit, 0);
   const manualAttributeProperty = useMemo(
     () =>
       debouncedSearch === search.trim() && !exactAttributeLoading
@@ -878,7 +956,13 @@ function PropertyPicker({
             search,
             category,
             properties: propertiesWithExactAttribute,
-            enabled: enableExactAttributeLookup,
+            // Do not guess that an unseen retained key is text while the
+            // cursor still has older typed pages. A manual future-key entry is
+            // offered only after the frozen retained catalog is exhausted.
+            enabled:
+              enableExactAttributeLookup &&
+              exactAttributeBrowseStatus === "exhausted" &&
+              !hasNextAttributePage,
             hasCategorySidebar,
           })
         : null,
@@ -886,26 +970,53 @@ function PropertyPicker({
       category,
       debouncedSearch,
       enableExactAttributeLookup,
+      exactAttributeBrowseStatus,
       exactAttributeLoading,
       hasCategorySidebar,
+      hasNextAttributePage,
       propertiesWithExactAttribute,
       search,
     ],
   );
 
   const paperWidth = hasCategorySidebar ? 480 : 320;
+  const loadNextAttributePage = useCallback(() => {
+    autoAttributeScrollPageUsedRef.current = true;
+    return fetchNextAttributePage();
+  }, [fetchNextAttributePage]);
+  const revealNextPropertyBatch = useCallback(() => {
+    autoAttributeScrollPageUsedRef.current = true;
+    setVisiblePropertyLimit((current) =>
+      Math.min(current + PROPERTY_PICKER_RENDER_BATCH_SIZE, filtered.length),
+    );
+  }, [filtered.length]);
   const handlePropertyScroll = useCallback(
     (event) => {
       const { scrollTop, clientHeight, scrollHeight } = event.currentTarget;
+      const isNearBottom = scrollHeight - scrollTop - clientHeight <= 40;
+      // One wheel/touchpad gesture must advance at most one cursor page.  A
+      // fast response can otherwise leave the list pinned at the bottom and
+      // consume every continuation (or race a later one) without user intent.
+      if (!isNearBottom) {
+        autoAttributeScrollPageUsedRef.current = false;
+        return;
+      }
       if (
-        scrollHeight - scrollTop - clientHeight <= 40 &&
-        hasNextAttributePage &&
-        !isFetchingNextAttributePage
+        !autoAttributeScrollPageUsedRef.current &&
+        (hiddenCount > 0 ||
+          (hasNextAttributePage && !isFetchingNextAttributePage))
       ) {
-        fetchNextAttributePage();
+        if (hiddenCount > 0) revealNextPropertyBatch();
+        else loadNextAttributePage();
       }
     },
-    [fetchNextAttributePage, hasNextAttributePage, isFetchingNextAttributePage],
+    [
+      hasNextAttributePage,
+      hiddenCount,
+      isFetchingNextAttributePage,
+      loadNextAttributePage,
+      revealNextPropertyBatch,
+    ],
   );
 
   return (
@@ -969,6 +1080,18 @@ function PropertyPicker({
                   {getAttributeLookupMessage(exactAttributeReadState)}
                 </Typography>
               )}
+            {!search.trim() &&
+              enableExactAttributeLookup &&
+              (source === "traces" || source === "spans") &&
+              exactAttributeReadState !== "complete" &&
+              !exactAttributeLoading && (
+                <Typography
+                  role="status"
+                  sx={{ mt: 0.75, fontSize: 11, color: "warning.main" }}
+                >
+                  {getAttributeLookupMessage(exactAttributeReadState)}
+                </Typography>
+              )}
             {!search.trim() && catalogError && (
               <Typography
                 role="status"
@@ -977,6 +1100,18 @@ function PropertyPicker({
                 {getQueryReadMessage("error")}
               </Typography>
             )}
+            {enableExactAttributeLookup &&
+              (source === "traces" || source === "spans") &&
+              exactAttributeReadState !== "complete" &&
+              !exactAttributeLoading && (
+                <Button
+                  size="small"
+                  onClick={() => refetchAttributePages?.()}
+                  sx={{ mt: 0.5, px: 0, minWidth: 0, fontSize: 11 }}
+                >
+                  Retry attribute suggestions
+                </Button>
+              )}
           </Box>
           <Divider />
           <Box sx={{ display: "flex", flex: 1, overflow: "hidden" }}>
@@ -1089,6 +1224,8 @@ function PropertyPicker({
                     px: 1.5,
                     py: 0.6,
                     cursor: "pointer",
+                    contentVisibility: "auto",
+                    containIntrinsicSize: "28px",
                     "&:hover": { bgcolor: "action.hover" },
                   }}
                 >
@@ -1177,20 +1314,51 @@ function PropertyPicker({
                   <CircularProgress size={14} />
                 </Box>
               )}
-              {hasNextAttributePage && !isFetchingNextAttributePage && (
+              {isNextAttributePageError && !isFetchingNextAttributePage && (
+                <Typography
+                  role="status"
+                  sx={{
+                    px: 1.5,
+                    pt: 0.75,
+                    fontSize: 11,
+                    color: "warning.main",
+                  }}
+                >
+                  More attributes could not be loaded. Please retry.
+                </Typography>
+              )}
+              {hiddenCount > 0 && (
                 <Box
                   sx={{ display: "flex", justifyContent: "center", py: 0.5 }}
                 >
                   <Button
-                    data-filter-property-load-more
+                    data-filter-property-show-more
                     size="small"
-                    onClick={() => fetchNextAttributePage()}
+                    onClick={revealNextPropertyBatch}
                     sx={{ fontSize: 11 }}
                   >
-                    Load more attributes
+                    {`Show ${Math.min(hiddenCount, PROPERTY_PICKER_RENDER_BATCH_SIZE)} more properties`}
                   </Button>
                 </Box>
               )}
+              {hiddenCount === 0 &&
+                hasNextAttributePage &&
+                !isFetchingNextAttributePage && (
+                  <Box
+                    sx={{ display: "flex", justifyContent: "center", py: 0.5 }}
+                  >
+                    <Button
+                      data-filter-property-load-more
+                      size="small"
+                      onClick={loadNextAttributePage}
+                      sx={{ fontSize: 11 }}
+                    >
+                      {isNextAttributePageError
+                        ? "Retry loading attributes"
+                        : "Load more attributes"}
+                    </Button>
+                  </Box>
+                )}
               {hiddenCount > 0 && (
                 <Typography
                   sx={{
@@ -1202,7 +1370,8 @@ function PropertyPicker({
                     borderColor: "divider",
                   }}
                 >
-                  {hiddenCount} more properties. Search to narrow the list.
+                  {hiddenCount} loaded properties remain. Continue scrolling or
+                  use the button above.
                 </Typography>
               )}
             </Box>
@@ -1918,7 +2087,6 @@ function FilterRow({
   freeSoloValues = false,
   operatorFilter,
   defaultOperatorForType,
-  attributeLookupContext,
   enableExactAttributeLookup = true,
   catalogError = false,
   attributeSource,
@@ -2384,7 +2552,6 @@ function FilterRow({
         onSelect={handlePropertySelect}
         projectId={projectId}
         source={attributeSource || source}
-        attributeLookupContext={attributeLookupContext}
         enableExactAttributeLookup={enableExactAttributeLookup}
         catalogError={catalogError}
       />
@@ -2519,10 +2686,6 @@ const TraceFilterPanel = ({
     [properties],
   );
   const propsLoading = skipDynamicProperties ? false : dynamicPropsLoading;
-  const attributeLookupContext = useMemo(
-    () => JSON.stringify(currentFilters || []),
-    [currentFilters],
-  );
   const effectiveCategories = categoriesOverride ?? CATEGORIES;
   const effectiveDefaultRow = defaultRowOverride || DEFAULT_ROW;
   const [activeTab, setActiveTab] = useState("basic");
@@ -3020,7 +3183,6 @@ const TraceFilterPanel = ({
                     freeSoloValues={freeSoloValues}
                     operatorFilter={operatorFilter}
                     defaultOperatorForType={defaultOperatorForType}
-                    attributeLookupContext={attributeLookupContext}
                     enableExactAttributeLookup={!skipDynamicProperties}
                     catalogError={!skipDynamicProperties && dynamicPropsError}
                     attributeSource={exactAttributeSource}

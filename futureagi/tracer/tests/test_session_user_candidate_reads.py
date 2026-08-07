@@ -21,6 +21,9 @@ from tracer.services.clickhouse.query_builders.user_list import (
 from tracer.services.clickhouse.v2.query_builders.session_list import (
     SessionListQueryBuilderV2,
 )
+from tracer.services.clickhouse.v2.query_builders.trace_list import (
+    TraceListQueryBuilderV2,
+)
 from tracer.services.clickhouse.v2.query_builders.user_list import (
     UserListQueryBuilderV2,
 )
@@ -1288,6 +1291,17 @@ def test_positive_end_user_filter_uses_candidate_scoped_membership():
     assert "latest_user_spans AS" in sql
     assert "matching_user_sessions AS" in sql
     assert "session_id IN (SELECT session_id FROM matching_user_sessions)" in sql
+    assert sql.index("matching_user_sessions AS") < sql.index(
+        "candidate_root_identities AS"
+    )
+    root_seed_sql = sql.split("candidate_root_identities AS (", 1)[1].split(
+        "),\n        latest_roots AS (", 1
+    )[0]
+    assert "trace_session_id IN (" in root_seed_sql
+    assert "SELECT session_id FROM matching_user_root_ids" in root_seed_sql
+    assert "matching_user_root_ids AS" in sql
+    assert "groupUniqArray(user_session_aliases.any_id)" in sql
+    assert "LEFT JOIN ts_survivor_map AS user_session_aliases" in sql
 
 
 @pytest.mark.unit
@@ -1315,6 +1329,10 @@ def test_negated_end_user_filter_uses_exact_time_scoped_membership():
     assert "session_id IN (SELECT session_id FROM matching_user_sessions)" in sql
     # A negated predicate must not preseed only the excluded user IDs.
     assert "candidate_filter_user_ids" not in params
+    root_seed_sql = sql.split("candidate_root_identities AS (", 1)[1].split(
+        "),\n        latest_roots AS (", 1
+    )[0]
+    assert "matching_user_sessions" not in root_seed_sql
 
 
 @pytest.mark.unit
@@ -1384,6 +1402,176 @@ def _ch25_client():
 def _dict_rows(rows, columns):
     names = [column[0] for column in columns]
     return [dict(zip(names, row, strict=True)) for row in rows]
+
+
+@pytest.mark.integration
+def test_user_trace_and_session_candidates_execute_with_alias_remaps():
+    """Execute exact CH25 user trace/session reads across both ID cutovers."""
+
+    client = _ch25_client()
+    original_database = client.execute("SELECT currentDatabase()")[0][0]
+    database = f"_test_user_candidates_{uuid.uuid4().hex}"
+    project_id = str(uuid.uuid4())
+    old_user_id, new_user_id = str(uuid.uuid4()), str(uuid.uuid4())
+    old_session_id, new_session_id = str(uuid.uuid4()), str(uuid.uuid4())
+    now = datetime.now(UTC).replace(tzinfo=None)
+    start, end = now - timedelta(days=1), now + timedelta(days=1)
+    trace_ids = (str(uuid.uuid4()), str(uuid.uuid4()))
+
+    try:
+        client.execute(f"CREATE DATABASE {database}")
+        client.execute(f"USE {database}")
+        client.execute(
+            """
+            CREATE TABLE spans (
+                project_id UUID,
+                trace_id String,
+                id String,
+                start_time DateTime64(6, 'UTC'),
+                parent_span_id Nullable(String),
+                trace_session_id Nullable(UUID),
+                end_user_id Nullable(UUID),
+                is_deleted UInt8,
+                _version UInt64
+            ) ENGINE = ReplacingMergeTree(_version)
+            PARTITION BY toDate(start_time)
+            ORDER BY (project_id, toStartOfHour(start_time), trace_id, id, start_time)
+            """
+        )
+        client.execute(
+            """
+            CREATE TABLE end_users (
+                project_id UUID,
+                end_user_id UUID,
+                user_id String,
+                user_id_type String,
+                is_deleted UInt8,
+                version DateTime64(6, 'UTC')
+            ) ENGINE = ReplacingMergeTree(version)
+            ORDER BY end_user_id
+            """
+        )
+        for table in ("end_user_id_remap", "trace_session_id_remap"):
+            client.execute(
+                f"""
+                CREATE TABLE {table} (
+                    old_id UUID,
+                    new_id UUID,
+                    version DateTime64(6, 'UTC')
+                ) ENGINE = ReplacingMergeTree(version)
+                ORDER BY old_id
+                """
+            )
+
+        client.execute(
+            "INSERT INTO end_users VALUES",
+            [(project_id, old_user_id, "guest-e3dce503", "custom", 0, now)],
+        )
+        client.execute(
+            "INSERT INTO end_user_id_remap VALUES",
+            [(old_user_id, new_user_id, now)],
+        )
+        client.execute(
+            "INSERT INTO trace_session_id_remap VALUES",
+            [(old_session_id, new_session_id, now)],
+        )
+        span_ids: list[str] = []
+        span_rows = []
+        for index, (trace_id, end_user_id, session_id) in enumerate(
+            zip(
+                trace_ids,
+                (old_user_id, new_user_id),
+                (old_session_id, new_session_id),
+                strict=True,
+            )
+        ):
+            span_id = f"root-{index}-{uuid.uuid4()}"
+            span_ids.append(span_id)
+            span_rows.append(
+                (
+                    project_id,
+                    trace_id,
+                    span_id,
+                    now - timedelta(minutes=2 - index),
+                    "",
+                    session_id,
+                    end_user_id,
+                    0,
+                    index + 1,
+                )
+            )
+        client.execute("INSERT INTO spans VALUES", span_rows)
+
+        filters = [
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "filter_type": "datetime",
+                    "filter_op": "between",
+                    "filter_value": [start.isoformat(), end.isoformat()],
+                },
+            },
+            {
+                "column_id": "user_id",
+                "filter_config": {
+                    "col_type": "TRACE_END_USER",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "guest-e3dce503",
+                },
+            },
+        ]
+        builder = TraceListQueryBuilderV2(
+            project_id=project_id,
+            filters=filters,
+            bounded_identity_only=True,
+        )
+        seed_sql, seed_params = builder.build_filter_seed_page(
+            slice_start=start,
+            slice_end=end,
+            limit=25,
+        )
+        seed_raw, seed_columns = client.execute(
+            seed_sql, seed_params, with_column_types=True
+        )
+        seed_rows = _dict_rows(seed_raw, seed_columns)
+        assert {row["trace_id"] for row in seed_rows} == set(trace_ids)
+
+        match_sql, match_params = builder.build_filter_match_query_from_seed_rows(
+            seed_rows
+        )
+        match_raw, match_columns = client.execute(
+            match_sql, match_params, with_column_types=True
+        )
+        matches = _dict_rows(match_raw, match_columns)
+        assert {row["trace_id"] for row in matches} == set(trace_ids)
+
+        session_builder = SessionListQueryBuilderV2(
+            project_id=project_id,
+            page_size=25,
+            filters=[
+                filters[0],
+                {
+                    "column_id": "end_user_id",
+                    "filter_config": {
+                        "filter_type": "text",
+                        "filter_op": "in",
+                        "filter_value": [old_user_id],
+                    },
+                },
+            ],
+        )
+        session_sql, session_params = session_builder.build_candidate_page_query()
+        session_raw, session_columns = client.execute(
+            session_sql, session_params, with_column_types=True
+        )
+        sessions = _dict_rows(session_raw, session_columns)
+        assert len(sessions) == 1
+        assert str(sessions[0]["session_id"]) == old_session_id
+        assert sessions[0]["total_count"] == 1
+    finally:
+        client.execute(f"USE {original_database}")
+        client.execute(f"DROP DATABASE IF EXISTS {database}")
 
 
 @pytest.mark.integration

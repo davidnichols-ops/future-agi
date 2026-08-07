@@ -8,6 +8,10 @@ const mocks = vi.hoisted(() => ({
   post: vi.fn(),
   exactFields: ["final_status"],
   exactReadState: "complete",
+  fetchNextAttributePage: vi.fn(),
+  hasNextAttributePage: false,
+  isFetchingNextAttributePage: false,
+  isNextAttributePageError: false,
 }));
 
 vi.mock("src/utils/axios", () => ({
@@ -41,6 +45,10 @@ vi.mock("./useExactEvalAttributeFields", async (importOriginal) => ({
     data: mocks.exactFields,
     queryReadState: mocks.exactReadState,
     isFetching: false,
+    fetchNextPage: mocks.fetchNextAttributePage,
+    hasNextPage: mocks.hasNextAttributePage,
+    isFetchingNextPage: mocks.isFetchingNextAttributePage,
+    isFetchNextPageError: mocks.isNextAttributePageError,
   }),
 }));
 
@@ -102,6 +110,9 @@ describe("TracingTestMode exact task attribute mapping", () => {
     vi.clearAllMocks();
     mocks.exactFields = ["final_status"];
     mocks.exactReadState = "complete";
+    mocks.hasNextAttributePage = false;
+    mocks.isFetchingNextAttributePage = false;
+    mocks.isNextAttributePageError = false;
     mocks.get.mockImplementation(async (url) => {
       if (url === `/projects/${PROJECT_ID}`) {
         return { data: { result: { id: PROJECT_ID, source: "api" } } };
@@ -164,6 +175,40 @@ describe("TracingTestMode exact task attribute mapping", () => {
     await waitFor(() =>
       expect(onReadyChange).toHaveBeenCalledWith(true, {
         evaluation_result: "final_status",
+      }),
+    );
+  });
+
+  it("loads the next retained attribute page on explicit request", async () => {
+    mocks.hasNextAttributePage = true;
+    renderTaskMapping(vi.fn());
+
+    await screen.findByPlaceholderText(
+      "Search or type a path (e.g. attributes.input.value)",
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Load more attributes" }),
+    );
+
+    expect(mocks.fetchNextAttributePage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an arbitrary exact path as a manual free-text mapping", async () => {
+    mocks.exactFields = [];
+    const onReadyChange = vi.fn();
+    renderTaskMapping(onReadyChange);
+
+    const input = await screen.findByPlaceholderText(
+      "Search or type a path (e.g. attributes.input.value)",
+    );
+    await waitFor(() => expect(input).not.toBeDisabled());
+    await userEvent.click(input);
+    await userEvent.type(input, "historical.custom.path");
+
+    expect(input).toHaveValue("historical.custom.path");
+    await waitFor(() =>
+      expect(onReadyChange).toHaveBeenCalledWith(true, {
+        evaluation_result: "historical.custom.path",
       }),
     );
   });

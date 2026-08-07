@@ -101,6 +101,48 @@ describe("buildFlowData metric mapping", () => {
     );
   });
 
+  it("uses exact execution edges instead of recorded nesting for aggregate graphs", () => {
+    const graph = buildFlowData({
+      nodes: [
+        { id: "chain:root", name: "root", type: "chain" },
+        { id: "chain:query", name: "query", type: "chain" },
+        { id: "retriever:lookup", name: "lookup", type: "retriever" },
+      ],
+      // These are authoritative parent_span_id relationships. They describe
+      // nesting, but not the execution transition between the two siblings.
+      edges: [
+        { source: "chain:root", target: "chain:query" },
+        { source: "chain:root", target: "retriever:lookup" },
+      ],
+      path_edges: [
+        { source: "chain:root", target: "chain:query" },
+        {
+          source: "chain:query",
+          target: "retriever:lookup",
+          transition_count: 3,
+        },
+      ],
+    });
+
+    expect(
+      graph.edges.map(({ source, target }) => `${source}->${target}`),
+    ).toEqual(["chain:root->chain:query", "chain:query->retriever:lookup"]);
+    expect(graph.edges[1]).toEqual(expect.objectContaining({ label: "×3" }));
+  });
+
+  it("does not replace an explicitly empty execution path with hierarchy", () => {
+    const graph = buildFlowData({
+      nodes: [
+        { id: "chain:root", name: "root", type: "chain" },
+        { id: "tool:child", name: "child", type: "tool" },
+      ],
+      edges: [{ source: "chain:root", target: "tool:child" }],
+      path_edges: [],
+    });
+
+    expect(graph.edges).toEqual([]);
+  });
+
   it("retains forks, joins, back edges, and self-loops with finite layout positions", () => {
     const graph = buildFlowData({
       nodes: [

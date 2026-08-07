@@ -16,7 +16,10 @@ export function getAttributeKeyPageReadState(page, { exact = false } = {}) {
     // authoritative and must not inherit browse-sampling UI.
     return "complete";
   }
-  if (page?.browse_mode === "recent_suggestions") {
+  if (
+    page?.browse_mode === "retained_catalog" ||
+    page?.browse_mode === "recent_suggestions"
+  ) {
     return page?.query_complete === true &&
       page?.query_status === "complete" &&
       ATTRIBUTE_BROWSE_STATUSES.has(page?.browse_status)
@@ -31,37 +34,30 @@ export function useExactTraceAttributeProperties({
   search,
   source = "traces",
   enabled = true,
-  contextKey = "",
 }) {
   const debouncedSearch = useDebounce(String(search || "").trim(), 350);
   const supportedSource = source === "traces" || source === "spans";
 
-  const query = useInfiniteQuery({
-    queryKey: [
-      "trace-attribute-exact",
-      projectId,
-      source,
-      contextKey,
-      debouncedSearch,
-    ],
+  const retainedQuery = useInfiniteQuery({
+    // Attribute names describe the retained project schema. Task/dashboard
+    // row filters and scheduling windows deliberately do not participate in
+    // this cache key or request. Search is supplemental, so typing never
+    // discards cursor progress through the retained catalog.
+    queryKey: ["trace-attribute-retained", projectId, source],
     queryFn: ({ signal, pageParam }) =>
       axios
         .get(endpoints.project.spanAttributeKeys(), {
           signal,
           params: {
             project_id: projectId,
-            ...(debouncedSearch
-              ? { q: debouncedSearch }
-              : {
-                  page_size: 10,
-                  ...(pageParam ? { cursor: pageParam } : {}),
-                }),
+            page_size: 10,
+            ...(pageParam ? { cursor: pageParam } : {}),
           },
         })
         .then(({ data }) => data || {}),
     initialPageParam: null,
     getNextPageParam: (lastPage) =>
-      !debouncedSearch && lastPage?.has_more && lastPage?.next_cursor
+      lastPage?.has_more && lastPage?.next_cursor
         ? lastPage.next_cursor
         : undefined,
     enabled: enabled && supportedSource && Boolean(projectId),
@@ -73,7 +69,42 @@ export function useExactTraceAttributeProperties({
     meta: { errorHandled: true },
   });
 
-  const pages = query.data?.pages || [];
+  const exactQuery = useInfiniteQuery({
+    // The exact cursor uses the indexed typed-Map lane first, then continues
+    // the same bounded retained-data walk for JSON-only keys. It supplements
+    // the stable catalog so partial text still filters already loaded names.
+    queryKey: ["trace-attribute-exact", projectId, source, debouncedSearch],
+    queryFn: ({ signal, pageParam }) =>
+      axios
+        .get(endpoints.project.spanAttributeKeys(), {
+          signal,
+          params: {
+            project_id: projectId,
+            page_size: 10,
+            q: debouncedSearch,
+            ...(pageParam ? { cursor: pageParam } : {}),
+          },
+        })
+        .then(({ data }) => data || {}),
+    initialPageParam: null,
+    getNextPageParam: (lastPage) =>
+      lastPage?.has_more && lastPage?.next_cursor
+        ? lastPage.next_cursor
+        : undefined,
+    enabled:
+      enabled &&
+      supportedSource &&
+      Boolean(projectId) &&
+      Boolean(debouncedSearch),
+    retry: false,
+    staleTime: 60_000,
+    gcTime: 5 * 60_000,
+    meta: { errorHandled: true },
+  });
+
+  const retainedPages = retainedQuery.data?.pages || [];
+  const exactPages = exactQuery.data?.pages || [];
+  const pages = [...retainedPages, ...exactPages];
   const seenKeys = new Set();
   const properties = pages.flatMap((page) =>
     (Array.isArray(page?.result) ? page.result : []).flatMap(
@@ -100,26 +131,74 @@ export function useExactTraceAttributeProperties({
       },
     ),
   );
-  const pageReadStates = pages.map((page) =>
-    getAttributeKeyPageReadState(page, { exact: Boolean(debouncedSearch) }),
-  );
-  const queryReadState = query.isError
+  const pageReadStates = [
+    ...retainedPages.map((page) => getAttributeKeyPageReadState(page)),
+    ...exactPages.map((page) =>
+      getAttributeKeyPageReadState(page, { exact: true }),
+    ),
+  ];
+  const queryIsError =
+    retainedQuery.isError || (Boolean(debouncedSearch) && exactQuery.isError);
+  const queryReadState = queryIsError
     ? "error"
     : pageReadStates.includes("degraded")
       ? "degraded"
       : pageReadStates.includes("sampled")
         ? "sampled"
         : "complete";
-  const lastPage = pages.at(-1);
-  const browseStatus = !debouncedSearch ? lastPage?.browse_status : undefined;
+  const retainedLastPage = retainedPages.at(-1);
+  const exactLastPage = exactPages.at(-1);
+  const browseStatus = debouncedSearch
+    ? exactLastPage?.browse_status || retainedLastPage?.browse_status
+    : retainedLastPage?.browse_status;
+  const exactHasNextPage = Boolean(debouncedSearch) && exactQuery.hasNextPage;
+  const hasNextPage = exactHasNextPage || retainedQuery.hasNextPage;
+  const fetchNextPage = (...args) => {
+    const reads = [];
+    if (retainedQuery.hasNextPage) {
+      reads.push(retainedQuery.fetchNextPage(...args));
+    }
+    if (exactHasNextPage) {
+      reads.push(exactQuery.fetchNextPage(...args));
+    }
+    return reads.length === 1 ? reads[0] : Promise.allSettled(reads);
+  };
+  const refetch = (...args) => {
+    const reads = [retainedQuery.refetch(...args)];
+    if (debouncedSearch) reads.push(exactQuery.refetch(...args));
+    return Promise.allSettled(reads);
+  };
 
   return {
-    ...query,
     data: properties,
     queryReadState,
     browseStatus,
-    browseLimit: !debouncedSearch ? lastPage?.browse_limit : undefined,
+    browseLimit: retainedLastPage?.browse_limit,
     browseLimitReached: browseStatus === "limit_reached",
     debouncedSearch,
+    isFetching:
+      retainedQuery.isFetching ||
+      (Boolean(debouncedSearch) && exactQuery.isFetching),
+    isLoading:
+      retainedQuery.isLoading ||
+      (Boolean(debouncedSearch) && exactQuery.isLoading),
+    isError: queryIsError,
+    isSuccess:
+      retainedQuery.isSuccess && (!debouncedSearch || exactQuery.isSuccess),
+    error: exactQuery.error || retainedQuery.error,
+    hasNextPage,
+    // One scroll advances both independent cursors. A long-running/absent
+    // exact lookup therefore cannot starve discovery of older catalog keys
+    // that still match the user's partial text locally.
+    fetchNextPage,
+    refetch,
+    isFetchingNextPage:
+      retainedQuery.isFetchingNextPage || exactQuery.isFetchingNextPage,
+    isFetchNextPageError:
+      retainedQuery.isFetchNextPageError || exactQuery.isFetchNextPageError,
+    // Consumers use this completion revision to unlock exactly one new
+    // scroll-to-load action even when a valid continuation page contains no
+    // previously unseen keys and therefore leaves `data.length` unchanged.
+    pageCount: retainedPages.length + exactPages.length,
   };
 }

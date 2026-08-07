@@ -317,6 +317,84 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.recommended_filter_initial_slice_width() == timedelta(hours=1)
 
 
+def test_org_user_trace_seed_is_remap_aware_scoped_and_cursor_ordered() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    start = END - timedelta(days=180)
+    filters = [
+        _time_filter(start, END),
+        _end_user_filter("guest-e3dce503"),
+    ]
+    builder = TraceListQueryBuilderV2(
+        project_ids=[PROJECT_ID, project_b],
+        filters=filters,
+    )
+
+    seed_sql, seed_params = builder.build_filter_seed_page(
+        slice_start=start,
+        slice_end=END,
+        limit=51,
+        before_start_time=END - timedelta(minutes=1),
+        before_id=("trace-z", project_b),
+    )
+    match_sql, match_params = builder.build_filter_match_query_from_seed_rows(
+        [
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-a",
+                "root_span_id": "root-a",
+                "start_time": END - timedelta(minutes=2),
+            }
+        ]
+    )
+
+    assert builder.supports_bounded_filter_scan() is True
+    assert builder.filter_seed_proves_result_order() is True
+    assert builder.recommended_filter_initial_slice_width() == timedelta(days=180)
+    assert builder.recommended_filter_max_slice_width() == timedelta(days=180)
+    assert "(parent_span_id IS NULL OR parent_span_id = '')" in seed_sql
+    assert "trace_id IN (SELECT trace_id FROM spans WHERE end_user_id IN (" in seed_sql
+    assert "FROM end_users AS eu FINAL" in seed_sql
+    assert "FROM end_user_id_remap FINAL" in seed_sql
+    assert seed_sql.count("project_id IN %(project_ids)s") >= 3
+    assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in seed_sql
+    assert "start_time < %(end_date)s + INTERVAL 1 DAY" in seed_sql
+    assert "created_at" not in seed_sql
+    assert "ORDER BY start_time DESC, trace_id DESC" in seed_sql
+    assert "LIMIT 1 BY project_id, trace_id" in seed_sql
+    assert "filter_before_project_id" in seed_sql
+    assert seed_params["col_1"] == "guest-e3dce503"
+    assert seed_params["filter_before_id"] == "trace-z"
+    assert seed_params["filter_before_project_id"] == project_b
+    # The seed is only a physical superset. The existing finite latest-state
+    # classifier remains authoritative and retains the residual user predicate.
+    assert "FROM end_users AS eu FINAL" in match_sql
+    assert "FROM end_user_id_remap FINAL" in match_sql
+    assert "candidate_trace_ids" in match_sql
+    assert match_params["org_residual_0_col_1"] == "guest-e3dce503"
+
+
+def test_negated_user_trace_filter_does_not_use_positive_root_seed() -> None:
+    filters = [
+        _time_filter(END - timedelta(days=180), END),
+        _end_user_filter("guest-e3dce503", operation="not_equals"),
+    ]
+    builder = TraceListQueryBuilderV2(project_id=PROJECT_ID, filters=filters)
+
+    seed_sql, _ = builder.build_filter_seed_page(
+        slice_start=END - timedelta(days=2),
+        slice_end=END,
+        limit=51,
+    )
+    match_sql, _ = builder.build_filter_match_query(["trace-a"])
+
+    assert "end_users" not in seed_sql
+    assert "end_user_id_remap" not in seed_sql
+    assert builder.recommended_filter_initial_slice_width() is None
+    assert builder.recommended_filter_max_slice_width() is None
+    assert "trace_id NOT IN (" in match_sql
+    assert "end_user_id_remap" in match_sql
+
+
 def test_graph_trace_key_witness_is_wide_key_only_and_classifier_stays_exact() -> None:
     filters = [
         _time_filter(END - timedelta(days=14), END),
@@ -5207,6 +5285,64 @@ def _call_observe_trace_list_with_bounded_page(
         )
 
     return response, bounded_reader, analytics, request
+
+
+def test_org_user_trace_endpoint_proves_six_month_empty_page_in_one_seed() -> None:
+    """A sparse/no-match user page must not walk ninety two-day slices."""
+
+    from tracer.views.trace import TraceView
+
+    project_b = "00000000-0000-4000-8000-000000000002"
+    start = END - timedelta(days=180)
+    filters = [_time_filter(start, END), _end_user_filter("guest-e3dce503")]
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.return_value = QueryResult(
+        data=[],
+        row_count=0,
+        backend_used="clickhouse",
+        query_time_ms=1.0,
+    )
+    request = _observe_trace_request()
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+
+    with (
+        mock.patch("tracer.views.trace.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        response = view._list_traces_of_session_clickhouse(
+            request,
+            project_id=None,
+            validated_data={
+                "filters": filters,
+                "page_number": 0,
+                "page_size": 25,
+                "allow_sampled": False,
+            },
+            analytics=analytics,
+            org_project_ids=[PROJECT_ID, project_b],
+            org=request.organization,
+        )
+
+    assert response[0] == "ok"
+    assert response[1]["table"] == []
+    assert response[1]["metadata"]["total_rows"] == 0
+    assert analytics.execute_ch_query.call_count == 1
+    seed_sql = analytics.execute_ch_query.call_args.args[0]
+    seed_params = analytics.execute_ch_query.call_args.args[1]
+    assert "FROM end_users AS eu FINAL" in seed_sql
+    assert "FROM end_user_id_remap FINAL" in seed_sql
+    assert "end_user_id IN (" in seed_sql
+    assert "created_at" not in seed_sql
+    assert seed_params["filter_slice_start"] == start
+    assert seed_params["filter_slice_end"] == END
+    assert seed_params["col_1"] == "guest-e3dce503"
 
 
 def test_observe_trace_empty_cursor_page_without_checkpoint_fails_closed() -> None:

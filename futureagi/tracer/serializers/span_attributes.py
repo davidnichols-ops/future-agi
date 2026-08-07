@@ -29,10 +29,10 @@ class SpanAttributeProjectQuerySerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 {"page_size": "page_size is required with cursor"}
             )
-        if attrs.get("q") and (attrs.get("cursor") or "page_size" in attrs):
-            raise serializers.ValidationError(
-                {"q": "Exact key lookup cannot be combined with pagination"}
-            )
+        # ``q`` without ``page_size`` preserves the legacy bounded lookup.
+        # With ``page_size`` it becomes a retained-data cursor search; the
+        # signed cursor binds the exact key so continuations cannot be replayed
+        # against a different attribute name.
         return attrs
 
     def validate_q(self, value):

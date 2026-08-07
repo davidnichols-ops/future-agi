@@ -979,6 +979,21 @@ def read_bounded_filter_page(
     # long window.  This changes only the acquisition boundary: the same
     # finite candidates still cross the exact latest-state classifier and the
     # same result-order proof before publication.
+    request_width = request_end - request_start
+    max_slice_width = _MAX_SLICE
+    max_slice_width_builder = getattr(
+        builder, "recommended_filter_max_slice_width", None
+    )
+    if callable(max_slice_width_builder):
+        raw_max_slice_width = max_slice_width_builder()
+        if raw_max_slice_width is not None:
+            if (
+                not isinstance(raw_max_slice_width, timedelta)
+                or not _INITIAL_SLICE <= raw_max_slice_width <= request_width
+            ):
+                raise ValueError("recommended max slice width exceeds bounded contract")
+            max_slice_width = max(max_slice_width, raw_max_slice_width)
+
     slice_width = _INITIAL_SLICE
     initial_slice_width_builder = getattr(
         builder, "recommended_filter_initial_slice_width", None
@@ -986,9 +1001,10 @@ def read_bounded_filter_page(
     if callable(initial_slice_width_builder):
         raw_initial_slice_width = initial_slice_width_builder()
         if raw_initial_slice_width is not None:
-            if (
-                not isinstance(raw_initial_slice_width, timedelta)
-                or not _INITIAL_SLICE <= raw_initial_slice_width <= _MAX_SLICE
+            if not isinstance(
+                raw_initial_slice_width, timedelta
+            ) or not _INITIAL_SLICE <= raw_initial_slice_width <= min(
+                max_slice_width, request_width
             ):
                 raise ValueError(
                     "recommended initial slice width exceeds bounded contract"
@@ -1991,7 +2007,7 @@ def read_bounded_filter_page(
             scheduled_coverage = timedelta(0)
             for _ in range(remaining_attempts):
                 scheduled_coverage += scheduled_width
-                scheduled_width = min(scheduled_width * 2, _MAX_SLICE)
+                scheduled_width = min(scheduled_width * 2, max_slice_width)
             active_width = slice_width
             if scheduled_coverage < remaining_window:
                 active_width = max(active_width, remaining_window / remaining_attempts)
@@ -2158,7 +2174,7 @@ def read_bounded_filter_page(
                     force=True,
                 )
             slice_end = slice_start
-            slice_width = min(active_width * 2, _MAX_SLICE)
+            slice_width = min(active_width * 2, max_slice_width)
             active_slice_start = None
             before_start_time = None
             before_id = None
