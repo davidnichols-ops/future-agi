@@ -6443,6 +6443,54 @@ def test_bounded_continuation_resumes_after_last_fully_classified_seed_page() ->
     assert len(combined) == len(set(combined))
 
 
+def test_empty_bounded_continuation_reserves_exact_checkpoint_tail() -> None:
+    rows = _rows(1, 2, 3, 4)
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        match_rows=[],
+        recommended_batch_size=2,
+        recommended_seed_batch_size=2,
+    )
+    clock = _ManualMonotonic()
+    executor = _IdentityHydrationFakeExecutor(
+        builder,
+        clock=clock,
+        # The first batch is fully classified with 200 ms left before the
+        # classification deadline. That is enough for the old 25 ms admission
+        # check, but not enough for another production-scale ClickHouse read.
+        durations_ms={"seed": 700, "match_identity": 800},
+    )
+
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter()],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=2_000,
+            max_seed_attempts=3,
+            max_candidates=2,
+            max_query_count=6,
+            classify_batch_size=2,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+        )
+
+    assert page.complete is False
+    assert page.rows == []
+    assert page.error_code == "deadline_exceeded"
+    assert page.continuation_slice_start is not None
+    assert page.continuation_slice_end is not None
+    assert page.continuation_before_start_time == rows[1]["start_time"]
+    assert page.continuation_before_id == "span-1"
+    assert [query for query, _ in executor.calls] == ["seed", "match_identity"]
+    assert executor.timeouts[1][0] == "match_identity"
+    assert executor.timeouts[1][1] <= 1_000
+    assert page.elapsed_ms <= 1_500
+
+
 def test_partial_identity_cursor_page_is_hydrated_before_publication() -> None:
     rows = [
         {

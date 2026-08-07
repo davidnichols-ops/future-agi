@@ -34,6 +34,11 @@ _MAX_OPTIONAL_ANCHOR_STRATA = 4
 # at 0.79-1.26 s under load; the caller's wall deadline, query count, rows,
 # bytes, memory, and single-thread settings remain the authoritative envelope.
 _QUERY_TIMEOUT_MS = 1_500
+# Do not launch a resumable cursor statement with a token timeout so short that
+# transport/server scheduling alone can consume it. Production heavy-data reads
+# complete in roughly 160-350 ms under the guarded single-thread profile; below
+# this floor we return the last fully classified exact checkpoint instead.
+_BOUNDED_CONTINUATION_MIN_QUERY_HEADROOM_MS = 250
 _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS = 250
 _CANDIDATE_WITNESS_PREFILTER_MAX_BYTES = 96 * 1024 * 1024
 _CANDIDATE_WITNESS_PREFILTER_STRATA = 8
@@ -1048,14 +1053,29 @@ def read_bounded_filter_page(
         max_bytes_to_read_cap: int | None = None,
         use_reserved_query_budget: bool = False,
     ) -> QueryResult:
-        hydration_reserve_is_active = bool(matched_by_id)
+        # A resumable cursor must leave enough wall time to roll back an
+        # in-flight seed batch and publish its last fully classified checkpoint,
+        # even when that checkpoint contains zero matches and needs no row
+        # hydration. Without this, a sparse scan can admit one final classifier
+        # against the full request deadline and cross the API wall while an exact
+        # continuation was already available.
+        hydration_reserve_is_active = bool(matched_by_id or bounded_continuation)
         active_deadline = (
             deadline
             if use_reserved_query_budget or not hydration_reserve_is_active
             else classification_deadline
         )
         remaining_ms = int((active_deadline - monotonic()) * 1000)
-        if remaining_ms < 25:
+        minimum_query_headroom_ms = (
+            _BOUNDED_CONTINUATION_MIN_QUERY_HEADROOM_MS
+            if (
+                bounded_continuation
+                and continuation_progressed
+                and not use_reserved_query_budget
+            )
+            else 25
+        )
+        if remaining_ms < minimum_query_headroom_ms:
             raise _BudgetExceeded("deadline_exceeded")
         active_query_limit = (
             max_query_count
