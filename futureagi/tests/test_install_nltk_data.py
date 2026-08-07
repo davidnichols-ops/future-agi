@@ -38,6 +38,7 @@ def test_nltk_archives_are_revision_and_checksum_pinned() -> None:
     assert set(install_nltk_data.PACKAGES) == {
         "corpora/stopwords",
         "tokenizers/punkt",
+        "tokenizers/punkt_tab",
     }
 
     for _, expected_sha256 in install_nltk_data.PACKAGES.values():
@@ -85,3 +86,38 @@ def test_checksum_mismatch_fails_before_extracting(
         install_nltk_data.install()
 
     assert not destination.exists()
+
+
+def test_install_verification_uses_only_the_fresh_destination(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import nltk
+    from nltk.corpus import stopwords
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("placeholder/resource", "verified by test doubles")
+    archive_bytes = payload.getvalue()
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    packages = {
+        "corpora/stopwords": ("corpora/stopwords.zip", archive_sha256),
+        "tokenizers/punkt": ("tokenizers/punkt.zip", archive_sha256),
+        "tokenizers/punkt_tab": ("tokenizers/punkt_tab.zip", archive_sha256),
+    }
+    previous_paths = list(nltk.data.path)
+
+    monkeypatch.setattr(install_nltk_data, "NLTK_DATA_ROOT", tmp_path)
+    monkeypatch.setattr(install_nltk_data, "PACKAGES", packages)
+    monkeypatch.setattr(install_nltk_data, "_download", lambda _: archive_bytes)
+    monkeypatch.setattr(stopwords, "words", lambda _: ["the"])
+    monkeypatch.setattr(
+        nltk,
+        "word_tokenize",
+        lambda _: ["Future", "AGI", "image", "verification"],
+    )
+
+    try:
+        install_nltk_data.install()
+        assert nltk.data.path == [str(tmp_path)]
+    finally:
+        nltk.data.path[:] = previous_paths

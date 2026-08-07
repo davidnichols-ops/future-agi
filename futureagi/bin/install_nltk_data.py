@@ -21,6 +21,10 @@ PACKAGES = {
         "tokenizers/punkt.zip",
         "51c3078994aeaf650bfc8e028be4fb42b4a0d177d41c012b6a983979653660ec",
     ),
+    "tokenizers/punkt_tab": (
+        "tokenizers/punkt_tab.zip",
+        "e57f64187974277726a3417ca6f181ec5403676c717672eef6a748a7b20e0106",
+    ),
 }
 
 
@@ -64,7 +68,10 @@ def install() -> None:
     import nltk
     from nltk.corpus import stopwords
 
-    nltk.data.path.insert(0, str(NLTK_DATA_ROOT))
+    # Verify exactly what the clean image will contain.  Do not allow a
+    # developer/CI host's pre-existing NLTK directories to hide a missing
+    # archive (NLTK 3.9+ requires ``punkt_tab`` in addition to ``punkt``).
+    nltk.data.path[:] = [str(NLTK_DATA_ROOT)]
     if not stopwords.words("english"):
         raise RuntimeError("NLTK English stopwords corpus is empty")
     if nltk.word_tokenize("Future AGI image verification") != [
