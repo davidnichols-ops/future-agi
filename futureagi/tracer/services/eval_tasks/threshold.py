@@ -16,14 +16,12 @@ from typing import TYPE_CHECKING, Any
 
 from tracer.models.eval_task import RunType
 from tracer.selectors.eval_tasks.row_resolver import build_eligible_query
+from tracer.selectors.eval_tasks.sampling import HASH_SPACE, sampling_hash_sql
 from tracer.services.clickhouse.v2 import get_reader
 from tracer.services.eval_tasks.ch_guardrails import eval_ch_guardrails
 
 if TYPE_CHECKING:
     from tracer.models.eval_task import EvalTask
-
-# cityHash64 >> 1 — the 63-bit space that fits a signed BIGINT.
-HASH_SPACE = 2**63
 
 # Above this k the naive top-k sort approaches CH's spill threshold (1.6 GiB at
 # k=105M); below it the histogram's second pass over the inner query costs more
@@ -32,12 +30,6 @@ NAIVE_MAX_K = 10_000_000
 
 # Top 16 bits of the 63-bit hash → 65536 histogram buckets.
 _BUCKET_SHIFT = 47
-
-
-def sampling_hash_sql(salt_param: str, id_col: str) -> str:
-    """The single definition of the sampling hash expression — every consumer
-    imports it rather than re-spelling it."""
-    return f"bitShiftRight(cityHash64(%({salt_param})s, toString({id_col})), 1)"
 
 
 def derive_threshold(task: EvalTask) -> int:
