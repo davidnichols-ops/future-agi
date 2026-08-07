@@ -170,6 +170,74 @@ describe("useExactEvalAttributeFields", () => {
     ]);
   });
 
+  it("continues exact search to an older key and stops at the terminal page", async () => {
+    const exactRequests = [];
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (!params.q) {
+        return Promise.resolve(retainedPage(["recent_catalog"]));
+      }
+
+      exactRequests.push(params);
+      if (!params.cursor) {
+        return Promise.resolve(
+          retainedPage([], {
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: "exact-page-2",
+            lookup_mode: "exact",
+            exact_match: false,
+          }),
+        );
+      }
+
+      return Promise.resolve(
+        retainedPage(["older_exact_key", "older_exact_key"], {
+          browse_status: "exhausted",
+          has_more: false,
+          next_cursor: null,
+          lookup_mode: "exact",
+          exact_match: true,
+        }),
+      );
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactEvalAttributeFields({
+          projectId: "project-synthetic",
+          rowType: "spans",
+          search: "older_exact_key",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(result.current.data).toEqual(["recent_catalog"]);
+      expect(result.current.hasNextPage).toBe(true);
+    });
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() =>
+      expect(result.current.data).toEqual([
+        "recent_catalog",
+        "older_exact_key",
+      ]),
+    );
+
+    expect(exactRequests).toEqual([
+      expect.objectContaining({ q: "older_exact_key" }),
+      expect.objectContaining({
+        q: "older_exact_key",
+        cursor: "exact-page-2",
+      }),
+    ]);
+    expect(result.current.hasNextPage).toBe(false);
+
+    const completedRequestCount = mocks.get.mock.calls.length;
+    await act(async () => result.current.fetchNextPage());
+    expect(mocks.get).toHaveBeenCalledTimes(completedRequestCount);
+  });
+
   it("reuses retained pages while exact search changes", async () => {
     const exactRequests = [];
     mocks.get.mockImplementation((_url, options) => {

@@ -33,9 +33,13 @@ from tracer.services.clickhouse.attribute_cursor_state import (
 from tracer.services.clickhouse.attribute_reads import (
     _LATEST_CARDINALITY_SQL,
     _STRATIFIED_CANDIDATE_SQL,
+    ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT,
+    ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES,
     ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES,
+    ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS,
     ATTRIBUTE_READ_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS,
+    ATTRIBUTE_READ_EXPLICIT_SEGMENT,
     ATTRIBUTE_READ_MAX_PROJECTS,
     ATTRIBUTE_READ_MAX_QUERY_COUNT,
     ATTRIBUTE_READ_TARGETED_CANDIDATE_PAGE_LIMIT,
@@ -43,6 +47,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
+    ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS,
     AttributeCardinalityRead,
     AttributeDetailRead,
     AttributeKeyCursorPageRead,
@@ -2565,6 +2570,203 @@ def test_filter_value_cursor_search_yields_verified_prefix_without_filling_page(
     assert len(executor.calls) == 2
 
 
+def test_filter_value_cursor_crosses_many_empty_slices_to_reach_old_value():
+    old_time = NOW - timedelta(days=60)
+    candidate = _candidate(
+        PROJECT_A,
+        "old-value",
+        trace_id="trace-old-value",
+        start_time=old_time,
+    )
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            rows = (
+                [candidate]
+                if call.params["segment_start"] <= old_time < call.params["segment_end"]
+                else []
+            )
+            return _keyset_candidate_page(rows, call)
+        return [
+            _target_row(
+                PROJECT_A,
+                "old-value",
+                trace_id="trace-old-value",
+                start_time=old_time,
+                string="retained-value",
+            )
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "mastra.span.type",
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+    )
+
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    widths = [
+        call.params["segment_end"] - call.params["segment_start"]
+        for call in candidate_calls
+    ]
+    assert read.rows == (AttributeValueRow("retained-value", "string", 1),)
+    assert read.has_more is False
+    assert read.browse_status == "exhausted"
+    assert max(widths) >= timedelta(days=32)
+    assert any(
+        call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+        for call in candidate_calls
+    )
+    # The old value is reached and the remaining frozen year is exhausted in
+    # one bounded request instead of exposing ~60 empty public pages.
+    assert len(candidate_calls) < ATTRIBUTE_READ_MAX_QUERY_COUNT
+
+
+def test_filter_value_cursor_empty_retained_window_terminates_without_loop():
+    executor = RecordingExecutor()
+    retained_start = NOW - timedelta(days=365)
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "missing.attribute",
+        page_size=10,
+        window_start=retained_start,
+        window_end=NOW,
+    )
+
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert read.rows == ()
+    assert read.has_more is False
+    assert read.browse_status == "exhausted"
+    assert read.next_segment_end == retained_start
+    assert read.next_before_identity is None
+    assert read.next_resume_identity is None
+    assert len(candidate_calls) < ATTRIBUTE_READ_MAX_QUERY_COUNT
+    assert all(
+        newer.params["segment_start"] == older.params["segment_end"]
+        for newer, older in zip(candidate_calls, candidate_calls[1:], strict=False)
+    )
+
+
+def test_filter_value_cursor_wide_probe_failure_retries_without_advancing():
+    failed_wide_end = None
+
+    def respond(call, _):
+        nonlocal failed_wide_end
+        if "segment_start" not in call.params:
+            raise AssertionError("empty candidate pages must not hydrate")
+        width = call.params["segment_end"] - call.params["segment_start"]
+        if failed_wide_end is None and width > ATTRIBUTE_READ_EXPLICIT_SEGMENT:
+            failed_wide_end = call.params["segment_end"]
+            return ReadDeadlineExceeded("speculative wide probe exceeded budget")
+        return []
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "sparse.attribute",
+        page_size=10,
+        window_start=NOW - timedelta(days=3),
+        window_end=NOW,
+    )
+
+    failed_index = next(
+        index
+        for index, call in enumerate(executor.calls)
+        if call.params.get("segment_end") == failed_wide_end
+        and call.params["segment_end"] - call.params["segment_start"]
+        > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    )
+    retry = executor.calls[failed_index + 1]
+    assert retry.params["segment_end"] == failed_wide_end
+    assert (
+        retry.params["segment_end"] - retry.params["segment_start"]
+        == ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    )
+    assert read.has_more is False
+    assert read.browse_status == "exhausted"
+
+
+def test_filter_value_cursor_widened_checkpoint_is_monotonic_and_unique():
+    old_time = NOW - timedelta(days=40)
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            span_id,
+            trace_id=f"trace-{span_id}",
+            start_time=old_time,
+        )
+        for span_id in ("z-newest", "y-older")
+    ]
+    value_by_id = {"z-newest": "newest", "y-older": "older"}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            in_segment = [
+                row
+                for row in candidates
+                if call.params["segment_start"]
+                <= row["start_time"]
+                < call.params["segment_end"]
+            ]
+            return _keyset_candidate_page(in_segment, call)
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=f"trace-{span_id}",
+                start_time=old_time,
+                string=value_by_id[span_id],
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    first = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "sparse.attribute",
+        page_size=1,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+    )
+    second = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "sparse.attribute",
+        page_size=1,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        before_identity=first.next_before_identity,
+        seen_value_digests=first.seen_value_digests,
+    )
+
+    assert [row.value for row in first.rows] == ["newest"]
+    assert [row.value for row in second.rows] == ["older"]
+    assert first.next_segment_end == old_time + ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    assert second.next_segment_end == first.next_segment_end
+    assert first.next_before_identity is not None
+    assert second.next_before_identity is not None
+    assert second.next_before_identity < first.next_before_identity
+    assert set(first.seen_value_digests).isdisjoint(
+        set(second.seen_value_digests[len(first.seen_value_digests) :])
+    )
+
+
 def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation():
     candidates = [
         _candidate(
@@ -4248,7 +4450,7 @@ def test_span_attribute_key_cursor_keeps_scanning_at_server_state_capacity(
     assert page.browse_status == "continuation"
 
 
-def test_span_attribute_key_cursor_publishes_untracked_keys_after_state_capacity(
+def test_span_attribute_key_cursor_publishes_keys_after_finite_tracking_prefix(
     monkeypatch,
 ):
     identity = (PROJECT_A, "trace-cap", "span-cap", NOW - timedelta(hours=1))
@@ -4297,6 +4499,238 @@ def test_span_attribute_key_cursor_publishes_untracked_keys_after_state_capacity
     assert page.seen_key_digests == seen
     assert page.has_more is True
     assert page.browse_status == "continuation"
+
+
+def test_span_attribute_key_cursor_skips_duplicate_only_page_after_first_state_block(
+    monkeypatch,
+):
+    duplicate_key = "repeated_after_first_block"
+    unique_key = "older_unique_key"
+    duplicate_identities = tuple(
+        (
+            PROJECT_A,
+            f"trace-duplicate-{index}",
+            f"span-duplicate-{index}",
+            NOW - timedelta(seconds=index + 1),
+        )
+        for index in range(1_000)
+    )
+    unique_identity = (
+        PROJECT_A,
+        "trace-unique",
+        "span-unique",
+        NOW - timedelta(seconds=len(duplicate_identities) + 1),
+    )
+    ordered_identities = (*duplicate_identities, unique_identity)
+    identity_indexes = {
+        identity: index for index, identity in enumerate(ordered_identities)
+    }
+    rows = {
+        identity: {
+            "project_id": PROJECT_A,
+            "trace_id": identity[1],
+            "id": identity[2],
+            "start_time": identity[3],
+            "is_deleted": 0,
+            "string_keys": [
+                unique_key if identity == unique_identity else duplicate_key
+            ],
+            "number_keys": [],
+            "boolean_keys": [],
+            "attributes_extra": "{}",
+        }
+        for identity in ordered_identities
+    }
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    candidate_limits: list[int] = []
+
+    def candidates(_projects, segment, **kwargs):
+        before_identity = kwargs.get("before_identity")
+        candidate_limits.append(kwargs["candidate_limit"])
+        matches = [
+            identity
+            for identity in ordered_identities
+            if segment[0] <= identity[3] < segment[1]
+            and (
+                before_identity is None
+                or identity_indexes[identity] > identity_indexes[before_identity]
+            )
+        ]
+        if not matches:
+            return (), False, {}
+        limit = kwargs["candidate_limit"]
+        return (
+            tuple(matches[:limit]),
+            len(matches) > limit,
+            {},
+        )
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **kwargs: [
+            rows[identity] for identity in kwargs.get("candidate_ids", ())
+        ],
+    )
+    seen = (
+        *(
+            attribute_key_cursor_digest(f"prior-{index}")
+            for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - 1)
+        ),
+        attribute_key_cursor_digest(duplicate_key),
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        seen_key_digests=seen,
+    )
+
+    assert [item.key for item in page.rows] == [unique_key]
+    assert page.seen_key_digests == seen
+    assert candidate_limits[:5] == [
+        64,
+        128,
+        256,
+        ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT,
+        ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT,
+    ]
+
+
+def test_span_attribute_key_cursor_collapses_empty_historical_suffix(monkeypatch):
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    widths: list[timedelta] = []
+    timeouts: list[int | None] = []
+
+    def candidates(_projects, segment, **kwargs):
+        widths.append(segment[1] - segment[0])
+        timeouts.append(kwargs.get("query_timeout_ms"))
+        return (), False, {}
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(selector, "_verify_latest", lambda *_args, **_kwargs: [])
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(days=3650),
+        window_end=NOW,
+    )
+
+    assert page.rows == ()
+    assert page.has_more is False
+    assert page.browse_status == "exhausted"
+    assert widths[0] == timedelta(hours=6)
+    assert all(
+        later == earlier * 2
+        for earlier, later in zip(widths, widths[1:-1], strict=False)
+    )
+    assert max(widths) > timedelta(days=60)
+    assert ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS in timeouts
+    assert len(widths) < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
+
+
+def test_span_attribute_key_cursor_retries_expanded_batch_without_moving_checkpoint(
+    monkeypatch,
+):
+    duplicate_key = "already_seen"
+    unique_key = "reachable_after_expanded_retry"
+    identities = tuple(
+        (
+            PROJECT_A,
+            f"trace-retry-{index}",
+            f"span-retry-{index}",
+            NOW - timedelta(seconds=index + 1),
+        )
+        for index in range(100)
+    )
+    unique_identity = (
+        PROJECT_A,
+        "trace-retry-unique",
+        "span-retry-unique",
+        NOW - timedelta(seconds=len(identities) + 1),
+    )
+    ordered_identities = (*identities, unique_identity)
+    identity_indexes = {
+        identity: index for index, identity in enumerate(ordered_identities)
+    }
+    rows = {
+        identity: {
+            "project_id": PROJECT_A,
+            "trace_id": identity[1],
+            "id": identity[2],
+            "start_time": identity[3],
+            "is_deleted": 0,
+            "string_keys": [
+                unique_key if identity == unique_identity else duplicate_key
+            ],
+            "number_keys": [],
+            "boolean_keys": [],
+            "attributes_extra": "{}",
+        }
+        for identity in ordered_identities
+    }
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    calls: list[tuple[int, tuple[str, str, str, datetime] | None]] = []
+
+    def candidates(_projects, segment, **kwargs):
+        limit = kwargs["candidate_limit"]
+        before_identity = kwargs.get("before_identity")
+        calls.append((limit, before_identity))
+        if limit > 64:
+            raise ReadDeadlineExceeded("expanded replay exceeded its short budget")
+        matches = [
+            identity
+            for identity in ordered_identities
+            if segment[0] <= identity[3] < segment[1]
+            and (
+                before_identity is None
+                or identity_indexes[identity] > identity_indexes[before_identity]
+            )
+        ]
+        return tuple(matches[:limit]), len(matches) > limit, {}
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **kwargs: [
+            rows[identity] for identity in kwargs.get("candidate_ids", ())
+        ],
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        seen_key_digests=(attribute_key_cursor_digest(duplicate_key),),
+    )
+
+    assert [row.key for row in page.rows] == [unique_key]
+    assert calls[:3] == [
+        (64, None),
+        (128, identities[63]),
+        (64, identities[63]),
+    ]
 
 
 def test_span_attribute_key_cursor_exact_search_continues_until_verified_match(
@@ -4753,7 +5187,7 @@ def test_span_attribute_key_cursor_preserves_widened_truncated_segment(
     assert set(returned_identities) == set(identities)
 
 
-def test_span_attribute_key_cursor_continuation_advances_or_terminates():
+def test_span_attribute_key_cursor_empty_retained_window_terminates_in_one_request():
     retained_start = datetime(1970, 1, 1, tzinfo=UTC)
     selector = AttributeReadSelector(
         RecordingExecutor(),
@@ -4762,40 +5196,18 @@ def test_span_attribute_key_cursor_continuation_advances_or_terminates():
         json_attribute_mode="structured",
     )
 
-    first = selector.read_key_cursor_page(
+    page = selector.read_key_cursor_page(
         [PROJECT_A],
         page_size=10,
         window_start=retained_start,
         window_end=NOW,
     )
-    assert first.has_more is True
-    assert first.browse_status == "continuation"
-    assert retained_start < first.next_segment_end < NOW
 
-    second = selector.read_key_cursor_page(
-        [PROJECT_A],
-        page_size=10,
-        window_start=retained_start,
-        window_end=NOW,
-        segment_end=first.next_segment_end,
-        before_identity=first.next_before_identity,
-        resume_identity=first.next_resume_identity,
-        resume_key_offset=first.next_resume_key_offset,
-        seen_key_digests=first.seen_key_digests,
-    )
-    assert second.has_more is True
-    assert retained_start < second.next_segment_end < first.next_segment_end
-
-    terminal_start = NOW - timedelta(hours=12)
-    terminal = selector.read_key_cursor_page(
-        [PROJECT_A],
-        page_size=10,
-        window_start=terminal_start,
-        window_end=NOW,
-    )
-    assert terminal.has_more is False
-    assert terminal.browse_status == "exhausted"
-    assert terminal.next_segment_end == terminal_start
+    assert page.rows == ()
+    assert page.has_more is False
+    assert page.browse_status == "exhausted"
+    assert page.next_segment_end == retained_start
+    assert 1 < page.metadata.query_count < ATTRIBUTE_READ_MAX_QUERY_COUNT
 
 
 def test_span_attribute_key_cursor_shrinks_widened_window_on_read_budget(
@@ -4919,7 +5331,9 @@ def test_span_attribute_key_cursor_jumps_from_slow_base_window_to_five_minutes(
     )
 
     assert attempted_widths[0] == timedelta(hours=6)
-    assert attempted_widths[1:] == [timedelta(minutes=5)] * 15
+    assert attempted_widths[1:] == [timedelta(minutes=5)] * (
+        ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
+    )
     assert clock() < 102.0
     assert page.has_more is True
     assert page.metadata.query_complete is True

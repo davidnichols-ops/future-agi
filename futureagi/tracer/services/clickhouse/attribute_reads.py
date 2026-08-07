@@ -119,6 +119,17 @@ ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT = 64
 # across every call) consume the whole five-second API wall while trying to
 # fill ten distinct options that did not exist.
 ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 4
+# Empty value probes are exact proofs that the requested key/search has no
+# candidate in that half-open physical slice.  Grow only after such a proof so
+# sparse retained history does not require one public cursor round-trip per
+# day.  The 60-day ceiling still exhausts a frozen 365-day window in a small,
+# finite number of statements, while the selector's independent six-second /
+# 30-query ceilings remain the hard request bound.
+ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT = timedelta(days=60)
+# A widened slice is an optional accelerator.  If ClickHouse cannot prove it
+# inside this short statement budget, retry the *same* cursor position with the
+# ordinary six-hour slice; never publish speculative progress.
+ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS = 750
 # De-duplication state lives in immutable server-side chunks.  The signed URL
 # therefore remains fixed width while pagination can continue until the frozen
 # physical window is exhausted; there is no vocabulary-count ceiling.
@@ -130,7 +141,18 @@ ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 4
 # searches reuse this physical cursor and bind their key into its signed state.
 ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE = 50
 ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT = 64
-ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES = 15
+# Duplicate-only pages may safely grow their finite replay batch after a
+# successful 64-row proof.  The ceiling matches the read envelope's modeled
+# block-stop point and remains small enough for one bounded latest-state
+# replay.  A budget failure at an expanded size falls back to 64 without
+# moving the physical cursor.
+ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT = 512
+# Empty candidate pages cost one query (there is nothing to replay), while a
+# non-empty page costs a candidate/replay pair.  Let the independent 30-query
+# operation ceiling decide how many of each fit: dense walks still stop after
+# at most 15 pairs, but an empty historical suffix can collapse up to 29
+# adjacent probes inside one API request instead of exposing empty UI pages.
+ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES = ATTRIBUTE_READ_MAX_QUERY_COUNT
 ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT = timedelta(minutes=5)
 # A missing candidate proves the whole queried slice has no selectable key, so
 # the next adjacent slice may widen.  Dense attribute-free intervals can still
@@ -139,7 +161,13 @@ ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT = timedelta(minutes=5)
 # doomed halvings. No cursor progress is published until that retry succeeds.
 # Every successful statement therefore stays inside the same row/byte/time
 # ceilings while sparse retained history remains reachable in practical pages.
-ATTRIBUTE_KEY_CURSOR_MAX_EMPTY_SEGMENT = timedelta(days=60)
+# Sixty days is the largest ordinary empty slice.  After a successful empty
+# proof, older slices may grow beyond it under a short speculative statement
+# timeout.  This lets partition-pruned years before a project's first span
+# collapse quickly, while a dense/slow wide slice falls back to the ordinary
+# 60-day ceiling without sacrificing any retained range.
+ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT = timedelta(days=60)
+ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS = 250
 ATTRIBUTE_KEY_CURSOR_DIGEST_BYTES = 16
 # The absolute returned-token guard covers unexpected high-entropy identity
 # shapes as well as the modeled 255-byte trace/span maximum. The endpoint adds
@@ -2819,6 +2847,7 @@ class AttributeReadSelector:
         emitted_digests: list[str] = []
         emitted: dict[str, AttributeKeyRow] = {}
         candidate_pages = 0
+        candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
         cursor_before = before_identity
         empty_segment_width = (
             current_segment_end - active_segment_start
@@ -2829,7 +2858,7 @@ class AttributeReadSelector:
         # for the rest of this request.  Re-doubling immediately after the
         # successful narrower retry would repeatedly spend the six-second wall
         # budget on the same known-failing shape while walking sparse history.
-        max_empty_segment_width = ATTRIBUTE_KEY_CURSOR_MAX_EMPTY_SEGMENT
+        max_empty_segment_width = current_segment_end - start
         exact_probe_segment_end: datetime | None = None
         next_resume_identity: PhysicalSpanIdentity | None = None
         next_resume_key_offset = 0
@@ -3015,10 +3044,41 @@ class AttributeReadSelector:
                     attribute_key=None,
                     ordered=True,
                     before_identity=cursor_before,
-                    candidate_limit=ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT,
+                    candidate_limit=candidate_limit,
+                    query_timeout_ms=(
+                        ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
+                        if cursor_before is None
+                        and active_segment_start is None
+                        and current_segment_end - current_segment_start
+                        > ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT
+                        else None
+                    ),
                     candidate_query_settings={"use_skip_indexes": 0},
                 )
             except Exception as exc:
+                if is_read_budget_error(exc) and candidate_limit > (
+                    ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                ):
+                    # An expanded duplicate-only replay is an accelerator, not
+                    # a correctness requirement. Retry the same physical
+                    # checkpoint at the production-qualified base size.
+                    candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                    continue
+                if (
+                    is_read_budget_error(exc)
+                    and active_segment_start is None
+                    and empty_segment_width
+                    > ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT
+                ):
+                    # The speculative wide empty probe proved nothing. Retry
+                    # the same unconsumed range at the ordinary safe ceiling;
+                    # no cursor checkpoint has moved.
+                    max_empty_segment_width = min(
+                        max_empty_segment_width,
+                        ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT,
+                    )
+                    empty_segment_width = max_empty_segment_width
+                    continue
                 if (
                     is_read_budget_error(exc)
                     and active_segment_start is None
@@ -3032,11 +3092,27 @@ class AttributeReadSelector:
                     continue
                 raise
             candidate_pages += 1
-            rows = self._verify_latest(
-                sql=_LATEST_BROWSE_SQL,
-                project_ids=projects,
-                candidate_ids=candidate_ids,
-            )
+            try:
+                rows = self._verify_latest(
+                    sql=_LATEST_BROWSE_SQL,
+                    project_ids=projects,
+                    candidate_ids=candidate_ids,
+                    query_timeout_ms=(
+                        ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS
+                        if candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                if is_read_budget_error(exc) and candidate_limit > (
+                    ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                ):
+                    # Latest-state replay did not certify the expanded batch,
+                    # so retry from the unchanged physical checkpoint. Never
+                    # publish progress from an incomplete accelerator.
+                    candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                    continue
+                raise
             rows_by_identity = {self._physical_identity(row): row for row in rows}
             fully_processed_identity = cursor_before
             for identity in candidate_ids:
@@ -3060,10 +3136,18 @@ class AttributeReadSelector:
             if segment_truncated and candidate_ids:
                 cursor_before = candidate_ids[-1]
                 active_segment_start = current_segment_start
+                if not emitted:
+                    candidate_limit = min(
+                        candidate_limit * 2,
+                        ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT,
+                    )
+                else:
+                    candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
                 continue
             current_segment_end = current_segment_start
             cursor_before = None
             active_segment_start = None
+            candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
             if candidate_ids:
                 empty_segment_width = min(
                     ATTRIBUTE_READ_EXPLICIT_SEGMENT,
@@ -3255,6 +3339,9 @@ class AttributeReadSelector:
         needle = normalized_search.casefold()
         candidate_pages = 0
         cursor_before = before_identity
+        empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+        max_empty_segment_width = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT
+        checkpoint_from_widened_segment = False
         next_resume_identity: PhysicalSpanIdentity | None = None
         next_resume_member_offset = 0
 
@@ -3407,29 +3494,53 @@ class AttributeReadSelector:
             # global per-operation query ceiling.
             and self._query_count + 2 <= ATTRIBUTE_READ_MAX_QUERY_COUNT
         ):
-            segment_start = max(
-                start, current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
-            )
+            segment_start = max(start, current_segment_end - empty_segment_width)
             segment = (segment_start, current_segment_end)
             candidate_ids: tuple[PhysicalSpanIdentity, ...] = ()
             segment_truncated = False
-            candidate_ids, segment_truncated, _ = self._candidate_ids(
-                projects,
-                segment,
-                predicate=candidate_predicate,
-                attribute_key=key,
-                ordered=True,
-                before_identity=cursor_before,
-                candidate_limit=ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
-                predicate_params=candidate_predicate_params,
+            widened_probe = (
+                segment_start < current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
             )
-            candidate_pages += 1
-            rows = self._verify_latest(
-                sql=_LATEST_TARGET_SQL,
-                project_ids=projects,
-                candidate_ids=candidate_ids,
-                attribute_key=key,
-            )
+            try:
+                candidate_ids, segment_truncated, _ = self._candidate_ids(
+                    projects,
+                    segment,
+                    predicate=candidate_predicate,
+                    attribute_key=key,
+                    ordered=True,
+                    before_identity=cursor_before,
+                    candidate_limit=ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+                    predicate_params=candidate_predicate_params,
+                    query_timeout_ms=(
+                        ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+                        if widened_probe
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                if (
+                    is_read_budget_error(exc)
+                    and cursor_before is None
+                    and widened_probe
+                ):
+                    # The failed wide probe proved nothing. Retry from the
+                    # identical segment end at the ordinary six-hour width and
+                    # do not widen again during this request.
+                    max_empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                    empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                    continue
+                raise
+
+            if candidate_ids:
+                candidate_pages += 1
+                rows = self._verify_latest(
+                    sql=_LATEST_TARGET_SQL,
+                    project_ids=projects,
+                    candidate_ids=candidate_ids,
+                    attribute_key=key,
+                )
+            else:
+                rows = ()
 
             rows_by_identity = {self._physical_identity(row): row for row in rows}
             fully_processed_identity = cursor_before
@@ -3456,14 +3567,37 @@ class AttributeReadSelector:
 
             cursor_before = fully_processed_identity
             if next_resume_identity is not None:
+                checkpoint_from_widened_segment = widened_probe
                 break
             if len(emitted) >= effective_page_size:
+                checkpoint_from_widened_segment = widened_probe
                 break
             if segment_truncated and candidate_ids:
                 cursor_before = candidate_ids[-1]
+                if widened_probe:
+                    # The ordered page is a proof that every matching identity
+                    # above this checkpoint was consumed. Move immediately to
+                    # a normal-width keyset segment so a second wide statement
+                    # is never required to preserve progress.
+                    current_segment_end = min(
+                        current_segment_end,
+                        cursor_before[3] + ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+                    )
+                    empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                    checkpoint_from_widened_segment = False
+                else:
+                    checkpoint_from_widened_segment = False
             else:
                 current_segment_end = segment_start
                 cursor_before = None
+                checkpoint_from_widened_segment = False
+                if candidate_ids:
+                    empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                else:
+                    empty_segment_width = min(
+                        empty_segment_width * 2,
+                        max_empty_segment_width,
+                    )
 
             # Search is an interactive narrowing operation.  Once one bounded
             # physical batch has produced verified matches, return that exact
@@ -3476,6 +3610,18 @@ class AttributeReadSelector:
             # ``continuation``.
             if needle and emitted:
                 break
+
+        next_checkpoint = next_resume_identity or cursor_before
+        if checkpoint_from_widened_segment and next_checkpoint is not None:
+            # The ordered widened probe proves every matching identity above
+            # this checkpoint was already consumed. Compress the public
+            # segment end to a normal six-hour window around the checkpoint so
+            # the existing five-field cursor can resume without carrying a new
+            # schema field or skipping older identities.
+            current_segment_end = min(
+                current_segment_end,
+                next_checkpoint[3] + ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+            )
 
         exhausted = current_segment_end <= start and next_resume_identity is None
         seen_after = (*seen, *emitted_digests)
@@ -3867,8 +4013,10 @@ def merge_read_metadata(
 
 
 __all__ = [
+    "ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT",
     "ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES",
     "ATTRIBUTE_KEY_CURSOR_MAX_PAGE_SIZE",
+    "ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS",
     "ATTRIBUTE_READ_HORIZON_DAYS",
     "ATTRIBUTE_READ_MAX_PROJECTS",
     "ATTRIBUTE_READ_SETTINGS",

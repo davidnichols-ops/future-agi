@@ -1,4 +1,4 @@
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
@@ -83,14 +83,14 @@ export function useExactEvalAttributeFields({
   // the base cursor walks older project data.  This request is deliberately
   // non-authoritative: a slow/failed exact lookup must not disable the mapping
   // control, publish a warning, or hide names already loaded by the catalog.
-  const exactQuery = useQuery({
+  const exactQuery = useInfiniteQuery({
     queryKey: [
       "eval-attribute-exact",
       projectId,
       normalizedRowType,
       exactSearch,
     ],
-    queryFn: ({ signal }) =>
+    queryFn: ({ signal, pageParam }) =>
       axios
         .get(endpoints.project.spanAttributeKeys(), {
           signal,
@@ -98,17 +98,15 @@ export function useExactEvalAttributeFields({
             project_id: projectId,
             page_size: 10,
             q: exactSearch,
+            ...(pageParam ? { cursor: pageParam } : {}),
           },
         })
         .then(({ data }) => data || {}),
-    select: (data) => ({
-      fields: (Array.isArray(data?.result) ? data.result : []).flatMap(
-        ({ key }) => {
-          const field = retainedAttributeFieldName(key, normalizedRowType);
-          return field ? [field] : [];
-        },
-      ),
-    }),
+    initialPageParam: null,
+    getNextPageParam: (lastPage) =>
+      lastPage?.has_more && lastPage?.next_cursor
+        ? lastPage.next_cursor
+        : undefined,
     enabled:
       enabled &&
       Boolean(projectId) &&
@@ -123,6 +121,7 @@ export function useExactEvalAttributeFields({
   });
 
   const retainedPages = retainedQuery.data?.pages || [];
+  const exactPages = exactQuery.data?.pages || [];
   const seenRetainedKeys = new Set();
   const retainedFields = retainedPages.flatMap((page) =>
     (Array.isArray(page?.result) ? page.result : []).flatMap(({ key }) => {
@@ -135,8 +134,28 @@ export function useExactEvalAttributeFields({
   const retainedReadState = retainedQuery.isError
     ? "error"
     : combineQueryReadStates(...retainedPages.map(getQueryReadState));
-  const exactFields = exactQuery.data?.fields || [];
+  const seenExactKeys = new Set();
+  const exactFields = exactPages.flatMap((page) =>
+    (Array.isArray(page?.result) ? page.result : []).flatMap(({ key }) => {
+      if (!key || seenExactKeys.has(key)) return [];
+      seenExactKeys.add(key);
+      const field = retainedAttributeFieldName(key, normalizedRowType);
+      return field ? [field] : [];
+    }),
+  );
   const queryReadState = retainedReadState;
+  const exactHasNextPage = Boolean(exactSearch) && exactQuery.hasNextPage;
+  const hasNextPage = exactHasNextPage || retainedQuery.hasNextPage;
+  const fetchNextPage = (...args) => {
+    const reads = [];
+    if (retainedQuery.hasNextPage) {
+      reads.push(retainedQuery.fetchNextPage(...args));
+    }
+    if (exactHasNextPage) {
+      reads.push(exactQuery.fetchNextPage(...args));
+    }
+    return reads.length === 1 ? reads[0] : Promise.allSettled(reads);
+  };
 
   return {
     data: mergeTracingFieldNames(retainedFields, exactFields),
@@ -150,11 +169,15 @@ export function useExactEvalAttributeFields({
     isError: retainedQuery.isError,
     isSuccess: retainedQuery.isSuccess,
     error: retainedQuery.error,
-    fetchNextPage: retainedQuery.fetchNextPage,
-    hasNextPage: retainedQuery.hasNextPage,
-    isFetchingNextPage: retainedQuery.isFetchingNextPage,
-    isFetchNextPageError: retainedQuery.isFetchNextPageError,
-    pageCount: retainedPages.length,
-    browseStatus: retainedPages.at(-1)?.browse_status,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage:
+      retainedQuery.isFetchingNextPage || exactQuery.isFetchingNextPage,
+    isFetchNextPageError:
+      retainedQuery.isFetchNextPageError || exactQuery.isFetchNextPageError,
+    pageCount: retainedPages.length + exactPages.length,
+    browseStatus:
+      (exactSearch ? exactPages.at(-1)?.browse_status : undefined) ||
+      retainedPages.at(-1)?.browse_status,
   };
 }
