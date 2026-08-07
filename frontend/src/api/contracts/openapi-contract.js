@@ -400,6 +400,32 @@ function isFormLikeBody(data) {
   );
 }
 
+// Multipart/urlencoded bodies encode lists as repeated fields; a single entry
+// is still a one-item list (how DRF ListField reads it). Normalize scalar
+// values to one-item arrays for fields the schema declares as arrays, so a
+// single-valued list field validates instead of being rejected as a scalar.
+function normalizeFormArrayFields(body, schema) {
+  if (
+    !schema?.properties ||
+    typeof body !== "object" ||
+    body === null ||
+    Array.isArray(body)
+  ) {
+    return body;
+  }
+  const normalized = { ...body };
+  for (const [key, prop] of Object.entries(schema.properties)) {
+    if (
+      prop?.type === "array" &&
+      Object.prototype.hasOwnProperty.call(normalized, key) &&
+      !Array.isArray(normalized[key])
+    ) {
+      normalized[key] = [normalized[key]];
+    }
+  }
+  return normalized;
+}
+
 function issueSummary(issues = []) {
   return issues
     .slice(0, 5)
@@ -465,12 +491,16 @@ export function validateContractedRequestConfig(config) {
 
   const { requestBody, queryParameters } = endpoint.contract;
   if (requestBody) {
+    const isForm = isFormLikeBody(config.data);
     const schema = schemaToZod(requestBody, {
-      coercePrimitives: isFormLikeBody(config.data),
+      coercePrimitives: isForm,
       requestBody: true,
     });
     const parsed = schema.safeParse(
-      parseMaybeJsonBody(config.data, config.headers),
+      normalizeFormArrayFields(
+        parseMaybeJsonBody(config.data, config.headers),
+        isForm ? resolveRef(requestBody.$ref)?.schema || requestBody : null,
+      ),
     );
     if (!parsed.success) {
       return validationFailure({

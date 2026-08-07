@@ -221,6 +221,36 @@ describe("OpenAPI runtime contract", () => {
     ).toBe(false);
   });
 
+  it("accepts single-valued multipart list fields as one-item arrays", () => {
+    const body = new FormData();
+    body.set(
+      "links",
+      "https://commondatastorage.googleapis.com/codeskulptor-assets/Epoq-Lepidoptera.ogg",
+    );
+    body.set("type", "audio");
+
+    expect(
+      validateContractedRequestConfig({
+        url: "/model-hub/upload-file/",
+        method: "post",
+        data: body,
+      }),
+    ).toMatchObject({ ok: true });
+  });
+
+  it("rejects scalar list fields in JSON bodies", () => {
+    const result = validateContractedRequestConfig({
+      url: "/model-hub/upload-file/",
+      method: "post",
+      data: { type: "audio", links: "https://example.com/a.mp3" },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error.message).toContain(
+      "request body contract validation failed",
+    );
+  });
+
   it("keeps form-body coercion isolated from JSON request validation", () => {
     const body = new FormData();
     body.set("require_2fa", "true");
