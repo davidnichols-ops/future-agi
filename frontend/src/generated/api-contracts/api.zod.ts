@@ -9589,8 +9589,8 @@ export const ApiTracesSpanAttributeDetailListResponse = zod.object({
 
 
 /**
- * Cursor mode returns recent distinct keys newest-first in bounded pages;
-exact ``q`` lookup remains available for keys outside that recent browse.
+ * Cursor mode walks retained project data newest-first in bounded pages;
+exact ``q`` lookup remains available for direct key discovery.
 The no-page-size form is retained for older clients.
 
 GET /api/traces/span-attribute-keys/?project_id=<uuid>&page_size=10
