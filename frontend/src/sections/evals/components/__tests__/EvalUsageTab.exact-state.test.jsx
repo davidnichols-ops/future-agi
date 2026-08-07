@@ -112,11 +112,15 @@ describe("EvalUsageTab exact read states", () => {
     };
   });
 
-  it("uses neutral preparation states and does not present failures as zero data", () => {
+  it("uses generic retry states and does not present failures as zero data", () => {
     render(<EvalUsageTab templateId="eval-1" />);
 
-    expect(screen.getAllByText("Loading results…")).toHaveLength(2);
-    expect(screen.queryByText(/could not be loaded/i)).not.toBeInTheDocument();
+    expect(
+      screen.getAllByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).toHaveLength(2);
+    expect(screen.queryByText("Loading results…")).not.toBeInTheDocument();
     expect(screen.queryByText(/No data to show/i)).not.toBeInTheDocument();
     expect(screen.queryByTestId("usage-table")).not.toBeInTheDocument();
     expect(screen.queryByTestId("usage-pagination")).not.toBeInTheDocument();
@@ -183,6 +187,11 @@ describe("EvalUsageTab exact read states", () => {
     );
     expect(screen.getByTestId("usage-pagination")).toBeInTheDocument();
     expect(screen.queryByText("Loading results…")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
     expect(screen.getByText(/Last updated/i)).toBeInTheDocument();
   });
 
@@ -215,6 +224,9 @@ describe("EvalUsageTab exact read states", () => {
     expect(screen.getByTestId("usage-table")).toBeInTheDocument();
     expect(screen.getByTestId("usage-pagination")).toBeInTheDocument();
     expect(screen.queryByText("Loading results…")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(h.refetchChart).toHaveBeenCalledOnce();

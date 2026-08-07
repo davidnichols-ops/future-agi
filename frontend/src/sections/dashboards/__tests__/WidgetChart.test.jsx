@@ -2,6 +2,7 @@ import React from "react";
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { act, render, screen, waitFor } from "src/utils/test-utils";
 import WidgetChart from "../WidgetChart";
+import { AGGREGATION_POLL_TIMEOUT_MS } from "src/utils/queryReadState";
 
 const h = vi.hoisted(() => ({
   query: { data: null, isPending: false, isError: false, mutate: vi.fn() },
@@ -255,6 +256,130 @@ describe("WidgetChart — queued exact refresh", () => {
     );
     expect(screen.getByTestId("apex-line")).toBeInTheDocument();
     expect(screen.queryByText(PREPARING_MESSAGE)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a finite retry state for an immediate transport failure", () => {
+    const onQuerySettled = vi.fn();
+    h.query.mutate.mockImplementation((_request, options) =>
+      options?.onError?.(new Error("transport failed")),
+    );
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    expect(screen.queryByText(PREPARING_MESSAGE)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+    expect(onQuerySettled).toHaveBeenCalledOnce();
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: false, updatedAt: null }),
+    );
+  });
+
+  it("stops a never-settling job, preserves cached exact data, and exposes a retry state", async () => {
+    vi.useFakeTimers();
+    const cachedResponse = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 12 },
+    ]);
+    const pendingResponse = {
+      data: {
+        result: {
+          metrics: [],
+          query_complete: false,
+          query_status: "pending",
+          query_sampled: false,
+          query_refreshing: true,
+        },
+      },
+    };
+    const onQuerySettled = vi.fn();
+    h.query.data = cachedResponse;
+    h.query.mutate.mockImplementation((_request, options) =>
+      options?.onSuccess?.(pendingResponse),
+    );
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+    expect(h.query.mutate).toHaveBeenCalledOnce();
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+    );
+
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+    expect(onQuerySettled).toHaveBeenCalledOnce();
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: false, updatedAt: null }),
+    );
+    const boundedRequestCount = h.query.mutate.mock.calls.length;
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS * 2),
+    );
+    expect(h.query.mutate).toHaveBeenCalledTimes(boundedRequestCount);
+    expect(boundedRequestCount).toBeLessThanOrEqual(12);
+  });
+
+  it("times out an unresolved request while preserving the previous exact snapshot", async () => {
+    vi.useFakeTimers();
+    const cachedResponse = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 12 },
+    ]);
+    const onQuerySettled = vi.fn();
+    h.query.data = cachedResponse;
+    h.query.mutate.mockImplementation(() => {});
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    expect(h.query.mutate).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+    expect(onQuerySettled).not.toHaveBeenCalled();
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+    );
+
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+    expect(onQuerySettled).toHaveBeenCalledOnce();
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: false, updatedAt: null }),
+    );
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS * 2),
+    );
+    expect(h.query.mutate).toHaveBeenCalledOnce();
+    expect(onQuerySettled).toHaveBeenCalledOnce();
   });
 });
 

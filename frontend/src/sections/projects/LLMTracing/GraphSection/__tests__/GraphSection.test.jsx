@@ -1,8 +1,9 @@
 import React from "react";
-import { fireEvent, render, screen, waitFor } from "src/utils/test-utils";
+import { act, fireEvent, render, screen, waitFor } from "src/utils/test-utils";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import axios from "src/utils/axios";
+import { AGGREGATION_POLL_TIMEOUT_MS } from "src/utils/queryReadState";
 import GraphSection from "../GraphSection";
 
 vi.mock("react-apexcharts", () => ({
@@ -11,23 +12,37 @@ vi.mock("react-apexcharts", () => ({
       data-testid="apex-chart"
       data-traffic-series-name={series?.[1]?.name}
       data-traffic-axis-series-name={options?.yaxis?.[1]?.seriesName}
+      data-primary-first-y={series?.[0]?.data?.[0]?.y}
     />
   ),
 }));
 
 vi.mock("../LeftControl", () => ({
   default: ({ onGraphConfigChange }) => (
-    <button
-      type="button"
-      onClick={() =>
-        onGraphConfigChange({
-          id: "latency",
-          type: "SYSTEM_METRIC",
-        })
-      }
-    >
-      Select latency
-    </button>
+    <>
+      <button
+        type="button"
+        onClick={() =>
+          onGraphConfigChange({
+            id: "latency",
+            type: "SYSTEM_METRIC",
+          })
+        }
+      >
+        Select latency
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          onGraphConfigChange({
+            id: "tokens",
+            type: "SYSTEM_METRIC",
+          })
+        }
+      >
+        Select tokens
+      </button>
+    </>
   ),
 }));
 
@@ -66,7 +81,7 @@ vi.mock("src/utils/axios", () => ({
   },
 }));
 
-function renderGraph() {
+function renderGraph({ selectedTab = "trace" } = {}) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -74,7 +89,7 @@ function renderGraph() {
   return render(
     <QueryClientProvider client={queryClient}>
       <GraphSection
-        selectedTab="trace"
+        selectedTab={selectedTab}
         filters={[]}
         showCompare={false}
         selectedGraphProperty="latency"
@@ -103,6 +118,8 @@ describe("GraphSection exact graph boundary", () => {
     vi.clearAllMocks();
   });
 
+  afterEach(() => vi.useRealTimers());
+
   it("does not chart points carried by a degraded response", async () => {
     axios.post.mockResolvedValue({
       data: {
@@ -125,7 +142,11 @@ describe("GraphSection exact graph boundary", () => {
     renderGraph();
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
-    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).toBeInTheDocument();
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
   });
@@ -155,15 +176,36 @@ describe("GraphSection exact graph boundary", () => {
     renderGraph();
     fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
 
-    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).toBeInTheDocument();
     await waitFor(() => expect(axios.post).toHaveBeenCalledOnce());
     expect(axios.post).toHaveBeenCalledWith(
       "/tracer/trace/get_graph_methods/",
       expect.any(Object),
-      { params: { allow_sampled: false } },
+      expect.objectContaining({ params: { allow_sampled: false } }),
     );
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
     expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
+  });
+
+  it("shows a terminal request failure as a generic retry, not loading", async () => {
+    axios.post.mockRejectedValue(
+      new Error("Code: 159 DB::Exception: Timeout exceeded Stack trace"),
+    );
+
+    renderGraph();
+    fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+
+    expect(
+      await screen.findByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+    expect(screen.queryByText(/DB::Exception/i)).not.toBeInTheDocument();
   });
 
   it("renders a completed exact response without waiting for snapshot persistence", async () => {
@@ -190,5 +232,120 @@ describe("GraphSection exact graph boundary", () => {
 
     expect(await screen.findByTestId("apex-chart")).toBeInTheDocument();
     expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+  });
+
+  it("refetches a span graph with the newly selected metric configuration", async () => {
+    axios.post.mockResolvedValue({
+      data: {
+        result: {
+          metric_name: "latency",
+          data: [],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+
+    renderGraph({ selectedTab: "spans" });
+    fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+    await waitFor(() => expect(axios.post).toHaveBeenCalledTimes(1));
+    expect(axios.post).toHaveBeenLastCalledWith(
+      "/tracer/observation-span/get_graph_methods/",
+      expect.objectContaining({
+        req_data_config: { id: "latency", type: "SYSTEM_METRIC" },
+      }),
+      expect.objectContaining({ params: { allow_sampled: false } }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Select tokens" }));
+    await waitFor(() => expect(axios.post).toHaveBeenCalledTimes(2));
+    expect(axios.post).toHaveBeenLastCalledWith(
+      "/tracer/observation-span/get_graph_methods/",
+      expect.objectContaining({
+        req_data_config: { id: "tokens", type: "SYSTEM_METRIC" },
+      }),
+      expect.objectContaining({ params: { allow_sampled: false } }),
+    );
+  });
+
+  it("bounds a never-resolving transport, ignores its late response, and restarts on refresh", async () => {
+    vi.useFakeTimers();
+    let resolveLateRequest;
+    axios.post.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveLateRequest = resolve;
+        }),
+    );
+
+    renderGraph();
+    fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+    expect(axios.post).toHaveBeenCalledOnce();
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+    );
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+    expect(axios.post).toHaveBeenCalledOnce();
+
+    resolveLateRequest({
+      data: {
+        result: {
+          metric_name: "latency",
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 999,
+              primary_traffic: 999,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
+
+    axios.post.mockResolvedValueOnce({
+      data: {
+        result: {
+          metric_name: "latency",
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 12,
+              primary_traffic: 1,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+    act(() => window.dispatchEvent(new CustomEvent("observe-refresh")));
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("apex-chart")).toHaveAttribute(
+      "data-primary-first-y",
+      "12",
+    );
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
   });
 });

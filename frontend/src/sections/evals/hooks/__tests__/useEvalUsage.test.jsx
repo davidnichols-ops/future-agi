@@ -14,6 +14,10 @@ vi.mock("src/utils/axios", () => ({
 }));
 
 import { useEvalUsageChart, useEvalUsageLogs } from "../useEvalUsage";
+import {
+  AGGREGATION_POLL_MAX_ATTEMPTS,
+  AGGREGATION_POLL_TIMEOUT_MS,
+} from "src/utils/queryReadState";
 
 function createQueryWrapper() {
   const queryClient = new QueryClient({
@@ -177,6 +181,57 @@ describe("useEvalUsage date params", () => {
     expect(result.current.data?.queryPending).toBe(false);
     expect(result.current.data?.chart).toHaveLength(1);
   });
+
+  it("bounds a stuck pending chart and lets an explicit retry start fresh", async () => {
+    vi.useFakeTimers();
+    const pending = {
+      data: {
+        result: {
+          stats: {},
+          chart: [],
+          query_complete: false,
+          query_status: "pending",
+          query_sampled: false,
+          query_refreshing: true,
+        },
+      },
+    };
+    mocks.get.mockResolvedValue(pending);
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () => useEvalUsageChart("t1", "30d", "30D", null),
+      { wrapper },
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(result.current.data?.queryPending).toBe(true);
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+    );
+    expect(result.current.isError).toBe(true);
+    const boundedRequestCount = mocks.get.mock.calls.length;
+    expect(boundedRequestCount).toBeLessThanOrEqual(
+      AGGREGATION_POLL_MAX_ATTEMPTS + 1,
+    );
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS * 2),
+    );
+    expect(mocks.get).toHaveBeenCalledTimes(boundedRequestCount);
+
+    mocks.get.mockResolvedValueOnce({
+      data: {
+        result: exactResult({
+          chart: [{ timestamp: "2026-08-03T00:00:00Z", calls: 2 }],
+        }),
+      },
+    });
+    await act(async () => result.current.refresh());
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(result.current.isError).toBe(false);
+    expect(result.current.data?.chart).toHaveLength(1);
+  });
 });
 
 describe("useEvalUsageLogs response mapping", () => {
@@ -305,5 +360,38 @@ describe("useEvalUsageLogs response mapping", () => {
     expect(result.current.data?.queryPending).toBe(false);
     expect(result.current.data?.table).toHaveLength(24);
     expect(result.current.data?.pagination.total).toBe(24);
+  });
+
+  it("bounds a stuck pending log page", async () => {
+    vi.useFakeTimers();
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          table: [],
+          logs: {},
+          query_complete: false,
+          query_status: "pending",
+          query_sampled: false,
+          query_refreshing: true,
+        },
+      },
+    });
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () => useEvalUsageLogs("t1", { dateOption: "30D" }),
+      { wrapper },
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+    );
+
+    expect(result.current.isError).toBe(true);
+    const boundedRequestCount = mocks.get.mock.calls.length;
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS * 2),
+    );
+    expect(mocks.get).toHaveBeenCalledTimes(boundedRequestCount);
   });
 });

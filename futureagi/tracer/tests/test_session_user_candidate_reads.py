@@ -1305,6 +1305,99 @@ def test_positive_end_user_filter_uses_candidate_scoped_membership():
 
 
 @pytest.mark.unit
+def test_positive_end_user_cursor_uses_exact_stable_keyset_query():
+    end_user_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    before_session_id = str(uuid.uuid4())
+    before_start = datetime(2026, 7, 31, 12, 0, 0, 123456, tzinfo=UTC)
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        page_size=25,
+        filters=[
+            {
+                "column_id": "end_user_id",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": end_user_ids,
+                },
+            }
+        ],
+        bounded_internal_scan=True,
+    )
+
+    first_sql, first_params = builder.build_candidate_cursor_page_query()
+    next_sql, next_params = builder.build_candidate_cursor_page_query(
+        before_start_time=before_start,
+        before_session_id=before_session_id,
+    )
+
+    assert builder.supports_candidate_cursor_page() is True
+    assert first_params["limit"] == 26
+    assert first_params["candidate_filter_user_ids"] == tuple(end_user_ids)
+    assert "matching_user_sessions AS" in first_sql
+    assert "count() OVER() AS remaining_count" in first_sql
+    assert "ORDER BY session_start DESC, session_id DESC" in first_sql
+    assert "cursor_before_start_us" not in first_params
+    assert "cursor_before_session_id" not in first_params
+
+    assert next_params["cursor_before_start_us"] == 1785499200123456
+    assert next_params["cursor_before_session_id"] == before_session_id
+    assert "session_start < fromUnixTimestamp64Micro(" in next_sql
+    assert "session_id < toUUID(%(cursor_before_session_id)s)" in next_sql
+    assert "OFFSET" not in next_sql
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("operator", ["not_equals", "not_in", "is_null", "is_not_null"])
+def test_non_positive_end_user_cursor_keeps_bounded_path(operator):
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            {
+                "column_id": "end_user_id",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": operator,
+                    "filter_value": [str(uuid.uuid4())],
+                },
+            }
+        ],
+        bounded_internal_scan=True,
+    )
+
+    assert builder.supports_candidate_cursor_page() is False
+
+
+@pytest.mark.unit
+def test_positive_end_user_cursor_with_another_filter_keeps_bounded_path():
+    builder = SessionListQueryBuilderV2(
+        project_id=str(uuid.uuid4()),
+        filters=[
+            {
+                "column_id": "end_user_id",
+                "filter_config": {
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": [str(uuid.uuid4())],
+                },
+            },
+            {
+                "column_id": "final_status",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "equals",
+                    "filter_value": "completed",
+                },
+            },
+        ],
+        bounded_internal_scan=True,
+    )
+
+    assert builder.supports_candidate_cursor_page() is False
+
+
+@pytest.mark.unit
 def test_negated_end_user_filter_uses_exact_time_scoped_membership():
     excluded_id = str(uuid.uuid4())
     builder = SessionListQueryBuilderV2(

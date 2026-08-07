@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,7 +12,11 @@ from tracer.models.dashboard import Dashboard, DashboardWidget
 from tracer.services.clickhouse.v2.query_builders.dashboard import (
     DashboardQueryBuilderV2,
 )
-from tracer.views.dashboard import DashboardViewSet, DashboardWidgetViewSet
+from tracer.views.dashboard import (
+    DashboardViewSet,
+    DashboardWidgetViewSet,
+    _canonicalize_persisted_dashboard_query_filters_for_read,
+)
 
 
 @pytest.fixture
@@ -64,6 +69,272 @@ def _trace_query(project_id):
             }
         ],
     }
+
+
+def _legacy_filtered_trace_query(project_id):
+    """Exact shape persisted by dashboard d0d98a25 before canonical filters."""
+
+    return {
+        "project_ids": [str(project_id)],
+        "granularity": "day",
+        "time_range": {"preset": "30D"},
+        "filters": [
+            {
+                "value": "32",
+                "source": "traces",
+                "operator": "equal_to",
+                "metric_name": "error_rate",
+                "metric_type": "system_metric",
+            }
+        ],
+        "metrics": [
+            {
+                "id": "error_rate",
+                "name": "error_rate",
+                "type": "system_metric",
+                "source": "traces",
+                "aggregation": "count",
+                "filters": [
+                    {
+                        "value": "32",
+                        "source": "traces",
+                        "operator": "equal_to",
+                        "metric_name": "input_tokens",
+                        "metric_type": "system_metric",
+                    }
+                ],
+            }
+        ],
+        "breakdowns": [],
+    }
+
+
+def _canonical_filtered_trace_query(project_id):
+    query = _legacy_filtered_trace_query(project_id)
+    query["filters"] = [
+        {
+            "column_id": "error_rate",
+            "source": "traces",
+            "filter_config": {
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "32",
+                "col_type": "SYSTEM_METRIC",
+            },
+        }
+    ]
+    query["metrics"][0]["filters"] = [
+        {
+            "column_id": "input_tokens",
+            "source": "traces",
+            "filter_config": {
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "32",
+                "col_type": "SYSTEM_METRIC",
+            },
+        }
+    ]
+    return query
+
+
+def _legacy_numeric_operator_query(project_id):
+    query = _legacy_filtered_trace_query(project_id)
+    query["filters"][0].pop("value")
+    query["filters"][0]["operator"] = "is_numeric"
+    query["metrics"][0]["filters"][0].pop("value")
+    query["metrics"][0]["filters"][0]["operator"] = "is_not_numeric"
+    return query
+
+
+def _canonical_numeric_operator_query(project_id):
+    query = _legacy_filtered_trace_query(project_id)
+    query["filters"] = [
+        {
+            "column_id": "error_rate",
+            "source": "traces",
+            "filter_config": {
+                "filter_type": "number",
+                "filter_op": "not_equals",
+                "filter_value": 0,
+                "col_type": "SYSTEM_METRIC",
+            },
+        }
+    ]
+    query["metrics"][0]["filters"] = [
+        {
+            "column_id": "input_tokens",
+            "source": "traces",
+            "filter_config": {
+                "filter_type": "number",
+                "filter_op": "equals",
+                "filter_value": 0,
+                "col_type": "SYSTEM_METRIC",
+            },
+        }
+    ]
+    return query
+
+
+@pytest.mark.parametrize(
+    "query_factory",
+    (_legacy_filtered_trace_query, _canonical_filtered_trace_query),
+    ids=("legacy-flattened", "current-canonical"),
+)
+def test_persisted_dashboard_filter_read_normalization_is_semantically_identical(
+    query_factory,
+):
+    project_id = uuid.uuid4()
+    query = query_factory(project_id)
+
+    restored = _canonicalize_persisted_dashboard_query_filters_for_read(query)
+
+    assert restored["filters"] == _canonical_filtered_trace_query(project_id)["filters"]
+    assert (
+        restored["metrics"][0]["filters"]
+        == _canonical_filtered_trace_query(project_id)["metrics"][0]["filters"]
+    )
+    # Read compatibility must never rewrite the model's in-memory JSON value.
+    assert query == query_factory(project_id)
+
+
+def test_legacy_numeric_operators_normalize_without_mutating_persisted_query():
+    project_id = uuid.uuid4()
+    legacy_query = _legacy_numeric_operator_query(project_id)
+
+    restored = _canonicalize_persisted_dashboard_query_filters_for_read(legacy_query)
+
+    current_query = _canonical_numeric_operator_query(project_id)
+    assert restored["filters"] == current_query["filters"]
+    assert restored["metrics"][0]["filters"] == current_query["metrics"][0]["filters"]
+    assert legacy_query == _legacy_numeric_operator_query(project_id)
+
+
+@pytest.mark.parametrize(
+    "query_factory",
+    (_legacy_filtered_trace_query, _canonical_filtered_trace_query),
+    ids=("legacy-flattened", "current-canonical"),
+)
+def test_widget_query_accepts_old_and_current_persisted_filter_shapes_without_write(
+    query_factory,
+):
+    stored_query = query_factory(uuid.uuid4())
+    original_query = query_factory(stored_query["project_ids"][0])
+    captured = {}
+    workspace = SimpleNamespace(id=uuid.uuid4(), organization_id=uuid.uuid4())
+
+    def _pending(namespace, identity, **kwargs):
+        captured.update(namespace=namespace, identity=identity)
+        return kwargs["pending_payload"]
+
+    with (
+        patch(
+            "tracer.views.dashboard._materialize_dashboard_query_scope",
+            side_effect=lambda config, *_args, **_kwargs: config,
+        ),
+        patch(
+            "tracer.views.dashboard.read_or_schedule_exact_snapshot",
+            side_effect=_pending,
+        ),
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+    ):
+        response = DashboardWidgetViewSet()._execute_ch_query_config(
+            stored_query,
+            workspace,
+        )
+
+    assert response.status_code == 200
+    assert response.data["result"]["query_status"] == "pending"
+    assert captured["namespace"] == "dashboard-query"
+    normalized = captured["identity"]["query_config"]
+    assert normalized["filters"] == [
+        {
+            "metric_type": "system_metric",
+            "metric_name": "error_rate",
+            "operator": "equal_to",
+            "value": "32",
+            "source": "traces",
+        }
+    ]
+    assert normalized["metrics"][0]["filters"] == [
+        {
+            "metric_type": "system_metric",
+            "metric_name": "input_tokens",
+            "operator": "equal_to",
+            "value": "32",
+            "source": "traces",
+        }
+    ]
+    assert stored_query == original_query
+
+
+def test_legacy_numeric_operators_match_current_widget_cache_identity_without_write():
+    project_id = uuid.uuid4()
+    workspace = SimpleNamespace(id=uuid.uuid4(), organization_id=uuid.uuid4())
+    stored_queries = [
+        _legacy_numeric_operator_query(project_id),
+        _canonical_numeric_operator_query(project_id),
+    ]
+    captured_identities = []
+
+    def _pending(_namespace, identity, **kwargs):
+        captured_identities.append(identity)
+        return kwargs["pending_payload"]
+
+    with (
+        patch(
+            "tracer.views.dashboard._materialize_dashboard_query_scope",
+            side_effect=lambda config, *_args, **_kwargs: config,
+        ),
+        patch(
+            "tracer.views.dashboard.read_or_schedule_exact_snapshot",
+            side_effect=_pending,
+        ),
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+    ):
+        responses = [
+            DashboardWidgetViewSet()._execute_ch_query_config(query, workspace)
+            for query in stored_queries
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert captured_identities[0] == captured_identities[1]
+    normalized = captured_identities[0]["query_config"]
+    assert normalized["filters"][0] == {
+        "metric_type": "system_metric",
+        "metric_name": "error_rate",
+        "operator": "not_equal_to",
+        "value": 0,
+        "source": "traces",
+    }
+    assert normalized["metrics"][0]["filters"][0] == {
+        "metric_type": "system_metric",
+        "metric_name": "input_tokens",
+        "operator": "equal_to",
+        "value": 0,
+        "source": "traces",
+    }
+    assert stored_queries == [
+        _legacy_numeric_operator_query(project_id),
+        _canonical_numeric_operator_query(project_id),
+    ]
+
+
+def test_invalid_persisted_dashboard_filter_error_is_sanitized():
+    query = _trace_query(uuid.uuid4())
+    query["filters"] = [{"operator": "equal_to", "value": "private-value"}]
+
+    response = DashboardWidgetViewSet()._execute_ch_query_config(
+        query,
+        SimpleNamespace(id=uuid.uuid4(), organization_id=uuid.uuid4()),
+    )
+
+    assert response.status_code == 400
+    payload = json.dumps(response.data)
+    assert "private-value" not in payload
+    assert "ErrorDetail" not in payload
+    assert "Missing filter item keys" not in payload
+    assert "Dashboard query configuration is invalid" in payload
 
 
 DIRECT_WRITE_ROUTING_CONFIGS = (

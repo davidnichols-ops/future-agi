@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen, waitFor } from "src/utils/test-utils";
 import axios from "src/utils/axios";
+import { AGGREGATION_POLL_TIMEOUT_MS } from "src/utils/queryReadState";
 import PrimaryGraph from "../PrimaryGraph";
 
 vi.mock("react-apexcharts", () => ({
@@ -11,6 +12,7 @@ vi.mock("react-apexcharts", () => ({
       data-testid="apex-chart"
       data-traffic-series-name={series?.[1]?.name}
       data-traffic-axis-series-name={options?.yaxis?.[1]?.seriesName}
+      data-primary-first-y={series?.[0]?.data?.[0]?.y}
     />
   ),
 }));
@@ -98,7 +100,7 @@ describe("PrimaryGraph", () => {
       expect.objectContaining({
         project_id: "project-override",
       }),
-      { params: { allow_sampled: false } },
+      expect.objectContaining({ params: { allow_sampled: false } }),
     );
   });
 
@@ -117,7 +119,7 @@ describe("PrimaryGraph", () => {
       expect.objectContaining({
         project_id: "project-override",
       }),
-      { params: { allow_sampled: false } },
+      expect.objectContaining({ params: { allow_sampled: false } }),
     );
   });
 
@@ -212,7 +214,11 @@ describe("PrimaryGraph", () => {
       <PrimaryGraph observeIdOverride="project-override" />,
     );
 
-    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText("No data available for this time range"),
     ).not.toBeInTheDocument();
@@ -244,7 +250,11 @@ describe("PrimaryGraph", () => {
       <PrimaryGraph observeIdOverride="project-override" />,
     );
 
-    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).toBeInTheDocument();
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
     expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
     expect(
@@ -261,7 +271,12 @@ describe("PrimaryGraph", () => {
       <PrimaryGraph observeIdOverride="project-override" />,
     );
 
-    expect(await screen.findByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
     expect(screen.queryByText(/DB::Exception/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Stack trace/i)).not.toBeInTheDocument();
   });
@@ -332,7 +347,9 @@ describe("PrimaryGraph", () => {
       2,
       "/tracer/trace/get_graph_methods/",
       expect.any(Object),
-      { params: { allow_sampled: false, refresh: true } },
+      expect.objectContaining({
+        params: { allow_sampled: false, refresh: true },
+      }),
     );
     expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Loading graph data/i)).not.toBeInTheDocument();
@@ -390,7 +407,7 @@ describe("PrimaryGraph", () => {
       2,
       "/tracer/trace/get_graph_methods/",
       expect.any(Object),
-      { params: { allow_sampled: false } },
+      expect.objectContaining({ params: { allow_sampled: false } }),
     );
     expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
     expect(exactCompletion).toHaveBeenCalledOnce();
@@ -398,6 +415,173 @@ describe("PrimaryGraph", () => {
       "observe-aggregation-completed",
       exactCompletion,
     );
+  });
+
+  it("bounds a never-resolving refresh, preserves exact data, and ignores its late response", async () => {
+    vi.useFakeTimers();
+    const exactResponse = {
+      data: {
+        result: {
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 12,
+              primary_traffic: 1,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    };
+    let resolveLateRefresh;
+    axios.post.mockResolvedValueOnce(exactResponse).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveLateRefresh = resolve;
+        }),
+    );
+
+    renderWithQueryClient(
+      <PrimaryGraph observeIdOverride="project-override" />,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+    expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
+    expect(screen.getByTestId("apex-chart")).toHaveAttribute(
+      "data-primary-first-y",
+      "12",
+    );
+
+    act(() => window.dispatchEvent(new CustomEvent("observe-refresh")));
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+    );
+    expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+    const boundedRequestCount = axios.post.mock.calls.length;
+    expect(boundedRequestCount).toBe(2);
+
+    resolveLateRefresh({
+      data: {
+        result: {
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 999,
+              primary_traffic: 999,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+
+    expect(axios.post).toHaveBeenCalledTimes(boundedRequestCount);
+    expect(screen.getByTestId("apex-chart")).toHaveAttribute(
+      "data-primary-first-y",
+      "12",
+    );
+
+    axios.post.mockResolvedValueOnce({
+      data: {
+        result: {
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 24,
+              primary_traffic: 2,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+    act(() => window.dispatchEvent(new CustomEvent("observe-refresh")));
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+
+    expect(axios.post).toHaveBeenCalledTimes(3);
+    expect(screen.getByTestId("apex-chart")).toHaveAttribute(
+      "data-primary-first-y",
+      "24",
+    );
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("starts a fresh transport budget when the graph query changes", async () => {
+    vi.useFakeTimers();
+    axios.post.mockImplementationOnce(() => new Promise(() => {}));
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <PrimaryGraph
+          observeIdOverride="project-override"
+          selectedInterval="day"
+        />
+      </QueryClientProvider>,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+    );
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+
+    axios.post.mockResolvedValueOnce({
+      data: {
+        result: {
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 36,
+              primary_traffic: 3,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+        },
+      },
+    });
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <PrimaryGraph
+          observeIdOverride="project-override"
+          selectedInterval="hour"
+        />
+      </QueryClientProvider>,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("apex-chart")).toHaveAttribute(
+      "data-primary-first-y",
+      "36",
+    );
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
   });
 
   it("renders a completed exact response without an intermediate empty label", async () => {

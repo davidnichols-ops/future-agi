@@ -3622,7 +3622,7 @@ def test_filter_value_cursor_resumed_array_duplicate_walk_uses_safe_29_query_cap
     assert read.next_before_identity[3] < resume_identity[3]
 
 
-def test_filter_value_cursor_reports_truthful_server_state_limit():
+def test_filter_value_cursor_exhausts_frozen_window_after_tracking_prefix_is_full():
     seen = tuple(
         attribute_value_cursor_digest("string", f"prior-{index}")
         for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS)
@@ -3635,17 +3635,196 @@ def test_filter_value_cursor_reports_truthful_server_state_limit():
         [PROJECT_A],
         "final_status",
         page_size=10,
-        window_start=NOW - timedelta(days=365),
+        window_start=NOW - timedelta(hours=1),
         window_end=NOW,
         seen_value_digests=seen,
     )
 
     assert read.rows == ()
     assert read.has_more is False
-    assert read.browse_status == "limit_reached"
+    assert read.browse_status == "exhausted"
     assert read.seen_value_digests == seen
     assert read.metadata.query_complete is True
-    assert executor.calls == []
+    assert len(executor.calls) == 1
+
+
+def test_filter_value_cursor_publishes_full_page_past_tracking_prefix(monkeypatch):
+    identity = (PROJECT_A, "trace-after-cap", "span-after-cap", NOW - timedelta(1))
+    selector = AttributeReadSelector(
+        RecordingExecutor(), now=NOW, json_attribute_mode="arrays"
+    )
+    monkeypatch.setattr(
+        selector,
+        "_candidate_ids",
+        lambda *_args, **_kwargs: ((identity,), False, {}),
+    )
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **_kwargs: [
+            _target_row(
+                PROJECT_A,
+                identity[2],
+                trace_id=identity[1],
+                start_time=identity[3],
+                legacy_raw=json.dumps(["after-4096-a", "after-4096-b"]),
+            )
+        ],
+    )
+    seen = tuple(
+        attribute_value_cursor_digest("string", f"prior-{index}")
+        for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - 1)
+    )
+
+    read = selector.read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=2,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        seen_value_digests=seen,
+    )
+
+    assert [row.value for row in read.rows] == ["after-4096-a", "after-4096-b"]
+    assert len(read.seen_value_digests) == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
+    assert read.seen_value_digests[-1] == attribute_value_cursor_digest(
+        "array", "after-4096-a"
+    )
+    assert (
+        attribute_value_cursor_digest("array", "after-4096-b")
+        not in read.seen_value_digests
+    )
+    assert read.has_more is True
+    assert read.browse_status == "continuation"
+
+
+def test_filter_value_cursor_post_cap_duplicates_still_advance_physical_cursor():
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"post-cap-{index}",
+            trace_id=f"trace-post-cap-{index}",
+            start_time=NOW - timedelta(minutes=index + 1),
+        )
+        for index in range(2)
+    ]
+    by_id = {str(row["id"]): row for row in candidates}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            in_segment = [
+                row
+                for row in candidates
+                if call.params["segment_start"]
+                <= row["start_time"]
+                < call.params["segment_end"]
+            ]
+            return _keyset_candidate_page(in_segment, call)
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=by_id[span_id]["trace_id"],
+                start_time=by_id[span_id]["start_time"],
+                string="repeated-after-cap",
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    seen = tuple(
+        attribute_value_cursor_digest("string", f"prior-{index}")
+        for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS)
+    )
+    first = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        seen_value_digests=seen,
+    )
+    second = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        before_identity=first.next_before_identity,
+        seen_value_digests=first.seen_value_digests,
+    )
+
+    assert [row.value for row in first.rows] == ["repeated-after-cap"]
+    assert [row.value for row in second.rows] == ["repeated-after-cap"]
+    assert first.seen_value_digests == second.seen_value_digests == seen
+    assert first.next_before_identity == (
+        PROJECT_A,
+        "trace-post-cap-0",
+        "post-cap-0",
+        NOW - timedelta(minutes=1),
+    )
+    assert second.next_before_identity == (
+        PROJECT_A,
+        "trace-post-cap-1",
+        "post-cap-1",
+        NOW - timedelta(minutes=2),
+    )
+    assert second.next_before_identity[3] < first.next_before_identity[3]
+    assert first.browse_status == second.browse_status == "continuation"
+
+
+def test_filter_value_cursor_search_remains_resumable_after_tracking_prefix(
+    monkeypatch,
+):
+    identity = (PROJECT_A, "trace-search-cap", "span-search-cap", NOW - timedelta(1))
+    selector = AttributeReadSelector(
+        RecordingExecutor(), now=NOW, json_attribute_mode="arrays"
+    )
+    candidate_calls = []
+
+    def candidates(*_args, **kwargs):
+        candidate_calls.append(kwargs)
+        return ((identity,), False, {})
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **_kwargs: [
+            _target_row(
+                PROJECT_A,
+                identity[2],
+                trace_id=identity[1],
+                start_time=identity[3],
+                string="Rechazado",
+            )
+        ],
+    )
+    seen = tuple(
+        attribute_value_cursor_digest("string", f"prior-{index}")
+        for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS)
+    )
+
+    read = selector.read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="rechazado",
+        attribute_type="string",
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        seen_value_digests=seen,
+    )
+
+    assert [row.value for row in read.rows] == ["Rechazado"]
+    assert read.seen_value_digests == seen
+    assert read.has_more is True
+    assert read.browse_status == "continuation"
+    assert candidate_calls[0]["predicate_params"] == {"attribute_search": "rechazado"}
 
 
 def test_filter_value_cursor_candidate_budget_failure_propagates_fail_closed():

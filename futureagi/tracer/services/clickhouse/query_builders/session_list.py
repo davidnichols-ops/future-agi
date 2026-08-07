@@ -777,6 +777,43 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             for item in self.sort_params
         )
 
+    def supports_candidate_cursor_page(self) -> bool:
+        """Use the exact keyset fast path for a single positive user filter.
+
+        Cursor mode normally uses the generic bounded classifier so arbitrary
+        span predicates can publish a resumable prefix.  A user-detail page is
+        different: the view has already resolved its external ``user_id`` to a
+        positive ``end_user_id`` set, and ``_candidate_session_ctes`` can apply
+        that selective membership before reading root sessions.  Sending this
+        shape through the generic root scan makes a sparse user search replay
+        unrelated roots until its wall deadline.
+
+        Keep the exception deliberately narrow.  Negative/null user filters,
+        extra session/span predicates, and custom sorts retain the existing
+        bounded path and its semantics.
+        """
+
+        if self.sort_params or not self.supports_candidate_first_page():
+            return False
+        active_filters = [
+            item
+            for item in self.filters
+            if (item.get("column_id") or item.get("columnId"))
+            not in {"created_at", "start_time"}
+        ]
+        if len(active_filters) != 1:
+            return False
+        item = active_filters[0]
+        if (item.get("column_id") or item.get("columnId")) not in (
+            self._ENDUSER_ID_FILTER_COLS
+        ):
+            return False
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        operator = config.get("filter_op") or config.get("filterOp")
+        raw_values = config.get("filter_value", config.get("filterValue"))
+        values = raw_values if isinstance(raw_values, list) else [raw_values]
+        return operator in {"equals", "in"} and any(values)
+
     def _candidate_order_clause(self) -> str:
         if not self.sort_params:
             return "ORDER BY session_start DESC, session_id DESC"
@@ -1690,6 +1727,66 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         {order_clause}
         LIMIT %(limit)s
         OFFSET %(offset)s
+        """
+        return query, params
+
+    def build_candidate_cursor_page_query(
+        self,
+        *,
+        before_start_time: datetime | None = None,
+        before_session_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Select an exact positive-user cursor page in stable root order.
+
+        The cursor order is the same total order as the numbered default page:
+        ``(session_start DESC, session_id DESC)``.  ``remaining_count`` is
+        evaluated after the keyset predicate, so the view can reconstruct an
+        exact current total as ``seen_rows + remaining_count`` without an
+        offset scan or a second count statement.
+        """
+
+        if not self.supports_candidate_cursor_page():
+            raise ValueError("session request is not candidate-cursor safe")
+        if (before_start_time is None) != (before_session_id is None):
+            raise ValueError("session cursor keyset values must be provided together")
+
+        self.start_date, self.end_date = self.parse_time_range(self.filters)
+        params: dict[str, Any] = {
+            **self.params,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "limit": self.page_size + 1,
+        }
+        keyset_clause = ""
+        if before_start_time is not None:
+            params["cursor_before_start_us"] = _unix_microseconds(before_start_time)
+            params["cursor_before_session_id"] = str(before_session_id)
+            keyset_clause = """
+        WHERE session_start < fromUnixTimestamp64Micro(
+                  %(cursor_before_start_us)s, 'UTC'
+              )
+           OR (
+               session_start = fromUnixTimestamp64Micro(
+                   %(cursor_before_start_us)s, 'UTC'
+               )
+               AND session_id < toUUID(%(cursor_before_session_id)s)
+           )
+            """
+
+        candidate_ctes = self._candidate_session_ctes(params)
+        query = f"""
+        WITH
+        {candidate_ctes}
+        SELECT
+            session_id,
+            session_start,
+            {"project_count," if self.project_ids is not None else ""}
+            {"max(project_count) OVER() AS max_project_count," if self.project_ids is not None else ""}
+            count() OVER() AS remaining_count
+        FROM sessions
+        {keyset_clause}
+        ORDER BY session_start DESC, session_id DESC
+        LIMIT %(limit)s
         """
         return query, params
 

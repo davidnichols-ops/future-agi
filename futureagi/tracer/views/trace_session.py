@@ -2628,7 +2628,14 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             annotation_label_ids_by_project=annotation_label_ids_by_project,
             bounded_internal_scan=cursor_enabled,
         )
-        if cursor_enabled and not builder.supports_bounded_filter_scan():
+        candidate_cursor = bool(
+            cursor_enabled and builder.supports_candidate_cursor_page()
+        )
+        if (
+            cursor_enabled
+            and not candidate_cursor
+            and not builder.supports_bounded_filter_scan()
+        ):
             if cursor_state is not None:
                 raise ListCursorError(
                     "cursor_unsupported",
@@ -2649,8 +2656,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         # latest-state classification. The latter avoids the historical
         # full-window GROUP BY that timed out on high-volume tenants while
         # preserving the same newest-session page membership.
-        candidate_first = builder.supports_candidate_first_page() and not cursor_enabled
+        candidate_first = builder.supports_candidate_first_page() and (
+            not cursor_enabled or candidate_cursor
+        )
         bounded_page = None
+        candidate_cursor_has_more = False
         if not candidate_first and not builder.supports_bounded_filter_scan():
             degraded_error_code = builder.bounded_filter_degraded_error_code()
             logger.warning(
@@ -2671,15 +2681,38 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
 
         candidate_total_count: int | None = None
         if candidate_first:
-            page_query, page_params = builder.build_candidate_page_query()
+            if candidate_cursor:
+                before_start_time = (
+                    cursor_state.order[0] if cursor_state is not None else None
+                )
+                before_session_id = (
+                    str(cursor_state.order[1]) if cursor_state is not None else None
+                )
+                page_query, page_params = builder.build_candidate_cursor_page_query(
+                    before_start_time=before_start_time,
+                    before_session_id=before_session_id,
+                )
+            else:
+                page_query, page_params = builder.build_candidate_page_query()
             page_result = analytics.execute_ch_query(
                 page_query,
                 page_params,
                 timeout_ms=read_deadline.remaining_ms(SESSION_LIST_QUERY_TIMEOUT_MS),
                 settings=_page_read_settings(page_size + 1),
             )
-            page_candidates = page_result.data[:page_size]
-            if page_candidates:
+            candidate_rows = list(page_result.data or [])
+            page_candidates = candidate_rows[:page_size]
+            if candidate_cursor:
+                candidate_cursor_has_more = len(candidate_rows) > page_size
+                prior_seen_rows = (
+                    cursor_state.seen_rows if cursor_state is not None else 0
+                )
+                candidate_total_count = prior_seen_rows + (
+                    int(candidate_rows[0].get("remaining_count", 0) or 0)
+                    if candidate_rows
+                    else 0
+                )
+            elif page_candidates:
                 candidate_total_count = int(
                     page_candidates[0].get("total_count", 0) or 0
                 )
@@ -3079,7 +3112,25 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         ) + len(page_candidates)
         next_cursor = None
         cursor_has_more = False
-        if (
+        if candidate_cursor and candidate_cursor_has_more:
+            window_start, window_end = builder.parse_time_range(filters)
+            last_candidate = page_candidates[-1]
+            next_cursor = encode_list_cursor(
+                resource="observe_sessions",
+                scope=cursor_scope,
+                query=cursor_query,
+                page_size=page_size,
+                window_start=window_start,
+                window_end=window_end,
+                order=(
+                    last_candidate["session_start"],
+                    str(last_candidate["session_id"]),
+                ),
+                seen_rows=cursor_seen_rows,
+                total_rows=total_count,
+            )
+            cursor_has_more = True
+        elif (
             cursor_enabled
             and bounded_page is not None
             and (
@@ -3131,7 +3182,19 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             cursor_has_more = True
 
         metadata = {"total_rows": total_count}
-        if bounded_page is not None:
+        if candidate_cursor:
+            metadata.update(
+                {
+                    "total_rows_exact": total_count,
+                    "total_rows_is_lower_bound": False,
+                    "has_more": cursor_has_more,
+                    "next_cursor": next_cursor,
+                    "query_complete": True,
+                    "query_status": "complete",
+                    "query_error_code": None,
+                }
+            )
+        elif bounded_page is not None:
             # The selector proves page membership and whether another page
             # exists, but it may stop once that ordered prefix is proved.  Its
             # count is therefore a lower bound, not an exact full-window count.
@@ -3146,17 +3209,18 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     "query_error_code": bounded_page.error_code,
                 }
             )
-        metadata.update(
-            cursor_page_metadata(
-                enabled=cursor_enabled,
-                has_more=cursor_has_more,
-                seen_rows=cursor_seen_rows,
-                next_cursor=next_cursor,
-                unseen_row_proven=bool(
-                    bounded_page is not None and bounded_page.has_more
-                ),
+        if not candidate_cursor:
+            metadata.update(
+                cursor_page_metadata(
+                    enabled=cursor_enabled,
+                    has_more=cursor_has_more,
+                    seen_rows=cursor_seen_rows,
+                    next_cursor=next_cursor,
+                    unseen_row_proven=bool(
+                        bounded_page is not None and bounded_page.has_more
+                    ),
+                )
             )
-        )
         if export and (
             page_number != 0
             or metadata.get("total_rows_is_lower_bound")

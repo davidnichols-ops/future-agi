@@ -47,6 +47,7 @@ import {
 } from "../Helpers/evalUsageColumns";
 import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
+import { QUERY_FAILED_RETRY_MESSAGE } from "src/utils/queryReadState";
 
 // ── Main ──
 const EvalUsageTab = ({
@@ -82,12 +83,14 @@ const EvalUsageTab = ({
     data: chartData,
     isLoading: chartLoading,
     isFetching: chartFetching,
+    isError: chartError,
     refresh: refreshChart,
   } = useEvalUsageChart(templateId, period, dateOption, dateFilter);
   const {
     data: logsData,
     isLoading: logsLoading,
     isFetching: logsFetching,
+    isError: logsError,
     refresh: refreshLogs,
   } = useEvalUsageLogs(templateId, {
     page,
@@ -371,6 +374,16 @@ const EvalUsageTab = ({
             >
               {isRefreshing ? "Refreshing" : "Refresh"}
             </Button>
+            {(chartError || logsError) &&
+              (displayChartData || displayLogsData) && (
+                <Typography
+                  role="status"
+                  variant="caption"
+                  color="text.secondary"
+                >
+                  {QUERY_FAILED_RETRY_MESSAGE}
+                </Typography>
+              )}
           </Box>
           {!chartLoading && displayChartData && (
             <Box
@@ -446,7 +459,7 @@ const EvalUsageTab = ({
               }}
             >
               <Typography variant="caption" color="text.secondary">
-                Loading results…
+                {chartError ? QUERY_FAILED_RETRY_MESSAGE : "Loading results…"}
               </Typography>
               {!chartData?.queryRefreshing && (
                 <Button size="small" onClick={handleRefresh}>
@@ -553,7 +566,7 @@ const EvalUsageTab = ({
                 }}
               >
                 <Typography variant="caption" color="text.secondary">
-                  Loading results…
+                  {logsError ? QUERY_FAILED_RETRY_MESSAGE : "Loading results…"}
                 </Typography>
                 {!logsData?.queryRefreshing && (
                   <Button size="small" onClick={() => refreshLogs()}>

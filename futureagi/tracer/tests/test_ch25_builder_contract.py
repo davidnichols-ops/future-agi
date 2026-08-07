@@ -309,6 +309,26 @@ class TestListBuilderOutputContract:
                 )
             elif name == "build_filter_navigation_target_query":
                 result = method(target_id="contract-navigation-target", result_limit=2)
+            elif name == "build_candidate_cursor_page_query":
+                # This deliberately narrow fast path exists only for one
+                # positive, resolved end-user filter. Exercise its emitted SQL
+                # under that exact capability contract.
+                original_filters = builder.filters
+                builder.filters = [
+                    *original_filters,
+                    {
+                        "column_id": "end_user_id",
+                        "filter_config": {
+                            "filter_type": "text",
+                            "filter_op": "in",
+                            "filter_value": ["00000000-0000-4000-8000-000000000001"],
+                        },
+                    },
+                ]
+                try:
+                    result = method()
+                finally:
+                    builder.filters = original_filters
             elif name == "build_user_dimension_query":
                 result = method(
                     [

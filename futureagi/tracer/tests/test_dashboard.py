@@ -31,6 +31,9 @@ from tracer.serializers.dashboard import (
     DashboardQuerySerializer,
     DashboardWidgetSerializer,
 )
+from tracer.services.clickhouse.attribute_cursor_state import (
+    ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
+)
 from tracer.services.clickhouse.attribute_reads import (
     AttributeReadMetadata,
     AttributeValueCursorPageRead,
@@ -68,6 +71,7 @@ from tracer.views.dashboard import (
     _materialize_dashboard_query_scope,
     _normalize_dashboard_query_filters,
 )
+from tracer.views.span_attributes import SPAN_ATTRIBUTE_RETAINED_DATA_START
 
 
 def _attribute_value_read(
@@ -1854,6 +1858,9 @@ class TestMetricsEndpoint:
         assert first_payload["query_complete"] is True
         assert first_payload["query_status"] == "complete"
         assert "query_error_code" not in first_payload
+        first_kwargs = selector.read_value_cursor_page.call_args_list[0].kwargs
+        assert first_kwargs["window_start"] == SPAN_ATTRIBUTE_RETAINED_DATA_START
+        frozen_window_end = first_kwargs["window_end"]
 
         second = auth_client.get(
             "/tracer/dashboard/filter_values/",
@@ -1876,11 +1883,110 @@ class TestMetricsEndpoint:
         assert second_payload["next_cursor"] is None
         assert selector.read_value_cursor_page.call_count == 2
         second_kwargs = selector.read_value_cursor_page.call_args_list[1].kwargs
+        assert second_kwargs["window_start"] == SPAN_ATTRIBUTE_RETAINED_DATA_START
+        assert second_kwargs["window_end"] == frozen_window_end
         assert second_kwargs["before_identity"] == first_before
         assert second_kwargs["attribute_type"] == "string"
         assert second_kwargs["seen_value_digests"] == (
             completed_digest,
             failed_digest,
+        )
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_signed_cursor_roundtrips_after_tracking_prefix_is_full(
+        self,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        seen = tuple(
+            attribute_value_cursor_digest("string", f"prior-{index}")
+            for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS)
+        )
+        first_before = (
+            str(observe_project.id),
+            "trace-at-cap",
+            "span-at-cap",
+            now - timedelta(minutes=1),
+        )
+        second_before = (
+            str(observe_project.id),
+            "trace-after-cap",
+            "span-after-cap",
+            now - timedelta(minutes=2),
+        )
+        selector = mock_selector_cls.return_value
+        selector.read_value_cursor_page.side_effect = [
+            _attribute_value_cursor_page(
+                ("prior-4095",),
+                has_more=True,
+                next_before_identity=first_before,
+                seen_value_digests=seen,
+            ),
+            _attribute_value_cursor_page(
+                ("after-cap",),
+                has_more=True,
+                next_before_identity=second_before,
+                seen_value_digests=seen,
+            ),
+            _attribute_value_cursor_page(
+                (),
+                has_more=False,
+                seen_value_digests=seen,
+            ),
+        ]
+        params = {
+            "metric_name": "call.status",
+            "metric_type": "custom_attribute",
+            "project_ids": str(observe_project.id),
+            "source": "traces",
+            "page_size": 1,
+            "attribute_type": "string",
+        }
+
+        first = auth_client.get("/tracer/dashboard/filter_values/", params)
+        first_payload = first.json()["result"]
+        second = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {**params, "cursor": first_payload["next_cursor"]},
+        )
+        second_payload = second.json()["result"]
+        third = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {**params, "cursor": second_payload["next_cursor"]},
+        )
+        third_payload = third.json()["result"]
+
+        assert first.status_code == second.status_code == third.status_code == 200
+        assert second_payload["values"][0]["value"] == "after-cap"
+        assert second_payload["browse_status"] == "continuation"
+        assert second_payload["next_cursor"]
+        assert second_payload["next_cursor"] != first_payload["next_cursor"]
+        assert third_payload["values"] == []
+        assert third_payload["browse_status"] == "exhausted"
+        assert third_payload["next_cursor"] is None
+        assert selector.read_value_cursor_page.call_count == 3
+        assert (
+            selector.read_value_cursor_page.call_args_list[1].kwargs[
+                "seen_value_digests"
+            ]
+            == seen
+        )
+        assert (
+            selector.read_value_cursor_page.call_args_list[1].kwargs["before_identity"]
+            == first_before
+        )
+        assert (
+            selector.read_value_cursor_page.call_args_list[2].kwargs[
+                "seen_value_digests"
+            ]
+            == seen
+        )
+        assert (
+            selector.read_value_cursor_page.call_args_list[2].kwargs["before_identity"]
+            == second_before
         )
 
     @pytest.mark.django_db

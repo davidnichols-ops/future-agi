@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  AGGREGATION_POLL_MAX_ATTEMPTS,
+  AGGREGATION_POLL_TIMEOUT_MS,
   failServerSideGridRead,
   getAttributeLookupMessage,
   getAggregationPollDelay,
@@ -12,6 +14,7 @@ import {
   getQueryReadMessage,
   getQueryReadState,
   getRenderableGraphData,
+  isAggregationPollBudgetExhausted,
   QUERY_FAILED_RETRY_MESSAGE,
   QUERY_READ_RETRY_MESSAGE,
   QUERY_READ_SAMPLED_MESSAGE,
@@ -150,6 +153,30 @@ describe("queryReadState", () => {
     expect([0, 1, 2, 3, 99].map(getAggregationPollDelay)).toEqual([
       1000, 2000, 4000, 8000, 8000,
     ]);
+  });
+
+  it("bounds exact aggregation polling by both attempts and elapsed time", () => {
+    expect(
+      isAggregationPollBudgetExhausted({
+        attempt: AGGREGATION_POLL_MAX_ATTEMPTS - 1,
+        startedAt: 1000,
+        now: 1000 + AGGREGATION_POLL_TIMEOUT_MS - 1,
+      }),
+    ).toBe(false);
+    expect(
+      isAggregationPollBudgetExhausted({
+        attempt: AGGREGATION_POLL_MAX_ATTEMPTS,
+        startedAt: 1000,
+        now: 1001,
+      }),
+    ).toBe(true);
+    expect(
+      isAggregationPollBudgetExhausted({
+        attempt: 1,
+        startedAt: 1000,
+        now: 1000 + AGGREGATION_POLL_TIMEOUT_MS,
+      }),
+    ).toBe(true);
   });
 
   it("recognizes explicit complete metadata", () => {

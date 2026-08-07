@@ -3332,7 +3332,11 @@ class AttributeReadSelector:
         the next physical key and digests of values already emitted, so later
         pages neither repeat options nor trust client state. Each page resolves
         current state independently because ClickHouse 25.3 cannot preserve a
-        historical ReplacingMergeTree snapshot after background merges.
+        historical ReplacingMergeTree snapshot after background merges. The
+        server tracks an exact finite de-duplication prefix; after that prefix
+        is full, later pages can repeat a typed value and consumers merge it.
+        Physical keyset progress remains monotonic, so the bound never becomes
+        a retained-value ceiling.
 
         Each returned page is exact for its ordered continuation prefix.  A
         finite per-request scan budget yields another continuation rather than
@@ -3425,28 +3429,17 @@ class AttributeReadSelector:
         ):
             raise ValueError("invalid filter-value seen-value state")
         seen_set = set(seen)
-        publication_budget = ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - len(seen)
-        if publication_budget < 0:
+        tracked_value_budget = ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - len(seen)
+        if tracked_value_budget < 0:
             raise ValueError("invalid filter-value seen-value state")
-        effective_page_size = min(page_size, publication_budget)
-        if effective_page_size == 0:
-            return AttributeValueCursorPageRead(
-                (),
-                self._metadata(
-                    complete=True,
-                    error_code=None,
-                    window_start=start,
-                    window_end=end,
-                    query_count=self._query_count,
-                ),
-                False,
-                current_segment_end,
-                before_identity,
-                resume_identity,
-                int(resume_member_offset),
-                seen,
-                "limit_reached",
-            )
+        # The server-side digest log is an exact de-duplication prefix, not a
+        # vocabulary ceiling.  Once it is full, keep walking the frozen
+        # physical keyset and publishing verified values. Values discovered
+        # after the tracked prefix may repeat on a later page; API consumers
+        # merge them by typed value while the physical cursor guarantees
+        # deterministic forward progress and makes every retained value
+        # reachable without growing cursor/cache state without bound.
+        effective_page_size = page_size
         emitted_digests: list[str] = []
         emitted: dict[str, AttributeValueRow] = {}
         needle = normalized_search.casefold()
@@ -3777,14 +3770,10 @@ class AttributeReadSelector:
             )
 
         exhausted = current_segment_end <= start and next_resume_identity is None
-        seen_after = (*seen, *emitted_digests)
-        limit_reached = len(seen_after) >= ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
+        tracked_emitted_digests = emitted_digests[:tracked_value_budget]
+        seen_after = (*seen, *tracked_emitted_digests)
         browse_status: AttributeValueBrowseStatus = (
-            "limit_reached"
-            if limit_reached
-            else "exhausted"
-            if exhausted
-            else "continuation"
+            "exhausted" if exhausted else "continuation"
         )
         has_more = browse_status == "continuation"
         # A list page is exact even while a later continuation exists.  This is

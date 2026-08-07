@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
@@ -92,6 +92,7 @@ from tracer.services.exact_aggregation_cache import (
     read_or_schedule_exact_snapshot,
 )
 from tracer.utils.workspace_scope import project_queryset_for_request
+from tracer.views.span_attributes import SPAN_ATTRIBUTE_RETAINED_DATA_START
 
 logger = structlog.get_logger(__name__)
 
@@ -242,6 +243,154 @@ DASHBOARD_FILTER_OP_TO_INTERNAL = {
     "is_not_null": "is_set",
     "is_null": "is_not_set",
 }
+
+DASHBOARD_INTERNAL_FILTER_OP_TO_API = {
+    internal_op: api_op
+    for api_op, internal_op in DASHBOARD_FILTER_OP_TO_INTERNAL.items()
+}
+
+DASHBOARD_METRIC_TYPE_TO_FILTER_COL_TYPE = {
+    metric_type: col_type
+    for col_type, metric_type in DASHBOARD_FILTER_COL_TYPE_TO_METRIC_TYPE.items()
+}
+
+_DASHBOARD_CANONICAL_FILTER_KEYS = {
+    "column_id",
+    "display_name",
+    "source",
+    "output_type",
+    "filter_config",
+}
+_DASHBOARD_NUMERIC_FILTER_OPS = {
+    "greater_than",
+    "greater_than_or_equal",
+    "less_than",
+    "less_than_or_equal",
+    "between",
+    "not_between",
+}
+_DASHBOARD_LEGACY_NUMERIC_FILTER_OPS = {
+    "is_numeric": ("not_equals", 0),
+    "is_not_numeric": ("equals", 0),
+}
+
+
+def _legacy_dashboard_filter_type(filter_item, filter_op):
+    """Infer the canonical validation type without changing legacy semantics."""
+
+    raw_type = str(
+        filter_item.get("attribute_type")
+        or filter_item.get("data_type")
+        or filter_item.get("filter_type")
+        or ""
+    ).lower()
+    type_aliases = {
+        "string": "text",
+        "str": "text",
+        "float": "number",
+        "integer": "number",
+        "int": "number",
+        "date": "datetime",
+        "object": "map",
+        "json": "map" if isinstance(filter_item.get("value"), dict) else "array",
+        "list": "array",
+    }
+    if raw_type:
+        return type_aliases.get(raw_type, raw_type)
+    if isinstance(filter_item.get("value"), bool):
+        return "boolean"
+    if filter_op in _DASHBOARD_NUMERIC_FILTER_OPS:
+        return "number"
+    return "text"
+
+
+def _canonicalize_persisted_dashboard_filter_for_read(filter_item):
+    """Return one canonical filter from either current or legacy storage.
+
+    Dashboard widgets created before the canonical filter contract persisted
+    the query builder's flattened ``metric_name``/``operator``/``value``
+    shape.  Writes remain strict; this adapter exists only on the widget read
+    path so those immutable historical configs can still be executed.
+    """
+
+    if not isinstance(filter_item, dict):
+        return filter_item
+
+    config = filter_item.get("filter_config")
+    if "column_id" in filter_item and isinstance(config, dict):
+        return {**filter_item, "filter_config": dict(config)}
+
+    canonical_filter = filter_item.get("canonical_filter")
+    if isinstance(canonical_filter, dict):
+        restored = {
+            key: value
+            for key, value in canonical_filter.items()
+            if key in _DASHBOARD_CANONICAL_FILTER_KEYS
+        }
+        canonical_config = restored.get("filter_config")
+        if isinstance(canonical_config, dict):
+            restored["filter_config"] = dict(canonical_config)
+        return restored
+
+    column_id = filter_item.get("metric_name")
+    operator = filter_item.get("operator")
+    metric_type = filter_item.get("metric_type") or "system_metric"
+    col_type = DASHBOARD_METRIC_TYPE_TO_FILTER_COL_TYPE.get(metric_type)
+    if not column_id or not operator or not col_type:
+        # Let the strict serializer reject unknown/malformed historical data;
+        # its details are sanitized by the caller before crossing the API.
+        return filter_item
+
+    legacy_numeric_op = _DASHBOARD_LEGACY_NUMERIC_FILTER_OPS.get(operator)
+    if legacy_numeric_op:
+        filter_op, filter_value = legacy_numeric_op
+        filter_type = "number"
+    else:
+        filter_op = DASHBOARD_INTERNAL_FILTER_OP_TO_API.get(operator, operator)
+        filter_value = filter_item.get("value")
+        filter_type = _legacy_dashboard_filter_type(filter_item, filter_op)
+    if filter_op in {"in", "not_in"} and not isinstance(filter_value, list):
+        filter_value = [filter_value]
+
+    canonical_config = {
+        "filter_type": filter_type,
+        "filter_op": filter_op,
+        "filter_value": filter_value,
+        "col_type": col_type,
+    }
+    restored = {
+        "column_id": column_id,
+        "filter_config": canonical_config,
+    }
+    for key in ("display_name", "source", "output_type"):
+        if filter_item.get(key) is not None:
+            restored[key] = filter_item[key]
+    return restored
+
+
+def _canonicalize_persisted_dashboard_query_filters_for_read(query_config):
+    """Canonicalize saved filters in memory; never mutate the stored JSON."""
+
+    if not isinstance(query_config, dict):
+        return query_config
+    restored = dict(query_config)
+    restored["filters"] = [
+        _canonicalize_persisted_dashboard_filter_for_read(filter_item)
+        for filter_item in query_config.get("filters", [])
+    ]
+    metrics = []
+    for metric in query_config.get("metrics", []):
+        if not isinstance(metric, dict):
+            metrics.append(metric)
+            continue
+        metric_copy = dict(metric)
+        metric_copy["filters"] = [
+            _canonicalize_persisted_dashboard_filter_for_read(filter_item)
+            for filter_item in metric.get("filters", [])
+        ]
+        metrics.append(metric_copy)
+    restored["metrics"] = metrics
+    return restored
 
 
 def _dashboard_filter_to_internal(filter_item):
@@ -1529,7 +1678,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             window_end = cursor_state.window_end
                         else:
                             window_end = datetime.now(UTC)
-                            window_start = window_end - timedelta(days=365)
+                            window_start = SPAN_ATTRIBUTE_RETAINED_DATA_START
                             segment_end = window_end
                             before_identity = None
                             resume_identity = None
@@ -2192,9 +2341,16 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
 
         Routes each metric to the appropriate builder based on source.
         """
-        serializer = DashboardQuerySerializer(data=query_config)
+        read_query_config = _canonicalize_persisted_dashboard_query_filters_for_read(
+            query_config
+        )
+        serializer = DashboardQuerySerializer(data=read_query_config)
         if not serializer.is_valid():
-            return self._gm.bad_request(f"Invalid query config: {serializer.errors}")
+            logger.warning(
+                "dashboard_widget_query_config_invalid",
+                invalid_fields=sorted(serializer.errors),
+            )
+            return self._gm.bad_request("Dashboard query configuration is invalid.")
         query_config = _normalize_dashboard_query_filters(serializer.validated_data)
         query_config["allow_sampled"] = False
 

@@ -276,6 +276,65 @@ export function getAggregationRefreshState(payload) {
 }
 
 const AGGREGATION_POLL_DELAYS_MS = [1000, 2000, 4000, 8000];
+export const AGGREGATION_POLL_MAX_ATTEMPTS = 12;
+export const AGGREGATION_POLL_TIMEOUT_MS = 60_000;
+
+const aggregationRequestError = (code) => {
+  const error = new Error("Exact aggregation request did not complete");
+  error.code = code;
+  return error;
+};
+
+/**
+ * Bound one transport attempt independently of the server-side polling
+ * contract. Promise callbacks that arrive after the deadline (or after the
+ * caller moved to a new request generation) are deliberately discarded.
+ */
+export function awaitAggregationRequestWithDeadline(
+  request,
+  { timeoutMs, isCurrent = () => true, onTimeout = () => {} } = {},
+) {
+  const deadlineMs = Math.max(Number(timeoutMs) || 0, 0);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      globalThis.clearTimeout(timer);
+      callback(value);
+    };
+    const timer = globalThis.setTimeout(() => {
+      if (settled) return;
+      if (isCurrent()) onTimeout();
+      finish(reject, aggregationRequestError("aggregation_request_timeout"));
+    }, deadlineMs);
+
+    Promise.resolve(request).then(
+      (response) => {
+        if (settled) return;
+        if (!isCurrent()) {
+          finish(
+            reject,
+            aggregationRequestError("aggregation_request_superseded"),
+          );
+          return;
+        }
+        finish(resolve, response);
+      },
+      (error) => {
+        if (!isCurrent()) {
+          finish(
+            reject,
+            aggregationRequestError("aggregation_request_superseded"),
+          );
+          return;
+        }
+        finish(reject, error);
+      },
+    );
+  });
+}
 
 /** Exponential polling cadence capped at eight seconds. */
 export function getAggregationPollDelay(attempt = 0) {
@@ -284,6 +343,26 @@ export function getAggregationPollDelay(attempt = 0) {
     AGGREGATION_POLL_DELAYS_MS.length - 1,
   );
   return AGGREGATION_POLL_DELAYS_MS[index];
+}
+
+/**
+ * Exact snapshot jobs are allowed to queue, but the browser must never poll a
+ * stuck job forever. The elapsed limit covers slow/failing transports while
+ * the attempt limit also bounds unexpectedly fast response loops.
+ */
+export function isAggregationPollBudgetExhausted({
+  attempt = 0,
+  startedAt,
+  now = Date.now(),
+} = {}) {
+  const attempts = Number.isInteger(attempt) ? Math.max(attempt, 0) : 0;
+  const elapsed = Number.isFinite(startedAt)
+    ? Math.max(Number(now) - startedAt, 0)
+    : 0;
+  return (
+    attempts >= AGGREGATION_POLL_MAX_ATTEMPTS ||
+    elapsed >= AGGREGATION_POLL_TIMEOUT_MS
+  );
 }
 
 export function getQueryReadMessage(state) {

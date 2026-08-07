@@ -786,6 +786,188 @@ def test_tampered_session_cursor_fails_closed_before_clickhouse_read():
 
 
 @pytest.mark.unit
+def test_positive_user_cursor_uses_exact_keyset_pages_without_duplicates():
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    project_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+    newest_id = str(uuid.uuid4())
+    oldest_id = str(uuid.uuid4())
+    newest_start = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
+    oldest_start = newest_start - timedelta(minutes=1)
+    window_start = newest_start - timedelta(days=30)
+    window_end = newest_start + timedelta(days=1)
+
+    builder = mock.MagicMock()
+    builder.supports_candidate_first_page.return_value = True
+    builder.supports_candidate_cursor_page.return_value = True
+    builder.supports_bounded_filter_scan.return_value = True
+    builder.parse_time_range.return_value = (window_start, window_end)
+    builder.build_candidate_cursor_page_query.side_effect = [
+        ("candidate cursor first", {}),
+        ("candidate cursor next", {}),
+    ]
+    builder.build_page_metrics_query.side_effect = lambda ids: (
+        "page metrics",
+        {"ids": tuple(ids)},
+    )
+    builder.build_content_query.side_effect = lambda ids: (
+        "page content",
+        {"ids": tuple(ids)},
+    )
+    builder.build_span_attributes_query.return_value = ("page attributes", {})
+    builder.format_sessions.side_effect = lambda rows, columns: [
+        dict(zip(columns, row, strict=True)) for row in rows
+    ]
+    analytics = mock.MagicMock()
+
+    def _metrics_row(session_id: str, start_time: datetime) -> dict:
+        return {
+            "session_id": session_id,
+            "session_start": start_time,
+            "session_end": start_time,
+            "duration": 0,
+            "total_cost": 0,
+            "total_tokens": 0,
+            "traces_count": 1,
+        }
+
+    starts = {newest_id: newest_start, oldest_id: oldest_start}
+
+    def _execute(query, params, **_kwargs):
+        if query == "candidate cursor first":
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": newest_id,
+                        "session_start": newest_start,
+                        "remaining_count": 2,
+                    },
+                    {
+                        "session_id": oldest_id,
+                        "session_start": oldest_start,
+                        "remaining_count": 2,
+                    },
+                ]
+            )
+        if query == "candidate cursor next":
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": oldest_id,
+                        "session_start": oldest_start,
+                        "remaining_count": 1,
+                    }
+                ]
+            )
+        if query == "page metrics":
+            return SimpleNamespace(
+                data=[_metrics_row(sid, starts[sid]) for sid in params["ids"]]
+            )
+        if query == "page content":
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": sid,
+                        "first_message": f"first-{sid}",
+                        "last_message": f"last-{sid}",
+                    }
+                    for sid in params["ids"]
+                ]
+            )
+        if query == "page attributes":
+            return SimpleNamespace(data=[])
+        raise AssertionError(f"unexpected ClickHouse query: {query}")
+
+    analytics.execute_ch_query.side_effect = _execute
+    view._fetch_session_names = mock.MagicMock(return_value={})
+    view._fetch_end_user_info = mock.MagicMock(return_value={})
+    validated_data = {
+        "filters": [
+            {
+                "column_id": "end_user_id",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": [user_id],
+                },
+            }
+        ],
+        "sort_params": [],
+        "page_number": 0,
+        "page_size": 1,
+        "cursor_mode": True,
+    }
+
+    with (
+        mock.patch(
+            "tracer.views.trace_session.SessionListQueryBuilderV2",
+            return_value=builder,
+        ),
+        mock.patch(
+            "tracer.views.trace_session.read_bounded_filter_page"
+        ) as bounded_read,
+        mock.patch(
+            "tracer.views.trace_session.AnnotationsLabels.objects.filter",
+            return_value=[],
+        ),
+    ):
+        first_status, first_payload = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=project_id,
+            project=None,
+            analytics=analytics,
+            validated_data=validated_data,
+        )
+        cursor = first_payload["metadata"]["next_cursor"]
+        second_status, second_payload = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=project_id,
+            project=None,
+            analytics=analytics,
+            validated_data={**validated_data, "cursor": cursor},
+        )
+
+    assert first_status == second_status == "ok"
+    assert [row["session_id"] for row in first_payload["table"]] == [newest_id]
+    assert [row["session_id"] for row in second_payload["table"]] == [oldest_id]
+    assert first_payload["metadata"] == {
+        "total_rows": 2,
+        "total_rows_exact": 2,
+        "total_rows_is_lower_bound": False,
+        "has_more": True,
+        "next_cursor": cursor,
+        "query_complete": True,
+        "query_status": "complete",
+        "query_error_code": None,
+    }
+    assert second_payload["metadata"] == {
+        "total_rows": 2,
+        "total_rows_exact": 2,
+        "total_rows_is_lower_bound": False,
+        "has_more": False,
+        "next_cursor": None,
+        "query_complete": True,
+        "query_status": "complete",
+        "query_error_code": None,
+    }
+    bounded_read.assert_not_called()
+    first_call, second_call = builder.build_candidate_cursor_page_query.call_args_list
+    assert first_call.kwargs == {
+        "before_start_time": None,
+        "before_session_id": None,
+    }
+    assert second_call.kwargs == {
+        "before_start_time": newest_start,
+        "before_session_id": newest_id,
+    }
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "membership_filter", [_attribute_filter(), _has_eval_filter(False)]
 )
@@ -804,6 +986,7 @@ def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
 
     builder = mock.MagicMock()
     builder.supports_candidate_first_page.return_value = True
+    builder.supports_candidate_cursor_page.return_value = False
     builder.supports_bounded_filter_scan.return_value = True
     builder.recommended_filter_classify_batch_size.return_value = 50
     builder.parse_time_range.return_value = (window_start, window_end)

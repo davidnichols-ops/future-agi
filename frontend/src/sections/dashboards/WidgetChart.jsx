@@ -23,11 +23,15 @@ import {
 } from "./widgetUtils";
 import { toTimeRangePayload } from "./dashboardDateRange";
 import {
+  AGGREGATION_POLL_MAX_ATTEMPTS,
+  AGGREGATION_POLL_TIMEOUT_MS,
   AGGREGATION_PREPARING_MESSAGE,
+  QUERY_FAILED_RETRY_MESSAGE,
   getAggregationPollDelay,
   getAggregationRefreshState,
   getExactAggregationReadState,
   getQueryCompletedAt,
+  isAggregationPollBudgetExhausted,
 } from "src/utils/queryReadState";
 
 const CHART_HEIGHT_FALLBACK = 280;
@@ -91,8 +95,8 @@ function getApexType(chartType) {
   return map[chartType] || "line";
 }
 
-function QueryReadStatus({ unavailable, hasSnapshot }) {
-  if (!unavailable || hasSnapshot) return null;
+function QueryReadStatus({ unavailable, hasSnapshot, retryUnavailable }) {
+  if (!unavailable || (hasSnapshot && !retryUnavailable)) return null;
 
   return (
     <Typography
@@ -101,7 +105,9 @@ function QueryReadStatus({ unavailable, hasSnapshot }) {
       color="text.secondary"
       sx={{ width: "100%", px: 1, pt: 0.5, textAlign: "center" }}
     >
-      {AGGREGATION_PREPARING_MESSAGE}
+      {retryUnavailable
+        ? QUERY_FAILED_RETRY_MESSAGE
+        : AGGREGATION_PREPARING_MESSAGE}
     </Typography>
   );
 }
@@ -109,6 +115,7 @@ function QueryReadStatus({ unavailable, hasSnapshot }) {
 QueryReadStatus.propTypes = {
   unavailable: PropTypes.bool,
   hasSnapshot: PropTypes.bool,
+  retryUnavailable: PropTypes.bool,
 };
 
 const getExactDashboardSnapshot = (response, signature) => {
@@ -195,6 +202,7 @@ export default function WidgetChart({
   const [latestOutcome, setLatestOutcome] = useState(() => ({
     signature: querySignature,
     unavailable: Boolean(queryMutation.data && !initialSnapshot),
+    retryUnavailable: false,
   }));
   const previousSignatureRef = useRef(null);
   const previousRefreshRequestRef = useRef(refreshRequestId);
@@ -211,11 +219,23 @@ export default function WidgetChart({
     previousRefreshRequestRef.current = refreshRequestId;
     let active = true;
     let pollTimer = null;
+    let deadlineTimer = null;
     let pollAttempt = 0;
+    const pollStartedAt = Date.now();
     let refreshWasQueued = false;
+    let settled = false;
 
     const settle = (snapshot, exact) => {
-      if (!active) return;
+      if (!active || settled) return;
+      settled = true;
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+      if (deadlineTimer !== null) {
+        window.clearTimeout(deadlineTimer);
+        deadlineTimer = null;
+      }
       onQuerySettledRef.current?.({
         dashboardId,
         widgetId: widget.id,
@@ -226,12 +246,48 @@ export default function WidgetChart({
       });
     };
 
+    const stopPendingPoll = () => {
+      if (!active || settled) return;
+      setLatestOutcome({
+        signature: querySignature,
+        unavailable: true,
+        retryUnavailable: true,
+      });
+      settle(null, false);
+    };
+
     const schedulePoll = () => {
       if (!active || pollTimer !== null) return;
-      const delay = getAggregationPollDelay(pollAttempt);
-      pollAttempt += 1;
+      if (
+        isAggregationPollBudgetExhausted({
+          attempt: pollAttempt,
+          startedAt: pollStartedAt,
+        })
+      ) {
+        stopPendingPoll();
+        return;
+      }
+      const remaining = Math.max(
+        AGGREGATION_POLL_TIMEOUT_MS - (Date.now() - pollStartedAt),
+        0,
+      );
+      const delay = Math.min(getAggregationPollDelay(pollAttempt), remaining);
       pollTimer = window.setTimeout(() => {
         pollTimer = null;
+        if (
+          isAggregationPollBudgetExhausted({
+            attempt: pollAttempt,
+            startedAt: pollStartedAt,
+          })
+        ) {
+          stopPendingPoll();
+          return;
+        }
+        pollAttempt += 1;
+        if (pollAttempt > AGGREGATION_POLL_MAX_ATTEMPTS) {
+          stopPendingPoll();
+          return;
+        }
         executeQuery(false);
       }, delay);
     };
@@ -241,7 +297,7 @@ export default function WidgetChart({
         { queryConfig, refresh },
         {
           onSuccess: (response) => {
-            if (!active) return;
+            if (!active || settled) return;
             const snapshot = getExactDashboardSnapshot(
               response,
               querySignature,
@@ -250,44 +306,81 @@ export default function WidgetChart({
               getAggregationRefreshState(response);
             const readState = getExactAggregationReadState(response);
             if (snapshot) setLastExactSnapshot(snapshot);
-            setLatestOutcome({
-              signature: querySignature,
-              unavailable: !snapshot,
-            });
 
             if (
               isRefreshing &&
               !refreshFailed &&
               (snapshot || readState === "pending")
             ) {
+              setLatestOutcome({
+                signature: querySignature,
+                unavailable: !snapshot,
+                retryUnavailable: false,
+              });
               refreshWasQueued = true;
               schedulePoll();
               return;
             }
             if (refreshFailed) {
+              setLatestOutcome({
+                signature: querySignature,
+                unavailable: true,
+                retryUnavailable: true,
+              });
               settle(snapshot, false);
               return;
             }
-            settle(snapshot, Boolean(snapshot));
+            if (snapshot) {
+              setLatestOutcome({
+                signature: querySignature,
+                unavailable: false,
+                retryUnavailable: false,
+              });
+              settle(snapshot, true);
+              return;
+            }
+            // Sampled, degraded, unmarked and otherwise malformed terminal
+            // bodies are failures, not long-running exact work. Keep any
+            // prior exact snapshot visible and offer one finite retry state.
+            setLatestOutcome({
+              signature: querySignature,
+              unavailable: true,
+              retryUnavailable: true,
+            });
+            settle(null, false);
           },
           onError: () => {
-            if (!active) return;
-            setLatestOutcome({ signature: querySignature, unavailable: true });
+            if (!active || settled) return;
             if (refreshWasQueued) {
+              setLatestOutcome({
+                signature: querySignature,
+                unavailable: true,
+                retryUnavailable: false,
+              });
               schedulePoll();
               return;
             }
+            setLatestOutcome({
+              signature: querySignature,
+              unavailable: true,
+              retryUnavailable: true,
+            });
             settle(null, false);
           },
         },
       );
     };
 
+    deadlineTimer = window.setTimeout(
+      stopPendingPoll,
+      AGGREGATION_POLL_TIMEOUT_MS,
+    );
     executeQuery(isManualRefresh);
 
     return () => {
       active = false;
       if (pollTimer !== null) window.clearTimeout(pollTimer);
+      if (deadlineTimer !== null) window.clearTimeout(deadlineTimer);
     };
   }, [
     mutateDashboardQuery,
@@ -314,6 +407,9 @@ export default function WidgetChart({
     awaitingFirstExactResult ||
     (latestOutcome.signature === querySignature && latestOutcome.unavailable) ||
     (queryMutation.isError && !queryMutation.isPending);
+  const retryUnavailable =
+    latestOutcome.signature === querySignature &&
+    latestOutcome.retryUnavailable === true;
 
   // Auto-select top 10 series by total value when there are many breakdown series
   const MAX_CHART_SERIES = 10;
@@ -487,6 +583,7 @@ export default function WidgetChart({
         <QueryReadStatus
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
+          retryUnavailable={retryUnavailable}
         />
         {!readUnavailable && (
           <Typography variant="body2" color="text.disabled">
@@ -515,6 +612,7 @@ export default function WidgetChart({
         <QueryReadStatus
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
+          retryUnavailable={retryUnavailable}
         />
         <Typography variant="body2" color="text.disabled">
           {NO_DATA_FOR_RANGE_MESSAGE}
@@ -539,6 +637,7 @@ export default function WidgetChart({
         <QueryReadStatus
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
+          retryUnavailable={retryUnavailable}
         />
         <Stack
           direction="row"
@@ -594,6 +693,7 @@ export default function WidgetChart({
         <QueryReadStatus
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
+          retryUnavailable={retryUnavailable}
         />
         <table
           style={{
@@ -814,6 +914,7 @@ export default function WidgetChart({
         <QueryReadStatus
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
+          retryUnavailable={retryUnavailable}
         />
         {pieLegendNames.length > 1 && (
           <ChartLegend items={pieLegendNames} colors={COLORS} />
@@ -911,6 +1012,7 @@ export default function WidgetChart({
         <QueryReadStatus
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
+          retryUnavailable={retryUnavailable}
         />
         {/* Legend */}
         <Stack
@@ -1088,6 +1190,7 @@ export default function WidgetChart({
         <QueryReadStatus
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
+          retryUnavailable={retryUnavailable}
         />
         <Alert severity="warning" sx={{ width: "100%" }}>
           {outOfRangeWarning}
@@ -1445,6 +1548,7 @@ export default function WidgetChart({
       <QueryReadStatus
         unavailable={readUnavailable}
         hasSnapshot={Boolean(exactSnapshot)}
+        retryUnavailable={retryUnavailable}
       />
       {legendNames.length > 1 && (
         <ChartLegend

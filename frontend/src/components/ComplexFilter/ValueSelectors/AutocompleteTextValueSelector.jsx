@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import PropTypes from "prop-types";
 import { Autocomplete, TextField, CircularProgress } from "@mui/material";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import { useDebounce } from "src/hooks/use-debounce";
 import { useParams } from "react-router-dom";
@@ -14,6 +14,35 @@ import { followEmptyListContinuations } from "src/sections/projects/LLMTracing/l
 const LOAD_MORE_OPTION = Object.freeze({ __loadMore: true });
 const RETRY_OPTION = Object.freeze({ __retry: true });
 const LIST_OPERATORS = new Set(LIST_FILTER_OPS);
+const TERMINAL_BROWSE_STATUSES = new Set(["exhausted", "limit_reached"]);
+const EMPTY_CONTINUATION_GUARD_EXHAUSTED = "empty_continuation_guard_exhausted";
+const FOLLOWED_CURSORS_KEY = "followed_value_cursors";
+
+const normalizeBrowseMetadata = (result = {}) =>
+  TERMINAL_BROWSE_STATUSES.has(result?.browse_status)
+    ? { ...result, has_more: false, next_cursor: null }
+    : result;
+
+const hasEmptyContinuation = (response) => {
+  const result = normalizeBrowseMetadata(response?.data?.result || {});
+  return (
+    (result.values || []).length === 0 &&
+    result.has_more === true &&
+    typeof result.next_cursor === "string" &&
+    result.next_cursor.length > 0
+  );
+};
+
+const markEmptyContinuationGuardExhausted = (response) => ({
+  ...response,
+  data: {
+    ...response?.data,
+    result: {
+      ...response?.data?.result,
+      [EMPTY_CONTINUATION_GUARD_EXHAUSTED]: true,
+    },
+  },
+});
 
 const isPaginationOption = (option) =>
   option === LOAD_MORE_OPTION || option === RETRY_OPTION;
@@ -30,6 +59,9 @@ const optionStorageType = (option) => {
   if (typeof value === "boolean") return "boolean";
   return "string";
 };
+
+const optionIdentity = (option) =>
+  `${optionStorageType(option)}:${JSON.stringify(optionValue(option))}`;
 
 const storageTypeToFilterType = (type) => {
   if (type === "number") return "number";
@@ -58,6 +90,7 @@ const AutocompleteTextValueSelector = ({
   // the strings "42"/"false" and silently change ClickHouse storage family.
   const freeTextDirtyRef = useRef(false);
   const debouncedInput = useDebounce(inputValue, 300);
+  const queryClient = useQueryClient();
   const { observeId, id } = useParams();
   const projectId = projectIdProp || observeId || id;
   const definitionFilterType = definition?.filterType?.type || definition?.type;
@@ -69,6 +102,13 @@ const AutocompleteTextValueSelector = ({
       ? normalizeAttributeType(definitionFilterType)
       : undefined;
 
+  const queryKey = [
+    "span-attribute-values",
+    projectId,
+    definition?.propertyId,
+    attributeType || "all-types",
+    debouncedInput,
+  ];
   const {
     data,
     isLoading,
@@ -80,13 +120,7 @@ const AutocompleteTextValueSelector = ({
     isFetchNextPageError,
     refetch,
   } = useInfiniteQuery({
-    queryKey: [
-      "span-attribute-values",
-      projectId,
-      definition?.propertyId,
-      attributeType || "all-types",
-      debouncedInput,
-    ],
+    queryKey,
     queryFn: async ({ signal, pageParam }) => {
       const requestPage = (cursor) =>
         axios.get(endpoints.dashboard.filterValues, {
@@ -102,24 +136,83 @@ const AutocompleteTextValueSelector = ({
             ...(cursor ? { cursor } : {}),
           },
         });
+      const cachedData = queryClient.getQueryData(queryKey);
+      const cachedPages = cachedData?.pages || [];
+      const knownValueIdentities = new Set(
+        cachedPages.flatMap((page) =>
+          (page?.data?.result?.values || []).map(optionIdentity),
+        ),
+      );
+      const followedCursors = new Set(
+        [
+          ...(cachedData?.pageParams || []),
+          ...cachedPages.flatMap(
+            (page) => page?.data?.result?.[FOLLOWED_CURSORS_KEY] || [],
+          ),
+          pageParam,
+        ].filter((cursor) => typeof cursor === "string" && cursor.length > 0),
+      );
       const initialResponse = await requestPage(pageParam);
       // The shared guard follows at most 12 empty checkpoints per UI action.
       // Its 30-second elapsed check is deliberately soft and runs between
       // completed requests; cancellation of an in-flight request remains the
       // responsibility of the query's AbortSignal/HTTP client.
-      return followEmptyListContinuations({
+      const response = await followEmptyListContinuations({
         initialResponse,
-        rowsFromResponse: (response) => response?.data?.result?.values || [],
-        metadataFromResponse: (response) => response?.data?.result || {},
+        rowsFromResponse: (response) =>
+          (response?.data?.result?.values || []).filter((option) => {
+            const identity = optionIdentity(option);
+            if (knownValueIdentities.has(identity)) return false;
+            knownValueIdentities.add(identity);
+            return true;
+          }),
+        metadataFromResponse: (response) =>
+          normalizeBrowseMetadata(response?.data?.result || {}),
         nextResponse: requestPage,
+        onContinuation: (metadata) => {
+          if (metadata?.next_cursor) {
+            followedCursors.add(metadata.next_cursor);
+          }
+        },
         isCurrent: () => !signal.aborted,
       });
+      // A sparse exact lookup can need more checkpoints than one browser
+      // action may safely fan out. Keep the signed cursor as the next page,
+      // but mark the action as bounded so the picker offers a retry instead
+      // of exposing an empty transport page as ordinary pagination.
+      const boundedResponse = hasEmptyContinuation(response)
+        ? markEmptyContinuationGuardExhausted(response)
+        : response;
+      return {
+        ...boundedResponse,
+        data: {
+          ...boundedResponse?.data,
+          result: {
+            ...boundedResponse?.data?.result,
+            [FOLLOWED_CURSORS_KEY]: [...followedCursors],
+          },
+        },
+      };
     },
     initialPageParam: null,
-    getNextPageParam: (lastPage) =>
-      lastPage?.data?.result?.has_more && lastPage?.data?.result?.next_cursor
-        ? lastPage.data.result.next_cursor
-        : undefined,
+    getNextPageParam: (lastPage, allPages, lastPageParam, allPageParams) => {
+      const result = normalizeBrowseMetadata(lastPage?.data?.result || {});
+      const nextCursor = result.has_more === true ? result.next_cursor : null;
+      if (!nextCursor) return undefined;
+      const requestedCursors = new Set(
+        (allPageParams || []).filter(
+          (cursor) => typeof cursor === "string" && cursor.length > 0,
+        ),
+      );
+      for (const page of allPages || []) {
+        for (const cursor of page?.data?.result?.[FOLLOWED_CURSORS_KEY] || []) {
+          requestedCursors.add(cursor);
+        }
+      }
+      return nextCursor === lastPageParam || requestedCursors.has(nextCursor)
+        ? undefined
+        : nextCursor;
+    },
     enabled: Boolean(projectId) && Boolean(definition?.propertyId),
     staleTime: 30000,
     retry: false,
@@ -130,11 +223,14 @@ const AutocompleteTextValueSelector = ({
     (page?.data?.result?.values || []).flatMap((item) => {
       const value = optionValue(item);
       const type = optionStorageType(item);
-      const key = `${type}:${JSON.stringify(value)}`;
+      const key = optionIdentity(item);
       if (seen.has(key)) return [];
       seen.add(key);
       return [{ value, type }];
     }),
+  );
+  const continuationGuardExhausted = Boolean(
+    data?.pages?.at(-1)?.data?.result?.[EMPTY_CONTINUATION_GUARD_EXHAUSTED],
   );
   const pickerOptions = hasNextPage
     ? [...options, LOAD_MORE_OPTION]
@@ -217,7 +313,7 @@ const AutocompleteTextValueSelector = ({
       filterOptions={(availableOptions) => availableOptions}
       getOptionLabel={(option) => {
         if (option === LOAD_MORE_OPTION) {
-          return isFetchNextPageError
+          return isFetchNextPageError || continuationGuardExhausted
             ? "Retry loading values"
             : "Load more values";
         }
@@ -250,7 +346,7 @@ const AutocompleteTextValueSelector = ({
                 : "Retry loading values"
               : isFetchingNextPage
                 ? "Loading more values…"
-                : isFetchNextPageError
+                : isFetchNextPageError || continuationGuardExhausted
                   ? "Retry loading values"
                   : "Load more values"}
           </li>

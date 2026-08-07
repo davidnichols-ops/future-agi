@@ -4,7 +4,6 @@ import React, {
   useEffect,
   useImperativeHandle,
   useMemo,
-  useRef,
   useState,
 } from "react";
 import PropTypes from "prop-types";
@@ -58,6 +57,7 @@ import {
   LIST_OPS,
   NO_VALUE_OPS,
 } from "src/sections/common/EvalsTasks/common";
+import { QUERY_FAILED_RETRY_MESSAGE } from "src/utils/queryReadState";
 
 // One form row → one wire entry. No cross-row merging: it would collapse
 // "not_contains A AND not_contains B" into "in [A, B]" (inverting intent) and
@@ -253,8 +253,6 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
   //   { [idx]: { status: "running" | "success" | "error", result?, error? } }
   const [testResults, setTestResults] = useState({});
   const [isTesting, setIsTesting] = useState(false);
-  const [listCursorRevision, advanceListCursor] = useState(0);
-  const listContinuationRef = useRef({ signature: null, cursor: null });
 
   const formFilters = useWatch({ control, name: "filters" });
   const startDate = useWatch({ control, name: "startDate" });
@@ -266,14 +264,6 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     () => buildApiFilterArray(formFilters, startDate, endDate),
     [formFilters, startDate, endDate],
   );
-  const listQuerySignature = JSON.stringify({ rowType, projectId, apiFilters });
-  if (listContinuationRef.current.signature !== listQuerySignature) {
-    listContinuationRef.current = {
-      signature: listQuerySignature,
-      cursor: null,
-    };
-  }
-
   // Reset row index when filters / rowType change
   useEffect(() => {
     setCurrentRowIndex(0);
@@ -286,13 +276,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     isFetching: listFetching,
     isError: listError,
   } = useQuery({
-    queryKey: [
-      "task-preview-list",
-      rowType,
-      projectId,
-      apiFilters,
-      listCursorRevision,
-    ],
+    queryKey: ["task-preview-list", rowType, projectId, apiFilters],
     queryFn: async ({ signal }) => {
       if (!projectId) return { rows: [], total: 0, columns: [] };
 
@@ -302,14 +286,8 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           projectId,
           apiFilters,
         });
-        const initialParams = listContinuationRef.current.cursor
-          ? listContinuationParams(
-              requestParams,
-              listContinuationRef.current.cursor,
-            )
-          : requestParams;
         let resp = await axios.get(endpoints.project.getCallLogs, {
-          params: initialParams,
+          params: requestParams,
           signal,
         });
         resp = await followEmptyListContinuations({
@@ -325,12 +303,17 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
               params: listContinuationParams(requestParams, cursor),
               signal,
             }),
+          isCurrent: () => !signal.aborted,
         });
         const result = resp.data?.result || resp.data || {};
         const rowsOut = result.results || result.data || result.calls || [];
         const nextCursor = getEmptyListContinuation(rowsOut, result);
         if (nextCursor) {
-          return { continuationPending: true, nextCursor };
+          // The shared follower already spent its complete 12-hop / 30-second
+          // budget. Do not restart that budget in a new React Query revision:
+          // a sparse or malformed cursor chain must terminate visibly instead
+          // of issuing an unbounded series of background requests.
+          throw new Error("Task preview continuation budget exhausted");
         }
         return {
           rows: rowsOut,
@@ -363,13 +346,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         projectId,
         apiFilters,
       });
-      const initialParams = listContinuationRef.current.cursor
-        ? listContinuationParams(
-            requestParams,
-            listContinuationRef.current.cursor,
-          )
-        : requestParams;
-      let resp = await axios.get(url, { params: initialParams, signal });
+      let resp = await axios.get(url, { params: requestParams, signal });
       resp = await followEmptyListContinuations({
         initialResponse: resp,
         rowsFromResponse: (response) => response?.data?.result?.table || [],
@@ -380,6 +357,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             params: listContinuationParams(requestParams, cursor),
             signal,
           }),
+        isCurrent: () => !signal.aborted,
       });
       const result = resp.data?.result || {};
       const rowsOut = result.table || result.results || result.data || [];
@@ -388,7 +366,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         result.metadata || {},
       );
       if (nextCursor) {
-        return { continuationPending: true, nextCursor };
+        throw new Error("Task preview continuation budget exhausted");
       }
       return {
         rows: rowsOut,
@@ -408,18 +386,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     meta: { errorHandled: true },
   });
 
-  useEffect(() => {
-    if (!listData?.continuationPending) {
-      if (listData) listContinuationRef.current.cursor = null;
-      return;
-    }
-    if (listContinuationRef.current.signature !== listQuerySignature) return;
-    listContinuationRef.current.cursor = listData.nextCursor;
-    advanceListCursor((revision) => revision + 1);
-  }, [listData, listQuerySignature]);
-
-  const listContinuationPending = listData?.continuationPending === true;
-  const rows = listContinuationPending ? [] : listData?.rows || [];
+  const rows = listData?.rows || [];
   const columns = listData?.columns || [];
   const currentRow = rows[currentRowIndex] || null;
 
@@ -684,9 +651,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
               />
             )}
           </Box>
-          {(listFetching || listContinuationPending) && (
-            <CircularProgress size={12} />
-          )}
+          {listFetching && <CircularProgress size={12} />}
         </Box>
         <Typography
           variant="caption"
@@ -708,7 +673,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             icon="solar:filter-outline"
             text="Select a project to preview matching rows"
           />
-        ) : listLoading || listContinuationPending ? (
+        ) : listLoading ? (
           <Box
             sx={{
               display: "flex",
@@ -725,7 +690,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             color="error"
             sx={{ fontSize: "12px", textAlign: "center", mt: 2 }}
           >
-            Failed to load preview
+            {QUERY_FAILED_RETRY_MESSAGE}
           </Typography>
         ) : rows.length === 0 ? (
           <EmptyState

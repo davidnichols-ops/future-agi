@@ -334,9 +334,11 @@ class TestSpanAttributeKeysPartitionPruning:
         assert len(calls) == 1
         sql, params, _, settings = calls[0]
         # start_time is the partition key -> CH can prune to the window.
-        assert "start_time >= %(segment_start)s" in sql
-        assert "start_time < %(segment_end)s" in sql
-        assert params["segment_start"] < params["segment_end"]
+        assert "start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)" in sql
+        assert "start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)" in sql
+        assert isinstance(params["segment_start_us"], int)
+        assert isinstance(params["segment_end_us"], int)
+        assert params["segment_start_us"] < params["segment_end_us"]
         # Picker reads are explicitly sampled. The initial probe follows the
         # storage key so LIMIT can stop early; latest-state replay still
         # verifies every retained physical identity before it is exposed.

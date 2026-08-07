@@ -516,17 +516,19 @@ def test_special_attribute_key_and_literal_value_execute_in_seed_and_latest_quer
 def test_streaming_attribute_candidate_datetime_param_executes_on_ch25(
     ch_client, bounded_span_table
 ) -> None:
-    """CH25 accepts native-bound datetimes without a dateDiff type mismatch."""
+    """CH25 accepts integer-microsecond DateTime64 segment bounds."""
 
     query = _STRATIFIED_CANDIDATE_SQL.format(candidate_predicate="1 = 1").replace(
         "FROM spans", f"FROM {bounded_span_table}"
     )
+    segment_start = datetime(2025, 1, 1, 9, 0, tzinfo=UTC)
+    segment_end = datetime(2025, 1, 1, 10, 0, tzinfo=UTC)
     rows = ch_client.execute(
         query,
         {
             "project_ids": ("00000000-0000-4000-8000-000000000001",),
-            "segment_start": datetime(2025, 1, 1, 9, 0),
-            "segment_end": datetime(2025, 1, 1, 10, 0),
+            "segment_start_us": _unix_microseconds(segment_start),
+            "segment_end_us": _unix_microseconds(segment_end),
             "candidate_limit": 25,
         },
     )
