@@ -4,10 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({
-  get: vi.fn(),
-  getEvalAttributes: vi.fn(),
-}));
+const mocks = vi.hoisted(() => ({ get: vi.fn() }));
 
 vi.mock("src/hooks/use-debounce", () => ({
   useDebounce: (value) => value,
@@ -20,10 +17,6 @@ vi.mock("src/utils/axios", () => ({
       spanAttributeKeys: () => "/api/traces/span-attribute-keys/",
     },
   },
-}));
-
-vi.mock("src/generated/api-contracts/api", () => ({
-  tracerObservationSpanGetEvalAttributesList: mocks.getEvalAttributes,
 }));
 
 import {
@@ -46,18 +39,6 @@ function retainedPage(keys, overrides = {}) {
   };
 }
 
-function exactResponse(fields, overrides = {}) {
-  return {
-    data: {
-      result: fields,
-      query_complete: true,
-      query_status: "complete",
-      ...overrides,
-    },
-    status: 200,
-  };
-}
-
 function createWrapper() {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -74,34 +55,54 @@ function createWrapper() {
 describe("useExactEvalAttributeFields", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.get.mockResolvedValue(retainedPage(["retained_status"]));
-    mocks.getEvalAttributes.mockResolvedValue(exactResponse([]));
+    mocks.get.mockImplementation((_url, { params }) =>
+      Promise.resolve(
+        params.q ? retainedPage([]) : retainedPage(["retained_status"]),
+      ),
+    );
   });
 
   it.each([
-    ["Span", "spans", "final_status", ["retained_status", "final_status"]],
+    [
+      "Span",
+      " final_status ",
+      "final_status",
+      ["retained_status", "final_status"],
+    ],
     [
       "traces",
-      "traces",
+      " spans.0.final_status ",
       "spans.0.final_status",
       ["spans.0.retained_status", "spans.0.final_status"],
     ],
   ])(
-    "merges retained %s fields with the project-scoped exact q fast path",
-    async (rowType, expectedRowType, expectedField, expectedFields) => {
-      mocks.getEvalAttributes.mockResolvedValue(exactResponse([expectedField]));
+    "merges retained %s fields with a non-blocking retained exact search",
+    async (rowType, search, expectedField, expectedFields) => {
+      mocks.get.mockImplementation((_url, { params }) =>
+        Promise.resolve(
+          params.q
+            ? retainedPage(["final_status"], {
+                lookup_mode: "exact",
+                exact_match: true,
+              })
+            : retainedPage(["retained_status"]),
+        ),
+      );
 
       const { result } = renderHook(
         () =>
           useExactEvalAttributeFields({
             projectId: "00000000-0000-4000-8000-000000000901",
             rowType,
-            search: " final_status ",
+            search,
           }),
         { wrapper: createWrapper() },
       );
 
-      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      await waitFor(() => expect(result.current.data).toEqual(expectedFields));
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.queryReadState).toBe("complete");
+      expect(result.current.data).toContain(expectedField);
       expect(mocks.get).toHaveBeenCalledWith(
         "/api/traces/span-attribute-keys/",
         expect.objectContaining({
@@ -112,18 +113,17 @@ describe("useExactEvalAttributeFields", () => {
           },
         }),
       );
-      expect(mocks.getEvalAttributes).toHaveBeenCalledWith(
-        {
-          filters: JSON.stringify({
+      expect(mocks.get).toHaveBeenCalledWith(
+        "/api/traces/span-attribute-keys/",
+        expect.objectContaining({
+          signal: expect.any(AbortSignal),
+          params: {
             project_id: "00000000-0000-4000-8000-000000000901",
-          }),
-          row_type: expectedRowType,
-          q: "final_status",
-        },
-        { signal: expect.any(AbortSignal) },
+            page_size: 10,
+            q: "final_status",
+          },
+        }),
       );
-      expect(result.current.data).toEqual(expectedFields);
-      expect(result.current.queryReadState).toBe("complete");
     },
   );
 
@@ -168,15 +168,14 @@ describe("useExactEvalAttributeFields", () => {
       "spans.0.duplicate",
       "spans.0.older",
     ]);
-    expect(mocks.getEvalAttributes).not.toHaveBeenCalled();
   });
 
-  it("reuses retained pages while exact typed search changes", async () => {
-    const requests = [];
-    mocks.getEvalAttributes.mockImplementation(
-      (params, options) =>
-        new Promise((resolve) => requests.push({ options, params, resolve })),
-    );
+  it("reuses retained pages while exact search changes", async () => {
+    const exactRequests = [];
+    mocks.get.mockImplementation((_url, options) => {
+      if (!options.params.q) return Promise.resolve(retainedPage(["retained"]));
+      return new Promise((resolve) => exactRequests.push({ options, resolve }));
+    });
 
     const { result, rerender } = renderHook(
       ({ search }) =>
@@ -191,39 +190,60 @@ describe("useExactEvalAttributeFields", () => {
       },
     );
 
-    await waitFor(() => expect(requests).toHaveLength(1));
+    await waitFor(() => expect(exactRequests).toHaveLength(1));
     rerender({ search: "customer_outcome" });
-    await waitFor(() => expect(requests).toHaveLength(2));
+    await waitFor(() => expect(exactRequests).toHaveLength(2));
 
-    expect(mocks.get).toHaveBeenCalledTimes(1);
-    expect(requests[0].options.signal.aborted).toBe(true);
-    expect(requests[1].params).toMatchObject({
-      filters: JSON.stringify({ project_id: "project-synthetic" }),
-      row_type: "spans",
-      q: "customer_outcome",
-    });
+    expect(
+      mocks.get.mock.calls.filter(([, options]) => !options.params.q),
+    ).toHaveLength(1);
+    expect(exactRequests[0].options.signal.aborted).toBe(true);
+    expect(exactRequests[1].options.params.q).toBe("customer_outcome");
 
     await act(async () => {
-      requests[0].resolve(exactResponse(["final_status"]));
-      requests[1].resolve(exactResponse(["customer_outcome"]));
+      exactRequests[0].resolve(retainedPage(["final_status"]));
+      exactRequests[1].resolve(retainedPage(["customer_outcome"]));
     });
-
     await waitFor(() =>
-      expect(result.current.data).toEqual([
-        "retained_status",
-        "customer_outcome",
-      ]),
+      expect(result.current.data).toEqual(["retained", "customer_outcome"]),
     );
-    expect(result.current.data).not.toContain("final_status");
   });
 
-  it("keeps verified fields while reporting a degraded exact fast path", async () => {
-    mocks.getEvalAttributes.mockResolvedValue(
-      exactResponse(["final_status"], {
-        query_complete: false,
-        query_status: "degraded",
-        query_error_code: "read_budget_exceeded",
-      }),
+  it("does not publish degraded state from the optional exact search", async () => {
+    mocks.get.mockImplementation((_url, { params }) =>
+      Promise.resolve(
+        params.q
+          ? retainedPage(["final_status"], {
+              query_complete: false,
+              query_status: "degraded",
+              query_error_code: "read_budget_exceeded",
+            })
+          : retainedPage(["retained_status"]),
+      ),
+    );
+
+    const { result } = renderHook(
+      () =>
+        useExactEvalAttributeFields({
+          projectId: "project-synthetic",
+          rowType: "spans",
+          search: "final_status",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() =>
+      expect(result.current.data).toEqual(["retained_status", "final_status"]),
+    );
+    expect(result.current.queryReadState).toBe("complete");
+    expect(result.current.isError).toBe(false);
+  });
+
+  it("keeps the mapping usable when the optional exact search fails", async () => {
+    mocks.get.mockImplementation((_url, { params }) =>
+      params.q
+        ? Promise.reject(new Error("internal details"))
+        : Promise.resolve(retainedPage(["retained_status"])),
     );
 
     const { result } = renderHook(
@@ -237,12 +257,17 @@ describe("useExactEvalAttributeFields", () => {
     );
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toEqual(["retained_status", "final_status"]);
-    expect(result.current.queryReadState).toBe("degraded");
+    expect(result.current.data).toEqual(["retained_status"]);
+    expect(result.current.isError).toBe(false);
+    expect(result.current.queryReadState).toBe("complete");
   });
 
-  it("keeps retained fields and exposes a sanitized exact-read error state", async () => {
-    mocks.getEvalAttributes.mockRejectedValue(new Error("internal details"));
+  it("does not block mapping while optional exact search is pending", async () => {
+    mocks.get.mockImplementation((_url, { params }) =>
+      params.q
+        ? new Promise(() => {})
+        : Promise.resolve(retainedPage(["retained_status"])),
+    );
 
     const { result } = renderHook(
       () =>
@@ -254,9 +279,9 @@ describe("useExactEvalAttributeFields", () => {
       { wrapper: createWrapper() },
     );
 
-    await waitFor(() => expect(result.current.isError).toBe(true));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.isFetching).toBe(false);
     expect(result.current.data).toEqual(["retained_status"]);
-    expect(result.current.queryReadState).toBe("error");
   });
 
   it.each(["sessions", "voiceCalls"])(
@@ -273,7 +298,6 @@ describe("useExactEvalAttributeFields", () => {
       );
 
       expect(mocks.get).not.toHaveBeenCalled();
-      expect(mocks.getEvalAttributes).not.toHaveBeenCalled();
     },
   );
 

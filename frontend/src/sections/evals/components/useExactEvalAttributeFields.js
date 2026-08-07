@@ -1,5 +1,4 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { tracerObservationSpanGetEvalAttributesList } from "src/generated/api-contracts/api";
 import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
@@ -47,6 +46,10 @@ export function useExactEvalAttributeFields({
 }) {
   const normalizedRowType = normalizeExactAttributeRowType(rowType);
   const debouncedSearch = useDebounce(String(search || "").trim(), 350);
+  const exactSearch =
+    normalizedRowType === "traces" && debouncedSearch.startsWith("spans.0.")
+      ? debouncedSearch.slice("spans.0.".length)
+      : debouncedSearch;
 
   const retainedQuery = useInfiniteQuery({
     // The retained project schema is deliberately independent of the task's
@@ -76,46 +79,41 @@ export function useExactEvalAttributeFields({
     meta: { errorHandled: true },
   });
 
-  // Keep the existing exact-name lookup as a supplemental fast path while
-  // the retained cursor is still walking older project data. It can surface a
-  // typed name immediately, but it is never the inventory source: retained
-  // pagination remains available independently of task filters and dates.
+  // Search the same retained-data endpoint as a supplemental fast path while
+  // the base cursor walks older project data.  This request is deliberately
+  // non-authoritative: a slow/failed exact lookup must not disable the mapping
+  // control, publish a warning, or hide names already loaded by the catalog.
   const exactQuery = useQuery({
     queryKey: [
       "eval-attribute-exact",
       projectId,
       normalizedRowType,
-      debouncedSearch,
+      exactSearch,
     ],
     queryFn: ({ signal }) =>
-      tracerObservationSpanGetEvalAttributesList(
-        {
-          filters: JSON.stringify({ project_id: projectId }),
-          row_type: normalizedRowType,
-          q: debouncedSearch,
+      axios
+        .get(endpoints.project.spanAttributeKeys(), {
+          signal,
+          params: {
+            project_id: projectId,
+            page_size: 10,
+            q: exactSearch,
+          },
+        })
+        .then(({ data }) => data || {}),
+    select: (data) => ({
+      fields: (Array.isArray(data?.result) ? data.result : []).flatMap(
+        ({ key }) => {
+          const field = retainedAttributeFieldName(key, normalizedRowType);
+          return field ? [field] : [];
         },
-        { signal },
       ),
-    select: ({ data }) => {
-      const queryReadState = getQueryReadState(data);
-      return {
-        // An exact-q response can be degraded because the bounded selector
-        // could not finish counting every matching span or sampling the full
-        // trace cardinality.  The fields it did return have still passed the
-        // latest-state replay, so hiding them makes common attributes vanish
-        // on large projects.  Keep those verified suggestions while retaining
-        // the degraded state below so the picker still shows its retry warning.
-        fields: Array.isArray(data?.result)
-          ? data.result.filter((field) => typeof field === "string" && field)
-          : [],
-        queryReadState,
-      };
-    },
+    }),
     enabled:
       enabled &&
       Boolean(projectId) &&
       Boolean(normalizedRowType) &&
-      Boolean(debouncedSearch),
+      Boolean(exactSearch),
     retry: false,
     staleTime: 60_000,
     gcTime: 5 * 60_000,
@@ -138,25 +136,20 @@ export function useExactEvalAttributeFields({
     ? "error"
     : combineQueryReadStates(...retainedPages.map(getQueryReadState));
   const exactFields = exactQuery.data?.fields || [];
-  const exactReadState = exactQuery.isError
-    ? "error"
-    : exactQuery.data?.queryReadState || "complete";
-  const queryReadState = combineQueryReadStates(
-    retainedReadState,
-    ...(debouncedSearch ? [exactReadState] : []),
-  );
+  const queryReadState = retainedReadState;
 
   return {
     data: mergeTracingFieldNames(retainedFields, exactFields),
     queryReadState,
     debouncedSearch,
     isSupportedRowType: Boolean(normalizedRowType),
-    isFetching: retainedQuery.isFetching || exactQuery.isFetching,
-    isLoading: retainedQuery.isLoading || exactQuery.isLoading,
-    isError: retainedQuery.isError || exactQuery.isError,
-    isSuccess:
-      retainedQuery.isSuccess && (!debouncedSearch || exactQuery.isSuccess),
-    error: exactQuery.error || retainedQuery.error,
+    // Only the retained inventory controls loading/error UI.  Exact search is
+    // an opportunistic accelerator and free-text mapping remains available.
+    isFetching: retainedQuery.isFetching,
+    isLoading: retainedQuery.isLoading,
+    isError: retainedQuery.isError,
+    isSuccess: retainedQuery.isSuccess,
+    error: retainedQuery.error,
     fetchNextPage: retainedQuery.fetchNextPage,
     hasNextPage: retainedQuery.hasNextPage,
     isFetchingNextPage: retainedQuery.isFetchingNextPage,
