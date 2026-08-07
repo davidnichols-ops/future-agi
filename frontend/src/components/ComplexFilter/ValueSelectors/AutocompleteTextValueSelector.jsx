@@ -55,8 +55,7 @@ const AutocompleteTextValueSelector = ({
   const debouncedInput = useDebounce(inputValue, 300);
   const { observeId, id } = useParams();
   const projectId = projectIdProp || observeId || id;
-  const definitionFilterType =
-    definition?.filterType?.type || definition?.type;
+  const definitionFilterType = definition?.filterType?.type || definition?.type;
   const attributeType =
     definitionFilterType &&
     definition?.attributeTypesExact === true &&
@@ -136,9 +135,9 @@ const AutocompleteTextValueSelector = ({
   });
 
   const updateSelectedValues = (selection) => {
-    const selected = (Array.isArray(selection) ? selection : [selection]).filter(
-      (option) => option != null && option !== LOAD_MORE_OPTION,
-    );
+    const selected = (
+      Array.isArray(selection) ? selection : [selection]
+    ).filter((option) => option != null && option !== LOAD_MORE_OPTION);
     const values = selected.map(optionValue);
     const types = selected.map(optionStorageType);
 

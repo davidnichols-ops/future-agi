@@ -261,8 +261,7 @@ export const serializeFilterForApi = (filter) => {
       attributeValueTypes.length !== filterValue.length ||
       attributeValueTypes.some(
         (value) =>
-          value !== null &&
-          !["string", "number", "boolean"].includes(value),
+          value !== null && !["string", "number", "boolean"].includes(value),
       )
     ) {
       throw new Error(
