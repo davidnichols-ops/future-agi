@@ -47,6 +47,8 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+    ATTRIBUTE_VALUE_CURSOR_DUPLICATE_ONLY_MAX_CANDIDATE_PAGES,
+    ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
     ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS,
     AttributeCardinalityRead,
@@ -256,6 +258,44 @@ def _keyset_candidate_page(
         )
         ordered = [row for row in ordered if _candidate_key(row) < before]
     return ordered[: call.params["candidate_limit"]]
+
+
+def _value_cursor_executor(
+    candidates: list[dict[str, Any]],
+    value_by_id: dict[str, str],
+    *,
+    fail_candidate_limit: int | None = None,
+    fail_replay_limit: int | None = None,
+) -> RecordingExecutor:
+    by_id = {str(row["id"]): row for row in candidates}
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            candidate_limit = call.params["candidate_limit"] - 1
+            if candidate_limit == fail_candidate_limit:
+                return ReadDeadlineExceeded("expanded candidate exceeded its budget")
+            in_segment = [
+                row
+                for row in candidates
+                if call.params["segment_start"]
+                <= row["start_time"]
+                < call.params["segment_end"]
+            ]
+            return _keyset_candidate_page(in_segment, call)
+        if len(call.params["candidate_ids_0"]) == fail_replay_limit:
+            return ReadDeadlineExceeded("expanded replay exceeded its budget")
+        return [
+            _target_row(
+                PROJECT_A,
+                span_id,
+                trace_id=by_id[span_id]["trace_id"],
+                start_time=by_id[span_id]["start_time"],
+                string=value_by_id[span_id],
+            )
+            for span_id in call.params["candidate_ids_0"]
+        ]
+
+    return RecordingExecutor(respond)
 
 
 class _ProjectScope:
@@ -2768,6 +2808,79 @@ def test_filter_value_cursor_widened_checkpoint_is_monotonic_and_unique():
     )
 
 
+@pytest.mark.parametrize("failure_stage", ["candidate", "replay"])
+def test_filter_value_cursor_expanded_failure_keeps_widened_checkpoint_compressed(
+    failure_stage,
+):
+    old_time = NOW - timedelta(days=40)
+    duplicate_value = "completed"
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"historical-{index:03d}",
+            start_time=old_time,
+        )
+        for index in range(200)
+    ]
+    executor = _value_cursor_executor(
+        candidates,
+        {str(row["id"]): duplicate_value for row in candidates},
+        **{f"fail_{failure_stage}_limit": 2 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT},
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "sparse.attribute",
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("string", duplicate_value),),
+    )
+
+    ordered = sorted(candidates, key=_candidate_key, reverse=True)
+    checkpoint_row = ordered[ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT - 1]
+    checkpoint = (
+        PROJECT_A,
+        str(checkpoint_row["trace_id"]),
+        str(checkpoint_row["id"]),
+        old_time,
+    )
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    successful_wide, failed_expansion = candidate_calls[-2:]
+    assert (
+        successful_wide.params["segment_end"] - successful_wide.params["segment_start"]
+        > ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    )
+    assert failed_expansion.params["candidate_limit"] - 1 == 128
+    assert failed_expansion.params["candidate_before_id"] == checkpoint[2]
+    assert failed_expansion.params["segment_start"] == old_time
+    assert failed_expansion.params["segment_end"] == old_time + (
+        ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    )
+    assert failed_expansion.timeout_ms == ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+    replay_sizes = [
+        len(call.params["candidate_ids_0"])
+        for call in executor.calls
+        if "segment_start" not in call.params
+    ]
+    assert replay_sizes == ([64] if failure_stage == "candidate" else [64, 128])
+    assert (
+        executor.calls[-1].timeout_ms == ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+    )
+    assert read.rows == ()
+    assert read.has_more is True
+    assert read.next_before_identity == checkpoint
+    assert read.next_segment_end == old_time + ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    assert (
+        read.next_segment_end - read.next_before_identity[3]
+        == ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    )
+
+
 def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation():
     candidates = [
         _candidate(
@@ -2852,50 +2965,310 @@ def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation()
     )
 
 
-def test_filter_value_cursor_resumed_low_diversity_page_respects_query_ceiling():
-    """A resumed low-diversity page stays inside its finite request ceiling."""
+def test_filter_value_cursor_duplicate_only_page_reaches_older_unique_value():
+    duplicate_value = "completed"
+    unique_value = "older-unique"
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"duplicate-{index:04d}",
+            start_time=NOW - timedelta(seconds=index + 1),
+        )
+        for index in range(1_000)
+    ]
+    candidates.append(
+        _candidate(
+            PROJECT_A,
+            "older-unique",
+            start_time=NOW - timedelta(seconds=1_001),
+        )
+    )
+    value_by_id = {
+        str(row["id"]): (
+            unique_value if row["id"] == "older-unique" else duplicate_value
+        )
+        for row in candidates
+    }
+    executor = _value_cursor_executor(candidates, value_by_id)
+    duplicate_digest = attribute_value_cursor_digest("string", duplicate_value)
 
-    resume_time = NOW - timedelta(seconds=1)
-    resume_identity = (
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=10,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        seen_value_digests=(duplicate_digest,),
+    )
+
+    candidate_limits = [
+        call.params["candidate_limit"] - 1
+        for call in executor.calls
+        if "segment_start" in call.params
+    ]
+    assert read.rows == (AttributeValueRow(unique_value, "string", 1),)
+    assert read.seen_value_digests == (
+        duplicate_digest,
+        attribute_value_cursor_digest("string", unique_value),
+    )
+    assert read.metadata.query_count == 10
+    assert candidate_limits == [64, 128, 256, 512, 512]
+    assert read.has_more is True
+    assert read.browse_status == "continuation"
+
+
+def test_filter_value_cursor_duplicate_only_page_reaches_terminal_exhaustion():
+    duplicate_value = "completed"
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"duplicate-{index:04d}",
+            start_time=NOW - timedelta(seconds=index + 1),
+        )
+        for index in range(1_000)
+    ]
+    executor = _value_cursor_executor(
+        candidates,
+        {str(row["id"]): duplicate_value for row in candidates},
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=10,
+        window_start=NOW - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("string", duplicate_value),),
+    )
+
+    candidate_limits = [
+        call.params["candidate_limit"] - 1
+        for call in executor.calls
+        if "segment_start" in call.params
+    ]
+    assert read.rows == ()
+    assert read.has_more is False
+    assert read.browse_status == "exhausted"
+    assert read.next_segment_end == NOW - ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    assert read.next_before_identity is None
+    assert read.metadata.query_count == 10
+    assert candidate_limits == [64, 128, 256, 512, 512]
+
+
+@pytest.mark.parametrize("failure_stage", ["candidate", "replay"])
+def test_filter_value_cursor_expanded_failure_continues_without_skip_or_repeat(
+    failure_stage,
+):
+    duplicate_value = "completed"
+    unique_value = "next-unique"
+    successful_prefix = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT + (
+        2 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+    )
+    failure_limit = 4 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"span-{index:03d}",
+            start_time=NOW - timedelta(microseconds=index + 1),
+        )
+        for index in range(successful_prefix)
+    ]
+    candidates.append(
+        _candidate(
+            PROJECT_A,
+            "next-unique",
+            start_time=NOW - timedelta(microseconds=successful_prefix + 1),
+        )
+    )
+    candidates.extend(
+        _candidate(
+            PROJECT_A,
+            f"tail-{index:03d}",
+            start_time=NOW - timedelta(microseconds=successful_prefix + index + 2),
+        )
+        for index in range(failure_limit)
+    )
+    value_by_id = {
+        str(row["id"]): (
+            unique_value if row["id"] == "next-unique" else duplicate_value
+        )
+        for row in candidates
+    }
+    failure_kwargs = {
+        f"fail_{failure_stage}_limit": failure_limit,
+    }
+    first_executor = _value_cursor_executor(
+        candidates,
+        value_by_id,
+        **failure_kwargs,
+    )
+    seen_digest = attribute_value_cursor_digest("string", duplicate_value)
+
+    first = AttributeReadSelector(
+        first_executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        seen_value_digests=(seen_digest,),
+    )
+    verified_row = candidates[successful_prefix - 1]
+    verified_checkpoint = (
         PROJECT_A,
-        "trace-resume",
-        "resume",
-        resume_time,
+        str(verified_row["trace_id"]),
+        str(verified_row["id"]),
+        verified_row["start_time"],
+    )
+
+    second_executor = _value_cursor_executor(candidates, value_by_id)
+    second = AttributeReadSelector(
+        second_executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        before_identity=first.next_before_identity,
+        resume_identity=first.next_resume_identity,
+        resume_member_offset=first.next_resume_member_offset,
+        seen_value_digests=first.seen_value_digests,
+    )
+
+    candidate_limits = [
+        call.params["candidate_limit"] - 1
+        for call in first_executor.calls
+        if "segment_start" in call.params
+    ]
+    replay_sizes = [
+        len(call.params["candidate_ids_0"])
+        for call in first_executor.calls
+        if "segment_start" not in call.params
+    ]
+    assert first.rows == ()
+    assert first.metadata.query_complete is True
+    assert first.next_segment_end == NOW
+    assert first.next_before_identity == verified_checkpoint
+    assert candidate_limits == [64, 128, failure_limit]
+    assert replay_sizes == (
+        [64, 128] if failure_stage == "candidate" else [64, 128, failure_limit]
+    )
+    assert first_executor.calls[-1].timeout_ms == (
+        ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+    )
+    assert second.rows == (AttributeValueRow(unique_value, "string", 1),)
+    assert second_executor.calls[0].params["candidate_before_id"] == verified_row["id"]
+    continued_ids = second_executor.calls[1].params["candidate_ids_0"]
+    assert continued_ids[0] == "next-unique"
+    assert set(continued_ids).isdisjoint(
+        {str(row["id"]) for row in candidates[:successful_prefix]}
+    )
+    assert [row.value for page in (first, second) for row in page.rows] == [
+        unique_value
+    ]
+
+
+def test_filter_value_cursor_duplicate_only_page_respects_query_ceiling():
+    duplicate_value = "completed"
+    processed_candidates = (
+        ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+        + (2 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT)
+        + (4 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT)
+        + (ATTRIBUTE_VALUE_CURSOR_DUPLICATE_ONLY_MAX_CANDIDATE_PAGES - 3)
+        * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT
     )
     candidates = [
         _candidate(
             PROJECT_A,
-            f"span-{index:04d}",
-            start_time=NOW - timedelta(seconds=index + 2),
+            f"span-{index:05d}",
+            start_time=NOW - timedelta(microseconds=index + 1),
         )
-        for index in range(
-            ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
-            * (ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES - 1)
-            + 1
+        for index in range(processed_candidates + 1)
+    ]
+    executor = _value_cursor_executor(
+        candidates,
+        {str(row["id"]): duplicate_value for row in candidates},
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "call.status",
+        page_size=10,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("string", duplicate_value),),
+    )
+
+    candidate_limits = [
+        call.params["candidate_limit"] - 1
+        for call in executor.calls
+        if "segment_start" in call.params
+    ]
+    last_verified = candidates[processed_candidates - 1]
+    assert read.rows == ()
+    assert read.has_more is True
+    assert read.browse_status == "continuation"
+    assert read.metadata.query_count == ATTRIBUTE_READ_MAX_QUERY_COUNT
+    assert len(executor.calls) == ATTRIBUTE_READ_MAX_QUERY_COUNT
+    assert candidate_limits == [64, 128, 256] + [
+        ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT
+    ] * (ATTRIBUTE_VALUE_CURSOR_DUPLICATE_ONLY_MAX_CANDIDATE_PAGES - 3)
+    assert read.next_before_identity == (
+        str(last_verified["project_id"]),
+        str(last_verified["trace_id"]),
+        str(last_verified["id"]),
+        last_verified["start_time"],
+    )
+
+
+def test_filter_value_cursor_resumed_array_duplicate_walk_uses_safe_29_query_cap():
+    duplicate_value = "completed"
+    resume_time = NOW - timedelta(microseconds=1)
+    resume_identity = (
+        PROJECT_A,
+        "trace-resume-array",
+        "resume-array",
+        resume_time,
+    )
+    candidate_pairs = (ATTRIBUTE_READ_MAX_QUERY_COUNT - 1) // 2
+    processed_candidates = (
+        ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+        + (2 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT)
+        + (4 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT)
+        + (candidate_pairs - 3) * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT
+    )
+    candidates = [
+        _candidate(
+            PROJECT_A,
+            f"span-{index:05d}",
+            start_time=NOW - timedelta(microseconds=index + 2),
         )
+        for index in range(processed_candidates + 1)
     ]
     by_id = {str(row["id"]): row for row in candidates}
 
     def respond(call, _):
         if "segment_start" in call.params:
-            in_segment = [
-                row
-                for row in candidates
-                if call.params["segment_start"]
-                <= row["start_time"]
-                < call.params["segment_end"]
-            ]
-            return _keyset_candidate_page(in_segment, call)
+            return _keyset_candidate_page(candidates, call)
         rows = []
         for span_id in call.params["candidate_ids_0"]:
-            if span_id == "resume":
+            if span_id == resume_identity[2]:
                 rows.append(
                     _target_row(
                         PROJECT_A,
-                        "resume",
-                        trace_id="trace-resume",
+                        span_id,
+                        trace_id=resume_identity[1],
                         start_time=resume_time,
-                        string="completed",
+                        legacy_raw=json.dumps(("prior", duplicate_value)),
                     )
                 )
                 continue
@@ -2906,16 +3279,18 @@ def test_filter_value_cursor_resumed_low_diversity_page_respects_query_ceiling()
                     span_id,
                     trace_id=candidate["trace_id"],
                     start_time=candidate["start_time"],
-                    string="completed",
+                    legacy_raw=json.dumps((duplicate_value,)),
                 )
             )
         return rows
 
     executor = RecordingExecutor(respond)
+    seen_digests = (
+        attribute_value_cursor_digest("array", "prior"),
+        attribute_value_cursor_digest("array", duplicate_value),
+    )
     read = AttributeReadSelector(
-        executor,
-        now=NOW,
-        json_attribute_mode="arrays",
+        executor, now=NOW, json_attribute_mode="arrays"
     ).read_value_cursor_page(
         [PROJECT_A],
         "call.status",
@@ -2923,15 +3298,33 @@ def test_filter_value_cursor_resumed_low_diversity_page_respects_query_ceiling()
         window_start=NOW - timedelta(days=1),
         window_end=NOW,
         resume_identity=resume_identity,
-        seen_value_digests=(attribute_value_cursor_digest("string", "completed"),),
+        resume_member_offset=1,
+        seen_value_digests=seen_digests,
     )
 
+    last_verified = candidates[processed_candidates - 1]
+    candidate_limits = [
+        call.params["candidate_limit"] - 1
+        for call in executor.calls
+        if "segment_start" in call.params
+    ]
     assert read.rows == ()
     assert read.has_more is True
     assert read.browse_status == "continuation"
-    expected_queries = 1 + (2 * ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES)
-    assert read.metadata.query_count == expected_queries
-    assert len(executor.calls) == expected_queries
+    assert read.seen_value_digests == seen_digests
+    assert read.metadata.query_count == 1 + (2 * candidate_pairs) == 29
+    assert len(executor.calls) == 29
+    assert candidate_limits == [64, 128, 256] + [
+        ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT
+    ] * (candidate_pairs - 3)
+    assert read.next_resume_identity is None
+    assert read.next_before_identity == (
+        str(last_verified["project_id"]),
+        str(last_verified["trace_id"]),
+        str(last_verified["id"]),
+        last_verified["start_time"],
+    )
+    assert read.next_before_identity[3] < resume_identity[3]
 
 
 def test_filter_value_cursor_reports_truthful_server_state_limit():

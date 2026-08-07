@@ -9,9 +9,14 @@ import {
   FILTER_TYPE_ALLOWED_OPS,
   LIST_FILTER_OPS,
 } from "src/api/contracts/filter-contract.generated";
+import { followEmptyListContinuations } from "src/sections/projects/LLMTracing/listCursorPagination";
 
 const LOAD_MORE_OPTION = Object.freeze({ __loadMore: true });
+const RETRY_OPTION = Object.freeze({ __retry: true });
 const LIST_OPERATORS = new Set(LIST_FILTER_OPS);
+
+const isPaginationOption = (option) =>
+  option === LOAD_MORE_OPTION || option === RETRY_OPTION;
 
 const optionValue = (option) =>
   option && typeof option === "object" && "value" in option
@@ -64,16 +69,26 @@ const AutocompleteTextValueSelector = ({
       ? normalizeAttributeType(definitionFilterType)
       : undefined;
 
-  const { data, isLoading, hasNextPage, fetchNextPage, isFetchingNextPage } =
-    useInfiniteQuery({
-      queryKey: [
-        "span-attribute-values",
-        projectId,
-        definition?.propertyId,
-        attributeType || "all-types",
-        debouncedInput,
-      ],
-      queryFn: ({ signal, pageParam }) =>
+  const {
+    data,
+    isLoading,
+    isFetching,
+    isError,
+    hasNextPage,
+    fetchNextPage,
+    isFetchingNextPage,
+    isFetchNextPageError,
+    refetch,
+  } = useInfiniteQuery({
+    queryKey: [
+      "span-attribute-values",
+      projectId,
+      definition?.propertyId,
+      attributeType || "all-types",
+      debouncedInput,
+    ],
+    queryFn: async ({ signal, pageParam }) => {
+      const requestPage = (cursor) =>
         axios.get(endpoints.dashboard.filterValues, {
           signal,
           params: {
@@ -84,19 +99,32 @@ const AutocompleteTextValueSelector = ({
             search: debouncedInput,
             page_size: 10,
             ...(attributeType ? { attribute_type: attributeType } : {}),
-            ...(pageParam ? { cursor: pageParam } : {}),
+            ...(cursor ? { cursor } : {}),
           },
-        }),
-      initialPageParam: null,
-      getNextPageParam: (lastPage) =>
-        lastPage?.data?.result?.has_more && lastPage?.data?.result?.next_cursor
-          ? lastPage.data.result.next_cursor
-          : undefined,
-      enabled: Boolean(projectId) && Boolean(definition?.propertyId),
-      staleTime: 30000,
-      retry: false,
-      meta: { errorHandled: true },
-    });
+        });
+      const initialResponse = await requestPage(pageParam);
+      // The shared guard follows at most 12 empty checkpoints per UI action.
+      // Its 30-second elapsed check is deliberately soft and runs between
+      // completed requests; cancellation of an in-flight request remains the
+      // responsibility of the query's AbortSignal/HTTP client.
+      return followEmptyListContinuations({
+        initialResponse,
+        rowsFromResponse: (response) => response?.data?.result?.values || [],
+        metadataFromResponse: (response) => response?.data?.result || {},
+        nextResponse: requestPage,
+        isCurrent: () => !signal.aborted,
+      });
+    },
+    initialPageParam: null,
+    getNextPageParam: (lastPage) =>
+      lastPage?.data?.result?.has_more && lastPage?.data?.result?.next_cursor
+        ? lastPage.data.result.next_cursor
+        : undefined,
+    enabled: Boolean(projectId) && Boolean(definition?.propertyId),
+    staleTime: 30000,
+    retry: false,
+    meta: { errorHandled: true },
+  });
   const seen = new Set();
   const options = (data?.pages || []).flatMap((page) =>
     (page?.data?.result?.values || []).flatMap((item) => {
@@ -108,7 +136,11 @@ const AutocompleteTextValueSelector = ({
       return [{ value, type }];
     }),
   );
-  const pickerOptions = hasNextPage ? [...options, LOAD_MORE_OPTION] : options;
+  const pickerOptions = hasNextPage
+    ? [...options, LOAD_MORE_OPTION]
+    : isError
+      ? [...options, RETRY_OPTION]
+      : options;
   const filterConfig = filter?.filter_config || {};
   const isListOperator = LIST_OPERATORS.has(filterConfig.filter_op);
   const selectedRawValues = isListOperator
@@ -137,7 +169,7 @@ const AutocompleteTextValueSelector = ({
   const updateSelectedValues = (selection) => {
     const selected = (
       Array.isArray(selection) ? selection : [selection]
-    ).filter((option) => option != null && option !== LOAD_MORE_OPTION);
+    ).filter((option) => option != null && !isPaginationOption(option));
     const values = selected.map(optionValue);
     const types = selected.map(optionStorageType);
 
@@ -184,7 +216,12 @@ const AutocompleteTextValueSelector = ({
       options={pickerOptions}
       filterOptions={(availableOptions) => availableOptions}
       getOptionLabel={(option) => {
-        if (option === LOAD_MORE_OPTION) return "Load more values";
+        if (option === LOAD_MORE_OPTION) {
+          return isFetchNextPageError
+            ? "Retry loading values"
+            : "Load more values";
+        }
+        if (option === RETRY_OPTION) return "Retry loading values";
         const value = optionValue(option);
         return typeof value === "string" ? value : JSON.stringify(value);
       }}
@@ -193,17 +230,29 @@ const AutocompleteTextValueSelector = ({
         optionStorageType(option) === optionStorageType(value)
       }
       renderOption={(props, option) =>
-        option === LOAD_MORE_OPTION ? (
+        isPaginationOption(option) ? (
           <li
             {...props}
             onMouseDown={(event) => event.preventDefault()}
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              if (!isFetchingNextPage) fetchNextPage();
+              if (option === RETRY_OPTION) {
+                if (!isFetching) refetch();
+              } else if (!isFetchingNextPage) {
+                fetchNextPage();
+              }
             }}
           >
-            {isFetchingNextPage ? "Loading more values…" : "Load more values"}
+            {option === RETRY_OPTION
+              ? isFetching
+                ? "Retrying values…"
+                : "Retry loading values"
+              : isFetchingNextPage
+                ? "Loading more values…"
+                : isFetchNextPageError
+                  ? "Retry loading values"
+                  : "Load more values"}
           </li>
         ) : (
           <li {...props}>
@@ -228,22 +277,35 @@ const AutocompleteTextValueSelector = ({
       }}
       inputValue={inputValue}
       onInputChange={(_, newInputValue, reason) => {
-        if (reason === "reset" && newInputValue === "Load more values") return;
+        if (
+          reason === "reset" &&
+          ["Load more values", "Retry loading values"].includes(newInputValue)
+        ) {
+          return;
+        }
         freeTextDirtyRef.current = reason === "input";
         setInputValue(newInputValue);
       }}
       value={isListOperator ? selectedOptions : selectedOptions[0] || null}
       onChange={(_, newValue) => {
         freeTextDirtyRef.current = false;
+        if (newValue === RETRY_OPTION) {
+          if (!isFetching) refetch();
+          return;
+        }
         if (newValue === LOAD_MORE_OPTION) {
           if (!isFetchingNextPage) fetchNextPage();
           return;
         }
         if (
           Array.isArray(newValue) &&
-          newValue.some((option) => option === LOAD_MORE_OPTION)
+          newValue.some((option) => isPaginationOption(option))
         ) {
-          if (!isFetchingNextPage) fetchNextPage();
+          if (newValue.includes(RETRY_OPTION)) {
+            if (!isFetching) refetch();
+          } else if (!isFetchingNextPage) {
+            fetchNextPage();
+          }
           return;
         }
         updateSelectedValues(newValue);
@@ -265,7 +327,7 @@ const AutocompleteTextValueSelector = ({
             ...params.InputProps,
             endAdornment: (
               <>
-                {isLoading || isFetchingNextPage ? (
+                {isLoading || isFetching ? (
                   <CircularProgress color="inherit" size={16} />
                 ) : null}
                 {params.InputProps.endAdornment}

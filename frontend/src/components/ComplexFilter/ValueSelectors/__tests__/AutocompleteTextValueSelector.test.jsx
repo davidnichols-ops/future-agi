@@ -50,7 +50,10 @@ describe("AutocompleteTextValueSelector", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
-            values: [{ value: "ended", type: "string" }],
+            values: [
+              { value: "completed", type: "string" },
+              { value: "ended", type: "string" },
+            ],
             query_complete: true,
             query_status: "complete",
             has_more: false,
@@ -107,6 +110,9 @@ describe("AutocompleteTextValueSelector", () => {
     fireEvent.scroll(listbox);
 
     expect(await screen.findByRole("option", { name: "ended" })).toBeVisible();
+    expect(screen.getAllByRole("option", { name: "completed" })).toHaveLength(
+      1,
+    );
     await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
     expect(mocks.get).toHaveBeenNthCalledWith(
       2,
@@ -157,7 +163,7 @@ describe("AutocompleteTextValueSelector", () => {
     );
   });
 
-  it("offers an explicit next-page action when an exact page has no values", async () => {
+  it("automatically follows an empty continuation until values arrive", async () => {
     mocks.get
       .mockResolvedValueOnce({
         data: {
@@ -192,10 +198,6 @@ describe("AutocompleteTextValueSelector", () => {
     );
 
     fireEvent.mouseDown(screen.getByRole("combobox"));
-    fireEvent.click(
-      await screen.findByRole("option", { name: "Load more values" }),
-    );
-
     expect(
       await screen.findByRole("option", { name: "completed" }),
     ).toBeVisible();
@@ -206,6 +208,258 @@ describe("AutocompleteTextValueSelector", () => {
         params: expect.objectContaining({ cursor: "older-page" }),
       }),
     );
+    expect(
+      screen.queryByRole("option", { name: "Load more values" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("bounds a 48-page empty chain and resumes it through manual load-more actions", async () => {
+    let responseIndex = 0;
+    mocks.get.mockImplementation(async () => {
+      const current = responseIndex;
+      responseIndex += 1;
+      if (current < 48) {
+        return {
+          data: {
+            result: {
+              values: [],
+              query_complete: true,
+              query_status: "complete",
+              has_more: true,
+              next_cursor: `cursor-${current + 1}`,
+            },
+          },
+        };
+      }
+      return {
+        data: {
+          result: {
+            values: [{ value: "eventually-found", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      };
+    });
+
+    render(
+      <AutocompleteTextValueSelector
+        definition={{ propertyId: "sparse.status", type: "text" }}
+        filter={{ id: "filter-1", filter_config: { filter_value: "" } }}
+        updateFilter={vi.fn()}
+      />,
+      { wrapper: Wrapper },
+    );
+
+    fireEvent.mouseDown(screen.getByRole("combobox"));
+    await screen.findByRole("option", { name: "Load more values" });
+    expect(mocks.get).toHaveBeenCalledTimes(13);
+
+    for (const expectedRequestCount of [26, 39]) {
+      fireEvent.click(screen.getByRole("option", { name: "Load more values" }));
+      await waitFor(() =>
+        expect(mocks.get).toHaveBeenCalledTimes(expectedRequestCount),
+      );
+      await screen.findByRole("option", { name: "Load more values" });
+    }
+
+    fireEvent.click(screen.getByRole("option", { name: "Load more values" }));
+    expect(
+      await screen.findByRole("option", { name: "eventually-found" }),
+    ).toBeVisible();
+    expect(mocks.get).toHaveBeenCalledTimes(49);
+    expect(mocks.get).toHaveBeenNthCalledWith(
+      49,
+      "/filter-values/",
+      expect.objectContaining({
+        params: expect.objectContaining({ cursor: "cursor-48" }),
+      }),
+    );
+    expect(
+      screen.queryByRole("option", { name: "Load more values" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("stops a repeated empty cursor and offers a bounded retry", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          values: [],
+          query_complete: true,
+          query_status: "complete",
+          has_more: true,
+          next_cursor: "repeated-cursor",
+        },
+      },
+    });
+
+    render(
+      <AutocompleteTextValueSelector
+        definition={{ propertyId: "broken.status", type: "text" }}
+        filter={{ id: "filter-1", filter_config: { filter_value: "" } }}
+        updateFilter={vi.fn()}
+      />,
+      { wrapper: Wrapper },
+    );
+
+    fireEvent.mouseDown(screen.getByRole("combobox"));
+    const retry = await screen.findByRole("option", {
+      name: "Retry loading values",
+    });
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+
+    fireEvent.click(retry);
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(4));
+    expect(
+      await screen.findByRole("option", { name: "Retry loading values" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
+
+  it("preserves loaded values when next-page retry reaches the empty-hop bound", async () => {
+    let requestNumber = 0;
+    mocks.get.mockImplementation(async () => {
+      requestNumber += 1;
+      if (requestNumber === 1) {
+        return {
+          data: {
+            result: {
+              values: [{ value: "completed", type: "string" }],
+              query_complete: true,
+              query_status: "complete",
+              has_more: true,
+              next_cursor: "retry-start",
+            },
+          },
+        };
+      }
+      if (requestNumber === 2) {
+        throw new Error("transient continuation failure");
+      }
+      if (requestNumber <= 15) {
+        return {
+          data: {
+            result: {
+              values: [],
+              query_complete: true,
+              query_status: "complete",
+              has_more: true,
+              next_cursor: `empty-${requestNumber - 2}`,
+            },
+          },
+        };
+      }
+      return {
+        data: {
+          result: {
+            values: [{ value: "recovered", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      };
+    });
+
+    render(
+      <AutocompleteTextValueSelector
+        definition={{ propertyId: "retry.status", type: "text" }}
+        filter={{ id: "filter-1", filter_config: { filter_value: "" } }}
+        updateFilter={vi.fn()}
+      />,
+      { wrapper: Wrapper },
+    );
+
+    fireEvent.mouseDown(screen.getByRole("combobox"));
+    expect(
+      await screen.findByRole("option", { name: "completed" }),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole("option", { name: "Load more values" }));
+
+    const retry = await screen.findByRole("option", {
+      name: "Retry loading values",
+    });
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("option", { name: "completed" })).toBeVisible();
+
+    fireEvent.click(retry);
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(15));
+    // Twelve continuations and the 30-second soft check are per-action guards.
+    // The latter is evaluated only between completed HTTP requests, so the
+    // deterministic hop bound is what this regression exercises.
+    expect(screen.getByRole("option", { name: "completed" })).toBeVisible();
+    const loadMore = await screen.findByRole("option", {
+      name: "Load more values",
+    });
+    expect(mocks.get).toHaveBeenNthCalledWith(
+      15,
+      "/filter-values/",
+      expect.objectContaining({
+        params: expect.objectContaining({ cursor: "empty-12" }),
+      }),
+    );
+
+    fireEvent.click(loadMore);
+    expect(
+      await screen.findByRole("option", { name: "recovered" }),
+    ).toBeVisible();
+    expect(screen.getByRole("option", { name: "completed" })).toBeVisible();
+    expect(mocks.get).toHaveBeenCalledTimes(16);
+    expect(mocks.get).toHaveBeenNthCalledWith(
+      16,
+      "/filter-values/",
+      expect.objectContaining({
+        params: expect.objectContaining({ cursor: "empty-13" }),
+      }),
+    );
+  });
+
+  it("stops automatically at an empty terminal continuation", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "terminal-page",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [],
+            query_complete: true,
+            query_status: "complete",
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      });
+
+    render(
+      <AutocompleteTextValueSelector
+        definition={{ propertyId: "absent.status", type: "text" }}
+        filter={{ id: "filter-1", filter_config: { filter_value: "" } }}
+        updateFilter={vi.fn()}
+      />,
+      { wrapper: Wrapper },
+    );
+
+    fireEvent.mouseDown(screen.getByRole("combobox"));
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole("option", { name: /load more|retry loading/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("queries all typed stores when an attribute has mixed storage types", async () => {

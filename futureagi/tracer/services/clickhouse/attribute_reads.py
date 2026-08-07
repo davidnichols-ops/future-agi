@@ -112,13 +112,17 @@ ATTRIBUTE_READ_MAX_PROJECTS = 64
 # an unbounded distinct scan.
 ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE = 50
 ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT = 64
+ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT = 512
 # One cursor request is a responsive, exact prefix read rather than a request
 # to exhaust the vocabulary.  Four candidate/latest-state pairs cover up to
-# 256 newest matching physical spans, then publish a continuation.  The former
-# 15-pair ceiling let low-cardinality values (for example one status repeated
-# across every call) consume the whole five-second API wall while trying to
-# fill ten distinct options that did not exist.
+# 256 newest matching physical spans once the page has found a new value.  A
+# duplicate-only continuation may use the independent 30-query operation
+# envelope and grow its finite replay batch up to 512 identities.  This keeps
+# ordinary pages responsive while collapsing long runs of already-seen values.
 ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES = 4
+ATTRIBUTE_VALUE_CURSOR_DUPLICATE_ONLY_MAX_CANDIDATE_PAGES = (
+    ATTRIBUTE_READ_MAX_QUERY_COUNT // 2
+)
 # Empty value probes are exact proofs that the requested key/search has no
 # candidate in that half-open physical slice.  Grow only after such a proof so
 # sparse retained history does not require one public cursor round-trip per
@@ -3420,6 +3424,7 @@ class AttributeReadSelector:
         emitted: dict[str, AttributeValueRow] = {}
         needle = normalized_search.casefold()
         candidate_pages = 0
+        candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
         cursor_before = before_identity
         empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
         max_empty_segment_width = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT
@@ -3568,7 +3573,12 @@ class AttributeReadSelector:
             current_segment_end > start
             and len(emitted) < effective_page_size
             and next_resume_identity is None
-            and candidate_pages < ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
+            and candidate_pages
+            < (
+                ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
+                if emitted
+                else ATTRIBUTE_VALUE_CURSOR_DUPLICATE_ONLY_MAX_CANDIDATE_PAGES
+            )
             # Every walk iteration issues one candidate query and one
             # latest-state verification query. A resumed array row consumes
             # one verification before this loop, so reserve capacity for the
@@ -3591,15 +3601,25 @@ class AttributeReadSelector:
                     attribute_key=key,
                     ordered=True,
                     before_identity=cursor_before,
-                    candidate_limit=ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+                    candidate_limit=candidate_limit,
                     predicate_params=candidate_predicate_params,
                     query_timeout_ms=(
                         ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
                         if widened_probe
+                        or candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                         else None
                     ),
                 )
             except Exception as exc:
+                if is_read_budget_error(exc) and candidate_limit > (
+                    ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                ):
+                    # Expanded duplicate replay is optional.  The failed seed
+                    # verified no additional identity, so publish the last
+                    # fully verified checkpoint as a safe continuation instead
+                    # of failing the picker or moving through unverified rows.
+                    candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                    break
                 if (
                     is_read_budget_error(exc)
                     and cursor_before is None
@@ -3615,12 +3635,28 @@ class AttributeReadSelector:
 
             if candidate_ids:
                 candidate_pages += 1
-                rows = self._verify_latest(
-                    sql=_LATEST_TARGET_SQL,
-                    project_ids=projects,
-                    candidate_ids=candidate_ids,
-                    attribute_key=key,
-                )
+                try:
+                    rows = self._verify_latest(
+                        sql=_LATEST_TARGET_SQL,
+                        project_ids=projects,
+                        candidate_ids=candidate_ids,
+                        attribute_key=key,
+                        query_timeout_ms=(
+                            ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+                            if candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                            else None
+                        ),
+                    )
+                except Exception as exc:
+                    if is_read_budget_error(exc) and candidate_limit > (
+                        ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                    ):
+                        # The expanded identities were not verified, so they
+                        # cannot advance the public cursor.  Return the prior
+                        # proven checkpoint as an exact continuation.
+                        candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                        break
+                    raise
             else:
                 rows = ()
 
@@ -3669,10 +3705,18 @@ class AttributeReadSelector:
                     checkpoint_from_widened_segment = False
                 else:
                     checkpoint_from_widened_segment = False
+                if emitted:
+                    candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                else:
+                    candidate_limit = min(
+                        candidate_limit * 2,
+                        ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT,
+                    )
             else:
                 current_segment_end = segment_start
                 cursor_before = None
                 checkpoint_from_widened_segment = False
+                candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                 if candidate_ids:
                     empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
                 else:
