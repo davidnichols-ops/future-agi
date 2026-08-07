@@ -3,7 +3,9 @@ Root conftest.py for core-backend tests.
 Provides common fixtures for all test modules.
 """
 
+import ipaddress
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -141,8 +143,75 @@ def _strict_ch25_apply() -> bool:
     return _os.getenv("FI_CH25_SCHEMA_APPLY_STRICT", "").lower() in ("1", "true", "yes")
 
 
+class UnsafeClickHouseTestTarget(RuntimeError):
+    """Raised before a test helper can mutate an unsafe ClickHouse target."""
+
+
+_CLICKHOUSE_DATABASE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CLICKHOUSE_TEST_DATABASE_NAME = re.compile(r"^_?test_[a-z0-9_]+$", re.IGNORECASE)
+
+
+def _is_loopback_ch25_host(host: str) -> bool:
+    """Return true only for explicit loopback names or literal addresses.
+
+    Hostnames are deliberately not DNS-resolved here: a mutable DNS answer must
+    not be able to turn a non-local test target into an implicitly trusted one.
+    """
+
+    normalized = str(host or "").strip().lower().rstrip(".")
+    if normalized == "localhost":
+        return True
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
+def _require_safe_ch25_test_target(*, host: str, database: str) -> None:
+    """Fail closed before pytest issues ClickHouse DDL or mutation commands.
+
+    Literal loopback targets are trusted for local development. A Docker/CI
+    sidecar addressed by a non-loopback hostname must be opted into explicitly
+    with ``FI_ALLOW_NONLOCAL_CH25_TEST_MUTATIONS=true`` and must use a database
+    beginning with ``test_`` (or ``_test_``). Never set that opt-in for a shared
+    or production ClickHouse service.
+    """
+
+    normalized_host = str(host or "").strip()
+    normalized_database = str(database or "").strip()
+    if not normalized_host:
+        raise UnsafeClickHouseTestTarget(
+            "Refusing ClickHouse test mutations without an explicit host."
+        )
+    if not _CLICKHOUSE_DATABASE_NAME.fullmatch(normalized_database):
+        raise UnsafeClickHouseTestTarget(
+            "Refusing ClickHouse test mutations without a valid database name."
+        )
+    if _is_loopback_ch25_host(normalized_host):
+        return
+
+    opted_in = (
+        os.getenv("FI_ALLOW_NONLOCAL_CH25_TEST_MUTATIONS", "").strip().lower() == "true"
+    )
+    if not opted_in or not _CLICKHOUSE_TEST_DATABASE_NAME.fullmatch(
+        normalized_database
+    ):
+        raise UnsafeClickHouseTestTarget(
+            "Refusing ClickHouse test mutations on non-loopback host "
+            f"{normalized_host!r} with database {normalized_database!r}. "
+            "An isolated sidecar requires "
+            "FI_ALLOW_NONLOCAL_CH25_TEST_MUTATIONS=true and a test_* database."
+        )
+
+
 def _apply_ch25_schema_for_tests():
-    """Apply CH 25.3 v2 schema (002-013) to the test ClickHouse BEFORE
+    """Apply the CH 25.3 v2 schema to the test ClickHouse BEFORE
     Django app startup runs `model_hub.apps._ensure_analytics_schema`.
 
     The legacy analytics path creates a `spans` table with the old
@@ -189,6 +258,10 @@ def _apply_ch25_schema_for_tests():
     ch_user = _os.getenv("CH25_USER") or _os.getenv("CH_USERNAME") or "default"
     ch_db = _os.getenv("CH25_DATABASE") or _os.getenv("CH_DATABASE") or "test_tfc"
     ch_password = _os.getenv("CH25_PASSWORD") or _os.getenv("CH_PASSWORD") or ""
+
+    # This must remain outside the broad schema-apply error handler below. A
+    # safety-policy failure is never a best-effort warning.
+    _require_safe_ch25_test_target(host=ch_host, database=ch_db)
 
     schema_dir = (
         Path(__file__).parent / "tracer" / "services" / "clickhouse" / "v2" / "schema"
@@ -358,6 +431,7 @@ def _drop_legacy_ch_spans_mvs():
         # `clickhouse` is the dev compose hostname; in tests force localhost.
         if host == "clickhouse":
             host = "localhost"
+        _require_safe_ch25_test_target(host=host, database=cfg["database"])
         client = clickhouse_connect.get_client(
             host=host,
             port=cfg["http_port"],
@@ -370,6 +444,10 @@ def _drop_legacy_ch_spans_mvs():
                 client.command(f"DROP VIEW IF EXISTS {mv}")
         finally:
             client.close()
+    except UnsafeClickHouseTestTarget:
+        # Never let the fixture's best-effort cleanup behavior swallow the
+        # fail-closed target policy.
+        raise
     except Exception:
         # Don't fail the suite if the CH test sidecar isn't reachable; the
         # tests that actually need CH will fail with a clearer error.

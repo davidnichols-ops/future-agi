@@ -35,6 +35,10 @@ GRAPH_WALL_DEADLINE_MS = 4_400
 GRAPH_QUERY_TIMEOUT_MS = 1_200
 GRAPH_DECORATION_TIMEOUT_MS = 900
 GRAPH_EVENT_LIMIT = 2_000
+# Part of the cache identity, not a database schema version. Incrementing this
+# prevents a rolling deploy from serving a 30-day cached payload produced by
+# the retired chronological-sibling path algorithm.
+AGENT_GRAPH_PAYLOAD_VERSION = 2
 # A short-window selector may prove as many as 4,096 trace matches. Decoration
 # fans each trace set into child-span reads, so keep the same finite 40-trace
 # envelope used by the long-window sampler before any decoration query runs.
@@ -855,7 +859,11 @@ def fetch_agent_graph_ch(
     normalized_filters = list(filters or [])
     return _read_or_refresh_exact_graph(
         namespace="observe-agent-graph",
-        identity={"project_id": project_id, "filters": normalized_filters},
+        identity={
+            "project_id": project_id,
+            "filters": normalized_filters,
+            "payload_version": AGENT_GRAPH_PAYLOAD_VERSION,
+        },
         refresh=bool(refresh),
         pending_payload={
             "nodes": [],

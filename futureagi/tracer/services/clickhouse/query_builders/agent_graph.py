@@ -3,7 +3,8 @@
 The graph and path are two views of the same current span set:
 
 * ``edges`` are exact parent -> child topology transitions;
-* ``path_edges`` are exact adjacent chronological transitions inside each trace.
+* ``path_edges`` are the same exact recorded parent -> child relationships,
+  projected separately for the Agent Path renderer.
 
 Both, together with node metrics, are produced by one ClickHouse statement and
 one physical ``spans`` reference.  This matters on ClickHouse 25.3: named CTEs
@@ -24,6 +25,20 @@ from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
     compile_exact_graph_row_predicates,
 )
+
+AGENT_GRAPH_MAX_VISIBLE_NODES = 64
+AGENT_GRAPH_OTHER_NODE_ID = "aggregate:__other_nodes__"
+AGENT_GRAPH_OTHER_NODE_NAME = "__other_nodes__"
+# The final SQL fold emits at most N nodes plus N^2 hierarchy and N^2 path
+# transitions. Keep one extra sentinel row in the transport limit so an
+# accidental regression fails closed before Python allocates an unbounded
+# response.
+AGENT_GRAPH_MAX_RESULT_ROWS = (
+    AGENT_GRAPH_MAX_VISIBLE_NODES
+    + 2 * AGENT_GRAPH_MAX_VISIBLE_NODES * AGENT_GRAPH_MAX_VISIBLE_NODES
+)
+AGENT_GRAPH_RESULT_ROW_SENTINEL = AGENT_GRAPH_MAX_RESULT_ROWS + 1
+AGENT_GRAPH_MAX_RESULT_BYTES = 64 * 1024 * 1024
 
 
 class AgentGraphQueryBuilder(BaseQueryBuilder):
@@ -54,6 +69,8 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                 # while contribution rows remain inside the selected window.
                 "graph_witness_start_date": self.start_date - timedelta(days=1),
                 "graph_witness_end_date": self.end_date + timedelta(days=1),
+                "graph_visible_keep_count": AGENT_GRAPH_MAX_VISIBLE_NODES - 1,
+                "graph_other_node_name": AGENT_GRAPH_OTHER_NODE_NAME,
             }
         )
 
@@ -74,6 +91,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
             "name",
             "observation_type",
             "start_time",
+            "end_time",
             "toFloat64(latency_ms)",
             "toInt64(total_tokens)",
             "toFloat64(cost)",
@@ -86,6 +104,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
             "name",
             "observation_type",
             "start_time",
+            "end_time",
             "latency_ms",
             "total_tokens",
             "cost",
@@ -115,6 +134,10 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         return (
             f"tuple({prefix}id, {prefix}parent_span_id, {prefix}name, "
             f"{prefix}observation_type, toUnixTimestamp64Micro({prefix}start_time), "
+            "greatest(toUnixTimestamp64Micro("
+            f"{prefix}start_time), toUnixTimestamp64Micro(ifNull({prefix}end_time, "
+            f"addMicroseconds({prefix}start_time, toInt64(greatest("
+            f"toFloat64({prefix}latency_ms), 0) * 1000))))), "
             f"toFloat64({prefix}latency_ms), toInt64({prefix}total_tokens), "
             f"toFloat64({prefix}cost), {prefix}status)"
         )
@@ -168,8 +191,8 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
 
         span_tuple = self._span_tuple("")
         # Tuple indexes in ``graph_spans``:
-        #   1 id, 2 parent id, 3 name, 4 type, 5 start-us,
-        #   6 latency, 7 tokens, 8 cost, 9 status.
+        #   1 id, 2 parent id, 3 name, 4 type, 5 start-us, 6 end-us,
+        #   7 latency, 8 tokens, 9 cost, 10 status.
         node_events = """arrayMap(
                     graph_span -> tuple(
                         'node',
@@ -177,61 +200,54 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                         tupleElement(graph_span, 4),
                         '',
                         '',
-                        tupleElement(graph_span, 6),
                         tupleElement(graph_span, 7),
                         tupleElement(graph_span, 8),
-                        toUInt8(upper(tupleElement(graph_span, 9)) IN
+                        tupleElement(graph_span, 9),
+                        toUInt8(upper(tupleElement(graph_span, 10)) IN
                             ('ERROR', 'ERRORED', 'FAILED'))
                     ),
                     graph_spans
                 )"""
-        hierarchy_events = """arrayMap(
-                    graph_child -> tuple(
-                        'hierarchy',
-                        tupleElement(arrayFirst(
-                            graph_parent -> tupleElement(graph_parent, 1)
-                                = tupleElement(graph_child, 2),
-                            graph_spans
-                        ), 3),
-                        tupleElement(arrayFirst(
-                            graph_parent -> tupleElement(graph_parent, 1)
-                                = tupleElement(graph_child, 2),
-                            graph_spans
-                        ), 4),
-                        tupleElement(graph_child, 3),
-                        tupleElement(graph_child, 4),
-                        tupleElement(graph_child, 6),
-                        tupleElement(graph_child, 7),
-                        tupleElement(graph_child, 8),
-                        toUInt8(upper(tupleElement(graph_child, 9)) IN
-                            ('ERROR', 'ERRORED', 'FAILED'))
-                    ),
-                    arrayFilter(
-                        graph_child -> tupleElement(graph_child, 2) != ''
-                            AND arrayExists(
-                                graph_parent -> tupleElement(graph_parent, 1)
-                                    = tupleElement(graph_child, 2),
-                                graph_spans
+
+        def direct_edge_events(kind: str) -> str:
+            """Return exact recorded parent -> child events for one wire view.
+
+            A span's timestamps do not prove causality between siblings.  In
+            particular, connecting every member of adjacent concurrent groups
+            creates an unbounded F x G Cartesian product and invents edges that
+            were never recorded.  Both graph views therefore use only the
+            explicit ``parent_span_id`` topology.
+            """
+
+            return f"""arrayFlatten(arrayMap(
+                    graph_sibling_set -> if(
+                        tupleElement(graph_sibling_set, 2) > 0,
+                        arrayMap(
+                            graph_child -> tuple(
+                                '{kind}',
+                                tupleElement(graph_id_sorted_spans[
+                                    tupleElement(graph_sibling_set, 2)
+                                ], 3),
+                                tupleElement(graph_id_sorted_spans[
+                                    tupleElement(graph_sibling_set, 2)
+                                ], 4),
+                                tupleElement(graph_child, 3),
+                                tupleElement(graph_child, 4),
+                                tupleElement(graph_child, 7),
+                                tupleElement(graph_child, 8),
+                                tupleElement(graph_child, 9),
+                                toUInt8(upper(tupleElement(graph_child, 10)) IN
+                                    ('ERROR', 'ERRORED', 'FAILED'))
                             ),
-                        graph_spans
-                    )
-                )"""
-        path_events = """arrayMap(
-                    graph_index -> tuple(
-                        'path',
-                        tupleElement(graph_ordered_spans[graph_index], 3),
-                        tupleElement(graph_ordered_spans[graph_index], 4),
-                        tupleElement(graph_ordered_spans[graph_index + 1], 3),
-                        tupleElement(graph_ordered_spans[graph_index + 1], 4),
-                        tupleElement(graph_ordered_spans[graph_index + 1], 6),
-                        tupleElement(graph_ordered_spans[graph_index + 1], 7),
-                        tupleElement(graph_ordered_spans[graph_index + 1], 8),
-                        toUInt8(upper(tupleElement(
-                            graph_ordered_spans[graph_index + 1], 9
-                        )) IN ('ERROR', 'ERRORED', 'FAILED'))
+                            tupleElement(graph_sibling_set, 1)
+                        ),
+                        []
                     ),
-                    range(1, length(graph_ordered_spans))
-                )"""
+                    graph_sibling_sets
+                ))"""
+
+        hierarchy_events = direct_edge_events("hierarchy")
+        path_events = direct_edge_events("path")
 
         query = f"""
         WITH graph_latest_spans AS (
@@ -279,12 +295,61 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                 graph_spans,
                 arraySort(
                     graph_span -> tuple(
-                        tupleElement(graph_span, 5),
                         tupleElement(graph_span, 1)
                     ),
                     graph_spans
-                ) AS graph_ordered_spans
+                ) AS graph_id_sorted_spans,
+                arraySort(
+                    graph_span -> tuple(
+                        tupleElement(graph_span, 2),
+                        tupleElement(graph_span, 5),
+                        tupleElement(graph_span, 6),
+                        tupleElement(graph_span, 1)
+                    ),
+                    graph_spans
+                ) AS graph_sibling_sorted_spans
             FROM graph_traces
+        ),
+        graph_indexed_traces AS (
+            SELECT
+                trace_id,
+                graph_spans,
+                graph_id_sorted_spans,
+                arrayMap(
+                    graph_span -> tupleElement(graph_span, 1),
+                    graph_id_sorted_spans
+                ) AS graph_sorted_span_ids,
+                arraySplit(
+                    (graph_span, graph_index) -> graph_index > 1
+                        AND tupleElement(graph_span, 2) != tupleElement(
+                            graph_sibling_sorted_spans[graph_index - 1], 2
+                        ),
+                    graph_sibling_sorted_spans,
+                    arrayEnumerate(graph_sibling_sorted_spans)
+                ) AS graph_sibling_groups
+            FROM graph_ordered_traces
+        ),
+        graph_prepared_traces AS (
+            SELECT
+                trace_id,
+                graph_spans,
+                graph_id_sorted_spans,
+                arrayMap(
+                    graph_siblings -> tuple(
+                        graph_siblings,
+                        if(
+                            length(graph_siblings) = 0
+                                OR tupleElement(graph_siblings[1], 2) = '',
+                            toUInt64(0),
+                            indexOfAssumeSorted(
+                                graph_sorted_span_ids,
+                                tupleElement(graph_siblings[1], 2)
+                            )
+                        )
+                    ),
+                    graph_sibling_groups
+                ) AS graph_sibling_sets
+            FROM graph_indexed_traces
         ),
         graph_events AS (
             SELECT
@@ -294,34 +359,166 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                     {hierarchy_events},
                     {path_events}
                 )) AS graph_event
-            FROM graph_ordered_traces
+            FROM graph_prepared_traces
+        ),
+        graph_trace_events AS (
+            SELECT
+                trace_id,
+                tupleElement(graph_event, 1) AS row_kind,
+                tupleElement(graph_event, 2) AS source_node,
+                tupleElement(graph_event, 3) AS source_type,
+                tupleElement(graph_event, 4) AS target_node,
+                tupleElement(graph_event, 5) AS target_type,
+                count() AS trace_item_count,
+                sum(tupleElement(graph_event, 6)) AS trace_latency_sum,
+                sum(tupleElement(graph_event, 7)) AS trace_total_tokens,
+                sum(tupleElement(graph_event, 8)) AS trace_total_cost,
+                sum(tupleElement(graph_event, 9)) AS trace_error_count
+            FROM graph_events
+            GROUP BY
+                trace_id,
+                row_kind,
+                source_node,
+                source_type,
+                target_node,
+                target_type
+        ),
+        graph_aggregate_events AS (
+            SELECT
+                row_kind,
+                source_node,
+                source_type,
+                target_node,
+                target_type,
+                sum(trace_item_count) AS item_count,
+                sum(trace_latency_sum) AS latency_sum,
+                sum(trace_total_tokens) AS total_tokens,
+                sum(trace_total_cost) AS total_cost,
+                sum(trace_error_count) AS error_count,
+                count() AS trace_count
+            FROM graph_trace_events
+            GROUP BY
+                row_kind,
+                source_node,
+                source_type,
+                target_node,
+                target_type
+        ),
+        graph_ranked_events AS (
+            SELECT
+                *,
+                row_number() OVER (
+                    ORDER BY
+                        row_kind != 'node',
+                        if(row_kind = 'node', item_count, 0) DESC,
+                        if(row_kind = 'node', source_type, ''),
+                        if(row_kind = 'node', source_node, '')
+                ) AS graph_global_rank
+            FROM graph_aggregate_events
+        ),
+        graph_fold_inputs AS (
+            SELECT
+                *,
+                groupArrayIf(
+                    tuple(source_type, source_node),
+                    row_kind = 'node'
+                        AND graph_global_rank <= %(graph_visible_keep_count)s
+                ) OVER () AS graph_visible_nodes,
+                countIf(row_kind = 'node') OVER () AS graph_total_nodes
+            FROM graph_ranked_events
+        ),
+        graph_fold_flags AS (
+            SELECT
+                *,
+                has(
+                    graph_visible_nodes,
+                    tuple(source_type, source_node)
+                ) AS graph_source_visible,
+                row_kind = 'node' OR has(
+                    graph_visible_nodes,
+                    tuple(target_type, target_node)
+                ) AS graph_target_visible
+            FROM graph_fold_inputs
+        ),
+        graph_mapped_events AS (
+            SELECT
+                row_kind,
+                if(
+                    graph_source_visible,
+                    source_node,
+                    %(graph_other_node_name)s
+                ) AS mapped_source_node,
+                if(
+                    graph_source_visible,
+                    source_type,
+                    'aggregate'
+                ) AS mapped_source_type,
+                if(
+                    graph_target_visible,
+                    target_node,
+                    %(graph_other_node_name)s
+                ) AS mapped_target_node,
+                if(
+                    graph_target_visible,
+                    target_type,
+                    'aggregate'
+                ) AS mapped_target_type,
+                item_count AS mapped_item_count,
+                latency_sum AS mapped_latency_sum,
+                total_tokens AS mapped_total_tokens,
+                total_cost AS mapped_total_cost,
+                error_count AS mapped_error_count,
+                trace_count AS mapped_trace_count,
+                graph_source_visible,
+                graph_target_visible,
+                graph_total_nodes
+            FROM graph_fold_flags
         )
         SELECT
-            tupleElement(graph_event, 1) AS row_kind,
-            tupleElement(graph_event, 2) AS source_node,
-            tupleElement(graph_event, 3) AS source_type,
-            tupleElement(graph_event, 4) AS target_node,
-            tupleElement(graph_event, 5) AS target_type,
-            count() AS item_count,
-            avg(tupleElement(graph_event, 6)) AS avg_latency_ms,
-            sum(tupleElement(graph_event, 7)) AS total_tokens,
-            sum(tupleElement(graph_event, 8)) AS total_cost,
-            sum(tupleElement(graph_event, 9)) AS error_count,
-            uniqExact(trace_id) AS trace_count
-        FROM graph_events
+            row_kind,
+            mapped_source_node AS source_node,
+            mapped_source_type AS source_type,
+            mapped_target_node AS target_node,
+            mapped_target_type AS target_type,
+            sum(mapped_item_count) AS item_count,
+            if(
+                sum(mapped_item_count) = 0,
+                0,
+                sum(mapped_latency_sum) / sum(mapped_item_count)
+            ) AS avg_latency_ms,
+            sum(mapped_total_tokens) AS total_tokens,
+            sum(mapped_total_cost) AS total_cost,
+            sum(mapped_error_count) AS error_count,
+            if(
+                graph_source_visible AND graph_target_visible,
+                toNullable(sum(mapped_trace_count)),
+                NULL
+            ) AS trace_count,
+            toUInt8(graph_source_visible AND graph_target_visible)
+                AS trace_count_exact,
+            max(graph_total_nodes) AS graph_total_nodes,
+            if(row_kind = 'node', count(), 0) AS aggregate_member_count,
+            toUInt8(graph_source_visible) AS source_endpoint_exact,
+            toUInt8(graph_target_visible) AS target_endpoint_exact
+        FROM graph_mapped_events
         GROUP BY
             row_kind,
-            source_node,
-            source_type,
-            target_node,
-            target_type
+            mapped_source_node,
+            mapped_source_type,
+            mapped_target_node,
+            mapped_target_type,
+            graph_source_visible,
+            graph_target_visible
         ORDER BY row_kind, item_count DESC, source_type, source_node,
                  target_type, target_node
         SETTINGS
             max_threads = 1,
             optimize_aggregation_in_order = 1,
             max_bytes_before_external_group_by = 33554432,
-            max_bytes_before_external_sort = 33554432
+            max_bytes_before_external_sort = 33554432,
+            max_result_rows = {AGENT_GRAPH_RESULT_ROW_SENTINEL},
+            max_result_bytes = {AGENT_GRAPH_MAX_RESULT_BYTES},
+            result_overflow_mode = 'throw'
         """
         return query, self.params
 
@@ -350,6 +547,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
         path_edges: list[dict[str, Any]] = []
+        original_node_count = 0
         for row in rows or []:
             kind = str(value(row, "row_kind", 0, ""))
             source_name = str(value(row, "source_node", 1, ""))
@@ -361,27 +559,56 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
             total_tokens = int(value(row, "total_tokens", 7, 0) or 0)
             total_cost = float(value(row, "total_cost", 8, 0) or 0)
             error_count = int(value(row, "error_count", 9, 0) or 0)
-            trace_count = int(value(row, "trace_count", 10, 0) or 0)
+            raw_trace_count = value(row, "trace_count", 10, 0)
+            trace_count = int(raw_trace_count) if raw_trace_count is not None else None
+            trace_count_exact = bool(
+                value(row, "trace_count_exact", 11, raw_trace_count is not None)
+            )
+            original_node_count = max(
+                original_node_count,
+                int(value(row, "graph_total_nodes", 12, 0) or 0),
+            )
+            member_count = int(value(row, "aggregate_member_count", 13, 1) or 0)
+            source_endpoint_exact = bool(value(row, "source_endpoint_exact", 14, True))
+            target_endpoint_exact = bool(value(row, "target_endpoint_exact", 15, True))
 
-            source_id = self._make_node_id(source_name, source_type)
+            source_id = (
+                self._make_node_id(source_name, source_type)
+                if source_endpoint_exact
+                else AGENT_GRAPH_OTHER_NODE_ID
+            )
             if kind == "node":
+                is_aggregate = not source_endpoint_exact
                 nodes.append(
                     {
                         "id": source_id,
-                        "name": source_name,
-                        "type": source_type,
+                        "name": "Other nodes" if is_aggregate else source_name,
+                        "type": "aggregate" if is_aggregate else source_type,
                         "span_count": count,
                         "avg_latency_ms": round(avg_latency, 2),
                         "total_tokens": total_tokens,
                         "total_cost": round(total_cost, 6),
                         "error_count": error_count,
                         "trace_count": trace_count,
+                        **(
+                            {
+                                "trace_count_exact": trace_count_exact,
+                                "is_aggregate": True,
+                                "member_count": member_count,
+                            }
+                            if is_aggregate
+                            else {}
+                        ),
                     }
                 )
                 continue
             if kind not in {"hierarchy", "path"}:
                 continue
-            target_id = self._make_node_id(target_name, target_type)
+            target_id = (
+                self._make_node_id(target_name, target_type)
+                if target_endpoint_exact
+                else AGENT_GRAPH_OTHER_NODE_ID
+            )
             edge = {
                 "source": source_id,
                 "target": target_id,
@@ -392,7 +619,171 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                 "error_count": error_count,
                 "trace_count": trace_count,
                 "is_self_loop": source_id == target_id,
+                **(
+                    {"trace_count_exact": trace_count_exact, "is_aggregate": True}
+                    if not (source_endpoint_exact and target_endpoint_exact)
+                    else {}
+                ),
             }
             (edges if kind == "hierarchy" else path_edges).append(edge)
 
-        return {"nodes": nodes, "edges": edges, "path_edges": path_edges}
+        return self._bound_result(
+            nodes,
+            edges,
+            path_edges,
+            original_node_count=original_node_count or len(nodes),
+        )
+
+    @staticmethod
+    def _bound_result(
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        path_edges: list[dict[str, Any]],
+        *,
+        original_node_count: int | None = None,
+    ) -> dict[str, Any]:
+        """Keep the wire graph UI-safe without sampling or inventing topology.
+
+        Exact aggregation can legitimately discover an unbounded vocabulary of
+        span names.  A browser cannot render an unbounded V x V graph, so when
+        necessary we keep the highest-volume nodes deterministically and fold
+        every omitted endpoint into one explicit ``Other nodes`` vertex.  Edge
+        counts and additive metrics remain exact; no transition is discarded.
+
+        Distinct trace counts cannot be unioned from already-aggregated rows, so
+        the synthetic node/edges mark that one metric unavailable instead of
+        publishing a false sum.
+        """
+
+        if len(nodes) <= AGENT_GRAPH_MAX_VISIBLE_NODES:
+            aggregate_nodes = [node for node in nodes if node.get("is_aggregate")]
+            graph_collapsed = bool(aggregate_nodes)
+            visible_original_nodes = len(nodes) - len(aggregate_nodes)
+            total_nodes = max(
+                int(original_node_count or 0),
+                visible_original_nodes,
+            )
+            omitted_node_count = sum(
+                max(0, int(node.get("member_count") or 0)) for node in aggregate_nodes
+            )
+            if graph_collapsed and not omitted_node_count:
+                omitted_node_count = max(0, total_nodes - visible_original_nodes)
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "path_edges": path_edges,
+                "graph_collapsed": graph_collapsed,
+                "graph_node_limit": AGENT_GRAPH_MAX_VISIBLE_NODES,
+                "omitted_node_count": omitted_node_count,
+            }
+
+        keep_count = AGENT_GRAPH_MAX_VISIBLE_NODES - 1
+        ordered = sorted(
+            nodes,
+            key=lambda node: (
+                -int(node.get("span_count") or 0),
+                str(node.get("id") or ""),
+            ),
+        )
+        kept = ordered[:keep_count]
+        omitted = ordered[keep_count:]
+        kept_ids = {str(node["id"]) for node in kept}
+        all_ids = {str(node.get("id") or "") for node in nodes}
+        other_node_id = AGENT_GRAPH_OTHER_NODE_ID
+        while other_node_id in all_ids:
+            other_node_id += ":overflow"
+
+        omitted_span_count = sum(int(node.get("span_count") or 0) for node in omitted)
+        omitted_latency_total = sum(
+            float(node.get("avg_latency_ms") or 0) * int(node.get("span_count") or 0)
+            for node in omitted
+        )
+        other_node = {
+            "id": other_node_id,
+            "name": "Other nodes",
+            "type": "aggregate",
+            "span_count": omitted_span_count,
+            "avg_latency_ms": round(
+                omitted_latency_total / omitted_span_count if omitted_span_count else 0,
+                2,
+            ),
+            "total_tokens": sum(int(node.get("total_tokens") or 0) for node in omitted),
+            "total_cost": round(
+                sum(float(node.get("total_cost") or 0) for node in omitted), 6
+            ),
+            "error_count": sum(int(node.get("error_count") or 0) for node in omitted),
+            "trace_count": None,
+            "trace_count_exact": False,
+            "is_aggregate": True,
+            "member_count": len(omitted),
+        }
+
+        def collapse_edge_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            buckets: dict[tuple[str, str], dict[str, Any]] = {}
+            for edge in rows:
+                raw_source = str(edge.get("source") or "")
+                raw_target = str(edge.get("target") or "")
+                source = raw_source if raw_source in kept_ids else other_node_id
+                target = raw_target if raw_target in kept_ids else other_node_id
+                key = (source, target)
+                count = int(edge.get("transition_count") or 0)
+                bucket = buckets.setdefault(
+                    key,
+                    {
+                        "source": source,
+                        "target": target,
+                        "transition_count": 0,
+                        "_latency_total": 0.0,
+                        "total_tokens": 0,
+                        "total_cost": 0.0,
+                        "error_count": 0,
+                        "trace_count": 0,
+                        "_collapsed": False,
+                    },
+                )
+                bucket["transition_count"] += count
+                bucket["_latency_total"] += (
+                    float(edge.get("avg_latency_ms") or 0) * count
+                )
+                bucket["total_tokens"] += int(edge.get("total_tokens") or 0)
+                bucket["total_cost"] += float(edge.get("total_cost") or 0)
+                bucket["error_count"] += int(edge.get("error_count") or 0)
+                bucket["trace_count"] += int(edge.get("trace_count") or 0)
+                bucket["_collapsed"] = bucket["_collapsed"] or (
+                    source != raw_source or target != raw_target
+                )
+
+            collapsed: list[dict[str, Any]] = []
+            for key in sorted(buckets):
+                bucket = buckets[key]
+                count = int(bucket["transition_count"])
+                trace_count_exact = not bucket["_collapsed"]
+                collapsed.append(
+                    {
+                        "source": bucket["source"],
+                        "target": bucket["target"],
+                        "transition_count": count,
+                        "avg_latency_ms": round(
+                            bucket["_latency_total"] / count if count else 0, 2
+                        ),
+                        "total_tokens": bucket["total_tokens"],
+                        "total_cost": round(bucket["total_cost"], 6),
+                        "error_count": bucket["error_count"],
+                        "trace_count": (
+                            bucket["trace_count"] if trace_count_exact else None
+                        ),
+                        "trace_count_exact": trace_count_exact,
+                        "is_self_loop": bucket["source"] == bucket["target"],
+                        "is_aggregate": bool(bucket["_collapsed"]),
+                    }
+                )
+            return collapsed
+
+        return {
+            "nodes": [*kept, other_node],
+            "edges": collapse_edge_rows(edges),
+            "path_edges": collapse_edge_rows(path_edges),
+            "graph_collapsed": True,
+            "graph_node_limit": AGENT_GRAPH_MAX_VISIBLE_NODES,
+            "omitted_node_count": len(omitted),
+        }

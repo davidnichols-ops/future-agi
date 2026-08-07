@@ -13,6 +13,7 @@ from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     compile_span_filter_plans,
 )
 from tracer.services.clickhouse.v2.query_builders.filters import (
+    ClickHouseFilterBuilderV2,
     rewrite_v1_sql_to_v2,
 )
 from tracer.services.clickhouse.v2.query_builders.span_list import (
@@ -53,6 +54,135 @@ def _attribute_filter(
     if filter_value is not None:
         config["filter_value"] = filter_value
     return {"column_id": key, "filter_config": config}
+
+
+def test_serializer_and_compiler_preserve_mixed_typed_picker_values() -> None:
+    payload = _attribute_filter(
+        "attempt",
+        filter_type="text",
+        filter_op="in",
+        filter_value=["1", 1, True],
+    )
+    payload["filter_config"]["attribute_value_types"] = [
+        "string",
+        "number",
+        "boolean",
+    ]
+
+    validated = FilterListField().run_validation([payload])
+    config = validated[0]["filter_config"]
+    assert config["filter_value"] == ["1", 1.0, True]
+    assert config["attribute_value_types"] == ["string", "number", "boolean"]
+
+    where, params = ClickHouseFilterBuilderV2(query_mode="span").translate(validated)
+    assert "mapContains(attrs_string, 'attempt')" in where
+    assert "mapContains(attrs_number, 'attempt')" in where
+    assert "mapContains(attrs_bool, 'attempt')" in where
+    assert ("1",) in params.values()
+    assert (1.0,) in params.values()
+    assert (1,) in params.values()
+
+
+def test_mixed_typed_not_in_negates_any_matching_representation() -> None:
+    payload = _attribute_filter(
+        "attempt",
+        filter_type="text",
+        filter_op="not_in",
+        filter_value=["1", 1],
+    )
+    payload["filter_config"]["attribute_value_types"] = ["string", "number"]
+    validated = FilterListField().run_validation([payload])
+
+    where, _ = ClickHouseFilterBuilderV2(query_mode="span").translate(validated)
+    assert "AND NOT" in where
+    assert "mapContains(attrs_string, 'attempt')" in where
+    assert "mapContains(attrs_number, 'attempt')" in where
+    assert "NOT IN" not in where
+
+
+@pytest.mark.parametrize(
+    ("compiler_mode", "expected_scope"), [("span", "span"), ("trace", "any")]
+)
+def test_bounded_latest_compiler_preserves_mixed_typed_membership(
+    compiler_mode: str, expected_scope: str
+) -> None:
+    payload = _attribute_filter(
+        "attempt",
+        filter_type="text",
+        filter_op="in",
+        filter_value=["ONE", 1, True],
+    )
+    payload["filter_config"]["attribute_value_types"] = [
+        "string",
+        "number",
+        "boolean",
+    ]
+    validated = FilterListField().run_validation([payload])
+
+    if compiler_mode == "span":
+        plan = compile_span_filter_plans(validated)[0]
+    else:
+        from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+            compile_trace_filter_plans,
+        )
+
+        plan = compile_trace_filter_plans(validated)[0]
+
+    aggregate_sql = " ".join(plan.aggregates)
+    assert "span_attr_str" in aggregate_sql
+    assert "span_attr_num" in aggregate_sql
+    assert "span_attr_bool" in aggregate_sql
+    assert "latest_attr_exists_0_string" in plan.predicate
+    assert "latest_attr_exists_0_number" in plan.predicate
+    assert "latest_attr_exists_0_boolean" in plan.predicate
+    assert " OR " in plan.predicate
+    assert plan.params["latest_filter_param_0_string"] == ("one",)
+    assert plan.params["latest_filter_param_0_number"] == (1.0,)
+    assert plan.params["latest_filter_param_0_boolean"] == (1,)
+    assert plan.raw_witness_predicate is not None
+    assert plan.raw_key_witness_predicate is not None
+    assert plan.scope == expected_scope
+
+
+def test_bounded_latest_mixed_not_in_requires_key_and_negates_all_types() -> None:
+    payload = _attribute_filter(
+        "attempt",
+        filter_type="text",
+        filter_op="not_in",
+        filter_value=["1", 1],
+    )
+    payload["filter_config"]["attribute_value_types"] = ["string", "number"]
+    validated = FilterListField().run_validation([payload])
+
+    plan = compile_span_filter_plans(validated)[0]
+
+    assert (
+        "latest_attr_exists_0_string OR latest_attr_exists_0_number" in plan.predicate
+    )
+    assert "AND NOT" in plan.predicate
+    assert plan.raw_witness_predicate is None
+    assert plan.raw_key_witness_predicate is None
+
+
+@pytest.mark.parametrize(
+    "types,values,error",
+    [
+        (["string"], ["1", 1], "one-for-one"),
+        (["number"], [True], "finite numbers"),
+        (["boolean"], ["true"], "true or false"),
+        (["array"], ["x"], "string, number, boolean"),
+    ],
+)
+def test_serializer_rejects_invalid_typed_picker_provenance(
+    types: list[str], values: list[object], error: str
+) -> None:
+    payload = _attribute_filter(
+        "attempt", filter_type="text", filter_op="in", filter_value=values
+    )
+    payload["filter_config"]["attribute_value_types"] = types
+
+    with pytest.raises(serializers.ValidationError, match=error):
+        FilterListField().run_validation([payload])
 
 
 @pytest.mark.parametrize("filter_type", ["array", "list", "json"])

@@ -554,7 +554,7 @@ class DashboardFilterValueOptionSerializer(serializers.Serializer):
     value = JsonValueField(allow_null=True)
     label = serializers.CharField()
     type = serializers.ChoiceField(
-        choices=["string", "number", "boolean", "array"],
+        choices=["string", "number", "boolean", "array", "map", "json"],
         required=False,
     )
     # Annotator options retain these established optional presentation fields.
@@ -577,6 +577,10 @@ class DashboardFilterValuesResultSerializer(serializers.Serializer):
     query_window_start = serializers.DateTimeField(required=False)
     query_window_end = serializers.DateTimeField(required=False)
     has_more = serializers.BooleanField(required=False)
+    browse_status = serializers.ChoiceField(
+        choices=["continuation", "exhausted", "limit_reached"],
+        required=False,
+    )
     next_cursor = serializers.CharField(
         required=False,
         allow_null=True,

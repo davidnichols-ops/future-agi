@@ -412,7 +412,10 @@ def test_session_full_state_classifier_reads_old_user_membership_by_candidate() 
     assert "start_time >= %(start_date)s" not in sql
     assert "start_time < %(end_date)s" not in sql
     assert "toDate(start_time) BETWEEN" not in sql
-    assert "trace_session_id IN %(candidate_filter_session_ids)s" in sql
+    assert "candidate_filter_sessions AS" in sql
+    assert "CAST(%(candidate_filter_session_id_array)s AS Array(UUID))" in sql
+    assert "SELECT session_id FROM candidate_filter_sessions" in sql
+    assert params["candidate_filter_session_id_array"] == [session_id]
 
 
 @pytest.mark.unit

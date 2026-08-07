@@ -59,6 +59,7 @@ from tracer.services.clickhouse.v2.query_builders.dashboard import (
     DashboardQueryBuilderV2,
 )
 from tracer.services.exact_aggregation_cache import snapshot_cache_key
+from tracer.utils.graphs_optimized import EvalGraphReadError
 from tracer.views.dashboard import (
     _DASHBOARD_TRACE_READ_SETTINGS,
     DashboardViewSet,
@@ -90,6 +91,7 @@ def _attribute_value_cursor_page(
     values,
     *,
     has_more,
+    browse_status=None,
     next_before_identity=None,
     next_resume_identity=None,
     next_resume_member_offset=0,
@@ -112,6 +114,7 @@ def _attribute_value_cursor_page(
         next_resume_identity=next_resume_identity,
         next_resume_member_offset=next_resume_member_offset,
         seen_value_digests=seen_value_digests,
+        browse_status=browse_status or ("continuation" if has_more else "exhausted"),
     )
 
 
@@ -209,6 +212,7 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
     start = datetime(2025, 8, 1, tzinfo=UTC)
     end = datetime(2026, 8, 1, tzinfo=UTC)
     project_id = "00000000-0000-0000-0000-000000000010"
+    eval_id = "00000000-0000-0000-0000-000000000040"
     workspace = SimpleNamespace(
         id="00000000-0000-0000-0000-000000000020",
         organization_id="00000000-0000-0000-0000-000000000030",
@@ -235,15 +239,37 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
                 "aggregation": "count",
                 "source": "traces",
             },
+            {
+                "id": eval_id,
+                "name": "quality",
+                "type": "eval_metric",
+                "aggregation": "avg",
+                "output_type": "SCORE",
+                "source": "all",
+            },
+            {
+                "id": "cost_breakdown.stt",
+                "name": "cost_breakdown.stt",
+                "type": "custom_attribute",
+                "aggregation": "avg",
+                "attribute_key": "cost_breakdown.stt",
+                "attribute_type": "number",
+                # Simulation custom attributes are stored on trace spans and
+                # must enter the exact trace compiler, not the simulation one.
+                "source": "simulation",
+            },
         ],
         "filters": [],
         "breakdowns": [],
     }
 
+    builder_configs = []
+
     class FakeTraceBuilder:
         def __init__(self, config):
             self.config = config
             self.metrics = config["metrics"]
+            builder_configs.append(config)
 
         def build_metric_query(self, metric):
             window = self.config["time_range"]
@@ -300,10 +326,12 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
             },
         )
 
-    assert len(analytics.calls) == 2
+    assert len(analytics.calls) == 4
     assert {call[0] for call in analytics.calls} == {
         "SELECT latency FROM spans FINAL",
         "SELECT traffic FROM spans FINAL",
+        f"SELECT {eval_id} FROM spans FINAL",
+        "SELECT cost_breakdown.stt FROM spans FINAL",
     }
     assert all(
         call_params["start_date"] == start
@@ -312,6 +340,20 @@ def test_dashboard_worker_runs_each_metric_once_without_snapshot_ceiling_metadat
         and "additional_table_filters" not in call_settings
         for _query, call_params, _timeout, call_settings in analytics.calls
     )
+    assert builder_configs
+    worker_config = builder_configs[0]
+    assert worker_config["workspace_id"] == workspace.id
+    assert worker_config["organization_id"] == workspace.organization_id
+    assert {metric["source"] for metric in worker_config["metrics"]} <= {
+        "traces",
+        "all",
+    }
+    routed_custom_metric = next(
+        metric
+        for metric in worker_config["metrics"]
+        if metric["id"] == "cost_breakdown.stt"
+    )
+    assert routed_custom_metric["source"] == "traces"
     result = response.data["result"]
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
@@ -986,6 +1028,7 @@ class TestMetricsEndpoint:
         assert metric["output_type"] == "PASS_FAIL"
         assert metric["choices"] == ["Passed", "Failed"]
 
+    @pytest.mark.integration
     @pytest.mark.django_db
     def test_metrics_includes_span_backed_annotation_labels(
         self, auth_client, project, observation_span, user, organization, workspace
@@ -1805,6 +1848,7 @@ class TestMetricsEndpoint:
             "failed",
         ]
         assert first_payload["has_more"] is True
+        assert first_payload["browse_status"] == "continuation"
         assert isinstance(first_payload["next_cursor"], str)
         assert first_payload["attribute_type"] == "string"
         assert first_payload["query_complete"] is True
@@ -1828,6 +1872,7 @@ class TestMetricsEndpoint:
         second_payload = second.json()["result"]
         assert [value["value"] for value in second_payload["values"]] == ["queued"]
         assert second_payload["has_more"] is False
+        assert second_payload["browse_status"] == "exhausted"
         assert second_payload["next_cursor"] is None
         assert selector.read_value_cursor_page.call_count == 2
         second_kwargs = selector.read_value_cursor_page.call_args_list[1].kwargs
@@ -1837,6 +1882,40 @@ class TestMetricsEndpoint:
             completed_digest,
             failed_digest,
         )
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_exposes_truthful_browse_limit(
+        self,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        mock_selector_cls.return_value.read_value_cursor_page.return_value = (
+            _attribute_value_cursor_page(
+                (),
+                has_more=False,
+                browse_status="limit_reached",
+            )
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {
+                "metric_name": "call.status",
+                "metric_type": "custom_attribute",
+                "project_ids": str(observe_project.id),
+                "source": "traces",
+                "page_size": 10,
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()["result"]
+        assert payload["values"] == []
+        assert payload["has_more"] is False
+        assert payload["next_cursor"] is None
+        assert payload["browse_status"] == "limit_reached"
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.AttributeReadSelector")
@@ -2368,10 +2447,10 @@ class TestChartsView:
         mock_analytics_cls.assert_not_called()
 
     @pytest.mark.django_db
-    @patch("tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService")
+    @patch("tracer.views.charts.get_eval_graph_data")
     def test_fetch_eval_graph_does_not_fall_back_or_expose_ch_error(
         self,
-        mock_analytics_cls,
+        mock_eval_graph,
         auth_client,
         observe_project,
         custom_eval_config,
@@ -2380,7 +2459,7 @@ class TestChartsView:
         custom_eval_config.save(update_fields=["project"])
         custom_eval_config.eval_template.config = {"output": "Pass/Fail"}
         custom_eval_config.eval_template.save(update_fields=["config"])
-        mock_analytics_cls.return_value.execute_ch_query.side_effect = RuntimeError(
+        mock_eval_graph.side_effect = EvalGraphReadError(
             "secret ClickHouse host and stack"
         )
 
@@ -2404,6 +2483,7 @@ class TestChartsView:
         payload = str(response.json())
         assert "temporarily unavailable" in payload
         assert "secret ClickHouse host" not in payload
+        mock_eval_graph.assert_called_once()
         pg_filter.assert_not_called()
 
     @pytest.mark.django_db
@@ -2414,6 +2494,9 @@ class TestChartsView:
         mock_system_metric_data.return_value = {
             "metric_name": "latency",
             "data": [],
+            "query_complete": True,
+            "query_status": "complete",
+            "query_sampled": False,
         }
 
         query = urlencode(
@@ -4716,39 +4799,6 @@ class TestDashboardQueryExecution:
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-    def test_query_action(self, mock_analytics_cls, auth_client, observe_project):
-        mock_service = MagicMock()
-        mock_result = MagicMock()
-        mock_result.data = [{"time_bucket": "2025-01-01T00:00:00", "value": 123.45}]
-        mock_service.execute_ch_query.return_value = mock_result
-        mock_analytics_cls.return_value = mock_service
-
-        response = auth_client.post(
-            "/tracer/dashboard/query/",
-            {
-                "project_ids": [str(observe_project.id)],
-                "granularity": "day",
-                "time_range": {"preset": "7D"},
-                "metrics": [
-                    {
-                        "id": "latency",
-                        "name": "latency",
-                        "type": "system_metric",
-                        "aggregation": "avg",
-                    }
-                ],
-            },
-            format="json",
-        )
-        assert response.status_code == 200
-        _, kwargs = mock_service.execute_ch_query.call_args
-        assert kwargs["settings"] == _DASHBOARD_TRACE_READ_SETTINGS
-        assert kwargs["settings"]["read_overflow_mode"] == "throw"
-        assert kwargs["settings"]["result_overflow_mode"] == "throw"
-        assert kwargs["settings"]["timeout_overflow_mode"] == "throw"
-
-    @pytest.mark.django_db
-    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
     def test_query_action_missing_project_ids_still_works(
         self, mock_analytics_cls, auth_client, observe_project
     ):
@@ -4777,83 +4827,6 @@ class TestDashboardQueryExecution:
             format="json",
         )
         assert response.status_code == 200
-
-    @pytest.mark.django_db
-    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-    def test_query_action_project_breakdown_uses_longer_timeout(
-        self, mock_analytics_cls, auth_client, observe_project
-    ):
-        mock_service = MagicMock()
-        mock_result = MagicMock()
-        mock_result.data = [
-            {
-                "time_bucket": "2025-01-01T00:00:00",
-                "breakdown_value": str(observe_project.id),
-                "value": 123.45,
-            }
-        ]
-        mock_service.execute_ch_query.return_value = mock_result
-        mock_analytics_cls.return_value = mock_service
-
-        response = auth_client.post(
-            "/tracer/dashboard/query/",
-            {
-                "project_ids": [str(observe_project.id)],
-                "granularity": "day",
-                "time_range": {"preset": "7D"},
-                "metrics": [
-                    {
-                        "id": "latency",
-                        "name": "latency",
-                        "type": "system_metric",
-                        "aggregation": "avg",
-                    }
-                ],
-                "breakdowns": [{"type": "system_metric", "name": "project"}],
-            },
-            format="json",
-        )
-        assert response.status_code == 200
-        _, kwargs = mock_service.execute_ch_query.call_args
-        assert kwargs["timeout_ms"] == 30000
-
-    @pytest.mark.django_db
-    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-    def test_query_action_simulation_custom_attribute_routes_to_trace_builder(
-        self, mock_analytics_cls, auth_client, observe_project
-    ):
-        mock_service = MagicMock()
-        mock_result = MagicMock()
-        mock_result.data = [{"time_bucket": "2025-01-01T00:00:00", "value": 0.01}]
-        mock_service.execute_ch_query.return_value = mock_result
-        mock_analytics_cls.return_value = mock_service
-
-        response = auth_client.post(
-            "/tracer/dashboard/query/",
-            {
-                "project_ids": [str(observe_project.id)],
-                "granularity": "day",
-                "time_range": {"preset": "7D"},
-                "metrics": [
-                    {
-                        "id": "cost_breakdown.stt",
-                        "name": "cost_breakdown.stt",
-                        "type": "custom_attribute",
-                        "attribute_key": "cost_breakdown.stt",
-                        "attribute_type": "number",
-                        "aggregation": "avg",
-                        "source": "simulation",
-                    }
-                ],
-            },
-            format="json",
-        )
-
-        assert response.status_code == 200
-        sql = mock_service.execute_ch_query.call_args.args[0]
-        assert "attrs_number" in sql
-        assert "FROM spans" in sql
-        assert "simulate_call_execution" not in sql
 
     def test_query_action_simulation_query_defect_fails_closed(
         self,
@@ -4903,6 +4876,7 @@ class TestDashboardQueryExecution:
         # partial chart that hides the broken query.
         assert mock_service.execute_ch_query.call_count == 2
 
+    @pytest.mark.integration
     @pytest.mark.django_db
     def test_query_action_eval_metric_runs_against_real_ch(
         self,
@@ -4945,128 +4919,6 @@ class TestDashboardQueryExecution:
         assert len(metrics) == 1
         # Query parsed + executed cleanly; no per-widget error attached.
         assert "error" not in metrics[0]
-
-    @pytest.mark.django_db
-    def test_query_action_invalid_combo_isolated_from_valid_metric(
-        self, auth_client, observe_project
-    ):
-        """Averaging a text attribute is invalid; the widget reports an error
-        while a valid metric in the same request still renders. Hits real CH.
-        """
-        response = auth_client.post(
-            "/tracer/dashboard/query/",
-            {
-                "project_ids": [str(observe_project.id)],
-                "granularity": "day",
-                "time_range": {"preset": "7D"},
-                "metrics": [
-                    {
-                        "id": "bot_wpm",
-                        "name": "bot_wpm",
-                        "type": "custom_attribute",
-                        "source": "traces",
-                        "aggregation": "avg",
-                        "attribute_key": "bot_wpm",
-                        "attribute_type": "string",
-                    },
-                    {
-                        "id": "latency",
-                        "name": "latency",
-                        "type": "system_metric",
-                        "source": "traces",
-                        "aggregation": "avg",
-                    },
-                ],
-            },
-            format="json",
-        )
-        # Whole dashboard does NOT 500 on the invalid combo.
-        assert response.status_code == 200
-        metrics = {m["name"]: m for m in response.json()["result"]["metrics"]}
-        assert "bot_wpm" in metrics and "latency" in metrics
-        # The invalid metric carries an explanatory error; the valid one does not.
-        assert "can't be applied" in metrics["bot_wpm"]["error"]
-        assert "error" not in metrics["latency"]
-
-    @pytest.mark.django_db
-    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-    def test_query_action_simulation_metric_preserves_simulation_units(
-        self, mock_analytics_cls, auth_client
-    ):
-        mock_service = MagicMock()
-        mock_result = MagicMock()
-        mock_result.data = [{"time_bucket": "2025-01-01T00:00:00", "value": 12.5}]
-        mock_service.execute_ch_query.return_value = mock_result
-        mock_analytics_cls.return_value = mock_service
-
-        response = auth_client.post(
-            "/tracer/dashboard/query/",
-            {
-                "workflow": "simulation",
-                "granularity": "day",
-                "time_range": {"preset": "7D"},
-                "metrics": [
-                    {
-                        "id": "duration",
-                        "name": "duration",
-                        "display_name": "Duration",
-                        "type": "system_metric",
-                        "aggregation": "avg",
-                        "source": "simulation",
-                    }
-                ],
-            },
-            format="json",
-        )
-
-        assert response.status_code == 200
-        metric = response.json()["result"]["metrics"][0]
-        assert metric["unit"] == "s"
-
-    @pytest.mark.django_db
-    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-    def test_query_action_dataset_string_metric_is_queryable(
-        self, mock_analytics_cls, auth_client
-    ):
-        mock_service = MagicMock()
-        mock_result = MagicMock()
-        mock_result.data = [{"time_bucket": "2025-01-01T00:00:00", "value": 3}]
-        mock_service.execute_ch_query.return_value = mock_result
-        mock_analytics_cls.return_value = mock_service
-
-        response = auth_client.post(
-            "/tracer/dashboard/query/",
-            {
-                "workflow": "observability",
-                "project_ids": [],
-                "time_range": {"preset": "12M"},
-                "granularity": "month",
-                "metrics": [
-                    {
-                        "id": "dataset",
-                        "name": "dataset",
-                        "display_name": "Dataset",
-                        "type": "system_metric",
-                        "source": "datasets",
-                        "aggregation": "avg",
-                        "attribute_type": "string",
-                        "data_type": "string",
-                        "filters": [],
-                    }
-                ],
-                "filters": [],
-                "breakdowns": [],
-            },
-            format="json",
-        )
-
-        assert response.status_code == 200
-        metric = response.json()["result"]["metrics"][0]
-        assert metric["id"] == "dataset"
-        assert metric["aggregation"] == "count_distinct"
-        sql = mock_service.execute_ch_query.call_args.args[0]
-        assert "uniqIf(" in sql
-        assert "dataset_dict" in sql
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.AnalyticsQueryService")
@@ -5557,104 +5409,6 @@ class TestDashboardMetricSourceNormalization:
 
 class TestWidgetQueryExecution:
     @pytest.mark.django_db
-    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
-    @patch("tracer.views.dashboard.get_clickhouse_client")
-    def test_execute_query(
-        self,
-        mock_get_client,
-        mock_enabled,
-        auth_client,
-        dashboard,
-        dashboard_widget,
-        observe_project,
-    ):
-        # Update widget to use a real project_id so validation passes
-        dashboard_widget.query_config["project_ids"] = [str(observe_project.id)]
-        dashboard_widget.save()
-
-        mock_client = MagicMock()
-        mock_client.execute_read.return_value = (
-            [(datetime(2025, 1, 1), 123.45)],
-            [("time_bucket", "DateTime"), ("value", "Float64")],
-            5.0,
-        )
-        mock_get_client.return_value = mock_client
-
-        with patch(
-            "tracer.services.clickhouse.v2.query_service.get_v2_query_client",
-            return_value=mock_client,
-        ):
-            response = auth_client.post(
-                f"/tracer/dashboard/{dashboard.id}/widgets/{dashboard_widget.id}/query/"
-            )
-        assert response.status_code == 200
-        data = response.json()["result"]
-        assert "metrics" in data
-        assert "time_range" in data
-        _, kwargs = mock_client.execute_read.call_args
-        assert kwargs["settings"] == _DASHBOARD_TRACE_READ_SETTINGS
-
-    @pytest.mark.django_db
-    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
-    @patch("tracer.views.dashboard.get_clickhouse_client")
-    def test_execute_query_eval_widget_threads_workspace_scope(
-        self,
-        mock_get_client,
-        mock_enabled,
-        auth_client,
-        workspace,
-        dashboard,
-        dashboard_widget,
-        observe_project,
-    ):
-        """Widget-endpoint eval queries never got workspace/org attached to
-        trace_config before the fix, so the eval builder scoped the SQL to
-        ``organization_id = toUUID('')`` and CH 500'd. Locks the fix by
-        asserting the executed params include the real workspace UUIDs.
-        """
-        dashboard_widget.query_config = {
-            "project_ids": [str(observe_project.id)],
-            "granularity": "month",
-            "time_range": {"preset": "6M"},
-            "metrics": [
-                {
-                    "id": str(uuid.uuid4()),
-                    "name": "conversation_hallucination",
-                    "type": "eval_metric",
-                    "config_id": str(uuid.uuid4()),
-                    "output_type": "SCORE",
-                    "aggregation": "count",
-                    "source": "all",
-                }
-            ],
-        }
-        dashboard_widget.save(update_fields=["query_config"])
-
-        mock_client = MagicMock()
-        mock_client.execute_read.return_value = (
-            [(datetime(2026, 1, 1), 12)],
-            [("time_bucket", "DateTime"), ("value", "Float64")],
-            5.0,
-        )
-        mock_get_client.return_value = mock_client
-
-        with patch(
-            "tracer.services.clickhouse.v2.query_service.get_v2_query_client",
-            return_value=mock_client,
-        ):
-            response = auth_client.post(
-                f"/tracer/dashboard/{dashboard.id}/widgets/{dashboard_widget.id}/query/"
-            )
-        assert response.status_code == 200
-        args = mock_client.execute_read.call_args.args
-        sql, params = args[0], args[1]
-        assert params.get("workspace_id") == str(workspace.id)
-        assert params.get("organization_id") == str(workspace.organization_id)
-        # Sanity: the executed SQL was scoped, not empty-UUID'd.
-        assert "toUUID('')" not in sql
-        assert "e.workspace_id = toUUID(%(workspace_id)s)" in sql
-
-    @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=False)
     def test_execute_query_clickhouse_disabled(
         self, mock_enabled, auth_client, dashboard, dashboard_widget
@@ -5663,59 +5417,6 @@ class TestWidgetQueryExecution:
             f"/tracer/dashboard/{dashboard.id}/widgets/{dashboard_widget.id}/query/"
         )
         assert response.status_code == 400
-
-    @pytest.mark.django_db
-    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
-    @patch("tracer.views.dashboard.get_clickhouse_client")
-    def test_execute_query_simulation_custom_attribute_routes_to_trace_builder(
-        self,
-        mock_get_client,
-        mock_enabled,
-        auth_client,
-        dashboard,
-        dashboard_widget,
-        observe_project,
-    ):
-        dashboard_widget.query_config = {
-            "workflow": "simulation",
-            "project_ids": [str(observe_project.id)],
-            "granularity": "day",
-            "time_range": {"preset": "7D"},
-            "metrics": [
-                {
-                    "id": "cost_breakdown.stt",
-                    "name": "cost_breakdown.stt",
-                    "type": "custom_attribute",
-                    "attribute_key": "cost_breakdown.stt",
-                    "attribute_type": "number",
-                    "aggregation": "avg",
-                    "source": "simulation",
-                }
-            ],
-        }
-        dashboard_widget.save(update_fields=["query_config"])
-
-        mock_client = MagicMock()
-        mock_client.execute_read.return_value = (
-            [(datetime(2025, 1, 1), 0.01)],
-            [("time_bucket", "DateTime"), ("value", "Float64")],
-            5.0,
-        )
-        mock_get_client.return_value = mock_client
-
-        with patch(
-            "tracer.services.clickhouse.v2.query_service.get_v2_query_client",
-            return_value=mock_client,
-        ):
-            response = auth_client.post(
-                f"/tracer/dashboard/{dashboard.id}/widgets/{dashboard_widget.id}/query/"
-            )
-
-        assert response.status_code == 200
-        sql = mock_client.execute_read.call_args.args[0]
-        assert "attrs_number" in sql
-        assert "FROM spans" in sql
-        assert "simulate_call_execution" not in sql
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
@@ -5755,54 +5456,6 @@ class TestWidgetQueryExecution:
                 format="json",
             )
         assert response.status_code == 200
-
-    @pytest.mark.django_db
-    @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
-    @patch("tracer.views.dashboard.get_clickhouse_client")
-    def test_preview_query_project_breakdown_uses_longer_timeout(
-        self, mock_get_client, mock_enabled, auth_client, dashboard, observe_project
-    ):
-        mock_client = MagicMock()
-        mock_client.execute_read.return_value = (
-            [(datetime(2025, 1, 1), str(observe_project.id), 50.0)],
-            [
-                ("time_bucket", "DateTime"),
-                ("breakdown_value", "String"),
-                ("value", "Float64"),
-            ],
-            3.0,
-        )
-        mock_get_client.return_value = mock_client
-
-        with patch(
-            "tracer.services.clickhouse.v2.query_service.get_v2_query_client",
-            return_value=mock_client,
-        ):
-            response = auth_client.post(
-                f"/tracer/dashboard/{dashboard.id}/widgets/preview/",
-                {
-                    "query_config": {
-                        "project_ids": [str(observe_project.id)],
-                        "granularity": "day",
-                        "time_range": {"preset": "7D"},
-                        "metrics": [
-                            {
-                                "id": "latency",
-                                "name": "latency",
-                                "type": "system_metric",
-                                "aggregation": "avg",
-                            }
-                        ],
-                        "breakdowns": [{"type": "system_metric", "name": "project"}],
-                    }
-                },
-                format="json",
-            )
-        assert response.status_code == 200
-        _, kwargs = mock_client.execute_read.call_args
-        assert kwargs["timeout_ms"] == 30000
-        data = response.json()["result"]
-        assert "metrics" in data
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
@@ -8766,7 +8419,7 @@ class TestFilterValuesEndpoint:
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
-    @patch("tracer.views.dashboard.AnalyticsQueryService")
+    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
     def test_traces_system_metric_returns_distinct_values(
         self, mock_analytics_cls, _mock_ch, auth_client, project
     ):
@@ -8818,7 +8471,7 @@ class TestFilterValuesEndpoint:
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True)
-    @patch("tracer.views.dashboard.AnalyticsQueryService")
+    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
     def test_traces_enduser_metric_returns_values(
         self, mock_analytics_cls, _mock_ch, auth_client, project
     ):
@@ -9315,3 +8968,121 @@ class TestXSSPayloadNonExecutable:
         assert resp.status_code == 200
         # Non-executable: served as JSON, so a reflected payload is inert text.
         assert resp["Content-Type"].startswith("application/json")
+
+
+@pytest.mark.django_db
+def test_dashboard_query_defers_exact_read_without_inline_clickhouse(
+    auth_client,
+    observe_project,
+):
+    captured = {}
+
+    def _pending(namespace, identity, **kwargs):
+        captured.update(namespace=namespace, identity=identity, options=kwargs)
+        return kwargs["pending_payload"]
+
+    with (
+        patch(
+            "tracer.views.dashboard.read_or_schedule_exact_snapshot",
+            side_effect=_pending,
+        ),
+        patch(
+            "tracer.views.dashboard.V2AnalyticsQueryService",
+            side_effect=AssertionError("public poll must not query ClickHouse"),
+        ),
+        patch(
+            "tracer.views.dashboard.AnalyticsQueryService",
+            side_effect=AssertionError("public poll must not use legacy ClickHouse"),
+        ),
+    ):
+        response = auth_client.post(
+            "/tracer/dashboard/query/",
+            {
+                "project_ids": [str(observe_project.id)],
+                "granularity": "day",
+                "time_range": {"preset": "7D"},
+                "metrics": [
+                    {
+                        "id": "latency",
+                        "name": "latency",
+                        "type": "system_metric",
+                        "aggregation": "avg",
+                    }
+                ],
+            },
+            format="json",
+        )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["query_status"] == "pending"
+    assert result["query_complete"] is False
+    assert result["query_sampled"] is False
+    assert result["query_refreshing"] is True
+    assert captured["namespace"] == "dashboard-query"
+    assert captured["identity"]["query_config"]["project_ids"] == [
+        str(observe_project.id)
+    ]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("action", ["execute", "preview"])
+def test_widget_query_defers_exact_read_without_inline_clickhouse(
+    action,
+    auth_client,
+    dashboard,
+    dashboard_widget,
+    observe_project,
+):
+    query_config = {
+        "project_ids": [str(observe_project.id)],
+        "granularity": "day",
+        "time_range": {"preset": "7D"},
+        "metrics": [
+            {
+                "id": "latency",
+                "name": "latency",
+                "type": "system_metric",
+                "aggregation": "avg",
+            }
+        ],
+    }
+    dashboard_widget.query_config = query_config
+    dashboard_widget.save(update_fields=["query_config"])
+
+    def _pending(_namespace, _identity, **kwargs):
+        return kwargs["pending_payload"]
+
+    with (
+        patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=True),
+        patch(
+            "tracer.views.dashboard.read_or_schedule_exact_snapshot",
+            side_effect=_pending,
+        ),
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
+        patch(
+            "tracer.views.dashboard.V2AnalyticsQueryService",
+            side_effect=AssertionError("public poll must not query ClickHouse"),
+        ),
+        patch(
+            "tracer.views.dashboard.get_clickhouse_client",
+            side_effect=AssertionError("public poll must not use legacy ClickHouse"),
+        ),
+    ):
+        if action == "execute":
+            response = auth_client.post(
+                f"/tracer/dashboard/{dashboard.id}/widgets/{dashboard_widget.id}/query/"
+            )
+        else:
+            response = auth_client.post(
+                f"/tracer/dashboard/{dashboard.id}/widgets/preview/",
+                {"query_config": query_config},
+                format="json",
+            )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["query_status"] == "pending"
+    assert result["query_complete"] is False
+    assert result["query_sampled"] is False
+    assert result["query_refreshing"] is True

@@ -27,6 +27,9 @@ from tracer.serializers.span_attributes import (
     SpanAttributeKeysResponseSerializer,
     SpanAttributeProjectQuerySerializer,
 )
+from tracer.services.clickhouse.attribute_cursor_state import (
+    ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
+)
 from tracer.services.clickhouse.attribute_reads import (
     _LATEST_CARDINALITY_SQL,
     _STRATIFIED_CANDIDATE_SQL,
@@ -2447,6 +2450,36 @@ def test_filter_value_cursor_page_is_newest_first_and_dedupes_across_pages():
     assert all(row.value != "completed" for row in second.rows)
 
 
+def test_filter_value_cursor_pushes_key_and_search_into_candidate_query():
+    executor = RecordingExecutor()
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="Rechazado",
+        # No type pin means a historically mixed key remains queryable across
+        # every typed Map and structured JSON overflow representation.
+        attribute_type=None,
+        window_start=NOW - timedelta(hours=1),
+        window_end=NOW,
+    )
+
+    assert read.rows == ()
+    assert len(executor.calls) == 1
+    candidate = executor.calls[0]
+    assert "AND (1)" not in candidate.sql
+    assert "mapContains(attrs_string, %(attribute_key)s)" in candidate.sql
+    assert "mapContains(attrs_number, %(attribute_key)s)" in candidate.sql
+    assert "mapContains(attrs_bool, %(attribute_key)s)" in candidate.sql
+    assert "JSONHas(attributes_extra, %(attribute_key)s)" in candidate.sql
+    assert "positionCaseInsensitiveUTF8" in candidate.sql
+    assert candidate.params["attribute_key"] == "final_status"
+    assert candidate.params["attribute_search"] == "Rechazado"
+
+
 def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation():
     candidates = [
         _candidate(
@@ -2526,6 +2559,32 @@ def test_filter_value_cursor_page_caps_each_request_and_publishes_continuation()
     assert read.seen_value_digests == (
         attribute_value_cursor_digest("string", "completed"),
     )
+
+
+def test_filter_value_cursor_reports_truthful_server_state_limit():
+    seen = tuple(
+        attribute_value_cursor_digest("string", f"prior-{index}")
+        for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS)
+    )
+    executor = RecordingExecutor()
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        seen_value_digests=seen,
+    )
+
+    assert read.rows == ()
+    assert read.has_more is False
+    assert read.browse_status == "limit_reached"
+    assert read.seen_value_digests == seen
+    assert read.metadata.query_complete is True
+    assert executor.calls == []
 
 
 def test_filter_value_cursor_candidate_budget_failure_propagates_fail_closed():
@@ -3923,7 +3982,7 @@ def test_span_attribute_key_cursor_pages_resume_wide_rows_without_duplicates(
     assert len(second.seen_key_digests) == 2
 
 
-def test_span_attribute_key_cursor_has_no_logical_vocabulary_cap(monkeypatch):
+def test_span_attribute_key_cursor_remains_pageable_below_state_capacity(monkeypatch):
     identity = (PROJECT_A, "trace-cap", "span-cap", NOW - timedelta(hours=1))
     row = {
         "project_id": PROJECT_A,
@@ -3965,6 +4024,57 @@ def test_span_attribute_key_cursor_has_no_logical_vocabulary_cap(monkeypatch):
     assert page.metadata.query_complete is True
     assert page.metadata.query_status == "complete"
     assert page.metadata.query_error_code is None
+
+
+def test_span_attribute_key_cursor_stops_cleanly_at_server_state_capacity(
+    monkeypatch,
+):
+    identity = (PROJECT_A, "trace-cap", "span-cap", NOW - timedelta(hours=1))
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+    monkeypatch.setattr(
+        selector,
+        "_candidate_ids",
+        lambda *_args, **_kwargs: ((identity,), False, {}),
+    )
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **_kwargs: [
+            {
+                "project_id": PROJECT_A,
+                "trace_id": identity[1],
+                "id": identity[2],
+                "start_time": identity[3],
+                "is_deleted": 0,
+                "string_keys": ["last_recent_key"],
+                "number_keys": [],
+                "boolean_keys": [],
+                "attributes_extra": "{}",
+            }
+        ],
+    )
+    seen = tuple(
+        attribute_key_cursor_digest(f"prior-{index}")
+        for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - 1)
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        seen_key_digests=seen,
+    )
+
+    assert [item.key for item in page.rows] == ["last_recent_key"]
+    assert len(page.seen_key_digests) == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
+    assert page.has_more is False
+    assert page.browse_status == "limit_reached"
 
 
 def test_span_attribute_key_cursor_rejects_dual_physical_checkpoints():
@@ -4032,7 +4142,7 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     assert "query_error_code" not in first_response.data
     assert first_response.data["browse_mode"] == "recent_suggestions"
     assert first_response.data["browse_status"] == "continuation"
-    assert "browse_limit" not in first_response.data
+    assert first_response.data["browse_limit"] == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
     contract = SpanAttributeKeysResponseSerializer(data=first_response.data)
     assert contract.is_valid(), contract.errors
     cursor = first_response.data["next_cursor"]
@@ -5289,7 +5399,12 @@ def test_span_attribute_keys_use_v2_when_legacy_clickhouse_is_disabled(monkeypat
 
     assert response.status_code == 200
     assert response.data["result"] == [
-        {"key": "json_choices", "type": "array", "count": 1}
+        {
+            "key": "json_choices",
+            "type": "array",
+            "count": 1,
+            "count_exact": False,
+        }
     ]
     assert response.data["lookup_mode"] == "exact"
     assert response.data["exact_match"] is True

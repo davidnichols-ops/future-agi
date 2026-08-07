@@ -166,7 +166,18 @@ def test_non_observe_complete_empty_bounded_page_is_success(monkeypatch):
     assert response.status_code == status.HTTP_200_OK
     assert response.data["result"] == {
         "column_config": [],
-        "metadata": {"total_rows": 0},
+        "metadata": {
+            "total_rows": 0,
+            "total_rows_is_lower_bound": True,
+            "has_more": False,
+            "query_complete": True,
+            "query_status": "complete",
+            "query_error_code": None,
+            "query_elapsed_ms": 750.0,
+            "query_count": 2,
+            "query_rows_returned": 0,
+            "query_result_payload_bytes": 0,
+        },
         "table": [],
     }
 

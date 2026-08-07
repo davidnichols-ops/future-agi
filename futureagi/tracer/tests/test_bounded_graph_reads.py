@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from model_hub.models.choices import AnnotationTypeChoices
 from tracer.selectors.trace_filter_reads import BoundedFilterPage
 from tracer.services.clickhouse import bounded_graph_reads, graph_dispatch
 from tracer.services.clickhouse.bounded_graph_reads import (
@@ -1079,6 +1078,40 @@ def test_1600th_root_trace_returns_visible_sample_instead_of_blank_error():
     )
 
     assert len(sample.rows) == bounded_graph_reads.GRAPH_TRACE_ROOT_CANDIDATE_LIMIT
+    assert sample.query_complete is False
+    assert sample.query_status == "sampled"
+    assert sample.query_error_code == "sample_limit"
+
+
+@pytest.mark.unit
+def test_640th_structured_trace_returns_visible_sample_instead_of_blank_error():
+    rows = [
+        {
+            "trace_id": f"trace-{index:04d}",
+            "root_span_id": f"span-{index:04d}",
+            "start_time": START + timedelta(milliseconds=index),
+        }
+        for index in range(640)
+    ]
+    analytics = _CandidateAnalytics(observe_type="trace", rows=rows)
+
+    sample = read_graph_candidates(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=[
+            _date_filter(),
+            _attribute_filter(
+                "customer.context",
+                {"tier": "vip", "attempt": 2},
+                filter_type="json",
+                filter_op="contains",
+            ),
+        ],
+        observe_type="trace",
+    )
+
+    expected_limit = (20 * bounded_graph_reads.GRAPH_TRACE_CLASSIFY_BATCH_BUDGET) - 1
+    assert len(sample.rows) == expected_limit
     assert sample.query_complete is False
     assert sample.query_status == "sampled"
     assert sample.query_error_code == "sample_limit"
@@ -3330,92 +3363,90 @@ def test_locked_trace_temporal_candidates_use_resource_safe_union_batches() -> N
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("observe_type", ["trace", "span"])
-@pytest.mark.parametrize("window_days", [180, 365])
-@pytest.mark.parametrize("structured_type", ["map", "json", "call_type"])
-def test_eval_graph_samples_long_structured_filters_without_full_window_anchor(
-    observe_type,
-    window_days,
-    structured_type,
+@pytest.mark.parametrize(
+    ("fetch_name", "namespace"),
+    [
+        ("fetch_system_metric_graph_ch", "observe-system-graph"),
+        ("fetch_all_system_metrics_ch", "observe-all-system-graphs"),
+        ("fetch_eval_graph_ch", "observe-eval-graph"),
+        ("fetch_eval_chart_series_ch", "observe-eval-chart-series"),
+        ("fetch_annotation_graph_ch", "observe-annotation-graph"),
+    ],
+)
+def test_public_graph_wrappers_use_exact_snapshot_without_inline_reads(
+    monkeypatch,
+    fetch_name,
+    namespace,
 ):
-    window_end = datetime(2026, 7, 31, 7)
-    window_start = window_end - timedelta(days=window_days)
-    window_width = window_end - window_start
-    stratum_count = bounded_graph_reads.GRAPH_ANY_SPAN_STRATA
-    rows = []
-    for stratum in range(stratum_count):
-        stratum_start = window_start + (window_width * stratum / stratum_count)
-        stratum_width = window_width / stratum_count
-        for index in range(60):
-            row = {
-                "trace_id": f"trace-{stratum}-{index:03d}",
-                "root_span_id": f"root-{stratum}-{index:03d}",
-                "start_time": (
-                    stratum_start + stratum_width - timedelta(minutes=1)
-                    if index == 59
-                    else stratum_start + (stratum_width * index / 60)
-                ),
-                "matches_latest": index == 59,
-            }
-            if observe_type == "span":
-                row["id"] = f"span-{stratum}-{index:03d}"
-            rows.append(row)
-    analytics = _LatestRareCandidateAnalytics(
-        observe_type=observe_type,
-        rows=rows,
-    )
+    calls = []
 
-    structured_filter = (
-        {
-            "column_id": "call_type",
-            "filter_config": {
-                "col_type": "SYSTEM_METRIC",
-                "filter_type": "text",
-                "filter_op": "equals",
-                "filter_value": "inbound",
-            },
-        }
-        if structured_type == "call_type"
-        else _attribute_filter(
-            "customer.context",
-            {"tier": "vip"},
-            filter_type=structured_type,
-            filter_op="contains" if structured_type == "json" else "equals",
+    def _read_or_schedule(actual_namespace, identity, **kwargs):
+        calls.append((actual_namespace, identity, kwargs))
+        return kwargs["pending_payload"]
+
+    monkeypatch.setattr(
+        graph_dispatch,
+        "read_or_schedule_exact_snapshot",
+        _read_or_schedule,
+    )
+    filters = [_date_filter(), _attribute_filter("final_status", "Rejected")]
+    common = {
+        "analytics": object(),
+        "project_id": PROJECT_ID,
+        "filters": filters,
+        "interval": "hour",
+    }
+    if fetch_name == "fetch_system_metric_graph_ch":
+        response = graph_dispatch.fetch_system_metric_graph_ch(
+            **common,
+            metric_id="latency",
+            observe_type="trace",
         )
-    )
-    response = graph_dispatch.fetch_eval_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[
-            _date_filter(window_start, window_end),
-            _attribute_filter("final_status", "Rejected"),
-            structured_filter,
-        ],
-        interval="day",
-        req_data_config={
-            "id": EVAL_ID,
-            "type": "EVAL",
-            "output_type": "SCORE",
-        },
-        observe_type=observe_type,
-    )
+    elif fetch_name == "fetch_all_system_metrics_ch":
+        response = graph_dispatch.fetch_all_system_metrics_ch(**common)
+    elif fetch_name == "fetch_eval_chart_series_ch":
+        response = graph_dispatch.fetch_eval_chart_series_ch(
+            **common,
+            req_data_config={
+                "id": EVAL_ID,
+                "type": "EVAL",
+                "output_type": "CHOICES",
+                "choices": ["good", "bad"],
+            },
+            eval_name="quality",
+        )
+    elif fetch_name == "fetch_eval_graph_ch":
+        response = graph_dispatch.fetch_eval_graph_ch(
+            **common,
+            req_data_config={
+                "id": EVAL_ID,
+                "type": "EVAL",
+                "output_type": "SCORE",
+            },
+            observe_type="trace",
+        )
+    else:
+        response = graph_dispatch.fetch_annotation_graph_ch(
+            **common,
+            req_data_config={"id": LABEL_ID, "output_type": "float"},
+            observe_type="trace",
+        )
 
-    assert response["query_status"] == "sampled"
-    assert response["query_sample_size"] == stratum_count
-    assert any(point["value"] == 50 for point in response["data"])
-    assert not any(
-        call[1].get("filter_anchor_limit") == 513 for call in analytics.calls
-    )
-    key_witness_ranges = [
-        (params["filter_anchor_start"], params["filter_anchor_end"])
-        for _, params, *_ in analytics.calls
-        if params.get("filter_graph_key_witness")
-    ]
-    assert len(key_witness_ranges) == stratum_count
-    assert all(
-        end - start > bounded_graph_reads.GRAPH_UNINDEXED_SAMPLE_SLICE
-        for start, end in key_witness_ranges
-    )
+    assert len(calls) == 1
+    actual_namespace, identity, options = calls[0]
+    assert actual_namespace == namespace
+    assert identity["project_id"] == PROJECT_ID
+    assert identity["filters"] == filters
+    assert identity["interval"] == "hour"
+    assert options["refresh"] is False
+    assert response == options["pending_payload"]
+    pending_items = response if isinstance(response, list) else [response]
+    assert all(item["query_status"] == "pending" for item in pending_items)
+    assert all(item["query_complete"] is False for item in pending_items)
+    assert all(item["query_sampled"] is False for item in pending_items)
+    assert all(item["query_refreshing"] is True for item in pending_items)
+    if fetch_name != "fetch_all_system_metrics_ch":
+        assert all(item["data"] == [] for item in pending_items)
 
 
 @pytest.mark.unit
@@ -3742,171 +3773,6 @@ def _sample() -> GraphCandidateSample:
     )
 
 
-@pytest.mark.unit
-def test_system_graph_rejects_partial_rows_instead_of_rendering_a_sample(
-    monkeypatch,
-):
-    incomplete = replace(
-        _sample(),
-        rows=(
-            {
-                "id": "span-proven-match",
-                "trace_id": "trace-proven-match",
-                "start_time": START + timedelta(minutes=1),
-                "latency_ms": 25,
-                "status": "OK",
-            },
-        ),
-        query_complete=False,
-        query_status="degraded",
-        query_error_code="read_budget_exceeded",
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: incomplete)
-
-    with pytest.raises(BoundedGraphReadError) as caught:
-        graph_dispatch.fetch_system_metric_graph_ch(
-            analytics=object(),
-            project_id=PROJECT_ID,
-            filters=[_date_filter(), _attribute_filter("score", 0.5)],
-            interval="hour",
-            metric_id="latency",
-            observe_type="span",
-        )
-
-    assert caught.value.error_code == "read_budget_exceeded"
-
-
-@pytest.mark.unit
-def test_span_system_graph_returns_explicit_sampled_points(
-    monkeypatch,
-):
-    incomplete = replace(
-        _sample(),
-        rows=(
-            {
-                "id": "span-proven-match",
-                "trace_id": "trace-proven-match",
-                "start_time": START + timedelta(minutes=1),
-                "latency_ms": 25,
-                "status": "OK",
-            },
-        ),
-        query_complete=False,
-        query_status="sampled",
-        query_error_code="sample_limit",
-        sampling_strategy="time_stratified_latest_state",
-        sampling_strata=8,
-        sampling_strata_completed=8,
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: incomplete)
-
-    response = graph_dispatch.fetch_system_metric_graph_ch(
-        analytics=object(),
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("score", 0.5)],
-        interval="hour",
-        metric_id="latency",
-        observe_type="span",
-    )
-
-    assert response["data"][0]["value"] == 25
-    assert response["data"][0]["primary_traffic"] == 1
-    assert response["query_complete"] is False
-    assert response["query_status"] == "sampled"
-    assert response["query_error_code"] == "sample_limit"
-    assert response["query_sample_size"] == 1
-    assert response["query_sampled"] is True
-
-
-@pytest.mark.unit
-def test_trace_system_graph_decorates_sample_with_any_live_span_semantics(monkeypatch):
-    trace_id = "11111111-1111-4111-8111-111111111111"
-    sampled = replace(
-        _sample(),
-        query_complete=False,
-        query_status="sampled",
-        query_error_code="sample_limit",
-        sampling_strategy="time_stratified_latest_state",
-        sampling_strata=8,
-        sampling_strata_completed=8,
-    )
-    analytics = _SequenceAnalytics(
-        [
-            [{"trace_id": trace_id, "id": "span-1", "start_time": START}],
-            [
-                {
-                    "time_bucket": START.replace(minute=0),
-                    "avg_latency": 12,
-                    "total_tokens": 5,
-                    "avg_cost": 0.1,
-                    "traffic_count": 1,
-                    "prompt_tokens": 2,
-                    "completion_tokens": 3,
-                    "error_rate": 0,
-                }
-            ],
-        ]
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: sampled)
-
-    response = graph_dispatch.fetch_system_metric_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-        metric_id="latency",
-        observe_type="trace",
-    )
-
-    assert response["data"][0]["value"] == 12
-    assert response["data"][0]["primary_traffic"] == 1
-    assert response["query_complete"] is False
-    assert response["query_status"] == "sampled"
-    assert response["query_error_code"] == "sample_limit"
-    assert len(analytics.calls) == 2
-    assert "argMax(is_deleted, _version)" in analytics.calls[1][0]
-    assert "latest_is_deleted = 0" in analytics.calls[1][0]
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    ("observe_type", "expected_deadline_ms"),
-    [
-        ("trace", bounded_graph_reads.GRAPH_DECORATION_CANDIDATE_DEADLINE_MS),
-        ("span", None),
-    ],
-)
-def test_system_graph_reserves_decoration_time_only_for_trace_candidates(
-    monkeypatch,
-    observe_type,
-    expected_deadline_ms,
-):
-    candidate_calls = []
-    sample = replace(_sample(), rows=())
-
-    def _candidates(**kwargs):
-        candidate_calls.append(kwargs)
-        return sample
-
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", _candidates)
-
-    response = graph_dispatch.fetch_system_metric_graph_ch(
-        analytics=object(),
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-        metric_id="latency",
-        observe_type=observe_type,
-    )
-
-    assert response["query_complete"] is True
-    assert len(candidate_calls) == 1
-    if expected_deadline_ms is None:
-        assert "deadline_ms" not in candidate_calls[0]
-    else:
-        assert candidate_calls[0]["deadline_ms"] == expected_deadline_ms
-
-
 class _DecorationAnalytics:
     def __init__(self, rows):
         self.rows = rows
@@ -3925,294 +3791,6 @@ class _SequenceAnalytics:
     def execute_ch_query(self, query, params, *, timeout_ms, settings):
         self.calls.append((query, params, timeout_ms, settings))
         return _Result(self.responses.pop(0))
-
-
-@pytest.mark.unit
-def test_short_window_4096_traces_use_newest_40_for_bounded_decoration(
-    monkeypatch,
-):
-    rows = tuple(
-        {
-            "trace_id": f"trace-{index:04d}",
-            "root_span_id": f"root-{index:04d}",
-            "start_time": START + timedelta(microseconds=index),
-        }
-        for index in range(4096)
-    )
-    sample = replace(
-        _sample(),
-        rows=rows,
-        rows_returned=len(rows),
-        total_rows_lower_bound=len(rows),
-    )
-    starts_by_trace = {row["trace_id"]: row["start_time"] for row in rows}
-
-    class _ShortWindowDecorationAnalytics:
-        def __init__(self):
-            self.calls = []
-
-        def execute_ch_query(self, query, params, *, timeout_ms, settings):
-            self.calls.append((query, params, timeout_ms, settings))
-            if "graph_entity_limit" in params:
-                return _Result(
-                    [
-                        {
-                            "trace_id": trace_id,
-                            "id": f"span-{trace_id}",
-                            "start_time": starts_by_trace[trace_id],
-                        }
-                        for trace_id in params["graph_trace_ids"]
-                    ]
-                )
-            if "graph_span_identities" in params:
-                traffic = len(params["graph_span_identities"])
-                return _Result(
-                    [
-                        {
-                            "time_bucket": START,
-                            "graph_latency_sum": traffic,
-                            "graph_latency_count": traffic,
-                            "total_tokens": traffic,
-                            "graph_cost_sum": traffic,
-                            "graph_cost_count": traffic,
-                            "traffic_count": traffic,
-                            "prompt_tokens": traffic,
-                            "completion_tokens": traffic,
-                            "graph_error_count": 0,
-                        }
-                    ]
-                )
-            raise AssertionError("unexpected decoration query")
-
-    analytics = _ShortWindowDecorationAnalytics()
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: sample)
-
-    response = graph_dispatch.fetch_system_metric_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-        metric_id="latency",
-        observe_type="trace",
-    )
-
-    entity_calls = [call for call in analytics.calls if "graph_entity_limit" in call[1]]
-    expected_trace_ids = tuple(f"trace-{index:04d}" for index in range(4095, 4055, -1))
-    decorated_trace_ids = tuple(
-        trace_id
-        for _, params, *_ in entity_calls
-        for trace_id in params["graph_trace_ids"]
-    )
-    assert decorated_trace_ids == expected_trace_ids
-    assert (
-        len(decorated_trace_ids)
-        == graph_dispatch.GRAPH_TRACE_DECORATION_CANDIDATE_LIMIT
-    )
-    assert len(entity_calls) == 1
-    assert all(
-        len(params["graph_trace_ids"]) <= graph_dispatch.GRAPH_TRACE_ENTITY_BATCH_SIZE
-        for _, params, *_ in entity_calls
-    )
-    assert len(analytics.calls) == 2
-    assert response["query_count"] == sample.query_count + len(analytics.calls)
-    assert response["query_count"] <= 32
-    assert response["query_complete"] is False
-    assert response["query_status"] == "sampled"
-    assert response["query_error_code"] == "sample_limit"
-    assert response["query_sample_size"] == 40
-    assert response["query_sampling_strategy"] == "newest_trace_candidates"
-    assert response["query_sampling_strata"] == 1
-    assert response["query_sampling_strata_completed"] == 1
-    assert response["data"][0]["value"] == 1
-    assert response["data"][0]["primary_traffic"] == 40
-
-
-@pytest.mark.unit
-def test_time_only_system_graph_uses_bounded_candidates_not_stale_rollup(monkeypatch):
-    sampled = replace(
-        _sample(),
-        query_complete=False,
-        query_status="sampled",
-        query_error_code="sample_limit",
-        sampling_strategy="time_stratified_latest_state",
-        sampling_strata=8,
-        sampling_strata_completed=8,
-    )
-    analytics = _SequenceAnalytics(
-        [
-            [
-                {
-                    "trace_id": sampled.rows[0]["trace_id"],
-                    "id": "span-1",
-                    "start_time": START,
-                }
-            ],
-            [
-                {
-                    "time_bucket": START.replace(minute=0),
-                    "avg_latency": 12.5,
-                    "total_tokens": 10,
-                    "avg_cost": 0.01,
-                    "traffic_count": 2,
-                    "prompt_tokens": 4,
-                    "completion_tokens": 6,
-                    "error_rate": 0,
-                }
-            ],
-        ]
-    )
-    candidate_calls = []
-
-    def _candidates(**kwargs):
-        candidate_calls.append(kwargs)
-        return sampled
-
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", _candidates)
-
-    response = graph_dispatch.fetch_system_metric_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter()],
-        interval="hour",
-        metric_id="latency",
-        observe_type="trace",
-    )
-
-    assert candidate_calls[0]["allow_time_only_seed"] is True
-    assert all("spans_hourly_rollup" not in query for query, *_ in analytics.calls)
-    assert all("WITH latest_spans AS" not in query for query, *_ in analytics.calls)
-    assert analytics.calls[0][3]["max_result_rows"] == 4097
-    assert analytics.calls[1][3]["max_result_rows"] == 10_001
-    assert response["query_complete"] is False
-    assert response["query_status"] == "sampled"
-
-
-@pytest.mark.unit
-def test_filtered_graph_never_routes_to_broad_final_or_nonreversible_attr_rollup():
-    source = inspect.getsource(graph_dispatch.fetch_system_metric_graph_ch)
-
-    assert "FROM spans FINAL" not in source
-    assert "dashboard_attr_rollup" not in source
-    assert "read_graph_candidates" in source
-
-
-@pytest.mark.unit
-def test_one_year_hourly_graph_is_not_constrained_by_event_result_cap():
-    window_end = datetime(2026, 7, 31)
-    window_start = window_end - timedelta(days=365)
-    analytics = _DecorationAnalytics([])
-
-    response = graph_dispatch.fetch_system_metric_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(window_start, window_end)],
-        interval="hour",
-        metric_id="latency",
-        observe_type="trace",
-    )
-
-    assert analytics.calls
-    assert all(call[3]["max_result_rows"] <= 512 for call in analytics.calls)
-    assert all("WITH latest_spans AS" not in call[0] for call in analytics.calls)
-    assert len(response["data"]) > 2_001
-    assert len(response["data"]) <= 10_000
-    assert response["query_complete"] is True
-    assert response["query_status"] == "complete"
-
-
-@pytest.mark.unit
-def test_filtered_trace_system_graph_aggregates_all_live_child_spans(monkeypatch):
-    trace_id = "11111111-1111-4111-8111-111111111111"
-    analytics = _SequenceAnalytics(
-        [
-            [
-                {"trace_id": trace_id, "id": "span-1", "start_time": START},
-                {
-                    "trace_id": trace_id,
-                    "id": "span-child-1",
-                    "start_time": START + timedelta(minutes=1),
-                },
-                {
-                    "trace_id": trace_id,
-                    "id": "span-child-2",
-                    "start_time": START + timedelta(minutes=2),
-                },
-            ],
-            [
-                {
-                    "time_bucket": START.replace(minute=0),
-                    "avg_latency": 30,
-                    "total_tokens": 33,
-                    "avg_cost": 0.2,
-                    "traffic_count": 3,
-                    "prompt_tokens": 12,
-                    "completion_tokens": 21,
-                    "error_rate": 100 / 3,
-                }
-            ],
-        ]
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: _sample())
-
-    response = graph_dispatch.fetch_system_metric_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-        metric_id="traffic",
-        observe_type="trace",
-    )
-
-    seed_query, seed_params, seed_timeout_ms, seed_settings = analytics.calls[0]
-    query, params, timeout_ms, settings = analytics.calls[1]
-    assert "FROM spans" in seed_query
-    assert "GROUP BY trace_id, id, start_time" in seed_query
-    assert seed_params["graph_entity_limit"] == 4097
-    assert seed_timeout_ms <= 1_200
-    assert seed_settings["max_result_rows"] == 4097
-    assert "FROM spans" in query
-    assert "argMax(" in query
-    assert "GROUP BY trace_id, id, start_time" in query
-    assert "FINAL" not in query
-    assert "IN (SELECT" not in query.upper()
-    replay_scope = query.split("FROM spans", 1)[1].split(
-        "GROUP BY trace_id, id, start_time", 1
-    )[0]
-    assert "id IN %(graph_span_ids)s" in replay_scope
-    assert "project_id = toUUID(%(graph_project_id)s)" in replay_scope
-    assert "trace_id IN %(graph_trace_ids)s" in replay_scope
-    assert "toUnixTimestamp64Micro(start_time)" in replay_scope
-    assert "IN %(graph_span_identities)s" in replay_scope
-    assert "toDate(start_time) IN %(graph_span_dates)s" in replay_scope
-    assert params["graph_project_id"] == PROJECT_ID
-    assert params["graph_trace_ids"] == ("11111111-1111-4111-8111-111111111111",)
-    assert params["graph_span_ids"] == (
-        "span-child-2",
-        "span-child-1",
-        "span-1",
-    )
-    assert params["graph_span_identities"] == (
-        (
-            trace_id,
-            "span-child-2",
-            _unix_microseconds(START + timedelta(minutes=2)),
-        ),
-        (
-            trace_id,
-            "span-child-1",
-            _unix_microseconds(START + timedelta(minutes=1)),
-        ),
-        (trace_id, "span-1", _unix_microseconds(START)),
-    )
-    assert params["graph_span_dates"] == (START.date(),)
-    assert params["graph_start_date"] == START
-    assert params["graph_end_date"] == END
-    assert params["graph_point_limit"] == 10_001
-    assert timeout_ms <= 1_200
-    assert settings["max_result_rows"] == 10_001
-    assert response["data"][0]["value"] == 3
-    assert response["data"][0]["primary_traffic"] == 3
-    assert response["query_complete"] is True
 
 
 @pytest.mark.unit
@@ -4350,325 +3928,6 @@ def test_trace_metric_default_batch_keeps_1025_identities_exact():
     assert metrics["latency"][0]["value"] == 1
     assert metrics["error_rate"][0]["value"] == pytest.approx(100 / 1_025)
     assert metadata["query_count"] == _sample().query_count + 3
-
-
-@pytest.mark.unit
-def test_all_system_metrics_share_one_finite_candidate_replay(monkeypatch):
-    analytics = _SequenceAnalytics([])
-    metric_sample = replace(
-        _sample(),
-        rows=tuple(
-            {
-                "trace_id": f"trace-{index}",
-                "id": f"span-{index}",
-                "start_time": START + timedelta(minutes=index),
-                "latency_ms": latency,
-                "total_tokens": total_tokens,
-                "cost": cost,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "status": "OK",
-            }
-            for index, (
-                latency,
-                total_tokens,
-                cost,
-                prompt_tokens,
-                completion_tokens,
-            ) in enumerate(
-                (
-                    (10, 3, 0.1, 1, 2),
-                    (30, 10, 0.2, 4, 6),
-                    (50, 20, 0.3, 7, 13),
-                ),
-                start=1,
-            )
-        ),
-        rows_returned=3,
-        total_rows_lower_bound=3,
-    )
-    candidate_calls = []
-
-    def _candidates(**kwargs):
-        candidate_calls.append(kwargs)
-        return metric_sample
-
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", _candidates)
-
-    response = graph_dispatch.fetch_all_system_metrics_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-    )
-
-    assert len(candidate_calls) == 1
-    assert candidate_calls[0]["observe_type"] == "span"
-    assert analytics.calls == []
-    assert response["latency"][0]["value"] == 30
-    assert response["tokens"][0]["value"] == 33
-    assert response["cost"][0]["value"] == 0.2
-    assert response["traffic"][0]["traffic"] == 3
-    assert response["query_status"] == "complete"
-
-
-@pytest.mark.unit
-def test_filtered_eval_graph_is_candidate_scoped_no_final_or_membership_subquery(
-    monkeypatch,
-):
-    analytics = _DecorationAnalytics(
-        [
-            {
-                "created_at": START + timedelta(minutes=2),
-                "output_bool": None,
-                "output_float": 0.75,
-                "output_str": None,
-                "output_str_list": "[]",
-                "error": 0,
-            }
-        ]
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: _sample())
-
-    response = graph_dispatch.fetch_eval_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-        req_data_config={"id": EVAL_ID, "type": "EVAL", "output_type": "SCORE"},
-        observe_type="trace",
-    )
-
-    query, params, timeout_ms, settings = analytics.calls[0]
-    assert "FINAL" not in query
-    assert "IN (SELECT" not in query.upper()
-    assert "LIMIT 1 BY id" in query
-    assert params["graph_event_limit"] == 2001
-    assert timeout_ms <= 900
-    assert settings["max_threads"] == 1
-    assert settings["max_result_rows"] == 2001
-    assert response["data"][0]["value"] == 75.0
-    assert response["query_complete"] is True
-    assert response["query_status"] == "complete"
-
-
-@pytest.mark.unit
-def test_public_choice_eval_series_share_one_finite_logger_read(monkeypatch):
-    analytics = _DecorationAnalytics(
-        [
-            {
-                "created_at": START + timedelta(minutes=2),
-                "output_bool": None,
-                "output_float": None,
-                "output_str": None,
-                "output_str_list": '["Accepted"]',
-                "error": 0,
-            }
-        ]
-    )
-    candidate_calls = []
-
-    def _candidates(**kwargs):
-        candidate_calls.append(kwargs)
-        return _sample()
-
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", _candidates)
-
-    response = graph_dispatch.fetch_eval_chart_series_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-        req_data_config={
-            "id": EVAL_ID,
-            "type": "EVAL",
-            "eval_output_type": "CHOICES",
-            "choices": ["Accepted", "Rejected"],
-        },
-        eval_name="Outcome",
-    )
-
-    assert len(candidate_calls) == 1
-    assert len(analytics.calls) == 1
-    assert [series["data"][0]["value"] for series in response] == [100, 0]
-    assert all(series["query_status"] == "complete" for series in response)
-    query, params, timeout_ms, settings = analytics.calls[0]
-    assert "WITH latest_eval_filter_spans AS" not in query
-    assert "IN (SELECT" not in query.upper()
-    assert "LIMIT 1 BY id" in query
-    assert params["graph_trace_ids"] == (_sample().rows[0]["trace_id"],)
-    assert timeout_ms <= 900
-    assert settings["max_result_rows"] == 2001
-
-
-@pytest.mark.unit
-def test_unfiltered_eval_uses_direct_logger_and_project_candidates(
-    monkeypatch, settings
-):
-    analytics = _DecorationAnalytics(
-        [
-            {
-                "created_at": START + timedelta(minutes=2),
-                "output_bool": True,
-                "output_float": None,
-                "output_str": None,
-                "output_str_list": "[]",
-                "error": 0,
-            }
-        ]
-    )
-    candidate_calls = []
-
-    def _candidates(**kwargs):
-        candidate_calls.append(kwargs)
-        return _sample()
-
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", _candidates)
-    settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
-
-    response = graph_dispatch.fetch_eval_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter()],
-        interval="hour",
-        req_data_config={
-            "id": EVAL_ID,
-            "type": "EVAL",
-            "output_type": "PASS_FAIL",
-            "value": True,
-        },
-        observe_type="trace",
-    )
-
-    query, params, timeout_ms, settings = analytics.calls[0]
-    assert candidate_calls[0]["project_id"] == PROJECT_ID
-    assert candidate_calls[0]["allow_time_only_seed"] is True
-    assert "FROM tracer_eval_logger" in query
-    assert "FROM tracer_eval_logger_v2" not in query
-    assert "ORDER BY _peerdb_version DESC" in query
-    assert "graph_is_deleted = 0" in query
-    assert "graph_soft_deleted = 0 OR graph_soft_deleted IS NULL" in query
-    assert "eval_metrics_hourly" not in query
-    assert "LIMIT 1 BY id" in query
-    assert "FINAL" not in query
-    assert "IN (SELECT" not in query.upper()
-    assert params["graph_eval_config_id"] == EVAL_ID
-    assert params["graph_trace_ids"] == ("11111111-1111-4111-8111-111111111111",)
-    assert params["graph_start_date"] == START
-    assert params["graph_end_date"] == END
-    assert timeout_ms <= 900
-    assert settings["max_result_rows"] == 2001
-    assert response["data"][0]["value"] == 100
-    assert response["query_complete"] is True
-    assert response["query_status"] == "complete"
-
-
-@pytest.mark.unit
-def test_annotation_graph_is_candidate_scoped_and_score_values_are_sanitized(
-    monkeypatch,
-):
-    trace_id = "11111111-1111-4111-8111-111111111111"
-    identities = [
-        {"trace_id": trace_id, "id": "span-1", "start_time": START},
-        {
-            "trace_id": trace_id,
-            "id": "span-child",
-            "start_time": START + timedelta(minutes=1),
-        },
-    ]
-    analytics = _SequenceAnalytics(
-        [
-            identities,
-            identities,
-        ]
-    )
-    score_read = {}
-
-    def _annotation_rows(**kwargs):
-        score_read.update(kwargs)
-        return [
-            {
-                "created_at": START + timedelta(minutes=3),
-                "value": {"rating": 4.5},
-            }
-        ]
-
-    monkeypatch.setattr(
-        graph_dispatch,
-        "AnnotationLabelScoresProjectPG",
-        lambda: SimpleNamespace(annotation_rows_for_candidates=_annotation_rows),
-    )
-    label = SimpleNamespace(
-        id=LABEL_ID,
-        name="Quality",
-        type=AnnotationTypeChoices.NUMERIC.value,
-    )
-    label_query = SimpleNamespace(get=lambda **_: label)
-    monkeypatch.setattr(
-        graph_dispatch, "get_annotation_labels_for_project", lambda _: label_query
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: _sample())
-
-    response = graph_dispatch.fetch_annotation_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter()],
-        interval="hour",
-        req_data_config={"id": LABEL_ID, "type": "ANNOTATION"},
-        observe_type="trace",
-    )
-
-    seed_query, seed_params, seed_timeout, seed_settings = analytics.calls[0]
-    identity_query, identity_params, identity_timeout, identity_settings = (
-        analytics.calls[1]
-    )
-    assert len(analytics.calls) == 2
-    assert "FROM spans" in seed_query
-    assert "GROUP BY trace_id, id, start_time" in seed_query
-    assert seed_params["graph_entity_limit"] == 4097
-    assert seed_timeout <= 900
-    assert seed_settings["max_result_rows"] == 4097
-    assert "FROM spans" in identity_query
-    assert "argMax(" in identity_query
-    assert "FINAL" not in identity_query
-    assert "IN (SELECT" not in identity_query.upper()
-    assert identity_params["graph_trace_ids"] == (trace_id,)
-    assert identity_params["graph_span_ids"] == ("span-child", "span-1")
-    assert identity_params["graph_span_identities"] == (
-        (
-            trace_id,
-            "span-child",
-            _unix_microseconds(START + timedelta(minutes=1)),
-        ),
-        (trace_id, "span-1", _unix_microseconds(START)),
-    )
-    assert identity_params["graph_span_dates"] == (START.date(),)
-    assert identity_params["graph_entity_limit"] == 4097
-    assert identity_timeout <= 900
-    assert identity_settings["max_result_rows"] == 4097
-    replay_scope = identity_query.split("FROM spans", 1)[1].split(
-        "GROUP BY trace_id, id, start_time", 1
-    )[0]
-    assert "id IN %(graph_span_ids)s" in replay_scope
-    assert "project_id = toUUID(%(graph_project_id)s)" in replay_scope
-    assert "trace_id IN %(graph_trace_ids)s" in replay_scope
-    assert "toUnixTimestamp64Micro(start_time)" in replay_scope
-    assert "IN %(graph_span_identities)s" in replay_scope
-    assert "toDate(start_time) IN %(graph_span_dates)s" in replay_scope
-    assert "is_deleted" not in replay_scope
-    assert score_read["project_id"] == PROJECT_ID
-    assert score_read["label_id"] == LABEL_ID
-    assert score_read["trace_ids"] == (trace_id,)
-    assert score_read["span_entities"] == (
-        (trace_id, "span-1"),
-        (trace_id, "span-child"),
-    )
-    assert score_read["limit"] == 2001
-    assert response["metric_name"] == LABEL_ID
-    assert response["name"] == "Quality"
-    assert response["data"][0]["value"] == 4.5
-    assert response["query_complete"] is True
-    assert response["query_status"] == "complete"
 
 
 @pytest.mark.unit
@@ -4833,197 +4092,6 @@ def test_trace_span_replay_resolves_scope_and_tombstones_from_global_latest_stat
 
 
 @pytest.mark.unit
-def test_eval_event_sentinel_returns_degraded_metadata_without_sampled_data(
-    monkeypatch,
-):
-    analytics = _DecorationAnalytics(
-        [
-            {
-                "created_at": START + timedelta(minutes=2),
-                "output_bool": None,
-                "output_float": 0.5,
-                "output_str": None,
-                "output_str_list": "[]",
-                "error": 0,
-            }
-            for _ in range(2001)
-        ]
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: _sample())
-
-    response = graph_dispatch.fetch_eval_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-        req_data_config={"id": EVAL_ID, "type": "EVAL", "output_type": "SCORE"},
-        observe_type="trace",
-    )
-
-    assert response["query_complete"] is False
-    assert response["query_status"] == "degraded"
-    assert response["query_error_code"] == "sample_limit"
-    assert response["data"] == []
-
-
-@pytest.mark.unit
-def test_eval_non_exhaustive_candidate_prefix_is_explicitly_sampled(monkeypatch):
-    analytics = _DecorationAnalytics([])
-    incomplete = replace(
-        _sample(),
-        query_complete=False,
-        query_status="sampled",
-        query_error_code="sample_limit",
-        sampling_strategy="time_stratified_latest_state",
-        sampling_strata=8,
-        sampling_strata_completed=8,
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: incomplete)
-
-    response = graph_dispatch.fetch_eval_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-        req_data_config={
-            "id": EVAL_ID,
-            "type": "EVAL",
-            "output_type": "SCORE",
-        },
-        observe_type="trace",
-    )
-
-    assert len(analytics.calls) == 1
-    assert response["data"]
-    assert response["query_complete"] is False
-    assert response["query_status"] == "sampled"
-    assert response["query_error_code"] == "sample_limit"
-
-
-@pytest.mark.unit
-def test_annotation_non_exhaustive_candidate_prefix_is_explicitly_sampled(
-    monkeypatch,
-):
-    sample = replace(
-        _sample(),
-        rows=(
-            {
-                "trace_id": "trace-proven-match",
-                "id": "span-proven-match",
-                "start_time": START + timedelta(minutes=1),
-            },
-        ),
-        query_complete=False,
-        query_status="sampled",
-        query_error_code="sample_limit",
-        sampling_strategy="time_stratified_latest_state",
-        sampling_strata=8,
-        sampling_strata_completed=8,
-    )
-    analytics = _DecorationAnalytics([])
-    label = SimpleNamespace(
-        id=LABEL_ID,
-        name="Quality",
-        type=AnnotationTypeChoices.NUMERIC.value,
-    )
-    monkeypatch.setattr(
-        graph_dispatch,
-        "get_annotation_labels_for_project",
-        lambda _: SimpleNamespace(get=lambda **__: label),
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: sample)
-    score_read = {}
-
-    def _annotation_rows(**kwargs):
-        score_read.update(kwargs)
-        return []
-
-    monkeypatch.setattr(
-        graph_dispatch,
-        "AnnotationLabelScoresProjectPG",
-        lambda: SimpleNamespace(annotation_rows_for_candidates=_annotation_rows),
-    )
-
-    response = graph_dispatch.fetch_annotation_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
-        interval="hour",
-        req_data_config={"id": LABEL_ID, "type": "ANNOTATION"},
-        observe_type="span",
-    )
-
-    assert analytics.calls == []
-    assert score_read["span_entities"] == (("trace-proven-match", "span-proven-match"),)
-    assert response["data"]
-    assert response["query_complete"] is False
-    assert response["query_status"] == "sampled"
-    assert response["query_error_code"] == "sample_limit"
-
-
-@pytest.mark.unit
-def test_annotation_child_span_identity_sentinel_stays_degraded(monkeypatch):
-    trace_id = "11111111-1111-4111-8111-111111111111"
-    analytics = _SequenceAnalytics(
-        [
-            [
-                {
-                    "trace_id": trace_id,
-                    "id": f"span-{index}",
-                    "start_time": START + timedelta(microseconds=index),
-                }
-                for index in range(4097)
-            ],
-            [
-                {
-                    "trace_id": trace_id,
-                    "id": f"span-{index}",
-                    "start_time": START + timedelta(microseconds=index),
-                }
-                for index in range(4096)
-            ],
-        ]
-    )
-    score_read = {}
-
-    def _annotation_rows(**kwargs):
-        score_read.update(kwargs)
-        return []
-
-    monkeypatch.setattr(
-        graph_dispatch,
-        "AnnotationLabelScoresProjectPG",
-        lambda: SimpleNamespace(annotation_rows_for_candidates=_annotation_rows),
-    )
-    label = SimpleNamespace(
-        id=LABEL_ID,
-        name="Quality",
-        type=AnnotationTypeChoices.NUMERIC.value,
-    )
-    label_query = SimpleNamespace(get=lambda **_: label)
-    monkeypatch.setattr(
-        graph_dispatch, "get_annotation_labels_for_project", lambda _: label_query
-    )
-    monkeypatch.setattr(graph_dispatch, "read_graph_candidates", lambda **_: _sample())
-
-    response = graph_dispatch.fetch_annotation_graph_ch(
-        analytics=analytics,
-        project_id=PROJECT_ID,
-        filters=[_date_filter()],
-        interval="hour",
-        req_data_config={"id": LABEL_ID, "type": "ANNOTATION"},
-        observe_type="trace",
-    )
-
-    assert len(analytics.calls[1][1]["graph_span_identities"]) == 4096
-    assert len(score_read["span_entities"]) == 4096
-    assert response["query_complete"] is False
-    assert response["query_status"] == "degraded"
-    assert response["query_error_code"] == "sample_limit"
-    assert response["data"] == []
-
-
-@pytest.mark.unit
 def test_degraded_response_never_contains_clickhouse_stack_or_raw_message():
     from clickhouse_driver.errors import ServerException
 
@@ -5153,7 +4221,15 @@ def test_graph_views_bind_v2_and_have_no_postgres_telemetry_fallback():
         )
         assert "_system_metric_graph_postgres" not in source
         assert "str(e)" not in source
-        assert "str(exc)" not in source
+        # The sole exception text exposed here is the typed principal-context
+        # validation error returned as a 400. ClickHouse and unexpected server
+        # failures retain static public messages below.
+        assert source.count("str(exc)") == 1
+        principal_handler = source.split(
+            "except FilterPrincipalContextError as exc:", 1
+        )[1]
+        assert "bad_request(str(exc))" in principal_handler
+        assert '"Graph data could not be loaded"' in source
         assert "isinstance(exc, BoundedGraphReadError)" in source
         assert "is_clickhouse_api_read_unavailable_error(exc)" in source
         assert "raise" in source

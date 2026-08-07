@@ -43,6 +43,15 @@ FILTER_CONFIG_SCHEMA = {
             "type": "string",
             "description": "Column family such as SYSTEM_METRIC, SPAN_ATTRIBUTE, EVAL_METRIC, ANNOTATION, or NORMAL.",
         },
+        "attribute_value_types": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": ["string", "number", "boolean"],
+                "x-nullable": True,
+            },
+            "description": "Optional storage-family provenance aligned one-for-one with filter_value for mixed SPAN_ATTRIBUTE in/not_in filters. Null entries retain filter_type semantics for manually entered values.",
+        },
     },
     "required": ["filter_type", "filter_op"],
     "additionalProperties": False,
@@ -307,6 +316,7 @@ class FilterItemField(serializers.JSONField):
             )
 
         filter_value = config.get("filter_value")
+        attribute_value_types = config.get("attribute_value_types")
         is_span_attribute = config.get("col_type") == "SPAN_ATTRIBUTE"
         filter_type = (
             normalize_span_attribute_filter_type(
@@ -343,6 +353,29 @@ class FilterItemField(serializers.JSONField):
                 )
         elif filter_op not in NO_VALUE_FILTER_OPS and "filter_value" not in config:
             raise serializers.ValidationError(f"{filter_op!r} requires filter_value.")
+
+        if attribute_value_types is not None:
+            if not is_span_attribute or filter_op not in LIST_FILTER_OPS:
+                raise serializers.ValidationError(
+                    "attribute_value_types is only supported for SPAN_ATTRIBUTE "
+                    "in/not_in filters."
+                )
+            if (
+                not isinstance(attribute_value_types, list)
+                or not isinstance(filter_value, list)
+                or len(attribute_value_types) != len(filter_value)
+            ):
+                raise serializers.ValidationError(
+                    "attribute_value_types must align one-for-one with filter_value."
+                )
+            if any(
+                value not in (None, "string", "number", "boolean")
+                for value in attribute_value_types
+            ):
+                raise serializers.ValidationError(
+                    "attribute_value_types entries must be string, number, "
+                    "boolean, or null."
+                )
 
         if is_span_attribute:
             # Structured span values live in the direct-write JSON overflow.
@@ -437,6 +470,52 @@ class FilterItemField(serializers.JSONField):
                         raise serializers.ValidationError(str(exc)) from exc
                     # The shared map validator has already checked every
                     # member's type/range/UTF-8 bounds.
+                    values_to_check = []
+                elif attribute_value_types is not None:
+                    if filter_type not in {"text", "number", "boolean"}:
+                        raise serializers.ValidationError(
+                            "Mixed typed value provenance is only supported for "
+                            "text, number, or boolean SPAN_ATTRIBUTE filters."
+                        )
+                    fallback_type = {
+                        "text": "string",
+                        "number": "number",
+                        "boolean": "boolean",
+                    }[filter_type]
+                    normalized_values = []
+                    for item, storage_type in zip(
+                        filter_value, attribute_value_types, strict=True
+                    ):
+                        effective_type = storage_type or fallback_type
+                        if effective_type == "string":
+                            if not isinstance(item, str):
+                                raise serializers.ValidationError(
+                                    "String SPAN_ATTRIBUTE values must be strings."
+                                )
+                            normalized_values.append(item)
+                        elif effective_type == "number":
+                            if isinstance(item, bool):
+                                raise serializers.ValidationError(
+                                    "Number SPAN_ATTRIBUTE values must be finite numbers."
+                                )
+                            try:
+                                numeric_item = float(item)
+                            except (TypeError, ValueError, OverflowError):
+                                raise serializers.ValidationError(
+                                    "Number SPAN_ATTRIBUTE values must be finite numbers."
+                                ) from None
+                            if not math.isfinite(numeric_item):
+                                raise serializers.ValidationError(
+                                    "Number SPAN_ATTRIBUTE values must be finite numbers."
+                                )
+                            normalized_values.append(numeric_item)
+                        else:
+                            if not isinstance(item, bool):
+                                raise serializers.ValidationError(
+                                    "Boolean SPAN_ATTRIBUTE values must be true or false."
+                                )
+                            normalized_values.append(item)
+                    config["filter_value"] = normalized_values
                     values_to_check = []
                 elif filter_op in RANGE_FILTER_OPS | LIST_FILTER_OPS:
                     values_to_check = filter_value

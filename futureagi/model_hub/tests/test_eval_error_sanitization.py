@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from inspect import unwrap
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from model_hub.selectors.eval_usage import (
     EvalUsageReadError,
     EvalUsageReadErrorCode,
 )
+from model_hub.serializers.contracts import EvalUsageQuerySerializer
 from model_hub.views import separate_evals
 
 
@@ -29,6 +31,30 @@ def _usage_template(organization, workspace):
         criteria="Check {{response}}",
         model="turing_large",
         visible_ui=True,
+    )
+
+
+def _usage_worker_response(template, organization, workspace):
+    query_serializer = EvalUsageQuerySerializer(
+        data={
+            "page": 0,
+            "page_size": 25,
+            "period": "30d",
+            "refresh": True,
+        }
+    )
+    query_serializer.is_valid(raise_exception=True)
+    request = SimpleNamespace(
+        validated_query_data=query_serializer.validated_data,
+        organization=organization,
+        workspace=workspace,
+        user=SimpleNamespace(organization=organization),
+        _exact_aggregation_worker=True,
+    )
+    return unwrap(separate_evals.EvalUsageStatsView.get)(
+        separate_evals.EvalUsageStatsView(),
+        request,
+        template.id,
     )
 
 
@@ -76,22 +102,17 @@ def test_eval_logs_table_internal_error_is_sanitized(auth_client, monkeypatch):
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
-    ("failure_code", "response_code"),
+    "failure_code",
     [
-        (
-            EvalUsageReadErrorCode.DEADLINE_EXCEEDED,
-            "eval_usage_deadline_exceeded",
-        ),
-        (EvalUsageReadErrorCode.QUERY_FAILED, "eval_usage_query_failed"),
+        EvalUsageReadErrorCode.DEADLINE_EXCEEDED,
+        EvalUsageReadErrorCode.QUERY_FAILED,
     ],
 )
-def test_eval_usage_typed_failure_is_sanitized_at_api_boundary(
-    auth_client,
+def test_eval_usage_typed_failure_propagates_from_exact_worker(
     organization,
     workspace,
     monkeypatch,
     failure_code,
-    response_code,
 ):
     template = _usage_template(organization, workspace)
     monkeypatch.setattr(separate_evals, "APICallLog", SimpleNamespace())
@@ -105,23 +126,48 @@ def test_eval_usage_typed_failure_is_sanitized_at_api_boundary(
 
     monkeypatch.setattr(separate_evals, "read_eval_usage", fail_bounded_read)
 
+    with pytest.raises(EvalUsageReadError) as raised:
+        _usage_worker_response(template, organization, workspace)
+
+    assert raised.value.code == failure_code
+
+
+@pytest.mark.django_db
+def test_eval_usage_public_poll_never_runs_clickhouse_inline(
+    auth_client,
+    organization,
+    workspace,
+    monkeypatch,
+):
+    template = _usage_template(organization, workspace)
+    monkeypatch.setattr(separate_evals, "APICallLog", SimpleNamespace())
+    monkeypatch.setattr(separate_evals, "is_clickhouse_enabled", lambda: True)
+    monkeypatch.setattr(
+        separate_evals,
+        "read_eval_usage",
+        lambda **_kwargs: pytest.fail("public poll ran the exact selector inline"),
+    )
+    monkeypatch.setattr(
+        separate_evals,
+        "read_or_schedule_exact_snapshot",
+        lambda _namespace, _identity, **kwargs: kwargs["pending_payload"],
+    )
+
     response = auth_client.get(
         f"/model-hub/eval-templates/{template.id}/usage/",
         {"page": 0, "page_size": 25, "period": "30d"},
     )
 
-    body = response.json()
-    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-    assert body["code"] == response_code
-    assert body["result"] == (
-        "Evaluation usage could not be loaded. Please try again later."
-    )
-    assert "stats" not in str(body)
+    result = response.data["result"]
+    assert response.status_code == status.HTTP_200_OK
+    assert result["query_complete"] is False
+    assert result["query_status"] == "pending"
+    assert result["query_sampled"] is False
+    assert result["table"] == []
 
 
 @pytest.mark.django_db
 def test_eval_usage_clickhouse_response_preserves_required_total_runs(
-    auth_client,
     organization,
     workspace,
     monkeypatch,
@@ -144,12 +190,9 @@ def test_eval_usage_clickhouse_response_preserves_required_total_runs(
         ),
     )
 
-    response = auth_client.get(
-        f"/model-hub/eval-templates/{template.id}/usage/",
-        {"page": 0, "page_size": 25, "period": "30d"},
-    )
+    response = _usage_worker_response(template, organization, workspace)
 
-    result = response.json()["result"]
+    result = response.data["result"]
     assert response.status_code == status.HTTP_200_OK
     assert result["completeness"] == "complete"
     assert result["unavailable_fields"] == []
@@ -158,7 +201,6 @@ def test_eval_usage_clickhouse_response_preserves_required_total_runs(
 
 @pytest.mark.django_db
 def test_eval_usage_non_finite_chart_averages_do_not_crash_api(
-    auth_client,
     organization,
     workspace,
     monkeypatch,
@@ -192,21 +234,17 @@ def test_eval_usage_non_finite_chart_averages_do_not_crash_api(
         ),
     )
 
-    response = auth_client.get(
-        f"/model-hub/eval-templates/{template.id}/usage/",
-        {"page": 0, "page_size": 25, "period": "30d"},
-    )
+    response = _usage_worker_response(template, organization, workspace)
 
     assert response.status_code == status.HTTP_200_OK
-    chart = response.json()["result"]["chart"]
+    chart = response.data["result"]["chart"]
     assert chart[0]["calls"] == 1
     assert chart[0]["avg_latency_ms"] == 0
     assert chart[0]["avg_score"] is None
 
 
 @pytest.mark.django_db
-def test_eval_usage_programming_defect_re_raises_through_api_boundary(
-    auth_client,
+def test_eval_usage_programming_defect_re_raises_through_exact_worker(
     organization,
     workspace,
     monkeypatch,
@@ -221,7 +259,4 @@ def test_eval_usage_programming_defect_re_raises_through_api_boundary(
     monkeypatch.setattr(separate_evals, "read_eval_usage", fail_with_bug)
 
     with pytest.raises(KeyError, match="eval usage application bug"):
-        auth_client.get(
-            f"/model-hub/eval-templates/{template.id}/usage/",
-            {"page": 0, "page_size": 25, "period": "30d"},
-        )
+        _usage_worker_response(template, organization, workspace)

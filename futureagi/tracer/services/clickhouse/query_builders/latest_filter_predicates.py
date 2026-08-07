@@ -333,6 +333,18 @@ def _attribute_plan(
         str(config.get("filter_type") or config.get("filterType") or ""),
         raw_filter_value,
     )
+    attribute_value_types = config.get(
+        "attribute_value_types", config.get("attributeValueTypes")
+    )
+    if attribute_value_types is not None:
+        return _mixed_typed_attribute_plan(
+            key=key,
+            config=config,
+            filter_type=filter_type,
+            attribute_value_types=attribute_value_types,
+            index=index,
+            scope=scope,
+        )
     if filter_type == "array":
         return _json_array_attribute_plan(
             key=key,
@@ -363,6 +375,7 @@ def _attribute_plan(
         value_type="text" if filter_type in {"text", "string"} else filter_type,
         index=index,
     )
+
     seed_predicate, seed_params = _comparison(
         alias=f"{map_column}[{bound_key}]",
         exists_alias=f"mapContains({map_column}, {bound_key})",
@@ -459,6 +472,147 @@ def _attribute_plan(
             if operation in positive_witness_operations
             else None
         ),
+    )
+
+
+def _mixed_typed_attribute_plan(
+    *,
+    key: str,
+    config: dict[str, Any],
+    filter_type: str,
+    attribute_value_types: object,
+    index: int,
+    scope: str,
+) -> LatestFilterPredicate:
+    """Preserve picker storage provenance in bounded latest-state reads."""
+
+    operation = normalize_filter_op(
+        str(config.get("filter_op") or config.get("filterOp") or "")
+    )
+    raw_values = config.get("filter_value", config.get("filterValue"))
+    if operation not in {"in", "not_in"}:
+        raise UnsupportedFilterShapeError(
+            "attribute_value_types is only supported for in/not_in filters"
+        )
+    if (
+        not isinstance(raw_values, list)
+        or not raw_values
+        or not isinstance(attribute_value_types, list)
+        or len(attribute_value_types) != len(raw_values)
+    ):
+        raise UnsupportedFilterShapeError(
+            "attribute_value_types must align one-for-one with filter_value"
+        )
+
+    fallback_storage_type = {
+        "text": "string",
+        "string": "string",
+        "number": "number",
+        "boolean": "boolean",
+    }.get(filter_type)
+    if fallback_storage_type is None:
+        raise UnsupportedFilterShapeError(
+            "mixed typed attributes require text, number, or boolean values"
+        )
+
+    grouped_values: dict[str, list[object]] = {}
+    for raw_value, selected_type in zip(raw_values, attribute_value_types, strict=True):
+        storage_type = selected_type or fallback_storage_type
+        if storage_type not in {"string", "number", "boolean"}:
+            raise UnsupportedFilterShapeError(
+                "attribute value type must be string, number, or boolean"
+            )
+        if raw_value is None or raw_value == "":
+            raise UnsupportedFilterShapeError(f"{operation} requires non-empty values")
+        grouped_values.setdefault(storage_type, []).append(raw_value)
+
+    key_param = f"latest_filter_key_{index}"
+    bound_key = f"%({key_param})s"
+    params: dict[str, Any] = {key_param: key}
+    aggregates: list[str] = []
+    latest_exists: list[str] = []
+    latest_matches: list[str] = []
+    seed_exists: list[str] = []
+    seed_matches: list[str] = []
+    key_witnesses: list[str] = []
+    storage_metadata: dict[str, tuple[str, Callable[[object], object], bool]] = {
+        "string": ("span_attr_str", _strict_text, True),
+        "number": ("span_attr_num", _strict_finite_number, False),
+        "boolean": ("span_attr_bool", _strict_bool, False),
+    }
+
+    for storage_type in ("string", "number", "boolean"):
+        values = grouped_values.get(storage_type)
+        if not values:
+            continue
+        map_column, coerce, case_insensitive = storage_metadata[storage_type]
+        try:
+            normalized_values = tuple(coerce(value) for value in values)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise UnsupportedFilterShapeError(str(exc)) from exc
+        if case_insensitive:
+            normalized_values = tuple(value.lower() for value in normalized_values)
+
+        suffix = f"{index}_{storage_type}"
+        exists_alias = f"latest_attr_exists_{suffix}"
+        value_alias = f"latest_attr_value_{suffix}"
+        value_param = f"latest_filter_param_{suffix}"
+        params[value_param] = normalized_values
+        aggregates.extend(
+            (
+                f"argMax(mapContains({map_column}, {bound_key}), _peerdb_version) AS {exists_alias}",
+                f"argMax({map_column}[{bound_key}], _peerdb_version) AS {value_alias}",
+            )
+        )
+
+        latest_lhs = (
+            f"lowerUTF8(toString({value_alias}))" if case_insensitive else value_alias
+        )
+        seed_value = f"{map_column}[{bound_key}]"
+        seed_lhs = (
+            f"lowerUTF8(toString({seed_value}))" if case_insensitive else seed_value
+        )
+        latest_exists.append(exists_alias)
+        latest_matches.append(f"({exists_alias} AND {latest_lhs} IN %({value_param})s)")
+        map_exists = f"mapContains({map_column}, {bound_key})"
+        seed_exists.append(map_exists)
+        seed_matches.append(f"({map_exists} AND {seed_lhs} IN %({value_param})s)")
+        key_witnesses.append(
+            f"(indexHint(has(mapKeys({map_column}), {bound_key})) "
+            f"AND has({map_column}.keys, {bound_key}))"
+        )
+
+    if not latest_matches:
+        raise UnsupportedFilterShapeError(
+            "mixed typed attribute filter has no selected values"
+        )
+
+    latest_positive = " OR ".join(latest_matches)
+    seed_positive = " OR ".join(seed_matches)
+    if operation == "in":
+        predicate = f"({latest_positive})"
+        seed_predicate = f"({seed_positive})"
+        raw_witness_predicate = f"({seed_positive})"
+        raw_key_witness_predicate = f"({' OR '.join(key_witnesses)})"
+        raw_witness_rank = 0
+    else:
+        predicate = f"(({' OR '.join(latest_exists)}) AND NOT ({latest_positive}))"
+        seed_predicate = f"(({' OR '.join(seed_exists)}) AND NOT ({seed_positive}))"
+        # Negative membership requires absence knowledge and therefore cannot
+        # use a raw-row witness without risking an incomplete latest replay.
+        raw_witness_predicate = None
+        raw_key_witness_predicate = None
+        raw_witness_rank = None
+
+    return LatestFilterPredicate(
+        aggregates=tuple(aggregates),
+        predicate=predicate,
+        seed_predicate=seed_predicate,
+        params=params,
+        scope=scope,
+        raw_witness_predicate=raw_witness_predicate,
+        raw_key_witness_predicate=raw_key_witness_predicate,
+        raw_witness_rank=raw_witness_rank,
     )
 
 

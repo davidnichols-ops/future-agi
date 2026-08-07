@@ -81,6 +81,11 @@ class SpanAttributeKeySerializer(serializers.Serializer):
     key = serializers.CharField()
     type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_KEY_TYPES)
     count = serializers.IntegerField()
+    count_exact = serializers.BooleanField(required=False)
+    types = serializers.ListField(
+        child=serializers.ChoiceField(choices=SPAN_ATTRIBUTE_KEY_TYPES),
+        required=False,
+    )
 
 
 class SpanAttributeKeysResponseSerializer(serializers.Serializer):
@@ -133,6 +138,7 @@ class SpanAttributeValuesResponseSerializer(serializers.Serializer):
 
 class SpanAttributeTopValueSerializer(serializers.Serializer):
     value = JsonValueField(allow_null=True)
+    type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_TYPES, required=False)
     count = serializers.IntegerField()
     percentage = serializers.FloatField()
 
@@ -145,11 +151,18 @@ class SpanAttributeNumericStatsSerializer(serializers.Serializer):
     p95 = serializers.FloatField(allow_null=True, required=False)
 
 
+class SpanAttributeTypeSummarySerializer(serializers.Serializer):
+    type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_TYPES)
+    count = serializers.IntegerField(min_value=0)
+    unique_values = serializers.IntegerField(min_value=0)
+
+
 class SpanAttributeDetailResponseSerializer(serializers.Serializer):
     key = serializers.CharField()
     type = serializers.ChoiceField(choices=SPAN_ATTRIBUTE_TYPES, allow_null=True)
     count = serializers.IntegerField()
     unique_values = serializers.IntegerField(required=False)
+    types = SpanAttributeTypeSummarySerializer(many=True, required=False)
     top_values = SpanAttributeTopValueSerializer(many=True, required=False)
     min = serializers.FloatField(required=False, allow_null=True)
     max = serializers.FloatField(required=False, allow_null=True)

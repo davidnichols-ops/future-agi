@@ -801,8 +801,15 @@ def test_bounded_list_is_null_returns_exact_empty_without_clickhouse(
     assert analytics.calls == 0
 
 
-def test_system_graph_is_null_returns_exact_empty_without_clickhouse():
+def test_system_graph_is_null_returns_pending_without_inline_clickhouse(monkeypatch):
+    from tracer.services.clickhouse import graph_dispatch
+
     analytics = _NoQueryAnalytics()
+    monkeypatch.setattr(
+        graph_dispatch,
+        "read_or_schedule_exact_snapshot",
+        lambda _namespace, _identity, **kwargs: kwargs["pending_payload"],
+    )
 
     response = fetch_system_metric_graph_ch(
         analytics=analytics,
@@ -813,8 +820,10 @@ def test_system_graph_is_null_returns_exact_empty_without_clickhouse():
     )
 
     assert response["data"] == []
-    assert response["query_complete"] is True
-    assert response["query_count"] == 0
+    assert response["query_complete"] is False
+    assert response["query_status"] == "pending"
+    assert response["query_sampled"] is False
+    assert response["query_refreshing"] is True
     assert analytics.calls == 0
 
 

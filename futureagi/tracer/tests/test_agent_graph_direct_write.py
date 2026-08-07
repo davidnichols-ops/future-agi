@@ -7,6 +7,12 @@ from unittest.mock import MagicMock
 import pytest
 from clickhouse_driver.errors import ServerException
 
+from tracer.services.clickhouse.query_builders.agent_graph import (
+    AGENT_GRAPH_MAX_RESULT_BYTES,
+    AGENT_GRAPH_MAX_VISIBLE_NODES,
+    AGENT_GRAPH_OTHER_NODE_ID,
+    AGENT_GRAPH_RESULT_ROW_SENTINEL,
+)
 from tracer.services.clickhouse.v2.query_builders.agent_graph import (
     AgentGraphQueryBuilderV2,
 )
@@ -89,6 +95,27 @@ def test_agent_graph_http_path_schedules_exact_snapshot_without_sync_ch(monkeypa
 
 
 @pytest.mark.unit
+def test_agent_graph_cache_identity_invalidates_retired_path_payloads(monkeypatch):
+    from tracer.services.clickhouse import graph_dispatch
+
+    schedule = MagicMock(return_value=_complete_payload())
+    monkeypatch.setattr(graph_dispatch, "read_or_schedule_exact_snapshot", schedule)
+
+    result = graph_dispatch.fetch_agent_graph_ch(
+        project_id=PROJECT_ID,
+        filters=[FINAL_STATUS_FILTER],
+    )
+
+    assert result == _complete_payload()
+    identity = schedule.call_args.args[1]
+    assert identity == {
+        "project_id": PROJECT_ID,
+        "filters": [FINAL_STATUS_FILTER],
+        "payload_version": 2,
+    }
+
+
+@pytest.mark.unit
 def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
     builder = AgentGraphQueryBuilderV2(
         project_id=PROJECT_ID,
@@ -110,8 +137,23 @@ def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
     assert "'node'" in query
     assert "'hierarchy'" in query
     assert "'path'" in query
+    assert "arrayFirst(" not in query
+    assert "arrayExists(" not in query
+    assert "indexOfAssumeSorted(" in query
+    assert "arrayFold(" not in query
+    assert "graph_execution_groups" not in query
+    assert "uniqExact(trace_id)" not in query
+    assert "graph_trace_events AS" in query
+    assert "graph_ranked_events AS" in query
+    assert "graph_fold_inputs AS" in query
+    assert "graph_mapped_events AS" in query
+    assert "groupArrayIf(" in query
+    assert "graph_global_rank <= %(graph_visible_keep_count)s" in query
+    assert f"max_result_rows = {AGENT_GRAPH_RESULT_ROW_SENTINEL}" in query
+    assert f"max_result_bytes = {AGENT_GRAPH_MAX_RESULT_BYTES}" in query
     assert "max_threads = 1" in query
     assert params["project_id"] == PROJECT_ID
+    assert params["graph_visible_keep_count"] == AGENT_GRAPH_MAX_VISIBLE_NODES - 1
 
     # Mutable Map/JSON values are consumed inside argMax. They must not be
     # applied as PREWHERE predicates where an old matching version could hide
@@ -125,7 +167,7 @@ def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
 
 
 @pytest.mark.unit
-def test_agent_graph_formatter_separates_topology_and_chronological_path():
+def test_agent_graph_formatter_separates_two_exact_topology_projections():
     builder = AgentGraphQueryBuilderV2(project_id=PROJECT_ID, filters=[])
     payload = builder.format_result(
         [
@@ -157,10 +199,10 @@ def test_agent_graph_formatter_separates_topology_and_chronological_path():
             },
             {
                 "row_kind": "path",
-                "source_node": "lookup",
-                "source_type": "tool",
-                "target_node": "answer",
-                "target_type": "llm",
+                "source_node": "agent",
+                "source_type": "agent",
+                "target_node": "lookup",
+                "target_type": "tool",
                 "item_count": 2,
                 "avg_latency_ms": 10,
                 "total_tokens": 8,
@@ -187,8 +229,140 @@ def test_agent_graph_formatter_separates_topology_and_chronological_path():
     ]
     assert payload["edges"][0]["source"] == "agent:agent"
     assert payload["edges"][0]["target"] == "tool:lookup"
-    assert payload["path_edges"][0]["source"] == "tool:lookup"
-    assert payload["path_edges"][0]["target"] == "llm:answer"
+    assert payload["path_edges"][0]["source"] == "agent:agent"
+    assert payload["path_edges"][0]["target"] == "tool:lookup"
+    assert payload["graph_collapsed"] is False
+
+
+@pytest.mark.unit
+def test_agent_graph_formatter_collapses_overflow_without_dropping_counts():
+    builder = AgentGraphQueryBuilderV2(project_id=PROJECT_ID, filters=[])
+    rows = []
+    for index in range(AGENT_GRAPH_MAX_VISIBLE_NODES + 6):
+        rows.append(
+            {
+                "row_kind": "node",
+                "source_node": f"node-{index:03d}",
+                "source_type": "tool",
+                "target_node": "",
+                "target_type": "",
+                "item_count": index + 1,
+                "avg_latency_ms": index + 0.5,
+                "total_tokens": index,
+                "total_cost": index / 100,
+                "error_count": index % 2,
+                "trace_count": 1,
+            }
+        )
+    rows.extend(
+        [
+            {
+                "row_kind": kind,
+                "source_node": "node-000",
+                "source_type": "tool",
+                "target_node": "node-001",
+                "target_type": "tool",
+                "item_count": 3,
+                "avg_latency_ms": 7,
+                "total_tokens": 5,
+                "total_cost": 0.1,
+                "error_count": 1,
+                "trace_count": 2,
+            }
+            for kind in ("hierarchy", "path")
+        ]
+    )
+
+    payload = builder.format_result(rows, [])
+
+    assert payload["graph_collapsed"] is True
+    assert payload["omitted_node_count"] == 7
+    assert len(payload["nodes"]) == AGENT_GRAPH_MAX_VISIBLE_NODES
+    other = next(
+        node for node in payload["nodes"] if node["id"] == AGENT_GRAPH_OTHER_NODE_ID
+    )
+    assert other["span_count"] == sum(range(1, 8))
+    assert other["trace_count"] is None
+    assert payload["edges"] == payload["path_edges"]
+    assert payload["edges"][0]["source"] == AGENT_GRAPH_OTHER_NODE_ID
+    assert payload["edges"][0]["target"] == AGENT_GRAPH_OTHER_NODE_ID
+    assert payload["edges"][0]["transition_count"] == 3
+
+
+@pytest.mark.unit
+def test_agent_graph_formatter_preserves_sql_side_exact_other_fold():
+    builder = AgentGraphQueryBuilderV2(project_id=PROJECT_ID, filters=[])
+    common = {
+        "graph_total_nodes": 70,
+        "aggregate_member_count": 7,
+        "source_endpoint_exact": 0,
+        "target_endpoint_exact": 1,
+        "trace_count": None,
+        "trace_count_exact": 0,
+    }
+    payload = builder.format_result(
+        [
+            {
+                **common,
+                "row_kind": "node",
+                "source_node": "__other_nodes__",
+                "source_type": "aggregate",
+                "target_node": "",
+                "target_type": "",
+                "item_count": 99,
+                "avg_latency_ms": 8,
+                "total_tokens": 4,
+                "total_cost": 0.2,
+                "error_count": 3,
+            },
+            {
+                **common,
+                "row_kind": "path",
+                "source_node": "__other_nodes__",
+                "source_type": "aggregate",
+                "target_node": "answer",
+                "target_type": "llm",
+                "item_count": 11,
+                "avg_latency_ms": 5,
+                "total_tokens": 2,
+                "total_cost": 0.1,
+                "error_count": 1,
+            },
+        ],
+        [],
+    )
+
+    assert payload["graph_collapsed"] is True
+    assert payload["omitted_node_count"] == 7
+    assert payload["nodes"] == [
+        {
+            "id": AGENT_GRAPH_OTHER_NODE_ID,
+            "name": "Other nodes",
+            "type": "aggregate",
+            "span_count": 99,
+            "avg_latency_ms": 8.0,
+            "total_tokens": 4,
+            "total_cost": 0.2,
+            "error_count": 3,
+            "trace_count": None,
+            "trace_count_exact": False,
+            "is_aggregate": True,
+            "member_count": 7,
+        }
+    ]
+    assert payload["path_edges"][0] == {
+        "source": AGENT_GRAPH_OTHER_NODE_ID,
+        "target": "llm:answer",
+        "transition_count": 11,
+        "avg_latency_ms": 5.0,
+        "total_tokens": 2,
+        "total_cost": 0.1,
+        "error_count": 1,
+        "trace_count": None,
+        "is_self_loop": False,
+        "trace_count_exact": False,
+        "is_aggregate": True,
+    }
 
 
 @pytest.mark.unit
@@ -208,6 +382,8 @@ def test_exact_agent_graph_reader_executes_only_one_statement():
     assert analytics.execute_ch_query.call_count == 1
     call = analytics.execute_ch_query.call_args
     assert call.kwargs["settings"]["max_threads"] == 1
+    assert call.kwargs["settings"]["max_result_rows"] == AGENT_GRAPH_RESULT_ROW_SENTINEL
+    assert call.kwargs["settings"]["max_result_bytes"] == AGENT_GRAPH_MAX_RESULT_BYTES
     assert call.args[0].count("FROM spans") == 1
     assert result["query_complete"] is True
     assert result["query_status"] == "complete"

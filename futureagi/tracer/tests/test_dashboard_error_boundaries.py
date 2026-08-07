@@ -111,6 +111,12 @@ def test_dashboard_query_uses_direct_write_backend_independent_of_routing(
             "tracer.views.dashboard.DashboardQueryBuilderV2",
             wraps=DashboardQueryBuilderV2,
         ) as v2_builder,
+        patch(
+            "tracer.views.dashboard.read_or_schedule_exact_snapshot",
+            side_effect=lambda _namespace, _identity, **kwargs: kwargs[
+                "pending_payload"
+            ],
+        ) as exact_snapshot,
     ):
         response = auth_client.post(
             "/tracer/dashboard/query/",
@@ -119,8 +125,10 @@ def test_dashboard_query_uses_direct_write_backend_independent_of_routing(
         )
 
     assert response.status_code == 200
-    assert v2_client.execute_read.called
-    assert v2_builder.called
+    assert response.json()["result"]["query_status"] == "pending"
+    assert not v2_client.execute_read.called
+    v2_builder.assert_not_called()
+    exact_snapshot.assert_called_once()
     dispatch.assert_not_called()
     legacy_analytics.assert_not_called()
 
@@ -167,6 +175,13 @@ def test_widget_trace_queries_use_direct_write_backend_independent_of_routing(
             "tracer.views.dashboard.DashboardQueryBuilderV2",
             wraps=DashboardQueryBuilderV2,
         ) as v2_builder,
+        patch(
+            "tracer.views.dashboard.read_or_schedule_exact_snapshot",
+            side_effect=lambda _namespace, _identity, **kwargs: kwargs[
+                "pending_payload"
+            ],
+        ) as exact_snapshot,
+        patch("tracer.views.dashboard.read_exact_snapshot", return_value=None),
     ):
         if action == "execute":
             response = auth_client.post(
@@ -180,8 +195,10 @@ def test_widget_trace_queries_use_direct_write_backend_independent_of_routing(
             )
 
     assert response.status_code == 200
-    assert v2_client.execute_read.called
-    assert v2_builder.called
+    assert response.json()["result"]["query_status"] == "pending"
+    assert not v2_client.execute_read.called
+    v2_builder.assert_not_called()
+    exact_snapshot.assert_called_once()
     dispatch.assert_not_called()
     legacy_analytics.assert_not_called()
     legacy_client.assert_not_called()
@@ -247,30 +264,35 @@ def test_system_filter_values_read_budget_is_sanitized_503(
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
-    ("failure", "expected_status"),
+    "failure",
     [
-        (ServerException("private missing-column query", code=47), 400),
-        (RuntimeError("private dashboard compiler invariant"), 400),
-        (ServerException("private timeout query", code=159), 503),
+        ServerException("private missing-column query", code=47),
+        RuntimeError("private dashboard compiler invariant"),
+        ServerException("private timeout query", code=159),
     ],
 )
 @patch("tracer.views.dashboard.V2AnalyticsQueryService")
-def test_dashboard_query_does_not_mask_clickhouse_failures(
+def test_dashboard_poll_defers_clickhouse_failures_to_exact_worker(
     mock_analytics_cls,
     failure,
-    expected_status,
     auth_client,
     observe_project,
 ):
     mock_analytics_cls.return_value.execute_ch_query.side_effect = failure
 
-    response = auth_client.post(
-        "/tracer/dashboard/query/",
-        _trace_query(observe_project.id),
-        format="json",
-    )
+    with patch(
+        "tracer.views.dashboard.read_or_schedule_exact_snapshot",
+        side_effect=lambda _namespace, _identity, **kwargs: kwargs["pending_payload"],
+    ):
+        response = auth_client.post(
+            "/tracer/dashboard/query/",
+            _trace_query(observe_project.id),
+            format="json",
+        )
 
-    assert response.status_code == expected_status
+    assert response.status_code == 200
+    assert response.json()["result"]["query_status"] == "pending"
+    mock_analytics_cls.assert_not_called()
     payload = json.dumps(response.json())
     assert "private" not in payload
     assert "missing-column" not in payload

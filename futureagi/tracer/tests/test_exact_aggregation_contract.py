@@ -985,6 +985,7 @@ def test_terminal_status_racing_with_activity_promotion_cannot_clear_running_cla
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 def test_expired_unstarted_dispatch_is_reclaimed_by_an_ordinary_poll(monkeypatch):
     """A Temporal pre-activity failure must not leave a one-hour pending UI."""
 
@@ -1107,6 +1108,7 @@ def test_cold_miss_enqueue_failure_releases_claim_and_fails_closed():
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 def test_background_worker_publishes_only_after_complete_loader(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 
@@ -1143,6 +1145,7 @@ def test_background_worker_publishes_only_after_complete_loader(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 def test_background_worker_failure_leaves_cache_unpublished_and_retryable(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 
@@ -1211,6 +1214,7 @@ def test_exact_refresh_workflow_id_is_deterministic_and_opaque_per_claim():
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 def test_redelivered_exact_refresh_cannot_publish_after_claim_finished(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 

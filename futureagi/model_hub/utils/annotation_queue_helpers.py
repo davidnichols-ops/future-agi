@@ -2659,8 +2659,14 @@ def _resolve_dataset_rule_ids(rule, filters, dataset_id, cap):
         rows = rows.filter(id__in=matching_cells.values_list("row_id", flat=True))
 
     rows = rows.order_by("order", "id")
-    total_matching = rows.count()
-    ids = list(rows.values_list("id", flat=True)[:cap])
+    # Fetch one bounded sentinel row instead of counting the full filtered
+    # queryset.  At or below the cap this is the exact total; above it the
+    # cap+1 value is sufficient for the caller's all-or-nothing overflow
+    # guard, without an unbounded COUNT(*) on a large dataset.
+    candidate_ids = list(rows.values_list("id", flat=True)[: cap + 1])
+    truncated = len(candidate_ids) > cap
+    ids = candidate_ids[:cap]
+    total_matching = len(ids) + (1 if truncated else 0)
     return total_matching, ids
 
 

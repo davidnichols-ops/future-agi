@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import structlog
 from django.conf import settings
@@ -121,7 +122,14 @@ def _materialize_dashboard_query_scope(
 
     scoped = {**query_config}
     if trace_metrics:
-        requested_project_ids = list(scoped.get("project_ids") or [])
+        try:
+            requested_project_ids = [
+                str(UUID(str(value))) for value in scoped.get("project_ids") or []
+            ]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise DashboardQueryScopeError(
+                "One or more project_ids are invalid"
+            ) from exc
         project_queryset = Project.objects.filter(workspace=workspace)
         if requested_project_ids:
             project_queryset = project_queryset.filter(id__in=requested_project_ids)
@@ -137,7 +145,14 @@ def _materialize_dashboard_query_scope(
     if dataset_metrics:
         from model_hub.models.develop_dataset import Dataset
 
-        requested_dataset_ids = list(scoped.get("dataset_ids") or [])
+        try:
+            requested_dataset_ids = [
+                str(UUID(str(value))) for value in scoped.get("dataset_ids") or []
+            ]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise DashboardQueryScopeError(
+                "Some dataset_ids are invalid or not in this workspace"
+            ) from exc
         dataset_queryset = Dataset.objects.filter(
             workspace=workspace,
             deleted=False,
@@ -1520,6 +1535,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 "values": values,
                                 **page_read.metadata.public_payload(),
                                 "has_more": page_read.has_more,
+                                "browse_status": page_read.browse_status,
                                 "next_cursor": next_cursor,
                                 **(
                                     {"attribute_type": attribute_type}

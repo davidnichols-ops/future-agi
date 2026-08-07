@@ -41,14 +41,16 @@ from tracer.services.clickhouse.v2.query_builders.trace_list import (
 # sample without ever constructing a tenant-wide Set.
 GRAPH_CANDIDATE_LIMIT = 4_096
 # A root-only trace classifier intentionally hydrates complete presentation
-# rows in batches of 50 (the production-safe memory ceiling).  Asking the
-# shared selector for 4,095 rows would require 83 minimum queries including
+# rows in batches of 50 (the production-safe memory ceiling). Asking the
+# shared selector for 4,096 rows would require 83 minimum queries including
 # the sentinel seed, above its hard 48-query request contract, so even a
-# one-trace equality filter would fail before ClickHouse was queried.  Keep
-# the exact root-only ceiling at 1,599: its 1,600-row sentinel needs at most
-# four 512-row seeds plus 32 classifier batches.  Any-span trace filters retain the
-# 4,096 ceiling because their directly-indexable classifier safely uses 512.
-GRAPH_TRACE_ROOT_CANDIDATE_LIMIT = 1_599
+# one-trace equality filter would fail before ClickHouse was queried. Keep at
+# most 32 classifier batches: a 50-row classifier therefore has an exact
+# 1,599-row ceiling, while smaller structured classifiers scale the ceiling
+# down by the same formula. Directly-indexable 512-row classifiers retain the
+# 4,096 graph ceiling.
+GRAPH_TRACE_CLASSIFY_BATCH_BUDGET = 32
+GRAPH_TRACE_ROOT_CANDIDATE_LIMIT = (50 * GRAPH_TRACE_CLASSIFY_BATCH_BUDGET) - 1
 GRAPH_CANDIDATE_DEADLINE_MS = 3_900
 GRAPH_DECORATION_CANDIDATE_DEADLINE_MS = 3_100
 GRAPH_MAX_POINTS = 10_000
@@ -1200,15 +1202,20 @@ def read_graph_candidates(
         )
 
     candidate_limit = GRAPH_CANDIDATE_LIMIT
-    if mode == "trace" and classify_batch_size == 50:
-        candidate_limit = GRAPH_TRACE_ROOT_CANDIDATE_LIMIT
-        builder = builder_class(
-            project_id=str(project_id),
-            page_number=0,
-            page_size=candidate_limit,
-            filters=effective_filters,
-            bounded_identity_only=True,
+    if mode == "trace":
+        trace_classify_batch_size = int(classify_batch_size or 50)
+        candidate_limit = min(
+            GRAPH_CANDIDATE_LIMIT,
+            (trace_classify_batch_size * GRAPH_TRACE_CLASSIFY_BATCH_BUDGET) - 1,
         )
+        if candidate_limit != GRAPH_CANDIDATE_LIMIT:
+            builder = builder_class(
+                project_id=str(project_id),
+                page_number=0,
+                page_size=candidate_limit,
+                filters=effective_filters,
+                bounded_identity_only=True,
+            )
 
     try:
         page = read_bounded_filter_page(

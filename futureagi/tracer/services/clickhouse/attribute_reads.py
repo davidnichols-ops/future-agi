@@ -21,12 +21,15 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import structlog
 
+from tracer.services.clickhouse.attribute_cursor_state import (
+    ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
+)
 from tracer.services.clickhouse.client import ClickHouseClient
 from tracer.services.clickhouse.read_budget import (
     ReadDeadlineExceeded,
@@ -43,6 +46,7 @@ AttributeType = Literal["string", "number", "boolean", "array", "map", "json"]
 JsonAttributeMode = Literal["none", "scalars", "arrays", "structured", "all"]
 QueryStatus = Literal["complete", "sampled", "degraded"]
 AttributeKeyBrowseStatus = Literal["continuation", "exhausted", "limit_reached"]
+AttributeValueBrowseStatus = Literal["continuation", "exhausted", "limit_reached"]
 PhysicalSpanIdentity = tuple[str, str, str, datetime]
 JsonScalar = str | int | float | bool
 AttributeValue = str | int | float | bool | tuple[JsonScalar, ...]
@@ -222,6 +226,9 @@ class AttributeKeyRow:
     key: str
     type: AttributeType
     count: int
+    # Supplemental response metadata must not change the row's long-standing
+    # value/equality identity, which is key + dominant type + observed count.
+    types: tuple[AttributeType, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -255,6 +262,7 @@ class AttributeValueCursorPageRead:
     next_resume_identity: PhysicalSpanIdentity | None
     next_resume_member_offset: int
     seen_value_digests: tuple[str, ...]
+    browse_status: AttributeValueBrowseStatus = "exhausted"
 
 
 @dataclass(frozen=True)
@@ -1129,6 +1137,7 @@ class AttributeReadSelector:
         query_timeout_ms: int | None = None,
         candidate_query_settings: dict[str, Any] | None = None,
         include_versions: bool = False,
+        predicate_params: dict[str, Any] | None = None,
     ) -> tuple[
         tuple[PhysicalSpanIdentity, ...],
         bool,
@@ -1143,6 +1152,11 @@ class AttributeReadSelector:
         }
         if attribute_key is not None:
             params["attribute_key"] = attribute_key
+        if predicate_params:
+            reserved = set(params).intersection(predicate_params)
+            if reserved:
+                raise ValueError("attribute candidate predicate parameter collision")
+            params.update(predicate_params)
         ordered = ordered or before_identity is not None
         candidate_sql = _ORDERED_CANDIDATE_SQL if ordered else _CANDIDATE_SQL
         query_settings = dict(candidate_query_settings or {})
@@ -1507,12 +1521,12 @@ class AttributeReadSelector:
         """
         keys: dict[str, AttributeType] = {}
         unsupported_value_seen = False
-        for attr_type, field in (
+        for attr_type, field_name in (
             ("string", "string_keys"),
             ("number", "number_keys"),
             ("boolean", "boolean_keys"),
         ):
-            raw_keys = row.get(field) or []
+            raw_keys = row.get(field_name) or []
             if not isinstance(raw_keys, (tuple, list)):
                 raise IncompleteLatestStateReplay(
                     "Attribute latest-state replay returned invalid Map keys"
@@ -2037,6 +2051,13 @@ class AttributeReadSelector:
                     key=lambda item: (-item[1], _TYPE_PRIORITY[item[0]]),
                 )[0],
                 count=key_totals[key],
+                types=tuple(
+                    attr_type
+                    for attr_type, _count in sorted(
+                        candidates,
+                        key=lambda item: _TYPE_PRIORITY[item[0]],
+                    )
+                ),
             )
             for key, candidates in type_counts.items()
         ]
@@ -2721,6 +2742,28 @@ class AttributeReadSelector:
         ):
             raise ValueError("invalid attribute-key seen state")
         seen_set = set(seen)
+        publication_budget = ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - len(seen)
+        if publication_budget < 0:
+            raise ValueError("invalid attribute-key seen state")
+        effective_page_size = min(page_size, publication_budget)
+        if effective_page_size == 0:
+            return AttributeKeyCursorPageRead(
+                (),
+                self._metadata(
+                    complete=True,
+                    error_code=None,
+                    window_start=start,
+                    window_end=end,
+                    query_count=self._query_count,
+                ),
+                False,
+                "limit_reached",
+                current_segment_end,
+                before_identity,
+                resume_identity,
+                resume_key_offset,
+                seen,
+            )
         emitted_digests: list[str] = []
         emitted: dict[str, AttributeKeyRow] = {}
         candidate_pages = 0
@@ -2754,15 +2797,21 @@ class AttributeReadSelector:
                     continue
                 prior = emitted.get(digest)
                 if prior is not None:
+                    observed_types = set(prior.types or (prior.type,))
+                    observed_types.add(attr_type)
+                    ordered_types = tuple(
+                        sorted(observed_types, key=lambda value: _TYPE_PRIORITY[value])
+                    )
                     emitted[digest] = AttributeKeyRow(
                         prior.key,
-                        prior.type,
+                        ordered_types[0],
                         prior.count + 1,
+                        ordered_types,
                     )
                     continue
-                emitted[digest] = AttributeKeyRow(key, attr_type, 1)
+                emitted[digest] = AttributeKeyRow(key, attr_type, 1, (attr_type,))
                 emitted_digests.append(digest)
-                if len(emitted) >= page_size:
+                if len(emitted) >= effective_page_size:
                     next_offset = index + 1
                     return next_offset >= len(keys), next_offset
             return True, len(keys)
@@ -2801,7 +2850,7 @@ class AttributeReadSelector:
 
         while (
             current_segment_end > start
-            and len(emitted) < page_size
+            and len(emitted) < effective_page_size
             and next_resume_identity is None
             and candidate_pages < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
             # Every walk iteration issues one candidate query and one
@@ -2843,11 +2892,11 @@ class AttributeReadSelector:
                     next_resume_key_offset = next_offset
                     break
                 fully_processed_identity = identity
-                if len(emitted) >= page_size:
+                if len(emitted) >= effective_page_size:
                     break
 
             cursor_before = fully_processed_identity
-            if next_resume_identity is not None or len(emitted) >= page_size:
+            if next_resume_identity is not None or len(emitted) >= effective_page_size:
                 break
             if segment_truncated and candidate_ids:
                 cursor_before = candidate_ids[-1]
@@ -2857,8 +2906,13 @@ class AttributeReadSelector:
 
         exhausted = current_segment_end <= start and next_resume_identity is None
         seen_after = (*seen, *emitted_digests)
+        limit_reached = len(seen_after) >= ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
         browse_status: AttributeKeyBrowseStatus = (
-            "exhausted" if exhausted else "continuation"
+            "limit_reached"
+            if limit_reached
+            else "exhausted"
+            if exhausted
+            else "continuation"
         )
         has_more = browse_status == "continuation"
         # A successful cursor page is a complete request, not a sampled
@@ -2947,6 +3001,7 @@ class AttributeReadSelector:
                 None,
                 0,
                 (),
+                "exhausted",
             )
         if before_identity is not None:
             before_identity = (
@@ -2983,6 +3038,28 @@ class AttributeReadSelector:
         ):
             raise ValueError("invalid filter-value seen-value state")
         seen_set = set(seen)
+        publication_budget = ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS - len(seen)
+        if publication_budget < 0:
+            raise ValueError("invalid filter-value seen-value state")
+        effective_page_size = min(page_size, publication_budget)
+        if effective_page_size == 0:
+            return AttributeValueCursorPageRead(
+                (),
+                self._metadata(
+                    complete=True,
+                    error_code=None,
+                    window_start=start,
+                    window_end=end,
+                    query_count=self._query_count,
+                ),
+                False,
+                current_segment_end,
+                before_identity,
+                resume_identity,
+                int(resume_member_offset),
+                seen,
+                "limit_reached",
+            )
         emitted_digests: list[str] = []
         emitted: dict[str, AttributeValueRow] = {}
         needle = normalized_search.casefold()
@@ -2990,6 +3067,73 @@ class AttributeReadSelector:
         cursor_before = before_identity
         next_resume_identity: PhysicalSpanIdentity | None = None
         next_resume_member_offset = 0
+
+        def value_candidate_predicate() -> tuple[str, dict[str, Any]]:
+            """Push the requested key/search into the finite identity seed.
+
+            The predicate may admit stale physical versions, but it can never
+            publish them: every identity is still replayed through argMax below.
+            False positives are harmless and are rechecked in Python; avoiding
+            the former ``predicate=1`` is what makes a rare typed value practical
+            on a high-volume project.
+            """
+
+            search_suffixes = {
+                "string": (
+                    "positionCaseInsensitiveUTF8("
+                    "attrs_string[%(attribute_key)s], %(attribute_search)s) > 0"
+                ),
+                "number": (
+                    "positionCaseInsensitiveUTF8("
+                    "toString(attrs_number[%(attribute_key)s]), "
+                    "%(attribute_search)s) > 0"
+                ),
+                "boolean": (
+                    "positionCaseInsensitiveUTF8("
+                    "if(attrs_bool[%(attribute_key)s], 'true', 'false'), "
+                    "%(attribute_search)s) > 0"
+                ),
+                "json": (
+                    "positionCaseInsensitiveUTF8("
+                    "JSONExtractRaw(attributes_extra, %(attribute_key)s), "
+                    "%(attribute_search)s) > 0"
+                ),
+            }
+            clauses: list[str] = []
+            requested_types = (
+                {attribute_type}
+                if attribute_type is not None
+                else {"string", "number", "boolean", "array", "map", "json"}
+            )
+            for attr_type, column in (
+                ("string", "attrs_string"),
+                ("number", "attrs_number"),
+                ("boolean", "attrs_bool"),
+            ):
+                if attr_type not in requested_types:
+                    continue
+                clause = (
+                    f"indexHint(has(mapKeys({column}), %(attribute_key)s)) "
+                    f"AND mapContains({column}, %(attribute_key)s)"
+                )
+                if needle:
+                    clause = f"({clause}) AND ({search_suffixes[attr_type]})"
+                clauses.append(f"({clause})")
+            if requested_types.intersection({"array", "map", "json"}):
+                clause = (
+                    "attributes_extra NOT IN ('', '{}', 'null') "
+                    "AND JSONHas(attributes_extra, %(attribute_key)s)"
+                )
+                if needle:
+                    clause = f"({clause}) AND ({search_suffixes['json']})"
+                clauses.append(f"({clause})")
+            if not clauses:
+                raise ValueError("invalid filter-value attribute type")
+            return " OR ".join(clauses), (
+                {"attribute_search": normalized_search} if needle else {}
+            )
+
+        candidate_predicate, candidate_predicate_params = value_candidate_predicate()
 
         def candidates_for(decoded: tuple[AttributeType, Any]) -> tuple[Any, ...]:
             attr_type, value = decoded
@@ -3026,7 +3170,7 @@ class AttributeReadSelector:
                     continue
                 emitted[digest] = AttributeValueRow(value, attr_type, 1)
                 emitted_digests.append(digest)
-                if len(emitted) >= page_size:
+                if len(emitted) >= effective_page_size:
                     next_offset = index + 1
                     return next_offset >= len(candidates), next_offset
             return True, len(candidates)
@@ -3063,7 +3207,7 @@ class AttributeReadSelector:
 
         while (
             current_segment_end > start
-            and len(emitted) < page_size
+            and len(emitted) < effective_page_size
             and next_resume_identity is None
             and candidate_pages < ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
         ):
@@ -3076,11 +3220,12 @@ class AttributeReadSelector:
             candidate_ids, segment_truncated, _ = self._candidate_ids(
                 projects,
                 segment,
-                predicate="1",
+                predicate=candidate_predicate,
                 attribute_key=key,
                 ordered=True,
                 before_identity=cursor_before,
                 candidate_limit=ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+                predicate_params=candidate_predicate_params,
             )
             candidate_pages += 1
             rows = self._verify_latest(
@@ -3110,13 +3255,13 @@ class AttributeReadSelector:
                     next_resume_member_offset = next_offset
                     break
                 fully_processed_identity = identity
-                if len(emitted) >= page_size:
+                if len(emitted) >= effective_page_size:
                     break
 
             cursor_before = fully_processed_identity
             if next_resume_identity is not None:
                 break
-            if len(emitted) >= page_size:
+            if len(emitted) >= effective_page_size:
                 break
             if segment_truncated and candidate_ids:
                 cursor_before = candidate_ids[-1]
@@ -3126,7 +3271,15 @@ class AttributeReadSelector:
 
         exhausted = current_segment_end <= start and next_resume_identity is None
         seen_after = (*seen, *emitted_digests)
-        has_more = not exhausted
+        limit_reached = len(seen_after) >= ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS
+        browse_status: AttributeValueBrowseStatus = (
+            "limit_reached"
+            if limit_reached
+            else "exhausted"
+            if exhausted
+            else "continuation"
+        )
+        has_more = browse_status == "continuation"
         # A list page is exact even while a later continuation exists.  This is
         # not an aggregate coverage claim: every emitted option was verified
         # against latest state and the cursor can exhaust the remaining window.
@@ -3146,6 +3299,7 @@ class AttributeReadSelector:
             next_resume_identity,
             next_resume_member_offset,
             seen_after,
+            browse_status,
         )
 
     def read_detail(

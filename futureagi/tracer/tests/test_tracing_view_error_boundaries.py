@@ -461,7 +461,7 @@ def test_graph_boundaries_return_503_for_partial_degraded_coverage(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("view_kind", ["trace", "span"])
-def test_graph_boundaries_keep_fully_executed_labelled_sample_at_200(
+def test_graph_boundaries_reject_labelled_sample_even_with_legacy_opt_in(
     monkeypatch,
     view_kind,
 ):
@@ -486,11 +486,7 @@ def test_graph_boundaries_keep_fully_executed_labelled_sample_at_200(
         allow_sampled=True,
     )
 
-    assert response.status_code == 200
-    result = _result(response)
-    assert result["data"] == [point]
-    assert result["query_complete"] is False
-    assert result["query_status"] == "sampled"
+    _assert_sanitized_503(response)
 
 
 @pytest.mark.unit

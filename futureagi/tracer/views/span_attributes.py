@@ -27,6 +27,7 @@ from tracer.serializers.span_attributes import (
     SpanAttributeValuesResponseSerializer,
 )
 from tracer.services.clickhouse.attribute_cursor_state import (
+    ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
     AttributeCursorStateError,
     load_attribute_cursor_seen_state,
     persist_attribute_cursor_seen_state,
@@ -75,6 +76,16 @@ def _is_expected_attribute_read_failure(exc: Exception) -> bool:
     """
 
     return is_read_budget_error(exc) or is_clickhouse_query_error(exc)
+
+
+def _attribute_key_payload(row) -> dict:
+    payload = asdict(row)
+    if not payload.get("types"):
+        payload.pop("types", None)
+    # Discovery is deliberately bounded. ``count`` is useful for ordering but
+    # is not an exact tenant-wide total unless a future exact endpoint says so.
+    payload["count_exact"] = False
+    return payload
 
 
 class SpanAttributeKeysView(APIView):
@@ -250,12 +261,19 @@ class SpanAttributeKeysView(APIView):
                     )
                 return Response(
                     {
-                        "result": [asdict(row) for row in page_read.rows],
+                        # Cursor browse counts only describe occurrences inside
+                        # the bounded physical prefix used to discover this
+                        # suggestion.  Never present them as exact tenant-wide
+                        # span totals.
+                        "result": [
+                            _attribute_key_payload(row) for row in page_read.rows
+                        ],
                         **page_read.metadata.public_payload(),
                         "has_more": published_has_more,
                         "next_cursor": next_cursor,
                         "browse_mode": "recent_suggestions",
                         "browse_status": published_browse_status,
+                        "browse_limit": ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
                     },
                     status=200,
                 )
@@ -263,7 +281,7 @@ class SpanAttributeKeysView(APIView):
             read = selector.discover_keys([project_id], exact_key=exact_key)
             return Response(
                 {
-                    "result": [asdict(row) for row in read.rows],
+                    "result": [_attribute_key_payload(row) for row in read.rows],
                     **read.metadata.public_payload(),
                     **(
                         {

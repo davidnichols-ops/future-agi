@@ -23,6 +23,10 @@ from model_hub.models.score import Score
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
+from tracer.services.clickhouse.query_builders.agent_graph import (
+    AGENT_GRAPH_MAX_RESULT_BYTES,
+    AGENT_GRAPH_RESULT_ROW_SENTINEL,
+)
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     compile_exact_graph_filter_predicates,
@@ -283,7 +287,7 @@ def read_exact_agent_graph(
     project_id: str,
     filters: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Compute exact node, topology-edge, and chronological-path aggregates.
+    """Compute exact node and recorded parent-topology projections.
 
     The builder emits one direct-write statement.  Keeping execution here,
     behind the shared exact-snapshot worker, prevents HTTP retries from
@@ -307,7 +311,18 @@ def read_exact_agent_graph(
         query,
         params,
         timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
-        settings={**EXACT_GRAPH_READ_SETTINGS, "max_threads": 1},
+        settings={
+            **EXACT_GRAPH_READ_SETTINGS,
+            "max_threads": 1,
+            # The SQL statement ranks exact node aggregates, retains the top
+            # 63, and folds every remaining endpoint into an explicit Other
+            # node before transport. With 64 wire nodes it can emit at most
+            # N + 2*N^2 rows; this sentinel makes that proof executable and
+            # prevents a future regression from allocating an unbounded Python
+            # result before formatting.
+            "max_result_rows": AGENT_GRAPH_RESULT_ROW_SENTINEL,
+            "max_result_bytes": AGENT_GRAPH_MAX_RESULT_BYTES,
+        },
     )
     rows = list(result.data or [])
     columns = list(result.columns or [])

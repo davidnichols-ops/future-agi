@@ -842,6 +842,9 @@ class ClickHouseFilterBuilder:
             filter_type = config.get("filter_type") or config.get("filterType")
             filter_op = config.get("filter_op") or config.get("filterOp")
             filter_value = config.get("filter_value", config.get("filterValue"))
+            attribute_value_types = config.get(
+                "attribute_value_types", config.get("attributeValueTypes")
+            )
 
             # Skip date filters (handled by BaseQueryBuilder.parse_time_range)
             if col_id in ("created_at", "start_time") and filter_type in (
@@ -881,7 +884,12 @@ class ClickHouseFilterBuilder:
                 continue
 
             condition = self._build_condition(
-                col_id, col_type, filter_type, filter_op, filter_value
+                col_id,
+                col_type,
+                filter_type,
+                filter_op,
+                filter_value,
+                attribute_value_types=attribute_value_types,
             )
             if condition:
                 conditions.append(condition)
@@ -941,6 +949,8 @@ class ClickHouseFilterBuilder:
         filter_type: str | None,
         filter_op: str | None,
         filter_value: Any,
+        *,
+        attribute_value_types: list[str | None] | None = None,
     ) -> str | None:
         """Dispatch to the appropriate condition builder based on column type."""
         col_type = self._normalize_col_type_for_dispatch(col_id, col_type)
@@ -950,6 +960,14 @@ class ClickHouseFilterBuilder:
             filter_op = normalize_filter_op(filter_op)
 
         if col_type == self.SPAN_ATTRIBUTE:
+            if attribute_value_types is not None:
+                return self._build_mixed_span_attr_condition(
+                    col_id,
+                    filter_type,
+                    filter_op,
+                    filter_value,
+                    attribute_value_types,
+                )
             return self._build_span_attr_condition(
                 col_id, filter_type, filter_op, filter_value
             )
@@ -1194,6 +1212,11 @@ class ClickHouseFilterBuilder:
         if not inner_predicate:
             return None
 
+        return self._scope_span_attr_inner(inner_predicate)
+
+    def _scope_span_attr_inner(self, inner_predicate: str) -> str:
+        """Apply one row predicate directly for spans or to any trace member."""
+
         if self.query_mode == self.QUERY_MODE_SPAN:
             return inner_predicate
         candidate_filter = self._candidate_trace_filter()
@@ -1206,6 +1229,100 @@ class ClickHouseFilterBuilder:
             f"{candidate_filter} "
             f"AND {inner_predicate})"
         )
+
+    def _build_mixed_span_attr_condition(
+        self,
+        attribute_key: str,
+        filter_type: str | None,
+        filter_op: str | None,
+        filter_value: Any,
+        attribute_value_types: list[str | None],
+    ) -> str:
+        """Compile a typed picker selection without guessing its Map family.
+
+        Attribute keys may migrate between string/number/boolean Maps.  The
+        picker returns the exact storage family for every selected option;
+        grouping those values produces one bounded any-span classifier while
+        preserving the ordinary homogeneous filter contract.
+        """
+
+        attribute_key = _sanitize_key(attribute_key)
+        if filter_op not in LIST_OPS:
+            raise ValueError(
+                "attribute_value_types is only supported for in/not_in filters"
+            )
+        if (
+            not isinstance(filter_value, list)
+            or not filter_value
+            or not isinstance(attribute_value_types, list)
+            or len(attribute_value_types) != len(filter_value)
+        ):
+            raise ValueError(
+                "attribute_value_types must align one-for-one with filter_value"
+            )
+
+        normalized_fallback = (filter_type or "").strip().lower()
+        fallback_storage_type = {
+            FilterType.TEXT.value: "string",
+            FilterType.NUMBER.value: "number",
+            FilterType.BOOLEAN.value: "boolean",
+        }.get(normalized_fallback)
+        if fallback_storage_type is None:
+            raise ValueError(
+                "mixed typed span attributes require text, number, or boolean"
+            )
+
+        grouped_values: dict[str, list[Any]] = {}
+        for value, storage_type in zip(
+            filter_value, attribute_value_types, strict=True
+        ):
+            effective_type = storage_type or fallback_storage_type
+            if effective_type not in {"string", "number", "boolean"}:
+                raise ValueError(
+                    f"unsupported attribute value storage type: {effective_type!r}"
+                )
+            grouped_values.setdefault(effective_type, []).append(value)
+
+        positive_predicates: list[str] = []
+        exists_predicates: list[str] = []
+        for storage_type, values in grouped_values.items():
+            effective_filter_type = (
+                FilterType.TEXT.value if storage_type == "string" else storage_type
+            )
+            _, map_column, value_coercer = self._resolve_span_attr_type(
+                effective_filter_type
+            )
+            # Mixed picker membership is an additive contract carried by the
+            # outer text in/not_in row. Numeric/boolean homogeneous filters
+            # retain their existing scalar-only operator vocabulary.
+            normalized_values = self._normalize_span_attr_value(
+                "in", value_coercer, values
+            )
+            exists_predicate = f"mapContains({map_column}, '{attribute_key}')"
+            exists_predicates.append(exists_predicate)
+            predicate = self._span_attr_inner(
+                map_column,
+                attribute_key,
+                exists_predicate,
+                "in",
+                normalized_values,
+                case_insensitive=(effective_filter_type == FilterType.TEXT.value),
+            )
+            if predicate:
+                positive_predicates.append(f"({predicate})")
+
+        positive = " OR ".join(positive_predicates)
+        if not positive:
+            raise ValueError("mixed typed span attribute filter has no values")
+        if filter_op == "in":
+            inner_predicate = f"({positive})"
+        else:
+            # Negation excludes a span if *any* selected typed representation
+            # matches. Requiring at least one selected-family key preserves the
+            # existing missing-value semantics without the dual-map OR bug.
+            exists = " OR ".join(exists_predicates)
+            inner_predicate = f"(({exists}) AND NOT ({positive}))"
+        return self._scope_span_attr_inner(inner_predicate)
 
     @staticmethod
     def _resolve_span_attr_type(

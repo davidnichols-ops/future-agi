@@ -67,7 +67,9 @@ def test_exact_attribute_key_response_preserves_numeric_and_boolean_types(
     response = SpanAttributeKeysView.as_view()(request)
 
     assert response.status_code == 200
-    assert response.data["result"] == [{"key": key, "type": attribute_type, "count": 1}]
+    assert response.data["result"] == [
+        {"key": key, "type": attribute_type, "count": 1, "count_exact": False}
+    ]
     assert response.data["query_complete"] is True
     assert response.data["query_status"] == "complete"
     assert captured == {"project_ids": [PROJECT_ID], "exact_key": key}

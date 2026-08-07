@@ -11,6 +11,7 @@ from time import monotonic, sleep
 import pytest
 from clickhouse_driver import Client
 
+from conftest import _require_safe_ch25_test_target
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
 from tracer.services.clickhouse.v2.query_builders.agent_graph import (
     AgentGraphQueryBuilderV2,
@@ -23,17 +24,65 @@ from tracer.services.clickhouse.v2.query_builders.user_time_series import (
 pytestmark = pytest.mark.integration
 
 CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-CH_NATIVE_PORT = int(os.environ.get("CH25_NATIVE_PORT", "19000"))
+CH_NATIVE_PORT = int(
+    os.environ.get("CH25_NATIVE_PORT") or os.environ.get("CH25_TCP_PORT") or "19000"
+)
+CH_USER = os.environ.get("CH25_USER") or os.environ.get("CH_USERNAME") or "default"
+CH_PASSWORD = os.environ.get("CH25_PASSWORD") or os.environ.get("CH_PASSWORD") or ""
+
+
+def _ch_client(*, database: str) -> Client:
+    return Client(
+        host=CH_HOST,
+        port=CH_NATIVE_PORT,
+        user=CH_USER,
+        password=CH_PASSWORD,
+        database=database,
+        connect_timeout=3,
+    )
 
 
 @pytest.fixture(scope="module")
-def ch_client():
-    client = Client(host=CH_HOST, port=CH_NATIVE_PORT, connect_timeout=3)
+def ch_database():
+    """Create one unique test-owned database and remove it after the module."""
+
+    database = f"test_user_graph_{uuid.uuid4().hex}"
+    _require_safe_ch25_test_target(host=CH_HOST, database=database)
+    admin = _ch_client(database="default")
+    created = False
     try:
-        client.execute("SELECT 1")
-    except Exception as exc:
-        pytest.skip(f"CH25 is not reachable on {CH_HOST}:{CH_NATIVE_PORT} ({exc!r})")
-    return client
+        try:
+            admin.execute("SELECT 1")
+        except Exception as exc:
+            pytest.skip(
+                f"CH25 is not reachable on {CH_HOST}:{CH_NATIVE_PORT} ({exc!r})"
+            )
+        admin.execute(f"CREATE DATABASE {database}")
+        created = True
+        yield database
+    finally:
+        try:
+            if created:
+                # The exact target is an unguessable database created above;
+                # no shared schema object is touched during cleanup.
+                admin.execute(f"DROP DATABASE IF EXISTS {database} SYNC")
+        finally:
+            admin.disconnect()
+
+
+@pytest.fixture(scope="module")
+def ch_client(ch_database):
+    client = _ch_client(database=ch_database)
+    try:
+        try:
+            client.execute("SELECT 1")
+        except Exception as exc:
+            pytest.skip(
+                f"CH25 is not reachable on {CH_HOST}:{CH_NATIVE_PORT} ({exc!r})"
+            )
+        yield client
+    finally:
+        client.disconnect()
 
 
 @pytest.fixture()
@@ -229,6 +278,7 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
             observation_type String,
             service_name String,
             start_time DateTime64(6, 'UTC'),
+            end_time Nullable(DateTime64(6, 'UTC')),
             trace_id String,
             id String,
             parent_span_id String,
@@ -257,12 +307,16 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
             deleted: int,
             version: int,
             offset: int,
+            duration: int = 1,
+            observation_type: str | None = None,
         ):
+            span_start = started_at + timedelta(seconds=offset)
             return (
                 project_id,
-                "agent" if not parent_id else "tool",
+                observation_type or ("agent" if not parent_id else "tool"),
                 "svc",
-                started_at + timedelta(seconds=offset),
+                span_start,
+                span_start + timedelta(seconds=duration),
                 "trace-a",
                 span_id,
                 parent_id,
@@ -280,9 +334,17 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
             [
                 row("root", "", "agent", 100, 0, 1, 0),
                 row("root", "", "agent", 10, 0, 2, 0),
-                row("lookup", "root", "lookup", 20, 0, 1, 1),
-                row("lookup", "root", "lookup", 20, 1, 2, 1),
-                row("answer", "root", "answer", 30, 0, 1, 2),
+                # Two overlapping direct siblings are both recorded children
+                # of root. Timestamps alone must not invent sibling causality.
+                row("lookup", "root", "lookup", 20, 0, 1, 1, 4, "tool"),
+                row("search", "root", "search", 25, 0, 1, 2, 2, "retriever"),
+                # A later sibling is still a direct child of root; its start
+                # time does not prove lookup/search -> answer transitions.
+                row("answer", "root", "answer", 30, 0, 1, 6, 1, "llm"),
+                # The newest physical version is a tombstone and contributes
+                # neither a node nor a transition.
+                row("deleted", "root", "deleted", 40, 0, 1, 8, 1, "tool"),
+                row("deleted", "root", "deleted", 40, 1, 2, 8, 1, "tool"),
             ],
         )
 
@@ -307,15 +369,25 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
         payload = builder.format_result(_execute(ch_client, query, params), [])
 
         assert query.count(f"FROM {table}") == 1
-        assert {node["name"] for node in payload["nodes"]} == {"agent", "answer"}
+        assert {node["name"] for node in payload["nodes"]} == {
+            "agent",
+            "lookup",
+            "search",
+            "answer",
+        }
         root = next(node for node in payload["nodes"] if node["name"] == "agent")
         assert root["avg_latency_ms"] == 10
-        assert [(edge["source"], edge["target"]) for edge in payload["edges"]] == [
-            ("agent:agent", "tool:answer")
-        ]
-        assert [(edge["source"], edge["target"]) for edge in payload["path_edges"]] == [
-            ("agent:agent", "tool:answer")
-        ]
+        assert {(edge["source"], edge["target"]) for edge in payload["edges"]} == {
+            ("agent:agent", "tool:lookup"),
+            ("agent:agent", "retriever:search"),
+            ("agent:agent", "llm:answer"),
+        }
+        assert {(edge["source"], edge["target"]) for edge in payload["path_edges"]} == {
+            ("agent:agent", "tool:lookup"),
+            ("agent:agent", "retriever:search"),
+            ("agent:agent", "llm:answer"),
+        }
+        assert payload["path_edges"] == payload["edges"]
     finally:
         ch_client.execute(f"DROP TABLE {table}")
 
@@ -625,7 +697,9 @@ def test_rmt_merge_proves_version_ceiling_is_not_time_travel(ch_client):
         ch_client.execute(f"DROP TABLE {table}")
 
 
-def test_one_statement_pins_parts_across_concurrent_insert_and_merge(ch_client):
+def test_one_statement_pins_parts_across_concurrent_insert_and_merge(
+    ch_client, ch_database
+):
     """A running statement keeps its parts snapshot while new parts are merged."""
 
     table = f"_test_exact_graph_statement_snapshot_{uuid.uuid4().hex[:8]}"
@@ -640,7 +714,7 @@ def test_one_statement_pins_parts_across_concurrent_insert_and_merge(ch_client):
         ORDER BY id
         """
     )
-    reader = Client(host=CH_HOST, port=CH_NATIVE_PORT, connect_timeout=3)
+    reader = _ch_client(database=ch_database)
     query_id = f"exact_statement_snapshot_{uuid.uuid4().hex}"
     outcome: dict[str, object] = {}
 

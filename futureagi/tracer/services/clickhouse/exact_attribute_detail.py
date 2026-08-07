@@ -58,81 +58,164 @@ _TYPE_PRIORITY: dict[str, int] = {
 
 EXACT_ATTRIBUTE_DETAIL_SQL = r"""
 WITH
-latest_spans AS
+candidate_identities AS
 (
+    /*
+     * The key predicate is intentionally applied only to the identity seed.
+     * Every version of those identities is replayed below, so a later key
+     * removal or tombstone still wins.  This avoids deserialising every wide
+     * attribute Map in the project merely to discover that the requested key
+     * was never present on that span.
+     */
     SELECT
         project_id,
         trace_id,
         id,
-        start_time,
-        argMax(
-            tuple(
-                is_deleted,
-                attrs_string,
-                attrs_number,
-                attrs_bool,
-                attributes_extra
-            ),
-            _version
-        ) AS latest_state
-    FROM spans AS attribute_source
-    PREWHERE attribute_source.project_id = toUUID(%(project_id)s)
-      AND attribute_source.start_time >= %(window_start)s
-      AND attribute_source.start_time < %(window_end)s
+        start_time
+    FROM spans AS candidate_source
+    PREWHERE candidate_source.project_id = toUUID(%(project_id)s)
+      AND candidate_source.start_time >= %(window_start)s
+      AND candidate_source.start_time < %(window_end)s
+    WHERE
+        (
+            indexHint(has(mapKeys(candidate_source.attrs_string), %(attribute_key)s))
+            AND mapContains(candidate_source.attrs_string, %(attribute_key)s)
+        )
+        OR (
+            indexHint(has(mapKeys(candidate_source.attrs_number), %(attribute_key)s))
+            AND mapContains(candidate_source.attrs_number, %(attribute_key)s)
+        )
+        OR (
+            indexHint(has(mapKeys(candidate_source.attrs_bool), %(attribute_key)s))
+            AND mapContains(candidate_source.attrs_bool, %(attribute_key)s)
+        )
+        OR (
+            candidate_source.attributes_extra NOT IN ('', '{}', 'null')
+            AND JSONHas(candidate_source.attributes_extra, %(attribute_key)s)
+        )
     GROUP BY project_id, trace_id, id, start_time
 ),
-active_values AS
+latest_spans AS
 (
     SELECT
-        'string' AS attribute_type,
-        toJSONString(tupleElement(latest_state, 2)[%(attribute_key)s]) AS value_json,
-        CAST(NULL, 'Nullable(Float64)') AS number_value
-    FROM latest_spans
-    WHERE tupleElement(latest_state, 1) = 0
-      AND mapContains(tupleElement(latest_state, 2), %(attribute_key)s)
-
-    UNION ALL
-
+        attribute_source.project_id AS project_id,
+        attribute_source.trace_id AS trace_id,
+        attribute_source.id AS id,
+        attribute_source.start_time AS start_time,
+        argMax(
+            tuple(
+                attribute_source.is_deleted,
+                mapContains(attribute_source.attrs_string, %(attribute_key)s),
+                attribute_source.attrs_string[%(attribute_key)s],
+                mapContains(attribute_source.attrs_number, %(attribute_key)s),
+                attribute_source.attrs_number[%(attribute_key)s],
+                mapContains(attribute_source.attrs_bool, %(attribute_key)s),
+                attribute_source.attrs_bool[%(attribute_key)s],
+                JSONHas(attribute_source.attributes_extra, %(attribute_key)s),
+                JSONExtractRaw(
+                    attribute_source.attributes_extra,
+                    %(attribute_key)s
+                )
+            ),
+            attribute_source._version
+        ) AS latest_state
+    FROM spans AS attribute_source
+    INNER JOIN candidate_identities AS candidate
+      ON candidate.project_id = attribute_source.project_id
+     AND candidate.trace_id = attribute_source.trace_id
+     AND candidate.id = attribute_source.id
+     AND candidate.start_time = attribute_source.start_time
+    WHERE attribute_source.project_id = toUUID(%(project_id)s)
+      AND attribute_source.start_time >= %(window_start)s
+      AND attribute_source.start_time < %(window_end)s
+    GROUP BY
+        attribute_source.project_id,
+        attribute_source.trace_id,
+        attribute_source.id,
+        attribute_source.start_time
+),
+exploded_values AS
+(
+    /*
+     * Expand each current live span once.  The synthetic ``__span__`` event
+     * is emitted exactly once for every physical span carrying the key, while
+     * typed events retain each populated storage representation.  Keeping the
+     * expansion in one ARRAY JOIN prevents ClickHouse from inlining and
+     * replaying the expensive latest-state CTE for one UNION branch per type.
+     */
     SELECT
-        'number' AS attribute_type,
-        toJSONString(tupleElement(latest_state, 3)[%(attribute_key)s]) AS value_json,
-        toFloat64(tupleElement(latest_state, 3)[%(attribute_key)s]) AS number_value
+        tupleElement(attribute_event, 1) AS attribute_type,
+        tupleElement(attribute_event, 2) AS value_json,
+        tupleElement(attribute_event, 3) AS number_value
     FROM latest_spans
-    WHERE tupleElement(latest_state, 1) = 0
-      AND mapContains(tupleElement(latest_state, 3), %(attribute_key)s)
-
-    UNION ALL
-
-    SELECT
-        'boolean' AS attribute_type,
-        if(tupleElement(latest_state, 4)[%(attribute_key)s], 'true', 'false') AS value_json,
-        CAST(NULL, 'Nullable(Float64)') AS number_value
-    FROM latest_spans
-    WHERE tupleElement(latest_state, 1) = 0
-      AND mapContains(tupleElement(latest_state, 4), %(attribute_key)s)
-
-    UNION ALL
-
-    SELECT
-        multiIf(
-            startsWith(trimLeft(raw_value), '['), 'array',
-            startsWith(trimLeft(raw_value), '{'), 'map',
-            'json'
-        ) AS attribute_type,
-        raw_value AS value_json,
-        CAST(NULL, 'Nullable(Float64)') AS number_value
-    FROM
-    (
-        SELECT
-            JSONExtractRaw(
-                tupleElement(latest_state, 5),
-                %(attribute_key)s
-            ) AS raw_value
-        FROM latest_spans
-        WHERE tupleElement(latest_state, 1) = 0
-          AND JSONHas(tupleElement(latest_state, 5), %(attribute_key)s)
-    )
-    WHERE raw_value != ''
+    ARRAY JOIN arrayFilter(
+        event -> tupleElement(event, 4),
+        [
+            tuple(
+                '__span__',
+                '',
+                CAST(NULL, 'Nullable(Float64)'),
+                toUInt8(
+                    tupleElement(latest_state, 1) = 0
+                    AND (
+                        tupleElement(latest_state, 2)
+                        OR tupleElement(latest_state, 4)
+                        OR tupleElement(latest_state, 6)
+                        OR (
+                            tupleElement(latest_state, 8)
+                            AND tupleElement(latest_state, 9) != ''
+                        )
+                    )
+                )
+            ),
+            tuple(
+                'string',
+                toJSONString(tupleElement(latest_state, 3)),
+                CAST(NULL, 'Nullable(Float64)'),
+                toUInt8(
+                    tupleElement(latest_state, 1) = 0
+                    AND tupleElement(latest_state, 2)
+                )
+            ),
+            tuple(
+                'number',
+                toJSONString(tupleElement(latest_state, 5)),
+                CAST(
+                    toFloat64(tupleElement(latest_state, 5)),
+                    'Nullable(Float64)'
+                ),
+                toUInt8(
+                    tupleElement(latest_state, 1) = 0
+                    AND tupleElement(latest_state, 4)
+                )
+            ),
+            tuple(
+                'boolean',
+                if(tupleElement(latest_state, 7), 'true', 'false'),
+                CAST(NULL, 'Nullable(Float64)'),
+                toUInt8(
+                    tupleElement(latest_state, 1) = 0
+                    AND tupleElement(latest_state, 6)
+                )
+            ),
+            tuple(
+                multiIf(
+                    startsWith(trimLeft(tupleElement(latest_state, 9)), '['),
+                    'array',
+                    startsWith(trimLeft(tupleElement(latest_state, 9)), '{'),
+                    'map',
+                    'json'
+                ),
+                tupleElement(latest_state, 9),
+                CAST(NULL, 'Nullable(Float64)'),
+                toUInt8(
+                    tupleElement(latest_state, 1) = 0
+                    AND tupleElement(latest_state, 8)
+                    AND tupleElement(latest_state, 9) != ''
+                )
+            )
+        ]
+    ) AS attribute_event
 ),
 grouped_values AS
 (
@@ -141,31 +224,8 @@ grouped_values AS
         value_json,
         any(number_value) AS number_value,
         count() AS value_count
-    FROM active_values
+    FROM exploded_values
     GROUP BY attribute_type, value_json
-),
-type_statistics AS
-(
-    SELECT
-        attribute_type,
-        sum(value_count) AS type_count,
-        count() AS unique_values,
-        minIf(number_value, isNotNull(number_value)) AS numeric_min,
-        maxIf(number_value, isNotNull(number_value)) AS numeric_max,
-        if(
-            sumIf(value_count, isNotNull(number_value)) = 0,
-            CAST(NULL, 'Nullable(Float64)'),
-            sumIf(number_value * value_count, isNotNull(number_value))
-                / sumIf(value_count, isNotNull(number_value))
-        ) AS numeric_avg,
-        quantileExactWeightedIf(0.50)(
-            number_value, value_count, isNotNull(number_value)
-        ) AS numeric_p50,
-        quantileExactWeightedIf(0.95)(
-            number_value, value_count, isNotNull(number_value)
-        ) AS numeric_p95
-    FROM grouped_values
-    GROUP BY attribute_type
 ),
 ranked_values AS
 (
@@ -173,6 +233,38 @@ ranked_values AS
         attribute_type,
         value_json,
         value_count,
+        sum(value_count) OVER (
+            PARTITION BY attribute_type
+        ) AS type_count,
+        count() OVER (
+            PARTITION BY attribute_type
+        ) AS unique_values,
+        minIf(number_value, isNotNull(number_value)) OVER (
+            PARTITION BY attribute_type
+        ) AS numeric_min,
+        maxIf(number_value, isNotNull(number_value)) OVER (
+            PARTITION BY attribute_type
+        ) AS numeric_max,
+        if(
+            sumIf(value_count, isNotNull(number_value)) OVER (
+                PARTITION BY attribute_type
+            ) = 0,
+            CAST(NULL, 'Nullable(Float64)'),
+            sumIf(
+                number_value * value_count,
+                isNotNull(number_value)
+            ) OVER (PARTITION BY attribute_type)
+                / sumIf(value_count, isNotNull(number_value)) OVER (
+                    PARTITION BY attribute_type
+                )
+        ) AS numeric_avg,
+        quantileExactWeightedIf(0.50)(
+            number_value, value_count, isNotNull(number_value)
+        ) OVER (PARTITION BY attribute_type) AS numeric_p50,
+        quantileExactWeightedIf(0.95)(
+            number_value, value_count, isNotNull(number_value)
+        ) OVER (PARTITION BY attribute_type) AS numeric_p95,
+        sumIf(value_count, attribute_type = '__span__') OVER () AS span_count,
         row_number() OVER (
             PARTITION BY attribute_type
             ORDER BY value_count DESC, value_json ASC
@@ -183,18 +275,19 @@ SELECT
     ranked_values.attribute_type AS attribute_type,
     ranked_values.value_json AS value_json,
     ranked_values.value_count AS value_count,
-    type_statistics.type_count AS type_count,
-    type_statistics.unique_values AS unique_values,
-    type_statistics.numeric_min AS numeric_min,
-    type_statistics.numeric_max AS numeric_max,
-    type_statistics.numeric_avg AS numeric_avg,
-    type_statistics.numeric_p50 AS numeric_p50,
-    type_statistics.numeric_p95 AS numeric_p95
+    ranked_values.type_count AS type_count,
+    ranked_values.unique_values AS unique_values,
+    ranked_values.numeric_min AS numeric_min,
+    ranked_values.numeric_max AS numeric_max,
+    ranked_values.numeric_avg AS numeric_avg,
+    ranked_values.numeric_p50 AS numeric_p50,
+    ranked_values.numeric_p95 AS numeric_p95,
+    ranked_values.span_count AS span_count
 FROM ranked_values
-INNER JOIN type_statistics USING (attribute_type)
-WHERE ranked_values.value_rank <= %(top_values_limit)s
+WHERE ranked_values.attribute_type != '__span__'
+  AND ranked_values.value_rank <= %(top_values_limit)s
 ORDER BY
-    type_statistics.type_count DESC,
+    ranked_values.type_count DESC,
     indexOf(['string', 'number', 'boolean', 'array', 'map', 'json'], attribute_type),
     ranked_values.value_rank ASC
 """
@@ -272,41 +365,63 @@ def read_exact_attribute_detail(
             "top_values": [],
         }
 
-    attribute_type = min(
+    ordered_types = sorted(
         by_type,
         key=lambda value: (
             -int(by_type[value][0].get("type_count") or 0),
             _TYPE_PRIORITY[value],
         ),
     )
-    selected = by_type[attribute_type]
-    total = int(selected[0].get("type_count") or 0)
+    attribute_type = ordered_types[0]
+    type_summaries = [
+        {
+            "type": value,
+            "count": int(by_type[value][0].get("type_count") or 0),
+            "unique_values": int(by_type[value][0].get("unique_values") or 0),
+        }
+        for value in ordered_types
+    ]
+    # ``type_count`` intentionally remains per storage family.  A single
+    # latest physical span can therefore contribute to multiple type
+    # summaries, while the public count and percentages must use the exact
+    # distinct physical-span denominator returned by ClickHouse.
+    total = int(rows[0].get("span_count") or 0)
+    unique_values = sum(summary["unique_values"] for summary in type_summaries)
+    ranked_rows = sorted(
+        (row for rows_for_type in by_type.values() for row in rows_for_type),
+        key=lambda row: (
+            -int(row.get("value_count") or 0),
+            _TYPE_PRIORITY[str(row.get("attribute_type"))],
+            str(row.get("value_json") or ""),
+        ),
+    )[:EXACT_ATTRIBUTE_DETAIL_TOP_VALUES]
     top_values = [
         {
             "value": _decode_json_value(row.get("value_json")),
+            "type": str(row.get("attribute_type")),
             "count": int(row.get("value_count") or 0),
             "percentage": (
-                float(row.get("value_count") or 0) * 100.0 / total
-                if total
-                else 0.0
+                float(row.get("value_count") or 0) * 100.0 / total if total else 0.0
             ),
         }
-        for row in selected
+        for row in ranked_rows
     ]
     payload: dict[str, Any] = {
         **common,
         "type": attribute_type,
+        "types": type_summaries,
         "count": total,
-        "unique_values": int(selected[0].get("unique_values") or 0),
+        "unique_values": unique_values,
         "top_values": top_values,
     }
-    if attribute_type == "number":
+    if "number" in by_type:
+        numeric = by_type["number"][0]
         stats = {
-            "min": selected[0].get("numeric_min"),
-            "max": selected[0].get("numeric_max"),
-            "avg": selected[0].get("numeric_avg"),
-            "p50": selected[0].get("numeric_p50"),
-            "p95": selected[0].get("numeric_p95"),
+            "min": numeric.get("numeric_min"),
+            "max": numeric.get("numeric_max"),
+            "avg": numeric.get("numeric_avg"),
+            "p50": numeric.get("numeric_p50"),
+            "p95": numeric.get("numeric_p95"),
         }
         payload.update(stats)
         payload["stats"] = stats

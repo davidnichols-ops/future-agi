@@ -120,6 +120,7 @@ class TestTimeSeriesAttrFilterScope:
             project_id=PROJECT_ID,
             filters=[DATETIME_FILTER, SPAN_ATTR_FILTER],
             interval="day",
+            observe_type="trace",
         )
         sql, params = builder.build()
         sub = _membership_subquery(sql)

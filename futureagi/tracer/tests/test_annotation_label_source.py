@@ -200,6 +200,7 @@ def _labels_with_rendered_annotations(project_id, span_ids, label_ids):
 
 @pytest.mark.django_db
 class TestAnnotationLabelSourceBehavior:
+    @pytest.mark.integration
     def test_pg_and_ch_sources_return_same_labels(
         self, organization, workspace, project, trace, user
     ):
@@ -232,6 +233,7 @@ class TestAnnotationLabelSourceBehavior:
         assert pg == set(labels)
         assert ch == pg
 
+    @pytest.mark.integration
     def test_cdc_tombstoned_label_excluded_by_discovery_and_render(
         self, organization, workspace, project, trace, user
     ):
@@ -337,6 +339,7 @@ class TestTracerProjectIdForSource:
 # --------------------------------------------------------------------------- #
 @pytest.mark.django_db
 class TestProjectPGDiscovery:
+    @pytest.mark.integration
     def test_parity_with_ch_scope(self, organization, workspace, project, trace, user):
         from tracer.services.annotation_label_source import (
             AnnotationLabelScoresCH,
@@ -549,6 +552,7 @@ class TestBackfillTracerProject:
             _tag(project.id, "observation_span_id", [str(span1.id), str(span2.id)]) == 0
         )
 
+    @pytest.mark.integration
     def test_backfill_from_ch_spans_then_noop(
         self, organization, workspace, project, trace, user
     ):
