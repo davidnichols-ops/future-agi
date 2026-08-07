@@ -37,6 +37,7 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
     retry: false,
     refetchInterval: (query) => {
       const payload = query.state.data?.data;
+      if (payload?.query_refresh_failed) return false;
       return payload?.query_status === "pending" || payload?.query_refreshing
         ? 1000
         : false;
@@ -74,6 +75,36 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
     );
   }
 
+  if (detail?.query_status === "pending" && detail?.query_refresh_failed) {
+    return (
+      <Box
+        sx={{
+          flex: 1,
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "center",
+          p: 3,
+        }}
+      >
+        <Alert
+          severity="warning"
+          action={
+            <Button
+              size="small"
+              disabled={refreshMutation.isPending}
+              onClick={() => refreshMutation.mutate()}
+            >
+              Retry
+            </Button>
+          }
+        >
+          Exact attribute details could not be prepared. Retry when you are
+          ready.
+        </Alert>
+      </Box>
+    );
+  }
+
   if (isLoading || detail?.query_status === "pending") {
     return (
       <Box
@@ -87,18 +118,8 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
         <Box sx={{ textAlign: "center" }}>
           <CircularProgress size={24} />
           <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-            Preparing exact attribute details…
+            Loading attribute details…
           </Typography>
-          {detail?.query_refresh_failed && (
-            <Button
-              size="small"
-              sx={{ mt: 1 }}
-              disabled={refreshMutation.isPending}
-              onClick={() => refreshMutation.mutate()}
-            >
-              Retry
-            </Button>
-          )}
         </Box>
       </Box>
     );
@@ -150,20 +171,30 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
           </Button>
         </Box>
         <Box sx={{ display: "flex", gap: 1.5, alignItems: "center" }}>
-          {detail.type && (
+          {(detail.types?.length
+            ? detail.types
+            : detail.type
+              ? [{ type: detail.type }]
+              : []
+          ).map(({ type, count }) => (
             <Chip
-              label={detail.type}
+              key={type}
+              label={
+                Number.isFinite(count)
+                  ? `${type} (${count.toLocaleString()})`
+                  : type
+              }
               size="small"
               variant="outlined"
               color={
-                detail.type === "string"
+                type === "string"
                   ? "info"
-                  : detail.type === "number"
+                  : type === "number"
                     ? "warning"
                     : "success"
               }
             />
-          )}
+          ))}
           <Typography variant="body2" color="text.secondary">
             {detail.count?.toLocaleString()} spans
           </Typography>
@@ -200,6 +231,7 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
               <TableHead>
                 <TableRow>
                   <TableCell>Value</TableCell>
+                  {detail.types?.length > 1 && <TableCell>Type</TableCell>}
                   <TableCell align="right">Count</TableCell>
                   <TableCell align="right">%</TableCell>
                   <TableCell sx={{ width: 120 }}></TableCell>
@@ -207,7 +239,9 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
               </TableHead>
               <TableBody>
                 {detail.top_values.map((row) => (
-                  <TableRow key={row.value}>
+                  <TableRow
+                    key={`${row.type || detail.type}:${JSON.stringify(row.value)}`}
+                  >
                     <TableCell
                       sx={{
                         maxWidth: 200,
@@ -218,6 +252,9 @@ const AttributeDetail = ({ projectId, attributeKey }) => {
                     >
                       {String(row.value)}
                     </TableCell>
+                    {detail.types?.length > 1 && (
+                      <TableCell>{row.type}</TableCell>
+                    )}
                     <TableCell align="right">
                       {row.count?.toLocaleString()}
                     </TableCell>

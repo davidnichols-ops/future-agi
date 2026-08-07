@@ -340,7 +340,9 @@ export function useDashboardFilterValues({
         option && typeof option === "object" && "value" in option
           ? option.value
           : option;
-      const identity = `${typeof value}:${JSON.stringify(value)}`;
+      const storageType =
+        option && typeof option === "object" ? option.type || "" : "";
+      const identity = `${storageType}:${typeof value}:${JSON.stringify(value)}`;
       if (seenValues.has(identity)) return false;
       seenValues.add(identity);
       return true;
@@ -354,11 +356,15 @@ export function useDashboardFilterValues({
       : pageReadStates.includes("sampled")
         ? "sampled"
         : "complete";
+  const lastPage = pages.at(-1);
+  const browseStatus = lastPage?.browse_status;
 
   return {
     ...query,
     data: values,
     queryReadState,
+    browseStatus,
+    browseLimitReached: browseStatus === "limit_reached",
     attributeType: pages.find((page) => page?.attribute_type)?.attribute_type,
   };
 }

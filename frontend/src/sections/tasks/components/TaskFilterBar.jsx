@@ -220,6 +220,11 @@ export function convertNewToOld(newFilters, { rowType } = {}) {
             canonicalField,
             coerceForType(arr, fieldType),
           ),
+          ...(isAttribute &&
+            Array.isArray(f.valueTypes) &&
+            f.valueTypes.length === arr.length && {
+              attributeValueTypes: f.valueTypes,
+            }),
         },
       });
       return;
@@ -304,6 +309,7 @@ export function convertOldToNew(oldFilters, { rowType } = {}) {
             ),
           operator: op,
           value: [],
+          valueTypes: [],
         };
         groups.set(key, entry);
         result.push(entry);
@@ -321,6 +327,7 @@ export function convertOldToNew(oldFilters, { rowType } = {}) {
         ),
         operator: op,
         value: [],
+        valueTypes: [],
       };
       result.push(entry);
     }
@@ -328,6 +335,7 @@ export function convertOldToNew(oldFilters, { rowType } = {}) {
     if (NO_VALUE_OPS.has(op)) return;
 
     const val = fromApiValue(persistedField, f?.filterConfig?.filterValue);
+    const valueTypes = f?.filterConfig?.attributeValueTypes;
     if (RANGE_OPS.has(op)) {
       entry.value = Array.isArray(val) ? val : [];
       return;
@@ -343,8 +351,10 @@ export function convertOldToNew(oldFilters, { rowType } = {}) {
     }
     if (Array.isArray(val)) {
       entry.value.push(...val);
+      if (Array.isArray(valueTypes)) entry.valueTypes.push(...valueTypes);
     } else {
       entry.value.push(val);
+      if (Array.isArray(valueTypes)) entry.valueTypes.push(valueTypes[0]);
     }
   });
   return result;

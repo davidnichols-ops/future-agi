@@ -72,6 +72,9 @@ export const getPlottedChartSeries = (series = [], isLineChart = false) =>
       }))
     : series;
 
+export const shouldConnectAcrossMissingBuckets = (apexType) =>
+  apexType === "line" || apexType === "area";
+
 /**
  * Dashboard responses are all-or-nothing aggregates. A single sampled,
  * degraded, or failed metric makes the payload non-renderable.

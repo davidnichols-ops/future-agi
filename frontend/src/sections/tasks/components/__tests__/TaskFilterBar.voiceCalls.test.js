@@ -302,6 +302,46 @@ describe("TaskFilterBar structured and mixed filter contract", () => {
     ]);
   });
 
+  it("round-trips mixed typed attribute options into task preview requests", () => {
+    const panelRows = [
+      {
+        field: "attempt",
+        fieldName: "attempt",
+        fieldCategory: "attribute",
+        fieldType: "string",
+        apiColType: "SPAN_ATTRIBUTE",
+        operator: "in",
+        value: ["1", 1, true],
+        valueTypes: ["string", "number", "boolean"],
+      },
+    ];
+
+    const formRows = convertNewToOld(panelRows, { rowType: "traces" });
+    expect(formRows[0].filterConfig).toEqual({
+      filterType: "text",
+      filterOp: "in",
+      filterValue: ["1", 1, true],
+      attributeValueTypes: ["string", "number", "boolean"],
+    });
+    expect(buildApiFilterArray(formRows)).toEqual([
+      {
+        column_id: "attempt",
+        filter_config: {
+          filter_type: "text",
+          filter_op: "in",
+          filter_value: ["1", 1, true],
+          col_type: "SPAN_ATTRIBUTE",
+          attribute_value_types: ["string", "number", "boolean"],
+        },
+      },
+    ]);
+    expect(convertOldToNew(formRows, { rowType: "traces" })[0]).toMatchObject({
+      field: "attempt",
+      value: ["1", 1, true],
+      valueTypes: ["string", "number", "boolean"],
+    });
+  });
+
   it("round-trips legacy json lists and objects without changing shape", () => {
     const legacyRows = [
       {

@@ -446,7 +446,7 @@ const EvalUsageTab = ({
               }}
             >
               <Typography variant="caption" color="text.secondary">
-                Preparing exact data…
+                Loading results…
               </Typography>
               {!chartData?.queryRefreshing && (
                 <Button size="small" onClick={handleRefresh}>
@@ -553,7 +553,7 @@ const EvalUsageTab = ({
                 }}
               >
                 <Typography variant="caption" color="text.secondary">
-                  Preparing exact data…
+                  Loading results…
                 </Typography>
                 {!logsData?.queryRefreshing && (
                   <Button size="small" onClick={() => refreshLogs()}>

@@ -1,4 +1,3 @@
-import { useState } from "react";
 import PropTypes from "prop-types";
 import {
   Box,
@@ -25,13 +24,9 @@ const AttributeKeyList = ({
   hasMore,
   isLoadingMore,
   onLoadMore,
+  search,
+  onSearchChange,
 }) => {
-  const [search, setSearch] = useState("");
-
-  const filtered = keys.filter((k) =>
-    k.key.toLowerCase().includes(search.toLowerCase()),
-  );
-
   return (
     <Box
       sx={{
@@ -46,9 +41,9 @@ const AttributeKeyList = ({
         <TextField
           size="small"
           fullWidth
-          placeholder="Search attributes..."
+          placeholder="Enter exact attribute key..."
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => onSearchChange(e.target.value)}
           InputProps={{
             startAdornment: (
               <InputAdornment position="start">
@@ -76,7 +71,7 @@ const AttributeKeyList = ({
           }
         }}
       >
-        {filtered.map(({ key, type, count }) => (
+        {keys.map(({ key, type, count, count_exact: countExact }) => (
           <ListItemButton
             key={key}
             selected={selectedKey === key}
@@ -85,7 +80,11 @@ const AttributeKeyList = ({
           >
             <ListItemText
               primary={key}
-              secondary={count.toLocaleString() + " spans"}
+              secondary={
+                countExact && Number.isFinite(count)
+                  ? count.toLocaleString() + " spans"
+                  : "Recent attribute"
+              }
               primaryTypographyProps={{
                 variant: "body2",
                 fontWeight: selectedKey === key ? 600 : 400,
@@ -102,7 +101,7 @@ const AttributeKeyList = ({
             />
           </ListItemButton>
         ))}
-        {filtered.length === 0 && !hasMore && (
+        {keys.length === 0 && !hasMore && (
           <Box sx={{ p: 2, textAlign: "center", color: "text.secondary" }}>
             No attributes found
           </Box>
@@ -137,6 +136,8 @@ AttributeKeyList.propTypes = {
   hasMore: PropTypes.bool,
   isLoadingMore: PropTypes.bool,
   onLoadMore: PropTypes.func,
+  search: PropTypes.string.isRequired,
+  onSearchChange: PropTypes.func.isRequired,
 };
 
 export default AttributeKeyList;

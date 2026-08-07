@@ -51,6 +51,7 @@ import {
 import {
   createListCursorPagination,
   followEmptyListContinuations,
+  resumeEmptyListPage,
 } from "./listCursorPagination";
 import { getListTotalState } from "./listTotalMetadata";
 
@@ -433,6 +434,7 @@ const SpanGrid = React.forwardRef(
             let pageNumber = 0;
             let firstPageRequestId = null;
             let requestGeneration = null;
+            let continuationPending = false;
             try {
               setLoading(true);
               const { request } = params;
@@ -501,10 +503,32 @@ const SpanGrid = React.forwardRef(
               }
 
               const res = results?.data?.result;
+              const rows = res?.table || [];
+              const metadata = res?.metadata || {};
+              if (
+                resumeEmptyListPage({
+                  rows,
+                  metadata,
+                  pagination: cursorPagination.current,
+                  pageNumber,
+                  resume: () => {
+                    if (cursorPagination.current.isCurrent(requestGeneration)) {
+                      params.fail();
+                      if (params.api?.retryServerSideLoads) {
+                        params.api.retryServerSideLoads();
+                      } else {
+                        params.api?.refreshServerSide?.({ purge: false });
+                      }
+                    }
+                  },
+                })
+              ) {
+                continuationPending = true;
+                return;
+              }
               const nextReadState = getQueryReadState(results?.data);
-              const responseRows = res?.table || [];
               const visibleListReadState =
-                responseRows.length > 0 || nextReadState === "sampled"
+                rows.length > 0 || nextReadState === "sampled"
                   ? "complete"
                   : nextReadState;
               if (pageNumber === 0 || visibleListReadState !== "complete") {
@@ -568,8 +592,6 @@ const SpanGrid = React.forwardRef(
                 }
               }
 
-              const rows = responseRows;
-              const metadata = res?.metadata || {};
               cursorPagination.current.recordResponse(pageNumber, metadata);
               const totalState = getListTotalState(metadata);
               params.api.totalRowCount = totalState.totalRowCount;
@@ -623,13 +645,14 @@ const SpanGrid = React.forwardRef(
               failServerSideGridRead(params);
             } finally {
               if (
+                !continuationPending &&
                 firstPageRequestId !== null &&
                 firstPageRequestId === firstPageRequestRef.current &&
                 cursorPagination.current.isCurrent(requestGeneration)
               ) {
                 setGridLoading(false);
               }
-              setLoading(false);
+              if (!continuationPending) setLoading(false);
             }
           },
         };

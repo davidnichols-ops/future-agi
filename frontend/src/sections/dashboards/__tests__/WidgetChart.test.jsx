@@ -49,7 +49,7 @@ const queryResult = (points) => ({
 });
 
 const NO_DATA_MESSAGE = /No data available for this time period/i;
-const PREPARING_MESSAGE = /Preparing exact data/i;
+const PREPARING_MESSAGE = /Loading results/i;
 
 describe("WidgetChart — empty time-range state", () => {
   beforeEach(() => {

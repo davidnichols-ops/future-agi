@@ -695,6 +695,122 @@ describe("filter-value picker bounded-read UX", () => {
     expect(fetchNextPage).toHaveBeenCalledOnce();
     document.body.removeChild(anchorEl);
   });
+
+  it("carries mixed option storage types into the applied filter row", async () => {
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [
+        { value: "1", label: "string one", type: "string" },
+        { value: 1, label: "number one", type: "number" },
+        { value: true, label: "boolean true", type: "boolean" },
+      ],
+    });
+    const onApply = vi.fn();
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+      onApply,
+    });
+
+    openValuePicker();
+    fireEvent.click(screen.getByText("string one"));
+    fireEvent.click(screen.getByText("number one"));
+    fireEvent.click(screen.getByText("boolean true"));
+
+    await waitFor(() => expect(onApply).toHaveBeenCalled());
+    const applied = onApply.mock.calls.at(-1)[0][0];
+    expect(applied.value).toEqual(["1", 1, true]);
+    expect(applied.valueTypes).toEqual(["string", "number", "boolean"]);
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("explains a truthful terminal recent-value cap without incomplete copy", () => {
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [{ value: "completed", label: "completed", type: "string" }],
+      browseLimitReached: true,
+    });
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+    });
+
+    openValuePicker();
+    expect(
+      screen.getByText(
+        "Recent value limit reached. Search or enter an exact value.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/incomplete/i)).not.toBeInTheDocument();
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("does not pin mixed attributes to only their dominant storage type", () => {
+    const mixedProperty = {
+      ...statusProperty,
+      attributeTypes: ["string", "number"],
+    };
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [mixedProperty],
+    });
+
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "call.status",
+        metricType: "custom_attribute",
+        attributeType: undefined,
+      }),
+    );
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("does not pin a bounded singleton type hint", () => {
+    const boundedProperty = {
+      ...statusProperty,
+      attributeTypes: ["string"],
+      attributeTypesExact: false,
+    };
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [boundedProperty],
+    });
+
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "call.status",
+        metricType: "custom_attribute",
+        attributeType: undefined,
+      }),
+    );
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("pins a server-certified singleton type", () => {
+    const exactProperty = {
+      ...statusProperty,
+      attributeTypes: ["string"],
+      attributeTypesExact: true,
+    };
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [exactProperty],
+    });
+
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "call.status",
+        metricType: "custom_attribute",
+        attributeType: "string",
+      }),
+    );
+
+    document.body.removeChild(anchorEl);
+  });
 });
 
 describe("toStaticFilterProperty (spans Span Name)", () => {

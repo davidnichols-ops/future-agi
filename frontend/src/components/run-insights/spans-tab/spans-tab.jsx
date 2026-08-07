@@ -345,6 +345,7 @@ const SpanTab = React.forwardRef(
               setFilters={setFilters}
               filterDefinition={filterDefinition}
               onClose={() => setFilterOpen(false)}
+              projectId={projectId}
             />
           </Box>
         </Collapse>

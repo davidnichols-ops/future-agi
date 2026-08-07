@@ -108,6 +108,41 @@ describe("filter contract", () => {
     expect(apiFilter.filter_config).not.toHaveProperty("filterOp");
   });
 
+  it("preserves typed custom-attribute option provenance", () => {
+    const apiFilter = buildApiFilterFromPanelRow({
+      field: "attempt",
+      fieldCategory: "attribute",
+      fieldType: "string",
+      operator: "in",
+      value: ["1", 1, true],
+      valueTypes: ["string", "number", "boolean"],
+    });
+
+    expect(apiFilter.filter_config).toEqual({
+      filter_type: "text",
+      filter_op: "in",
+      filter_value: ["1", 1, true],
+      col_type: "SPAN_ATTRIBUTE",
+      attribute_value_types: ["string", "number", "boolean"],
+    });
+    expect(serializeFilterForApi(apiFilter)).toEqual(apiFilter);
+  });
+
+  it("rejects misaligned typed custom-attribute provenance", () => {
+    expect(() =>
+      serializeFilterForApi({
+        column_id: "attempt",
+        filter_config: {
+          filter_type: "text",
+          filter_op: "in",
+          filter_value: ["1", 1],
+          col_type: "SPAN_ATTRIBUTE",
+          attribute_value_types: ["string"],
+        },
+      }),
+    ).toThrow(/align/);
+  });
+
   it("keeps direct id filters out of metric col_type routing", () => {
     const apiFilter = buildApiFilterFromPanelRow({
       field: "trace_id",

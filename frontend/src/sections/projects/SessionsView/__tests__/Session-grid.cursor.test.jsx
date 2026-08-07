@@ -114,6 +114,7 @@ const makeParams = ({ startRow = 0, sortModel = [] } = {}) => ({
   api: {
     showNoRowsOverlay: vi.fn(),
     refreshServerSide: vi.fn(),
+    retryServerSideLoads: vi.fn(),
   },
   success: vi.fn(),
   fail: vi.fn(),
@@ -199,6 +200,49 @@ describe("SessionGrid cursor continuation", () => {
     expect(getMock.mock.calls[1][1].params).not.toHaveProperty("page_number");
     expect(params.success).toHaveBeenCalledWith({
       rowData: [row(8)],
+      rowCount: 1,
+    });
+  });
+
+  it("resumes the same visible page after the bounded continuation round", async () => {
+    Array.from({ length: 13 }, (_, index) =>
+      sessionResponse({
+        hasMore: true,
+        nextCursor: `checkpoint-${index}`,
+        lowerBound: true,
+      }),
+    ).forEach((response) => getMock.mockResolvedValueOnce(response));
+    getMock.mockResolvedValueOnce(
+      sessionResponse({
+        rows: [row(99)],
+        hasMore: false,
+        nextCursor: null,
+        totalRows: 1,
+      }),
+    );
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const boundedRound = makeParams();
+    await getRows(boundedRound);
+
+    expect(getMock).toHaveBeenCalledTimes(13);
+    expect(boundedRound.success).not.toHaveBeenCalled();
+    expect(boundedRound.api.showNoRowsOverlay).not.toHaveBeenCalled();
+    expect(boundedRound.fail).toHaveBeenCalledTimes(1);
+    expect(boundedRound.api.retryServerSideLoads).toHaveBeenCalledTimes(1);
+
+    const resumedPage = makeParams();
+    await getRows(resumedPage);
+
+    expect(getMock.mock.calls[13][1].params).toEqual(
+      expect.objectContaining({
+        cursor_mode: true,
+        cursor: "checkpoint-12",
+      }),
+    );
+    expect(resumedPage.success).toHaveBeenCalledWith({
+      rowData: [row(99)],
       rowCount: 1,
     });
   });

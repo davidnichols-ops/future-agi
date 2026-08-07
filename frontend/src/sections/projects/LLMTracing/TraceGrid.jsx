@@ -45,6 +45,7 @@ import {
 import {
   createListCursorPagination,
   followEmptyListContinuations,
+  resumeEmptyListPage,
 } from "./listCursorPagination";
 import { getListReadMessage, getListTotalState } from "./listTotalMetadata";
 
@@ -246,6 +247,7 @@ const TraceGrid = React.forwardRef(
             let pageNumber = 0;
             let firstPageRequestId = null;
             let requestGeneration = null;
+            let continuationPending = false;
             try {
               setLoading(true);
               params.api?.hideOverlay();
@@ -317,6 +319,29 @@ const TraceGrid = React.forwardRef(
               }
 
               const res = results?.data?.result;
+              const rows = res?.table || [];
+              const metadata = res?.metadata || {};
+              if (
+                resumeEmptyListPage({
+                  rows,
+                  metadata,
+                  pagination: cursorPagination.current,
+                  pageNumber,
+                  resume: () => {
+                    if (cursorPagination.current.isCurrent(requestGeneration)) {
+                      params.fail();
+                      if (params.api?.retryServerSideLoads) {
+                        params.api.retryServerSideLoads();
+                      } else {
+                        params.api?.refreshServerSide?.({ purge: false });
+                      }
+                    }
+                  },
+                })
+              ) {
+                continuationPending = true;
+                return;
+              }
               const nextReadState = getQueryReadState(results?.data);
               if (pageNumber === 0 || nextReadState !== "complete") {
                 const nextReadMessage = getListReadMessage(results?.data);
@@ -380,8 +405,6 @@ const TraceGrid = React.forwardRef(
                 }
               }
 
-              const rows = res?.table || [];
-              const metadata = res?.metadata || {};
               cursorPagination.current.recordResponse(pageNumber, metadata);
               const totalState = getListTotalState(metadata);
               params.api.totalRowCount = totalState.totalRowCount;
@@ -452,13 +475,14 @@ const TraceGrid = React.forwardRef(
               failServerSideGridRead(params);
             } finally {
               if (
+                !continuationPending &&
                 firstPageRequestId !== null &&
                 firstPageRequestId === firstPageRequestRef.current &&
                 cursorPagination.current.isCurrent(requestGeneration)
               ) {
                 setGridLoading(false);
               }
-              setLoading(false);
+              if (!continuationPending) setLoading(false);
             }
           },
         };

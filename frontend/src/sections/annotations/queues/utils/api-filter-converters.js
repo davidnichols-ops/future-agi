@@ -124,5 +124,6 @@ export function apiFilterToPanel(
     fieldType,
     operator: canonicalOp,
     value,
+    valueTypes: config.attribute_value_types,
   };
 }

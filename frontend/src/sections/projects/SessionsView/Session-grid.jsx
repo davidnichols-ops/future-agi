@@ -33,6 +33,7 @@ import { failServerSideGridRead } from "src/utils/queryReadState";
 import {
   createListCursorPagination,
   followEmptyListContinuations,
+  resumeEmptyListPage,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
 
 const getSessionGridThemeParams = (theme) => ({
@@ -378,6 +379,26 @@ const SessionGrid = React.forwardRef(
               setFilteredColumnDefs(filteredColumns);
               const rows = res?.table || [];
               const metadata = res?.metadata || {};
+              if (
+                resumeEmptyListPage({
+                  rows,
+                  metadata,
+                  pagination: cursorPagination.current,
+                  pageNumber,
+                  resume: () => {
+                    if (cursorPagination.current.isCurrent(requestGeneration)) {
+                      params.fail();
+                      if (params.api?.retryServerSideLoads) {
+                        params.api.retryServerSideLoads();
+                      } else {
+                        params.api?.refreshServerSide?.({ purge: false });
+                      }
+                    }
+                  },
+                })
+              ) {
+                return;
+              }
               cursorPagination.current.recordResponse(pageNumber, metadata);
               const totalState = getListTotalState(metadata);
               params.api.totalRowCount = totalState.totalRowCount;

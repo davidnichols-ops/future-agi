@@ -7,6 +7,7 @@ import {
   getPlottedChartSeries,
   getYAxisRangeWarning,
   seriesHasDataPoints,
+  shouldConnectAcrossMissingBuckets,
   toAxisConfigPayload,
 } from "../widgetUtils";
 import { ALL_AGGREGATIONS } from "../constants";
@@ -81,6 +82,12 @@ describe("seriesHasDataPoints", () => {
 });
 
 describe("getPlottedChartSeries", () => {
+  it("connects both line and stacked-line area renderers across missing buckets", () => {
+    expect(shouldConnectAcrossMissingBuckets("line")).toBe(true);
+    expect(shouldConnectAcrossMissingBuckets("area")).toBe(true);
+    expect(shouldConnectAcrossMissingBuckets("bar")).toBe(false);
+  });
+
   it("connects the widget editor line preview across null buckets without changing zeroes or source data", () => {
     const source = [
       {

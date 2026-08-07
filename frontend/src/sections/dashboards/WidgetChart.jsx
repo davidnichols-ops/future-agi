@@ -19,6 +19,7 @@ import {
   getUnitRendering,
   getYAxisRangeWarning,
   seriesHasDataPoints,
+  shouldConnectAcrossMissingBuckets,
 } from "./widgetUtils";
 import { toTimeRangePayload } from "./dashboardDateRange";
 import {
@@ -156,7 +157,7 @@ export default function WidgetChart({
   const isMetricCard = chartType === "metric";
   const isLineChart = apexType === "line";
   const connectsAcrossMissingBuckets =
-    apexType === "line" || apexType === "area";
+    shouldConnectAcrossMissingBuckets(apexType);
 
   // Measure container height so charts fill available space
   const containerRef = useRef(null);

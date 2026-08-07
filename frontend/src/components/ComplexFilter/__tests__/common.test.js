@@ -141,4 +141,67 @@ describe("ComplexFilter contract wiring", () => {
       expect(parsed.success, colType).toBe(true);
     }
   });
+
+  it("preserves aligned mixed scalar provenance for span-attribute lists", () => {
+    const schema = getComplexFilterValidation();
+    const parsed = schema.safeParse({
+      column_id: "mixed.value",
+      _meta: { parentProperty: "Attribute" },
+      filter_config: {
+        col_type: "SPAN_ATTRIBUTE",
+        filter_type: "text",
+        filter_op: "in",
+        filter_value: ["42", 42, false],
+        attribute_value_types: ["string", "number", "boolean"],
+      },
+    });
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.data.filter_config).toEqual({
+      col_type: "SPAN_ATTRIBUTE",
+      filter_type: "text",
+      filter_op: "in",
+      filter_value: ["42", 42, false],
+      attribute_value_types: ["string", "number", "boolean"],
+    });
+  });
+
+  it.each([
+    {
+      label: "misaligned",
+      config: {
+        col_type: "SPAN_ATTRIBUTE",
+        filter_type: "text",
+        filter_op: "in",
+        filter_value: ["42", 42],
+        attribute_value_types: ["string"],
+      },
+    },
+    {
+      label: "scalar",
+      config: {
+        col_type: "SPAN_ATTRIBUTE",
+        filter_type: "number",
+        filter_op: "equals",
+        filter_value: 42,
+        attribute_value_types: ["number"],
+      },
+    },
+    {
+      label: "non-attribute",
+      config: {
+        col_type: "SYSTEM_METRIC",
+        filter_type: "text",
+        filter_op: "in",
+        filter_value: ["42"],
+        attribute_value_types: ["string"],
+      },
+    },
+  ])("rejects $label attribute-value provenance", ({ config }) => {
+    const parsed = getComplexFilterValidation().safeParse({
+      column_id: "mixed.value",
+      filter_config: config,
+    });
+    expect(parsed.success).toBe(false);
+  });
 });

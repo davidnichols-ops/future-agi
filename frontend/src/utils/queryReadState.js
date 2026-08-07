@@ -18,7 +18,7 @@ export const ATTRIBUTE_LOOKUP_UNAVAILABLE_MESSAGE =
 export const QUERY_FAILED_RETRY_MESSAGE =
   "We couldn't load this data. Please retry in a moment.";
 
-export const AGGREGATION_PREPARING_MESSAGE = "Preparing exact data…";
+export const AGGREGATION_PREPARING_MESSAGE = "Loading results…";
 
 export const GRAPH_LOADING_MESSAGE = "Loading graph data…";
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { getNewTaskFilters } from "../validation";
+import { getNewTaskFilters, NewTaskValidationSchema } from "../validation";
 
 describe("eval task filter payload contract", () => {
   it("maps task panel span kind to the backend observation_type key", () => {
@@ -117,6 +117,46 @@ describe("eval task filter payload contract", () => {
       tier: "vip",
       attempt: 2,
     });
+  });
+
+  it("preserves mixed scalar attribute types through the task form schema", () => {
+    const result = NewTaskValidationSchema().parse({
+      name: "Typed attribute task",
+      project: "1372e742-a10b-4d98-9ca4-31ef4d67115f",
+      spansLimit: 100,
+      samplingRate: 100,
+      evalsDetails: [{ id: "eval-1" }],
+      startDate: "2026-08-01T00:00:00.000Z",
+      endDate: "2026-08-02T00:00:00.000Z",
+      runType: "continuous",
+      rowType: "traces",
+      filters: [
+        {
+          property: "attributes",
+          propertyId: "attempt",
+          apiColType: "SPAN_ATTRIBUTE",
+          filterConfig: {
+            filterType: "text",
+            filterOp: "in",
+            filterValue: ["1", 1, true],
+            attributeValueTypes: ["string", "number", "boolean"],
+          },
+        },
+      ],
+    });
+
+    expect(result.filters.filters).toEqual([
+      {
+        column_id: "attempt",
+        filter_config: {
+          filter_type: "text",
+          filter_op: "in",
+          filter_value: ["1", 1, true],
+          col_type: "SPAN_ATTRIBUTE",
+          attribute_value_types: ["string", "number", "boolean"],
+        },
+      },
+    ]);
   });
 
   it("keeps direct source id filters for linked trace tasks", () => {

@@ -49,11 +49,45 @@ describe("AttributeDetail", () => {
     );
 
     expect(
-      await screen.findByText("Preparing exact attribute details…"),
+      await screen.findByText("Loading attribute details…"),
     ).toBeVisible();
     expect(
       screen.queryByText(/incomplete|sample-limited/i),
     ).not.toBeInTheDocument();
+  });
+
+  it("terminates a failed cold refresh with an explicit retry", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        key: "final_status",
+        type: null,
+        count: 0,
+        unique_values: 0,
+        top_values: [],
+        query_complete: false,
+        query_status: "pending",
+        query_sampled: false,
+        query_refreshing: false,
+        query_refresh_failed: true,
+      },
+    });
+
+    render(
+      <AttributeDetail projectId="project-large" attributeKey="final_status" />,
+      { wrapper: Wrapper },
+    );
+
+    expect(
+      await screen.findByText(
+        "Exact attribute details could not be prepared. Retry when you are ready.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
+    expect(
+      screen.queryByText("Loading attribute details…"),
+    ).not.toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(mocks.get).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the completed exact snapshot visible while requesting a refresh", async () => {

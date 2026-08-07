@@ -292,4 +292,74 @@ describe("useExactTraceAttributeProperties", () => {
       }),
     ]);
   });
+
+  it("preserves every observed storage type for a mixed attribute", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: [
+          {
+            key: "mixed_status",
+            type: "string",
+            types: ["string", "number", "boolean"],
+            count: 3,
+            count_exact: false,
+          },
+        ],
+        query_complete: true,
+        query_status: "complete",
+        lookup_mode: "exact",
+        exact_match: true,
+      },
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "mixed_status",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data[0].attributeTypes).toEqual([
+      "string",
+      "number",
+      "boolean",
+    ]);
+    expect(result.current.data[0].attributeTypesExact).toBe(false);
+  });
+
+  it("only certifies storage-type coverage when the server does", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: [
+          {
+            key: "certified_status",
+            type: "string",
+            types: ["string"],
+            types_exact: true,
+          },
+        ],
+        query_complete: true,
+        query_status: "complete",
+        lookup_mode: "exact",
+        exact_match: true,
+      },
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "certified_status",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data[0].attributeTypesExact).toBe(true);
+  });
 });

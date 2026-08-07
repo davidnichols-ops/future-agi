@@ -86,9 +86,23 @@ export const getComplexFilterValidation = (
               AllowedColumnTypes,
             )
             .optional(),
+          attribute_value_types: z
+            .array(z.enum(["string", "number", "boolean"]).nullable())
+            .optional(),
         })
         .refine(
           (val) => {
+            if (val.attribute_value_types !== undefined) {
+              if (
+                val.col_type !== "SPAN_ATTRIBUTE" ||
+                !ListOperators.has(val.filter_op) ||
+                !Array.isArray(val.filter_value) ||
+                val.attribute_value_types.length !== val.filter_value.length
+              ) {
+                return false;
+              }
+            }
+
             // Skip validation for null operators as they don't require filter_value
             if (NoValueOperators.has(val.filter_op)) {
               return true;

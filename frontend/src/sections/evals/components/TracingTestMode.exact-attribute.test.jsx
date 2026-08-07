@@ -168,6 +168,91 @@ describe("TracingTestMode exact task attribute mapping", () => {
     );
   });
 
+  it("keeps loading and resumes the same preview page after the cursor round bound", async () => {
+    let spanListCalls = 0;
+    mocks.get.mockImplementation(async (url) => {
+      if (url === `/projects/${PROJECT_ID}`) {
+        return { data: { result: { id: PROJECT_ID, source: "api" } } };
+      }
+      if (url === "/spans/") {
+        const callIndex = spanListCalls;
+        spanListCalls += 1;
+        if (callIndex < 13) {
+          return {
+            data: {
+              result: {
+                config: [],
+                table: [],
+                metadata: {
+                  has_more: true,
+                  next_cursor: `checkpoint-${callIndex}`,
+                  total_rows_is_lower_bound: true,
+                },
+              },
+            },
+          };
+        }
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-rare",
+                  trace_id: "trace-rare",
+                  input: "rare preview value",
+                },
+              ],
+              metadata: {
+                has_more: false,
+                next_cursor: null,
+                total_rows: 1,
+              },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-rare/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-rare" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-rare",
+                    input: "rare preview value",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+
+    renderTaskMapping(vi.fn());
+
+    const input = await screen.findByPlaceholderText(
+      "Search or type a path (e.g. attributes.input.value)",
+    );
+    await waitFor(() => expect(input).not.toBeDisabled());
+
+    const spanRequests = mocks.get.mock.calls.filter(
+      ([url]) => url === "/spans/",
+    );
+    expect(spanRequests).toHaveLength(14);
+    expect(spanRequests[13][1].params).toEqual(
+      expect.objectContaining({
+        cursor_mode: true,
+        cursor: "checkpoint-12",
+      }),
+    );
+    expect(screen.getByText("Row 1 of 1")).toBeInTheDocument();
+  });
+
   it.each([
     [
       "degraded",

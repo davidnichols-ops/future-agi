@@ -77,7 +77,7 @@ export function useExactTraceAttributeProperties({
   const seenKeys = new Set();
   const properties = pages.flatMap((page) =>
     (Array.isArray(page?.result) ? page.result : []).flatMap(
-      ({ key, type }) => {
+      ({ key, type, types, types_exact: typesExact }) => {
         if (!key || seenKeys.has(key)) return [];
         seenKeys.add(key);
         return [
@@ -87,6 +87,13 @@ export function useExactTraceAttributeProperties({
             category: "attribute",
             rawCategory: "custom_attribute",
             type,
+            attributeTypes:
+              Array.isArray(types) && types.length > 0 ? types : [type],
+            // Key discovery is deliberately bounded. Even a positive exact-key
+            // lookup proves existence, not that the first observed storage type
+            // is the only type in the full window. Consumers may pin a typed
+            // value query only when the server explicitly certifies coverage.
+            attributeTypesExact: typesExact === true,
             apiColType: "SPAN_ATTRIBUTE",
           },
         ];

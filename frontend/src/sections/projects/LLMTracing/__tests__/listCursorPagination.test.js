@@ -1,10 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   createListCursorPagination,
   followEmptyListContinuations,
+  getEmptyListContinuation,
   listContinuationParams,
   LIST_CURSOR_MODES,
+  resumeEmptyListPage,
 } from "../listCursorPagination";
 
 describe("list cursor pagination", () => {
@@ -175,6 +177,96 @@ describe("list cursor pagination", () => {
         }),
       }),
     ).rejects.toThrow("repeated continuation cursor");
+  });
+
+  it("preserves a valid sparse continuation at its hop bound", async () => {
+    const pagination = createListCursorPagination();
+    let cursorIndex = 0;
+    const response = await followEmptyListContinuations({
+      initialResponse: {
+        rows: [],
+        metadata: { has_more: true, next_cursor: "checkpoint-0" },
+      },
+      rowsFromResponse: (value) => value.rows,
+      metadataFromResponse: (value) => value.metadata,
+      maxContinuations: 2,
+      nextResponse: async () => {
+        cursorIndex += 1;
+        return {
+          rows: [],
+          metadata: {
+            has_more: true,
+            next_cursor: `checkpoint-${cursorIndex}`,
+          },
+        };
+      },
+    });
+
+    expect(response).toEqual({
+      rows: [],
+      metadata: { has_more: true, next_cursor: "checkpoint-2" },
+    });
+    expect(cursorIndex).toBe(2);
+    expect(getEmptyListContinuation(response.rows, response.metadata)).toBe(
+      "checkpoint-2",
+    );
+    pagination.recordEmptyContinuation(0, response.metadata);
+    expect(pagination.requestParams(0, { page_size: 25 })).toEqual({
+      page_size: 25,
+      cursor_mode: true,
+      cursor: "checkpoint-2",
+    });
+  });
+
+  it("preserves a valid sparse continuation at its time bound", async () => {
+    let elapsedMs = 0;
+    const response = await followEmptyListContinuations({
+      initialResponse: {
+        rows: [],
+        metadata: { has_more: true, next_cursor: "checkpoint-0" },
+      },
+      rowsFromResponse: (value) => value.rows,
+      metadataFromResponse: (value) => value.metadata,
+      maxElapsedMs: 50,
+      now: () => elapsedMs,
+      nextResponse: async () => {
+        elapsedMs = 75;
+        return {
+          rows: [],
+          metadata: { has_more: true, next_cursor: "checkpoint-1" },
+        };
+      },
+    });
+
+    expect(response).toEqual({
+      rows: [],
+      metadata: { has_more: true, next_cursor: "checkpoint-1" },
+    });
+  });
+
+  it("schedules an AG Grid retry without advancing the visible page", () => {
+    const pagination = createListCursorPagination();
+    const resume = vi.fn();
+    const schedule = vi.fn((callback) => callback());
+
+    expect(
+      resumeEmptyListPage({
+        rows: [],
+        metadata: { has_more: true, next_cursor: "checkpoint-rare" },
+        pagination,
+        pageNumber: 0,
+        resume,
+        schedule,
+      }),
+    ).toBe(true);
+
+    expect(schedule).toHaveBeenCalledTimes(1);
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(pagination.requestParams(0, { page_size: 25 })).toEqual({
+      page_size: 25,
+      cursor_mode: true,
+      cursor: "checkpoint-rare",
+    });
   });
 
   it("preserves a page-N start cursor across transient empty checkpoints", () => {

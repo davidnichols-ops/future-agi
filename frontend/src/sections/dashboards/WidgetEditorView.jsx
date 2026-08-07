@@ -88,6 +88,7 @@ import {
   getSuggestedUnitConfig,
   getUnitRendering,
   getYAxisRangeWarning,
+  shouldConnectAcrossMissingBuckets,
   toAxisConfigPayload,
 } from "./widgetUtils";
 import {
@@ -2302,6 +2303,8 @@ export default function WidgetEditorView() {
   const isTable = chartType === "table";
   const isMetricCard = chartType === "metric";
   const isLineChart = apexType === "line";
+  const connectsAcrossMissingBuckets =
+    shouldConnectAcrossMissingBuckets(apexType);
 
   const aggColumnLabel = useMemo(
     () => getAggColumnLabel(metrics, ALL_AGGREGATIONS),
@@ -2317,8 +2320,8 @@ export default function WidgetEditorView() {
   // Match the saved-dashboard renderer: null means an absent aggregate
   // bucket, not zero, so line previews connect the neighbouring exact points.
   const plottedChartSeries = useMemo(
-    () => getPlottedChartSeries(chartSeries, isLineChart),
-    [chartSeries, isLineChart],
+    () => getPlottedChartSeries(chartSeries, connectsAcrossMissingBuckets),
+    [chartSeries, connectsAcrossMissingBuckets],
   );
 
   const outOfRangeWarning = useMemo(

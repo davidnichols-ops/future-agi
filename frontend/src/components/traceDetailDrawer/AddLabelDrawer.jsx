@@ -13,7 +13,7 @@ import {
 } from "@mui/material";
 import Iconify from "src/components/iconify";
 import {
-  useAnnotationLabelsList,
+  useInfiniteAnnotationLabelsList,
   annotationLabelKeys,
 } from "src/api/annotation-labels/annotation-labels";
 import {
@@ -26,6 +26,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import PropTypes from "prop-types";
 import CreateLabelDrawer from "src/sections/annotations/labels/create-label-drawer";
 import LabelTypeChip from "src/components/label-type-chip/LabelTypeChip";
+import { useDebounce } from "src/hooks/use-debounce";
 
 const AddLabelDrawerContent = ({
   projectId,
@@ -37,16 +38,26 @@ const AddLabelDrawerContent = ({
   const [search, setSearch] = useState("");
   const [defaultQueue, setDefaultQueue] = useState(null);
   const [queueLabelIds, setQueueLabelIds] = useState(new Set());
+  const [knownLabelsById, setKnownLabelsById] = useState(new Map());
   const [saving, setSaving] = useState(false);
   const [createLabelOpen, setCreateLabelOpen] = useState(false);
   const [queueError, setQueueError] = useState("");
   const queryClient = useQueryClient();
+  const debouncedSearch = useDebounce(search.trim(), 300);
 
-  const { data: labelsData } = useAnnotationLabelsList({
-    search: "",
-    limit: 100,
+  const {
+    data: labelsData,
+    isLoading: isLabelsLoading,
+    isError: isLabelsError,
+    isFetchingNextPage,
+    hasNextPage,
+    fetchNextPage,
+    refetch: retryLabels,
+  } = useInfiniteAnnotationLabelsList({
+    search: debouncedSearch,
+    limit: 50,
   });
-  const allLabels = labelsData?.results || [];
+  const labels = labelsData?.results || [];
 
   const { mutate: getOrCreateDefault, isPending: isDefaultQueuePending } =
     useGetOrCreateDefaultQueue({
@@ -74,10 +85,18 @@ const AddLabelDrawerContent = ({
               (result?.labels || []).map((l) => l.id),
             );
             setQueueLabelIds(existingIds);
+            setKnownLabelsById(
+              new Map(
+                (result?.labels || [])
+                  .filter((label) => label?.id)
+                  .map((label) => [label.id, label]),
+              ),
+            );
           },
           onError: (error) => {
             setDefaultQueue(null);
             setQueueLabelIds(new Set());
+            setKnownLabelsById(new Map());
             setQueueError(
               extractErrorMessage(error, "Failed to get default queue"),
             );
@@ -93,12 +112,6 @@ const AddLabelDrawerContent = ({
     agentDefinitionId,
     getOrCreateDefault,
   ]);
-
-  const filteredLabels = search
-    ? allLabels.filter((l) =>
-        l.name?.toLowerCase().includes(search.toLowerCase()),
-      )
-    : allLabels;
 
   const handleToggle = async (labelId) => {
     if (!defaultQueue?.id) return;
@@ -121,6 +134,12 @@ const AddLabelDrawerContent = ({
           labelId,
         });
         setQueueLabelIds((prev) => new Set([...prev, labelId]));
+        const selectedLabel = labels.find((label) => label.id === labelId);
+        if (selectedLabel) {
+          setKnownLabelsById((prev) =>
+            new Map(prev).set(selectedLabel.id, selectedLabel),
+          );
+        }
       }
       onLabelsChanged?.();
     } finally {
@@ -128,7 +147,22 @@ const AddLabelDrawerContent = ({
     }
   };
 
-  const selectedLabels = allLabels.filter((l) => queueLabelIds.has(l.id));
+  const visibleLabelsById = new Map(knownLabelsById);
+  labels.forEach((label) => visibleLabelsById.set(label.id, label));
+  const selectedLabels = Array.from(queueLabelIds)
+    .map((labelId) => visibleLabelsById.get(labelId))
+    .filter(Boolean);
+  const isInitialLoading =
+    isDefaultQueuePending || (isLabelsLoading && labels.length === 0);
+
+  const handleLabelsScroll = (event) => {
+    const element = event.currentTarget;
+    const isNearBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight < 32;
+    if (isNearBottom && hasNextPage && !isFetchingNextPage) {
+      fetchNextPage();
+    }
+  };
 
   return (
     <Box
@@ -165,7 +199,8 @@ const AddLabelDrawerContent = ({
           flexDirection: "column",
           gap: 2,
           flex: 1,
-          overflow: "auto",
+          minHeight: 0,
+          overflow: "hidden",
         }}
       >
         <Typography variant="body2" color="text.secondary">
@@ -211,15 +246,18 @@ const AddLabelDrawerContent = ({
 
         {/* Label list */}
         <Box
+          data-testid="annotation-labels-scroll-region"
+          onScroll={handleLabelsScroll}
           sx={{
-            flex: 1,
-            overflow: "auto",
+            flex: "1 1 0",
+            minHeight: 120,
+            overflowY: "auto",
             border: "1px solid",
             borderColor: "divider",
             borderRadius: 1,
           }}
         >
-          {isDefaultQueuePending ? (
+          {isInitialLoading ? (
             <Typography
               variant="body2"
               color="text.secondary"
@@ -227,8 +265,24 @@ const AddLabelDrawerContent = ({
             >
               Loading...
             </Typography>
+          ) : isLabelsError && labels.length === 0 ? (
+            <Alert
+              severity="error"
+              action={
+                <Button
+                  color="inherit"
+                  size="small"
+                  onClick={() => retryLabels()}
+                >
+                  Retry
+                </Button>
+              }
+              sx={{ m: 1 }}
+            >
+              We couldn&apos;t load labels. Please retry.
+            </Alert>
           ) : (
-            filteredLabels.map((label) => (
+            labels.map((label) => (
               <Box
                 key={label.id}
                 onClick={() =>
@@ -274,7 +328,7 @@ const AddLabelDrawerContent = ({
               </Box>
             ))
           )}
-          {!getOrCreateDefault.isPending && filteredLabels.length === 0 && (
+          {!isInitialLoading && !isLabelsError && labels.length === 0 && (
             <Typography
               variant="body2"
               color="text.secondary"
@@ -282,6 +336,17 @@ const AddLabelDrawerContent = ({
             >
               No labels found
             </Typography>
+          )}
+          {!isInitialLoading && hasNextPage && (
+            <Button
+              fullWidth
+              size="small"
+              disabled={isFetchingNextPage}
+              onClick={() => fetchNextPage()}
+              sx={{ borderRadius: 0, py: 1 }}
+            >
+              {isFetchingNextPage ? "Loading more..." : "Load more labels"}
+            </Button>
           )}
         </Box>
 

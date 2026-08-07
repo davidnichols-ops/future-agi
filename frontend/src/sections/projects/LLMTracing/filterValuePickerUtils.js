@@ -16,6 +16,19 @@ export function getPickerOptionValue(option) {
   return option?.value ?? option?.label ?? "";
 }
 
+export function getPickerOptionType(option) {
+  if (!option || typeof option !== "object") return undefined;
+  return ["string", "number", "boolean", "array", "map", "json"].includes(
+    option.type,
+  )
+    ? option.type
+    : undefined;
+}
+
+export function getPickerValueIdentity(value, storageType) {
+  return `${storageType || ""}:${typeof value}:${JSON.stringify(value)}`;
+}
+
 export function getPickerOptionLabel(option) {
   if (
     typeof option === "string" ||

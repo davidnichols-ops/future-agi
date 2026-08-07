@@ -115,7 +115,7 @@ describe("EvalUsageTab exact read states", () => {
   it("uses neutral preparation states and does not present failures as zero data", () => {
     render(<EvalUsageTab templateId="eval-1" />);
 
-    expect(screen.getAllByText("Preparing exact data…")).toHaveLength(2);
+    expect(screen.getAllByText("Loading results…")).toHaveLength(2);
     expect(screen.queryByText(/could not be loaded/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/No data to show/i)).not.toBeInTheDocument();
     expect(screen.queryByTestId("usage-table")).not.toBeInTheDocument();
@@ -147,7 +147,7 @@ describe("EvalUsageTab exact read states", () => {
 
     render(<EvalUsageTab templateId="eval-1" />);
 
-    expect(screen.getAllByText("Preparing exact data…")).toHaveLength(2);
+    expect(screen.getAllByText("Loading results…")).toHaveLength(2);
     expect(screen.queryByText(/No data to show/i)).not.toBeInTheDocument();
     expect(screen.queryByTestId("usage-table")).not.toBeInTheDocument();
     expect(screen.queryByText(/Runs: 0/i)).not.toBeInTheDocument();
@@ -182,7 +182,7 @@ describe("EvalUsageTab exact read states", () => {
       "No evaluation logs for this period",
     );
     expect(screen.getByTestId("usage-pagination")).toBeInTheDocument();
-    expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading results…")).not.toBeInTheDocument();
     expect(screen.getByText(/Last updated/i)).toBeInTheDocument();
   });
 
@@ -214,7 +214,7 @@ describe("EvalUsageTab exact read states", () => {
     expect(screen.getByTestId("usage-chart")).toBeInTheDocument();
     expect(screen.getByTestId("usage-table")).toBeInTheDocument();
     expect(screen.getByTestId("usage-pagination")).toBeInTheDocument();
-    expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading results…")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(h.refetchChart).toHaveBeenCalledOnce();
@@ -252,7 +252,7 @@ describe("EvalUsageTab exact read states", () => {
 
     expect(screen.getByTestId("usage-chart")).toBeInTheDocument();
     expect(screen.getByTestId("usage-table")).toBeInTheDocument();
-    expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading results…")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Refreshing" })).toBeDisabled();
   });
 
@@ -308,7 +308,7 @@ describe("EvalUsageTab exact read states", () => {
     expect(screen.getByTestId("usage-chart")).toBeInTheDocument();
     expect(screen.getByTestId("usage-table")).toBeInTheDocument();
     expect(screen.getByText(/Runs: 4/i)).toBeInTheDocument();
-    expect(screen.queryByText("Preparing exact data…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading results…")).not.toBeInTheDocument();
     expect(screen.queryByText(/Runs: 0/i)).not.toBeInTheDocument();
   });
 
@@ -340,7 +340,7 @@ describe("EvalUsageTab exact read states", () => {
 
     render(<EvalUsageTab templateId="eval-1" />);
 
-    expect(screen.getAllByText("Preparing exact data…")).toHaveLength(2);
+    expect(screen.getAllByText("Loading results…")).toHaveLength(2);
     expect(screen.queryByText(/No data to show/i)).not.toBeInTheDocument();
     expect(screen.queryByTestId("usage-table")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Refreshing" })).toBeDisabled();

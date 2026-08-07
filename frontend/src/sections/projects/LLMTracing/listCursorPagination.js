@@ -2,6 +2,8 @@ const CURSOR_MODE = "cursor";
 const NUMBERED_MODE = "numbered";
 const UNKNOWN_MODE = "unknown";
 const MIXED_VERSION_ERROR_CODE = "LIST_CURSOR_MIXED_VERSION";
+const DEFAULT_MAX_EMPTY_CONTINUATIONS = 12;
+const DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS = 30_000;
 
 const hasOwn = (value, key) =>
   Object.prototype.hasOwnProperty.call(value || {}, key);
@@ -198,6 +200,42 @@ export const listContinuationParams = (baseParams, cursor) => {
 };
 
 /**
+ * Return the signed checkpoint for a transport-only empty response.
+ *
+ * An empty table is not a user-visible empty result while `has_more` is true:
+ * the bounded backend scan has only proved that its current candidate prefix
+ * contains no matches. Callers must keep this cursor on the same visible page
+ * and resume that page instead of publishing an empty row set.
+ */
+export const getEmptyListContinuation = (rows, metadata) => {
+  if (
+    Array.isArray(rows) &&
+    rows.length === 0 &&
+    metadata?.has_more === true &&
+    typeof metadata?.next_cursor === "string" &&
+    metadata.next_cursor.length > 0
+  ) {
+    return metadata.next_cursor;
+  }
+  return null;
+};
+
+/** Preserve and asynchronously resume a transport-only page for AG Grid. */
+export const resumeEmptyListPage = ({
+  rows,
+  metadata,
+  pagination,
+  pageNumber,
+  resume,
+  schedule = queueMicrotask,
+}) => {
+  if (!getEmptyListContinuation(rows, metadata)) return false;
+  pagination.recordEmptyContinuation(pageNumber, metadata);
+  schedule(resume);
+  return true;
+};
+
+/**
  * Follow checkpoint-only transport pages until the API returns genuine rows
  * or proves the cursor chain is exhausted.  Sparse filters can legitimately
  * classify a bounded prefix without finding a match; exposing that transport
@@ -211,9 +249,19 @@ export const followEmptyListContinuations = async ({
   nextResponse,
   onContinuation,
   isCurrent = () => true,
+  maxContinuations = DEFAULT_MAX_EMPTY_CONTINUATIONS,
+  maxElapsedMs = DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS,
+  now = () => Date.now(),
 }) => {
+  if (!Number.isInteger(maxContinuations) || maxContinuations < 1) {
+    throw new Error("Invalid list continuation limit");
+  }
+  if (!Number.isFinite(maxElapsedMs) || maxElapsedMs < 1) {
+    throw new Error("Invalid list continuation deadline");
+  }
   let response = initialResponse;
   const followed = new Set();
+  const startedAt = now();
   let rows = rowsFromResponse(response) || [];
 
   while (rows.length === 0) {
@@ -227,8 +275,21 @@ export const followEmptyListContinuations = async ({
       return response;
     }
     if (!isCurrent()) return response;
+    // A repeated checkpoint is a malformed continuation chain regardless of
+    // whether this request has also reached its local hop/time budget.
     if (followed.has(nextCursor)) {
       throw new Error("List API returned a repeated continuation cursor");
+    }
+    if (
+      followed.size >= maxContinuations ||
+      now() - startedAt >= maxElapsedMs
+    ) {
+      // Sparse exact filters can legitimately need more checkpoints than one
+      // browser request should follow. Return the current transport page with
+      // its signed continuation intact; the normal page/cursor flow can resume
+      // from it without turning a valid sparse result into a user-visible
+      // failure or starting an unbounded request fan-out.
+      return response;
     }
     followed.add(nextCursor);
     onContinuation?.(metadata);

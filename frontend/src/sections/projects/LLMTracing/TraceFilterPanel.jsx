@@ -48,7 +48,9 @@ import {
   getPickerOptionLabel,
   getPickerOptionSearchText,
   getPickerOptionSecondaryLabel,
+  getPickerOptionType,
   getPickerOptionValue,
+  getPickerValueIdentity,
   normalizePickerValues,
   usesFreeTextValue,
 } from "./filterValuePickerUtils";
@@ -498,6 +500,7 @@ export const serializeFilterSet = (filters) =>
       field: f.field,
       operator: normalizeFilterRowOperator(f).operator,
       value: f.value,
+      valueTypes: f.valueTypes,
     })),
   );
 
@@ -1210,13 +1213,15 @@ const SESSION_VALUE_FIELDS = new Set([
 const FREE_TEXT_NO_OPTIONS_TEXT =
   "No values in the last 7 days — type to search, or add an exact value";
 
-const pickerValueKey = (value) => `${typeof value}:${JSON.stringify(value)}`;
+const pickerValueKey = (value, storageType) =>
+  getPickerValueIdentity(value, storageType);
 
 function ValuePicker({
   propertyId,
   propertyCategory,
   projectId,
   value = [],
+  valueTypes = [],
   onChange,
   source = "traces",
   property,
@@ -1263,6 +1268,7 @@ function ValuePicker({
     isLoading: dashLoading,
     isError: dashError,
     queryReadState: dashboardReadState,
+    browseLimitReached: dashboardBrowseLimitReached,
     fetchNextPage: fetchNextDashboardPage,
     hasNextPage: hasNextDashboardPage,
     isFetchingNextPage: isFetchingNextDashboardPage,
@@ -1276,11 +1282,14 @@ function ValuePicker({
     pageSize: 10,
     attributeType:
       propertyCategory === "attribute"
-        ? property?.type === "text"
-          ? "string"
-          : ["float", "integer"].includes(property?.type)
-            ? "number"
-            : property?.type
+        ? property?.attributeTypesExact === true &&
+          property?.attributeTypes?.length === 1
+          ? property?.type === "text"
+            ? "string"
+            : ["float", "integer"].includes(property?.type)
+              ? "number"
+              : property?.type
+          : undefined
         : undefined,
     enabled:
       !hasStaticChoices &&
@@ -1384,25 +1393,62 @@ function ValuePicker({
       ? normalizeVoiceCallStatus(normalized)
       : normalized;
   }, [propertyId, value]);
+  const selectedValueTypes = useMemo(
+    () =>
+      selectedValues.map((_, index) =>
+        Array.isArray(valueTypes) ? valueTypes[index] : undefined,
+      ),
+    [selectedValues, valueTypes],
+  );
+
+  const selectedIndexFor = useCallback(
+    (optionValue, optionType) =>
+      selectedValues.findIndex((selectedValue, index) => {
+        if (!Object.is(selectedValue, optionValue)) return false;
+        const selectedType = selectedValueTypes[index];
+        // Legacy/saved filters predate typed value provenance. Treat their
+        // scalar as selected until the user makes a typed choice, at which
+        // point the storage family is persisted explicitly.
+        return !optionType || !selectedType || selectedType === optionType;
+      }),
+    [selectedValues, selectedValueTypes],
+  );
 
   const toggleValue = useCallback(
     (val) => {
       // Use the shared helper to read the picker option's stable value
       // (handles both string and {value, label} object shapes).
       const optionValue = getPickerOptionValue(val);
+      const optionType = getPickerOptionType(val);
+      const selectedIndex = selectedIndexFor(optionValue, optionType);
       if (singleSelect) {
         // Clicking the already-selected value clears; clicking a different
         // value replaces — standard single-select dropdown UX.
-        onChange(selectedValues.includes(optionValue) ? [] : [optionValue]);
+        onChange(
+          selectedIndex >= 0 ? [] : [optionValue],
+          selectedIndex >= 0 ? [] : [optionType],
+        );
+        return;
+      }
+      if (selectedIndex >= 0) {
+        onChange(
+          selectedValues.filter((_, index) => index !== selectedIndex),
+          selectedValueTypes.filter((_, index) => index !== selectedIndex),
+        );
         return;
       }
       onChange(
-        selectedValues.includes(optionValue)
-          ? selectedValues.filter((v) => v !== optionValue)
-          : [...selectedValues, optionValue],
+        [...selectedValues, optionValue],
+        [...selectedValueTypes, optionType],
       );
     },
-    [selectedValues, onChange, singleSelect],
+    [
+      selectedIndexFor,
+      selectedValueTypes,
+      selectedValues,
+      onChange,
+      singleSelect,
+    ],
   );
 
   const customSearchValue = search.trim();
@@ -1458,15 +1504,20 @@ function ValuePicker({
           // in a list", which mis-signals multi-select.
           (() => {
             const v = selectedValues[0];
+            const selectedType = selectedValueTypes[0];
             const match = options.find((o) => {
               const ov = typeof o === "string" ? o : o.value;
-              return ov === v;
+              const optionType = getPickerOptionType(o);
+              return (
+                Object.is(ov, v) &&
+                (!selectedType || !optionType || selectedType === optionType)
+              );
             });
             const displayLabel =
               (typeof match === "string" ? match : match?.label) ?? String(v);
             return (
               <Typography
-                key={pickerValueKey(v)}
+                key={pickerValueKey(v, selectedValueTypes[0])}
                 noWrap
                 title={displayLabel}
                 sx={{
@@ -1483,10 +1534,15 @@ function ValuePicker({
             );
           })()
         ) : (
-          selectedValues.slice(0, 3).map((v) => {
+          selectedValues.slice(0, 3).map((v, selectedIndex) => {
+            const selectedType = selectedValueTypes[selectedIndex];
             const match = options.find((o) => {
               const ov = typeof o === "string" ? o : o.value;
-              return ov === v;
+              const optionType = getPickerOptionType(o);
+              return (
+                Object.is(ov, v) &&
+                (!selectedType || !optionType || selectedType === optionType)
+              );
             });
             const displayLabel =
               (typeof match === "string" ? match : match?.label) ?? String(v);
@@ -1496,13 +1552,18 @@ function ValuePicker({
               : displayLabel;
             return (
               <Chip
-                key={pickerValueKey(v)}
+                key={pickerValueKey(v, selectedType)}
                 label={displayLabel}
                 title={chipTitle}
                 size="small"
                 onDelete={(e) => {
                   e.stopPropagation();
-                  onChange(selectedValues.filter((x) => x !== v));
+                  onChange(
+                    selectedValues.filter((_, index) => index !== selectedIndex),
+                    selectedValueTypes.filter(
+                      (_, index) => index !== selectedIndex,
+                    ),
+                  );
                 }}
                 deleteIcon={<Iconify icon="mdi:close" width={10} />}
                 sx={{
@@ -1631,12 +1692,13 @@ function ValuePicker({
               fallback (search did not match any fetched option). */}
           {filtered.map((opt) => {
             const optionValue = getPickerOptionValue(opt);
+            const optionType = getPickerOptionType(opt);
             const label = getPickerOptionLabel(opt);
             const secondaryLabel = getPickerOptionSecondaryLabel(opt);
-            const isSelected = selectedValues.includes(optionValue);
+            const isSelected = selectedIndexFor(optionValue, optionType) >= 0;
             return (
               <Box
-                key={pickerValueKey(optionValue)}
+                key={pickerValueKey(optionValue, optionType)}
                 data-filter-value-option={String(optionValue)}
                 onClick={() => toggleValue(opt)}
                 sx={{
@@ -1700,9 +1762,12 @@ function ValuePicker({
                   // singleSelect: replace the selection. Otherwise: append
                   // (but skip if the value is already selected).
                   if (singleSelect) {
-                    onChange([customSearchValue]);
+                    onChange([customSearchValue], [undefined]);
                   } else if (!selectedValues.includes(customSearchValue)) {
-                    onChange([...selectedValues, customSearchValue]);
+                    onChange(
+                      [...selectedValues, customSearchValue],
+                      [...selectedValueTypes, undefined],
+                    );
                   }
                   setSearch("");
                 }}
@@ -1735,6 +1800,16 @@ function ValuePicker({
               <CircularProgress size={14} />
             </Box>
           )}
+          {!isLoading &&
+            dashboardBrowseLimitReached &&
+            metricType === "custom_attribute" && (
+              <Typography
+                role="status"
+                sx={{ px: 1.5, py: 0.75, fontSize: 11, color: "text.secondary" }}
+              >
+                Recent value limit reached. Search or enter an exact value.
+              </Typography>
+            )}
           {hasNextDashboardPage && !isFetchingNextDashboardPage && (
             <Box sx={{ display: "flex", justifyContent: "center", py: 0.5 }}>
               <Button
@@ -1763,7 +1838,7 @@ function ValuePicker({
               </Typography>
               <Button
                 size="small"
-                onClick={() => onChange([])}
+                onClick={() => onChange([], [])}
                 sx={{
                   textTransform: "none",
                   fontSize: 11,
@@ -1870,9 +1945,12 @@ function FilterRow({
         fieldName: prop.name,
         fieldCategory: prop.category,
         fieldType: nt,
+        attributeTypes: prop.attributeTypes,
+        attributeTypesExact: prop.attributeTypesExact,
         apiColType: prop.apiColType,
         operator: defaultOp,
         value: defaultValue,
+        valueTypes: [],
       });
     },
     [index, onChange, defaultOperatorForType],
@@ -1906,7 +1984,18 @@ function FilterRow({
             ? []
             : [newVal];
       }
-      onChange(index, { ...filter, operator: newOp, value: newVal });
+      const nextValueTypes = Array.isArray(filter.valueTypes)
+        ? filter.valueTypes.slice(
+            0,
+            Array.isArray(newVal) ? newVal.length : newVal === "" ? 0 : 1,
+          )
+        : [];
+      onChange(index, {
+        ...filter,
+        operator: newOp,
+        value: newVal,
+        valueTypes: nextValueTypes,
+      });
     },
     [index, filter, safeOperator, isNumber, isDate, isArray, onChange],
   );
@@ -2170,11 +2259,20 @@ function FilterRow({
         fieldType={normalizedType}
         projectId={projectId}
         value={filter.value}
+        valueTypes={filter.valueTypes}
         source={source}
-        property={properties.find((p) => p.id === filter.field)}
+        property={
+          properties.find((p) => p.id === filter.field) || {
+            type: filter.fieldType,
+            attributeTypes: filter.attributeTypes,
+            attributeTypesExact: filter.attributeTypesExact,
+          }
+        }
         freeSoloValues={rowFreeSoloValues}
         singleSelect={SINGLE_VALUE_OPS.has(safeOperator) && !isArray}
-        onChange={(newVal) => updateRow({ value: newVal })}
+        onChange={(newVal, newValueTypes = []) =>
+          updateRow({ value: newVal, valueTypes: newValueTypes })
+        }
       />
     );
   };
@@ -2286,6 +2384,7 @@ const DEFAULT_ROW = {
   fieldCategory: "system",
   operator: "in",
   value: [],
+  valueTypes: [],
 };
 
 const TraceFilterPanel = ({
@@ -2454,11 +2553,14 @@ const TraceFilterPanel = ({
     pageSize: queryMetricType === "custom_attribute" ? 10 : undefined,
     attributeType:
       queryMetricType === "custom_attribute"
-        ? queryFieldProp?.type === "text"
-          ? "string"
-          : ["float", "integer"].includes(queryFieldProp?.type)
-            ? "number"
-            : queryFieldProp?.type
+        ? queryFieldProp?.attributeTypesExact === true &&
+          queryFieldProp?.attributeTypes?.length === 1
+          ? queryFieldProp?.type === "text"
+            ? "string"
+            : ["float", "integer"].includes(queryFieldProp?.type)
+              ? "number"
+              : queryFieldProp?.type
+          : undefined
         : undefined,
   });
   const queryValuesMessage = getQueryReadMessage(
@@ -2498,9 +2600,13 @@ const TraceFilterPanel = ({
             fieldCategory: resolveFieldCategory(f.fieldCategory, prop),
             fieldName: f.fieldName || prop?.name,
             fieldType,
+            attributeTypes: f.attributeTypes || prop?.attributeTypes,
+            attributeTypesExact:
+              f.attributeTypesExact ?? prop?.attributeTypesExact,
             apiColType: f.apiColType || prop?.apiColType,
             operator: hydratedOp,
             value,
+            valueTypes: f.valueTypes,
           });
         });
         setRows(enriched);
@@ -2541,6 +2647,8 @@ const TraceFilterPanel = ({
             prop?.type ||
             queryFieldDef?.panelType ||
             (queryFieldDef?.type === "enum" ? "categorical" : "string"),
+          attributeTypes: prop?.attributeTypes,
+          attributeTypesExact: prop?.attributeTypesExact,
           apiColType: prop?.apiColType || queryFieldDef?.apiColType,
           operator: QUERY_TO_BASIC_OP[t.operator] || t.operator,
           value: NO_VALUE_OPS.has(t.operator)

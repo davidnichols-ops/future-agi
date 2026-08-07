@@ -83,6 +83,13 @@ export const extractAttributeFilters = (filters) => {
           filter_op: op,
           col_type: apiColType,
           ...(filterValue !== undefined && { filter_value: filterValue }),
+          ...(apiColType === "SPAN_ATTRIBUTE" &&
+            LIST_OPS.has(op) &&
+            Array.isArray(filterValue) &&
+            Array.isArray(f?.filterConfig?.attributeValueTypes) &&
+            f.filterConfig.attributeValueTypes.length === filterValue.length && {
+              attribute_value_types: f.filterConfig.attributeValueTypes,
+            }),
         },
       };
     })
@@ -180,6 +187,9 @@ export const NewTaskValidationSchema = () =>
                 filterOp: z.any().optional(),
                 filterValue: z.any().optional(),
                 colType: z.string().optional(),
+                attributeValueTypes: z
+                  .array(z.enum(["string", "number", "boolean"]).nullable())
+                  .optional(),
               })
               .optional(),
           }),

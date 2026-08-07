@@ -4,6 +4,7 @@ import React, {
   useEffect,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import PropTypes from "prop-types";
@@ -47,6 +48,7 @@ import {
 import { ID_ONLY_FIELDS } from "src/sections/projects/LLMTracing/idFields";
 import {
   followEmptyListContinuations,
+  getEmptyListContinuation,
   listContinuationParams,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
 import {
@@ -96,6 +98,14 @@ export function buildApiFilterArray(oldFormatFilters, startDate, endDate) {
           filter_op: op,
           ...(filterValue !== undefined && { filter_value: filterValue }),
           ...(!isIdColumn && { col_type: colType }),
+          ...(colType === "SPAN_ATTRIBUTE" &&
+            LIST_OPS.has(op) &&
+            Array.isArray(filterValue) &&
+            Array.isArray(f?.filterConfig?.attributeValueTypes) &&
+            f.filterConfig.attributeValueTypes.length ===
+              filterValue.length && {
+              attribute_value_types: f.filterConfig.attributeValueTypes,
+            }),
         },
       };
     })
@@ -243,6 +253,8 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
   //   { [idx]: { status: "running" | "success" | "error", result?, error? } }
   const [testResults, setTestResults] = useState({});
   const [isTesting, setIsTesting] = useState(false);
+  const [listCursorRevision, advanceListCursor] = useState(0);
+  const listContinuationRef = useRef({ signature: null, cursor: null });
 
   const formFilters = useWatch({ control, name: "filters" });
   const startDate = useWatch({ control, name: "startDate" });
@@ -254,6 +266,13 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     () => buildApiFilterArray(formFilters, startDate, endDate),
     [formFilters, startDate, endDate],
   );
+  const listQuerySignature = JSON.stringify({ rowType, projectId, apiFilters });
+  if (listContinuationRef.current.signature !== listQuerySignature) {
+    listContinuationRef.current = {
+      signature: listQuerySignature,
+      cursor: null,
+    };
+  }
 
   // Reset row index when filters / rowType change
   useEffect(() => {
@@ -267,8 +286,14 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     isFetching: listFetching,
     isError: listError,
   } = useQuery({
-    queryKey: ["task-preview-list", rowType, projectId, apiFilters],
-    queryFn: async () => {
+    queryKey: [
+      "task-preview-list",
+      rowType,
+      projectId,
+      apiFilters,
+      listCursorRevision,
+    ],
+    queryFn: async ({ signal }) => {
       if (!projectId) return { rows: [], total: 0, columns: [] };
 
       if (rowType === "voiceCalls") {
@@ -277,8 +302,15 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           projectId,
           apiFilters,
         });
+        const initialParams = listContinuationRef.current.cursor
+          ? listContinuationParams(
+              requestParams,
+              listContinuationRef.current.cursor,
+            )
+          : requestParams;
         let resp = await axios.get(endpoints.project.getCallLogs, {
-          params: requestParams,
+          params: initialParams,
+          signal,
         });
         resp = await followEmptyListContinuations({
           initialResponse: resp,
@@ -291,10 +323,15 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           nextResponse: (cursor) =>
             axios.get(endpoints.project.getCallLogs, {
               params: listContinuationParams(requestParams, cursor),
+              signal,
             }),
         });
         const result = resp.data?.result || resp.data || {};
         const rowsOut = result.results || result.data || result.calls || [];
+        const nextCursor = getEmptyListContinuation(rowsOut, result);
+        if (nextCursor) {
+          return { continuationPending: true, nextCursor };
+        }
         return {
           rows: rowsOut,
           total:
@@ -326,7 +363,13 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         projectId,
         apiFilters,
       });
-      let resp = await axios.get(url, { params: requestParams });
+      const initialParams = listContinuationRef.current.cursor
+        ? listContinuationParams(
+            requestParams,
+            listContinuationRef.current.cursor,
+          )
+        : requestParams;
+      let resp = await axios.get(url, { params: initialParams, signal });
       resp = await followEmptyListContinuations({
         initialResponse: resp,
         rowsFromResponse: (response) => response?.data?.result?.table || [],
@@ -335,11 +378,20 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         nextResponse: (cursor) =>
           axios.get(url, {
             params: listContinuationParams(requestParams, cursor),
+            signal,
           }),
       });
       const result = resp.data?.result || {};
+      const rowsOut = result.table || result.results || result.data || [];
+      const nextCursor = getEmptyListContinuation(
+        rowsOut,
+        result.metadata || {},
+      );
+      if (nextCursor) {
+        return { continuationPending: true, nextCursor };
+      }
       return {
-        rows: result.table || result.results || result.data || [],
+        rows: rowsOut,
         total:
           result.metadata?.total_rows ||
           result.total_count ||
@@ -356,7 +408,18 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     meta: { errorHandled: true },
   });
 
-  const rows = listData?.rows || [];
+  useEffect(() => {
+    if (!listData?.continuationPending) {
+      if (listData) listContinuationRef.current.cursor = null;
+      return;
+    }
+    if (listContinuationRef.current.signature !== listQuerySignature) return;
+    listContinuationRef.current.cursor = listData.nextCursor;
+    advanceListCursor((revision) => revision + 1);
+  }, [listData, listQuerySignature]);
+
+  const listContinuationPending = listData?.continuationPending === true;
+  const rows = listContinuationPending ? [] : listData?.rows || [];
   const columns = listData?.columns || [];
   const currentRow = rows[currentRowIndex] || null;
 
@@ -621,7 +684,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
               />
             )}
           </Box>
-          {listFetching && <CircularProgress size={12} />}
+          {(listFetching || listContinuationPending) && (
+            <CircularProgress size={12} />
+          )}
         </Box>
         <Typography
           variant="caption"
@@ -643,7 +708,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             icon="solar:filter-outline"
             text="Select a project to preview matching rows"
           />
-        ) : listLoading ? (
+        ) : listLoading || listContinuationPending ? (
           <Box
             sx={{
               display: "flex",

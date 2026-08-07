@@ -293,6 +293,7 @@ const ObserveToolbar = ({
             : rawColType,
         operator: rawOp,
         value,
+        valueTypes: gf.filter_config?.attribute_value_types,
       };
     });
     setPanelFilters(newPanelFilters);

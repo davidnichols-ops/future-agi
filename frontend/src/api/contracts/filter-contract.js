@@ -31,6 +31,7 @@ const API_FILTER_CONFIG_KEYS = new Set([
   "filter_op",
   "filter_value",
   "col_type",
+  "attribute_value_types",
 ]);
 const STORED_FILTER_ITEM_KEY_ALIASES = {
   columnId: "column_id",
@@ -43,6 +44,7 @@ const STORED_FILTER_CONFIG_KEY_ALIASES = {
   filterType: "filter_type",
   filterOp: "filter_op",
   filterValue: "filter_value",
+  attributeValueTypes: "attribute_value_types",
 };
 const STORED_FILTER_OPERATOR_ALIASES = {
   is: "equals",
@@ -154,6 +156,21 @@ export const buildApiFilterFromPanelRow = (row) => {
   });
   const filterValue = coerceFilterValue(row?.value, filterOp, filterType);
   const apiColType = normalizeColumnType(row?.apiColType || row?.fieldCategory);
+  const attributeValueTypes = (() => {
+    if (
+      apiColType !== "SPAN_ATTRIBUTE" ||
+      !LIST_OP_SET.has(filterOp) ||
+      !Array.isArray(filterValue) ||
+      !Array.isArray(row?.valueTypes) ||
+      row.valueTypes.length !== filterValue.length
+    ) {
+      return undefined;
+    }
+    const normalized = row.valueTypes.map((value) =>
+      ["string", "number", "boolean"].includes(value) ? value : null,
+    );
+    return normalized.some(Boolean) ? normalized : undefined;
+  })();
 
   if (!isAllowedFilterOperator(filterType, filterOp)) {
     throw new Error(
@@ -169,6 +186,9 @@ export const buildApiFilterFromPanelRow = (row) => {
       filter_op: filterOp,
       filter_value: filterValue,
       ...(apiColType && { col_type: apiColType }),
+      ...(attributeValueTypes && {
+        attribute_value_types: attributeValueTypes,
+      }),
     },
   };
 };
@@ -231,6 +251,25 @@ export const serializeFilterForApi = (filter) => {
     filterOp,
     filterType,
   );
+  const attributeValueTypes = config.attribute_value_types;
+  if (attributeValueTypes !== undefined) {
+    if (
+      normalizeColumnType(config.col_type) !== "SPAN_ATTRIBUTE" ||
+      !LIST_OP_SET.has(filterOp) ||
+      !Array.isArray(filterValue) ||
+      !Array.isArray(attributeValueTypes) ||
+      attributeValueTypes.length !== filterValue.length ||
+      attributeValueTypes.some(
+        (value) =>
+          value !== null &&
+          !["string", "number", "boolean"].includes(value),
+      )
+    ) {
+      throw new Error(
+        "attribute_value_types must align with a SPAN_ATTRIBUTE list filter.",
+      );
+    }
+  }
   if (
     filterOp !== "is_null" &&
     filterOp !== "is_not_null" &&
@@ -254,6 +293,9 @@ export const serializeFilterForApi = (filter) => {
       filter_value: filterValue,
       ...(config.col_type && {
         col_type: normalizeColumnType(config.col_type),
+      }),
+      ...(attributeValueTypes !== undefined && {
+        attribute_value_types: attributeValueTypes,
       }),
     },
   };

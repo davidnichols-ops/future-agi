@@ -126,6 +126,7 @@ const makeGridParams = ({ startRow = 0, endRow = 25, sortModel = [] } = {}) => {
       if (key === "context") context = value;
     }),
     refreshServerSide: vi.fn(),
+    retryServerSideLoads: vi.fn(),
   };
   return {
     request: { startRow, endRow, sortModel },
@@ -265,6 +266,43 @@ describe("UsersGrid deterministic pagination", () => {
     const secondPage = makeGridParams({ startRow: 25, endRow: 50 });
     await readPage(secondPage);
     expect(getMock.mock.calls[2][1].params.cursor).toBe("signed-users-page-2");
+  });
+
+  it("keeps a bounded sparse continuation on the same visible users page", async () => {
+    Array.from({ length: 13 }, (_, index) =>
+      usersResponse({
+        hasMore: true,
+        nextCursor: `checkpoint-${index}`,
+        countIsLowerBound: true,
+      }),
+    ).forEach((response) => getMock.mockResolvedValueOnce(response));
+    getMock.mockResolvedValueOnce(usersResponse({ rows: [row(88)] }));
+    const props = renderGrid();
+
+    const boundedRound = makeGridParams();
+    await readPage(boundedRound);
+
+    expect(getMock).toHaveBeenCalledTimes(13);
+    expect(boundedRound.success).not.toHaveBeenCalled();
+    expect(boundedRound.api.showNoRowsOverlay).not.toHaveBeenCalled();
+    expect(boundedRound.fail).toHaveBeenCalledTimes(1);
+    expect(boundedRound.api.retryServerSideLoads).toHaveBeenCalledTimes(1);
+    expect(props.setHasData).not.toHaveBeenCalledWith(false);
+    expect(props.setIsLoading).not.toHaveBeenCalledWith(false);
+
+    const resumedPage = makeGridParams();
+    await readPage(resumedPage);
+
+    expect(getMock.mock.calls[13][1].params).toEqual(
+      expect.objectContaining({
+        cursor_mode: true,
+        cursor: "checkpoint-12",
+      }),
+    );
+    expect(resumedPage.success).toHaveBeenCalledWith({
+      rowData: [row(88)],
+      rowCount: 1,
+    });
   });
 
   it("retains numbered pagination for explicitly sorted requests", async () => {

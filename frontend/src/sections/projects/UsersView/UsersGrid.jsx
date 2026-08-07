@@ -26,6 +26,7 @@ import {
   createListCursorPagination,
   followEmptyListContinuations,
   LIST_CURSOR_MODES,
+  resumeEmptyListPage,
 } from "../LLMTracing/listCursorPagination";
 import {
   failServerSideGridRead,
@@ -186,6 +187,7 @@ const UsersGrid = React.memo(
         getRows: async (params) => {
           let pageNumber = 0;
           let requestGeneration = null;
+          let continuationPending = false;
           try {
             setIsLoading(true);
             params.api.hideOverlay();
@@ -319,6 +321,28 @@ const UsersGrid = React.memo(
 
             const res = results?.data?.result || {};
             const userData = res?.table || [];
+            if (
+              useCursorPagination &&
+              resumeEmptyListPage({
+                rows: userData,
+                metadata: res,
+                pagination: cursorPagination.current,
+                pageNumber,
+                resume: () => {
+                  if (cursorPagination.current.isCurrent(requestGeneration)) {
+                    params.fail();
+                    if (params.api?.retryServerSideLoads) {
+                      params.api.retryServerSideLoads();
+                    } else {
+                      params.api?.refreshServerSide?.({ purge: false });
+                    }
+                  }
+                },
+              })
+            ) {
+              continuationPending = true;
+              return;
+            }
             const hasResults = userData.length > 0;
             if (pageNumber === 0) setHasData(hasResults);
             else if (hasResults) setHasData(true);
@@ -420,7 +444,7 @@ const UsersGrid = React.memo(
             setSearchState("error");
             failServerSideGridRead(params);
           } finally {
-            setIsLoading(false);
+            if (!continuationPending) setIsLoading(false);
           }
         },
         getRowId: ({ data }) => data.user_id,

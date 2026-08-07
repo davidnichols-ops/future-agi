@@ -7,6 +7,24 @@ import {
   getExactAggregationReadState,
 } from "src/utils/queryReadState";
 
+export const getAgentGraphPresentationState = (query) => {
+  const readState = query.data
+    ? getExactAggregationReadState(query.data)
+    : null;
+  const { refreshFailed } = getAggregationRefreshState(query.data);
+  const failedPendingRefresh = readState === "pending" && refreshFailed;
+  const hasUnreadablePayload =
+    Boolean(query.data) && readState !== "complete" && readState !== "pending";
+
+  return {
+    data: readState === "complete" ? query.data : undefined,
+    isLoading:
+      query.isLoading || (readState === "pending" && !failedPendingRefresh),
+    isError: query.isError || hasUnreadablePayload || failedPendingRefresh,
+    queryReadState: readState,
+  };
+};
+
 /**
  * Fetch an exact aggregate Agent Graph/Path snapshot.
  *
@@ -81,17 +99,10 @@ export const useAgentGraph = (
     return () => window.removeEventListener("observe-refresh", handleRefresh);
   }, [enabled, projectId, refetch]);
 
-  const readState = query.data
-    ? getExactAggregationReadState(query.data)
-    : null;
-  const hasUnreadablePayload =
-    Boolean(query.data) && readState !== "complete" && readState !== "pending";
+  const presentationState = getAgentGraphPresentationState(query);
 
   return {
     ...query,
-    data: readState === "complete" ? query.data : undefined,
-    isLoading: query.isLoading || readState === "pending",
-    isError: query.isError || hasUnreadablePayload,
-    queryReadState: readState,
+    ...presentationState,
   };
 };
