@@ -80796,8 +80796,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "boolean",
             "datetime",
             "date"
-          ],
-          "default": "string"
+          ]
         },
         "column_id": {
           "title": "Column id",

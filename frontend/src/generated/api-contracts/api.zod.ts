@@ -34701,7 +34701,6 @@ export const tracerDashboardQueryBodyProjectIdsDefault = [];
 export const tracerDashboardQueryBodyGranularityDefault = `day`;
 export const tracerDashboardQueryBodyMetricsItemSourceDefault = `traces`;
 export const tracerDashboardQueryBodyMetricsItemAggregationDefault = `avg`;
-export const tracerDashboardQueryBodyMetricsItemAttributeTypeDefault = `string`;
 export const tracerDashboardQueryBodyMetricsItemDataTypeDefault = `string`;
 export const tracerDashboardQueryBodyMetricsItemFiltersDefault = [];
 export const tracerDashboardQueryBodyFiltersDefault = [];
@@ -34734,7 +34733,7 @@ export const TracerDashboardQueryBody = zod.object({
   "config_id": zod.string().optional(),
   "label_id": zod.string().optional(),
   "attribute_key": zod.string().optional(),
-  "attribute_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardQueryBodyMetricsItemAttributeTypeDefault),
+  "attribute_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).optional(),
   "column_id": zod.string().optional(),
   "data_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardQueryBodyMetricsItemDataTypeDefault),
   "filters": zod.array(zod.object({
@@ -35035,7 +35034,6 @@ export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigProjectIdsDefault 
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigGranularityDefault = `day`;
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigMetricsItemSourceDefault = `traces`;
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigMetricsItemAggregationDefault = `avg`;
-export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigMetricsItemAttributeTypeDefault = `string`;
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigMetricsItemDataTypeDefault = `string`;
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigMetricsItemFiltersDefault = [];
 export const tracerDashboardWidgetsPreviewQueryBodyQueryConfigFiltersDefault = [];
@@ -35070,7 +35068,7 @@ export const TracerDashboardWidgetsPreviewQueryBody = zod.object({
   "config_id": zod.string().optional(),
   "label_id": zod.string().optional(),
   "attribute_key": zod.string().optional(),
-  "attribute_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigMetricsItemAttributeTypeDefault),
+  "attribute_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).optional(),
   "column_id": zod.string().optional(),
   "data_type": zod.enum(['string', 'text', 'number', 'float', 'integer', 'boolean', 'datetime', 'date']).default(tracerDashboardWidgetsPreviewQueryBodyQueryConfigMetricsItemDataTypeDefault),
   "filters": zod.array(zod.object({
