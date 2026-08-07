@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import structlog
@@ -1678,7 +1678,18 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             window_end = cursor_state.window_end
                         else:
                             window_end = datetime.now(UTC)
-                            window_start = SPAN_ATTRIBUTE_RETAINED_DATA_START
+                            retained_start = selector.retained_window_start(
+                                project_ids,
+                                window_end=window_end,
+                            )
+                            window_start = (
+                                max(
+                                    SPAN_ATTRIBUTE_RETAINED_DATA_START,
+                                    retained_start,
+                                )
+                                if retained_start is not None
+                                else window_end - timedelta(microseconds=1)
+                            )
                             segment_end = window_end
                             before_identity = None
                             resume_identity = None
@@ -1722,6 +1733,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             seen_value_digests=seen_state.digests,
                             search=search,
                             attribute_type=attribute_type,
+                            continue_operation=not bool(cursor_token),
                         )
                         values = [
                             {

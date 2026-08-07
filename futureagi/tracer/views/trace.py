@@ -169,6 +169,13 @@ TRACE_LIST_WALL_DEADLINE_MS = 10_000
 # only a ceiling: healthy reads return immediately and issue no additional query.
 TRACE_LIST_CANDIDATE_DEADLINE_MS = 8_000
 TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 900
+# Page-local content/attribute hydration is exact but can still make ClickHouse
+# read a wide part when a caller requests the serializer's 500-row maximum.
+# High-volume qualification showed 100 identities remain below the locked
+# 512 MiB per-query read ceiling while a single 500-identity replay can cross it
+# on a continuation page. Split only the finite public page; every chunk is
+# still required and the response fails closed if any chunk is unavailable.
+TRACE_LIST_ENRICHMENT_CHUNK_SIZE = 100
 # Enrichments are page-local and individually bounded, but fanning every
 # optional field out at once can exceed ClickHouse's admission limit on a busy
 # tenant. Two workers retain overlap without turning one list request into a
@@ -4256,31 +4263,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         bounded_user_resolver = getattr(
             builder, "resolve_user_ids_for_trace_identities", None
         )
-        root_identities = [
-            (
-                str(row.get("project_id") or project_id or ""),
-                str(row.get("trace_id") or ""),
-                str(row.get("root_span_id") or ""),
-                row.get("start_time"),
-            )
-            for row in result.data
-            if row.get("trace_id")
-            and row.get("root_span_id")
-            and row.get("start_time") is not None
-            and (row.get("project_id") or project_id)
-        ]
-        content_query, content_params = builder.build_content_query(
-            trace_ids,
-            root_identities=(
-                root_identities if len(root_identities) == len(result.data) else None
-            ),
-        )
         if callable(bounded_user_resolver):
             user_query, user_params = "", {}
         else:
             user_query, user_params = builder.build_user_id_query(trace_ids)
         eval_query, eval_params = builder.build_eval_query(trace_ids)
-        attr_query, attr_params = builder.build_span_attributes_query(trace_ids)
 
         def _execute_enrichment(query, params):
             return analytics.execute_ch_query(
@@ -4301,14 +4288,57 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
 
         tasks: dict[str, Any] = {}
-        if content_query:
-            tasks["content"] = (content_query, content_params)
+        content_task_names: list[str] = []
+        attribute_task_names: list[str] = []
+        for chunk_index, chunk_start in enumerate(
+            range(0, len(result.data), TRACE_LIST_ENRICHMENT_CHUNK_SIZE)
+        ):
+            chunk_rows = result.data[
+                chunk_start : chunk_start + TRACE_LIST_ENRICHMENT_CHUNK_SIZE
+            ]
+            chunk_trace_ids = list(
+                dict.fromkeys(
+                    str(row.get("trace_id") or "")
+                    for row in chunk_rows
+                    if row.get("trace_id")
+                )
+            )
+            chunk_root_identities = [
+                (
+                    str(row.get("project_id") or project_id or ""),
+                    str(row.get("trace_id") or ""),
+                    str(row.get("root_span_id") or ""),
+                    row.get("start_time"),
+                )
+                for row in chunk_rows
+                if row.get("trace_id")
+                and row.get("root_span_id")
+                and row.get("start_time") is not None
+                and (row.get("project_id") or project_id)
+            ]
+            content_query, content_params = builder.build_content_query(
+                chunk_trace_ids,
+                root_identities=(
+                    chunk_root_identities
+                    if len(chunk_root_identities) == len(chunk_rows)
+                    else None
+                ),
+            )
+            if content_query:
+                task_name = f"content:{chunk_index}"
+                tasks[task_name] = (content_query, content_params)
+                content_task_names.append(task_name)
+            attr_query, attr_params = builder.build_span_attributes_query(
+                chunk_trace_ids
+            )
+            if attr_query:
+                task_name = f"attributes:{chunk_index}"
+                tasks[task_name] = (attr_query, attr_params)
+                attribute_task_names.append(task_name)
         if user_query:
             tasks["users"] = (user_query, user_params)
         if eval_query and trace_ids and eval_config_ids:
             tasks["evals"] = (eval_query, eval_params)
-        if attr_query:
-            tasks["attributes"] = (attr_query, attr_params)
 
         enrichment_results: dict[str, Any] = {}
         pool = concurrent.futures.ThreadPoolExecutor(
@@ -4392,6 +4422,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         if set(enrichment_results) != set(future_names.values()):
             raise AssertionError("trace enrichment futures did not all complete")
 
+        def _chunked_enrichment_rows(task_names: list[str]) -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for task_name in task_names:
+                task_result = enrichment_results.get(task_name)
+                if task_result is not None:
+                    rows.extend(task_result.data or [])
+            return rows
+
         query_count += len(future_names)
         resolved_users = enrichment_results.get("users")
         query_count += max(0, getattr(resolved_users, "query_count", 1) - 1)
@@ -4412,12 +4450,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     ).encode("utf-8")
                 )
 
-        content_result = enrichment_results.get("content")
-        content_rows = content_result.data if content_result is not None else []
+        content_rows = _chunked_enrichment_rows(content_task_names)
         if not org_scope:
             for content_row in content_rows:
                 content_row.setdefault("project_id", str(project_id or ""))
-        if content_query and len(content_rows) < len(trace_ids):
+        if content_task_names and len(content_rows) < len(trace_ids):
             logger.warning(
                 "trace_list_content_replay_incomplete",
                 returned=len(content_rows),
@@ -4521,8 +4558,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             "output.value",
         )
         aggregated_attrs = {}  # (project_id, trace_id) -> {attr_key -> values}
-        attr_result = enrichment_results.get("attributes")
-        for attr_row in attr_result.data if attr_result is not None else []:
+        for attr_row in _chunked_enrichment_rows(attribute_task_names):
             tid = str(attr_row.get("trace_id", ""))
             attr_project_id = str(
                 attr_row.get("project_id") or (project_id if not org_scope else "")

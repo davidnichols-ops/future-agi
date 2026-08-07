@@ -70,10 +70,17 @@ def test_dimension_candidate_query_is_stable_keyset_and_finite():
     assert "end_user_id_remap" in sql
     assert "ORDER BY first_seen DESC, end_user_id DESC" in sql
     assert "first_seen < %(before_first_seen)s" in sql
+    # The SELECT/ORDER BY contract exposes ``end_user_id`` as a String.  Keep
+    # the keyset tie-breaker in that same lexicographic domain; comparing the
+    # aliased String to ``toUUID(...)`` fails in ClickHouse and UUID's internal
+    # byte ordering would not match the published String ordering anyway.
+    assert "toString(end_user_id) < %(before_end_user_id)s" in sql
+    assert "end_user_id < toUUID(%(before_end_user_id)s)" not in sql
     assert "LIMIT %(dimension_limit)s" in sql
     assert "FROM spans" not in sql
     assert params["dimension_limit"] == 26
     assert params["before_first_seen"] == before
+    assert isinstance(params["before_end_user_id"], str)
 
 
 def test_finite_candidate_ids_narrow_before_span_replay():

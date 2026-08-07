@@ -544,6 +544,23 @@ class V2AttributeQueryExecutor:
 _ATTRIBUTE_READ_CAPACITY = threading.BoundedSemaphore(8)
 
 
+# Cursor pickers freeze their full retained-data window on page one. Starting
+# every project at the Unix epoch makes a legitimately exhausted vocabulary
+# walk decades of empty six-hour slices. The active MergeTree-part minimum is
+# metadata-only and exact for the table's physical lower bound. It is
+# deliberately global: a bound earlier than a project's first row is safe,
+# while a project-local ``min(start_time)`` can exceed the finite row-read cap
+# on large tenants before discovery even begins.
+_GLOBAL_RETAINED_START_SQL = """
+    SELECT minOrNull(min_time) AS retained_start
+    FROM system.parts
+    WHERE active
+      AND database = currentDatabase()
+      AND table = 'spans'
+      AND min_time < fromUnixTimestamp64Micro(%(window_end_us)s)
+"""
+
+
 # The first probe follows the spans sorting key and has no LIMIT BY. Picker reads
 # are samples, not chronological lists: the former newest-first global sort and
 # LIMIT BY forced CH25 to process every matching row before returning the first
@@ -974,6 +991,52 @@ class AttributeReadSelector:
     @property
     def query_window_end(self) -> datetime:
         return self._window_end
+
+    def retained_window_start(
+        self,
+        project_ids: Iterable[Any],
+        *,
+        window_end: datetime,
+    ) -> datetime | None:
+        """Return the exact global physical lower bound before a window end.
+
+        The active-part minimum is a safe lower bound for every project's
+        latest/live attributes and costs no span-row scan. It lets cursors prove
+        exhaustion at the real table-retention boundary instead of emitting
+        empty continuations back to 1970. ``None`` means the spans table has no
+        active part before the frozen window.
+        """
+
+        self._begin_operation()
+        projects = self._project_ids(project_ids)
+        if not projects:
+            return None
+        end = _utc(window_end)
+        rows = self._execute(
+            _GLOBAL_RETAINED_START_SQL,
+            {
+                "window_end_us": _unix_microseconds(end),
+            },
+            max_result_rows=1,
+            query_timeout_ms=ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
+        )
+        if len(rows) != 1:
+            raise IncompleteLatestStateReplay(
+                "Attribute retained-window query returned an invalid result"
+            )
+        retained_start = rows[0].get("retained_start")
+        if retained_start is None:
+            return None
+        if not isinstance(retained_start, datetime):
+            raise IncompleteLatestStateReplay(
+                "Attribute retained-window query returned an invalid timestamp"
+            )
+        retained_start = _utc(retained_start)
+        if retained_start >= end:
+            raise IncompleteLatestStateReplay(
+                "Attribute retained-window query returned an invalid boundary"
+            )
+        return retained_start
 
     def degraded_metadata(self, error_code: str) -> AttributeReadMetadata:
         """Build a sanitized failure envelope for a discarded read."""
@@ -2737,6 +2800,7 @@ class AttributeReadSelector:
         resume_key_offset: int = 0,
         seen_key_digests: Iterable[str] = (),
         exact_key: str | None = None,
+        continue_operation: bool = False,
     ) -> AttributeKeyCursorPageRead:
         """Return a bounded newest-first page of verified unique keys.
 
@@ -2750,7 +2814,8 @@ class AttributeReadSelector:
         the generic latest-state fallback.
         """
 
-        self._begin_operation()
+        if not continue_operation:
+            self._begin_operation()
         projects = self._project_ids(project_ids)
         if exact_key is not None:
             exact_key = validate_attribute_key(exact_key)
@@ -3322,6 +3387,7 @@ class AttributeReadSelector:
         seen_value_digests: Iterable[str] = (),
         search: str | None = None,
         attribute_type: AttributeType | None = None,
+        continue_operation: bool = False,
     ) -> AttributeValueCursorPageRead:
         """Return a bounded newest-first page of verified unique values.
 
@@ -3343,7 +3409,8 @@ class AttributeReadSelector:
         truncating the vocabulary or publishing sampled/incomplete metadata.
         """
 
-        self._begin_operation()
+        if not continue_operation:
+            self._begin_operation()
         projects = self._project_ids(project_ids)
         key = validate_attribute_key(key)
         normalized_search = validate_attribute_search(search or "")

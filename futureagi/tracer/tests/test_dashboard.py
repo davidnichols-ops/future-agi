@@ -71,7 +71,6 @@ from tracer.views.dashboard import (
     _materialize_dashboard_query_scope,
     _normalize_dashboard_query_filters,
 )
-from tracer.views.span_attributes import SPAN_ATTRIBUTE_RETAINED_DATA_START
 
 
 def _attribute_value_read(
@@ -1815,6 +1814,8 @@ class TestMetricsEndpoint:
             now - timedelta(minutes=1),
         )
         selector = mock_selector_cls.return_value
+        retained_start = now - timedelta(days=400)
+        selector.retained_window_start.return_value = retained_start
         selector.read_value_cursor_page.side_effect = [
             _attribute_value_cursor_page(
                 ("completed", "failed"),
@@ -1859,7 +1860,8 @@ class TestMetricsEndpoint:
         assert first_payload["query_status"] == "complete"
         assert "query_error_code" not in first_payload
         first_kwargs = selector.read_value_cursor_page.call_args_list[0].kwargs
-        assert first_kwargs["window_start"] == SPAN_ATTRIBUTE_RETAINED_DATA_START
+        assert first_kwargs["window_start"] == retained_start
+        assert first_kwargs["continue_operation"] is True
         frozen_window_end = first_kwargs["window_end"]
 
         second = auth_client.get(
@@ -1883,7 +1885,8 @@ class TestMetricsEndpoint:
         assert second_payload["next_cursor"] is None
         assert selector.read_value_cursor_page.call_count == 2
         second_kwargs = selector.read_value_cursor_page.call_args_list[1].kwargs
-        assert second_kwargs["window_start"] == SPAN_ATTRIBUTE_RETAINED_DATA_START
+        assert second_kwargs["window_start"] == retained_start
+        assert second_kwargs["continue_operation"] is False
         assert second_kwargs["window_end"] == frozen_window_end
         assert second_kwargs["before_identity"] == first_before
         assert second_kwargs["attribute_type"] == "string"

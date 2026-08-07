@@ -5790,6 +5790,83 @@ def test_span_attribute_key_cursor_rejects_dual_physical_checkpoints():
         )
 
 
+def test_attribute_retained_window_start_uses_exact_global_part_metadata():
+    retained_start = NOW - timedelta(days=400)
+
+    def respond(call, _call_number):
+        assert "FROM system.parts" in call.sql
+        assert "minOrNull(min_time) AS retained_start" in call.sql
+        assert call.params == {
+            "window_end_us": _unix_microseconds(NOW),
+        }
+        return [{"retained_start": retained_start}]
+
+    executor = RecordingExecutor(respond)
+
+    result = AttributeReadSelector(executor, now=NOW).retained_window_start(
+        [PROJECT_A, PROJECT_B],
+        window_end=NOW,
+    )
+
+    assert result == retained_start
+    assert len(executor.calls) == 1
+
+
+def test_attribute_retained_window_start_returns_none_for_empty_scope():
+    executor = RecordingExecutor(lambda _call, _call_number: [{"retained_start": None}])
+
+    result = AttributeReadSelector(executor, now=NOW).retained_window_start(
+        [PROJECT_A],
+        window_end=NOW,
+    )
+
+    assert result is None
+    assert len(executor.calls) == 1
+
+
+def test_attribute_cursor_continues_retained_bound_operation_budget():
+    retained_start = NOW - timedelta(microseconds=1)
+
+    def respond(call, _call_number):
+        if "FROM system.parts" in call.sql:
+            return [{"retained_start": retained_start}]
+        return []
+
+    executor = RecordingExecutor(respond)
+    selector = AttributeReadSelector(executor, now=NOW)
+
+    assert selector.retained_window_start([PROJECT_A], window_end=NOW) == retained_start
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=retained_start,
+        window_end=NOW,
+        continue_operation=True,
+    )
+
+    assert page.has_more is False
+    assert page.metadata.query_count == len(executor.calls)
+    assert page.metadata.query_count >= 2
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [{"retained_start": "not-a-datetime"}],
+        [{"retained_start": NOW}],
+    ],
+)
+def test_attribute_retained_window_start_rejects_invalid_exact_envelope(rows):
+    executor = RecordingExecutor(lambda _call, _call_number: rows)
+
+    with pytest.raises(IncompleteLatestStateReplay):
+        AttributeReadSelector(executor, now=NOW).retained_window_start(
+            [PROJECT_A],
+            window_end=NOW,
+        )
+
+
 def test_span_attribute_key_cursor_reaches_retained_key_older_than_one_year(
     monkeypatch,
 ):
@@ -6424,12 +6501,10 @@ def test_span_attribute_key_cursor_exact_json_fallback_shrinks_without_reprobe(
 
 
 def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypatch):
-    from tracer.views.span_attributes import (
-        SPAN_ATTRIBUTE_RETAINED_DATA_START,
-        SpanAttributeKeysView,
-    )
+    from tracer.views.span_attributes import SpanAttributeKeysView
 
     identity = (PROJECT_A, "trace-1", "span-1", NOW - timedelta(hours=1))
+    retained_start = NOW - timedelta(days=400)
     seen = (attribute_key_cursor_digest("alpha"),)
     calls = []
 
@@ -6462,6 +6537,11 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
 
     monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
     monkeypatch.setattr(
+        AttributeReadSelector,
+        "retained_window_start",
+        lambda _self, _projects, *, window_end: retained_start,
+    )
+    monkeypatch.setattr(
         "tracer.views.span_attributes._project_is_in_request_scope",
         lambda _request, _project_id: True,
     )
@@ -6479,7 +6559,8 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
     assert first_response.data["browse_mode"] == "recent_suggestions"
     assert first_response.data["browse_status"] == "continuation"
     assert "browse_limit" not in first_response.data
-    assert calls[0][1]["window_start"] == SPAN_ATTRIBUTE_RETAINED_DATA_START
+    assert calls[0][1]["window_start"] == retained_start
+    assert calls[0][1]["continue_operation"] is True
     contract = SpanAttributeKeysResponseSerializer(data=first_response.data)
     assert contract.is_valid(), contract.errors
     cursor = first_response.data["next_cursor"]
@@ -6493,7 +6574,8 @@ def test_span_attribute_key_api_cursor_is_scoped_and_restores_progress(monkeypat
 
     assert second_response.status_code == 200
     assert second_response.data["result"][0]["key"] == "beta"
-    assert calls[1][1]["window_start"] == SPAN_ATTRIBUTE_RETAINED_DATA_START
+    assert calls[1][1]["window_start"] == retained_start
+    assert calls[1][1]["continue_operation"] is False
     assert calls[1][1]["window_end"] == calls[0][1]["window_end"]
     assert calls[1][1]["segment_start"] == (
         calls[0][1]["window_end"] - timedelta(hours=12)
@@ -6542,6 +6624,11 @@ def test_span_attribute_key_api_cursor_binds_and_continues_exact_search(monkeypa
         )
 
     monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", read_page)
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "retained_window_start",
+        lambda _self, _projects, *, window_end: NOW - timedelta(days=400),
+    )
     monkeypatch.setattr(
         "tracer.views.span_attributes._project_is_in_request_scope",
         lambda _request, _project_id: True,
@@ -6673,6 +6760,11 @@ def test_span_attribute_key_api_does_not_turn_cursor_size_into_vocabulary_cap(
             0,
             (attribute_key_cursor_digest("recent_key"),),
         ),
+    )
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "retained_window_start",
+        lambda _self, _projects, *, window_end: NOW - timedelta(days=400),
     )
     monkeypatch.setattr(
         "tracer.views.span_attributes._project_is_in_request_scope",
@@ -6958,6 +7050,11 @@ def test_dashboard_cursor_budget_failure_returns_503_without_values_or_cursor(
         raise ReadDeadlineExceeded("private cursor deadline")
 
     monkeypatch.setattr(AttributeReadSelector, "read_value_cursor_page", fail)
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "retained_window_start",
+        lambda _self, _projects, *, window_end: NOW - timedelta(days=400),
+    )
     monkeypatch.setattr(
         "tracer.views.dashboard.project_queryset_for_request",
         lambda _request: _ProjectScope([PROJECT_A]),

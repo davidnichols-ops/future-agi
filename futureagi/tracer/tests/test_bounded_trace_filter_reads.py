@@ -2920,9 +2920,13 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
 @override_settings(
     CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
 )
-def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
+@pytest.mark.parametrize("row_count", [1, 201])
+def test_trace_list_nonempty_page_enrichments_share_wall_budget(
+    row_count: int,
+) -> None:
     from tracer.views.trace import (
         TRACE_LIST_CANDIDATE_DEADLINE_MS,
+        TRACE_LIST_ENRICHMENT_CHUNK_SIZE,
         TRACE_LIST_ENRICHMENT_MAX_WORKERS,
         TRACE_LIST_READ_SETTINGS,
         TRACE_LIST_WALL_DEADLINE_MS,
@@ -2930,28 +2934,31 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
     )
 
     started = END - timedelta(minutes=1)
-    row = {
-        "project_id": PROJECT_ID,
-        "trace_id": "trace-a",
-        "root_span_id": "root-a",
-        "trace_name": "trace-a",
-        "span_name": "root-a",
-        "observation_type": "llm",
-        "status": "OK",
-        "start_time": started,
-        "latency_ms": 12.0,
-        "cost": 0.001,
-    }
+    rows = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "trace_name": f"trace-{index}",
+            "span_name": f"root-{index}",
+            "observation_type": "llm",
+            "status": "OK",
+            "start_time": started - timedelta(microseconds=index),
+            "latency_ms": 12.0,
+            "cost": 0.001,
+        }
+        for index in range(row_count)
+    ]
     bounded = BoundedFilterPage(
-        rows=[row],
+        rows=rows,
         has_more=False,
         complete=True,
         status="complete",
         error_code=None,
-        total_rows_lower_bound=1,
+        total_rows_lower_bound=row_count,
         elapsed_ms=2.0,
         query_count=1,
-        rows_returned=1,
+        rows_returned=row_count,
         result_payload_bytes=10,
         attempts=(),
     )
@@ -2965,7 +2972,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
             if "content_trace_ids" in params:
                 data = [
                     {
-                        "trace_id": "trace-a",
+                        "trace_id": trace_id,
                         "input": "in",
                         "output": "out",
                         "attrs_string": {},
@@ -2975,6 +2982,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
                         "metadata": "{}",
                         "trace_tags": [],
                     }
+                    for trace_id in params["content_trace_ids"]
                 ]
             else:
                 data = []
@@ -3015,7 +3023,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
-                "page_size": 25,
+                "page_size": row_count,
                 "allow_sampled": True,
             },
             analytics=analytics,
@@ -3024,15 +3032,42 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget() -> None:
         )
 
     assert status_name == "ok"
-    assert payload["table"][0]["trace_id"] == "trace-a"
-    assert payload["metadata"]["query_count"] == 4
+    assert [row["trace_id"] for row in payload["table"]] == [
+        f"trace-{index}" for index in range(row_count)
+    ]
+    expected_chunks = (
+        row_count + TRACE_LIST_ENRICHMENT_CHUNK_SIZE - 1
+    ) // TRACE_LIST_ENRICHMENT_CHUNK_SIZE
+    assert payload["metadata"]["query_count"] == 2 * expected_chunks + 2
     assert 0 <= payload["metadata"]["query_elapsed_ms"] < 3_000
     assert (
         bounded_read.call_args.kwargs["deadline_ms"] <= TRACE_LIST_CANDIDATE_DEADLINE_MS
     )
     assert TRACE_LIST_CANDIDATE_DEADLINE_MS < TRACE_LIST_WALL_DEADLINE_MS < 30_000
     assert TRACE_LIST_ENRICHMENT_MAX_WORKERS == 2
-    assert len(analytics.calls) == 3
+    assert len(analytics.calls) == 2 * expected_chunks + 1
+    content_chunks = [
+        params["content_trace_ids"]
+        for params, _timeout_ms, _settings in analytics.calls
+        if "content_trace_ids" in params
+    ]
+    attribute_chunks = [
+        params["attr_trace_ids"]
+        for params, _timeout_ms, _settings in analytics.calls
+        if "attr_trace_ids" in params
+    ]
+    assert len(content_chunks) == expected_chunks
+    assert len(attribute_chunks) == expected_chunks
+    assert all(
+        0 < len(chunk) <= TRACE_LIST_ENRICHMENT_CHUNK_SIZE
+        for chunk in (*content_chunks, *attribute_chunks)
+    )
+    assert [trace_id for chunk in content_chunks for trace_id in chunk] == [
+        f"trace-{index}" for index in range(row_count)
+    ]
+    assert [trace_id for chunk in attribute_chunks for trace_id in chunk] == [
+        f"trace-{index}" for index in range(row_count)
+    ]
     assert all(0 < timeout_ms <= 900 for _, timeout_ms, _ in analytics.calls)
     assert all(
         settings == TRACE_LIST_READ_SETTINGS for _, _, settings in analytics.calls

@@ -8,7 +8,7 @@ Endpoints:
 """
 
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from rest_framework.permissions import IsAuthenticated
@@ -213,7 +213,18 @@ class SpanAttributeKeysView(APIView):
                     window_end = cursor_state.window_end
                 else:
                     window_end = datetime.now(UTC)
-                    window_start = SPAN_ATTRIBUTE_RETAINED_DATA_START
+                    retained_start = selector.retained_window_start(
+                        project_ids,
+                        window_end=window_end,
+                    )
+                    window_start = (
+                        max(
+                            SPAN_ATTRIBUTE_RETAINED_DATA_START,
+                            retained_start,
+                        )
+                        if retained_start is not None
+                        else window_end - timedelta(microseconds=1)
+                    )
                     segment_end = window_end
                     segment_start = None
                     before_identity = None
@@ -255,6 +266,7 @@ class SpanAttributeKeysView(APIView):
                     resume_key_offset=resume_key_offset,
                     seen_key_digests=seen_state.digests,
                     exact_key=exact_key,
+                    continue_operation=not bool(cursor_token),
                 )
                 next_cursor = None
                 published_has_more = page_read.has_more

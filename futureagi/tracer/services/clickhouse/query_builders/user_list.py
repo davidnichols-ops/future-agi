@@ -191,7 +191,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
                 first_seen < %(before_first_seen)s
                 OR (
                     first_seen = %(before_first_seen)s
-                    AND end_user_id < toUUID(%(before_end_user_id)s)
+                    AND toString(end_user_id) < %(before_end_user_id)s
                 )
             )
             """
