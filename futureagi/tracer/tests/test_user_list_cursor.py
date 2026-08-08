@@ -75,7 +75,14 @@ def test_dimension_candidate_query_is_stable_keyset_and_finite():
     # the global survivor map here exceeded the production memory ceiling.
     assert "end_user_id_remap" not in sql
     assert "ORDER BY first_seen DESC, toString(eu.end_user_id) DESC" in sql
-    assert "first_seen < %(before_first_seen)s" in sql
+    assert (
+        "first_seen\n                    < parseDateTime64BestEffort("
+        "%(before_first_seen)s, 6, 'UTC')"
+    ) in sql
+    assert (
+        "= parseDateTime64BestEffort(\n"
+        "                            %(before_first_seen)s, 6, 'UTC'"
+    ) in sql
     # The SELECT/ORDER BY contract exposes ``end_user_id`` as a String.  Keep
     # the keyset tie-breaker in that same lexicographic domain; comparing the
     # aliased String to ``toUUID(...)`` fails in ClickHouse and UUID's internal
@@ -85,8 +92,25 @@ def test_dimension_candidate_query_is_stable_keyset_and_finite():
     assert "LIMIT %(dimension_limit)s" in sql
     assert "FROM spans" not in sql
     assert params["dimension_limit"] == 26
-    assert params["before_first_seen"] == before
+    assert params["before_first_seen"] == "2026-08-05T12:00:00+00:00"
     assert isinstance(params["before_end_user_id"], str)
+
+
+def test_dimension_candidate_cursor_preserves_microsecond_tie_precision():
+    builder = UserListQueryBuilder(
+        organization_id=str(uuid.uuid4()),
+        project_ids=[str(uuid.uuid4())],
+    )
+    boundary = datetime(2026, 8, 5, 12, 0, 0, 52877, tzinfo=UTC)
+
+    sql, params = builder.build_dimension_candidate_query(
+        limit=26,
+        before_first_seen=boundary,
+        before_end_user_id=str(uuid.uuid4()),
+    )
+
+    assert params["before_first_seen"] == "2026-08-05T12:00:00.052877+00:00"
+    assert sql.count("parseDateTime64BestEffort") == 2
 
 
 def test_dimension_survivor_query_is_candidate_bounded():

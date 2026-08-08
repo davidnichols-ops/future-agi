@@ -6050,7 +6050,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         if bounded_page.error_code:
             response_data["query_error_code"] = bounded_page.error_code
         if response_data["count_is_lower_bound"] and exact_total_explicitly_required(
-            request, validated_data
+            request,
+            validated_data,
+            allow_exact_cursor_lower_bound=True,
         ):
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,

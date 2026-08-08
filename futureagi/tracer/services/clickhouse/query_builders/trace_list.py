@@ -607,6 +607,109 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 return plan
         return None
 
+    def _filter_exact_zero_probe_plans(
+        self,
+    ) -> list[LatestFilterPredicate] | None:
+        """Return scalar Map leaves eligible for an exact negative proof.
+
+        Each returned raw witness is an exhaustive superset of one positive
+        latest-state leaf.  Intersecting the witnesses by trace can therefore
+        prove that a conjunction has no result, while a positive intersection
+        is intentionally inconclusive and must fall back to the normal exact
+        latest-state selector.  Separate branches preserve trace any-span
+        semantics: sibling spans may satisfy separate leaves.
+
+        Keep this optional accelerator on the public, one-project list shape.
+        Root, relational, structured, negative, internal, and organization
+        reads retain their existing bounded path unchanged.
+        """
+
+        if (
+            self._bounded_internal_scan
+            or self._bounded_identity_only
+            or self.project_ids is not None
+            or not self.project_id
+        ):
+            return None
+
+        plans, residual_filters = self._partition_trace_filter_plans(
+            self._bounded_filters()
+        )
+        if residual_filters or any(plan.scope == "root" for plan in plans):
+            return None
+        any_span_plans = [plan for plan in plans if plan.scope == "any"]
+        if len(any_span_plans) < 2:
+            return None
+
+        for plan in any_span_plans:
+            raw_witness = str(plan.raw_witness_predicate or "")
+            seed_predicate = str(plan.seed_predicate or "")
+            if (
+                plan.raw_witness_rank != 0
+                or len(plan.aggregates) != 2
+                or not raw_witness
+                or "JSONExtract" in raw_witness
+                or "mapContains(span_attr_" not in seed_predicate
+            ):
+                return None
+        return any_span_plans
+
+    def supports_filter_exact_zero_probe(self) -> bool:
+        """Whether this generic public trace page can prove an empty result."""
+
+        return self._filter_exact_zero_probe_plans() is not None
+
+    @staticmethod
+    def recommended_filter_exact_zero_probe_timeout_ms() -> int:
+        return 1_500
+
+    @staticmethod
+    def recommended_filter_exact_zero_probe_max_bytes() -> int:
+        return 256 * 1024 * 1024
+
+    def build_filter_exact_zero_probe(self) -> tuple[str, dict[str, Any]]:
+        """Build an exact-zero proof from independent any-span raw witnesses."""
+
+        any_span_plans = self._filter_exact_zero_probe_plans()
+        if any_span_plans is None:
+            raise ValueError("exact-zero probe is unavailable for this filter shape")
+
+        request_start, request_end = self._bounded_request_window
+        params: dict[str, Any] = {
+            **self.params,
+            "exact_zero_start_us": _unix_microseconds(request_start),
+            "exact_zero_end_us": _unix_microseconds(request_end),
+        }
+        branches: list[str] = []
+        witness_conditions: list[str] = []
+        for witness_index, plan in enumerate(any_span_plans):
+            params.update(plan.params)
+            branches.append(
+                f"""
+                SELECT trace_id, toUInt16({witness_index}) AS witness_kind
+                FROM {self.TABLE}
+                PREWHERE {self.project_filter_sql()}
+                  AND toDate(start_time) >= toDate(fromUnixTimestamp64Micro(%(exact_zero_start_us)s))
+                  AND toDate(start_time) <= toDate(fromUnixTimestamp64Micro(%(exact_zero_end_us)s))
+                  AND start_time >= fromUnixTimestamp64Micro(%(exact_zero_start_us)s)
+                  AND start_time < fromUnixTimestamp64Micro(%(exact_zero_end_us)s)
+                WHERE {plan.raw_witness_predicate}
+                GROUP BY trace_id
+                """
+            )
+            witness_conditions.append(f"countIf(witness_kind = {witness_index}) > 0")
+
+        query = f"""
+        SELECT trace_id
+        FROM (
+            {" UNION ALL ".join(branches)}
+        ) AS raw_filter_witnesses
+        GROUP BY trace_id
+        HAVING {" AND ".join(witness_conditions)}
+        LIMIT 1
+        """
+        return query, params
+
     @staticmethod
     def _plan_uses_indexed_anchor(plan: LatestFilterPredicate) -> bool:
         """Return whether an any-span predicate has a safe broad sentinel."""

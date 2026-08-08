@@ -183,7 +183,17 @@ class UserListQueryBuilder(BaseQueryBuilder):
         if self.search:
             params["search"] = self.search
         if before_first_seen is not None:
-            params["before_first_seen"] = before_first_seen
+            # ``clickhouse-driver`` formats a bound Python datetime at whole-
+            # second precision.  A continuation created inside a DateTime64(6)
+            # tie would therefore skip every remaining user in that
+            # microsecond bucket.  Carry an ISO string and parse it explicitly
+            # in ClickHouse so the keyset predicate uses the same precision as
+            # the published ordering value.
+            params["before_first_seen"] = (
+                before_first_seen.isoformat()
+                if hasattr(before_first_seen, "isoformat")
+                else str(before_first_seen)
+            )
             params["before_end_user_id"] = str(before_end_user_id)
 
         empty_scope_filter = "AND 0 = 1" if self.empty_scope else ""
@@ -195,9 +205,13 @@ class UserListQueryBuilder(BaseQueryBuilder):
         continuation_filter = (
             """
             AND (
-                first_seen < %(before_first_seen)s
+                first_seen
+                    < parseDateTime64BestEffort(%(before_first_seen)s, 6, 'UTC')
                 OR (
-                    first_seen = %(before_first_seen)s
+                    first_seen
+                        = parseDateTime64BestEffort(
+                            %(before_first_seen)s, 6, 'UTC'
+                        )
                     AND toString(eu.end_user_id) < %(before_end_user_id)s
                 )
             )

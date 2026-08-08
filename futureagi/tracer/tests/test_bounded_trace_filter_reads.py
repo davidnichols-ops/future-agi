@@ -6056,7 +6056,10 @@ def test_voice_list_uses_v2_builder_when_routing_is_disabled() -> None:
     assert bounded_reader.call_args.kwargs["page_size"] == 30
 
 
-def test_voice_cursor_freezes_snapshot_and_continues_by_root_order() -> None:
+@pytest.mark.parametrize("explicit_strict_total", [False, True])
+def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
+    explicit_strict_total: bool,
+) -> None:
     from tracer.services.clickhouse.list_cursor import (
         cursor_scope_for_request,
         decode_list_cursor,
@@ -6107,13 +6110,17 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order() -> None:
     )
     view = TraceView.__new__(TraceView)
     analytics = mock.MagicMock()
-    request = _observe_trace_request({"cursor_mode": "true"})
+    request_query = {"cursor_mode": "true"}
     initial_data = {
         "filters": [_time_filter()],
         "page": 1,
         "page_size": 1,
         "cursor_mode": True,
     }
+    if explicit_strict_total:
+        request_query["allow_sampled"] = "false"
+        initial_data["allow_sampled"] = False
+    request = _observe_trace_request(request_query)
 
     with (
         mock.patch(
@@ -6153,9 +6160,11 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order() -> None:
             **initial_data,
             "cursor": cursor,
         }
-        continuation_request = _observe_trace_request(
-            {"cursor_mode": "true", "cursor": cursor}
-        )
+        continuation_request_query = {
+            **request_query,
+            "cursor": cursor,
+        }
+        continuation_request = _observe_trace_request(continuation_request_query)
         second_response = view._list_voice_calls_clickhouse(
             continuation_request,
             project_id=PROJECT_ID,

@@ -171,7 +171,10 @@ def test_user_dimension_cursor_keeps_string_tie_order_across_pages(ch_client):
     table = f"_test_user_dimension_cursor_{uuid.uuid4().hex[:8]}"
     organization_id = str(uuid.uuid4())
     project_id = str(uuid.uuid4())
-    first_seen = datetime(2026, 8, 1, 10, 0, tzinfo=UTC)
+    # Keep every row in the same non-zero DateTime64(6) bucket.  A Python
+    # datetime bound through clickhouse-driver used to lose ``.052877`` and
+    # skip the unconsumed suffix of this tie on the next keyset page.
+    first_seen = datetime(2026, 8, 1, 10, 0, 0, 52_877, tzinfo=UTC)
     end_user_ids = [str(uuid.UUID(int=index)) for index in range(1, 42)]
     ch_client.execute(
         f"""
