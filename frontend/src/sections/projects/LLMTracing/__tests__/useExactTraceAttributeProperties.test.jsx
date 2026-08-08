@@ -88,6 +88,7 @@ describe("useExactTraceAttributeProperties", () => {
       1,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
+        timeout: 35_000,
         params: {
           project_id: "project-synthetic",
           page_size: 10,
@@ -100,6 +101,7 @@ describe("useExactTraceAttributeProperties", () => {
       2,
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
+        timeout: 35_000,
         params: {
           project_id: "project-synthetic",
           page_size: 10,
@@ -117,6 +119,147 @@ describe("useExactTraceAttributeProperties", () => {
     expect(result.current.browseStatus).toBe("exhausted");
     expect(result.current.browseLimit).toBe(224);
     expect(result.current.browseLimitReached).toBe(false);
+  });
+
+  it("returns control after one bounded chunk and continues older retained checkpoints on request", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (!params.cursor) {
+        return Promise.resolve({
+          data: {
+            result: [{ key: "recent.attribute", type: "string" }],
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: "empty-1",
+          },
+        });
+      }
+      const index = Number(params.cursor.slice("empty-".length));
+      if (index <= 14) {
+        return Promise.resolve({
+          data: {
+            result: [],
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: `empty-${index + 1}`,
+          },
+        });
+      }
+      return Promise.resolve({
+        data: {
+          result: [{ key: "older.attribute", type: "number" }],
+          browse_status: "exhausted",
+          has_more: false,
+          next_cursor: null,
+        },
+      });
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(14));
+
+    expect(result.current.hasNextPage).toBe(true);
+    expect(result.current.isFetchingNextPage).toBe(false);
+    expect(result.current.data.map(({ id }) => id)).toEqual([
+      "recent.attribute",
+    ]);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(mocks.get).toHaveBeenCalledTimes(16);
+    expect(result.current.isError).toBe(false);
+    expect(result.current.isFetchNextPageError).toBe(false);
+    expect(result.current.data.map(({ id }) => id)).toEqual([
+      "recent.attribute",
+      "older.attribute",
+    ]);
+  });
+
+  it("keeps prior keys and makes a repeated retained cursor degraded and retryable", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: [{ key: "recent.attribute", type: "string" }],
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "same-cursor",
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: [],
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "same-cursor",
+        },
+      });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.queryReadState).toBe("degraded"));
+
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(result.current.hasNextPage).toBe(true);
+    expect(result.current.isFetchNextPageError).toBe(true);
+    expect(result.current.data.map(({ id }) => id)).toEqual([
+      "recent.attribute",
+    ]);
+  });
+
+  it("keeps an unchanged exhausted catalog after a successful cached refetch", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: [{ key: "final_status", type: "string", count: 1 }],
+        query_complete: true,
+        query_status: "complete",
+        browse_mode: "retained_catalog",
+        browse_status: "exhausted",
+        has_more: false,
+        next_cursor: null,
+      },
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() =>
+      expect(result.current.data.map(({ id }) => id)).toEqual(["final_status"]),
+    );
+    await act(async () => result.current.refetch());
+
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(result.current.data.map(({ id }) => id)).toEqual(["final_status"]);
+    expect(result.current.queryReadState).toBe("complete");
+    expect(result.current.browseStatus).toBe("exhausted");
+    expect(result.current.hasNextPage).toBe(false);
   });
 
   it("uses endpoint-specific browse state instead of generic sampling state", () => {
@@ -309,6 +452,7 @@ describe("useExactTraceAttributeProperties", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data.map((item) => item.id)).toEqual([
       "final_category",
+      "final_status",
     ]);
     expect(result.current.hasNextPage).toBe(true);
     await act(async () => result.current.fetchNextPage());

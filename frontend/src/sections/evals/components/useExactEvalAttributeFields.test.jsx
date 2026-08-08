@@ -107,6 +107,7 @@ describe("useExactEvalAttributeFields", () => {
         "/api/traces/span-attribute-keys/",
         expect.objectContaining({
           signal: expect.any(AbortSignal),
+          timeout: 35_000,
           params: {
             project_id: "00000000-0000-4000-8000-000000000901",
             page_size: 10,
@@ -117,6 +118,7 @@ describe("useExactEvalAttributeFields", () => {
         "/api/traces/span-attribute-keys/",
         expect.objectContaining({
           signal: expect.any(AbortSignal),
+          timeout: 35_000,
           params: {
             project_id: "00000000-0000-4000-8000-000000000901",
             page_size: 10,
@@ -170,6 +172,94 @@ describe("useExactEvalAttributeFields", () => {
     ]);
   });
 
+  it("returns control after one bounded chunk and continues older checkpoints on request", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (!params.cursor) {
+        return Promise.resolve(
+          retainedPage(["recent"], {
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: "empty-1",
+          }),
+        );
+      }
+      const index = Number(params.cursor.slice("empty-".length));
+      if (index <= 14) {
+        return Promise.resolve(
+          retainedPage([], {
+            browse_status: "continuation",
+            has_more: true,
+            next_cursor: `empty-${index + 1}`,
+          }),
+        );
+      }
+      return Promise.resolve(retainedPage([]));
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactEvalAttributeFields({
+          projectId: "project-synthetic",
+          rowType: "traces",
+          search: "",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(14));
+
+    expect(result.current.hasNextPage).toBe(true);
+    expect(result.current.isFetchingNextPage).toBe(false);
+    expect(result.current.data).toEqual(["spans.0.recent"]);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+
+    expect(mocks.get).toHaveBeenCalledTimes(16);
+    expect(result.current.data).toEqual(["spans.0.recent"]);
+    expect(result.current.isError).toBe(false);
+    expect(result.current.isFetchNextPageError).toBe(false);
+  });
+
+  it("keeps prior fields and makes a repeated cursor degraded and retryable", async () => {
+    mocks.get
+      .mockResolvedValueOnce(
+        retainedPage(["recent"], {
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "same-cursor",
+        }),
+      )
+      .mockResolvedValueOnce(
+        retainedPage([], {
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "same-cursor",
+        }),
+      );
+
+    const { result } = renderHook(
+      () =>
+        useExactEvalAttributeFields({
+          projectId: "project-synthetic",
+          rowType: "traces",
+          search: "",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.queryReadState).toBe("degraded"));
+
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(result.current.data).toEqual(["spans.0.recent"]);
+    expect(result.current.hasNextPage).toBe(true);
+    expect(result.current.isFetchNextPageError).toBe(true);
+  });
+
   it("continues exact search to an older key and stops at the terminal page", async () => {
     const exactRequests = [];
     mocks.get.mockImplementation((_url, { params }) => {
@@ -211,12 +301,6 @@ describe("useExactEvalAttributeFields", () => {
       { wrapper: createWrapper() },
     );
 
-    await waitFor(() => {
-      expect(result.current.data).toEqual(["recent_catalog"]);
-      expect(result.current.hasNextPage).toBe(true);
-    });
-
-    await act(async () => result.current.fetchNextPage());
     await waitFor(() =>
       expect(result.current.data).toEqual([
         "recent_catalog",

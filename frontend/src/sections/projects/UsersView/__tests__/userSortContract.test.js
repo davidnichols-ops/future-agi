@@ -5,7 +5,7 @@ import {
 } from "../userSortContract";
 
 describe("Observe Users server sort contract", () => {
-  it("keeps only exact server-supported sort columns", () => {
+  it("rejects every global sort until a bounded server sort exists", () => {
     expect(
       sanitizeUserSortModel([
         { colId: "last_active", sort: "desc" },
@@ -13,10 +13,10 @@ describe("Observe Users server sort contract", () => {
         { colId: "avg_trace_latency", sort: "desc" },
         { colId: "eval_score", sort: "asc" },
       ]),
-    ).toEqual([{ colId: "last_active", sort: "desc" }]);
+    ).toEqual([]);
   });
 
-  it("clears unsupported saved-view sorts without changing display state", () => {
+  it("clears every persisted global sort without changing display state", () => {
     expect(
       sanitizeUserColumnState([
         {
@@ -44,8 +44,8 @@ describe("Observe Users server sort contract", () => {
       },
       {
         colId: "total_cost",
-        sort: "asc",
-        sortIndex: 1,
+        sort: null,
+        sortIndex: null,
         hide: false,
         width: 180,
       },

@@ -2,6 +2,12 @@ import { useInfiniteQuery } from "@tanstack/react-query";
 import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
+import {
+  ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+  getNextAttributeKeyPageParam,
+  isAttributeKeyCursorChainStopped,
+  readAttributeKeyPage,
+} from "src/sections/projects/LLMTracing/attributeKeyCursorPagination";
 
 const EXACT_ATTRIBUTE_ROW_TYPES = {
   span: "spans",
@@ -50,28 +56,42 @@ export function useExactEvalAttributeFields({
     normalizedRowType === "traces" && debouncedSearch.startsWith("spans.0.")
       ? debouncedSearch.slice("spans.0.".length)
       : debouncedSearch;
+  const retainedQueryKey = [
+    "eval-attribute-retained",
+    projectId,
+    normalizedRowType,
+  ];
+  const exactQueryKey = [
+    "eval-attribute-exact",
+    projectId,
+    normalizedRowType,
+    exactSearch,
+  ];
 
   const retainedQuery = useInfiniteQuery({
     // The retained project schema is deliberately independent of the task's
     // preview filters and scheduling window. Search also stays local so typing
     // cannot discard cursor progress through older retained rows.
-    queryKey: ["eval-attribute-retained", projectId, normalizedRowType],
+    queryKey: retainedQueryKey,
     queryFn: ({ signal, pageParam }) =>
-      axios
-        .get(endpoints.project.spanAttributeKeys(), {
-          signal,
-          params: {
-            project_id: projectId,
-            page_size: 10,
-            ...(pageParam ? { cursor: pageParam } : {}),
-          },
-        })
-        .then(({ data }) => data || {}),
+      readAttributeKeyPage({
+        pageParam,
+        signal,
+        requestPage: (cursor) =>
+          axios
+            .get(endpoints.project.spanAttributeKeys(), {
+              signal,
+              timeout: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+              params: {
+                project_id: projectId,
+                page_size: 10,
+                ...(cursor ? { cursor } : {}),
+              },
+            })
+            .then(({ data }) => data || {}),
+      }),
     initialPageParam: null,
-    getNextPageParam: (lastPage) =>
-      lastPage?.has_more && lastPage?.next_cursor
-        ? lastPage.next_cursor
-        : undefined,
+    getNextPageParam: getNextAttributeKeyPageParam,
     enabled: enabled && Boolean(projectId) && Boolean(normalizedRowType),
     retry: false,
     staleTime: 60_000,
@@ -84,29 +104,27 @@ export function useExactEvalAttributeFields({
   // non-authoritative: a slow/failed exact lookup must not disable the mapping
   // control, publish a warning, or hide names already loaded by the catalog.
   const exactQuery = useInfiniteQuery({
-    queryKey: [
-      "eval-attribute-exact",
-      projectId,
-      normalizedRowType,
-      exactSearch,
-    ],
+    queryKey: exactQueryKey,
     queryFn: ({ signal, pageParam }) =>
-      axios
-        .get(endpoints.project.spanAttributeKeys(), {
-          signal,
-          params: {
-            project_id: projectId,
-            page_size: 10,
-            q: exactSearch,
-            ...(pageParam ? { cursor: pageParam } : {}),
-          },
-        })
-        .then(({ data }) => data || {}),
+      readAttributeKeyPage({
+        pageParam,
+        signal,
+        requestPage: (cursor) =>
+          axios
+            .get(endpoints.project.spanAttributeKeys(), {
+              signal,
+              timeout: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+              params: {
+                project_id: projectId,
+                page_size: 10,
+                q: exactSearch,
+                ...(cursor ? { cursor } : {}),
+              },
+            })
+            .then(({ data }) => data || {}),
+      }),
     initialPageParam: null,
-    getNextPageParam: (lastPage) =>
-      lastPage?.has_more && lastPage?.next_cursor
-        ? lastPage.next_cursor
-        : undefined,
+    getNextPageParam: getNextAttributeKeyPageParam,
     enabled:
       enabled &&
       Boolean(projectId) &&
@@ -122,6 +140,10 @@ export function useExactEvalAttributeFields({
 
   const retainedPages = retainedQuery.data?.pages || [];
   const exactPages = exactQuery.data?.pages || [];
+  const retainedCursorStopped = isAttributeKeyCursorChainStopped(
+    retainedQuery.data,
+  );
+  const exactCursorStopped = isAttributeKeyCursorChainStopped(exactQuery.data);
   const seenRetainedKeys = new Set();
   const retainedFields = retainedPages.flatMap((page) =>
     (Array.isArray(page?.result) ? page.result : []).flatMap(({ key }) => {
@@ -133,7 +155,9 @@ export function useExactEvalAttributeFields({
   );
   const retainedReadState = retainedQuery.isError
     ? "error"
-    : combineQueryReadStates(...retainedPages.map(getQueryReadState));
+    : retainedCursorStopped
+      ? "degraded"
+      : combineQueryReadStates(...retainedPages.map(getQueryReadState));
   const seenExactKeys = new Set();
   const exactFields = exactPages.flatMap((page) =>
     (Array.isArray(page?.result) ? page.result : []).flatMap(({ key }) => {
@@ -144,14 +168,21 @@ export function useExactEvalAttributeFields({
     }),
   );
   const queryReadState = retainedReadState;
-  const exactHasNextPage = Boolean(exactSearch) && exactQuery.hasNextPage;
-  const hasNextPage = exactHasNextPage || retainedQuery.hasNextPage;
+  const retainedHasNextPage =
+    retainedQuery.hasNextPage || retainedCursorStopped;
+  const exactHasNextPage =
+    Boolean(exactSearch) && (exactQuery.hasNextPage || exactCursorStopped);
+  const hasNextPage = exactHasNextPage || retainedHasNextPage;
   const fetchNextPage = (...args) => {
     const reads = [];
-    if (retainedQuery.hasNextPage) {
+    if (retainedCursorStopped) {
+      reads.push(retainedQuery.refetch(...args));
+    } else if (retainedQuery.hasNextPage) {
       reads.push(retainedQuery.fetchNextPage(...args));
     }
-    if (exactHasNextPage) {
+    if (Boolean(exactSearch) && exactCursorStopped) {
+      reads.push(exactQuery.refetch(...args));
+    } else if (Boolean(exactSearch) && exactQuery.hasNextPage) {
       reads.push(exactQuery.fetchNextPage(...args));
     }
     return reads.length === 1 ? reads[0] : Promise.allSettled(reads);
@@ -172,9 +203,15 @@ export function useExactEvalAttributeFields({
     fetchNextPage,
     hasNextPage,
     isFetchingNextPage:
-      retainedQuery.isFetchingNextPage || exactQuery.isFetchingNextPage,
+      retainedQuery.isFetchingNextPage ||
+      exactQuery.isFetchingNextPage ||
+      (retainedCursorStopped && retainedQuery.isFetching) ||
+      (exactCursorStopped && exactQuery.isFetching),
     isFetchNextPageError:
-      retainedQuery.isFetchNextPageError || exactQuery.isFetchNextPageError,
+      retainedQuery.isFetchNextPageError ||
+      exactQuery.isFetchNextPageError ||
+      retainedCursorStopped ||
+      exactCursorStopped,
     pageCount: retainedPages.length + exactPages.length,
     browseStatus:
       (exactSearch ? exactPages.at(-1)?.browse_status : undefined) ||
