@@ -178,7 +178,11 @@ def test_annotation_span_map_uses_supplied_v2_service_when_map_is_missing(
 ):
     from tracer.views import trace as trace_view
 
-    span_trace_map = {"span-1": "trace-1"}
+    # The candidate trace may have arbitrary physical fanout; only these two
+    # PG-proven Score identities are allowed into the ClickHouse membership
+    # predicate.
+    scored_span_ids = ("span-7", "span-4999")
+    span_trace_map = dict.fromkeys(scored_span_ids, "trace-1")
     analytics = MagicMock()
     analytics.get_span_trace_map.return_value = span_trace_map
     pg_builder = MagicMock(return_value={"trace-1": {}})
@@ -186,6 +190,8 @@ def test_annotation_span_map_uses_supplied_v2_service_when_map_is_missing(
         side_effect=AssertionError("supplied V2 service must be reused")
     )
     legacy_factory = _legacy_factory()
+    score_span_reader = MagicMock(return_value=scored_span_ids)
+    monkeypatch.setattr(trace_view, "_annotation_score_span_ids", score_span_reader)
     monkeypatch.setattr(trace_view, "_build_annotation_map_from_scores_pg", pg_builder)
     monkeypatch.setattr(trace_view, "V2AnalyticsQueryService", v2_factory)
     monkeypatch.setattr(trace_view, "AnalyticsQueryService", legacy_factory)
@@ -204,10 +210,16 @@ def test_annotation_span_map_uses_supplied_v2_service_when_map_is_missing(
         project_id=PROJECT_ID,
         start_date=None,
         end_date=None,
+        scored_span_ids=scored_span_ids,
     )
     pg_builder.assert_called_once_with(
-        ["trace-1"], ["label-1"], {"label-1": "numeric"}, span_trace_map
+        ["trace-1"],
+        ["label-1"],
+        {"label-1": "numeric"},
+        span_trace_map,
+        project_id=PROJECT_ID,
     )
+    score_span_reader.assert_called_once_with(["label-1"], PROJECT_ID)
     v2_factory.assert_not_called()
     legacy_factory.assert_not_called()
 
@@ -221,6 +233,11 @@ def test_annotation_span_map_fallback_is_explicitly_v2(monkeypatch):
     v2_factory = MagicMock(return_value=analytics)
     legacy_factory = _legacy_factory()
     monkeypatch.setattr(
+        trace_view,
+        "_annotation_score_span_ids",
+        MagicMock(return_value=("span-1",)),
+    )
+    monkeypatch.setattr(
         trace_view, "_build_annotation_map_from_scores_pg", MagicMock(return_value={})
     )
     monkeypatch.setattr(trace_view, "V2AnalyticsQueryService", v2_factory)
@@ -228,7 +245,10 @@ def test_annotation_span_map_fallback_is_explicitly_v2(monkeypatch):
 
     assert (
         trace_view._build_annotation_map_from_scores(
-            ["trace-1"], ["label-1"], {"label-1": "numeric"}
+            ["trace-1"],
+            ["label-1"],
+            {"label-1": "numeric"},
+            project_id=PROJECT_ID,
         )
         == {}
     )
@@ -236,3 +256,34 @@ def test_annotation_span_map_fallback_is_explicitly_v2(monkeypatch):
     v2_factory.assert_called_once_with()
     analytics.get_span_trace_map.assert_called_once()
     legacy_factory.assert_not_called()
+
+
+@pytest.mark.unit
+def test_annotation_span_map_skips_clickhouse_without_span_linked_scores(monkeypatch):
+    from tracer.views import trace as trace_view
+
+    analytics = MagicMock()
+    pg_builder = MagicMock(return_value={"trace-1": {}})
+    monkeypatch.setattr(
+        trace_view,
+        "_annotation_score_span_ids",
+        MagicMock(return_value=()),
+    )
+    monkeypatch.setattr(trace_view, "_build_annotation_map_from_scores_pg", pg_builder)
+
+    assert trace_view._build_annotation_map_from_scores(
+        ["trace-1"],
+        ["label-1"],
+        {"label-1": "numeric"},
+        analytics=analytics,
+        project_id=PROJECT_ID,
+    ) == {"trace-1": {}}
+
+    analytics.get_span_trace_map.assert_not_called()
+    pg_builder.assert_called_once_with(
+        ["trace-1"],
+        ["label-1"],
+        {"label-1": "numeric"},
+        {},
+        project_id=PROJECT_ID,
+    )

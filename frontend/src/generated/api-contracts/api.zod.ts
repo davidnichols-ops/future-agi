@@ -42857,6 +42857,7 @@ export const TracerTraceListTracesOfSessionQueryParams = zod.object({
   "page_size": zod.number().min(1).max(tracerTraceListTracesOfSessionQueryPageSizeMax).default(tracerTraceListTracesOfSessionQueryPageSizeDefault),
   "cursor": zod.string().min(1).max(tracerTraceListTracesOfSessionQueryCursorMax).optional().describe('Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.'),
   "cursor_mode": zod.boolean().default(tracerTraceListTracesOfSessionQueryCursorModeDefault),
+  "attribute_keys": zod.string().optional().describe('JSON-encoded list of custom attribute keys to hydrate; only requested keys are returned. Each key resolves to its latest live span value by (start_time, span_id). Comma-separated simple keys remain supported.'),
   "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total. Send true to opt in explicitly to lower-bound totals and, on the first page, a clearly labelled bounded partial result when the full ordered prefix cannot be proven inside the read budget.'),
   "interval": zod.string().optional()
 })

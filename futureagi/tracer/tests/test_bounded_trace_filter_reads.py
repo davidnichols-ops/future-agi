@@ -3052,9 +3052,15 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
         if "content_trace_ids" in params
     ]
     attribute_chunks = [
-        params["attr_trace_ids"]
+        (
+            params["attr_trace_ids"]
+            if "attr_trace_ids" in params
+            else tuple(
+                trace_id for _project_id, trace_id in params["attr_trace_identities"]
+            )
+        )
         for params, _timeout_ms, _settings in analytics.calls
-        if "attr_trace_ids" in params
+        if "attr_trace_ids" in params or "attr_trace_identities" in params
     ]
     assert len(content_chunks) == expected_chunks
     assert len(attribute_chunks) == expected_chunks
@@ -3071,6 +3077,237 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
     assert all(0 < timeout_ms <= 900 for _, timeout_ms, _ in analytics.calls)
     assert all(
         settings == TRACE_LIST_READ_SETTINGS for _, _, settings in analytics.calls
+    )
+
+
+@override_settings(
+    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
+)
+def test_page_500_slow_candidate_admits_every_exact_enrichment_wave():
+    """The 16 s ceiling admits the modeled 14.3 s max-page exact replay.
+
+    The virtual two-worker scheduler is deterministic: the candidate consumes
+    8 s, each CH statement consumes its full 900 ms cap, and the optional user
+    resolver consumes two statements. Five content chunks, five packed
+    attribute chunks, packed evals, annotations, and user replay therefore use
+    fourteen worker slots / two workers = seven waves. No required future may
+    be silently omitted.
+    """
+
+    import concurrent.futures
+
+    from tracer.views.trace import (
+        TRACE_LIST_ENRICHMENT_MAX_WORKERS,
+        TRACE_LIST_ENRICHMENT_TIMEOUT_MS,
+        TRACE_LIST_WALL_DEADLINE_MS,
+        TraceView,
+    )
+
+    candidate_ms = 8_000
+    query_ms = 900
+    started = END - timedelta(minutes=1)
+    rows = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": started - timedelta(microseconds=index),
+        }
+        for index in range(500)
+    ]
+    bounded = BoundedFilterPage(
+        rows=rows,
+        has_more=False,
+        complete=True,
+        status="complete",
+        error_code=None,
+        total_rows_lower_bound=500,
+        elapsed_ms=float(candidate_ms),
+        query_count=1,
+        rows_returned=500,
+        result_payload_bytes=5_000,
+        attempts=(),
+    )
+
+    class VirtualDeadline:
+        def __init__(self):
+            self.total_ms = 0
+            self.now_ms = 0
+
+        def elapsed_ms(self):
+            return float(self.now_ms)
+
+        def remaining_ms(self, cap_ms=None, *, floor_ms=25):
+            remaining = self.total_ms - self.now_ms
+            if remaining < floor_ms:
+                raise ReadDeadlineExceeded("virtual deadline exceeded")
+            return remaining if cap_ms is None else min(cap_ms, remaining)
+
+    deadline = VirtualDeadline()
+
+    class DeadlineFactory:
+        @staticmethod
+        def start(total_ms):
+            deadline.total_ms = total_ms
+            return deadline
+
+    class VirtualPool:
+        instances = []
+
+        def __init__(self, *, max_workers):
+            assert max_workers == TRACE_LIST_ENRICHMENT_MAX_WORKERS == 2
+            self.worker_ready_ms = [candidate_ms, candidate_ms]
+            self.submit_count = 0
+            self.__class__.instances.append(self)
+
+        def submit(self, fn, *args, **kwargs):
+            worker = min(
+                range(len(self.worker_ready_ms)),
+                key=self.worker_ready_ms.__getitem__,
+            )
+            slots = (
+                2
+                if getattr(fn, "__name__", "")
+                == "resolve_user_ids_for_trace_identities"
+                else 1
+            )
+            self.worker_ready_ms[worker] += slots * query_ms
+            deadline.now_ms = max(deadline.now_ms, self.worker_ready_ms[worker])
+            self.submit_count += 1
+            future = concurrent.futures.Future()
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except Exception as exc:
+                future.set_exception(exc)
+            return future
+
+        def shutdown(self, **_kwargs):
+            return None
+
+    class ExactAnalytics:
+        def __init__(self):
+            self.timeouts = []
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.timeouts.append(timeout_ms)
+            if "content_trace_ids" in params:
+                data = [
+                    {
+                        "project_id": PROJECT_ID,
+                        "trace_id": trace_id,
+                        "input": f"input-{trace_id}",
+                        "output": f"output-{trace_id}",
+                        "metadata": "{}",
+                    }
+                    for trace_id in params["content_trace_ids"]
+                ]
+            elif "user_trace_identities" in params:
+                data = [
+                    {
+                        "project_id": PROJECT_ID,
+                        "trace_id": "trace-0",
+                        "resolved_end_user_id": "user-physical",
+                        "physical_end_user_ids": ["user-physical"],
+                    }
+                ]
+            else:
+                data = []
+            return QueryResult(data, len(data), "clickhouse", 0.0)
+
+        def get_span_trace_map(self, *args, **kwargs):
+            return {}
+
+    configs = [
+        SimpleNamespace(
+            id=f"config-{index}",
+            project_id=PROJECT_ID,
+            name=f"config-{index}",
+            eval_template=SimpleNamespace(
+                id=f"template-{index}",
+                config={"output": "SCORE"},
+                choices=None,
+            ),
+        )
+        for index in range(11)
+    ]
+    label = SimpleNamespace(
+        id="00000000-0000-4000-8000-000000000101",
+        type="text",
+        name="label-a",
+        settings={},
+    )
+    analytics = ExactAnalytics()
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    organization = SimpleNamespace(id="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+    )
+
+    def delayed_candidate(**_kwargs):
+        deadline.now_ms = candidate_ms
+        return bounded
+
+    with (
+        mock.patch("tracer.views.trace.ReadDeadline", DeadlineFactory),
+        mock.patch(
+            "tracer.views.trace.concurrent.futures.ThreadPoolExecutor", VirtualPool
+        ),
+        mock.patch("tracer.views.trace.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project",
+            return_value=[label],
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.views.trace._annotation_score_span_ids",
+            return_value=["scored-span"],
+        ),
+        mock.patch(
+            "tracer.views.trace.update_column_config_based_on_eval_config",
+            side_effect=lambda config, _evals: config,
+        ),
+        mock.patch(
+            "tracer.views.trace.update_span_column_config_based_on_annotations",
+            side_effect=lambda config, _labels: config,
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            side_effect=delayed_candidate,
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = configs
+        status_name, payload = view._list_traces_of_session_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 500,
+                "allow_sampled": True,
+            },
+            analytics=analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+
+    assert status_name == "ok"
+    assert len(payload["table"]) == 500
+    assert TRACE_LIST_WALL_DEADLINE_MS == 16_000
+    assert deadline.now_ms == 14_300
+    assert VirtualPool.instances[0].submit_count == 13
+    assert all(
+        0 < timeout <= TRACE_LIST_ENRICHMENT_TIMEOUT_MS
+        for timeout in analytics.timeouts
     )
 
 
@@ -3209,7 +3446,7 @@ def test_org_trace_content_same_trace_id_is_merged_by_project_identity() -> None
                         "str_lists": [],
                     },
                 ]
-            elif "attr_trace_ids" in params:
+            elif "attr_trace_ids" in params or "attr_trace_identities" in params:
                 rows = [
                     {
                         "project_id": PROJECT_ID,
@@ -3238,6 +3475,7 @@ def test_org_trace_content_same_trace_id_is_merged_by_project_identity() -> None
     )
     validated_data = {
         "filters": [_time_filter()],
+        "attribute_keys": ["tenant_marker"],
         "page_number": 0,
         "page_size": 25,
         "cursor_mode": True,
@@ -3298,6 +3536,104 @@ def test_org_trace_content_same_trace_id_is_merged_by_project_identity() -> None
         "shared-trace",
         project_b,
     )
+
+
+@override_settings(
+    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"},
+)
+def test_org_trace_content_equal_count_with_missing_and_extra_identity_fails_closed():
+    from tracer.views.trace import TraceView
+
+    project_b = "00000000-0000-4000-8000-000000000002"
+    project_extra = "00000000-0000-4000-8000-000000000003"
+    started = END - timedelta(minutes=1)
+    bounded = BoundedFilterPage(
+        rows=[
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "shared-trace",
+                "root_span_id": "root-a",
+                "start_time": started,
+            },
+            {
+                "project_id": project_b,
+                "trace_id": "shared-trace",
+                "root_span_id": "root-b",
+                "start_time": started,
+            },
+        ],
+        has_more=False,
+        complete=True,
+        status="complete",
+        error_code=None,
+        total_rows_lower_bound=2,
+        elapsed_ms=2.0,
+        query_count=1,
+        rows_returned=2,
+        result_payload_bytes=20,
+        attempts=(),
+    )
+
+    class IdentityDriftAnalytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            if "content_trace_ids" in params:
+                rows = [
+                    {
+                        "project_id": PROJECT_ID,
+                        "trace_id": "shared-trace",
+                        "input": "tenant-a-input",
+                    },
+                    {
+                        "project_id": project_extra,
+                        "trace_id": "shared-trace",
+                        "input": "unexpected-tenant-input",
+                    },
+                ]
+            else:
+                rows = []
+            return QueryResult(rows, len(rows), "clickhouse", 0.0)
+
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    organization = SimpleNamespace(id="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+    )
+
+    with (
+        mock.patch("tracer.views.trace.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded,
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        response = view._list_traces_of_session_clickhouse(
+            request,
+            project_id=None,
+            validated_data={
+                "filters": [_time_filter()],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": True,
+                "allow_sampled": True,
+            },
+            analytics=IdentityDriftAnalytics(),
+            org_project_ids=[PROJECT_ID, project_b, project_extra],
+            org=organization,
+        )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2]["code"] == "service_unavailable"
+    assert "unexpected-tenant-input" not in str(response)
 
 
 @override_settings(
@@ -5127,13 +5463,19 @@ def test_numbered_page_budget_can_reserve_a_speculative_anchor_query() -> None:
 
 
 def test_voice_numbered_page_ceiling_is_deterministic() -> None:
-    classify_batch_size = (
-        VoiceCallListQueryBuilder.recommended_filter_classify_batch_size()
+    builder = VoiceCallListQueryBuilder(
+        project_id=PROJECT_ID,
+        page_number=0,
+        page_size=30,
+        filters=[_time_filter()],
+        eval_config_ids=[],
+        annotation_label_ids=[],
     )
+    classify_batch_size = int(builder.recommended_filter_classify_batch_size() or 50)
     common = {
         "page_size": 30,
         "classify_batch_size": classify_batch_size,
-        "seed_batch_size": classify_batch_size,
+        "seed_batch_size": builder.recommended_filter_seed_batch_size(),
     }
 
     # Public voice page 71 needs a 2,131-row prefix and exactly 48 reads.
@@ -5989,6 +6331,110 @@ def test_voice_first_page_explicit_sample_hydrates_only_proven_rows() -> None:
     assert response.data["results"][0]["final_status"] == "Rejected"
     assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is True
     analytics.execute_ch_query.assert_called_once()
+
+
+def test_voice_page_size_500_hydrates_content_in_bounded_batches() -> None:
+    from tracer.views.trace import TraceView
+
+    page_rows = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index:03d}",
+            "root_span_id": f"root-{index:03d}",
+            "span_id": f"root-{index:03d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+            "end_time": END - timedelta(microseconds=index + 1),
+            "provider": "vapi",
+        }
+        for index in range(500)
+    ]
+    row_by_span_id = {row["span_id"]: row for row in page_rows}
+    bounded_page = BoundedFilterPage(
+        rows=page_rows,
+        has_more=False,
+        complete=True,
+        status="complete",
+        error_code=None,
+        total_rows_lower_bound=500,
+        elapsed_ms=1_000.0,
+        query_count=12,
+        rows_returned=500,
+        result_payload_bytes=32_000,
+        attempts=(),
+    )
+
+    def hydrate_batch(_query, params, **_kwargs):
+        rows = []
+        for span_id in params["content_span_ids"]:
+            selected = row_by_span_id[span_id]
+            rows.append(
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": selected["trace_id"],
+                    "span_id": span_id,
+                    "start_time": selected["start_time"],
+                    "span_attributes": "{}",
+                    "attrs_string": {},
+                    "attrs_number": {},
+                    "attrs_bool": {},
+                    "provider": "vapi",
+                }
+            )
+        return QueryResult(
+            data=rows,
+            row_count=len(rows),
+            backend_used="clickhouse",
+            query_time_ms=10.0,
+        )
+
+    view = TraceView.__new__(TraceView)
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.side_effect = hydrate_batch
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.views.trace.ObservabilityService.process_raw_logs",
+            return_value={"status": "completed"},
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded_page,
+        ),
+    ):
+        response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params={"allow_sampled": "true"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [_time_filter()],
+                "page": 1,
+                "page_size": 500,
+                "allow_sampled": True,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response.status_code == 200
+    assert len(response.data["results"]) == 500
+    assert response.data["count"] == 500
+    assert analytics.execute_ch_query.call_count == 3
+    assert [
+        len(call.args[1]["content_root_identities"])
+        for call in analytics.execute_ch_query.call_args_list
+    ] == [200, 200, 100]
+    assert all(
+        call.kwargs["settings"]["max_result_rows"] == 200
+        for call in analytics.execute_ch_query.call_args_list
+    )
 
 
 @pytest.mark.parametrize(

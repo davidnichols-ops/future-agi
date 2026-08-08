@@ -88,9 +88,10 @@ def test_user_default_page_replays_latest_state_before_pagination():
     assert "LIMIT 1" in physical_sql
     assert physical_params["project_id"] == builder.project_id
     assert "candidate_users AS" in page_sql
-    assert "latest_candidate_spans AS" in page_sql
-    assert "argMax(is_deleted, _version) AS latest_is_deleted" in page_sql
-    assert "latest_is_deleted = 0" in page_sql
+    assert "FROM spans AS sp FINAL" in page_sql
+    assert "candidate_span_identities AS" not in page_sql
+    assert "latest_candidate_spans AS" not in page_sql
+    assert "sp.is_deleted = 0" in page_sql
     assert "span_user_rollup" not in page_sql
     assert "span_user_rollup" not in combined_sql
     assert "FROM span_user_rollup" not in inspect.getsource(UserListQueryBuilder)
@@ -2189,10 +2190,15 @@ def test_candidate_reads_on_ch25_preserve_remap_and_tombstone_semantics():
         seed_sql, seed_params, with_column_types=True
     )
     seed_rows = _dict_rows(seed_raw, seed_columns)
-    # The old physical root is tombstoned, so the raw live-row seed exposes
-    # only the deterministic new alias. The finite classifier below must still
-    # expand that alias's remap group and return the canonical old survivor.
-    assert {str(row["session_id"]) for row in seed_rows} == {new_session_id}
+    # Seed acquisition deliberately scans raw non-deleted versions without a
+    # latest-state replay.  Until the ReplacingMergeTree merges the old live
+    # version with its tombstone, that old alias may remain as a bounded false
+    # positive beside the deterministic new alias.  The live new alias must
+    # always be present, and the finite classifier below is the authoritative
+    # phase that collapses either seed shape to the canonical old survivor.
+    seed_ids = {str(row["session_id"]) for row in seed_rows}
+    assert new_session_id in seed_ids
+    assert seed_ids <= {old_session_id, new_session_id}
     match_sql, match_params = attribute_builder.build_filter_match_query(
         [new_session_id]
     )
@@ -2222,7 +2228,7 @@ def test_candidate_reads_on_ch25_preserve_remap_and_tombstone_semantics():
         page_size=25,
         deadline_ms=5000,
     )
-    assert bounded_page.complete is True
+    assert bounded_page.complete is True, bounded_page
     assert [str(row["session_id"]) for row in bounded_page.rows] == [old_session_id]
 
     tombstoned_attribute_builder = SessionListQueryBuilderV2(

@@ -7,10 +7,15 @@ Endpoints:
 3. GET /api/traces/span-attribute-detail/<key>/ - Full detail for a specific attribute key
 """
 
+import re
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
 import structlog
+from clickhouse_connect.driver.exceptions import (
+    DatabaseError as ClickHouseConnectDatabaseError,
+)
+from clickhouse_driver.errors import Error as ClickHouseError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -39,8 +44,7 @@ from tracer.services.clickhouse.list_cursor import (
     encode_list_cursor,
 )
 from tracer.services.clickhouse.read_budget import (
-    is_clickhouse_query_error,
-    is_read_budget_error,
+    is_clickhouse_api_read_unavailable_error,
 )
 from tracer.services.exact_aggregation_cache import read_or_schedule_exact_snapshot
 from tracer.utils.workspace_scope import project_queryset_for_request
@@ -64,6 +68,8 @@ ERROR_RESPONSES = {
 # a wrapped partition bound and incorrectly prune current data. No telemetry
 # predates Unix time, so epoch is the earliest lossless retained-data bound.
 SPAN_ATTRIBUTE_RETAINED_DATA_START = datetime(1970, 1, 1, tzinfo=UTC)
+_CLICKHOUSE_ERROR_CODE_RE = re.compile(r"\bcode:\s*(\d+)\b", re.IGNORECASE)
+_ATTRIBUTE_READ_PERMISSION_ERROR_CODES = frozenset({497})
 
 
 def _project_is_in_request_scope(request, project_id: str) -> bool:
@@ -72,20 +78,67 @@ def _project_is_in_request_scope(request, project_id: str) -> bool:
     return project_queryset_for_request(request).filter(id=project_id).exists()
 
 
-def _attribute_error_code(exc: Exception) -> str:
-    return "read_budget_exceeded" if is_read_budget_error(exc) else "query_failed"
+def _clickhouse_error_code(exc: Exception) -> int | None:
+    """Extract a typed ClickHouse error code without exposing its message."""
+
+    if isinstance(exc, ClickHouseError):
+        code = getattr(exc, "code", None)
+        return code if isinstance(code, int) else None
+    if isinstance(exc, ClickHouseConnectDatabaseError):
+        match = _CLICKHOUSE_ERROR_CODE_RE.search(str(exc))
+        return int(match.group(1)) if match else None
+    return None
 
 
-def _is_expected_attribute_read_failure(exc: Exception) -> bool:
-    """Return whether an attribute read may safely become degraded metadata.
+def is_attribute_api_read_unavailable_error(exc: Exception) -> bool:
+    """Classify retryable attribute-read failures at the HTTP boundary.
 
-    Only driver-typed ClickHouse failures and explicit read-budget exhaustion
-    are operational failures.  Arbitrary ``Exception`` values are programming
-    defects; turning those into an empty successful picker hid regressions in
-    production and made a broken attribute compiler look like "no values".
+    Attribute discovery now reads retained-window metadata before its bounded
+    cursor walk.  A read-only ClickHouse user can lack access to that metadata
+    during a rolling credential/configuration change (code 497).  That is an
+    unavailable telemetry read, not proof that a tenant has no attributes and
+    not a programming defect.  Keep the shared timeout/resource/transport
+    classifier narrow and add only this attribute-specific permission case.
     """
 
-    return is_read_budget_error(exc) or is_clickhouse_query_error(exc)
+    return (
+        is_clickhouse_api_read_unavailable_error(exc)
+        or _clickhouse_error_code(exc) in _ATTRIBUTE_READ_PERMISSION_ERROR_CODES
+    )
+
+
+def _attribute_read_metadata_is_unavailable(metadata) -> bool:
+    """Reject degraded selector output while retaining labelled samples."""
+
+    return not metadata.query_complete and metadata.query_status != "sampled"
+
+
+def retained_attribute_window_start(
+    retained_start: datetime | None,
+    *,
+    window_end: datetime,
+) -> datetime:
+    """Normalize the exact retained-data lower bound for cursor APIs.
+
+    ``AttributeReadSelector`` has a strict ``datetime | None`` contract.  Keep
+    that invariant at the HTTP boundary instead of comparing arbitrary objects
+    (including an accidentally unconfigured test double) with a timestamp.  A
+    genuine ``None`` means ClickHouse has no active part before ``window_end``;
+    the one-microsecond empty interval lets the cursor terminate immediately.
+    Any other type is a programming defect and must fail closed rather than
+    masquerading as an empty tenant vocabulary.
+    """
+
+    if retained_start is None:
+        return window_end - timedelta(microseconds=1)
+    if not isinstance(retained_start, datetime):
+        raise TypeError("retained attribute window start must be a datetime or None")
+    normalized_start = (
+        retained_start.replace(tzinfo=UTC)
+        if retained_start.tzinfo is None
+        else retained_start.astimezone(UTC)
+    )
+    return max(SPAN_ATTRIBUTE_RETAINED_DATA_START, normalized_start)
 
 
 def _attribute_key_payload(row) -> dict:
@@ -217,13 +270,9 @@ class SpanAttributeKeysView(APIView):
                         project_ids,
                         window_end=window_end,
                     )
-                    window_start = (
-                        max(
-                            SPAN_ATTRIBUTE_RETAINED_DATA_START,
-                            retained_start,
-                        )
-                        if retained_start is not None
-                        else window_end - timedelta(microseconds=1)
+                    window_start = retained_attribute_window_start(
+                        retained_start,
+                        window_end=window_end,
                     )
                     segment_end = window_end
                     segment_start = None
@@ -268,6 +317,17 @@ class SpanAttributeKeysView(APIView):
                     exact_key=exact_key,
                     continue_operation=not bool(cursor_token),
                 )
+                if not page_read.metadata.query_complete:
+                    logger.warning(
+                        "span_attribute_key_cursor_incomplete",
+                        project_id=project_id,
+                        error_code=page_read.metadata.query_error_code,
+                    )
+                    return self._gm.custom_error_response(
+                        503,
+                        "Span attribute keys are temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
                 next_cursor = None
                 published_has_more = page_read.has_more
                 published_browse_status = page_read.browse_status
@@ -342,6 +402,17 @@ class SpanAttributeKeysView(APIView):
             # recreate the original 503. UI consumers paginate the retained
             # catalog and filter those verified typed names locally.
             read = selector.discover_keys([project_id], exact_key=exact_key)
+            if _attribute_read_metadata_is_unavailable(read.metadata):
+                logger.warning(
+                    "span_attribute_keys_incomplete",
+                    project_id=project_id,
+                    error_code=read.metadata.query_error_code,
+                )
+                return self._gm.custom_error_response(
+                    503,
+                    "Span attribute keys are temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
             return Response(
                 {
                     "result": [_attribute_key_payload(row) for row in read.rows],
@@ -374,16 +445,7 @@ class SpanAttributeKeysView(APIView):
                 code=exc.code,
             )
         except Exception as exc:
-            if not _is_expected_attribute_read_failure(exc):
-                logger.exception(
-                    "span_attribute_keys_programming_error",
-                    project_id=project_id,
-                    error_type=type(exc).__name__,
-                )
-                return self._gm.internal_server_error_response(
-                    "Span attribute keys could not be loaded"
-                )
-            if selector is None:
+            if is_attribute_api_read_unavailable_error(exc):
                 logger.warning(
                     "span_attribute_keys_unavailable",
                     project_id=project_id,
@@ -394,19 +456,13 @@ class SpanAttributeKeysView(APIView):
                     "Span attribute keys are temporarily unavailable. Please retry.",
                     code="service_unavailable",
                 )
-            logger.warning(
-                "span_attribute_keys_failed",
+            logger.exception(
+                "span_attribute_keys_programming_error",
                 project_id=project_id,
                 error_type=type(exc).__name__,
             )
-            return Response(
-                {
-                    "result": [],
-                    **selector.degraded_metadata(
-                        _attribute_error_code(exc)
-                    ).public_payload(),
-                },
-                status=200,
+            return self._gm.internal_server_error_response(
+                "Span attribute keys could not be loaded"
             )
 
 
@@ -444,6 +500,18 @@ class SpanAttributeValuesView(APIView):
             if not _project_is_in_request_scope(request, project_id):
                 return self._gm.not_found("Project not found")
             read = selector.read_values([project_id], key, search=q, max_values=limit)
+            if _attribute_read_metadata_is_unavailable(read.metadata):
+                logger.warning(
+                    "span_attribute_values_incomplete",
+                    project_id=project_id,
+                    key=key,
+                    error_code=read.metadata.query_error_code,
+                )
+                return self._gm.custom_error_response(
+                    503,
+                    "Span attribute values are temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
             return Response(
                 {
                     "result": [asdict(row) for row in read.rows],
@@ -452,17 +520,7 @@ class SpanAttributeValuesView(APIView):
                 status=200,
             )
         except Exception as exc:
-            if not _is_expected_attribute_read_failure(exc):
-                logger.exception(
-                    "span_attribute_values_programming_error",
-                    project_id=project_id,
-                    key=key,
-                    error_type=type(exc).__name__,
-                )
-                return self._gm.internal_server_error_response(
-                    "Span attribute values could not be loaded"
-                )
-            if selector is None:
+            if is_attribute_api_read_unavailable_error(exc):
                 logger.warning(
                     "span_attribute_values_unavailable",
                     project_id=project_id,
@@ -474,20 +532,14 @@ class SpanAttributeValuesView(APIView):
                     "Span attribute values are temporarily unavailable. Please retry.",
                     code="service_unavailable",
                 )
-            logger.warning(
-                "span_attribute_values_failed",
+            logger.exception(
+                "span_attribute_values_programming_error",
                 project_id=project_id,
                 key=key,
                 error_type=type(exc).__name__,
             )
-            return Response(
-                {
-                    "result": [],
-                    **selector.degraded_metadata(
-                        _attribute_error_code(exc)
-                    ).public_payload(),
-                },
-                status=200,
+            return self._gm.internal_server_error_response(
+                "Span attribute values could not be loaded"
             )
 
 

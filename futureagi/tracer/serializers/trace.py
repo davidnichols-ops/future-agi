@@ -1,3 +1,5 @@
+import json
+
 from django.db.models import Q
 from rest_framework import serializers
 
@@ -151,6 +153,33 @@ class CommaSeparatedStringListField(serializers.Field):
         return value or []
 
 
+class JSONOrCommaSeparatedStringListField(CommaSeparatedStringListField):
+    """Accept an exact JSON string list, retaining CSV compatibility.
+
+    Attribute paths are user data and may themselves contain commas. New
+    callers send a JSON array so those keys round-trip exactly; the historical
+    comma-separated shape remains accepted for simple keys.
+    """
+
+    def to_internal_value(self, data):
+        if data in (None, ""):
+            return []
+        if isinstance(data, str) and data.lstrip().startswith("["):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError as exc:
+                raise serializers.ValidationError(
+                    "Value must be a JSON string array."
+                ) from exc
+            if not isinstance(data, list):
+                raise serializers.ValidationError("Value must be a JSON string array.")
+            if not all(isinstance(item, str) for item in data):
+                raise serializers.ValidationError(
+                    "Every attribute key must be a string."
+                )
+        return super().to_internal_value(data)
+
+
 class TraceListQuerySerializer(StrictInputSerializer):
     project_version_id = serializers.UUIDField(required=True)
     trace_ids = CommaSeparatedStringListField(required=False, default=list)
@@ -193,6 +222,15 @@ class TraceObserveListQuerySerializer(StrictInputSerializer):
         required=False, allow_blank=False, max_length=4096, help_text=CURSOR_HELP_TEXT
     )
     cursor_mode = serializers.BooleanField(required=False, default=False)
+    attribute_keys = JSONOrCommaSeparatedStringListField(
+        required=False,
+        help_text=(
+            "JSON-encoded list of custom attribute keys to hydrate; only "
+            "requested keys are returned. Each key resolves to its latest live "
+            "span value by (start_time, span_id). Comma-separated simple keys "
+            "remain supported."
+        ),
+    )
     allow_sampled = serializers.BooleanField(
         required=False,
         help_text=(
@@ -207,6 +245,22 @@ class TraceObserveListQuerySerializer(StrictInputSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        attribute_keys = tuple(dict.fromkeys(attrs.get("attribute_keys") or ()))
+        if len(attribute_keys) > 100 or any(len(key) > 512 for key in attribute_keys):
+            raise serializers.ValidationError(
+                {
+                    "attribute_keys": "Request at most 100 attribute keys (512 chars each)."
+                }
+            )
+        if sum(len(key.encode("utf-8")) for key in attribute_keys) > 2_048:
+            raise serializers.ValidationError(
+                {
+                    "attribute_keys": (
+                        "Combined attribute keys must be at most 2048 UTF-8 bytes."
+                    )
+                }
+            )
+        attrs["attribute_keys"] = list(attribute_keys)
         return validate_cursor_exclusivity(self, attrs, page_field="page_number")
 
 
@@ -360,9 +414,55 @@ class UsersQuerySerializer(StrictInputSerializer):
         required=False, allow_blank=False, max_length=4096, help_text=CURSOR_HELP_TEXT
     )
     cursor_mode = serializers.BooleanField(required=False, default=False)
+    requested_columns = JSONOrCommaSeparatedStringListField(
+        required=False,
+        default=list,
+        help_text=(
+            "JSON-encoded list of visible Users-table fields. Raw-derived "
+            "metrics are hydrated only when explicitly requested."
+        ),
+    )
+    attribute_keys = JSONOrCommaSeparatedStringListField(
+        required=False,
+        default=list,
+        help_text=(
+            "JSON-encoded list of visible custom user attribute keys. Only "
+            "these keys (plus keys required by filters) are hydrated."
+        ),
+    )
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        requested_columns = tuple(dict.fromkeys(attrs.get("requested_columns") or ()))
+        attribute_keys = tuple(dict.fromkeys(attrs.get("attribute_keys") or ()))
+        if len(requested_columns) > 100 or any(
+            len(column) > 128 for column in requested_columns
+        ):
+            raise serializers.ValidationError(
+                {
+                    "requested_columns": (
+                        "Request at most 100 Users columns (128 chars each)."
+                    )
+                }
+            )
+        if len(attribute_keys) > 100 or any(len(key) > 512 for key in attribute_keys):
+            raise serializers.ValidationError(
+                {
+                    "attribute_keys": (
+                        "Request at most 100 attribute keys (512 chars each)."
+                    )
+                }
+            )
+        if sum(len(key.encode("utf-8")) for key in attribute_keys) > 2_048:
+            raise serializers.ValidationError(
+                {
+                    "attribute_keys": (
+                        "Combined attribute keys must be at most 2048 UTF-8 bytes."
+                    )
+                }
+            )
+        attrs["requested_columns"] = list(requested_columns)
+        attrs["attribute_keys"] = list(attribute_keys)
         return validate_cursor_exclusivity(
             self,
             attrs,

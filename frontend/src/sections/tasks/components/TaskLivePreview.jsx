@@ -9,6 +9,7 @@ import React, {
 import PropTypes from "prop-types";
 import {
   Box,
+  Button,
   Chip,
   CircularProgress,
   Divider,
@@ -264,6 +265,14 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     () => buildApiFilterArray(formFilters, startDate, endDate),
     [formFilters, startDate, endDate],
   );
+  const previewScopeKey = useMemo(
+    () => JSON.stringify([rowType, projectId || null, apiFilters]),
+    [apiFilters, projectId, rowType],
+  );
+  const [listContinuation, setListContinuation] = useState(null);
+  const activeListContinuation =
+    listContinuation?.scopeKey === previewScopeKey ? listContinuation : null;
+  const resumeCursor = activeListContinuation?.cursor || null;
   // Reset row index when filters / rowType change
   useEffect(() => {
     setCurrentRowIndex(0);
@@ -276,9 +285,56 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     isFetching: listFetching,
     isError: listError,
   } = useQuery({
-    queryKey: ["task-preview-list", rowType, projectId, apiFilters],
+    queryKey: [
+      "task-preview-list",
+      rowType,
+      projectId,
+      apiFilters,
+      resumeCursor,
+    ],
     queryFn: async ({ signal }) => {
       if (!projectId) return { rows: [], total: 0, columns: [] };
+
+      // Cursors are opaque and query-bound. Keep every cursor already
+      // requested for this exact project/filter scope so a repeated or cyclic
+      // backend chain fails closed instead of spinning forever. The pending
+      // continuation itself is deliberately not in this set until this
+      // request consumes it.
+      const requestedCursors = new Set(
+        activeListContinuation?.requestedCursors || [],
+      );
+      if (resumeCursor) {
+        if (requestedCursors.has(resumeCursor)) {
+          throw new Error("List API returned a repeated continuation cursor");
+        }
+        requestedCursors.add(resumeCursor);
+      }
+
+      const recordContinuation = (metadata) => {
+        const nextCursor = metadata?.next_cursor;
+        if (
+          typeof nextCursor !== "string" ||
+          nextCursor.length === 0 ||
+          requestedCursors.has(nextCursor)
+        ) {
+          throw new Error("List API returned a repeated continuation cursor");
+        }
+        requestedCursors.add(nextCursor);
+      };
+
+      const continuationResult = (nextCursor) => {
+        if (!nextCursor) return null;
+        // The shared per-attempt follower checks cycles inside one bounded
+        // attempt. This second guard covers a cycle that lands exactly on the
+        // attempt boundary and points back to any cursor consumed earlier.
+        if (requestedCursors.has(nextCursor)) {
+          throw new Error("List API returned a repeated continuation cursor");
+        }
+        return {
+          cursor: nextCursor,
+          requestedCursors: [...requestedCursors],
+        };
+      };
 
       if (rowType === "voiceCalls") {
         const requestParams = buildTaskPreviewListParams({
@@ -287,7 +343,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           apiFilters,
         });
         let resp = await axios.get(endpoints.project.getCallLogs, {
-          params: requestParams,
+          params: resumeCursor
+            ? listContinuationParams(requestParams, resumeCursor)
+            : requestParams,
           signal,
         });
         resp = await followEmptyListContinuations({
@@ -303,18 +361,12 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
               params: listContinuationParams(requestParams, cursor),
               signal,
             }),
+          onContinuation: recordContinuation,
           isCurrent: () => !signal.aborted,
         });
         const result = resp.data?.result || resp.data || {};
         const rowsOut = result.results || result.data || result.calls || [];
         const nextCursor = getEmptyListContinuation(rowsOut, result);
-        if (nextCursor) {
-          // The shared follower already spent its complete 12-hop / 30-second
-          // budget. Do not restart that budget in a new React Query revision:
-          // a sparse or malformed cursor chain must terminate visibly instead
-          // of issuing an unbounded series of background requests.
-          throw new Error("Task preview continuation budget exhausted");
-        }
         return {
           rows: rowsOut,
           total:
@@ -323,6 +375,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             result.total ??
             rowsOut.length,
           columns: [],
+          continuation: continuationResult(nextCursor),
         };
       }
 
@@ -346,7 +399,12 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         projectId,
         apiFilters,
       });
-      let resp = await axios.get(url, { params: requestParams, signal });
+      let resp = await axios.get(url, {
+        params: resumeCursor
+          ? listContinuationParams(requestParams, resumeCursor)
+          : requestParams,
+        signal,
+      });
       resp = await followEmptyListContinuations({
         initialResponse: resp,
         rowsFromResponse: (response) => response?.data?.result?.table || [],
@@ -357,6 +415,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             params: listContinuationParams(requestParams, cursor),
             signal,
           }),
+        onContinuation: recordContinuation,
         isCurrent: () => !signal.aborted,
       });
       const result = resp.data?.result || {};
@@ -365,9 +424,6 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         rowsOut,
         result.metadata || {},
       );
-      if (nextCursor) {
-        throw new Error("Task preview continuation budget exhausted");
-      }
       return {
         rows: rowsOut,
         total:
@@ -376,6 +432,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           result.total ||
           (result.table || []).length,
         columns: result.config || [],
+        continuation: continuationResult(nextCursor),
       };
     },
     enabled: !!projectId,
@@ -388,18 +445,24 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
 
   const rows = listData?.rows || [];
   const columns = listData?.columns || [];
+  const pendingListContinuation = listData?.continuation || null;
   const currentRow = rows[currentRowIndex] || null;
 
   // ── Fetch full detail for the currently selected row ──
-  const { data: spanDetail, isLoading: detailLoading } = useQuery({
+  const {
+    data: spanDetail,
+    isLoading: detailLoading,
+    isError: detailError,
+  } = useQuery({
     queryKey: [
       "task-preview-detail",
+      projectId,
       rowType,
       currentRow?.trace_id,
       currentRow?.span_id,
       currentRow?.session_id,
     ],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       if (!currentRow) return null;
       const spanId = currentRow.span_id;
       const traceId = currentRow.trace_id;
@@ -412,7 +475,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         try {
           const { data } = await axios.get(
             endpoints.project.getVoiceCallDetail,
-            { params: { trace_id: traceId } },
+            { params: { trace_id: traceId }, signal },
           );
           const voiceResult = data?.result || data?.data || data || {};
           detailData = { ...currentRow, ...voiceResult };
@@ -420,7 +483,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           detailData = { ...currentRow };
         }
       } else if ((rowType === "spans" || rowType === "traces") && traceId) {
-        const { data } = await axios.get(endpoints.project.getTrace(traceId));
+        const { data } = await axios.get(endpoints.project.getTrace(traceId), {
+          signal,
+        });
         const traceResult = data?.result;
 
         const spans = traceResult?.observation_spans;
@@ -453,7 +518,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         try {
           const sResp = await axios.get(
             `${endpoints.project.traceSession}${sid}/`,
-            { params: { page_number: 0, page_size: 30 } },
+            { params: { page_number: 0, page_size: 30 }, signal },
           );
           const sResult = sResp.data?.result || {};
           sessionMeta = sResult.session_metadata || {};
@@ -471,6 +536,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             try {
               const tResp = await axios.get(
                 endpoints.project.getTrace(firstTraceId),
+                { signal },
               );
               const tResult = tResp.data?.result || {};
               firstTraceSpans = sortSpansForMapping(
@@ -692,6 +758,42 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           >
             {QUERY_FAILED_RETRY_MESSAGE}
           </Typography>
+        ) : pendingListContinuation ? (
+          <Box
+            sx={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 1,
+              minHeight: 160,
+              textAlign: "center",
+            }}
+          >
+            <Typography variant="body2" sx={{ fontSize: "12px" }}>
+              No match found in the current scan.
+            </Typography>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ fontSize: "11px" }}
+            >
+              Continue searching older data from the saved position.
+            </Typography>
+            <Button
+              size="small"
+              variant="outlined"
+              disabled={listFetching}
+              onClick={() =>
+                setListContinuation({
+                  scopeKey: previewScopeKey,
+                  ...pendingListContinuation,
+                })
+              }
+            >
+              Continue search
+            </Button>
+          </Box>
         ) : rows.length === 0 ? (
           <EmptyState
             icon="solar:magnifer-outline"
@@ -744,6 +846,14 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
               <Box sx={{ display: "flex", justifyContent: "center", py: 3 }}>
                 <CircularProgress size={18} />
               </Box>
+            ) : detailError ? (
+              <Typography
+                variant="body2"
+                color="error"
+                sx={{ fontSize: "12px", textAlign: "center", py: 3 }}
+              >
+                {QUERY_FAILED_RETRY_MESSAGE}
+              </Typography>
             ) : spanDetail ? (
               <RowDetailTable
                 spanDetail={spanDetail}

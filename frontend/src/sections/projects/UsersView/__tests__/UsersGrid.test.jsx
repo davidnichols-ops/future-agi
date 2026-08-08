@@ -305,8 +305,16 @@ describe("UsersGrid deterministic pagination", () => {
     });
   });
 
-  it("retains numbered pagination for explicitly sorted requests", async () => {
-    getMock.mockResolvedValue(usersResponse());
+  it("clears explicit sorts and keeps deterministic cursor pagination", async () => {
+    getMock
+      .mockResolvedValueOnce(
+        usersResponse({
+          hasMore: true,
+          nextCursor: "signed-users-page-2",
+          countIsLowerBound: true,
+        }),
+      )
+      .mockResolvedValueOnce(usersResponse());
     renderGrid();
 
     const sortModel = [{ colId: "total_cost", sort: "desc" }];
@@ -318,20 +326,23 @@ describe("UsersGrid deterministic pagination", () => {
     expect(getMock.mock.calls[0][1].params).toEqual(
       expect.objectContaining({
         current_page_index: 0,
-        sort_params: JSON.stringify([
-          { column_id: "total_cost", direction: "desc" },
-        ]),
+        sort_params: "[]",
+        cursor_mode: true,
       }),
     );
-    expect(getMock.mock.calls[0][1].params).not.toHaveProperty("cursor_mode");
     expect(getMock.mock.calls[1][1].params).toEqual(
-      expect.objectContaining({ current_page_index: 1 }),
+      expect.objectContaining({
+        sort_params: "[]",
+        cursor_mode: true,
+        cursor: "signed-users-page-2",
+      }),
     );
-    expect(getMock.mock.calls[1][1].params).not.toHaveProperty("cursor");
-    expect(getMock.mock.calls[1][1].params).not.toHaveProperty("cursor_mode");
+    expect(getMock.mock.calls[1][1].params).not.toHaveProperty(
+      "current_page_index",
+    );
   });
 
-  it("disables unsupported derived and custom global sort controls", () => {
+  it("disables every global sort control until a bounded sort exists", () => {
     storeState.columns = [
       { id: "last_active", isVisible: true },
       { id: "total_cost", isVisible: true },
@@ -355,8 +366,8 @@ describe("UsersGrid deterministic pagination", () => {
       ]),
     );
     expect(sortability).toEqual({
-      last_active: true,
-      total_cost: true,
+      last_active: false,
+      total_cost: false,
       num_sessions: false,
       avg_trace_latency: false,
       eval_score: false,
@@ -390,7 +401,7 @@ describe("UsersGrid deterministic pagination", () => {
     );
   });
 
-  it("preserves a supported stored sort while removing only stale derived sorts", async () => {
+  it("clears all stored sorts from the previously unbounded contract", async () => {
     localStorage.setItem(
       "ag-grid-sort-model-proj-1",
       JSON.stringify([
@@ -404,11 +415,9 @@ describe("UsersGrid deterministic pagination", () => {
     const params = makeGridParams();
     await readPage(params);
 
-    expect(localStorage.getItem("ag-grid-sort-model-proj-1")).toBe(
-      JSON.stringify([{ colId: "total_cost", sort: "asc" }]),
-    );
+    expect(localStorage.getItem("ag-grid-sort-model-proj-1")).toBeNull();
     expect(params.api.applyColumnState).toHaveBeenCalledWith({
-      state: [{ colId: "total_cost", sort: "asc" }],
+      state: [],
       defaultState: { sort: null },
     });
   });
@@ -484,9 +493,9 @@ describe("UsersGrid deterministic pagination", () => {
     const staleRead = gridState.props.serverSideDatasource.getRows(staleParams);
     await waitFor(() => expect(getMock).toHaveBeenCalledTimes(1));
 
-    const currentParams = makeGridParams({
-      sortModel: [{ colId: "last_active", sort: "desc" }],
-    });
+    // A different page size changes the request identity even though every
+    // client-side sort is intentionally cleared by the bounded contract.
+    const currentParams = makeGridParams({ endRow: 50 });
     await readPage(currentParams);
     resolveStale(usersResponse({ rows: [row(1)] }));
     await act(async () => staleRead);

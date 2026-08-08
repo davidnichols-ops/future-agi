@@ -662,24 +662,27 @@ const ObserveHeader = ({
               </ObserveIconButton>
             </CustomTooltip>
 
-            {/* Export/Download */}
-            <CustomTooltip
-              show
-              title={isExportData ? "Exporting..." : "Export CSV"}
-              arrow
-              size="small"
-              type="black"
-            >
-              <span>
-                <ObserveIconButton
-                  size="small"
-                  onClick={handleExportClick}
-                  disabled={isExportData}
-                >
-                  <Iconify icon="mdi:download-outline" width={16} />
-                </ObserveIconButton>
-              </span>
-            </CustomTooltip>
+            {/* Users export is hidden until it has an exact bounded preflight.
+                The previous streaming path could return a partial 200 CSV. */}
+            {text !== "Users" && (
+              <CustomTooltip
+                show
+                title={isExportData ? "Exporting..." : "Export CSV"}
+                arrow
+                size="small"
+                type="black"
+              >
+                <span>
+                  <ObserveIconButton
+                    size="small"
+                    onClick={handleExportClick}
+                    disabled={isExportData}
+                  >
+                    <Iconify icon="mdi:download-outline" width={16} />
+                  </ObserveIconButton>
+                </span>
+              </CustomTooltip>
+            )}
 
             {/* View Docs */}
             <CustomTooltip

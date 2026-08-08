@@ -620,6 +620,46 @@ class TestFilterSerializerContracts:
         assert serializer.is_valid(), serializer.errors
         assert serializer.validated_data["filters"][0]["column_id"] == "customer_tier"
 
+    def test_trace_observe_list_query_accepts_exact_json_attribute_keys(self):
+        serializer = TraceObserveListQuerySerializer(
+            data={
+                "attribute_keys": json.dumps(
+                    ["final_status", "metadata.path,with-comma", "final_status"]
+                )
+            }
+        )
+
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["attribute_keys"] == [
+            "final_status",
+            "metadata.path,with-comma",
+        ]
+
+    def test_trace_observe_list_query_defaults_missing_attribute_keys_to_empty(self):
+        serializer = TraceObserveListQuerySerializer(data={})
+
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["attribute_keys"] == []
+
+    @pytest.mark.parametrize(
+        "attribute_keys",
+        [
+            json.dumps([f"key-{index}" for index in range(101)]),
+            json.dumps(["x" * 513]),
+            json.dumps([f"{index}-" + "x" * 510 for index in range(5)]),
+            json.dumps(["ok", 1]),
+        ],
+    )
+    def test_trace_observe_list_query_rejects_unsafe_attribute_key_payloads(
+        self, attribute_keys
+    ):
+        serializer = TraceObserveListQuerySerializer(
+            data={"attribute_keys": attribute_keys}
+        )
+
+        assert not serializer.is_valid()
+        assert "attribute_keys" in serializer.errors
+
     def test_trace_observe_list_query_rejects_camel_case_aliases(self):
         serializer = TraceObserveListQuerySerializer(
             data={

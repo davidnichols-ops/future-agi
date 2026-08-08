@@ -17,6 +17,12 @@ const LIST_OPERATORS = new Set(LIST_FILTER_OPS);
 const TERMINAL_BROWSE_STATUSES = new Set(["exhausted", "limit_reached"]);
 const EMPTY_CONTINUATION_GUARD_EXHAUSTED = "empty_continuation_guard_exhausted";
 const FOLLOWED_CURSORS_KEY = "followed_value_cursors";
+// The shared Axios client intentionally has no global timeout. Attribute
+// browsing is interactive, though, and an interrupted proxy/backend response
+// must not leave the picker in an endless "Loading more" state. This is just
+// above the server-side 30-second ceiling so ordinary server timeouts can
+// retain their structured response while transport stalls fail into Retry.
+const ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS = 35_000;
 
 const normalizeBrowseMetadata = (result = {}) =>
   TERMINAL_BROWSE_STATUSES.has(result?.browse_status)
@@ -125,6 +131,7 @@ const AutocompleteTextValueSelector = ({
       const requestPage = (cursor) =>
         axios.get(endpoints.dashboard.filterValues, {
           signal,
+          timeout: ATTRIBUTE_VALUE_REQUEST_TIMEOUT_MS,
           params: {
             project_ids: projectId,
             metric_name: definition?.propertyId,

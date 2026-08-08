@@ -1,15 +1,8 @@
-const USER_GLOBAL_SORTABLE_COLUMN_IDS = new Set([
-  "user_id",
-  "user_id_type",
-  "user_id_hash",
-  "activated_at",
-  "last_active",
-  "num_traces",
-  "total_tokens",
-  "total_cost",
-  "input_tokens",
-  "output_tokens",
-]);
+// Exact global sorting requires evaluating every matching user before LIMIT.
+// At large-tenant scale that is the known unbounded query path, so Users stays
+// in its deterministic server cursor order until a bounded sort index exists.
+// Keeping the set empty also clears stale persisted AG Grid sort state.
+const USER_GLOBAL_SORTABLE_COLUMN_IDS = new Set();
 
 const USER_SORT_DIRECTIONS = new Set(["asc", "desc"]);
 

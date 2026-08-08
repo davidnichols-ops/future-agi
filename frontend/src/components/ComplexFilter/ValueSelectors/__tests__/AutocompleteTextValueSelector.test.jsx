@@ -84,6 +84,7 @@ describe("AutocompleteTextValueSelector", () => {
       1,
       "/filter-values/",
       expect.objectContaining({
+        timeout: 35_000,
         params: expect.objectContaining({
           project_ids: "project-large",
           metric_name: "call.status",

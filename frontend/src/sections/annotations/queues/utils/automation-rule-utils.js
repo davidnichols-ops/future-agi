@@ -176,6 +176,9 @@ function snakeFilterToUi(filter) {
       filter_op: config.filter_op || "",
       filter_value: filterValue,
       ...(config.col_type ? { col_type: config.col_type } : {}),
+      ...(Array.isArray(config.attribute_value_types)
+        ? { attribute_value_types: [...config.attribute_value_types] }
+        : {}),
     },
   };
 }

@@ -28391,6 +28391,10 @@ page_size?: number;
 cursor?: string;
 cursor_mode?: boolean;
 /**
+ * JSON-encoded list of custom attribute keys to hydrate; only requested keys are returned. Each key resolves to its latest live span value by (start_time, span_id). Comma-separated simple keys remain supported.
+ */
+attribute_keys?: string;
+/**
  * Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total. Send true to opt in explicitly to lower-bound totals and, on the first page, a clearly labelled bounded partial result when the full ordered prefix cannot be proven inside the read budget.
  */
 allow_sampled?: boolean;

@@ -54,57 +54,140 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
     Or route via the shadow harness in v2/shadow.py.
     """
 
-    _v2_rewrite_exclude = frozenset({"build_eval_query", "build_annotation_query"})
+    _v2_rewrite_exclude = frozenset(
+        {
+            "build_eval_query",
+            "build_eval_replay_query",
+            "build_annotation_query",
+        }
+    )
 
     # Use the v2 filter compiler so filters read the v2 dimension tables
     # (end_users, etc.) instead of the dropped legacy CDC tables.
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
 
     def build_span_attributes_query(
-        self, trace_ids: list[str]
+        self,
+        trace_ids: list[str],
+        attribute_keys: Iterable[str] | None = None,
+        *,
+        trace_identities: Iterable[tuple[str, str]] | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Hydrate every live latest span attribute for a finite trace page."""
+        """Hydrate the latest live value of each requested key on a trace page.
 
-        if not trace_ids:
+        A trace's physical span fanout is unbounded. Packing every span's full
+        maps into one ``groupArray`` merely hides that fanout from the result-row
+        limit while retaining unbounded ClickHouse/Python memory. This query
+        projects only requested keys and deterministically selects one value per
+        ``(project, trace, key)``: the value on the latest live physical span by
+        ``(start_time, id)``. ReplacingMergeTree versions are collapsed before
+        tombstones and key presence are evaluated. Therefore result cardinality
+        is bounded by ``page trace identities * requested keys`` regardless of
+        historical span/value fanout, without sampling or truncation.
+
+        It intentionally does not reuse the list's date window: child spans can
+        start more than a day after their root. Exact page-scoped project/trace
+        pairs are the membership boundary, including in organization mode where
+        trace ids are customer controlled and can collide across tenants.
+        """
+
+        normalized_trace_ids = tuple(
+            dict.fromkeys(str(trace_id) for trace_id in trace_ids if trace_id)
+        )
+        requested_keys = tuple(
+            dict.fromkeys(str(key) for key in (attribute_keys or ()) if key)
+        )
+        if not normalized_trace_ids or not requested_keys:
             return "", {}
+
+        if trace_identities is None:
+            if self.project_ids is not None:
+                raise ValueError(
+                    "multi-project attribute hydration requires exact trace identities"
+                )
+            if not self.project_id:
+                raise ValueError("attribute hydration requires a project identity")
+            normalized_trace_identities = tuple(
+                (str(self.project_id), trace_id) for trace_id in normalized_trace_ids
+            )
+        else:
+            normalized_trace_identities = tuple(
+                dict.fromkeys(
+                    (str(candidate_project_id), str(candidate_trace_id))
+                    for candidate_project_id, candidate_trace_id in trace_identities
+                    if candidate_project_id and candidate_trace_id
+                )
+            )
+            requested_trace_id_set = set(normalized_trace_ids)
+            allowed_project_ids = (
+                set(self.project_ids or ())
+                if self.project_ids is not None
+                else {str(self.project_id)}
+            )
+            if not normalized_trace_identities or any(
+                candidate_project_id not in allowed_project_ids
+                or candidate_trace_id not in requested_trace_id_set
+                for candidate_project_id, candidate_trace_id in normalized_trace_identities
+            ):
+                raise ValueError("attribute hydration identities escaped request scope")
+
         params: dict[str, Any] = {
             **self.params,
-            "attr_trace_ids": tuple(trace_ids),
+            "attr_trace_identities": normalized_trace_identities,
+            "requested_attribute_keys": requested_keys,
         }
-        span_window = self._span_time_window(params)
         query = f"""
         SELECT
             toString(project_id) AS project_id,
             trace_id,
-            latest_attributes_extra AS attributes_extra,
-            latest_attrs_string AS attrs_string,
-            latest_attrs_number AS attrs_number,
-            latest_attrs_bool AS attrs_bool
+            attribute_key,
+            argMax(candidate_attribute_value_json, tuple(start_time, id))
+                AS attribute_value_json
         FROM (
             SELECT
                 project_id,
                 trace_id,
                 id,
                 start_time,
-                argMax(tuple(attributes_extra), _version).1
-                    AS latest_attributes_extra,
-                argMax(attrs_string, _version) AS latest_attrs_string,
-                argMax(attrs_number, _version) AS latest_attrs_number,
-                argMax(attrs_bool, _version) AS latest_attrs_bool,
-                argMax(is_deleted, _version) AS latest_is_deleted
-            FROM {self.TABLE}
-            PREWHERE trace_id IN %(attr_trace_ids)s
-              AND {self.project_filter_sql()}
-              {span_window}
-            GROUP BY project_id, trace_id, id, start_time
-        ) AS latest_physical_spans
-        WHERE latest_is_deleted = 0
-          AND (
-            latest_attributes_extra NOT IN ('', '{{}}', 'null')
-            OR length(mapKeys(latest_attrs_string)) > 0
-            OR length(mapKeys(latest_attrs_number)) > 0
-            OR length(mapKeys(latest_attrs_bool)) > 0
-          )
+                attribute_key,
+                multiIf(
+                    notEmpty(JSONExtractRaw(latest_attributes_extra, attribute_key)),
+                        JSONExtractRaw(latest_attributes_extra, attribute_key),
+                    mapContains(latest_attrs_bool, attribute_key),
+                        if(latest_attrs_bool[attribute_key] != 0, 'true', 'false'),
+                    mapContains(latest_attrs_number, attribute_key),
+                        if(
+                            isFinite(latest_attrs_number[attribute_key]),
+                            toString(latest_attrs_number[attribute_key]),
+                            'null'
+                        ),
+                    mapContains(latest_attrs_string, attribute_key),
+                        toJSONString(latest_attrs_string[attribute_key]),
+                    ''
+                ) AS candidate_attribute_value_json
+            FROM (
+                SELECT
+                    project_id,
+                    trace_id,
+                    id,
+                    start_time,
+                    argMax(tuple(attributes_extra), _version).1
+                        AS latest_attributes_extra,
+                    argMax(attrs_string, _version) AS latest_attrs_string,
+                    argMax(attrs_number, _version) AS latest_attrs_number,
+                    argMax(attrs_bool, _version) AS latest_attrs_bool,
+                    argMax(is_deleted, _version) AS latest_is_deleted
+                FROM {self.TABLE}
+                PREWHERE (toString(project_id), trace_id)
+                    IN %(attr_trace_identities)s
+                  AND {self.project_filter_sql()}
+                GROUP BY project_id, trace_id, id, start_time
+            ) AS latest_physical_spans
+            ARRAY JOIN %(requested_attribute_keys)s AS attribute_key
+            WHERE latest_is_deleted = 0
+        ) AS projected_attribute_values
+        WHERE notEmpty(candidate_attribute_value_json)
+        GROUP BY project_id, trace_id, attribute_key
         """
         return query, params
 
@@ -465,4 +548,6 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
         return super().build_count_query()
 
 
-__all__ = ["TraceListQueryBuilderV2"]
+__all__ = [
+    "TraceListQueryBuilderV2",
+]

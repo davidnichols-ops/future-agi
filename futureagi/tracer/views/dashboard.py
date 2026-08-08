@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
@@ -92,7 +92,10 @@ from tracer.services.exact_aggregation_cache import (
     read_or_schedule_exact_snapshot,
 )
 from tracer.utils.workspace_scope import project_queryset_for_request
-from tracer.views.span_attributes import SPAN_ATTRIBUTE_RETAINED_DATA_START
+from tracer.views.span_attributes import (
+    is_attribute_api_read_unavailable_error,
+    retained_attribute_window_start,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -1682,13 +1685,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 project_ids,
                                 window_end=window_end,
                             )
-                            window_start = (
-                                max(
-                                    SPAN_ATTRIBUTE_RETAINED_DATA_START,
-                                    retained_start,
-                                )
-                                if retained_start is not None
-                                else window_end - timedelta(microseconds=1)
+                            window_start = retained_attribute_window_start(
+                                retained_start,
+                                window_end=window_end,
                             )
                             segment_end = window_end
                             before_identity = None
@@ -1735,6 +1734,17 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             attribute_type=attribute_type,
                             continue_operation=not bool(cursor_token),
                         )
+                        if not page_read.metadata.query_complete:
+                            logger.warning(
+                                "filter_value_cursor_incomplete",
+                                metric_name=metric_name,
+                                error_code=page_read.metadata.query_error_code,
+                            )
+                            return self._gm.custom_error_response(
+                                status.HTTP_503_SERVICE_UNAVAILABLE,
+                                "Filter values are temporarily unavailable. Please retry.",
+                                code="service_unavailable",
+                            )
                         values = [
                             {
                                 "value": row.value,
@@ -1865,7 +1875,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 except InvalidAttributeKey:
                     return self._gm.bad_request("Invalid attribute key")
                 except Exception as exc:
-                    if is_clickhouse_api_read_unavailable_error(exc):
+                    if is_attribute_api_read_unavailable_error(exc):
                         logger.warning(
                             "filter_values_ch_query_unavailable",
                             metric_name=metric_name,

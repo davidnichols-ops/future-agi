@@ -142,8 +142,15 @@ def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
     assert "indexOfAssumeSorted(" in query
     assert "arrayFold(" not in query
     assert "graph_execution_groups" not in query
-    assert "graph_chronological_spans" in query
-    assert "range(1, length(graph_chronological_spans))" in query
+    # Both visualizations are different presentations of recorded
+    # parent_span_id topology. Timestamp order must never invent a transition
+    # between siblings.
+    assert "graph_chronological_spans" not in query
+    assert "range(1, length(graph_chronological_spans))" not in query
+    assert (
+        "'path',\n                                tupleElement(graph_id_sorted_spans["
+        in query
+    )
     assert "uniqExact(trace_id)" not in query
     assert "graph_trace_events AS" in query
     assert "graph_ranked_events AS" in query

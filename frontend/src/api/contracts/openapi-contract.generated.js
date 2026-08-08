@@ -36378,6 +36378,12 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "default": false
             }
           },
+          "attribute_keys": {
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           "allow_sampled": {
             "required": false,
             "schema": {

@@ -47,6 +47,9 @@ _CANDIDATE_WITNESS_PREFILTER_TOTAL_MS = 2_000
 _CANDIDATE_WITNESS_EXACT_RESERVE_MS = 1_000
 _UNINDEXED_POSITIVE_MICRO_SEED_TIMEOUT_MS = 200
 _UNINDEXED_POSITIVE_MICRO_SEED_MAX_BYTES = 96 * 1024 * 1024
+_EXACT_ZERO_PROBE_TIMEOUT_MS = 1_500
+_EXACT_ZERO_PROBE_MAX_BYTES = 256 * 1024 * 1024
+_EXACT_ZERO_FALLBACK_RESERVE_MS = 1_000
 # Trace/span list queries fetch one additional page-sized de-duplication
 # margin; 5,000 is also the existing server-side result ceiling used by those
 # endpoints.  Keeping one public ceiling makes numbered-page work finite for
@@ -1134,7 +1137,7 @@ def read_bounded_filter_page(
         except Exception as exc:
             if is_read_budget_error(exc):
                 error_code = "read_budget_exceeded"
-            elif kind in {"prefilter", "micro_seed"} and isinstance(
+            elif kind in {"prefilter", "micro_seed", "zero_probe"} and isinstance(
                 exc, (RuntimeError, TimeoutError)
             ):
                 # The witness probe is an optional optimization. Some guarded
@@ -1637,6 +1640,76 @@ def read_bounded_filter_page(
         return False
 
     try:
+        use_seed_loop = True
+        # A builder may expose a strict negative proof for a narrowly qualified
+        # positive filter conjunction. The query reads only exhaustive raw
+        # witnesses: zero rows is therefore conclusive, while any row (or any
+        # timeout/resource ceiling) is deliberately inconclusive and restores
+        # the ordinary latest-state selector unchanged. Keep one second for
+        # that fallback so this optimization can never consume the whole API
+        # deadline or turn an uncertain probe into a public empty page.
+        exact_zero_probe_builder = getattr(
+            builder, "build_filter_exact_zero_probe", None
+        )
+        exact_zero_probe_support = getattr(
+            builder, "supports_filter_exact_zero_probe", None
+        )
+        exact_zero_timeout_builder = getattr(
+            builder, "recommended_filter_exact_zero_probe_timeout_ms", None
+        )
+        exact_zero_bytes_builder = getattr(
+            builder, "recommended_filter_exact_zero_probe_max_bytes", None
+        )
+        exact_zero_timeout_ms = (
+            int(exact_zero_timeout_builder())
+            if callable(exact_zero_timeout_builder)
+            else _EXACT_ZERO_PROBE_TIMEOUT_MS
+        )
+        exact_zero_max_bytes = (
+            int(exact_zero_bytes_builder())
+            if callable(exact_zero_bytes_builder)
+            else _EXACT_ZERO_PROBE_MAX_BYTES
+        )
+        if not 25 <= exact_zero_timeout_ms <= _QUERY_TIMEOUT_MS:
+            raise ValueError("exact-zero probe timeout exceeds bounded contract")
+        if not 0 < exact_zero_max_bytes <= _READ_SETTINGS["max_bytes_to_read"]:
+            raise ValueError("exact-zero probe byte cap exceeds bounded contract")
+        exact_zero_can_run = bool(
+            probe_limits_enforced
+            and not workflow_exact
+            and not defer_classification
+            and not graph_key_witness_probe
+            and not anchor_probe_only
+            and page_number == 0
+            and cursor_key is None
+            and continuation_slice_end is None
+            and callable(exact_zero_probe_builder)
+            and callable(exact_zero_probe_support)
+            and exact_zero_probe_support()
+            and int((classification_deadline - monotonic()) * 1000)
+            >= exact_zero_timeout_ms + _EXACT_ZERO_FALLBACK_RESERVE_MS
+        )
+        if exact_zero_can_run:
+            try:
+                zero_query, zero_params = exact_zero_probe_builder()
+                zero_result = execute(
+                    kind="zero_probe",
+                    query=zero_query,
+                    params=zero_params,
+                    active_start=request_start,
+                    active_end=request_end,
+                    result_limit=1,
+                    timeout_cap_ms=exact_zero_timeout_ms,
+                    max_bytes_to_read_cap=exact_zero_max_bytes,
+                )
+                if not list(zero_result.data or []):
+                    page_complete = True
+                    use_seed_loop = False
+            except _BudgetExceeded:
+                # Optional proof only. Required seed/classify reads below retain
+                # the full fail-closed behavior and never publish probe rows.
+                pass
+
         # Positive call-type/JSON predicates have no skip index, so evaluating
         # them over an adaptive multi-day seed is the broad scan this reader is
         # designed to avoid. Give builders a small fixed-width raw predicate
@@ -1677,9 +1750,9 @@ def read_bounded_filter_page(
             if callable(micro_strata_builder) and micro_width is not None
             else None
         )
-        use_seed_loop = True
         if (
-            isinstance(micro_width, timedelta)
+            use_seed_loop
+            and isinstance(micro_width, timedelta)
             and micro_width > timedelta(0)
             and type(micro_strata) is int
             and 1 <= micro_strata <= _MAX_OPTIONAL_ANCHOR_STRATA

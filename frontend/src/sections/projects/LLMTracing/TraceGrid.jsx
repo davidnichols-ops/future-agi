@@ -48,6 +48,7 @@ import {
   resumeEmptyListPage,
 } from "./listCursorPagination";
 import { getListReadMessage, getListTotalState } from "./listTotalMetadata";
+import { getTraceAttributeRequestKey } from "./traceAttributeRequest";
 
 const ROWS_LIMIT = 25;
 const EMPTY_EXTRA_FILTERS = [];
@@ -107,6 +108,10 @@ const TraceGrid = React.forwardRef(
     useEffect(() => {
       columnsRef.current = columns;
     }, [columns]);
+    const requestedAttributeKeysKey = useMemo(
+      () => getTraceAttributeRequestKey(columns),
+      [columns],
+    );
 
     // Prefetch cache: stores next page data so scroll feels instant
     const prefetchCache = useRef(new Map());
@@ -135,6 +140,7 @@ const TraceGrid = React.forwardRef(
           hasEvalFilter,
           dateInterval,
           projectId,
+          requestedAttributeKeys: requestedAttributeKeysKey,
           enabled,
         }),
       [
@@ -144,6 +150,7 @@ const TraceGrid = React.forwardRef(
         hasEvalFilter,
         dateInterval,
         projectId,
+        requestedAttributeKeysKey,
         enabled,
       ],
     );
@@ -273,6 +280,11 @@ const TraceGrid = React.forwardRef(
                   // detail page).
                   ...(projectId ? { project_id: projectId } : {}),
                   page_size: ROWS_LIMIT,
+                  // JSON preserves attribute paths containing commas. The API
+                  // rejects oversized requests; neither side truncates.
+                  ...(requestedAttributeKeysKey === "[]"
+                    ? {}
+                    : { attribute_keys: requestedAttributeKeysKey }),
                   filters: JSON.stringify(
                     toBackendFilters([
                       ...filters,
@@ -500,6 +512,7 @@ const TraceGrid = React.forwardRef(
         hasEvalFilter,
         enabled,
         dateInterval,
+        requestedAttributeKeysKey,
       ],
     );
 

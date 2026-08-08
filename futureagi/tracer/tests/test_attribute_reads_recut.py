@@ -59,6 +59,7 @@ from tracer.services.clickhouse.attribute_reads import (
     AttributeQueryPage,
     AttributeReadMetadata,
     AttributeReadSelector,
+    AttributeValueCursorPageRead,
     AttributeValueRead,
     AttributeValueRow,
     IncompleteLatestStateReplay,
@@ -132,6 +133,20 @@ def test_attribute_metadata_distinguishes_samples_from_incomplete_reads():
 
     assert sampled.public_payload()["query_status"] == "sampled"
     assert degraded.public_payload()["query_status"] == "degraded"
+
+
+def test_retained_attribute_window_start_normalizes_only_datetime_or_none():
+    from tracer.views.span_attributes import retained_attribute_window_start
+
+    naive_start = datetime(2025, 8, 1)
+    assert retained_attribute_window_start(naive_start, window_end=NOW) == (
+        naive_start.replace(tzinfo=UTC)
+    )
+    assert retained_attribute_window_start(None, window_end=NOW) == (
+        NOW - timedelta(microseconds=1)
+    )
+    with pytest.raises(TypeError, match="must be a datetime or None"):
+        retained_attribute_window_start(MagicMock(), window_end=NOW)
 
 
 def test_merged_attribute_metadata_never_hides_a_degraded_phase():
@@ -6680,6 +6695,107 @@ def test_span_attribute_key_api_cursor_binds_and_continues_exact_search(monkeypa
     assert calls[1][1]["exact_key"] == "final_status"
 
 
+@pytest.mark.parametrize("failure_stage", ["retained_window", "cursor_page"])
+@pytest.mark.parametrize(
+    "failure_code",
+    [
+        pytest.param(None, id="request-wall-deadline"),
+        pytest.param(159, id="clickhouse-timeout"),
+        pytest.param(241, id="clickhouse-memory-budget"),
+        pytest.param(497, id="clickhouse-read-permission"),
+    ],
+)
+def test_span_attribute_key_cursor_operational_failures_are_sanitized_503(
+    monkeypatch, failure_stage, failure_code
+):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    def fail(*_args, **_kwargs):
+        if failure_code is None:
+            raise ReadDeadlineExceeded("private key cursor deadline")
+        raise ServerException("private key cursor ClickHouse detail", failure_code)
+
+    if failure_stage == "retained_window":
+        monkeypatch.setattr(AttributeReadSelector, "retained_window_start", fail)
+        monkeypatch.setattr(
+            AttributeReadSelector,
+            "read_key_cursor_page",
+            lambda *_args, **_kwargs: pytest.fail(
+                "cursor read crossed a failed retained-window preflight"
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            AttributeReadSelector,
+            "retained_window_start",
+            lambda _self, _projects, *, window_end: NOW - timedelta(days=400),
+        )
+        monkeypatch.setattr(AttributeReadSelector, "read_key_cursor_page", fail)
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
+    request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"project_id": PROJECT_A, "page_size": 10},
+    )
+
+    response = SpanAttributeKeysView.as_view()(request)
+
+    assert response.status_code == 503
+    assert response.data["code"] == "service_unavailable"
+    payload = json.dumps(response.data)
+    assert "temporarily unavailable" in payload
+    assert "private key cursor" not in payload
+    assert "next_cursor" not in payload
+    assert "has_more" not in payload
+    assert "query_complete" not in payload
+
+
+def test_span_attribute_key_cursor_incomplete_metadata_is_a_sanitized_503(
+    monkeypatch,
+):
+    from tracer.views.span_attributes import SpanAttributeKeysView
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "retained_window_start",
+        lambda _self, _projects, *, window_end: NOW - timedelta(days=400),
+    )
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "read_key_cursor_page",
+        lambda _self, _project_ids, **kwargs: AttributeKeyCursorPageRead(
+            (AttributeKeyRow("final_status", "string", 1),),
+            _metadata(complete=False, error_code="read_budget_exceeded"),
+            True,
+            "continuation",
+            kwargs["window_end"],
+            None,
+            None,
+            0,
+            (attribute_key_cursor_digest("final_status"),),
+        ),
+    )
+    monkeypatch.setattr(
+        "tracer.views.span_attributes._project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
+    request = _authenticated_get(
+        "/api/traces/span-attribute-keys/",
+        {"project_id": PROJECT_A, "page_size": 10},
+    )
+
+    response = SpanAttributeKeysView.as_view()(request)
+
+    assert response.status_code == 503
+    payload = json.dumps(response.data)
+    assert "temporarily unavailable" in payload
+    assert "final_status" not in payload
+    assert "read_budget_exceeded" not in payload
+    assert "next_cursor" not in payload
+
+
 def _max_entropy_physical_id(label: str, length: int = 255) -> str:
     encoded = ""
     index = 0
@@ -7036,8 +7152,17 @@ def test_dashboard_budget_errors_return_sanitized_503_and_are_not_retried(
     assert calls == 1
 
 
-def test_dashboard_cursor_budget_failure_returns_503_without_values_or_cursor(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "failure_code",
+    [
+        pytest.param(None, id="request-wall-deadline"),
+        pytest.param(159, id="clickhouse-timeout"),
+        pytest.param(241, id="clickhouse-memory-budget"),
+        pytest.param(497, id="clickhouse-read-permission"),
+    ],
+)
+def test_dashboard_cursor_operational_failure_returns_503_without_values_or_cursor(
+    monkeypatch, failure_code
 ):
     from tracer.views.dashboard import DashboardViewSet
 
@@ -7047,7 +7172,9 @@ def test_dashboard_cursor_budget_failure_returns_503_without_values_or_cursor(
         nonlocal calls
         calls += 1
         assert "version_ceiling" not in kwargs
-        raise ReadDeadlineExceeded("private cursor deadline")
+        if failure_code is None:
+            raise ReadDeadlineExceeded("private cursor deadline")
+        raise ServerException("private cursor ClickHouse detail", failure_code)
 
     monkeypatch.setattr(AttributeReadSelector, "read_value_cursor_page", fail)
     monkeypatch.setattr(
@@ -7077,8 +7204,57 @@ def test_dashboard_cursor_budget_failure_returns_503_without_values_or_cursor(
     payload = json.dumps(response.data)
     assert "temporarily unavailable" in payload
     assert "private cursor deadline" not in payload
+    assert "private cursor ClickHouse detail" not in payload
     assert "next_cursor" not in payload
     assert '"values"' not in payload
+
+
+def test_dashboard_cursor_incomplete_metadata_is_a_sanitized_503(monkeypatch):
+    from tracer.views.dashboard import DashboardViewSet
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "read_value_cursor_page",
+        lambda _self, _project_ids, _key, **kwargs: AttributeValueCursorPageRead(
+            (AttributeValueRow("Rechazado", "string", 1),),
+            _metadata(complete=False, error_code="read_budget_exceeded"),
+            True,
+            kwargs["window_end"],
+            None,
+            None,
+            0,
+            (attribute_value_cursor_digest("string", "Rechazado"),),
+            "continuation",
+        ),
+    )
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        "retained_window_start",
+        lambda _self, _projects, *, window_end: NOW - timedelta(days=400),
+    )
+    monkeypatch.setattr(
+        "tracer.views.dashboard.project_queryset_for_request",
+        lambda _request: _ProjectScope([PROJECT_A]),
+    )
+    request = _authenticated_get(
+        "/tracer/dashboard/filter_values/",
+        {
+            "metric_name": "final_status",
+            "metric_type": "custom_attribute",
+            "project_ids": PROJECT_A,
+            "source": "traces",
+            "page_size": 10,
+        },
+    )
+
+    response = DashboardViewSet.as_view({"get": "filter_values"})(request)
+
+    assert response.status_code == 503
+    payload = json.dumps(response.data)
+    assert "temporarily unavailable" in payload
+    assert "Rechazado" not in payload
+    assert "read_budget_exceeded" not in payload
+    assert "next_cursor" not in payload
 
 
 def test_eval_picker_uses_selector_for_keys_and_cardinality_without_pg_fallback(
@@ -7680,17 +7856,27 @@ def test_span_attribute_detail_schedule_failure_is_sanitized(monkeypatch):
         ),
     ],
 )
-def test_span_attribute_views_degrade_typed_transient_failures(
+@pytest.mark.parametrize(
+    "failure_code",
+    [
+        pytest.param(159, id="clickhouse-timeout"),
+        pytest.param(210, id="clickhouse-network"),
+        pytest.param(241, id="clickhouse-memory-budget"),
+        pytest.param(497, id="clickhouse-read-permission"),
+    ],
+)
+def test_span_attribute_views_return_sanitized_503_for_operational_failures(
     monkeypatch,
     view_name,
     selector_method,
     path,
     params,
+    failure_code,
 ):
     from tracer.views import span_attributes
 
     def fail(*_args, **_kwargs):
-        raise ServerException("secret network detail", 210)
+        raise ServerException("secret ClickHouse detail", failure_code)
 
     monkeypatch.setattr(AttributeReadSelector, selector_method, fail)
     monkeypatch.setattr(
@@ -7702,11 +7888,71 @@ def test_span_attribute_views_degrade_typed_transient_failures(
 
     response = getattr(span_attributes, view_name).as_view()(request)
 
-    assert response.status_code == 200
-    assert response.data["query_complete"] is False
-    assert response.data["query_status"] == "degraded"
-    assert response.data["query_error_code"] == "query_failed"
-    assert "secret network detail" not in json.dumps(response.data)
+    assert response.status_code == 503
+    assert response.data["code"] == "service_unavailable"
+    payload = json.dumps(response.data)
+    assert "temporarily unavailable" in payload
+    assert "secret ClickHouse detail" not in payload
+    assert "query_complete" not in payload
+    assert "query_status" not in payload
+    assert "query_error_code" not in payload
+
+
+@pytest.mark.parametrize(
+    ("view_name", "selector_method", "read_result", "path", "params"),
+    [
+        (
+            "SpanAttributeKeysView",
+            "discover_keys",
+            AttributeKeyRead(
+                (AttributeKeyRow("final_status", "string", 1),),
+                _metadata(complete=False, error_code="read_budget_exceeded"),
+            ),
+            "/api/traces/span-attribute-keys/",
+            {"project_id": PROJECT_A},
+        ),
+        (
+            "SpanAttributeValuesView",
+            "read_values",
+            AttributeValueRead(
+                (AttributeValueRow("Rechazado", "string", 1),),
+                _metadata(complete=False, error_code="read_budget_exceeded"),
+            ),
+            "/api/traces/span-attribute-values/",
+            {"project_id": PROJECT_A, "key": "final_status"},
+        ),
+    ],
+)
+def test_span_attribute_views_reject_incomplete_selector_metadata(
+    monkeypatch,
+    view_name,
+    selector_method,
+    read_result,
+    path,
+    params,
+):
+    from tracer.views import span_attributes
+
+    monkeypatch.setattr(
+        AttributeReadSelector,
+        selector_method,
+        lambda *_args, **_kwargs: read_result,
+    )
+    monkeypatch.setattr(
+        span_attributes,
+        "_project_is_in_request_scope",
+        lambda _request, _project_id: True,
+    )
+    request = _authenticated_get(path, params)
+
+    response = getattr(span_attributes, view_name).as_view()(request)
+
+    assert response.status_code == 503
+    payload = json.dumps(response.data)
+    assert "temporarily unavailable" in payload
+    assert "read_budget_exceeded" not in payload
+    assert "final_status" not in payload
+    assert "Rechazado" not in payload
 
 
 @pytest.mark.parametrize(

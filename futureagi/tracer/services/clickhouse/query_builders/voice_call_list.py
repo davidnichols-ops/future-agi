@@ -389,9 +389,172 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
     def filter_seed_proves_result_order(self) -> bool:
         return self._bounded_delegate().filter_seed_proves_result_order()
 
+    def recommended_filter_seed_batch_size(self) -> int:
+        """Acquire the same finite root batch as the delegated trace selector."""
+
+        return self._bounded_delegate().recommended_filter_seed_batch_size()
+
+    def recommended_filter_classify_batch_size(self) -> int | None:
+        """Retain the trace selector's filter-shape-specific safety ceiling."""
+
+        return self._bounded_delegate().recommended_filter_classify_batch_size()
+
+    def _filter_exact_zero_probe_plans(self) -> tuple[Any, list[Any]] | None:
+        """Return scalar Map leaves eligible for an exact negative proof.
+
+        The probe reads physical raw witnesses, which are a superset of
+        latest-live membership.  Therefore an exhausted intersection proves
+        exact zero, while any returned trace merely falls back to the normal
+        latest-state selector.  Restrict the optimization to the two-or-more
+        positive scalar equality/IN shapes whose compiler explicitly exposes
+        that exhaustive raw witness.
+        """
+
+        if (
+            self._bounded_internal_scan
+            or self._bounded_identity_only
+            or self.project_ids is not None
+            or not self.project_id
+        ):
+            return None
+
+        delegate = self._bounded_delegate()
+        plans, residual_filters = delegate._partition_trace_filter_plans(
+            delegate._bounded_filters()
+        )
+        if residual_filters:
+            return None
+        root_plans = [plan for plan in plans if plan.scope == "root"]
+        any_span_plans = [plan for plan in plans if plan.scope == "any"]
+        # The only root predicate must be the private conversation invariant
+        # injected by ``_bounded_delegate``.  Extra root/residual semantics stay
+        # on the ordinary exact selector rather than broadening this fast path.
+        if (
+            len(root_plans) != 1
+            or "observation_type" not in root_plans[0].seed_predicate
+            or not any(
+                value == "conversation" for value in root_plans[0].params.values()
+            )
+            or len(any_span_plans) < 2
+        ):
+            return None
+
+        for plan in any_span_plans:
+            raw_witness = str(plan.raw_witness_predicate or "")
+            seed_predicate = str(plan.seed_predicate or "")
+            if (
+                plan.raw_witness_rank != 0
+                or len(plan.aggregates) != 2
+                or not raw_witness
+                or "JSONExtract" in raw_witness
+                or "mapContains(span_attr_" not in seed_predicate
+            ):
+                return None
+        return root_plans[0], any_span_plans
+
+    def supports_filter_exact_zero_probe(self) -> bool:
+        """Whether this public voice page can prove a zero-result conjunction."""
+
+        return self._filter_exact_zero_probe_plans() is not None
+
     @staticmethod
-    def recommended_filter_classify_batch_size() -> int:
-        return 50
+    def recommended_filter_exact_zero_probe_timeout_ms() -> int:
+        return 1_500
+
+    @staticmethod
+    def recommended_filter_exact_zero_probe_max_bytes() -> int:
+        return 256 * 1024 * 1024
+
+    def build_filter_exact_zero_probe(self) -> tuple[str, dict[str, Any]]:
+        """Build an exact-zero proof for independent any-span Map leaves.
+
+        Each UNION branch is an exhaustive *raw* witness for one positive
+        latest-state filter.  The outer GROUP BY intersects those witnesses by
+        trace, preserving the documented semantics that separate sibling spans
+        may satisfy separate leaves.  Returning no row is conclusive because a
+        latest-live match must have a corresponding physical raw witness.
+        Returning a row is intentionally inconclusive (it may be stale or
+        deleted) and the caller continues through the exact latest-state path.
+        """
+
+        probe_plans = self._filter_exact_zero_probe_plans()
+        if probe_plans is None:
+            raise ValueError("exact-zero probe is unavailable for this filter shape")
+        root_plan, any_span_plans = probe_plans
+
+        request_start, request_end = self._bounded_request_window
+        params: dict[str, Any] = {
+            **self.params,
+            "exact_zero_start_us": _unix_microseconds(request_start),
+            "exact_zero_end_us": _unix_microseconds(request_end),
+        }
+        params.update(root_plan.params)
+        branches: list[str] = [
+            f"""
+            SELECT trace_id, toUInt16(0) AS witness_kind
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND toDate(start_time) >= toDate(fromUnixTimestamp64Micro(%(exact_zero_start_us)s))
+              AND toDate(start_time) <= toDate(fromUnixTimestamp64Micro(%(exact_zero_end_us)s))
+              AND start_time >= fromUnixTimestamp64Micro(%(exact_zero_start_us)s)
+              AND start_time < fromUnixTimestamp64Micro(%(exact_zero_end_us)s)
+            WHERE (parent_span_id IS NULL OR parent_span_id = '')
+              AND ({root_plan.seed_predicate})
+            GROUP BY trace_id
+            """
+        ]
+        witness_conditions: list[str] = ["countIf(witness_kind = 0) > 0"]
+        for witness_index, plan in enumerate(any_span_plans, start=1):
+            params.update(plan.params)
+            branches.append(
+                f"""
+                SELECT trace_id, toUInt16({witness_index}) AS witness_kind
+                FROM {self.TABLE}
+                PREWHERE {self.project_filter_sql()}
+                  AND toDate(start_time) >= toDate(fromUnixTimestamp64Micro(%(exact_zero_start_us)s))
+                  AND toDate(start_time) <= toDate(fromUnixTimestamp64Micro(%(exact_zero_end_us)s))
+                  AND start_time >= fromUnixTimestamp64Micro(%(exact_zero_start_us)s)
+                  AND start_time < fromUnixTimestamp64Micro(%(exact_zero_end_us)s)
+                WHERE {plan.raw_witness_predicate}
+                GROUP BY trace_id
+                """
+            )
+            witness_conditions.append(f"countIf(witness_kind = {witness_index}) > 0")
+
+        query = f"""
+        SELECT trace_id
+        FROM (
+            {" UNION ALL ".join(branches)}
+        ) AS raw_filter_witnesses
+        GROUP BY trace_id
+        HAVING {" AND ".join(witness_conditions)}
+        LIMIT 1
+        """
+        return query, params
+
+    def recommended_filter_classify_read_settings(self) -> dict[str, int] | None:
+        """Retain the trace classifier's structured-attribute block ceiling."""
+
+        return self._bounded_delegate().recommended_filter_classify_read_settings()
+
+    def use_identity_only_filter_classification(self) -> bool:
+        """Hydrate presentation columns only after an interactive page is proven.
+
+        Historical/internal selectors can request thousands of identities and
+        deliberately retain their one-phase membership projection. Public voice
+        pages are bounded to the trace hydration contract and benefit from the
+        same lightweight candidate classifier used by the trace grid.
+        """
+
+        return bool(
+            not self._bounded_internal_scan
+            and not self._bounded_identity_only
+            and self.page_size <= 512
+        )
+
+    @staticmethod
+    def recommended_filter_page_hydration_reserve_ms() -> int:
+        return TraceListQueryBuilder.recommended_filter_page_hydration_reserve_ms()
 
     def build_filter_seed_page(self, **kwargs: Any) -> tuple[str, dict[str, Any]]:
         return self._bounded_delegate().build_filter_seed_page(**kwargs)
@@ -407,6 +570,42 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
     def bounded_filter_seed_order_token(self, row: dict[str, Any]) -> Any:
         return self._bounded_delegate().bounded_filter_seed_order_token(row)
 
+    def bounded_filter_row_identity(self, row: dict[str, Any]) -> Any:
+        return self._bounded_delegate().bounded_filter_row_identity(row)
+
+    def bounded_filter_row_order_token(self, row: dict[str, Any]) -> Any:
+        return self._bounded_delegate().bounded_filter_row_order_token(row)
+
+    def bounded_filter_page_hydration_identity(self, row: dict[str, Any]) -> Any:
+        return self._bounded_delegate().bounded_filter_page_hydration_identity(row)
+
+    def build_filter_match_query_from_seed_rows(
+        self, candidate_rows: list[dict[str, Any]]
+    ) -> tuple[str, dict[str, Any]]:
+        query, params = (
+            self._bounded_delegate().build_filter_match_query_from_seed_rows(
+                candidate_rows
+            )
+        )
+        return self._apply_bounded_voice_constraints(query, params)
+
+    def build_filter_identity_match_query_from_seed_rows(
+        self, candidate_rows: list[dict[str, Any]]
+    ) -> tuple[str, dict[str, Any]]:
+        query, params = (
+            self._bounded_delegate().build_filter_identity_match_query_from_seed_rows(
+                candidate_rows
+            )
+        )
+        return self._apply_bounded_voice_constraints(query, params)
+
+    def build_filter_page_hydration_query(
+        self, candidate_rows: list[dict[str, Any]]
+    ) -> tuple[str, dict[str, Any]]:
+        return self._bounded_delegate().build_filter_page_hydration_query(
+            candidate_rows
+        )
+
     def build_filter_match_query(
         self,
         candidate_ids: list[str],
@@ -419,6 +618,18 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
             candidate_ids,
             candidate_full_state=candidate_full_state,
         )
+        if not query:
+            return query, params
+
+        return self._apply_bounded_voice_constraints(query, params)
+
+    def _apply_bounded_voice_constraints(
+        self,
+        query: str,
+        params: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """Apply voice-only simulator/sampling predicates to a finite classifier."""
+
         if not query:
             return query, params
 

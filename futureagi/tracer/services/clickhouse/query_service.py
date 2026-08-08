@@ -34,6 +34,10 @@ from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 logger = structlog.get_logger(__name__)
 
 
+class SpanTraceMapIntegrityError(ReadDeadlineExceeded):
+    """A finite scored span did not resolve to one unambiguous live trace."""
+
+
 _PAGE_EVAL_READ_SETTINGS = {
     "max_threads": 2,
     "max_rows_to_read": 2_000_000,
@@ -429,36 +433,248 @@ class AnalyticsQueryService:
         end_date: datetime | None = None,
         timeout_ms: int = 10000,
         settings: dict | None = None,
-    ) -> dict[str, str]:
-        """Map span id -> trace id for spans in the given traces (CH-native).
+        scored_span_ids: list[str] | tuple[str, ...] | None = None,
+        trace_identities: list[tuple[str, str]]
+        | tuple[tuple[str, str], ...]
+        | None = None,
+        scored_span_identities: list[tuple[str, str]]
+        | tuple[tuple[str, str], ...]
+        | None = None,
+    ) -> dict[Any, Any]:
+        """Map scored span id -> trace id for spans in the given traces.
 
         ``project_id`` prunes the scan to the partition/PK prefix; the
         ``start_date``/``end_date`` window (widened one day each side to cover a
-        trace's full duration) prunes partitions. Without them the query is a
-        full-table scan.
+        trace's full duration) prunes partitions.  Annotation callers also pass
+        the finite set of ``Score.observation_span_id`` values discovered in
+        PostgreSQL.  That predicate is load-bearing: a trace may contain an
+        arbitrary number of unannotated spans, and materializing all of them
+        merely to find the handful with scores can exhaust ClickHouse memory.
+
+        ``scored_span_ids=None`` retains the generic compatibility shape for
+        non-annotation callers.  An explicitly empty collection is a proven
+        no-op and skips ClickHouse entirely.  Matching ids are packed per trace
+        and expanded here, preserving every scored physical identity without a
+        result row per span.
         """
-        if not trace_ids:
+        pair_scoped = trace_identities is not None or scored_span_identities is not None
+        normalized_trace_identities: tuple[tuple[str, str], ...] | None = None
+        normalized_scored_span_identities: tuple[tuple[str, str], ...] | None = None
+        if pair_scoped:
+            normalized_trace_identities = tuple(
+                dict.fromkeys(
+                    (str(candidate_project_id), str(candidate_trace_id))
+                    for candidate_project_id, candidate_trace_id in (
+                        trace_identities or ()
+                    )
+                    if candidate_project_id and candidate_trace_id
+                )
+            )
+            normalized_scored_span_identities = tuple(
+                dict.fromkeys(
+                    (str(candidate_project_id), str(candidate_span_id))
+                    for candidate_project_id, candidate_span_id in (
+                        scored_span_identities or ()
+                    )
+                    if candidate_project_id and candidate_span_id
+                )
+            )
+            if not normalized_trace_identities or not normalized_scored_span_identities:
+                return {}
+        elif not trace_ids:
             return {}
-        params: dict[str, Any] = {"trace_ids": trace_ids}
-        where = ["trace_id IN %(trace_ids)s", "is_deleted = 0"]
-        if project_id is not None:
+        normalized_scored_span_ids: tuple[str, ...] | None = None
+        if scored_span_ids is not None:
+            normalized_scored_span_ids = tuple(
+                dict.fromkeys(str(span_id) for span_id in scored_span_ids if span_id)
+            )
+            if not normalized_scored_span_ids:
+                return {}
+        params: dict[str, Any] = {}
+        if pair_scoped:
+            params["trace_identities"] = normalized_trace_identities
+            params["scored_span_identities"] = normalized_scored_span_identities
+            where = [
+                "(toString(project_id), toString(id)) IN %(scored_span_identities)s"
+            ]
+        else:
+            params["trace_ids"] = trace_ids
+            where = ["trace_id IN %(trace_ids)s", "is_deleted = 0"]
+        if normalized_scored_span_ids is not None and not pair_scoped:
+            params["scored_span_ids"] = normalized_scored_span_ids
+            where.append("id IN %(scored_span_ids)s")
+        if project_id is not None and not pair_scoped:
             params["project_id"] = project_id
             where.append("project_id = %(project_id)s")
-        if start_date is not None and end_date is not None:
+        # A scored child may legitimately start more than one day after its
+        # root. Once both the page trace ids and finite scored-span ids are
+        # known, those identities are a stronger exact bound than a heuristic
+        # date window. Keep the historical window only for generic callers
+        # that did not provide scored identities.
+        if (
+            not pair_scoped
+            and normalized_scored_span_ids is None
+            and start_date is not None
+            and end_date is not None
+        ):
             params["start_date"] = start_date
             params["end_date"] = end_date
             where.append(
                 "start_time >= %(start_date)s - INTERVAL 1 DAY "
                 "AND start_time < %(end_date)s + INTERVAL 1 DAY"
             )
+        # Resolve ReplacingMergeTree state before checking live membership.
+        # Filtering ``is_deleted = 0`` in the physical scan resurrects an older
+        # version after a tombstone. A span id can also be reused/reassigned;
+        # retain every live candidate trace so Python can reject ambiguity.
+        physical_where = (
+            list(where)
+            if pair_scoped
+            else [
+                predicate
+                for predicate in where
+                if predicate != "trace_id IN %(trace_ids)s"
+                and predicate != "is_deleted = 0"
+                and not predicate.startswith("start_time >=")
+            ]
+        )
+        window_fragment = ""
+        if (
+            not pair_scoped
+            and normalized_scored_span_ids is None
+            and start_date is not None
+            and end_date is not None
+        ):
+            window_fragment = (
+                "AND start_time >= %(start_date)s - INTERVAL 1 DAY "
+                "AND start_time < %(end_date)s + INTERVAL 1 DAY"
+            )
+        mapping_columns = (
+            "project_id_string, span_id, live_trace_ids"
+            if pair_scoped
+            else "span_id, live_trace_ids"
+        )
+        candidate_project_projection = "project_id_string," if pair_scoped else ""
+        candidate_group_by = "project_id_string, span_id" if pair_scoped else "span_id"
+        membership_predicate = (
+            "(project_id_string, latest_trace_id) IN %(trace_identities)s"
+            if pair_scoped
+            else "latest_trace_id IN %(trace_ids)s"
+        )
+        query = f"""
+        SELECT groupArray(tuple({mapping_columns})) AS span_mappings
+        FROM (
+            SELECT
+                {candidate_project_projection}
+                span_id,
+                groupUniqArray(latest_trace_id) AS live_trace_ids
+            FROM (
+                SELECT
+                    project_id,
+                    toString(project_id) AS project_id_string,
+                    toString(id) AS span_id,
+                    start_time,
+                    toString(argMax(trace_id, _version)) AS latest_trace_id,
+                    argMax(is_deleted, _version) AS latest_is_deleted
+                FROM spans
+                WHERE {" AND ".join(physical_where) or "1"}
+                  {window_fragment}
+                GROUP BY project_id, id, start_time
+            ) AS latest_physical_spans
+            WHERE latest_is_deleted = 0
+              AND {membership_predicate}
+            GROUP BY {candidate_group_by}
+        ) AS scored_span_candidates
+        """
         result = self.execute_ch_query(
-            "SELECT toString(id) AS span_id, toString(trace_id) AS trace_id "
-            f"FROM spans WHERE {' AND '.join(where)}",
+            query,
             params,
             timeout_ms=timeout_ms,
             settings=settings,
         )
-        return {r["span_id"]: r["trace_id"] for r in result.data}
+        span_trace_map: dict[Any, Any] = {}
+        for row in result.data:
+            mappings = row.get("span_mappings")
+            if mappings is not None:
+                for mapping in mappings or ():
+                    expected_mapping_size = 3 if pair_scoped else 2
+                    if (
+                        not isinstance(mapping, (list, tuple))
+                        or len(mapping) != expected_mapping_size
+                    ):
+                        raise SpanTraceMapIntegrityError(
+                            "invalid scored span mapping payload"
+                        )
+                    if pair_scoped:
+                        mapping_project_id, span_id, trace_candidates = mapping
+                    else:
+                        span_id, trace_candidates = mapping
+                    candidates = tuple(
+                        dict.fromkeys(
+                            str(trace_id)
+                            for trace_id in (trace_candidates or ())
+                            if trace_id
+                        )
+                    )
+                    if len(candidates) != 1:
+                        raise SpanTraceMapIntegrityError(
+                            "scored span resolves to ambiguous live traces"
+                        )
+                    if span_id:
+                        if pair_scoped:
+                            if not mapping_project_id:
+                                raise SpanTraceMapIntegrityError(
+                                    "scored span mapping omitted project identity"
+                                )
+                            project_key = str(mapping_project_id)
+                            if (
+                                project_key,
+                                str(span_id),
+                            ) not in normalized_scored_span_identities or (
+                                project_key,
+                                candidates[0],
+                            ) not in normalized_trace_identities:
+                                raise SpanTraceMapIntegrityError(
+                                    "scored span mapping escaped candidate identities"
+                                )
+                            span_trace_map[(project_key, str(span_id))] = (
+                                project_key,
+                                candidates[0],
+                            )
+                        else:
+                            span_trace_map[str(span_id)] = candidates[0]
+                continue
+            trace_id = str(row.get("trace_id") or "")
+            row_project_id = str(row.get("project_id") or "")
+            packed_span_ids = row.get("span_ids")
+            if packed_span_ids is None:
+                # Compatibility for alternative services and focused mocks
+                # that still emit the historical expanded row shape.
+                packed_span_ids = [row.get("span_id")]
+            for span_id in packed_span_ids or ():
+                if span_id and trace_id:
+                    if pair_scoped:
+                        if not row_project_id:
+                            raise SpanTraceMapIntegrityError(
+                                "scored span mapping omitted project identity"
+                            )
+                        if (
+                            row_project_id,
+                            str(span_id),
+                        ) not in normalized_scored_span_identities or (
+                            row_project_id,
+                            trace_id,
+                        ) not in normalized_trace_identities:
+                            raise SpanTraceMapIntegrityError(
+                                "scored span mapping escaped candidate identities"
+                            )
+                        span_trace_map[(row_project_id, str(span_id))] = (
+                            row_project_id,
+                            trace_id,
+                        )
+                    else:
+                        span_trace_map[str(span_id)] = trace_id
+        return span_trace_map
 
     def get_children_eval_metrics_ch(
         self,

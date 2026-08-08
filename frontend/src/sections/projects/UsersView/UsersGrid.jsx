@@ -179,6 +179,22 @@ const UsersGrid = React.memo(
       return result;
     }, [columns]);
 
+    const requestedProjection = useMemo(() => {
+      const visible = Array.isArray(columns)
+        ? columns.filter((column) => column?.isVisible !== false)
+        : [];
+      return {
+        requestedColumns: visible
+          .filter((column) => column?.groupBy !== "Custom Columns")
+          .map((column) => column.id)
+          .filter(Boolean),
+        attributeKeys: visible
+          .filter((column) => column?.groupBy === "Custom Columns")
+          .map((column) => column.id)
+          .filter(Boolean),
+      };
+    }, [columns]);
+
     const dataSource = useMemo(() => {
       cursorPagination.current.reset();
       cursorQueryKeyRef.current = null;
@@ -260,6 +276,8 @@ const UsersGrid = React.memo(
               search: debouncedSearchQuery || "",
               filters: validatedFilters,
               sort: sortParams,
+              requestedColumns: requestedProjection.requestedColumns,
+              attributeKeys: requestedProjection.attributeKeys,
               pageSize,
             });
             if (cursorQueryKeyRef.current !== queryKey) {
@@ -285,6 +303,10 @@ const UsersGrid = React.memo(
                 : null,
               page_size: pageSize,
               filters: JSON.stringify(validatedFilters),
+              requested_columns: JSON.stringify(
+                requestedProjection.requestedColumns,
+              ),
+              attribute_keys: JSON.stringify(requestedProjection.attributeKeys),
             });
             const buildParams = (page) =>
               cursorPagination.current.requestParams(page, buildBaseParams());
@@ -459,6 +481,7 @@ const UsersGrid = React.memo(
       setSearchState,
       hasActiveFilter,
       sortStorageKey,
+      requestedProjection,
     ]);
 
     const defaultColDef = useMemo(

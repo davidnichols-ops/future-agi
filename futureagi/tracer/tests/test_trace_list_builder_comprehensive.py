@@ -659,14 +659,65 @@ class TestEvalQueryDeletionPredicate:
         assert "latest_state_0 = 0" in query
         assert "(latest_state_1 = 0 OR latest_state_1 IS NULL)" in query
 
-    def test_created_at_pruning_only_after_build(self, project_id):
-        # build_eval_query guards the created_at fragment on self.start_date
+    def test_eval_replay_does_not_drop_late_evals_for_old_traces(self, project_id):
         builder = TraceListQueryBuilder(project_id=project_id, eval_config_ids=["ec1"])
-        # no prior build(): start_date is None → no created_at fragment
         query_no_build, _ = builder.build_eval_query(["t1"])
         assert "created_at >= %(start_date)s" not in query_no_build
 
-        builder.build()  # sets start_date
+        # Even after build() captures the trace window, eval identity is the
+        # finite trace/config pair. Evals may be run days or months later.
+        builder.build()
         query_after, params = builder.build_eval_query(["t1"])
-        assert "created_at >= %(start_date)s - INTERVAL 1 DAY" in query_after
-        assert "start_date" in params
+        assert "created_at >= %(start_date)s" not in query_after
+        assert "start_date" not in params
+        assert params["trace_ids"] == ("t1",)
+        assert params["eval_config_ids"] == ("ec1",)
+
+    def test_page_500_by_11_eval_replay_is_packed_below_result_row_cap(
+        self, project_id
+    ):
+        trace_ids = [f"trace-{index}" for index in range(500)]
+        config_ids = [f"config-{index}" for index in range(11)]
+        builder = TraceListQueryBuilder(
+            project_id=project_id,
+            eval_config_ids=config_ids,
+        )
+
+        query, params = builder.build_eval_replay_query(trace_ids)
+
+        assert "groupArray(tuple(" in query
+        assert ")) AS eval_rows" in query
+        assert "GROUP BY trace_id" in query
+        assert params["trace_ids"] == tuple(trace_ids)
+        assert params["eval_config_ids"] == tuple(config_ids)
+
+        packed_rows = [
+            {
+                "trace_id": trace_id,
+                "eval_rows": [
+                    (
+                        config_id,
+                        0.75,
+                        50.0,
+                        1,
+                        0,
+                        1,
+                        [],
+                        0,
+                        0,
+                        0,
+                        None,
+                    )
+                    for config_id in config_ids
+                ],
+            }
+            for trace_id in trace_ids
+        ]
+        expanded = builder.expand_eval_replay_rows(packed_rows)
+
+        assert len(packed_rows) == 500
+        assert len(expanded) == 5_500
+        assert expanded[0]["trace_id"] == "trace-0"
+        assert expanded[0]["eval_config_id"] == "config-0"
+        assert expanded[-1]["trace_id"] == "trace-499"
+        assert expanded[-1]["eval_config_id"] == "config-10"

@@ -155,13 +155,13 @@ describe("TaskLivePreview sparse cursor continuation", () => {
     );
   });
 
-  it("resumes a sparse voice-call preview with the same signed cursor", async () => {
+  it("resumes a sparse voice-call preview beyond the first hop budget", async () => {
     let listCalls = 0;
     mocks.get.mockImplementation(async (url) => {
       if (url === "/calls/") {
         const callIndex = listCalls;
         listCalls += 1;
-        if (callIndex < 12) {
+        if (callIndex < 24) {
           return {
             data: {
               result: {
@@ -198,21 +198,203 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       </QueryClientProvider>,
     );
 
+    const continueSearch = await screen.findByRole("button", {
+      name: "Continue search",
+    });
+    expect(listCalls).toBe(13);
+
+    await act(async () => continueSearch.click());
     await screen.findByText("Row 1 of 1");
 
     const listRequests = mocks.get.mock.calls.filter(
       ([url]) => url === "/calls/",
     );
-    expect(listRequests).toHaveLength(13);
-    expect(listRequests[12][1].params).toEqual(
+    expect(listRequests).toHaveLength(25);
+    expect(listRequests[13][1].params).toEqual(
       expect.objectContaining({
         cursor_mode: true,
-        cursor: "voice-checkpoint-11",
+        cursor: "voice-checkpoint-12",
       }),
     );
   });
 
-  it("fails closed after one overall continuation budget", async () => {
+  it("resumes a valid sparse continuation beyond the first hop budget", async () => {
+    let spanListCalls = 0;
+    mocks.get.mockImplementation(async (url) => {
+      if (url === "/spans/") {
+        const callIndex = spanListCalls;
+        spanListCalls += 1;
+        if (callIndex < 24) {
+          return {
+            data: {
+              result: {
+                config: [],
+                table: [],
+                metadata: {
+                  has_more: true,
+                  next_cursor: `checkpoint-${callIndex}`,
+                  total_rows_is_lower_bound: true,
+                },
+              },
+            },
+          };
+        }
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-beyond-budget",
+                  trace_id: "trace-beyond-budget",
+                  input: "found after a resumed cursor",
+                },
+              ],
+              metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-beyond-budget/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-beyond-budget" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-beyond-budget",
+                    input: "found after a resumed cursor",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness />
+      </QueryClientProvider>,
+    );
+
+    const continueSearch = await screen.findByRole("button", {
+      name: "Continue search",
+    });
+    expect(spanListCalls).toBe(13);
+    expect(
+      screen.queryByText(QUERY_FAILED_RETRY_MESSAGE),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("No matching rows")).not.toBeInTheDocument();
+
+    await act(async () => continueSearch.click());
+    await screen.findByText("Row 1 of 1");
+    expect(spanListCalls).toBe(25);
+    const resumedRequest = mocks.get.mock.calls.filter(
+      ([url]) => url === "/spans/",
+    )[13];
+    expect(resumedRequest[1].params).toEqual(
+      expect.objectContaining({
+        cursor_mode: true,
+        cursor: "checkpoint-12",
+      }),
+    );
+  });
+
+  it("shows a real empty state only after resumed terminal exhaustion", async () => {
+    let spanListCalls = 0;
+    mocks.get.mockImplementation(async (url) => {
+      if (url !== "/spans/") throw new Error(`Unexpected GET ${url}`);
+      const callIndex = spanListCalls;
+      spanListCalls += 1;
+      if (callIndex < 13) {
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [],
+              metadata: {
+                has_more: true,
+                next_cursor: `terminal-checkpoint-${callIndex}`,
+              },
+            },
+          },
+        };
+      }
+      return {
+        data: {
+          result: {
+            config: [],
+            table: [],
+            metadata: { has_more: false, next_cursor: null, total_rows: 0 },
+          },
+        },
+      };
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness />
+      </QueryClientProvider>,
+    );
+
+    const continueSearch = await screen.findByRole("button", {
+      name: "Continue search",
+    });
+    expect(spanListCalls).toBe(13);
+    expect(screen.queryByText("No matching rows")).not.toBeInTheDocument();
+
+    await act(async () => continueSearch.click());
+    await screen.findByText("No matching rows");
+    expect(
+      screen.queryByRole("button", { name: "Continue search" }),
+    ).not.toBeInTheDocument();
+    expect(spanListCalls).toBe(14);
+  });
+
+  it("fails closed without looping when the API repeats a signed cursor", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          config: [],
+          table: [],
+          metadata: {
+            has_more: true,
+            next_cursor: "repeated-cursor",
+            total_rows_is_lower_bound: true,
+          },
+        },
+      },
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText(QUERY_FAILED_RETRY_MESSAGE);
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText("No matching rows")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Continue search" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("fails closed when a cursor cycles at a later attempt boundary", async () => {
     let spanListCalls = 0;
     mocks.get.mockImplementation(async (url) => {
       if (url !== "/spans/") throw new Error(`Unexpected GET ${url}`);
@@ -225,7 +407,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
             table: [],
             metadata: {
               has_more: true,
-              next_cursor: `checkpoint-${callIndex}`,
+              next_cursor: callIndex === 25 ? "cycle-0" : `cycle-${callIndex}`,
               total_rows_is_lower_bound: true,
             },
           },
@@ -242,21 +424,28 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       </QueryClientProvider>,
     );
 
-    await screen.findByText(QUERY_FAILED_RETRY_MESSAGE);
-    expect(spanListCalls).toBe(13);
-    expect(screen.queryByText("No matching rows")).not.toBeInTheDocument();
+    const continueSearch = await screen.findByRole("button", {
+      name: "Continue search",
+    });
+    await act(async () => continueSearch.click());
 
-    await act(async () => Promise.resolve());
-    expect(spanListCalls).toBe(13);
+    await screen.findByText(QUERY_FAILED_RETRY_MESSAGE);
+    expect(spanListCalls).toBe(26);
+    expect(screen.queryByText("No matching rows")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Continue search" }),
+    ).not.toBeInTheDocument();
   });
 
   it("does not let a superseded project response overwrite the active preview", async () => {
     let resolveOldResponse;
+    let oldSignal;
     const oldResponse = new Promise((resolve) => {
       resolveOldResponse = resolve;
     });
     mocks.get.mockImplementation(async (url, options = {}) => {
       if (url === "/spans/" && options.params?.project_id === "project-old") {
+        oldSignal = options.signal;
         return oldResponse;
       }
       if (url === "/spans/" && options.params?.project_id === "project-new") {
@@ -312,6 +501,7 @@ describe("TaskLivePreview sparse cursor continuation", () => {
       </QueryClientProvider>,
     );
     await screen.findByText(/fresh preview value/);
+    expect(oldSignal?.aborted).toBe(true);
 
     await act(async () => {
       resolveOldResponse({
@@ -334,5 +524,225 @@ describe("TaskLivePreview sparse cursor continuation", () => {
 
     expect(screen.getByText(/fresh preview value/)).toBeInTheDocument();
     expect(screen.queryByText(/stale preview value/)).not.toBeInTheDocument();
+  });
+
+  it("never carries a resumed cursor into a different project", async () => {
+    let oldListCalls = 0;
+    let resolveOldResume;
+    let oldResumeSignal;
+    const oldResume = new Promise((resolve) => {
+      resolveOldResume = resolve;
+    });
+    mocks.get.mockImplementation(async (url, options = {}) => {
+      if (url === "/spans/" && options.params?.project_id === "project-old") {
+        const callIndex = oldListCalls;
+        oldListCalls += 1;
+        if (callIndex < 13) {
+          return {
+            data: {
+              result: {
+                config: [],
+                table: [],
+                metadata: {
+                  has_more: true,
+                  next_cursor: `old-checkpoint-${callIndex}`,
+                  total_rows_is_lower_bound: true,
+                },
+              },
+            },
+          };
+        }
+        oldResumeSignal = options.signal;
+        return oldResume;
+      }
+      if (url === "/spans/" && options.params?.project_id === "project-new") {
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-new-scope",
+                  trace_id: "trace-new-scope",
+                  input: "new scope preview",
+                },
+              ],
+              metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-new-scope/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-new-scope" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-new-scope",
+                    input: "new scope preview",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness projectId="project-old" />
+      </QueryClientProvider>,
+    );
+
+    const continueSearch = await screen.findByRole("button", {
+      name: "Continue search",
+    });
+    await act(async () => continueSearch.click());
+    await waitFor(() => expect(oldListCalls).toBe(14));
+
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness projectId="project-new" />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText(/new scope preview/);
+    const newProjectRequest = mocks.get.mock.calls.find(
+      ([url, options]) =>
+        url === "/spans/" && options.params?.project_id === "project-new",
+    );
+    expect(newProjectRequest[1].params).not.toHaveProperty("cursor");
+    expect(oldResumeSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      resolveOldResume({
+        data: {
+          result: {
+            config: [],
+            table: [
+              {
+                span_id: "span-old-scope",
+                trace_id: "trace-old-scope",
+                input: "stale resumed preview",
+              },
+            ],
+            metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+          },
+        },
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText(/new scope preview/)).toBeInTheDocument();
+    expect(screen.queryByText(/stale resumed preview/)).not.toBeInTheDocument();
+  });
+
+  it("does not reuse cached detail data after the selected project changes", async () => {
+    let detailCalls = 0;
+    mocks.get.mockImplementation(async (url, options = {}) => {
+      if (url === "/spans/") {
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-shared",
+                  trace_id: "trace-shared",
+                  input: `${options.params?.project_id} list value`,
+                },
+              ],
+              metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-shared/") {
+        detailCalls += 1;
+        const detail =
+          detailCalls === 1 ? "old project detail" : "new project detail";
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-shared" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-shared",
+                    input: detail,
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness projectId="project-old" />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText(/old project detail/);
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness projectId="project-new" />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText(/new project detail/);
+    expect(detailCalls).toBe(2);
+    expect(screen.queryByText(/old project detail/)).not.toBeInTheDocument();
+  });
+
+  it("renders a sanitized failure state when row detail cannot be loaded", async () => {
+    mocks.get.mockImplementation(async (url) => {
+      if (url === "/spans/") {
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-detail-error",
+                  trace_id: "trace-detail-error",
+                },
+              ],
+              metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-detail-error/") {
+        throw new Error("Code: 159. DB::Exception: internal detail");
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText(QUERY_FAILED_RETRY_MESSAGE)).toBeVisible();
+    expect(screen.queryByText(/DB::Exception/)).not.toBeInTheDocument();
+    expect(screen.queryByText("No matching rows")).not.toBeInTheDocument();
   });
 });

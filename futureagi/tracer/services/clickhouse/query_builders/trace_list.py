@@ -3212,21 +3212,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             "eval_config_ids": tuple(self.eval_config_ids),
         }
 
-        # Partition-prune `tracer_eval_logger` (PARTITION BY toYYYYMM(created_at))
-        # so the FINAL merge can skip months that cannot match this page.
-        # The page of trace_ids was selected by build() within the user's
-        # [start_date, end_date] window on `start_time`, so the matching eval
-        # rows' `created_at` falls inside that window plus ingestion skew. A
-        # lower-bound-only filter with a 1-day skew buffer (identical to the
-        # mitigation in build()/build_count_query()) prunes old partitions
-        # without dropping any legitimately-matching eval row. Guarded on
-        # self.start_date so callers that invoke build_eval_query() without a
-        # prior build() (e.g. unit tests) keep their current behavior.
-        created_at_fragment = ""
-        if self.start_date is not None:
-            params["start_date"] = self.start_date
-            created_at_fragment = "AND created_at >= %(start_date)s - INTERVAL 1 DAY"
-
         eval_table, _ = self._EVAL_LOGGER_SOURCE(include_cdc_tombstone_guard=True)
         eval_version = eval_logger_version_column(eval_table)
         if eval_table.endswith("_v2"):
@@ -3315,7 +3300,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             FROM {eval_table}
             WHERE trace_id IN %(trace_ids)s
               AND custom_eval_config_id IN %(eval_config_ids)s
-              {created_at_fragment}
             ORDER BY {eval_version} DESC
             LIMIT 1 BY id
         )
@@ -3323,6 +3307,85 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         GROUP BY trace_id, custom_eval_config_id
         """
         return query, params
+
+    def build_eval_replay_query(
+        self,
+        trace_ids: list[str],
+    ) -> tuple[str, dict[str, Any]]:
+        """Pack exact page eval cells into at most one result row per trace.
+
+        ``build_eval_query`` returns one row per ``(trace, config)``.  The
+        public API permits 500 traces and a real project may own more than ten
+        eval configs, so that otherwise-correct shape can exceed the shared
+        5,001 result-row guard.  Packing only the *outer* result preserves every
+        exact cell and all status counters while bounding the physical result
+        row count by the already-finite trace page.
+        """
+
+        query, params = self.build_eval_query(trace_ids)
+        if not query:
+            return "", {}
+        packed_query = f"""
+        SELECT
+            trace_id,
+            groupArray(tuple(
+                eval_config_id,
+                avg_score,
+                pass_rate,
+                success_count,
+                error_count,
+                eval_count,
+                str_lists,
+                skipped_count,
+                running_count,
+                pending_count,
+                skipped_reason
+            )) AS eval_rows
+        FROM (
+            {query}
+        ) AS exact_eval_cells
+        GROUP BY trace_id
+        """
+        return packed_query, params
+
+    @staticmethod
+    def expand_eval_replay_rows(
+        eval_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Expand packed eval replay rows into the established pivot shape."""
+
+        columns = (
+            "eval_config_id",
+            "avg_score",
+            "pass_rate",
+            "success_count",
+            "error_count",
+            "eval_count",
+            "str_lists",
+            "skipped_count",
+            "running_count",
+            "pending_count",
+            "skipped_reason",
+        )
+        expanded: list[dict[str, Any]] = []
+        for row in eval_rows:
+            packed_cells = row.get("eval_rows")
+            # Compatibility for callers/tests that supply the historical
+            # already-expanded result shape. Production replay is packed.
+            if packed_cells is None:
+                expanded.append(row)
+                continue
+            trace_id = str(row.get("trace_id") or "")
+            for cell in packed_cells or ():
+                if not isinstance(cell, (list, tuple)) or len(cell) != len(columns):
+                    raise ValueError("invalid packed eval replay row")
+                expanded.append(
+                    {
+                        "trace_id": trace_id,
+                        **dict(zip(columns, cell, strict=True)),
+                    }
+                )
+        return expanded
 
     # ------------------------------------------------------------------
     # Phase 3: Annotations for a set of trace IDs

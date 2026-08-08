@@ -317,7 +317,7 @@ class TestPerfQueryShapes:
                 project_id=project_id,
                 eval_config_ids=["ec1"],
             )
-            builder.build()  # binds start_date so the created_at prune is emitted
+            builder.build()
             query, params = builder.build_eval_query(["t1"])
 
         assert f"{eval_table} FINAL" not in query
@@ -327,9 +327,11 @@ class TestPerfQueryShapes:
         assert "LIMIT 1 BY id" in query
         assert f"WHERE {live_predicate}" in query
         assert query.index("LIMIT 1 BY id") < query.index(f"WHERE {live_predicate}")
-        # The partition-pruning lower bound must survive inside the subquery.
-        assert "created_at >= %(start_date)s - INTERVAL 1 DAY" in query
-        assert "start_date" in params
+        # Eval rows may arrive days or months after their trace. Page trace ids
+        # plus config ids are the exact identity scope; applying the trace
+        # window to eval.created_at silently drops legitimate late results.
+        assert "created_at >= %(start_date)s - INTERVAL 1 DAY" not in query
+        assert "start_date" not in params
 
     def test_membership_filter_subqueries_are_time_bounded(self, project_id):
         """Trace-membership wraps (`trace_id IN (SELECT … FROM spans …)`) for

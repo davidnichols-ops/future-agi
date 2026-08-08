@@ -175,6 +175,33 @@ describe("create rule Observe filter serialization", () => {
     expect(filters[0].id).toBeTruthy();
   });
 
+  it("round-trips mixed typed attribute values without changing their storage family", () => {
+    const savedFilter = {
+      column_id: "mixed_attribute",
+      display_name: "Mixed Attribute",
+      filter_config: {
+        filter_type: "text",
+        filter_op: "in",
+        filter_value: ["vip", 2, true],
+        col_type: "SPAN_ATTRIBUTE",
+        attribute_value_types: ["string", "number", "boolean"],
+      },
+    };
+
+    const [editableFilter] = ruleConditionsToFilters({
+      source_type: "trace",
+      conditions: { filter: [savedFilter] },
+    });
+    const conditions = buildConditionsForRule(
+      "trace",
+      [editableFilter],
+      { project_id: "project-1" },
+      {},
+    );
+
+    expect(conditions.filter).toEqual([savedFilter]);
+  });
+
   it("uses queue project scope for span and session rules when no override is set", () => {
     const filters = [
       {

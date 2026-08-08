@@ -5,6 +5,7 @@ import json
 import math
 import re
 import traceback
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -31,7 +32,7 @@ from django.db.models import (
     When,
 )
 from django.db.models.functions import Coalesce, JSONObject, Round
-from django.http import FileResponse, HttpResponse, StreamingHttpResponse
+from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_yasg.utils import swagger_auto_schema
@@ -162,11 +163,20 @@ ERROR_RESPONSES = {
     500: ApiErrorResponseSerializer,
 }
 
-TRACE_LIST_WALL_DEADLINE_MS = 10_000
+# The outer infrastructure ceiling is 30 s.  Keep one exact request below it
+# while admitting the serializer's maximum 500-row page without increasing CH
+# concurrency: five 100-trace content chunks + five attribute chunks + one
+# packed eval replay + one annotation span-map replay + the two-phase optional
+# user replay consume at most fourteen 900 ms worker slots.  At two workers the
+# modeled enrichment ceiling is seven waves (6.3 s); after the bounded 8 s
+# candidate phase that is 14.3 s.  The extra 1.7 s covers response assembly and
+# scheduler jitter.  Healthy reads still return immediately.
+TRACE_LIST_WALL_DEADLINE_MS = 16_000
 # The candidate reader remains a single bounded pass. Production qualification
 # showed a complete heavy-tenant proof just beyond the former 2.5 s ceiling, so
-# allow it up to 8 s while retaining 2 s for hydration and enrichment. This is
-# only a ceiling: healthy reads return immediately and issue no additional query.
+# allow it up to 8 s while retaining the separately modeled enrichment budget.
+# This is only a ceiling: healthy reads return immediately and issue no
+# additional query.
 TRACE_LIST_CANDIDATE_DEADLINE_MS = 8_000
 TRACE_LIST_ENRICHMENT_TIMEOUT_MS = 900
 # Page-local content/attribute hydration is exact but can still make ClickHouse
@@ -181,6 +191,12 @@ TRACE_LIST_ENRICHMENT_CHUNK_SIZE = 100
 # tenant. Two workers retain overlap without turning one list request into a
 # five-query concurrency spike.
 TRACE_LIST_ENRICHMENT_MAX_WORKERS = 2
+# The annotation relation is exact, but PostgreSQL score discovery must not
+# materialize an unbounded project history into one request. 50k scored span
+# identities is intentionally above the former 5,001-row regression while
+# still placing a hard ceiling on Python memory and the subsequent CH IN set.
+# Pages above this bound fail closed (503); they are never silently truncated.
+TRACE_LIST_ANNOTATION_SCORE_SPAN_LIMIT = 50_000
 TRACE_LIST_READ_SETTINGS = {
     "max_threads": 1,
     "max_block_size": 8192,
@@ -197,6 +213,10 @@ TRACE_NAVIGATION_MAX_QUERIES = 128
 TRACE_NAVIGATION_WALL_DEADLINE_MS = 20_000
 _CLICKHOUSE_ERROR_CODE_RE = re.compile(r"\bcode:\s*(\d+)\b", re.IGNORECASE)
 _OPTIONAL_USER_ENRICHMENT_ERROR_CODES = frozenset({497})
+
+
+class AnnotationScoreReadBoundExceeded(ReadDeadlineExceeded):
+    """Exact annotation hydration cannot fit its bounded read contract."""
 
 
 def _clickhouse_error_code(exc: Exception) -> int | None:
@@ -393,6 +413,61 @@ def _append_trace_attribute_value(values: list[Any], value: Any) -> None:
     token = _trace_attribute_value_token(normalized)
     if all(_trace_attribute_value_token(existing) != token for existing in values):
         values.append(normalized)
+
+
+def _iter_merged_trace_attribute_rows(
+    replay_row: dict[str, Any],
+) -> Iterable[dict[str, Any]]:
+    """Yield legacy packed physical span attribute maps.
+
+    New CH25 trace-list reads project only explicitly requested keys and do not
+    use this packed shape: packing all physical rows into one ``groupArray``
+    bypasses row limits while retaining unbounded server/client memory.  This
+    helper remains for the historical expanded shape and focused compatibility
+    mocks.  The tuple keeps typed maps aligned with ``attributes_extra``;
+    merging them independently would incorrectly retain a typed value that the
+    same span's extra JSON overrides.
+    """
+
+    packed_rows = replay_row.get("attribute_rows")
+    if packed_rows is None:
+        yield merge_span_attributes(
+            replay_row.get("attrs_string"),
+            replay_row.get("attrs_number"),
+            replay_row.get("attrs_bool"),
+            replay_row.get("attributes_extra", "{}"),
+        )
+        return
+
+    for physical_row in packed_rows or ():
+        if not isinstance(physical_row, (list, tuple)) or len(physical_row) != 4:
+            raise ValueError("invalid packed trace attribute replay row")
+        attributes_extra, attrs_string, attrs_number, attrs_bool = physical_row
+        yield merge_span_attributes(
+            attrs_string,
+            attrs_number,
+            attrs_bool,
+            attributes_extra,
+        )
+
+
+def _decode_projected_trace_attribute_value(raw_value: Any) -> Any:
+    """Decode one exact JSON scalar/object projected by the CH25 attr reader.
+
+    The query emits JSON for every storage family so strings remain distinct
+    from numbers/booleans and structured ``attributes_extra`` values retain
+    their shape.  Invalid payloads are never treated as missing data: callers
+    fail the read closed instead of publishing a silently incomplete column.
+    """
+
+    if not isinstance(raw_value, str):
+        return raw_value
+    if not raw_value:
+        raise ValueError("empty projected trace attribute value")
+    try:
+        return json.loads(raw_value)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("invalid projected trace attribute JSON") from exc
 
 
 _SIMULATOR_CALL_EXECUTION_KEYS = (
@@ -931,6 +1006,135 @@ def _simulation_context_for_voice_call(
     }
 
 
+def _annotation_score_span_ids(
+    annotation_label_ids,
+    project_id,
+    *,
+    max_span_ids=TRACE_LIST_ANNOTATION_SCORE_SPAN_LIMIT,
+):
+    """Return a bounded scored-span identity set for one tracer project.
+
+    A public trace page must never enumerate every span in its candidate traces
+    just to discover which ones have annotations: one trace can legitimately
+    contain millions (or more) unannotated spans.  ``Score`` is authoritative
+    for annotations and carries the indexed, denormalized tracer project id, so
+    discover only observation-span ids that can contribute to the requested
+    label columns.  The subsequent ClickHouse lookup intersects this finite set
+    with the page's trace ids and time window.
+
+    ``Score.project_id`` is deliberately not used here; that FK belongs to the
+    model-hub project id space.  ``tracer_project_id`` is the observability
+    tenancy boundary and is populated/backfilled by the direct-write rollout.
+
+    The ``LIMIT + 1`` sentinel is fail-closed: exceeding the explicit bound
+    raises before ClickHouse is contacted. It never publishes a partial
+    annotation map and never materializes the project's full score history.
+    A missing project scope with requested labels is also rejected; a trace id
+    is customer-controlled and cannot serve as an organization tenant key.
+    """
+    if not annotation_label_ids:
+        return ()
+    if not project_id:
+        raise AnnotationScoreReadBoundExceeded(
+            "annotation score hydration requires an explicit tracer project"
+        )
+    finite_limit = max(int(max_span_ids), 1)
+    rows = tuple(
+        str(span_id)
+        for span_id in Score.no_workspace_objects.filter(
+            tracer_project_id=project_id,
+            label_id__in=annotation_label_ids,
+            trace_id__isnull=True,
+            observation_span_id__isnull=False,
+            deleted=False,
+        )
+        .order_by()
+        .values_list("observation_span_id", flat=True)
+        .distinct()[: finite_limit + 1]
+        if span_id
+    )
+    if len(rows) > finite_limit:
+        raise AnnotationScoreReadBoundExceeded(
+            "annotation score span identity limit exceeded"
+        )
+    return rows
+
+
+def _annotation_score_span_ids_by_project(
+    annotation_label_ids_by_project,
+    trace_identities,
+    *,
+    max_span_ids=TRACE_LIST_ANNOTATION_SCORE_SPAN_LIMIT,
+):
+    """Discover a finite, tenant-qualified scored-span set for an org page.
+
+    The page's ``(project_id, trace_id)`` identities are the authorization and
+    candidate boundary.  PostgreSQL can identify legacy span-linked scores by
+    tracer project but cannot join the direct-write ClickHouse span table, so
+    this reads only those candidate projects and lets one pair-scoped CH replay
+    intersect the finite score ids with the exact page trace identities.
+    """
+    candidate_project_ids = tuple(
+        dict.fromkeys(
+            str(candidate_project_id)
+            for candidate_project_id, candidate_trace_id in trace_identities or ()
+            if candidate_project_id and candidate_trace_id
+        )
+    )
+    labels_by_project = {
+        str(candidate_project_id): tuple(
+            dict.fromkeys(str(label_id) for label_id in label_ids if label_id)
+        )
+        for candidate_project_id, label_ids in (
+            annotation_label_ids_by_project or {}
+        ).items()
+        if str(candidate_project_id) in candidate_project_ids
+    }
+    label_ids = tuple(
+        dict.fromkeys(
+            label_id
+            for candidate_project_id in candidate_project_ids
+            for label_id in labels_by_project.get(candidate_project_id, ())
+        )
+    )
+    if not candidate_project_ids or not label_ids:
+        return {}
+
+    finite_limit = max(int(max_span_ids), 1)
+    rows = tuple(
+        (str(row_project_id), str(span_id))
+        for row_project_id, span_id in Score.no_workspace_objects.filter(
+            tracer_project_id__in=candidate_project_ids,
+            label_id__in=label_ids,
+            trace_id__isnull=True,
+            observation_span_id__isnull=False,
+            deleted=False,
+        )
+        .order_by()
+        .values_list("tracer_project_id", "observation_span_id")
+        .distinct()[: finite_limit + 1]
+        if row_project_id and span_id
+    )
+    if len(rows) > finite_limit:
+        raise AnnotationScoreReadBoundExceeded(
+            "annotation score span identity limit exceeded"
+        )
+
+    rows_by_project: dict[str, list[str]] = {}
+    for row_project_id, span_id in rows:
+        # The tenant predicate already constrains this, but keep an explicit
+        # in-process guard so malformed/mocked rows cannot widen the page.
+        if row_project_id not in labels_by_project:
+            raise AnnotationScoreReadBoundExceeded(
+                "annotation score replay escaped candidate project scope"
+            )
+        rows_by_project.setdefault(row_project_id, []).append(span_id)
+    return {
+        row_project_id: tuple(dict.fromkeys(span_ids))
+        for row_project_id, span_ids in rows_by_project.items()
+    }
+
+
 def _build_annotation_map_from_scores(
     trace_ids,
     annotation_label_ids,
@@ -940,6 +1144,8 @@ def _build_annotation_map_from_scores(
     project_id=None,
     start_date=None,
     end_date=None,
+    trace_identities=None,
+    annotation_label_ids_by_project=None,
 ):
     """Fetch annotation values from PG Score table and build annotation_map.
 
@@ -956,18 +1162,70 @@ def _build_annotation_map_from_scores(
         Dict mapping trace_id -> label_id -> structured annotation data
         matching the format produced by build_annotation_subqueries (PG ORM path).
     """
-    if not trace_ids or not annotation_label_ids:
+    org_scoped = trace_identities is not None
+    effective_label_ids = tuple(
+        dict.fromkeys(
+            [
+                *(annotation_label_ids or ()),
+                *(
+                    label_id
+                    for label_ids in (annotation_label_ids_by_project or {}).values()
+                    for label_id in label_ids
+                ),
+            ]
+        )
+    )
+    if not trace_ids or not effective_label_ids:
         return {}
     if span_trace_map is None:
-        analytics = analytics or V2AnalyticsQueryService()
-        span_trace_map = analytics.get_span_trace_map(
-            trace_ids,
-            project_id=project_id,
-            start_date=start_date,
-            end_date=end_date,
+        if org_scoped:
+            scored_span_ids_by_project = _annotation_score_span_ids_by_project(
+                annotation_label_ids_by_project,
+                trace_identities,
+            )
+            scored_span_identities = tuple(
+                (candidate_project_id, span_id)
+                for candidate_project_id, span_ids in scored_span_ids_by_project.items()
+                for span_id in span_ids
+            )
+            if scored_span_identities:
+                analytics = analytics or V2AnalyticsQueryService()
+                span_trace_map = analytics.get_span_trace_map(
+                    trace_ids,
+                    trace_identities=trace_identities,
+                    scored_span_identities=scored_span_identities,
+                )
+            else:
+                span_trace_map = {}
+        else:
+            scored_span_ids = _annotation_score_span_ids(
+                annotation_label_ids, project_id
+            )
+            if scored_span_ids:
+                analytics = analytics or V2AnalyticsQueryService()
+                span_trace_map = analytics.get_span_trace_map(
+                    trace_ids,
+                    project_id=project_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    scored_span_ids=scored_span_ids,
+                )
+            else:
+                # Direct trace-linked Score rows still need to be returned, but a
+                # project with no span-linked scores requires no ClickHouse query.
+                span_trace_map = {}
+    annotation_read_kwargs = {"project_id": project_id}
+    if org_scoped:
+        annotation_read_kwargs.update(
+            trace_identities=trace_identities,
+            annotation_label_ids_by_project=annotation_label_ids_by_project,
         )
     return _build_annotation_map_from_scores_pg(
-        trace_ids, annotation_label_ids, label_types, span_trace_map
+        trace_ids,
+        effective_label_ids if org_scoped else annotation_label_ids,
+        label_types,
+        span_trace_map,
+        **annotation_read_kwargs,
     )
 
 
@@ -1143,7 +1401,14 @@ def _build_annotation_map_from_scores_ch(trace_ids, annotation_label_ids, label_
 
 
 def _build_annotation_map_from_scores_pg(
-    trace_ids, annotation_label_ids, label_types, span_trace_map=None
+    trace_ids,
+    annotation_label_ids,
+    label_types,
+    span_trace_map=None,
+    *,
+    project_id=None,
+    trace_identities=None,
+    annotation_label_ids_by_project=None,
 ):
     """PG fallback implementation of annotation map builder.
 
@@ -1158,21 +1423,116 @@ def _build_annotation_map_from_scores_pg(
     from django.db.models import Q
 
     span_trace_map = span_trace_map or {}
+    org_scoped = trace_identities is not None
+    candidate_trace_identities = tuple(
+        dict.fromkeys(
+            (str(candidate_project_id), str(candidate_trace_id))
+            for candidate_project_id, candidate_trace_id in trace_identities or ()
+            if candidate_project_id and candidate_trace_id
+        )
+    )
+    candidate_trace_identity_set = set(candidate_trace_identities)
     span_ids = list(span_trace_map.keys())
     annotation_map = {}
     # Trace- or span-linked scores by column id (no dropped-table JOIN).
-    scores = Score.objects.filter(
-        Q(trace_id__in=trace_ids) | Q(observation_span_id__in=span_ids),
-        label_id__in=annotation_label_ids,
-        deleted=False,
-    ).select_related("annotator")
+    if org_scoped:
+        trace_ids_by_project: dict[str, list[str]] = {}
+        span_ids_by_project: dict[str, list[str]] = {}
+        for candidate_project_id, candidate_trace_id in candidate_trace_identities:
+            trace_ids_by_project.setdefault(candidate_project_id, []).append(
+                candidate_trace_id
+            )
+        for candidate_project_id, candidate_span_id in span_ids:
+            span_ids_by_project.setdefault(str(candidate_project_id), []).append(
+                str(candidate_span_id)
+            )
+
+        # Keep SQL topology O(candidate projects), not O(candidate spans).
+        # A page may map tens of thousands of legacy scored spans; emitting one
+        # OR node per identity can overflow PostgreSQL's parser/parameter stack.
+        # Project-qualified IN predicates preserve composite tenant identity
+        # while keeping the expression tree finite and shallow.
+        entity_scope = Q(pk__in=[])
+        for candidate_project_id in trace_ids_by_project:
+            allowed_project_labels = tuple(
+                dict.fromkeys(
+                    str(label_id)
+                    for label_id in (annotation_label_ids_by_project or {}).get(
+                        candidate_project_id, ()
+                    )
+                    if label_id
+                )
+            )
+            if not allowed_project_labels:
+                continue
+            candidate_project_trace_ids = tuple(
+                dict.fromkeys(trace_ids_by_project[candidate_project_id])
+            )
+            if candidate_project_trace_ids:
+                entity_scope |= Q(
+                    tracer_project_id=candidate_project_id,
+                    trace_id__in=candidate_project_trace_ids,
+                    label_id__in=allowed_project_labels,
+                )
+            candidate_project_span_ids = tuple(
+                dict.fromkeys(span_ids_by_project.get(candidate_project_id, ()))
+            )
+            if candidate_project_span_ids:
+                entity_scope |= Q(
+                    tracer_project_id=candidate_project_id,
+                    observation_span_id__in=candidate_project_span_ids,
+                    label_id__in=allowed_project_labels,
+                )
+    else:
+        entity_scope = Q(trace_id__in=trace_ids)
+        if span_ids:
+            entity_scope |= Q(observation_span_id__in=span_ids)
+    score_filters = {
+        "label_id__in": annotation_label_ids,
+        "deleted": False,
+    }
+    if project_id:
+        score_filters["tracer_project_id"] = project_id
+    elif org_scoped:
+        score_filters["tracer_project_id__in"] = tuple(
+            dict.fromkeys(
+                candidate_project_id
+                for candidate_project_id, _ in candidate_trace_identities
+            )
+        )
+    scores = list(
+        Score.no_workspace_objects.filter(
+            entity_scope,
+            **score_filters,
+        ).select_related("annotator")[: TRACE_LIST_ANNOTATION_SCORE_SPAN_LIMIT + 1]
+    )
+    if len(scores) > TRACE_LIST_ANNOTATION_SCORE_SPAN_LIMIT:
+        raise AnnotationScoreReadBoundExceeded("annotation score row limit exceeded")
 
     for s in scores:
-        tid = (
-            str(s.trace_id)
-            if s.trace_id
-            else span_trace_map.get(str(s.observation_span_id))
-        )
+        score_project_id = str(getattr(s, "tracer_project_id", None) or "")
+        if org_scoped:
+            tid = (
+                (score_project_id, str(s.trace_id))
+                if s.trace_id
+                else span_trace_map.get((score_project_id, str(s.observation_span_id)))
+            )
+            if tid not in candidate_trace_identity_set:
+                continue
+            allowed_labels = {
+                str(label_id)
+                for label_id in (annotation_label_ids_by_project or {}).get(
+                    score_project_id, ()
+                )
+            }
+            if str(s.label_id) not in allowed_labels:
+                continue
+        else:
+            tid = (
+                str(s.trace_id)
+                if s.trace_id
+                else span_trace_map.get(str(s.observation_span_id))
+            )
         if not tid or tid == "None":
             continue
         lid = str(s.label_id)
@@ -3943,6 +4303,31 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         org_scope = bool(org_project_ids)
         filters = list(validated_data.get("filters", []) or [])
+        filtered_attribute_keys = [
+            str(item.get("column_id") or item.get("columnId") or "")
+            for item in filters
+            if (item.get("filter_config") or item.get("filterConfig") or {}).get(
+                "col_type"
+            )
+            == "SPAN_ATTRIBUTE"
+        ]
+        requested_attribute_keys = tuple(
+            dict.fromkeys(
+                [
+                    *(validated_data.get("attribute_keys", []) or []),
+                    *filtered_attribute_keys,
+                ]
+            )
+        )
+        if (
+            len(requested_attribute_keys) > 100
+            or sum(len(key.encode("utf-8")) for key in requested_attribute_keys) > 2_048
+        ):
+            return self._gm.custom_error_response(
+                status.HTTP_400_BAD_REQUEST,
+                "Too many custom attribute keys were requested.",
+                code="invalid",
+            )
         page_number = validated_data["page_number"]
         page_size = validated_data["page_size"]
         cursor_token = validated_data.get("cursor")
@@ -4029,6 +4414,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             eval_config_ids = [str(c.id) for c in eval_configs]
 
         annotation_label_ids_by_project = None
+        labels_by_project = {}
         if org_scope:
             if any(
                 (item.get("column_id") or item.get("columnId")) == "has_annotation"
@@ -4048,8 +4434,30 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             annotation_labels = []
         else:
             annotation_labels = get_annotation_labels_for_project(project_id)
-        annotation_label_ids = [str(label.id) for label in annotation_labels]
-        label_types = {str(label.id): label.type for label in annotation_labels}
+        annotation_label_ids = list(
+            dict.fromkeys(
+                str(label.id)
+                for label in [
+                    *annotation_labels,
+                    *(
+                        label
+                        for project_labels in labels_by_project.values()
+                        for label in project_labels
+                    ),
+                ]
+            )
+        )
+        label_types = {
+            str(label.id): label.type
+            for label in [
+                *annotation_labels,
+                *(
+                    label
+                    for project_labels in labels_by_project.values()
+                    for label in project_labels
+                ),
+            ]
+        }
 
         cursor_supported = snapshot_cursor_supported(filters, resource="observe_traces")
         if cursor_state is not None and not cursor_supported:
@@ -4267,7 +4675,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             user_query, user_params = "", {}
         else:
             user_query, user_params = builder.build_user_id_query(trace_ids)
-        eval_query, eval_params = builder.build_eval_query(trace_ids)
+        eval_query, eval_params = builder.build_eval_replay_query(trace_ids)
 
         def _execute_enrichment(query, params):
             return analytics.execute_ch_query(
@@ -4278,18 +4686,48 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
 
         def _fetch_span_trace_map():
+            if org_scope:
+                scored_span_ids_by_project = _annotation_score_span_ids_by_project(
+                    annotation_label_ids_by_project,
+                    trace_user_identities,
+                )
+                scored_span_identities = tuple(
+                    (candidate_project_id, span_id)
+                    for candidate_project_id, span_ids in scored_span_ids_by_project.items()
+                    for span_id in span_ids
+                )
+                if not scored_span_identities:
+                    return {}
+                return analytics.get_span_trace_map(
+                    trace_ids,
+                    trace_identities=trace_user_identities,
+                    scored_span_identities=scored_span_identities,
+                    timeout_ms=read_deadline.remaining_ms(
+                        TRACE_LIST_ENRICHMENT_TIMEOUT_MS
+                    ),
+                    settings=page_read_settings,
+                )
+
+            scored_span_ids = _annotation_score_span_ids(
+                annotation_label_ids,
+                str(project_id),
+            )
+            if not scored_span_ids:
+                return {}
             return analytics.get_span_trace_map(
                 trace_ids,
-                project_id=None if org_scope else str(project_id),
+                project_id=str(project_id),
                 start_date=builder.params.get("start_date"),
                 end_date=builder.params.get("end_date"),
                 timeout_ms=read_deadline.remaining_ms(TRACE_LIST_ENRICHMENT_TIMEOUT_MS),
                 settings=page_read_settings,
+                scored_span_ids=scored_span_ids,
             )
 
         tasks: dict[str, Any] = {}
         content_task_names: list[str] = []
         attribute_task_names: list[str] = []
+        attribute_task_expected_rows: dict[str, int] = {}
         for chunk_index, chunk_start in enumerate(
             range(0, len(result.data), TRACE_LIST_ENRICHMENT_CHUNK_SIZE)
         ):
@@ -4301,6 +4739,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     str(row.get("trace_id") or "")
                     for row in chunk_rows
                     if row.get("trace_id")
+                )
+            )
+            chunk_trace_identities = tuple(
+                dict.fromkeys(
+                    (
+                        str(row.get("project_id") or project_id or ""),
+                        str(row.get("trace_id") or ""),
+                    )
+                    for row in chunk_rows
+                    if (row.get("project_id") or project_id) and row.get("trace_id")
                 )
             )
             chunk_root_identities = [
@@ -4329,12 +4777,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 tasks[task_name] = (content_query, content_params)
                 content_task_names.append(task_name)
             attr_query, attr_params = builder.build_span_attributes_query(
-                chunk_trace_ids
+                chunk_trace_ids,
+                attribute_keys=requested_attribute_keys,
+                trace_identities=chunk_trace_identities,
             )
             if attr_query:
                 task_name = f"attributes:{chunk_index}"
                 tasks[task_name] = (attr_query, attr_params)
                 attribute_task_names.append(task_name)
+                attribute_task_expected_rows[task_name] = len(
+                    chunk_trace_identities
+                ) * len(requested_attribute_keys)
         if user_query:
             tasks["users"] = (user_query, user_params)
         if eval_query and trace_ids and eval_config_ids:
@@ -4454,11 +4907,23 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         if not org_scope:
             for content_row in content_rows:
                 content_row.setdefault("project_id", str(project_id or ""))
-        if content_task_names and len(content_rows) < len(trace_ids):
+        expected_content_identities = tuple(trace_user_identities)
+        actual_content_identities = tuple(
+            (
+                str(content_row.get("project_id") or ""),
+                str(content_row.get("trace_id") or ""),
+            )
+            for content_row in content_rows
+        )
+        if content_task_names and (
+            len(expected_content_identities) != len(result.data)
+            or len(actual_content_identities) != len(expected_content_identities)
+            or set(actual_content_identities) != set(expected_content_identities)
+        ):
             logger.warning(
                 "trace_list_content_replay_incomplete",
-                returned=len(content_rows),
-                requested=len(trace_ids),
+                returned=len(actual_content_identities),
+                requested=len(expected_content_identities),
                 project_id=str(project_id) if project_id else None,
             )
             return self._gm.custom_error_response(
@@ -4517,10 +4982,24 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         eval_map = {}
         eval_result = enrichment_results.get("evals")
         if eval_result is not None:
-            eval_map = builder.pivot_eval_results(
-                [(list(row.values())) for row in eval_result.data],
-                list(eval_result.data[0].keys()) if eval_result.data else [],
-            )
+            try:
+                expanded_eval_rows = builder.expand_eval_replay_rows(eval_result.data)
+                eval_map = builder.pivot_eval_results(
+                    [(list(row.values())) for row in expanded_eval_rows],
+                    (list(expanded_eval_rows[0].keys()) if expanded_eval_rows else []),
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "trace_list_eval_replay_invalid",
+                    error_type=type(exc).__name__,
+                    project_id=str(project_id) if project_id else None,
+                    page_number=page_number,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trace data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
 
         # Phase 3: Annotations — PG values, span->trace resolved via CH.
         # In org-scoped mode the page spans multiple projects, so scope the
@@ -4533,6 +5012,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             label_types,
             span_trace_map,
             analytics=analytics,
+            project_id=None if org_scope else str(project_id),
+            trace_identities=trace_user_identities if org_scope else None,
+            annotation_label_ids_by_project=annotation_label_ids_by_project,
         )
         try:
             read_deadline.remaining_ms()
@@ -4558,28 +5040,82 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             "output.value",
         )
         aggregated_attrs = {}  # (project_id, trace_id) -> {attr_key -> values}
-        for attr_row in _chunked_enrichment_rows(attribute_task_names):
-            tid = str(attr_row.get("trace_id", ""))
-            attr_project_id = str(
-                attr_row.get("project_id") or (project_id if not org_scope else "")
-            )
-            if not tid or not attr_project_id:
-                continue
-            attr_identity = (attr_project_id, tid)
-            attrs = merge_span_attributes(
-                attr_row.get("attrs_string"),
-                attr_row.get("attrs_number"),
-                attr_row.get("attrs_bool"),
-                attr_row.get("attributes_extra", "{}"),
-            )
-            aggregated_attrs.setdefault(attr_identity, {})
-            for key, value in attrs.items():
-                if key.startswith(_SKIP_ATTR_PREFIXES):
+        for task_name in attribute_task_names:
+            task_result = enrichment_results.get(task_name)
+            task_rows = task_result.data if task_result is not None else []
+            # The query returns at most one row for every exact page identity
+            # and requested key. A larger replay is impossible for valid SQL
+            # and therefore indicates a malformed/cross-tenant result rather
+            # than a legitimate high-fanout trace.
+            expected_rows = attribute_task_expected_rows.get(task_name, 0)
+            if len(task_rows or ()) > expected_rows:
+                logger.warning(
+                    "trace_list_attribute_result_bound_exceeded",
+                    returned=len(task_rows),
+                    expected_rows=expected_rows,
+                    requested_key_count=len(requested_attribute_keys),
+                    project_id=str(project_id) if project_id else None,
+                    page_number=page_number,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trace data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+
+        requested_attribute_key_set = set(requested_attribute_keys)
+        try:
+            for attr_row in _chunked_enrichment_rows(attribute_task_names):
+                tid = str(attr_row.get("trace_id", ""))
+                attr_project_id = str(
+                    attr_row.get("project_id") or (project_id if not org_scope else "")
+                )
+                if not tid or not attr_project_id:
                     continue
-                if isinstance(value, str) and len(value) > 500:
+                attr_identity = (attr_project_id, tid)
+                aggregated_attrs.setdefault(attr_identity, {})
+
+                # Current CH25 shape: one exact distinct value per requested
+                # (project, trace, key).  Values are JSON across every typed
+                # storage family, so decoding retains scalar/structured type.
+                if "attribute_key" in attr_row:
+                    key = str(attr_row.get("attribute_key") or "")
+                    if not key or key not in requested_attribute_key_set:
+                        raise ValueError(
+                            "trace attribute replay returned an unrequested key"
+                        )
+                    value = _decode_projected_trace_attribute_value(
+                        attr_row.get("attribute_value_json")
+                    )
+                    if key in aggregated_attrs[attr_identity]:
+                        raise ValueError(
+                            "trace attribute replay returned a duplicate identity"
+                        )
+                    aggregated_attrs[attr_identity][key] = [value]
                     continue
-                values = aggregated_attrs[attr_identity].setdefault(key, [])
-                _append_trace_attribute_value(values, value)
+
+                # Historical expanded/packed rows remain accepted by tests and
+                # rolling-version callers, but retain their legacy exclusions.
+                for attrs in _iter_merged_trace_attribute_rows(attr_row):
+                    for key, value in attrs.items():
+                        if key.startswith(_SKIP_ATTR_PREFIXES):
+                            continue
+                        if isinstance(value, str) and len(value) > 500:
+                            continue
+                        values = aggregated_attrs[attr_identity].setdefault(key, [])
+                        _append_trace_attribute_value(values, value)
+        except ValueError as exc:
+            logger.warning(
+                "trace_list_attribute_replay_invalid",
+                error_type=type(exc).__name__,
+                project_id=str(project_id) if project_id else None,
+                page_number=page_number,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
 
         # Build column config — get_default_trace_config() already includes
         # all standard columns (latency, tokens, cost, user_id, etc.)
@@ -4649,7 +5185,10 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
 
             # Add annotations
-            trace_annotations = annotation_map.get(trace_id, {})
+            trace_annotations = annotation_map.get(
+                (str(row.get("project_id") or ""), trace_id) if org_scope else trace_id,
+                {},
+            )
             for label in annotation_labels:
                 label_id = str(label.id)
                 if label_id in trace_annotations:
@@ -4668,14 +5207,15 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         else:
                             entry[key] = value
 
-            # Include aggregated span attributes — single value or array of unique values
+            # Requested custom columns use the deterministic latest live value
+            # across every span in the trace. This intentionally supersedes an
+            # older root-span value for the same requested key.
             trace_attrs = aggregated_attrs.get(
                 (str(row.get("project_id") or project_id or ""), trace_id), {}
             )
             for key, values in trace_attrs.items():
-                if key not in entry:
-                    vals = sorted(values, key=_trace_attribute_value_token)
-                    entry[key] = vals[0] if len(vals) == 1 else vals
+                vals = sorted(values, key=_trace_attribute_value_token)
+                entry[key] = vals[0] if len(vals) == 1 else vals
 
             table_data.append(entry)
 
@@ -4867,14 +5407,34 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
             filters.append(frozen_window_filter(cursor_state))
             page_number = 0
-        classify_batch_size = int(
-            VoiceCallListQueryBuilderV2.recommended_filter_classify_batch_size()
+
+        sim_flag = remove_simulation_calls and str(
+            remove_simulation_calls
+        ).lower() not in ("false", "0", "")
+
+        # Reject unsupported numbered-page depths before any PG or ClickHouse
+        # work.  The builder's scan recommendations depend only on the request
+        # shape; eval and annotation projections do not affect this bound.
+        preflight_builder = VoiceCallListQueryBuilderV2(
+            project_id=str(project_id),
+            filters=filters,
+            page_number=page_number,
+            page_size=page_size,
+            eval_config_ids=[],
+            remove_simulation_calls=sim_flag,
+            annotation_label_ids=[],
+        )
+        preflight_classify_batch_size = int(
+            preflight_builder.recommended_filter_classify_batch_size() or 50
+        )
+        preflight_seed_batch_size = int(
+            preflight_builder.recommended_filter_seed_batch_size()
         )
         if bounded_numbered_page_depth_exceeded(
             page_number=page_number,
             page_size=page_size,
-            classify_batch_size=classify_batch_size,
-            seed_batch_size=classify_batch_size,
+            classify_batch_size=preflight_classify_batch_size,
+            seed_batch_size=preflight_seed_batch_size,
         ):
             logger.info(
                 "voice_call_list_page_depth_exceeded_preflight",
@@ -4908,10 +5468,6 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "Cursor pagination is unavailable for this query shape.",
             )
         cursor_enabled = cursor_requested and cursor_supported
-
-        sim_flag = remove_simulation_calls and str(
-            remove_simulation_calls
-        ).lower() not in ("false", "0", "")
 
         builder = VoiceCallListQueryBuilderV2(
             project_id=str(project_id),
@@ -5034,49 +5590,57 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
                 for row in page_rows
             ]
-            attrs_query, attrs_params = builder.build_content_query(
-                span_ids,
-                root_identities=root_identities,
-            )
-            try:
-                content_timeout_ms = read_deadline.remaining_ms(1_500)
-                attrs_result = analytics.execute_ch_query(
-                    attrs_query,
-                    attrs_params,
-                    timeout_ms=content_timeout_ms,
-                    settings={
-                        **page_read_settings,
-                        "max_result_rows": 200,
-                        "result_overflow_mode": "throw",
-                    },
+            hydrated_rows = []
+            content_batch_size = 200
+            for batch_start in range(0, len(root_identities), content_batch_size):
+                batch_end = batch_start + content_batch_size
+                batch_identities = root_identities[batch_start:batch_end]
+                batch_span_ids = span_ids[batch_start:batch_end]
+                attrs_query, attrs_params = builder.build_content_query(
+                    batch_span_ids,
+                    root_identities=batch_identities,
                 )
-            except Exception as exc:
-                if not is_read_budget_error(exc):
-                    raise
-                logger.warning(
-                    "voice_call_content_read_budget_exceeded",
-                    project_id=str(project_id),
-                    page_number=page_number,
-                )
-                return self._gm.custom_error_response(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "Voice call data is temporarily unavailable. Please retry.",
-                    code="service_unavailable",
-                )
-            if len(attrs_result.data) != len(root_identities):
-                logger.warning(
-                    "voice_call_content_replay_incomplete",
-                    project_id=str(project_id),
-                    page_number=page_number,
-                    expected_rows=len(root_identities),
-                    actual_rows=len(attrs_result.data),
-                )
-                return self._gm.custom_error_response(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "Voice call data is temporarily unavailable. Please retry.",
-                    code="service_unavailable",
-                )
-            for arow in attrs_result.data:
+                try:
+                    content_timeout_ms = read_deadline.remaining_ms(1_500)
+                    attrs_result = analytics.execute_ch_query(
+                        attrs_query,
+                        attrs_params,
+                        timeout_ms=content_timeout_ms,
+                        settings={
+                            **page_read_settings,
+                            "max_result_rows": content_batch_size,
+                            "result_overflow_mode": "throw",
+                        },
+                    )
+                except Exception as exc:
+                    if not is_read_budget_error(exc):
+                        raise
+                    logger.warning(
+                        "voice_call_content_read_budget_exceeded",
+                        project_id=str(project_id),
+                        page_number=page_number,
+                    )
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Voice call data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
+                if len(attrs_result.data) != len(batch_identities):
+                    logger.warning(
+                        "voice_call_content_replay_incomplete",
+                        project_id=str(project_id),
+                        page_number=page_number,
+                        expected_rows=len(batch_identities),
+                        actual_rows=len(attrs_result.data),
+                    )
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Voice call data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
+                    )
+                hydrated_rows.extend(attrs_result.data)
+
+            for arow in hydrated_rows:
                 sid = str(arow.get("span_id", ""))
                 attr_identity = (
                     str(arow.get("project_id") or project_id),
@@ -5163,15 +5727,22 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
 
         # Phase 3: Annotations — fetch from PG Score (unified annotation system)
-        annotation_map = _build_annotation_map_from_scores(
-            trace_ids,
-            annotation_label_ids,
-            label_types,
-            analytics=analytics,
-            project_id=str(project_id),
-            start_date=builder.params.get("start_date"),
-            end_date=builder.params.get("end_date"),
-        )
+        try:
+            annotation_map = _build_annotation_map_from_scores(
+                trace_ids,
+                annotation_label_ids,
+                label_types,
+                analytics=analytics,
+                project_id=str(project_id),
+                start_date=builder.params.get("start_date"),
+                end_date=builder.params.get("end_date"),
+            )
+        except AnnotationScoreReadBoundExceeded:
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Voice call data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
 
         # Phase 4 (child spans) removed — observation_span is a detail-only field.
 
@@ -5844,15 +6415,22 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         }
 
         # Phase 3: Annotations — fetch from PG Score (unified annotation system)
-        annotation_map = _build_annotation_map_from_scores(
-            trace_ids,
-            annotation_label_ids,
-            label_types,
-            analytics=analytics,
-            project_id=str(project_id),
-            start_date=builder.params.get("start_date"),
-            end_date=builder.params.get("end_date"),
-        )
+        try:
+            annotation_map = _build_annotation_map_from_scores(
+                trace_ids,
+                annotation_label_ids,
+                label_types,
+                analytics=analytics,
+                project_id=str(project_id),
+                start_date=builder.params.get("start_date"),
+                end_date=builder.params.get("end_date"),
+            )
+        except AnnotationScoreReadBoundExceeded:
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         try:
             read_deadline.remaining_ms()
         except ReadDeadlineExceeded:
@@ -6045,6 +6623,25 @@ class UsersView(APIView):
             export = query_data.get("export", False)
             search = query_data.get("search", "")
 
+            # The historical Users CSV and sorted-numbered-page paths must
+            # aggregate every matching user before producing the first row.
+            # They are not safe at large-tenant scale and cannot satisfy the
+            # bounded exact-read contract. Fail closed with a stable public
+            # error until a preflighted asynchronous export / bounded global
+            # sort is available; never start a partial 200 CSV stream.
+            if export:
+                return self._gm.custom_error_response(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "User export is temporarily unavailable.",
+                    code="user_export_unavailable",
+                )
+            if query_data.get("sort_params"):
+                return self._gm.custom_error_response(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "User sorting is temporarily unavailable.",
+                    code="user_sort_unavailable",
+                )
+
             try:
                 page_size = int(query_data.get("page_size", 30))
                 current_page = int(query_data.get("current_page_index", 0))
@@ -6067,19 +6664,9 @@ class UsersView(APIView):
                 search=search.strip() if search else None,
                 filters=query_data.get("filters", []),
                 sort_params=query_data.get("sort_params", []),
+                requested_columns=query_data.get("requested_columns", []),
+                attribute_keys=query_data.get("attribute_keys", []),
             )
-
-            if export:
-                if query_data.get("cursor") or query_data.get("cursor_mode"):
-                    return self._gm.bad_request(
-                        "Continuation cursors are not available for CSV export"
-                    )
-                response = StreamingHttpResponse(
-                    manager.iter_export_csv(),
-                    content_type="text/csv",
-                )
-                response["Content-Disposition"] = "attachment"
-                return response
 
             cursor_token = query_data.get("cursor")
             cursor_requested = bool(cursor_token or query_data.get("cursor_mode"))

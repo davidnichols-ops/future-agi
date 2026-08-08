@@ -242,10 +242,10 @@ export const computeNaturalSize = (layout) => {
 export const computeSankeyLayout = (graphData) => {
   if (!graphData?.nodes?.length) return null;
 
-  // Agent Path is the exact chronological adjacency projection; Agent Graph
-  // separately renders recorded parent_span_id hierarchy. Falling back to
-  // `edges` keeps compatibility with older cached payloads that predate
-  // `path_edges`, while an explicit empty path stays empty.
+  // Agent Path is the exact recorded parent_span_id flow rendered as a Sankey;
+  // timestamps alone never create a transition between sibling spans.
+  // Falling back to `edges` keeps compatibility with older cached payloads
+  // that predate `path_edges`, while an explicit empty path stays empty.
   const graphEdges =
     graphData.path_edges ?? graphData.pathEdges ?? graphData.edges ?? [];
 

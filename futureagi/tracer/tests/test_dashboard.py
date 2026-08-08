@@ -1921,6 +1921,7 @@ class TestMetricsEndpoint:
             now - timedelta(minutes=2),
         )
         selector = mock_selector_cls.return_value
+        selector.retained_window_start.return_value = now - timedelta(days=365)
         selector.read_value_cursor_page.side_effect = [
             _attribute_value_cursor_page(
                 ("prior-4095",),
@@ -2000,12 +2001,12 @@ class TestMetricsEndpoint:
         auth_client,
         observe_project,
     ):
-        mock_selector_cls.return_value.read_value_cursor_page.return_value = (
-            _attribute_value_cursor_page(
-                (),
-                has_more=False,
-                browse_status="limit_reached",
-            )
+        selector = mock_selector_cls.return_value
+        selector.retained_window_start.return_value = datetime(2025, 8, 1, tzinfo=UTC)
+        selector.read_value_cursor_page.return_value = _attribute_value_cursor_page(
+            (),
+            has_more=False,
+            browse_status="limit_reached",
         )
 
         response = auth_client.get(
@@ -2036,18 +2037,18 @@ class TestMetricsEndpoint:
     ):
         now = datetime(2026, 8, 1, tzinfo=UTC)
         digest = attribute_value_cursor_digest("string", "completed")
-        mock_selector_cls.return_value.read_value_cursor_page.return_value = (
-            _attribute_value_cursor_page(
-                ("completed",),
-                has_more=True,
-                next_before_identity=(
-                    str(observe_project.id),
-                    "trace-first",
-                    "span-first",
-                    now - timedelta(minutes=1),
-                ),
-                seen_value_digests=(digest,),
-            )
+        selector = mock_selector_cls.return_value
+        selector.retained_window_start.return_value = now - timedelta(days=365)
+        selector.read_value_cursor_page.return_value = _attribute_value_cursor_page(
+            ("completed",),
+            has_more=True,
+            next_before_identity=(
+                str(observe_project.id),
+                "trace-first",
+                "span-first",
+                now - timedelta(minutes=1),
+            ),
+            seen_value_digests=(digest,),
         )
         base = {
             "metric_name": "call.status",
@@ -2066,7 +2067,7 @@ class TestMetricsEndpoint:
 
         assert mismatched.status_code == 400
         assert mismatched.json()["code"] == "cursor_mismatch"
-        assert mock_selector_cls.return_value.read_value_cursor_page.call_count == 1
+        assert selector.read_value_cursor_page.call_count == 1
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.AttributeReadSelector")
