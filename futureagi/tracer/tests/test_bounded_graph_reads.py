@@ -936,7 +936,8 @@ def test_nested_json_and_map_filters_fail_closed_before_clickhouse_read(
 
 
 @pytest.mark.unit
-def test_customer_final_status_1090_rows_completes_below_any_span_ceiling():
+def test_customer_final_status_1090_rows_respects_safe_classifier_ceiling():
+    filters = [_date_filter(), _attribute_filter("final_status", "Rejected")]
     rows = [
         {
             "trace_id": f"trace-{index:04d}",
@@ -951,20 +952,31 @@ def test_customer_final_status_1090_rows_completes_below_any_span_ceiling():
     sample = read_graph_candidates(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[_date_filter(), _attribute_filter("final_status", "Rejected")],
+        filters=filters,
         observe_type="trace",
     )
 
-    assert sample.query_complete is True
-    assert sample.query_status == "complete"
-    assert sample.query_error_code is None
-    assert len(sample.rows) == 1090
-    # One 513-ID cardinality probe plus three ordered 512-root batches and
-    # their finite classifiers. The sentinel switches common values away from
-    # an unordered full-window distinct scan without constructing a Set.
-    assert 7 <= sample.query_count <= 10
+    builder = bounded_graph_reads.TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        page_number=0,
+        page_size=bounded_graph_reads.GRAPH_CANDIDATE_LIMIT,
+        filters=filters,
+        bounded_identity_only=True,
+    )
+    classify_batch_size = int(builder.recommended_filter_classify_batch_size() or 50)
+    expected_limit = min(
+        bounded_graph_reads.GRAPH_CANDIDATE_LIMIT,
+        (classify_batch_size * bounded_graph_reads.GRAPH_TRACE_CLASSIFY_BATCH_BUDGET)
+        - 1,
+    )
+    assert len(sample.rows) == expected_limit
+    assert sample.query_complete is False
+    assert sample.query_status == "sampled"
+    assert sample.query_error_code == "sample_limit"
+    assert sample.total_rows_lower_bound == expected_limit + 1
     assert all(
-        len(call[1].get("candidate_trace_ids", ())) <= 512 for call in analytics.calls
+        len(call[1].get("candidate_trace_ids", ())) <= classify_batch_size
+        for call in analytics.calls
     )
 
 
@@ -1085,6 +1097,15 @@ def test_1600th_root_trace_returns_visible_sample_instead_of_blank_error():
 
 @pytest.mark.unit
 def test_640th_structured_trace_returns_visible_sample_instead_of_blank_error():
+    filters = [
+        _date_filter(),
+        _attribute_filter(
+            "customer.context",
+            {"tier": "vip", "attempt": 2},
+            filter_type="json",
+            filter_op="contains",
+        ),
+    ]
     rows = [
         {
             "trace_id": f"trace-{index:04d}",
@@ -1098,19 +1119,23 @@ def test_640th_structured_trace_returns_visible_sample_instead_of_blank_error():
     sample = read_graph_candidates(
         analytics=analytics,
         project_id=PROJECT_ID,
-        filters=[
-            _date_filter(),
-            _attribute_filter(
-                "customer.context",
-                {"tier": "vip", "attempt": 2},
-                filter_type="json",
-                filter_op="contains",
-            ),
-        ],
+        filters=filters,
         observe_type="trace",
     )
 
-    expected_limit = (20 * bounded_graph_reads.GRAPH_TRACE_CLASSIFY_BATCH_BUDGET) - 1
+    builder = bounded_graph_reads.TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        page_number=0,
+        page_size=bounded_graph_reads.GRAPH_CANDIDATE_LIMIT,
+        filters=filters,
+        bounded_identity_only=True,
+    )
+    classify_batch_size = int(builder.recommended_filter_classify_batch_size() or 50)
+    expected_limit = min(
+        bounded_graph_reads.GRAPH_CANDIDATE_LIMIT,
+        (classify_batch_size * bounded_graph_reads.GRAPH_TRACE_CLASSIFY_BATCH_BUDGET)
+        - 1,
+    )
     assert len(sample.rows) == expected_limit
     assert sample.query_complete is False
     assert sample.query_status == "sampled"

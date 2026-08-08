@@ -234,8 +234,8 @@ def test_identity_only_trace_classifier_accepts_200_but_rejects_201(
     assert len(result) == 200
     # The builder accepts a finite 200-identity input, but the production
     # scheduler deliberately chunks any-span replay into the qualified
-    # twenty-trace memory envelope.
-    assert builder.recommended_filter_classify_batch_size() == 20
+    # ten-trace memory envelope.
+    assert builder.recommended_filter_classify_batch_size() == 10
     assert "project_id = %(project_id)s" in query
     assert "candidate_start_date" in query and "candidate_end_date" in query
     with pytest.raises(ValueError, match="candidate trace batch exceeds bounded limit"):
