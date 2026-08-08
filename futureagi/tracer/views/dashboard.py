@@ -1741,6 +1741,17 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 resume_identity = raw_resume_identity
                             window_start = cursor_state.window_start
                             window_end = cursor_state.window_end
+                            segment_start = cursor_state.scan_slice_start
+                            scan_slice_end = cursor_state.scan_slice_end
+                            if (
+                                (segment_start is None) != (scan_slice_end is None)
+                                or scan_slice_end is not None
+                                and scan_slice_end != segment_end
+                            ):
+                                raise ListCursorError(
+                                    "invalid_cursor",
+                                    "The continuation cursor is invalid.",
+                                )
                         else:
                             window_end = datetime.now(UTC)
                             retained_start = selector.retained_window_start(
@@ -1752,6 +1763,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                 window_end=window_end,
                             )
                             segment_end = window_end
+                            segment_start = None
                             before_identity = None
                             resume_identity = None
                             resume_member_offset = 0
@@ -1788,6 +1800,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             window_start=window_start,
                             window_end=window_end,
                             segment_end=segment_end,
+                            segment_start=segment_start,
                             before_identity=before_identity,
                             resume_identity=resume_identity,
                             resume_member_offset=resume_member_offset,
@@ -1853,6 +1866,12 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                                     seen_reference,
                                 ),
                                 seen_rows=len(page_read.seen_value_digests),
+                                scan_slice_start=page_read.next_segment_start,
+                                scan_slice_end=(
+                                    page_read.next_segment_end
+                                    if page_read.next_segment_start is not None
+                                    else None
+                                ),
                             )
                         return self._gm.success_response(
                             {

@@ -348,6 +348,10 @@ class AttributeValueCursorPageRead:
     next_resume_member_offset: int
     seen_value_digests: tuple[str, ...]
     browse_status: AttributeValueBrowseStatus = "exhausted"
+    # Signed continuation hint for the next exact physical slice.  This is an
+    # execution bound, not result state: old cursors may omit it and safely
+    # fall back to the legacy six-hour width.
+    next_segment_start: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -3919,6 +3923,7 @@ class AttributeReadSelector:
         window_start: datetime,
         window_end: datetime,
         segment_end: datetime | None = None,
+        segment_start: datetime | None = None,
         before_identity: PhysicalSpanIdentity | None = None,
         resume_identity: PhysicalSpanIdentity | None = None,
         resume_member_offset: int = 0,
@@ -4008,6 +4013,16 @@ class AttributeReadSelector:
         elif int(resume_member_offset) != 0:
             raise ValueError("member offset requires a resume identity")
 
+        active_segment_start = (
+            _utc(segment_start) if segment_start is not None else None
+        )
+        if active_segment_start is not None and (
+            not start <= active_segment_start < current_segment_end
+            or current_segment_end - active_segment_start
+            > ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT
+        ):
+            raise ValueError("invalid filter-value segment cursor")
+
         # Rolling compatibility for cursors issued before candidate segment
         # bounds preserved DateTime64(6) precision.  Those reads could admit a
         # checkpoint a few microseconds below the cursor's implied six-hour
@@ -4018,7 +4033,8 @@ class AttributeReadSelector:
         # it, so recovery neither repeats nor skips a physical row.
         incoming_checkpoint = resume_identity or before_identity
         if (
-            incoming_checkpoint is not None
+            active_segment_start is None
+            and incoming_checkpoint is not None
             and incoming_checkpoint[3]
             < current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
         ):
@@ -4026,6 +4042,14 @@ class AttributeReadSelector:
                 current_segment_end,
                 incoming_checkpoint[3] + ATTRIBUTE_READ_EXPLICIT_SEGMENT,
             )
+        if (
+            incoming_checkpoint is not None
+            and active_segment_start is not None
+            and not (
+                active_segment_start <= incoming_checkpoint[3] < current_segment_end
+            )
+        ):
+            raise ValueError("invalid filter-value physical cursor")
 
         seen = tuple(dict.fromkeys(str(value) for value in seen_value_digests))
         if any(
@@ -4057,8 +4081,13 @@ class AttributeReadSelector:
         candidate_pages = 0
         candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
         cursor_before = before_identity
-        empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+        empty_segment_width = (
+            current_segment_end - active_segment_start
+            if active_segment_start is not None
+            else ATTRIBUTE_READ_EXPLICIT_SEGMENT
+        )
         max_empty_segment_width = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT
+        last_successful_segment_width = empty_segment_width
         checkpoint_from_widened_segment = False
         next_resume_identity: PhysicalSpanIdentity | None = None
         next_resume_member_offset = 0
@@ -4091,12 +4120,14 @@ class AttributeReadSelector:
             nonlocal checkpoint_from_widened_segment
             nonlocal current_segment_end
             nonlocal empty_segment_width
+            nonlocal last_successful_segment_width
 
             current_segment_end = min(
                 current_segment_end,
                 checkpoint[3] + width,
             )
             empty_segment_width = width
+            last_successful_segment_width = width
             candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
             checkpoint_from_widened_segment = False
 
@@ -4442,6 +4473,7 @@ class AttributeReadSelector:
                     # This statement certified nothing, but an earlier complete
                     # batch already moved the request-local physical frontier.
                     # Publish only that earlier checkpoint.
+                    empty_segment_width = last_successful_segment_width
                     break
                 if is_read_budget_error(exc) and candidate_limit > (
                     ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
@@ -4474,10 +4506,6 @@ class AttributeReadSelector:
                         # Retry the same frontier at the five-minute exact floor;
                         # a keyset checkpoint must be re-anchored so timestamp ties
                         # below it stay inside the half-open segment.
-                        max_empty_segment_width = min(
-                            max_empty_segment_width,
-                            retry_width,
-                        )
                         if cursor_before is not None:
                             anchor_checkpoint_window(
                                 cursor_before,
@@ -4527,6 +4555,7 @@ class AttributeReadSelector:
                         # Candidate identities from this failed replay are not
                         # certified. Retain only the checkpoint from a prior
                         # complete batch in this request.
+                        empty_segment_width = last_successful_segment_width
                         break
                     if is_read_budget_error(exc) and candidate_limit > (
                         ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
@@ -4545,10 +4574,6 @@ class AttributeReadSelector:
                         if failed_width > retry_width:
                             # The candidate prefix was not certified, so narrow
                             # the same temporal frontier before retrying it.
-                            max_empty_segment_width = min(
-                                max_empty_segment_width,
-                                retry_width,
-                            )
                             if cursor_before is not None:
                                 anchor_checkpoint_window(
                                     cursor_before,
@@ -4570,6 +4595,12 @@ class AttributeReadSelector:
                 candidate_pages += 1
             else:
                 rows = ()
+
+            # Candidate discovery plus any required latest-state replay has
+            # completed for this whole half-open slice.  Remember only this
+            # proven width; a later wider failure may publish it as the signed
+            # continuation hint without claiming progress for the failed read.
+            last_successful_segment_width = current_segment_end - segment_start
 
             rows_by_identity = {self._physical_identity(row): row for row in rows}
             fully_processed_identity = cursor_before
@@ -4628,13 +4659,10 @@ class AttributeReadSelector:
                 cursor_before = None
                 checkpoint_from_widened_segment = False
                 candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
-                if candidate_ids:
-                    empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
-                else:
-                    empty_segment_width = min(
-                        empty_segment_width * 2,
-                        max_empty_segment_width,
-                    )
+                empty_segment_width = min(
+                    empty_segment_width * 2,
+                    max_empty_segment_width,
+                )
 
             # Search is an interactive narrowing operation.  Once one bounded
             # physical batch has produced verified matches, return that exact
@@ -4684,6 +4712,9 @@ class AttributeReadSelector:
             window_end=end,
             query_count=self._query_count,
         )
+        next_segment_start = (
+            max(start, current_segment_end - empty_segment_width) if has_more else None
+        )
         return AttributeValueCursorPageRead(
             tuple(emitted[digest] for digest in emitted_digests),
             metadata,
@@ -4694,6 +4725,7 @@ class AttributeReadSelector:
             next_resume_member_offset,
             seen_after,
             browse_status,
+            next_segment_start,
         )
 
     def read_detail(

@@ -19,6 +19,8 @@ from urllib.parse import urlencode
 
 import pytest
 from clickhouse_driver.errors import NetworkError, ServerException
+from django.conf import settings
+from django.core import signing
 
 from accounts.models.workspace import Workspace
 from model_hub.models.ai_model import AIModel
@@ -41,6 +43,7 @@ from tracer.services.clickhouse.attribute_reads import (
     AttributeValueRow,
     attribute_value_cursor_digest,
 )
+from tracer.services.clickhouse.list_cursor import CURSOR_SALT
 from tracer.services.clickhouse.query_builders.dashboard import (
     AGGREGATIONS,
     FILTER_OPERATORS,
@@ -100,6 +103,7 @@ def _attribute_value_cursor_page(
     next_resume_identity=None,
     next_resume_member_offset=0,
     seen_value_digests=(),
+    next_segment_start=None,
 ):
     now = datetime(2026, 8, 1, tzinfo=UTC)
     return AttributeValueCursorPageRead(
@@ -119,6 +123,7 @@ def _attribute_value_cursor_page(
         next_resume_member_offset=next_resume_member_offset,
         seen_value_digests=seen_value_digests,
         browse_status=browse_status or ("continuation" if has_more else "exhausted"),
+        next_segment_start=next_segment_start,
     )
 
 
@@ -1823,6 +1828,7 @@ class TestMetricsEndpoint:
                 has_more=True,
                 next_before_identity=first_before,
                 seen_value_digests=(completed_digest, failed_digest),
+                next_segment_start=now - timedelta(minutes=5),
             ),
             _attribute_value_cursor_page(
                 ("queued",),
@@ -1890,6 +1896,7 @@ class TestMetricsEndpoint:
         assert second_kwargs["continue_operation"] is False
         assert second_kwargs["window_end"] == frozen_window_end
         assert second_kwargs["before_identity"] == first_before
+        assert second_kwargs["segment_start"] == now - timedelta(minutes=5)
         assert second_kwargs["attribute_type"] == "string"
         assert second_kwargs["seen_value_digests"] == (
             completed_digest,
@@ -1993,6 +2000,65 @@ class TestMetricsEndpoint:
             selector.read_value_cursor_page.call_args_list[2].kwargs["before_identity"]
             == second_before
         )
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    def test_filter_values_rejects_scan_slice_that_mismatches_order(
+        self,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        digest = attribute_value_cursor_digest("string", "Rechazado")
+        selector = mock_selector_cls.return_value
+        selector.retained_window_start.return_value = now - timedelta(days=365)
+        selector.read_value_cursor_page.return_value = _attribute_value_cursor_page(
+            ("Rechazado",),
+            has_more=True,
+            next_before_identity=(
+                str(observe_project.id),
+                "trace-rechazado",
+                "span-rechazado",
+                now - timedelta(minutes=1),
+            ),
+            seen_value_digests=(digest,),
+            next_segment_start=now - timedelta(minutes=5),
+        )
+        params = {
+            "metric_name": "final_status",
+            "metric_type": "custom_attribute",
+            "project_ids": str(observe_project.id),
+            "source": "traces",
+            "page_size": 10,
+            "search": "Rechazado",
+        }
+        first = auth_client.get("/tracer/dashboard/filter_values/", params)
+        assert first.status_code == 200
+        token = first.json()["result"]["next_cursor"]
+        payload = signing.loads(
+            token,
+            key=settings.SECRET_KEY,
+            salt=CURSOR_SALT,
+        )
+        payload["scan_slice_end"] = {
+            "$datetime": (now - timedelta(seconds=1)).isoformat()
+        }
+        malformed = signing.dumps(
+            payload,
+            key=settings.SECRET_KEY,
+            salt=CURSOR_SALT,
+            compress=True,
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {**params, "cursor": malformed},
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "invalid_cursor"
+        assert selector.read_value_cursor_page.call_count == 1
 
     @pytest.mark.django_db
     @patch("tracer.views.dashboard.AttributeReadSelector")

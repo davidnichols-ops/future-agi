@@ -57,6 +57,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
+    ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS,
     AttributeCardinalityRead,
@@ -4709,6 +4710,225 @@ def test_filter_value_cursor_replay_budget_retries_exact_five_minute_frontier():
     ]
 
 
+def test_filter_value_cursor_persists_last_successful_adaptive_width():
+    candidate = _candidate(
+        PROJECT_A,
+        "adaptive-search-result",
+        start_time=NOW - timedelta(minutes=20),
+    )
+    attempted_widths = []
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            width = call.params["segment_end"] - call.params["segment_start"]
+            attempted_widths.append(width)
+            if width in {ATTRIBUTE_READ_EXPLICIT_SEGMENT, timedelta(minutes=20)}:
+                return ReadDeadlineExceeded("adaptive deadline")
+            if (
+                call.params["segment_start"]
+                <= candidate["start_time"]
+                < call.params["segment_end"]
+            ):
+                return [candidate]
+            return []
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    candidate["id"],
+                    trace_id=candidate["trace_id"],
+                    start_time=candidate["start_time"],
+                    latest_version=candidate["candidate_version"],
+                )
+            ]
+        return [
+            _target_row(
+                PROJECT_A,
+                candidate["id"],
+                trace_id=candidate["trace_id"],
+                start_time=candidate["start_time"],
+                string="Rechazado",
+            )
+        ]
+
+    first = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="Rechazado",
+        attribute_type="string",
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert first.rows == ()
+    assert first.has_more is True
+    assert first.next_before_identity is None
+    assert first.next_segment_end == NOW - timedelta(minutes=15)
+    assert first.next_segment_start == NOW - timedelta(minutes=25)
+    assert attempted_widths == [
+        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+        timedelta(minutes=5),
+        timedelta(minutes=10),
+        timedelta(minutes=20),
+    ]
+
+    second_attempt_start = len(attempted_widths)
+    second = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="Rechazado",
+        attribute_type="string",
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        segment_start=first.next_segment_start,
+        seen_value_digests=first.seen_value_digests,
+    )
+
+    assert second.rows == (AttributeValueRow("Rechazado", "string", 1),)
+    assert attempted_widths[second_attempt_start] == timedelta(minutes=10)
+    assert (
+        ATTRIBUTE_READ_EXPLICIT_SEGMENT not in attempted_widths[second_attempt_start:]
+    )
+
+
+def test_filter_value_cursor_persists_width_after_later_replay_failure():
+    candidate = _candidate(
+        PROJECT_A,
+        "adaptive-replay-search-result",
+        start_time=NOW - timedelta(minutes=20),
+    )
+    attempted_widths = []
+    current_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+
+    def respond(call, _):
+        nonlocal current_width
+        if "segment_start" in call.params:
+            current_width = call.params["segment_end"] - call.params["segment_start"]
+            attempted_widths.append(current_width)
+            if (
+                call.params["segment_start"]
+                <= candidate["start_time"]
+                < call.params["segment_end"]
+            ):
+                return [candidate]
+            return []
+        if current_width in {
+            ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+            timedelta(minutes=20),
+        }:
+            return ReadDeadlineExceeded("adaptive replay deadline")
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    candidate["id"],
+                    trace_id=candidate["trace_id"],
+                    start_time=candidate["start_time"],
+                    latest_version=candidate["candidate_version"],
+                )
+            ]
+        return [
+            _target_row(
+                PROJECT_A,
+                candidate["id"],
+                trace_id=candidate["trace_id"],
+                start_time=candidate["start_time"],
+                string="Rechazado",
+            )
+        ]
+
+    first = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="Rechazado",
+        attribute_type="string",
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert first.rows == ()
+    assert first.next_segment_end == NOW - timedelta(minutes=15)
+    assert first.next_segment_start == NOW - timedelta(minutes=25)
+    assert attempted_widths == [
+        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+        timedelta(minutes=5),
+        timedelta(minutes=10),
+        timedelta(minutes=20),
+    ]
+
+    second_attempt_start = len(attempted_widths)
+    second = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="Rechazado",
+        attribute_type="string",
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        segment_start=first.next_segment_start,
+        seen_value_digests=first.seen_value_digests,
+    )
+
+    assert second.rows == (AttributeValueRow("Rechazado", "string", 1),)
+    assert attempted_widths[second_attempt_start] == timedelta(minutes=10)
+    assert (
+        ATTRIBUTE_READ_EXPLICIT_SEGMENT not in attempted_widths[second_attempt_start:]
+    )
+
+
+@pytest.mark.parametrize(
+    "segment_start",
+    (
+        NOW,
+        NOW - timedelta(days=1, microseconds=1),
+        NOW - ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT - timedelta(microseconds=1),
+    ),
+)
+def test_filter_value_cursor_rejects_invalid_adaptive_segment(segment_start):
+    with pytest.raises(ValueError, match="invalid filter-value segment cursor"):
+        AttributeReadSelector(RecordingExecutor(), now=NOW).read_value_cursor_page(
+            [PROJECT_A],
+            "final_status",
+            page_size=10,
+            window_start=NOW - timedelta(days=1),
+            window_end=NOW,
+            segment_start=segment_start,
+        )
+
+
+def test_filter_value_cursor_adaptive_segment_must_contain_checkpoint():
+    checkpoint = (
+        PROJECT_A,
+        "trace-before-adaptive-segment",
+        "span-before-adaptive-segment",
+        NOW - timedelta(minutes=10),
+    )
+
+    with pytest.raises(ValueError, match="invalid filter-value physical cursor"):
+        AttributeReadSelector(RecordingExecutor(), now=NOW).read_value_cursor_page(
+            [PROJECT_A],
+            "final_status",
+            page_size=10,
+            window_start=NOW - timedelta(days=1),
+            window_end=NOW,
+            segment_start=NOW - timedelta(minutes=5),
+            before_identity=checkpoint,
+        )
+
+
 @pytest.mark.parametrize("failure_stage", ["candidate", "replay"])
 def test_filter_value_cursor_five_minute_floor_failure_remains_fail_closed(
     failure_stage,
@@ -4806,6 +5026,8 @@ def test_filter_value_cursor_full_url_stays_below_common_request_line_limit():
         window_end=NOW,
         order=(NOW, (), (), 0, seen_reference),
         seen_rows=1_000_000,
+        scan_slice_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+        scan_slice_end=NOW,
     )
     full_url = "https://api.futureagi.com/tracer/dashboard/filter_values/?" + urlencode(
         {
