@@ -57,6 +57,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
+    ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS,
     AttributeCardinalityRead,
     AttributeDetailRead,
@@ -3027,7 +3028,7 @@ def test_filter_value_cursor_empty_retained_window_terminates_without_loop():
     )
 
 
-def test_filter_value_cursor_wide_probe_failure_retries_without_advancing():
+def test_filter_value_cursor_wide_probe_failure_returns_prior_exact_progress():
     failed_wide_end = None
 
     def respond(call, _):
@@ -3051,21 +3052,15 @@ def test_filter_value_cursor_wide_probe_failure_retries_without_advancing():
         window_end=NOW,
     )
 
-    failed_index = next(
-        index
-        for index, call in enumerate(executor.calls)
-        if call.params.get("segment_end") == failed_wide_end
-        and call.params["segment_end"] - call.params["segment_start"]
+    failed_call = executor.calls[-1]
+    assert failed_call.params["segment_end"] == failed_wide_end
+    assert (
+        failed_call.params["segment_end"] - failed_call.params["segment_start"]
         > ATTRIBUTE_READ_EXPLICIT_SEGMENT
     )
-    retry = executor.calls[failed_index + 1]
-    assert retry.params["segment_end"] == failed_wide_end
-    assert (
-        retry.params["segment_end"] - retry.params["segment_start"]
-        == ATTRIBUTE_READ_EXPLICIT_SEGMENT
-    )
-    assert read.has_more is False
-    assert read.browse_status == "exhausted"
+    assert read.next_segment_end == failed_wide_end
+    assert read.has_more is True
+    assert read.browse_status == "continuation"
 
 
 def test_filter_value_cursor_widened_checkpoint_is_monotonic_and_unique():
@@ -4594,47 +4589,169 @@ def test_filter_value_cursor_search_remains_resumable_after_tracking_prefix(
     assert candidate_calls[0]["include_versions"] is True
 
 
-def test_filter_value_cursor_candidate_budget_failure_propagates_fail_closed():
-    executor = RecordingExecutor(lambda *_: ReadDeadlineExceeded("candidate deadline"))
-
-    with pytest.raises(ReadDeadlineExceeded, match="candidate deadline"):
-        AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
-            [PROJECT_A],
-            "final_status",
-            page_size=10,
-            window_start=NOW - timedelta(days=1),
-            window_end=NOW,
-        )
-
-    assert len(executor.calls) == 1
-    assert "segment_start" in executor.calls[0].params
-
-
-def test_filter_value_cursor_verify_budget_failure_propagates_fail_closed():
+def test_filter_value_cursor_candidate_budget_retries_exact_five_minute_frontier():
     candidate = _candidate(
         PROJECT_A,
-        "verify-budget",
+        "candidate-budget-recovered",
         start_time=NOW - timedelta(minutes=1),
     )
+    attempted_widths = []
 
     def respond(call, _):
         if "segment_start" in call.params:
+            attempted_widths.append(
+                call.params["segment_end"] - call.params["segment_start"]
+            )
+            if attempted_widths[-1] > ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT:
+                return ReadDeadlineExceeded("candidate deadline")
+            return [candidate]
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    candidate["id"],
+                    trace_id=candidate["trace_id"],
+                    start_time=candidate["start_time"],
+                    latest_version=candidate["candidate_version"],
+                )
+            ]
+        return [
+            _target_row(
+                PROJECT_A,
+                candidate["id"],
+                trace_id=candidate["trace_id"],
+                start_time=candidate["start_time"],
+                string="recovered",
+            )
+        ]
+
+    executor = RecordingExecutor(respond)
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="recovered",
+        attribute_type="string",
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert read.rows == (AttributeValueRow("recovered", "string", 1),)
+    assert read.metadata.query_complete is True
+    assert attempted_widths == [
+        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+        ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+    ]
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert (
+        candidate_calls[0].params["segment_end"]
+        == candidate_calls[1].params["segment_end"]
+    )
+    assert all("candidate_before_id" not in call.params for call in candidate_calls)
+
+
+def test_filter_value_cursor_replay_budget_retries_exact_five_minute_frontier():
+    candidate = _candidate(
+        PROJECT_A,
+        "replay-budget-recovered",
+        start_time=NOW - timedelta(minutes=1),
+    )
+    attempted_widths = []
+    current_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+
+    def respond(call, _):
+        nonlocal current_width
+        if "segment_start" in call.params:
+            current_width = call.params["segment_end"] - call.params["segment_start"]
+            attempted_widths.append(current_width)
+            return [candidate]
+        if current_width > ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT:
+            return ReadDeadlineExceeded("verify deadline")
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    candidate["id"],
+                    trace_id=candidate["trace_id"],
+                    start_time=candidate["start_time"],
+                    latest_version=candidate["candidate_version"],
+                )
+            ]
+        return [
+            _target_row(
+                PROJECT_A,
+                candidate["id"],
+                trace_id=candidate["trace_id"],
+                start_time=candidate["start_time"],
+                string="recovered",
+            )
+        ]
+
+    read = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="recovered",
+        attribute_type="string",
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert read.rows == (AttributeValueRow("recovered", "string", 1),)
+    assert read.metadata.query_complete is True
+    assert attempted_widths == [
+        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+        ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+    ]
+
+
+@pytest.mark.parametrize("failure_stage", ["candidate", "replay"])
+def test_filter_value_cursor_five_minute_floor_failure_remains_fail_closed(
+    failure_stage,
+):
+    candidate = _candidate(
+        PROJECT_A,
+        f"{failure_stage}-floor-failure",
+        start_time=NOW - timedelta(minutes=1),
+    )
+    attempted_widths = []
+
+    def respond(call, _):
+        if "segment_start" in call.params:
+            attempted_widths.append(
+                call.params["segment_end"] - call.params["segment_start"]
+            )
+            if failure_stage == "candidate":
+                return ReadDeadlineExceeded("candidate deadline")
             return [candidate]
         return ReadDeadlineExceeded("verify deadline")
 
-    executor = RecordingExecutor(respond)
-    with pytest.raises(ReadDeadlineExceeded, match="verify deadline"):
-        AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+    message = (
+        "candidate deadline" if failure_stage == "candidate" else "verify deadline"
+    )
+    with pytest.raises(ReadDeadlineExceeded, match=message):
+        AttributeReadSelector(
+            RecordingExecutor(respond), now=NOW
+        ).read_value_cursor_page(
             [PROJECT_A],
             "final_status",
             page_size=10,
+            attribute_type="string",
             window_start=NOW - timedelta(days=1),
             window_end=NOW,
         )
 
-    assert len(executor.calls) == 2
-    assert "segment_start" in executor.calls[0].params
-    assert "segment_start" not in executor.calls[1].params
+    assert attempted_widths[:2] == [
+        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+        ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+    ]
+    assert all(
+        width == ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT for width in attempted_widths[1:]
+    )
 
 
 def test_filter_value_cursor_resume_budget_failure_never_advances_cursor():

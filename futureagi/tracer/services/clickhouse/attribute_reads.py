@@ -145,6 +145,11 @@ ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT = timedelta(minutes=15)
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT = timedelta(minutes=5)
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = timedelta(hours=2)
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 500
+# Dense projects can cross the ordinary row/byte envelope even inside the
+# production-qualified six-hour seed.  A failed statement proves nothing, so
+# retry its identical newest-first frontier in this smaller exact slice before
+# exposing an unavailable picker response.
+ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT = timedelta(minutes=5)
 # An unpinned physical page can require candidate, version certificate, typed
 # hydration and isolated JSON hydration.  Leave that full fallback available
 # when a speculative distinct proof cannot certify its slice.
@@ -4057,6 +4062,43 @@ class AttributeReadSelector:
         checkpoint_from_widened_segment = False
         next_resume_identity: PhysicalSpanIdentity | None = None
         next_resume_member_offset = 0
+        initial_cursor_state = (
+            current_segment_end,
+            before_identity,
+            resume_identity,
+            int(resume_member_offset),
+        )
+
+        def frontier_state() -> tuple[Any, ...]:
+            return (
+                current_segment_end,
+                cursor_before,
+                next_resume_identity,
+                int(next_resume_member_offset),
+            )
+
+        def request_has_progress() -> bool:
+            return frontier_state() != initial_cursor_state
+
+        def anchor_checkpoint_window(
+            checkpoint: PhysicalSpanIdentity,
+            *,
+            width: timedelta,
+        ) -> None:
+            """Keep a proven keyset checkpoint inside a narrower exact slice."""
+
+            nonlocal candidate_limit
+            nonlocal checkpoint_from_widened_segment
+            nonlocal current_segment_end
+            nonlocal empty_segment_width
+
+            current_segment_end = min(
+                current_segment_end,
+                checkpoint[3] + width,
+            )
+            empty_segment_width = width
+            candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+            checkpoint_from_widened_segment = False
 
         def value_candidate_predicate() -> tuple[str, dict[str, Any]]:
             """Push the requested key/search into the finite identity seed.
@@ -4353,6 +4395,18 @@ class AttributeReadSelector:
             and self._query_count + candidate_page_query_cost
             <= ATTRIBUTE_READ_MAX_QUERY_COUNT
         ):
+            assert self._deadline is not None
+            remaining_ms = int((self._deadline - self._clock()) * 1000)
+            physical_batch_reserve_ms = (
+                candidate_page_query_cost
+                * ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+                + ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS
+            )
+            if request_has_progress() and remaining_ms <= physical_batch_reserve_ms:
+                # Do not start a multi-statement candidate/replay batch that can
+                # only fail after a prior exact checkpoint. Return that proven
+                # continuation and let the next request own a fresh wall budget.
+                break
             segment_start = max(start, current_segment_end - empty_segment_width)
             segment = (segment_start, current_segment_end)
             candidate_ids: tuple[PhysicalSpanIdentity, ...] = ()
@@ -4384,6 +4438,11 @@ class AttributeReadSelector:
                     include_versions=versioned_cursor_read,
                 )
             except Exception as exc:
+                if is_read_budget_error(exc) and request_has_progress():
+                    # This statement certified nothing, but an earlier complete
+                    # batch already moved the request-local physical frontier.
+                    # Publish only that earlier checkpoint.
+                    break
                 if is_read_budget_error(exc) and candidate_limit > (
                     ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                 ):
@@ -4404,10 +4463,34 @@ class AttributeReadSelector:
                     max_empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
                     empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
                     continue
+                if is_read_budget_error(exc):
+                    failed_width = current_segment_end - segment_start
+                    retry_width = min(
+                        ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+                        current_segment_end - start,
+                    )
+                    if failed_width > retry_width:
+                        # The failed read did not advance any public cursor state.
+                        # Retry the same frontier at the five-minute exact floor;
+                        # a keyset checkpoint must be re-anchored so timestamp ties
+                        # below it stay inside the half-open segment.
+                        max_empty_segment_width = min(
+                            max_empty_segment_width,
+                            retry_width,
+                        )
+                        if cursor_before is not None:
+                            anchor_checkpoint_window(
+                                cursor_before,
+                                width=retry_width,
+                            )
+                        else:
+                            empty_segment_width = retry_width
+                            candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                            checkpoint_from_widened_segment = False
+                        continue
                 raise
 
             if candidate_ids:
-                candidate_pages += 1
                 try:
                     replay_timeout_ms = (
                         ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
@@ -4440,6 +4523,11 @@ class AttributeReadSelector:
                         )
                     )
                 except Exception as exc:
+                    if is_read_budget_error(exc) and request_has_progress():
+                        # Candidate identities from this failed replay are not
+                        # certified. Retain only the checkpoint from a prior
+                        # complete batch in this request.
+                        break
                     if is_read_budget_error(exc) and candidate_limit > (
                         ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                     ):
@@ -4448,7 +4536,38 @@ class AttributeReadSelector:
                         # proven checkpoint as an exact continuation.
                         candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                         break
+                    if is_read_budget_error(exc):
+                        failed_width = current_segment_end - segment_start
+                        retry_width = min(
+                            ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+                            current_segment_end - start,
+                        )
+                        if failed_width > retry_width:
+                            # The candidate prefix was not certified, so narrow
+                            # the same temporal frontier before retrying it.
+                            max_empty_segment_width = min(
+                                max_empty_segment_width,
+                                retry_width,
+                            )
+                            if cursor_before is not None:
+                                anchor_checkpoint_window(
+                                    cursor_before,
+                                    width=retry_width,
+                                )
+                            else:
+                                empty_segment_width = retry_width
+                                candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                                checkpoint_from_widened_segment = False
+                            continue
+                    if is_read_budget_error(exc) and candidate_limit > 1:
+                        # Replay cost depends on the finite identity batch more
+                        # directly than temporal width. Discard the unverified
+                        # candidates and retry the identical frontier with a
+                        # smaller prefix; no cursor state has moved yet.
+                        candidate_limit = max(candidate_limit // 2, 1)
+                        continue
                     raise
+                candidate_pages += 1
             else:
                 rows = ()
 
@@ -4548,6 +4667,13 @@ class AttributeReadSelector:
             "exhausted" if exhausted else "continuation"
         )
         has_more = browse_status == "continuation"
+        if has_more and frontier_state() == initial_cursor_state:
+            # Never return a successful Load-more cursor that repeats the same
+            # unproven read forever. The API boundary sanitizes this honest
+            # bounded-read failure without leaking ClickHouse diagnostics.
+            raise ReadDeadlineExceeded(
+                "Exact filter-value cursor made no physical progress"
+            )
         # A list page is exact even while a later continuation exists.  This is
         # not an aggregate coverage claim: every emitted option was verified
         # against latest state and the cursor can exhaust the remaining window.
