@@ -12,6 +12,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useAgTheme } from "src/hooks/use-ag-theme";
 import {
   Box,
+  Button,
   MenuItem,
   Pagination,
   PaginationItem,
@@ -42,7 +43,12 @@ import {
   getQueryReadMessage,
   getQueryReadState,
 } from "src/utils/queryReadState";
-import { createListCursorPagination } from "src/sections/projects/LLMTracing/listCursorPagination";
+import {
+  LIST_CURSOR_CONTINUATION_NOTICE,
+  createListCursorPagination,
+  isListCursorContinuationLimitError,
+  isListCursorProtocolError,
+} from "src/sections/projects/LLMTracing/listCursorPagination";
 
 const CELL_HEIGHT_MAP = { Short: 40, Medium: 52, Large: 68, "Extra Large": 88 };
 
@@ -243,14 +249,30 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     enabled,
   });
   const exactPage = data?.__exactPage || data?.result?.__exactPage || null;
+  const hasBufferedSameGenerationError =
+    module === "project" &&
+    Boolean(error) &&
+    cursorPagination.current.isCurrent(paginationRequest.generation) &&
+    Boolean(bufferedPage) &&
+    !isListCursorProtocolError(error);
+  const cursorContinuationPaused =
+    module === "project" &&
+    (exactPage?.pending === true ||
+      isListCursorContinuationLimitError(error) ||
+      hasBufferedSameGenerationError);
   const readState = useMemo(
-    () => getQueryReadState(data, { isError: Boolean(error) }),
-    [data, error],
+    () =>
+      getQueryReadState(data, {
+        isError: Boolean(error) && !cursorContinuationPaused,
+      }),
+    [cursorContinuationPaused, data, error],
   );
-  const responseRows = useMemo(
-    () => (Array.isArray(data?.results) ? data.results : []),
-    [data?.results],
-  );
+  const responseRows =
+    isListCursorContinuationLimitError(error) || hasBufferedSameGenerationError
+      ? bufferedPage?.rows || []
+      : Array.isArray(data?.results)
+        ? data.results
+        : [];
   const hasCursorContinuation =
     module === "project" &&
     (exactPage
@@ -263,7 +285,10 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     typeof data?.has_more === "boolean" &&
     Object.prototype.hasOwnProperty.call(data || {}, "next_cursor");
   const readMessage =
-    responseRows.length > 0 || readState === "sampled" || hasCursorContinuation
+    cursorContinuationPaused ||
+    responseRows.length > 0 ||
+    readState === "sampled" ||
+    hasCursorContinuation
       ? null
       : getQueryReadMessage(readState);
   const isCompleteRead = readState === "complete";
@@ -283,11 +308,6 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     }
     try {
       if (exactPage) {
-        if (exactPage.pending) {
-          // The helper retained rows plus the signed checkpoint on this same
-          // visible page. Change the query key and resume it immediately.
-          advanceCursorTransport((revision) => revision + 1);
-        }
         return;
       }
       if (responseRows.length === 0 && hasCursorContinuation) {
@@ -321,6 +341,11 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     paginationRequest.generation,
     responseRows.length,
   ]);
+
+  const continueCursorSearch = useCallback(() => {
+    if (!cursorContinuationPaused) return;
+    advanceCursorTransport((revision) => revision + 1);
+  }, [cursorContinuationPaused]);
 
   useEffect(() => {
     if (!isLoading) {
@@ -586,6 +611,34 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
           },
         }}
       >
+        {cursorContinuationPaused && (
+          <Box
+            role="status"
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 1,
+              px: 1.5,
+              py: 0.75,
+              color: "text.secondary",
+              bgcolor: "action.hover",
+              borderBottom: "1px solid",
+              borderColor: "divider",
+            }}
+          >
+            <Typography variant="caption">
+              {LIST_CURSOR_CONTINUATION_NOTICE}
+            </Typography>
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={continueCursorSearch}
+            >
+              Continue search
+            </Button>
+          </Box>
+        )}
         {readMessage && (
           <Box
             role="status"
@@ -638,18 +691,20 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
             }
             pagination={false}
             noRowsOverlayComponent={() =>
-              NoRowsOverlay(
-                <Typography
-                  sx={{
-                    fontSize: 14,
-                    fontWeight: 400,
-                    color: "text.secondary",
-                  }}
-                >
-                  {readMessage ||
-                    (showErrors ? "No error found" : "No calls found")}
-                </Typography>,
-              )
+              cursorContinuationPaused
+                ? null
+                : NoRowsOverlay(
+                    <Typography
+                      sx={{
+                        fontSize: 14,
+                        fontWeight: 400,
+                        color: "text.secondary",
+                      }}
+                    >
+                      {readMessage ||
+                        (showErrors ? "No error found" : "No calls found")}
+                    </Typography>,
+                  )
             }
             getRowStyle={getRowStyle}
             onRowClicked={(params) => {

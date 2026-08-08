@@ -208,6 +208,102 @@ describe("list cursor pagination", () => {
     ).rejects.toThrow("repeated continuation cursor");
   });
 
+  it("rejects a non-adjacent cursor cycle persisted across bounded attempts", () => {
+    const pagination = createListCursorPagination();
+
+    pagination.recordEmptyContinuation(0, {
+      has_more: true,
+      next_cursor: "checkpoint-a",
+    });
+    pagination.recordEmptyContinuation(0, {
+      has_more: true,
+      next_cursor: "checkpoint-b",
+    });
+
+    expect(() =>
+      pagination.recordEmptyContinuation(0, {
+        has_more: true,
+        next_cursor: "checkpoint-a",
+      }),
+    ).toThrow("repeated continuation cursor");
+  });
+
+  it("rejects a cursor replay even when it crosses visible pages", () => {
+    const pagination = createListCursorPagination();
+
+    pagination.recordEmptyContinuation(0, {
+      has_more: true,
+      next_cursor: "page-scoped-token",
+    });
+    expect(() =>
+      pagination.recordEmptyContinuation(1, {
+        has_more: true,
+        next_cursor: "page-scoped-token",
+      }),
+    ).toThrow("repeated continuation cursor");
+  });
+
+  it("rejects a non-advancing next-page response cursor", () => {
+    const pagination = createListCursorPagination();
+
+    pagination.recordResponse(0, {
+      has_more: true,
+      next_cursor: "cursor-consumed-by-page-1",
+    });
+    expect(() =>
+      pagination.recordResponse(1, {
+        has_more: true,
+        next_cursor: "cursor-consumed-by-page-1",
+      }),
+    ).toThrow("repeated continuation cursor");
+  });
+
+  it("resumes a buffered partial page from its live signed checkpoint", async () => {
+    const pagination = createListCursorPagination();
+    const loadResponse = vi.fn().mockResolvedValue({
+      rows: [{ id: "row-1" }],
+      metadata: { has_more: true, next_cursor: "resume-after-outage" },
+    });
+    const outage = new Error("network unavailable");
+    const failedContinuation = vi.fn().mockRejectedValue(outage);
+
+    await expect(
+      loadExactListPage({
+        pagination,
+        pageNumber: 0,
+        targetRowCount: 2,
+        loadResponse,
+        nextResponse: failedContinuation,
+        rowsFromResponse: (value) => value.rows,
+        metadataFromResponse: (value) => value.metadata,
+        rowIdentity: (row) => row.id,
+      }),
+    ).rejects.toBe(outage);
+
+    const resumedContinuation = vi.fn().mockResolvedValue({
+      rows: [{ id: "row-2" }],
+      metadata: { has_more: false, next_cursor: null },
+    });
+    await expect(
+      loadExactListPage({
+        pagination,
+        pageNumber: 0,
+        targetRowCount: 2,
+        loadResponse,
+        nextResponse: resumedContinuation,
+        rowsFromResponse: (value) => value.rows,
+        metadataFromResponse: (value) => value.metadata,
+        rowIdentity: (row) => row.id,
+      }),
+    ).resolves.toMatchObject({
+      rows: [{ id: "row-1" }, { id: "row-2" }],
+      pending: false,
+      isLastPage: true,
+    });
+    expect(loadResponse).toHaveBeenCalledOnce();
+    expect(resumedContinuation).toHaveBeenCalledWith("resume-after-outage");
+  });
+
   it("preserves a valid sparse continuation at its hop bound", async () => {
     const pagination = createListCursorPagination();
     let cursorIndex = 0;
@@ -465,6 +561,7 @@ describe("list cursor pagination", () => {
     expect(firstPage.rows.map(({ id }) => id)).toEqual(
       Array.from({ length: 25 }, (_, index) => index + 1),
     );
+    expect(firstPage.canPrefetch).toBe(false);
     expect(pagination.requestParams(1, { page_size: 25 }).cursor).toBe(
       "after-26",
     );
@@ -524,6 +621,7 @@ describe("list cursor pagination", () => {
     });
     expect(firstPage.rows).toHaveLength(25);
     expect(firstPage.isLastPage).toBe(false);
+    expect(firstPage.canPrefetch).toBe(false);
 
     const loadResponse = vi.fn();
     const secondPage = await loadExactListPage({

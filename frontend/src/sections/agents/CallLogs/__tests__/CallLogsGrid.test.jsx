@@ -1,6 +1,6 @@
 import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "src/utils/test-utils";
+import { render, screen, userEvent, waitFor } from "src/utils/test-utils";
 
 const { agGridState, prefetchCallLogsMock, useCallLogsMock } = vi.hoisted(
   () => ({
@@ -193,29 +193,14 @@ describe("CallLogsGrid bounded-read state", () => {
     await waitFor(() => expect(prefetchCallLogsMock).not.toHaveBeenCalled());
   });
 
-  it("advances a bounded same-page continuation without returning to its cached start", async () => {
+  it("pauses a bounded same-page continuation until the user explicitly resumes it", async () => {
     useCallLogsMock.mockImplementation(({ paginationRevision }) => ({
-      data: {
-        ...completeData,
-        has_more: paginationRevision === 0,
-        next_cursor: paginationRevision === 0 ? "bounded-checkpoint" : null,
-        __exactPage:
-          paginationRevision === 0
-            ? {
-                pending: true,
-                stale: false,
-                isLastPage: false,
-                canPrefetch: false,
-              }
-            : {
-                pending: false,
-                stale: false,
-                isLastPage: true,
-                canPrefetch: false,
-              },
-      },
+      data: paginationRevision === 0 ? undefined : completeData,
       isLoading: false,
-      error: null,
+      error:
+        paginationRevision === 0
+          ? { code: "LIST_CURSOR_CONTINUATION_LIMIT" }
+          : null,
       queryKey: [
         "callLogs",
         "project",
@@ -229,13 +214,75 @@ describe("CallLogsGrid bounded-read state", () => {
 
     render(<CallLogsGrid id="project-1" module="project" hideDrawer />);
 
+    const continueSearch = await screen.findByRole("button", {
+      name: "Continue search",
+    });
+    expect(useCallLogsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ paginationRevision: 0 }),
+    );
+    expect(screen.queryByText("No calls found")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Some results could not be loaded. Please try again."),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(continueSearch);
     await waitFor(() =>
       expect(useCallLogsMock).toHaveBeenCalledWith(
         expect.objectContaining({ paginationRevision: 1 }),
       ),
     );
     expect(agGridState.props.rowData).toEqual(completeData.results);
-    expect(prefetchCallLogsMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(prefetchCallLogsMock).toHaveBeenCalledOnce());
+  });
+
+  it("keeps buffered rows visible and surfaces retry for any same-generation transport error", async () => {
+    const provenRows = [
+      { id: "call-proven", trace_id: "call-proven", status: "completed" },
+    ];
+    const transportError = new Error("network unavailable");
+    let seeded = false;
+    useCallLogsMock.mockImplementation(
+      ({ cursorPagination, paginationRevision }) => {
+        if (!seeded) {
+          cursorPagination.recordVisibleContinuation(
+            0,
+            { has_more: true, next_cursor: "saved-checkpoint" },
+            { rows: provenRows, response: { data: {} } },
+          );
+          seeded = true;
+        }
+        return {
+          data: undefined,
+          isLoading: false,
+          error: transportError,
+          queryKey: [
+            "callLogs",
+            "project",
+            "project-1",
+            15,
+            {},
+            1,
+            paginationRevision,
+          ],
+        };
+      },
+    );
+
+    const view = render(
+      <CallLogsGrid id="project-1" module="project" hideDrawer />,
+    );
+    // The mock records the buffer during the first hook invocation; render
+    // once more just as React Query would after publishing the failed state.
+    view.rerender(<CallLogsGrid id="project-1" module="project" hideDrawer />);
+
+    expect(agGridState.props.rowData).toEqual(provenRows);
+    expect(screen.queryByText("No calls found")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Some results could not be loaded. Please try again."),
+    ).not.toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: "Continue search" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps proven rows and cursor navigation usable despite degraded total metadata", async () => {

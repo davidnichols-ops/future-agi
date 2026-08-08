@@ -1482,7 +1482,7 @@ const SESSION_VALUE_FIELDS = new Set([
 ]);
 
 const FREE_TEXT_NO_OPTIONS_TEXT =
-  "No values in the last 7 days — type to search, or add an exact value";
+  "No retained values found — type to search, or add an exact value";
 
 const pickerValueKey = (value, storageType) =>
   getPickerValueIdentity(value, storageType);

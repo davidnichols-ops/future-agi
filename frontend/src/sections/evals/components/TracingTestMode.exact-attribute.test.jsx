@@ -2,6 +2,7 @@ import React from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, userEvent, waitFor } from "src/utils/test-utils";
+import { QUERY_FAILED_RETRY_MESSAGE } from "src/utils/queryReadState";
 
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
@@ -193,6 +194,40 @@ describe("TracingTestMode exact task attribute mapping", () => {
     expect(mocks.fetchNextAttributePage).toHaveBeenCalledOnce();
   });
 
+  it("labels a cursor total lower bound without presenting it as exact", async () => {
+    const defaultGet = mocks.get.getMockImplementation();
+    mocks.get.mockImplementation(async (url, ...args) => {
+      if (url === "/spans/") {
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-1",
+                  trace_id: "trace-1",
+                  input: "generic preview value",
+                },
+              ],
+              metadata: {
+                total_rows: 100,
+                total_rows_is_lower_bound: true,
+              },
+            },
+          },
+        };
+      }
+      return defaultGet(url, ...args);
+    });
+
+    renderTaskMapping(vi.fn());
+
+    expect(
+      await screen.findByText("(≥100 matching total)"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("(100 matching total)")).not.toBeInTheDocument();
+  });
+
   it("keeps an arbitrary exact path as a manual free-text mapping", async () => {
     mocks.exactFields = [];
     const onReadyChange = vi.fn();
@@ -213,7 +248,7 @@ describe("TracingTestMode exact task attribute mapping", () => {
     );
   });
 
-  it("keeps loading and resumes the same preview page after the cursor round bound", async () => {
+  it("pauses at the cursor round bound and resumes only after explicit confirmation", async () => {
     let spanListCalls = 0;
     mocks.get.mockImplementation(async (url) => {
       if (url === `/projects/${PROJECT_ID}`) {
@@ -285,10 +320,21 @@ describe("TracingTestMode exact task attribute mapping", () => {
     );
     await waitFor(() => expect(input).not.toBeDisabled());
 
-    const spanRequests = mocks.get.mock.calls.filter(
+    let spanRequests = mocks.get.mock.calls.filter(
       ([url]) => url === "/spans/",
     );
-    expect(spanRequests).toHaveLength(14);
+    expect(spanRequests).toHaveLength(13);
+    expect(screen.queryByText(/no span data found/i)).not.toBeInTheDocument();
+
+    const continueSearch = await screen.findByRole("button", {
+      name: "Continue search",
+    });
+    await userEvent.click(continueSearch);
+
+    await waitFor(() => {
+      spanRequests = mocks.get.mock.calls.filter(([url]) => url === "/spans/");
+      expect(spanRequests).toHaveLength(14);
+    });
     expect(spanRequests[13][1].params).toEqual(
       expect.objectContaining({
         cursor_mode: true,
@@ -296,6 +342,178 @@ describe("TracingTestMode exact task attribute mapping", () => {
       }),
     );
     expect(screen.getByText("Row 1 of 1")).toBeInTheDocument();
+  });
+
+  it("preserves proven rows and retries the saved cursor after a continuation transport failure", async () => {
+    let spanListCalls = 0;
+    mocks.get.mockImplementation(async (url) => {
+      if (url === `/projects/${PROJECT_ID}`) {
+        return { data: { result: { id: PROJECT_ID, source: "api" } } };
+      }
+      if (url === "/spans/") {
+        const callIndex = spanListCalls;
+        spanListCalls += 1;
+        if (callIndex === 13) {
+          throw new Error("temporary transport failure");
+        }
+        if (callIndex < 13) {
+          return {
+            data: {
+              result: {
+                config: [],
+                table:
+                  callIndex === 0
+                    ? [
+                        {
+                          span_id: "span-buffered",
+                          trace_id: "trace-buffered",
+                          input: "proven preview value",
+                        },
+                      ]
+                    : [],
+                metadata: {
+                  has_more: true,
+                  next_cursor: `checkpoint-${callIndex}`,
+                  total_rows_is_lower_bound: true,
+                },
+              },
+            },
+          };
+        }
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-rare",
+                  trace_id: "trace-rare",
+                  input: "rare preview value",
+                },
+              ],
+              metadata: {
+                has_more: false,
+                next_cursor: null,
+                total_rows: 2,
+              },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-buffered/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-buffered" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-buffered",
+                    input: "proven preview value",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+
+    renderTaskMapping(vi.fn());
+
+    await screen.findByPlaceholderText(
+      "Search or type a path (e.g. attributes.input.value)",
+    );
+    expect(await screen.findByText("Row 1 of 1")).toBeInTheDocument();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Continue search" }),
+    );
+    await waitFor(() => {
+      expect(
+        mocks.get.mock.calls.filter(([url]) => url === "/spans/"),
+      ).toHaveLength(14);
+    });
+
+    // The failed continuation keeps the proven row visible and exposes an
+    // explicit retry instead of turning the preview into an empty/error page.
+    expect(screen.getByText("Row 1 of 1")).toBeInTheDocument();
+    const retry = await screen.findByRole("button", {
+      name: "Continue search",
+    });
+    let spanRequests = mocks.get.mock.calls.filter(
+      ([url]) => url === "/spans/",
+    );
+    expect(spanRequests[13][1].params.cursor).toBe("checkpoint-12");
+
+    await userEvent.click(retry);
+    await waitFor(() => {
+      spanRequests = mocks.get.mock.calls.filter(([url]) => url === "/spans/");
+      expect(spanRequests).toHaveLength(15);
+    });
+    // Restoring the pre-attempt requested-cursor set makes the exact saved
+    // checkpoint retryable once; the failed attempt did not poison it.
+    expect(spanRequests[14][1].params.cursor).toBe("checkpoint-12");
+    expect(await screen.findByText("Row 1 of 2")).toBeInTheDocument();
+  });
+
+  it("retries a cold initial preview failure in place", async () => {
+    let spanListCalls = 0;
+    mocks.get.mockImplementation(async (url) => {
+      if (url === `/projects/${PROJECT_ID}`) {
+        return { data: { result: { id: PROJECT_ID, source: "api" } } };
+      }
+      if (url === "/spans/") {
+        spanListCalls += 1;
+        if (spanListCalls === 1) {
+          throw new Error("temporary initial transport failure");
+        }
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-after-cold-retry",
+                  trace_id: "trace-after-cold-retry",
+                  input: "eval preview recovered",
+                },
+              ],
+              metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-after-cold-retry/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-after-cold-retry" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-after-cold-retry",
+                    input: "eval preview recovered",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+
+    renderTaskMapping(vi.fn());
+
+    expect(await screen.findByText(QUERY_FAILED_RETRY_MESSAGE)).toBeVisible();
+    await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByText("Row 1 of 1")).toBeInTheDocument();
+    expect(spanListCalls).toBe(2);
   });
 
   it.each([

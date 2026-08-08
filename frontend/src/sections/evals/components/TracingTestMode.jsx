@@ -33,6 +33,8 @@ import { getSafeActionErrorMessage } from "src/utils/errorUtils";
 import { canonicalEntries } from "src/utils/utils";
 import {
   collectExactListRows,
+  createListCursorProtocolError,
+  isListCursorProtocolError,
   listContinuationParams,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
 
@@ -375,10 +377,14 @@ const TracingTestMode = React.forwardRef(
     const [columns, setColumns] = useState([]);
     const [rows, setRows] = useState([]);
     const [totalRows, setTotalRows] = useState(0);
+    const [totalRowsIsLowerBound, setTotalRowsIsLowerBound] = useState(false);
     const [listReadState, setListReadState] = useState("complete");
+    const [listFailureRetryable, setListFailureRetryable] = useState(false);
     const [currentRowIndex, setCurrentRowIndex] = useState(0);
     const [loading, setLoading] = useState(false);
     const [listCursorRevision, advanceListCursor] = useState(0);
+    const [listContinuationPending, setListContinuationPending] =
+      useState(false);
     const listContinuationRef = useRef({
       signature: null,
       cursor: null,
@@ -399,6 +405,15 @@ const TracingTestMode = React.forwardRef(
       : null;
     const isPendingNewFetch =
       !!currentFetchKey && lastFetchedKey !== currentFetchKey;
+    const continueListSearch = useCallback(() => {
+      if (!listContinuationRef.current.cursor) return;
+      setListContinuationPending(false);
+      advanceListCursor((revision) => revision + 1);
+    }, []);
+    const retryListRead = useCallback(() => {
+      setListFailureRetryable(false);
+      advanceListCursor((revision) => revision + 1);
+    }, []);
 
     // Columns/Value table — user-resizable key column. Drag the divider
     // between key and value to widen long dotted paths. Ref holds the
@@ -531,14 +546,20 @@ const TracingTestMode = React.forwardRef(
         setColumns([]);
         setRows([]);
         setTotalRows(0);
+        setTotalRowsIsLowerBound(false);
         setCurrentRowIndex(0);
         setLastFetchedKey(null);
         setListReadState("complete");
+        setListFailureRetryable(false);
+        setListContinuationPending(false);
         return;
       }
 
       setLoading(true);
       setListReadState("complete");
+      setListFailureRetryable(false);
+      setTotalRowsIsLowerBound(false);
+      setListContinuationPending(false);
       let cancelled = false;
       const fetchKey = `${selectedProjectId}:${rowType}:${effectiveFilterKey}`;
       if (listContinuationRef.current.signature !== fetchKey) {
@@ -553,17 +574,25 @@ const TracingTestMode = React.forwardRef(
       const startingRows = startingCursor
         ? listContinuationRef.current.rows || []
         : [];
+      const continuationSnapshot = startingCursor
+        ? {
+            signature: fetchKey,
+            cursor: startingCursor,
+            rows: [...startingRows],
+            requestedCursors: [
+              ...(listContinuationRef.current.requestedCursors || []),
+            ],
+          }
+        : null;
       const requestedCursors = new Set(
         listContinuationRef.current.requestedCursors || [],
       );
-      let continuationPending = false;
-
       const fetchData = async () => {
         if (!startingCursor) setRows([]);
         try {
           if (startingCursor) {
             if (requestedCursors.has(startingCursor)) {
-              throw new Error(
+              throw createListCursorProtocolError(
                 "List API returned a repeated continuation cursor",
               );
             }
@@ -576,7 +605,7 @@ const TracingTestMode = React.forwardRef(
               nextCursor.length === 0 ||
               requestedCursors.has(nextCursor)
             ) {
-              throw new Error(
+              throw createListCursorProtocolError(
                 "List API returned a repeated continuation cursor",
               );
             }
@@ -623,8 +652,12 @@ const TracingTestMode = React.forwardRef(
                 rows: rowsOut,
                 requestedCursors: [...requestedCursors],
               };
-              continuationPending = true;
-              advanceListCursor((revision) => revision + 1);
+              setColumns([]);
+              setRows(rowsOut);
+              setTotalRows(rowsOut.length);
+              setTotalRowsIsLowerBound(true);
+              setCurrentRowIndex(0);
+              setListContinuationPending(true);
               return;
             }
             listContinuationRef.current = {
@@ -647,7 +680,13 @@ const TracingTestMode = React.forwardRef(
                 result.total ??
                 rowsOut.length,
             );
+            setTotalRowsIsLowerBound(
+              result.count_is_lower_bound === true ||
+                result.total_count_is_lower_bound === true ||
+                result.total_is_lower_bound === true,
+            );
             setCurrentRowIndex(0);
+            setListContinuationPending(false);
             return;
           }
 
@@ -698,8 +737,12 @@ const TracingTestMode = React.forwardRef(
               rows: tableRows,
               requestedCursors: [...requestedCursors],
             };
-            continuationPending = true;
-            advanceListCursor((revision) => revision + 1);
+            setColumns(cols);
+            setRows(tableRows);
+            setTotalRows(tableRows.length);
+            setTotalRowsIsLowerBound(true);
+            setCurrentRowIndex(0);
+            setListContinuationPending(true);
             return;
           }
           listContinuationRef.current = {
@@ -714,14 +757,39 @@ const TracingTestMode = React.forwardRef(
               ? "complete"
               : nextReadState,
           );
-          const total = res.metadata?.total_rows || tableRows.length;
+          const total = res.metadata?.total_rows ?? tableRows.length;
 
           setColumns(cols);
           setRows(tableRows);
           setTotalRows(total);
+          setTotalRowsIsLowerBound(
+            res.metadata?.total_rows_is_lower_bound === true,
+          );
           setCurrentRowIndex(0);
-        } catch {
+          setListContinuationPending(false);
+        } catch (error) {
           if (cancelled) return;
+          if (continuationSnapshot && !isListCursorProtocolError(error)) {
+            // A transport failure does not invalidate rows and a checkpoint
+            // already proven by earlier bounded reads. Restore the exact
+            // pre-attempt snapshot (including the requested-cursor set before
+            // `startingCursor` was added) so an explicit retry can safely
+            // request the same saved checkpoint once more.
+            listContinuationRef.current = continuationSnapshot;
+            setListReadState("error");
+            setListFailureRetryable(true);
+            setRows(continuationSnapshot.rows);
+            setTotalRows(continuationSnapshot.rows.length);
+            setTotalRowsIsLowerBound(true);
+            setCurrentRowIndex((index) =>
+              Math.min(
+                index,
+                Math.max(0, continuationSnapshot.rows.length - 1),
+              ),
+            );
+            setListContinuationPending(true);
+            return;
+          }
           listContinuationRef.current = {
             signature: fetchKey,
             cursor: null,
@@ -729,11 +797,14 @@ const TracingTestMode = React.forwardRef(
             requestedCursors: [],
           };
           setListReadState("error");
+          setListFailureRetryable(!isListCursorProtocolError(error));
           setColumns([]);
           setRows([]);
           setTotalRows(0);
+          setTotalRowsIsLowerBound(false);
+          setListContinuationPending(false);
         } finally {
-          if (!cancelled && !continuationPending) {
+          if (!cancelled) {
             setLoading(false);
             setLastFetchedKey(fetchKey);
           }
@@ -1489,6 +1560,39 @@ const TracingTestMode = React.forwardRef(
           </Box>
         )}
 
+        {selectedProjectId &&
+          listContinuationPending &&
+          !loading &&
+          !isPendingNewFetch && (
+            <Box
+              role="status"
+              sx={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 1,
+                px: 1.5,
+                py: 1,
+                border: "1px solid",
+                borderColor: "divider",
+                borderRadius: "6px",
+                bgcolor: "action.hover",
+              }}
+            >
+              <Typography variant="caption" color="text.secondary">
+                Preparing exact results. Continue from the saved position to
+                search the next bounded batch.
+              </Typography>
+              <Button
+                size="small"
+                variant="outlined"
+                onClick={continueListSearch}
+              >
+                Continue search
+              </Button>
+            </Box>
+          )}
+
         {/* Row navigator */}
         {selectedProjectId &&
           (rows?.length ?? 0) > 0 &&
@@ -1518,7 +1622,8 @@ const TracingTestMode = React.forwardRef(
                       ml: 0.5,
                     }}
                   >
-                    ({totalRows} matching total)
+                    ({totalRowsIsLowerBound ? "≥" : ""}
+                    {totalRows} matching total)
                   </Typography>
                 )}
               </Typography>
@@ -1823,6 +1928,7 @@ const TracingTestMode = React.forwardRef(
         {selectedProjectId &&
           !loading &&
           !isPendingNewFetch &&
+          !listContinuationPending &&
           getQueryReadMessage(listReadState) && (
             <Box
               role="status"
@@ -1836,15 +1942,34 @@ const TracingTestMode = React.forwardRef(
                 backgroundColor: alpha(theme.palette.warning.main, 0.08),
               })}
             >
-              <Typography variant="caption" color="warning.main">
-                {getQueryReadMessage(listReadState)}
-              </Typography>
+              <Box
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 1,
+                }}
+              >
+                <Typography variant="caption" color="warning.main">
+                  {getQueryReadMessage(listReadState)}
+                </Typography>
+                {listReadState === "error" && listFailureRetryable && (
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    onClick={retryListRead}
+                  >
+                    Retry
+                  </Button>
+                )}
+              </Box>
             </Box>
           )}
 
         {selectedProjectId &&
           !loading &&
           !isPendingNewFetch &&
+          !listContinuationPending &&
           listReadState === "complete" &&
           totalRows === 0 && (
             <Box

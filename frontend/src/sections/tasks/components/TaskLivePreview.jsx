@@ -4,6 +4,7 @@ import React, {
   useEffect,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import PropTypes from "prop-types";
@@ -20,7 +21,7 @@ import {
 } from "@mui/material";
 import { alpha } from "@mui/material/styles";
 import { useWatch } from "react-hook-form";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import { canonicalEntries } from "src/utils/utils";
 import { ROW_TYPE_LABELS } from "src/utils/constants";
@@ -48,6 +49,8 @@ import {
 import { ID_ONLY_FIELDS } from "src/sections/projects/LLMTracing/idFields";
 import {
   collectExactListRows,
+  createListCursorProtocolError,
+  isListCursorProtocolError,
   listContinuationParams,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
 import {
@@ -267,6 +270,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
   //   { [idx]: { status: "running" | "success" | "error", result?, error? } }
   const [testResults, setTestResults] = useState({});
   const [isTesting, setIsTesting] = useState(false);
+  const queryClient = useQueryClient();
 
   const formFilters = useWatch({ control, name: "filters" });
   const startDate = useWatch({ control, name: "startDate" });
@@ -286,10 +290,28 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
   const activeListContinuation =
     listContinuation?.scopeKey === previewScopeKey ? listContinuation : null;
   const resumeCursor = activeListContinuation?.cursor || null;
-  // Reset row index when filters / rowType change
+  const previousPreviewScopeKeyRef = useRef(previewScopeKey);
+  // Signed cursors are snapshot- and scope-bound. Remove every cached list
+  // response for the scope being left so A -> B -> A starts a fresh read
+  // instead of resurrecting A's old cursor or accumulated rows.
   useEffect(() => {
+    const previousScopeKey = previousPreviewScopeKeyRef.current;
+    if (previousScopeKey !== previewScopeKey) {
+      queryClient.removeQueries({
+        predicate: (query) => {
+          const key = query?.queryKey || [];
+          if (key[0] !== "task-preview-list") return false;
+          return (
+            JSON.stringify([key[1], key[2] || null, key[3] || []]) ===
+            previousScopeKey
+          );
+        },
+      });
+      previousPreviewScopeKeyRef.current = previewScopeKey;
+      setListContinuation(null);
+    }
     setCurrentRowIndex(0);
-  }, [apiFilters, rowType, projectId]);
+  }, [previewScopeKey, queryClient]);
 
   // ── Fetch list of matching rows ──
   const {
@@ -297,6 +319,8 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     isLoading: listLoading,
     isFetching: listFetching,
     isError: listError,
+    error: listQueryError,
+    refetch: refetchList,
   } = useQuery({
     queryKey: [
       "task-preview-list",
@@ -318,7 +342,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
       );
       if (resumeCursor) {
         if (requestedCursors.has(resumeCursor)) {
-          throw new Error("List API returned a repeated continuation cursor");
+          throw createListCursorProtocolError(
+            "List API returned a repeated continuation cursor",
+          );
         }
         requestedCursors.add(resumeCursor);
       }
@@ -330,7 +356,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           nextCursor.length === 0 ||
           requestedCursors.has(nextCursor)
         ) {
-          throw new Error("List API returned a repeated continuation cursor");
+          throw createListCursorProtocolError(
+            "List API returned a repeated continuation cursor",
+          );
         }
         requestedCursors.add(nextCursor);
       };
@@ -341,7 +369,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         // attempt. This second guard covers a cycle that lands exactly on the
         // attempt boundary and points back to any cursor consumed earlier.
         if (requestedCursors.has(nextCursor)) {
-          throw new Error("List API returned a repeated continuation cursor");
+          throw createListCursorProtocolError(
+            "List API returned a repeated continuation cursor",
+          );
         }
         return {
           cursor: nextCursor,
@@ -463,7 +493,20 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
     meta: { errorHandled: true },
   });
 
-  const rows = listData?.rows || [];
+  const retryableListContinuationError = Boolean(
+    listError &&
+      activeListContinuation?.cursor &&
+      !isListCursorProtocolError(listQueryError),
+  );
+  const retryableColdListError = Boolean(
+    listError &&
+      !activeListContinuation?.cursor &&
+      !isListCursorProtocolError(listQueryError),
+  );
+  const rows =
+    listData?.rows ||
+    (retryableListContinuationError ? activeListContinuation?.rows : []) ||
+    [];
   const columns = listData?.columns || [];
   const pendingListContinuation = listData?.continuation || null;
   const currentRow = rows[currentRowIndex] || null;
@@ -770,14 +813,64 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           >
             <CircularProgress size={20} />
           </Box>
-        ) : listError ? (
-          <Typography
-            variant="body2"
-            color="error"
-            sx={{ fontSize: "12px", textAlign: "center", mt: 2 }}
+        ) : retryableListContinuationError ? (
+          <Box
+            sx={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 1,
+              minHeight: 160,
+              textAlign: "center",
+            }}
           >
-            {QUERY_FAILED_RETRY_MESSAGE}
-          </Typography>
+            <Typography variant="body2" sx={{ fontSize: "12px" }}>
+              The exact preview was paused.
+            </Typography>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ fontSize: "11px" }}
+            >
+              Your saved position is retained. Retry to continue from it.
+            </Typography>
+            <Button
+              size="small"
+              variant="outlined"
+              disabled={listFetching}
+              onClick={() => refetchList()}
+            >
+              Retry search
+            </Button>
+          </Box>
+        ) : listError ? (
+          <Box
+            role="status"
+            sx={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 1,
+              minHeight: 160,
+              justifyContent: "center",
+              textAlign: "center",
+            }}
+          >
+            <Typography variant="body2" color="error" sx={{ fontSize: "12px" }}>
+              {QUERY_FAILED_RETRY_MESSAGE}
+            </Typography>
+            {retryableColdListError && (
+              <Button
+                size="small"
+                variant="outlined"
+                disabled={listFetching}
+                onClick={() => refetchList()}
+              >
+                Retry search
+              </Button>
+            )}
+          </Box>
         ) : pendingListContinuation ? (
           <Box
             sx={{

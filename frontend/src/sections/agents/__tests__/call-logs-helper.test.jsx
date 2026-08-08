@@ -130,7 +130,7 @@ describe("useCallLogs", () => {
     });
   });
 
-  it("fills one exact visible voice page across short cursor responses", async () => {
+  it("preserves exact voice totals across short cursor responses", async () => {
     const pagination = createListCursorPagination({
       pageParam: "page",
       pageOffset: 1,
@@ -148,9 +148,12 @@ describe("useCallLogs", () => {
       .mockResolvedValueOnce({
         data: {
           result: {
-            results: Array.from({ length: 24 }, (_, index) => ({
+            results: Array.from({ length: 15 }, (_, index) => ({
               id: `call-${index + 2}`,
             })),
+            count: 16,
+            count_is_lower_bound: false,
+            total_pages: 1,
             has_more: false,
             next_cursor: null,
           },
@@ -174,7 +177,7 @@ describe("useCallLogs", () => {
       { wrapper: createWrapper() },
     );
 
-    await waitFor(() => expect(result.current.data?.results).toHaveLength(25));
+    await waitFor(() => expect(result.current.data?.results).toHaveLength(16));
     expect(axiosMocks.get).toHaveBeenNthCalledWith(
       1,
       axiosMocks.projectGetCallLogs,
@@ -204,6 +207,13 @@ describe("useCallLogs", () => {
         pending: false,
         isLastPage: true,
         canPrefetch: false,
+      }),
+    );
+    expect(result.current.data).toEqual(
+      expect.objectContaining({
+        count: 16,
+        count_is_lower_bound: false,
+        total_pages: 1,
       }),
     );
   });

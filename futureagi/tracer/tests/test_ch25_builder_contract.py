@@ -301,12 +301,27 @@ class TestListBuilderOutputContract:
                     builder.filters = original_filters
             elif name == "build_filter_exact_zero_probe":
                 # This capability-gated voice optimization only compiles for
-                # two or more positive scalar any-span leaves. Exercise the
-                # SQL boundary under that supported public contract.
+                # two or more positive scalar any-span leaves in a short
+                # request window. Exercise the SQL boundary under that
+                # supported public contract instead of asking the optional
+                # accelerator to compile the generic 24-hour fixture.
                 original_filters = builder.filters
                 original_internal_scan = builder._bounded_internal_scan
+                original_request_window = builder._bounded_request_window
+                request_end = original_request_window[1]
+                request_start = request_end - timedelta(minutes=30)
                 builder.filters = [
-                    *original_filters,
+                    {
+                        "column_id": "created_at",
+                        "filter_config": {
+                            "filter_type": "datetime",
+                            "filter_op": "between",
+                            "filter_value": [
+                                request_start.isoformat(),
+                                request_end.isoformat(),
+                            ],
+                        },
+                    },
                     {
                         "column_id": "contract.numeric",
                         "filter_config": {
@@ -327,11 +342,13 @@ class TestListBuilderOutputContract:
                     },
                 ]
                 builder._bounded_internal_scan = False
+                builder._bounded_request_window = (request_start, request_end)
                 try:
                     result = method()
                 finally:
                     builder.filters = original_filters
                     builder._bounded_internal_scan = original_internal_scan
+                    builder._bounded_request_window = original_request_window
             elif name == "build_filter_navigation_seed_page":
                 start, end = builder.parse_time_range(builder.filters)
                 result = method(

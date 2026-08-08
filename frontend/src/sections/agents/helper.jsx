@@ -16,6 +16,7 @@ import { AGENT_TYPES, isLiveKitProvider } from "./constants";
 import AnnotationHeaderCellRenderer from "./CallLogs/AnnotationHeaderCellRenderer";
 import NewAnnotationCellRenderer from "./NewAnnotationCellRenderer";
 import {
+  isListCursorContinuationLimitError,
   listContinuationParams,
   loadExactListPage,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
@@ -913,9 +914,8 @@ export const useCallLogs = ({
           data: payload.result
             ? {
                 ...payload,
+                ...mergedResult,
                 result: mergedResult,
-                results: exactPage.rows,
-                __exactPage: exactMetadata,
               }
             : mergedResult,
         };
@@ -931,6 +931,8 @@ export const useCallLogs = ({
     // CallLogsGrid owns a concise retry/empty state. Never let a failed
     // ClickHouse-backed list request reach the global raw-error snackbar.
     meta: { errorHandled: true },
+    retry: (failureCount, queryError) =>
+      !isListCursorContinuationLimitError(queryError) && failureCount < 1,
   });
   return { queryKey, data, isLoading, error };
 };
@@ -1009,9 +1011,8 @@ export const prefetchCallLogs = (
           data: payload.result
             ? {
                 ...payload,
+                ...mergedResult,
                 result: mergedResult,
-                results: exactPage.rows,
-                __exactPage: exactMetadata,
               }
             : mergedResult,
         };

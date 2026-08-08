@@ -362,6 +362,205 @@ describe("TaskLivePreview sparse cursor continuation", () => {
     expect(spanListCalls).toBe(14);
   });
 
+  it("retries a transport failure from the retained preview checkpoint", async () => {
+    let spanListCalls = 0;
+    mocks.get.mockImplementation(async (url) => {
+      if (url === "/spans/") {
+        const callIndex = spanListCalls;
+        spanListCalls += 1;
+        if (callIndex < 13) {
+          return {
+            data: {
+              result: {
+                config: [],
+                table:
+                  callIndex === 0
+                    ? [
+                        {
+                          span_id: "span-retained",
+                          trace_id: "trace-retained",
+                          input: "retained preview row",
+                        },
+                      ]
+                    : [],
+                metadata: {
+                  has_more: true,
+                  next_cursor: `retry-checkpoint-${callIndex}`,
+                },
+              },
+            },
+          };
+        }
+        if (callIndex === 13) {
+          throw new Error("temporary transport failure");
+        }
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-after-retry",
+                  trace_id: "trace-after-retry",
+                  input: "preview resumed after retry",
+                },
+              ],
+              metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-after-retry/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-after-retry" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-after-retry",
+                    input: "preview resumed after retry",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-retained/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-retained" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-retained",
+                    input: "retained preview row",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness />
+      </QueryClientProvider>,
+    );
+
+    const continueSearch = await screen.findByRole("button", {
+      name: "Continue search",
+    });
+    await act(async () => continueSearch.click());
+
+    const retrySearch = await screen.findByRole("button", {
+      name: "Retry search",
+    });
+    expect(screen.getByText("The exact preview was paused.")).toBeVisible();
+    expect(screen.queryByText("No matching rows")).not.toBeInTheDocument();
+
+    const failedResumeRequest = mocks.get.mock.calls.filter(
+      ([url]) => url === "/spans/",
+    )[13];
+    expect(failedResumeRequest[1].params).toEqual(
+      expect.objectContaining({
+        cursor_mode: true,
+        cursor: "retry-checkpoint-12",
+      }),
+    );
+
+    await act(async () => retrySearch.click());
+    await screen.findByText("Row 1 of 2");
+    expect(screen.getByText(/retained preview row/)).toBeVisible();
+
+    const successfulResumeRequest = mocks.get.mock.calls.filter(
+      ([url]) => url === "/spans/",
+    )[14];
+    expect(successfulResumeRequest[1].params).toEqual(
+      expect.objectContaining({
+        cursor_mode: true,
+        cursor: "retry-checkpoint-12",
+      }),
+    );
+  });
+
+  it("retries a cold initial list failure without requiring a scope change", async () => {
+    let spanListCalls = 0;
+    mocks.get.mockImplementation(async (url) => {
+      if (url === "/spans/") {
+        spanListCalls += 1;
+        if (spanListCalls === 1) {
+          throw new Error("temporary initial transport failure");
+        }
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-after-cold-retry",
+                  trace_id: "trace-after-cold-retry",
+                  input: "preview recovered after cold retry",
+                },
+              ],
+              metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-after-cold-retry/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-after-cold-retry" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-after-cold-retry",
+                    input: "preview recovered after cold retry",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText(QUERY_FAILED_RETRY_MESSAGE)).toBeVisible();
+    const retrySearch = await screen.findByRole("button", {
+      name: "Retry search",
+    });
+    await act(async () => retrySearch.click());
+
+    await screen.findByText("Row 1 of 1");
+    expect(
+      screen.getByText(/preview recovered after cold retry/),
+    ).toBeVisible();
+    expect(spanListCalls).toBe(2);
+  });
+
   it("fails closed without looping when the API repeats a signed cursor", async () => {
     mocks.get.mockResolvedValue({
       data: {
@@ -642,6 +841,132 @@ describe("TaskLivePreview sparse cursor continuation", () => {
 
     expect(screen.getByText(/new scope preview/)).toBeInTheDocument();
     expect(screen.queryByText(/stale resumed preview/)).not.toBeInTheDocument();
+  });
+
+  it("starts a fresh list read when returning to an earlier scope", async () => {
+    let oldScopeCalls = 0;
+    mocks.get.mockImplementation(async (url, options = {}) => {
+      const projectId = options.params?.project_id;
+      if (url === "/spans/" && projectId === "project-old") {
+        const callIndex = oldScopeCalls;
+        oldScopeCalls += 1;
+        if (callIndex < 13) {
+          return {
+            data: {
+              result: {
+                config: [],
+                table: [],
+                metadata: {
+                  has_more: true,
+                  next_cursor: `old-scope-checkpoint-${callIndex}`,
+                },
+              },
+            },
+          };
+        }
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-old-fresh",
+                  trace_id: "trace-old-fresh",
+                  input: "fresh read after returning to old scope",
+                },
+              ],
+              metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/spans/" && projectId === "project-new") {
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-new",
+                  trace_id: "trace-new",
+                  input: "new scope row",
+                },
+              ],
+              metadata: { has_more: false, next_cursor: null, total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-new/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-new" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-new",
+                    input: "new scope row",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-old-fresh/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-old-fresh" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-old-fresh",
+                    input: "fresh read after returning to old scope",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness projectId="project-old" />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByRole("button", { name: "Continue search" });
+    expect(oldScopeCalls).toBe(13);
+
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness projectId="project-new" />
+      </QueryClientProvider>,
+    );
+    await screen.findByText(/new scope row/);
+
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness projectId="project-old" />
+      </QueryClientProvider>,
+    );
+    await screen.findByText(/fresh read after returning to old scope/);
+
+    const returnedRequest = mocks.get.mock.calls.filter(
+      ([url, options]) =>
+        url === "/spans/" && options.params?.project_id === "project-old",
+    )[13];
+    expect(returnedRequest[1].params).not.toHaveProperty("cursor");
+    expect(oldScopeCalls).toBe(14);
   });
 
   it("does not reuse cached detail data after the selected project changes", async () => {
