@@ -11,13 +11,9 @@ logger = structlog.get_logger(__name__)
 @temporal_activity(time_limit=7200, queue="default")
 def soft_delete_expired_data_activity():
     try:
-        from ee.cloud.tasks.retention import soft_delete_expired_data
+        from ee.usage.tasks.retention import soft_delete_expired_data
     except ImportError:
         soft_delete_expired_data = None
-
-    if soft_delete_expired_data is None:
-        logger.info("soft_delete_activity_skipped_retention_is_cloud_only")
-        return {}
 
     result = soft_delete_expired_data()
     total = sum(sum(counts.values()) for counts in result.values())
@@ -32,13 +28,9 @@ def soft_delete_expired_data_activity():
 @temporal_activity(time_limit=14400, queue="default")
 def hard_delete_expired_data_activity():
     try:
-        from ee.cloud.tasks.retention import hard_delete_expired_data
+        from ee.usage.tasks.retention import hard_delete_expired_data
     except ImportError:
         hard_delete_expired_data = None
-
-    if hard_delete_expired_data is None:
-        logger.info("hard_delete_activity_skipped_retention_is_cloud_only")
-        return {}
 
     result = hard_delete_expired_data()
     total = sum(result.values())
