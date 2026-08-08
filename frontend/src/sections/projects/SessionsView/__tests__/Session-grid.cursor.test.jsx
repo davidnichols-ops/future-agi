@@ -1,13 +1,12 @@
 import React from "react";
-import PropTypes from "prop-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor } from "src/utils/test-utils";
+import { act, render, screen, userEvent, waitFor } from "src/utils/test-utils";
 
 const { enqueueSnackbarMock, getMock, gridState, sessionStoreState } =
   vi.hoisted(() => ({
     enqueueSnackbarMock: vi.fn(),
     getMock: vi.fn(),
-    gridState: { props: null },
+    gridState: { props: null, api: null },
     sessionStoreState: {
       toggledNodes: [],
       selectAll: false,
@@ -15,16 +14,25 @@ const { enqueueSnackbarMock, getMock, gridState, sessionStoreState } =
     },
   }));
 
-function MockAgGridReact(props) {
-  gridState.props = props;
-  return <div data-testid="session-grid" />;
-}
-
-MockAgGridReact.propTypes = {
-  serverSideDatasource: PropTypes.object,
-};
-
-vi.mock("ag-grid-react", () => ({ AgGridReact: MockAgGridReact }));
+vi.mock("ag-grid-react", async () => {
+  const ReactModule = await import("react");
+  const AgGridReact = ReactModule.forwardRef(
+    function MockAgGridReact(props, ref) {
+      gridState.props = props;
+      ReactModule.useImperativeHandle(
+        ref,
+        () => ({
+          get api() {
+            return gridState.api;
+          },
+        }),
+        [],
+      );
+      return <div data-testid="session-grid" />;
+    },
+  );
+  return { AgGridReact };
+});
 vi.mock("src/styles/clean-data-table.css", () => ({}));
 vi.mock("src/utils/utils", () => ({ getRandomId: () => "column" }));
 vi.mock("src/sections/develop-detail/Common/TotalRowsStatusBar", () => ({
@@ -97,6 +105,7 @@ const row = (number) => ({ session_id: `session-${number}` });
 const renderGrid = () =>
   render(
     <SessionGrid
+      ref={React.createRef()}
       updateObj={{ session_id: true }}
       columns={[{ id: "session_id", isVisible: true }]}
       setColumns={vi.fn()}
@@ -121,6 +130,7 @@ const makeParams = ({ startRow = 0, sortModel = [] } = {}) => ({
 });
 
 const getRows = async (params) => {
+  gridState.api = params.api;
   await act(async () => {
     await gridState.props.serverSideDatasource.getRows(params);
   });
@@ -131,6 +141,7 @@ describe("SessionGrid cursor continuation", () => {
     getMock.mockReset();
     enqueueSnackbarMock.mockReset();
     gridState.props = null;
+    gridState.api = null;
   });
 
   it("falls back to numbered prefetch when a sorted response omits cursor metadata", async () => {
@@ -282,6 +293,18 @@ describe("SessionGrid cursor continuation", () => {
     expect(screen.getByRole("status")).toHaveTextContent(
       "Preparing exact results. Refresh or retry to continue.",
     );
+    expect(gridState.props.className).toContain("ag-grid-cursor-paused");
+    expect(gridState.props.noRowsOverlayComponent()).toBeNull();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Continue search" }),
+    );
+    expect(boundedRound.api.retryServerSideLoads).toHaveBeenCalledOnce();
+    expect(boundedRound.api.refreshServerSide).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("button", { name: "Continue search" }),
+    ).not.toBeInTheDocument();
+    expect(gridState.props.className).not.toContain("ag-grid-cursor-paused");
 
     // A deliberate retry resumes the retained exact checkpoint. The bounded
     // automatic read itself never spins or publishes a false empty page.

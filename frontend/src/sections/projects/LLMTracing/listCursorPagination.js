@@ -16,6 +16,25 @@ const hasOwn = (value, key) =>
 export const isListCursorContinuationLimitError = (error) =>
   error?.code === LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE;
 
+/**
+ * Resume an AG Grid server-side block without resetting the exact cursor chain.
+ *
+ * `retryServerSideLoads` turns AG Grid's failed block back into a loading stub.
+ * The refresh fallback supports older grid APIs while preserving the store and
+ * the signed checkpoint owned by the datasource.
+ */
+export const retryServerSideCursorLoad = (api) => {
+  if (typeof api?.retryServerSideLoads === "function") {
+    api.retryServerSideLoads();
+    return true;
+  }
+  if (typeof api?.refreshServerSide === "function") {
+    api.refreshServerSide({ purge: false });
+    return true;
+  }
+  return false;
+};
+
 export const createListCursorProtocolError = (message) => {
   const error = new Error(message);
   error.code = LIST_CURSOR_PROTOCOL_ERROR_CODE;

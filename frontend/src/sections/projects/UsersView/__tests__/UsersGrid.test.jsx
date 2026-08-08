@@ -1,6 +1,6 @@
 import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor } from "src/utils/test-utils";
+import { act, render, screen, userEvent, waitFor } from "src/utils/test-utils";
 
 const { getMock, gridState, routeState, storeState, validated } = vi.hoisted(
   () => {
@@ -19,7 +19,7 @@ const { getMock, gridState, routeState, storeState, validated } = vi.hoisted(
     ];
     return {
       getMock: vi.fn(),
-      gridState: { props: null },
+      gridState: { props: null, api: null },
       routeState: { observeId: "proj-1" },
       validated,
       storeState: {
@@ -43,6 +43,15 @@ vi.mock("ag-grid-react", async () => {
   const AgGridReact = ReactModule.forwardRef(
     function MockAgGridReact(props, _ref) {
       gridState.props = props;
+      ReactModule.useImperativeHandle(
+        _ref,
+        () => ({
+          get api() {
+            return gridState.api;
+          },
+        }),
+        [],
+      );
       return (
         <div data-testid="ag-grid">{props.noRowsOverlayComponent?.()}</div>
       );
@@ -150,6 +159,7 @@ const renderGrid = (overrides = {}) => {
 };
 
 const readPage = async (params) => {
+  gridState.api = params.api;
   await act(async () => {
     await gridState.props.serverSideDatasource.getRows(params);
   });
@@ -159,6 +169,7 @@ describe("UsersGrid deterministic pagination", () => {
   beforeEach(() => {
     getMock.mockReset();
     gridState.props = null;
+    gridState.api = null;
     routeState.observeId = "proj-1";
     storeState.searchQuery = "";
     storeState.filters = validated;
@@ -292,6 +303,18 @@ describe("UsersGrid deterministic pagination", () => {
       "Preparing exact results. Refresh or retry to continue.",
     );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(gridState.props.className).toContain("ag-grid-cursor-paused");
+    expect(gridState.props.noRowsOverlayComponent()).toBeNull();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Continue search" }),
+    );
+    expect(boundedRound.api.retryServerSideLoads).toHaveBeenCalledOnce();
+    expect(boundedRound.api.refreshServerSide).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("button", { name: "Continue search" }),
+    ).not.toBeInTheDocument();
+    expect(gridState.props.className).not.toContain("ag-grid-cursor-paused");
 
     // A deliberate retry resumes the retained exact checkpoint. The bounded
     // automatic read itself never spins or publishes a false empty page.

@@ -1232,6 +1232,55 @@ def test_call_type_span_filter_has_exact_micro_seed_only() -> None:
     assert graph_builder.recommended_filter_unindexed_micro_seed_width() is None
 
 
+def test_time_only_span_cursor_exposes_tightly_bounded_sparse_probe() -> None:
+    builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter()],
+        page_size=25,
+        bounded_internal_scan=True,
+    )
+
+    assert builder.allow_filter_anchor_probe_for_initial_continuation() is True
+    assert builder.supports_filter_anchor_probe() is True
+    assert builder.recommended_filter_anchor_probe_limit() == 26
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
+    assert builder.recommended_filter_anchor_probe_strata() == 1
+    assert builder.recommended_filter_max_query_count() == 49
+    assert (
+        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 96 * 1024 * 1024
+    )
+
+    sql, params = builder.build_filter_anchor_probe(limit=26)
+    normalized_sql = " ".join(sql.split())
+    assert "WHERE 1 = 1" in normalized_sql
+    assert "ORDER BY" not in normalized_sql
+    assert "LIMIT 1 BY" not in normalized_sql
+    limit_clause = "LIMIT %(filter_anchor_limit)s"
+    assert limit_clause in normalized_sql
+    assert normalized_sql.index(limit_clause) < normalized_sql.index("SETTINGS")
+    assert params["filter_anchor_limit"] == 26
+
+    numbered_builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter()],
+        page_size=25,
+    )
+    assert (
+        numbered_builder.allow_filter_anchor_probe_for_initial_continuation() is False
+    )
+    assert numbered_builder.supports_filter_anchor_probe() is False
+
+    filtered_builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+        page_size=25,
+        bounded_internal_scan=True,
+    )
+    assert (
+        filtered_builder.allow_filter_anchor_probe_for_initial_continuation() is False
+    )
+
+
 def test_negative_only_trace_filter_skips_long_window_anchor() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
@@ -5270,6 +5319,34 @@ class _SmallAnchorFakeBuilder(_SkipFullAnchorFakeBuilder):
         return 96 * 1024 * 1024
 
 
+class _InitialCursorAnchorFakeBuilder(_AnchorFakeBuilder):
+    @staticmethod
+    def allow_filter_anchor_probe_for_initial_continuation() -> bool:
+        return True
+
+    @staticmethod
+    def recommended_filter_anchor_probe_limit() -> int:
+        return 3
+
+    @staticmethod
+    def recommended_filter_anchor_probe_timeout_ms() -> int:
+        return 300
+
+    @staticmethod
+    def recommended_filter_anchor_probe_strata() -> int:
+        return 1
+
+    @staticmethod
+    def recommended_filter_anchor_probe_max_bytes_to_read() -> int:
+        return 96 * 1024 * 1024
+
+
+class _InitialCursorBudgetAnchorFakeBuilder(_InitialCursorAnchorFakeBuilder):
+    @staticmethod
+    def recommended_filter_max_query_count() -> int:
+        return 5
+
+
 class _AnchorFakeExecutor(_FakeExecutor):
     def execute_ch_query(
         self,
@@ -8226,6 +8303,202 @@ def test_long_window_sparse_indexed_anchor_is_exact_under_small_timeout() -> Non
         for query, settings in executor.settings
         if query == "anchor"
     )
+
+
+def test_initial_cursor_sparse_anchor_closes_exact_page_without_scan_cursor() -> None:
+    rows = _rows(1, 2)
+    builder = _InitialCursorAnchorFakeBuilder(rows)
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=2_200,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert page.status == "complete"
+    assert page.error_code is None
+    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert page.has_more is False
+    assert page.continuation_slice_end is None
+    assert [query for query, _ in executor.calls] == ["anchor", "match"]
+    assert executor.timeouts[0] == ("anchor", 300)
+    assert executor.settings[0][1]["max_bytes_to_read"] == 96 * 1024 * 1024
+    assert executor.settings[0][1]["max_threads"] == 1
+
+
+def test_initial_cursor_sparse_anchor_deduplicates_raw_versions_before_classify() -> (
+    None
+):
+    latest = {"id": "span-0", "start_time": END - timedelta(minutes=1)}
+    raw_versions = [dict(latest), dict(latest)]
+    builder = _InitialCursorAnchorFakeBuilder(raw_versions, match_rows=[latest])
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=2_200,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert page.rows == [latest]
+    assert executor.calls == [
+        ("anchor", {"limit": 3}),
+        ("match", {"candidate_ids": ("span-0",)}),
+    ]
+
+
+def test_initial_cursor_empty_anchor_proves_exact_empty_window() -> None:
+    builder = _InitialCursorAnchorFakeBuilder([])
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=2_200,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert page.rows == []
+    assert page.total_rows_lower_bound == 0
+    assert page.has_more is False
+    assert page.continuation_slice_end is None
+    assert [query for query, _ in executor.calls] == ["anchor"]
+
+
+def test_initial_cursor_common_anchor_falls_back_to_narrow_exact_seed() -> None:
+    rows = _rows(1, 2, 3)
+    builder = _InitialCursorAnchorFakeBuilder(rows)
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=2_200,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert page.error_code is None
+    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert page.has_more is True
+    assert [query for query, _ in executor.calls] == [
+        "anchor",
+        "ordered_seed",
+        "match",
+    ]
+
+
+def test_resumed_cursor_never_repeats_full_window_sparse_anchor() -> None:
+    builder = _InitialCursorAnchorFakeBuilder([])
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=2_200,
+        max_seed_attempts=1,
+        include_incomplete_rows=True,
+        continuation_slice_end=END - timedelta(days=31),
+        bounded_continuation=True,
+    )
+
+    assert page.complete is False
+    assert page.error_code == "scan_budget_exceeded"
+    assert page.continuation_slice_end is not None
+    assert [query for query, _ in executor.calls] == ["ordered_seed"]
+
+
+def test_initial_cursor_sparse_anchor_timeout_preserves_exact_fallback() -> None:
+    rows = _rows(1, 2, 3)
+    builder = _InitialCursorAnchorFakeBuilder(rows)
+    executor = _TimedAnchorFakeExecutor(builder, fail_anchor=True)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=2_200,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert page.error_code is None
+    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert [query for query, _ in executor.calls] == [
+        "anchor",
+        "ordered_seed",
+        "match",
+    ]
+    assert page.attempts[0].error_code == "read_budget_exceeded"
+
+
+def test_saturated_initial_anchor_preserves_full_exact_fallback_query_budget() -> None:
+    first = {"id": "span-new", "start_time": END - timedelta(minutes=1)}
+    match = {"id": "span-match", "start_time": END - timedelta(minutes=7)}
+    old = {"id": "span-old", "start_time": END - timedelta(days=30)}
+    builder = _InitialCursorBudgetAnchorFakeBuilder(
+        [first, match, old],
+        match_rows=[match],
+    )
+    executor = _TimedAnchorFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=1,
+        deadline_ms=5_000,
+        max_seed_attempts=2,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.error_code == "scan_budget_exceeded"
+    assert page.continuation_slice_end is not None
+    assert [row["id"] for row in page.rows] == ["span-match"]
+    assert [query for query, _ in executor.calls] == [
+        "anchor",
+        "ordered_seed",
+        "match",
+        "ordered_seed",
+        "match",
+    ]
 
 
 def test_long_window_common_indexed_anchor_falls_back_to_ordered_roots() -> None:

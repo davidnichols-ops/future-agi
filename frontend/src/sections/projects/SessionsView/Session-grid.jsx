@@ -33,10 +33,11 @@ import { failServerSideGridRead } from "src/utils/queryReadState";
 import {
   createListCursorPagination,
   isListCursorContinuationLimitError,
-  LIST_CURSOR_CONTINUATION_NOTICE,
   loadExactListPage,
+  retryServerSideCursorLoad,
   resumePendingListPage,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
+import ListCursorContinuationNotice from "src/sections/projects/LLMTracing/ListCursorContinuationNotice";
 
 const getSessionGridThemeParams = (theme) => ({
   columnBorder: false,
@@ -85,6 +86,12 @@ const SessionGrid = React.forwardRef(
     const [open, setOpen] = useState(false);
     const [currentRowData, setCurrentRowData] = useState(null);
     const [continuationNotice, setContinuationNotice] = useState(null);
+    const continueCursorSearch = useCallback(() => {
+      if (!continuationNotice) return;
+      if (retryServerSideCursorLoad(gridApiRef?.current?.api)) {
+        setContinuationNotice(null);
+      }
+    }, [continuationNotice, gridApiRef]);
     const theme = useTheme();
     const agTheme = useAgThemeWith(getSessionGridThemeParams(theme));
     const handleDrawerClose = () => {
@@ -450,7 +457,7 @@ const SessionGrid = React.forwardRef(
                 // Preserve the exact continuation checkpoint and any rows
                 // already rendered. This bounded pause is neutral and only a
                 // deliberate refresh/retry resumes the next exact segment.
-                setContinuationNotice(LIST_CURSOR_CONTINUATION_NOTICE);
+                setContinuationNotice(true);
                 params.fail();
                 return;
               }
@@ -573,22 +580,10 @@ const SessionGrid = React.forwardRef(
               minHeight: 0,
             }}
           >
-            {continuationNotice && (
-              <Box
-                role="status"
-                sx={{
-                  px: 1.5,
-                  py: 0.75,
-                  fontSize: 12,
-                  color: "text.secondary",
-                  bgcolor: "action.hover",
-                  borderBottom: "1px solid",
-                  borderColor: "divider",
-                }}
-              >
-                {continuationNotice}
-              </Box>
-            )}
+            <ListCursorContinuationNotice
+              pending={Boolean(continuationNotice)}
+              onContinue={continueCursorSearch}
+            />
             <Box
               className={`ag-theme-quartz ${className} ${cellHeight && cellHeight !== "Short" ? "cell-wrap" : ""}`}
               style={{ flex: 1, minHeight: 0 }}
@@ -609,7 +604,7 @@ const SessionGrid = React.forwardRef(
                 }
                 statusBar={statusBar}
                 rowSelection={{ mode: "multiRow", enableClickSelection: false }}
-                className="clean-data-table"
+                className={`clean-data-table${continuationNotice ? " ag-grid-cursor-paused" : ""}`}
                 theme={agTheme}
                 rowModelType="serverSide"
                 serverSideDatasource={dataSource}
@@ -618,6 +613,9 @@ const SessionGrid = React.forwardRef(
                 maxBlocksInCache={5}
                 rowBuffer={5}
                 suppressServerSideFullWidthLoadingRow={true}
+                noRowsOverlayComponent={
+                  continuationNotice ? () => null : undefined
+                }
                 serverSideInitialRowCount={DATASET_ROWS_LIMIT}
                 defaultColDef={defaultColDef}
                 rowStyle={{ cursor: "pointer" }}

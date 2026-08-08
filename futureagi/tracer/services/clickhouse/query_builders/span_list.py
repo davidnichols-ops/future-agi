@@ -70,6 +70,9 @@ _LONG_WINDOW_VALUE_ANCHOR_SENTINEL = 64
 _LONG_WINDOW_VALUE_ANCHOR_TIMEOUT_MS = 300
 _LONG_WINDOW_VALUE_ANCHOR_STRATA = 4
 _LONG_WINDOW_VALUE_ANCHOR_MAX_BYTES_TO_READ = 96 * 1024 * 1024
+_TIME_ONLY_CURSOR_SPARSE_PROBE_MIN_WINDOW = timedelta(days=2)
+_TIME_ONLY_CURSOR_SPARSE_PROBE_MAX_ROWS = 512
+_TIME_ONLY_CURSOR_SPARSE_PROBE_MAX_QUERIES = 49
 
 
 def _unix_microseconds(value: datetime) -> int:
@@ -318,14 +321,52 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     def recommended_filter_classify_batch_size() -> int:
         return 200
 
+    def recommended_filter_max_query_count(self) -> int | None:
+        """Keep the pre-probe 24 seed + 24 classifier fallback budget intact."""
+
+        if self._supports_time_only_cursor_sparse_probe():
+            return _TIME_ONLY_CURSOR_SPARSE_PROBE_MAX_QUERIES
+        return None
+
+    def _supports_time_only_cursor_sparse_probe(self) -> bool:
+        """Whether a cheap full-window sentinel may close an initial cursor.
+
+        The ordinary cursor scanner deliberately starts with five-minute
+        slices.  That protects dense projects, but a sparse year-long project
+        otherwise needs one public continuation for roughly every month just
+        to prove that no older rows exist.  A time-only span request has a
+        cheaper exact option: read at most ``page_size + 1`` unordered physical
+        rows, then use the unchanged
+        latest-state classifier if the sentinel exhausts.  A saturated or
+        resource-limited probe proves nothing and falls back to the existing
+        narrow scanner.
+        """
+
+        request_start, request_end = self._bounded_request_window
+        return bool(
+            self._bounded_internal_scan
+            and not self._bounded_anchor_probe
+            and self._bounded_sampling_rate is None
+            and not self._active_non_time_filters()
+            and request_end - request_start > _TIME_ONLY_CURSOR_SPARSE_PROBE_MIN_WINDOW
+        )
+
+    def allow_filter_anchor_probe_for_initial_continuation(self) -> bool:
+        """Allow only the first signed cursor request to run the sparse probe."""
+
+        return self._supports_time_only_cursor_sparse_probe()
+
     def supports_filter_anchor_probe(self) -> bool:
         """Whether an indexed span leaf can seed a sparse graph sentinel."""
 
         return bool(
-            self._filter_anchor_plans()
-            and (
-                self._bounded_anchor_probe
-                or self._positive_typed_map_anchor_plan() is not None
+            self._supports_time_only_cursor_sparse_probe()
+            or (
+                self._filter_anchor_plans()
+                and (
+                    self._bounded_anchor_probe
+                    or self._positive_typed_map_anchor_plan() is not None
+                )
             )
         )
 
@@ -485,6 +526,11 @@ class SpanListQueryBuilder(BaseQueryBuilder):
     def recommended_filter_anchor_probe_limit(self) -> int | None:
         """Use a small exact value sentinel for long-window list reads."""
 
+        if self._supports_time_only_cursor_sparse_probe():
+            return min(
+                self.page_size + 1,
+                _TIME_ONLY_CURSOR_SPARSE_PROBE_MAX_ROWS,
+            )
         request_start, request_end = self._bounded_request_window
         if (
             not self._bounded_anchor_probe
@@ -500,6 +546,8 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         return None
 
     def recommended_filter_anchor_probe_strata(self) -> int | None:
+        if self._supports_time_only_cursor_sparse_probe():
+            return 1
         if self.recommended_filter_anchor_probe_limit() is not None:
             return _LONG_WINDOW_VALUE_ANCHOR_STRATA
         return None
@@ -662,7 +710,10 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                     if f"%({key})s" in seed_predicate
                 }
             )
-        predicate = " AND ".join(seeded_predicates)
+        # A time-only cursor probe has no value predicate. Its finite sentinel
+        # is still a complete raw-identity superset when it exhausts; every row
+        # is replayed through the same latest-state classifier before exposure.
+        predicate = " AND ".join(seeded_predicates) or "1 = 1"
 
         datetime_predicate, datetime_params = (
             BaseQueryBuilder.bounded_datetime_exclusion_sql(
@@ -695,6 +746,27 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                   ), 100
               ) < %(bounded_sampling_rate)s
             """
+
+        if self._supports_time_only_cursor_sparse_probe() and not _graph_key_witness:
+            # Deliberately unordered and without LIMIT 1 BY. ClickHouse may stop
+            # after reading the sentinel instead of sorting/deduplicating a
+            # year-long tenant window. Duplicate physical versions can only
+            # saturate the sentinel and force the safe narrow fallback. When
+            # fewer rows are returned, every raw non-deleted row was exhausted,
+            # so their de-duplicated identities are a complete candidate
+            # superset for the unchanged latest-state classifier.
+            query = f"""
+            SELECT project_id, id, trace_id, start_time
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND is_deleted = 0
+              {project_version_fragment}
+              AND start_time >= fromUnixTimestamp64Micro(%(filter_anchor_start_us)s)
+              AND start_time < fromUnixTimestamp64Micro(%(filter_anchor_end_us)s)
+            WHERE 1 = 1{datetime_fragment}
+            LIMIT %(filter_anchor_limit)s
+            """
+            return query, params
 
         query = f"""
         SELECT project_id, id, trace_id, start_time

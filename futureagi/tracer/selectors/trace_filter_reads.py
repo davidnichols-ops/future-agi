@@ -764,10 +764,26 @@ def read_bounded_filter_page(
         and callable(skip_full_anchor_builder)
         and bool(skip_full_anchor_builder())
     )
+    initial_continuation_anchor_builder = getattr(
+        builder,
+        "allow_filter_anchor_probe_for_initial_continuation",
+        None,
+    )
+    initial_continuation_anchor_allowed = bool(
+        callable(initial_continuation_anchor_builder)
+        and initial_continuation_anchor_builder()
+    )
     anchor_can_run = (
         not workflow_exact
         and not seed_proves_population_bound
-        and not bounded_continuation
+        and (
+            not bounded_continuation
+            or (
+                continuation_slice_end is None
+                and cursor_key is None
+                and initial_continuation_anchor_allowed
+            )
+        )
         and cursor_key is None
         and (
             anchor_limit == _SELECTIVE_ANCHOR_SENTINEL
@@ -2078,7 +2094,7 @@ def read_bounded_filter_page(
                         timeout_cap_ms=anchor_timeout_cap_ms,
                         max_bytes_to_read_cap=(
                             recommended_anchor_max_bytes_to_read
-                            if recommended_anchor_strata > 1 and not anchor_probe_only
+                            if not anchor_probe_only
                             else None
                         ),
                     )

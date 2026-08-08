@@ -45,10 +45,11 @@ import {
 import {
   createListCursorPagination,
   isListCursorContinuationLimitError,
-  LIST_CURSOR_CONTINUATION_NOTICE,
   loadExactListPage,
+  retryServerSideCursorLoad,
   resumePendingListPage,
 } from "./listCursorPagination";
+import ListCursorContinuationNotice from "./ListCursorContinuationNotice";
 import { getListReadMessage, getListTotalState } from "./listTotalMetadata";
 import { getTraceAttributeRequestKey } from "./traceAttributeRequest";
 
@@ -138,6 +139,12 @@ const TraceGrid = React.forwardRef(
       },
       [enabled, gridRef],
     );
+    const continueCursorSearch = useCallback(() => {
+      if (!continuationNotice) return;
+      if (retryServerSideCursorLoad(gridRef?.current?.api)) {
+        setContinuationNotice(null);
+      }
+    }, [continuationNotice, gridRef]);
     const filterRequestKey = useMemo(
       () =>
         JSON.stringify({
@@ -473,7 +480,7 @@ const TraceGrid = React.forwardRef(
                 // Keep the signed checkpoint and any existing rows. This is a
                 // bounded exact read awaiting an explicit retry, not an empty
                 // result or a user-visible query failure.
-                setContinuationNotice(LIST_CURSOR_CONTINUATION_NOTICE);
+                setContinuationNotice(true);
                 params.fail();
                 return;
               }
@@ -708,25 +715,13 @@ const TraceGrid = React.forwardRef(
             {readMessage}
           </Box>
         )}
-        {continuationNotice && (
-          <Box
-            role="status"
-            sx={{
-              px: 1.5,
-              py: 0.75,
-              fontSize: 12,
-              color: "text.secondary",
-              bgcolor: "action.hover",
-              borderBottom: "1px solid",
-              borderColor: "divider",
-            }}
-          >
-            {continuationNotice}
-          </Box>
-        )}
+        <ListCursorContinuationNotice
+          pending={Boolean(continuationNotice)}
+          onContinue={continueCursorSearch}
+        />
         <AgGridReact
           style={{ flex: 1, minHeight: 0 }}
-          className={`clean-data-table ${shouldDisable ? "ag-grid-disabled" : ""}`}
+          className={`clean-data-table ${continuationNotice ? "ag-grid-cursor-paused" : ""} ${shouldDisable ? "ag-grid-disabled" : ""}`}
           theme={agTheme.withParams({
             columnBorder: false,
             headerColumnBorder: false,
@@ -762,18 +757,20 @@ const TraceGrid = React.forwardRef(
             previousFilterRequestKeyRef.current !== filterRequestKey
           }
           noRowsOverlayComponent={() =>
-            NoRowsOverlay(
-              <Typography
-                sx={{
-                  fontSize: 14,
-                  fontWeight: 400,
-                  color: "text.secondary",
-                }}
-              >
-                {readMessageRef.current ||
-                  (showErrors ? "No error found" : "No traces found")}
-              </Typography>,
-            )
+            continuationNotice
+              ? null
+              : NoRowsOverlay(
+                  <Typography
+                    sx={{
+                      fontSize: 14,
+                      fontWeight: 400,
+                      color: "text.secondary",
+                    }}
+                  >
+                    {readMessageRef.current ||
+                      (showErrors ? "No error found" : "No traces found")}
+                  </Typography>,
+                )
           }
           onCellClicked={handleCellClick}
           onSelectionChanged={onSelectionChanged}

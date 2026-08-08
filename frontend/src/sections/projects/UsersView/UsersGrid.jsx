@@ -25,11 +25,12 @@ import { APP_CONSTANTS } from "src/utils/constants";
 import {
   createListCursorPagination,
   isListCursorContinuationLimitError,
-  LIST_CURSOR_CONTINUATION_NOTICE,
   LIST_CURSOR_MODES,
   loadExactListPage,
+  retryServerSideCursorLoad,
   resumePendingListPage,
 } from "../LLMTracing/listCursorPagination";
+import ListCursorContinuationNotice from "../LLMTracing/ListCursorContinuationNotice";
 import {
   failServerSideGridRead,
   QUERY_FAILED_RETRY_MESSAGE,
@@ -77,6 +78,12 @@ const UsersGrid = React.memo(
     const cursorQueryKeyRef = useRef(null);
     const [readError, setReadError] = useState(null);
     const [continuationNotice, setContinuationNotice] = useState(null);
+    const continueCursorSearch = useCallback(() => {
+      if (!continuationNotice) return;
+      if (retryServerSideCursorLoad(gridApiRef.current?.api)) {
+        setContinuationNotice(null);
+      }
+    }, [continuationNotice]);
     const {
       setGridApi,
       searchQuery,
@@ -460,7 +467,7 @@ const UsersGrid = React.memo(
               // can explicitly retry without seeing a false empty or error
               // state, and the client never drains an unbounded cursor chain.
               setReadError(null);
-              setContinuationNotice(LIST_CURSOR_CONTINUATION_NOTICE);
+              setContinuationNotice(true);
               params.fail();
               return;
             }
@@ -679,29 +686,17 @@ const UsersGrid = React.memo(
     };
     return (
       <Box sx={containerStyle}>
-        {continuationNotice && (
-          <Box
-            role="status"
-            sx={{
-              px: 1.5,
-              py: 0.75,
-              fontSize: 12,
-              color: "text.secondary",
-              bgcolor: "action.hover",
-              borderBottom: "1px solid",
-              borderColor: "divider",
-            }}
-          >
-            {continuationNotice}
-          </Box>
-        )}
+        <ListCursorContinuationNotice
+          pending={Boolean(continuationNotice)}
+          onContinue={continueCursorSearch}
+        />
         <Box
           className={`ag-theme-quartz ${cellHeight && cellHeight !== "Short" ? "cell-wrap" : ""}`}
           sx={gridWrapperStyle}
         >
           <Box className="ag-theme-quartz" sx={fullHeightStyle}>
             <AgGridReact
-              className="clean-data-table"
+              className={`clean-data-table${continuationNotice ? " ag-grid-cursor-paused" : ""}`}
               ref={(params) => {
                 gridApiRef.current = params;
               }}
@@ -733,16 +728,18 @@ const UsersGrid = React.memo(
               onRowSelected={onSelectionChanged}
               onGridReady={onGridReady}
               noRowsOverlayComponent={() =>
-                NoRowsOverlay(
-                  <Typography
-                    role={readError ? "alert" : undefined}
-                    typography="m3"
-                    color="text.primary"
-                    fontWeight="fontWeightMedium"
-                  >
-                    {readError || "No active users for current filters"}
-                  </Typography>,
-                )
+                continuationNotice
+                  ? null
+                  : NoRowsOverlay(
+                      <Typography
+                        role={readError ? "alert" : undefined}
+                        typography="m3"
+                        color="text.primary"
+                        fontWeight="fontWeightMedium"
+                      >
+                        {readError || "No active users for current filters"}
+                      </Typography>,
+                    )
               }
             />
           </Box>

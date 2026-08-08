@@ -51,10 +51,11 @@ import {
 import {
   createListCursorPagination,
   isListCursorContinuationLimitError,
-  LIST_CURSOR_CONTINUATION_NOTICE,
   loadExactListPage,
+  retryServerSideCursorLoad,
   resumePendingListPage,
 } from "./listCursorPagination";
+import ListCursorContinuationNotice from "./ListCursorContinuationNotice";
 import { getListTotalState } from "./listTotalMetadata";
 
 const ROWS_LIMIT = 25;
@@ -254,6 +255,12 @@ const SpanGrid = React.forwardRef(
       },
       [enabled, gridRef],
     );
+    const continueCursorSearch = useCallback(() => {
+      if (!continuationNotice) return;
+      if (retryServerSideCursorLoad(gridRef?.current?.api)) {
+        setContinuationNotice(null);
+      }
+    }, [continuationNotice, gridRef]);
     const filterRequestKey = useMemo(
       () =>
         JSON.stringify({
@@ -633,7 +640,7 @@ const SpanGrid = React.forwardRef(
                 // Preserve the exact checkpoint and current rows. A deliberate
                 // refresh may continue; do not publish a false empty page or
                 // surface this bounded pause as a query error.
-                setContinuationNotice(LIST_CURSOR_CONTINUATION_NOTICE);
+                setContinuationNotice(true);
                 params.fail();
                 return;
               }
@@ -803,29 +810,13 @@ const SpanGrid = React.forwardRef(
             {readMessage}
           </Box>
         )}
-        {continuationNotice && (
-          <Box
-            role="status"
-            sx={{
-              px: 1.5,
-              py: 0.75,
-              fontSize: 12,
-              color: "text.secondary",
-              bgcolor: "action.hover",
-              borderBottom: "1px solid",
-              borderColor: "divider",
-            }}
-          >
-            {continuationNotice}
-          </Box>
-        )}
+        <ListCursorContinuationNotice
+          pending={Boolean(continuationNotice)}
+          onContinue={continueCursorSearch}
+        />
         <AgGridReact
           style={{ flex: 1, minHeight: 0 }}
-          className={
-            cellHeight && cellHeight !== "Short"
-              ? "cell-wrap clean-data-table"
-              : "clean-data-table"
-          }
+          className={`${cellHeight && cellHeight !== "Short" ? "cell-wrap " : ""}clean-data-table${continuationNotice ? " ag-grid-cursor-paused" : ""}`}
           // rowSelection={{ mode: "multiRow" }}
           rowHeight={userTraceRowHeightMapping[cellHeight]?.height ?? 40}
           theme={agTheme.withParams({
@@ -861,17 +852,20 @@ const SpanGrid = React.forwardRef(
           }
           suppressServerSideFullWidthLoadingRow={true}
           noRowsOverlayComponent={() =>
-            NoRowsOverlay(
-              <Typography
-                sx={{
-                  fontSize: 14,
-                  fontWeight: 400,
-                  color: "text.secondary",
-                }}
-              >
-                {getQueryReadMessage(readStateRef.current) || "No spans found"}
-              </Typography>,
-            )
+            continuationNotice
+              ? null
+              : NoRowsOverlay(
+                  <Typography
+                    sx={{
+                      fontSize: 14,
+                      fontWeight: 400,
+                      color: "text.secondary",
+                    }}
+                  >
+                    {getQueryReadMessage(readStateRef.current) ||
+                      "No spans found"}
+                  </Typography>,
+                )
           }
           onCellClicked={handleCellClick}
           onSelectionChanged={onSelectionChanged}

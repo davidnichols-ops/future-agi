@@ -114,8 +114,9 @@ ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE = 50
 ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT = 64
 ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT = 512
 # One cursor request is a responsive, exact prefix read rather than a request
-# to exhaust the vocabulary.  Four candidate/latest-state pairs cover up to
-# 256 newest matching physical spans once the page has found a new value.  A
+# to exhaust the vocabulary. Four candidate batches and their bounded
+# latest-state reads cover up to 256 newest matching physical spans once the
+# page has found a new value. A
 # duplicate-only continuation may use the independent 30-query operation
 # envelope and grow its finite replay batch up to 512 identities.  This keeps
 # ordinary pages responsive while collapsing long runs of already-seen values.
@@ -808,6 +809,37 @@ _LATEST_TYPED_TARGET_SQL = """
     )
 """
 
+_LATEST_JSON_TARGET_SQL = """
+    SELECT
+        toString(project_id) AS project_id,
+        toString(trace_id) AS trace_id,
+        toString(id) AS id,
+        start_time,
+        tupleElement(latest_state, 1) AS is_deleted,
+        tupleElement(latest_state, 2) AS legacy_present,
+        tupleElement(latest_state, 3) AS legacy_value_raw
+    FROM
+    (
+        SELECT
+            project_id,
+            trace_id,
+            id,
+            start_time,
+            argMax(
+                tuple(
+                    is_deleted,
+                    JSONHas(attributes_extra, %(attribute_key)s),
+                    JSONExtractRaw(attributes_extra, %(attribute_key)s)
+                ),
+                _version
+            ) AS latest_state
+        FROM spans AS attribute_source
+        PREWHERE project_id IN %(project_ids)s
+          AND ({candidate_predicate})
+        GROUP BY project_id, trace_id, id, start_time
+    )
+"""
+
 # Certify candidate versions and tombstones without reading any Map subcolumn.
 # The candidate query already proved that its raw row had the requested key;
 # only a row whose version is still latest and live may advance to value
@@ -1462,17 +1494,117 @@ class AttributeReadSelector:
             candidate_ids=candidate_ids,
             query_timeout_ms=query_timeout_ms,
         )
+        version_by_identity = {
+            self._physical_identity(row): row for row in version_rows
+        }
         active_ids = tuple(
-            self._physical_identity(row)
-            for row in version_rows
-            if int(row.get("is_deleted") or 0) == 0
-            and int(row.get("latest_version", -1))
-            == candidate_versions[self._physical_identity(row)]
+            identity
+            for identity in candidate_ids
+            if int(version_by_identity[identity].get("is_deleted") or 0) == 0
+            and int(version_by_identity[identity].get("latest_version", -1))
+            == candidate_versions[identity]
         )
         if not active_ids:
             return []
-        return self._verify_latest(
+        hydrated_rows = self._verify_latest(
             sql=_LATEST_TYPED_TARGET_SQL,
+            project_ids=project_ids,
+            candidate_ids=active_ids,
+            attribute_key=attribute_key,
+            query_timeout_ms=query_timeout_ms,
+        )
+        hydrated_by_identity = {
+            self._physical_identity(row): row for row in hydrated_rows
+        }
+        return [hydrated_by_identity[identity] for identity in active_ids]
+
+    @staticmethod
+    def _typed_target_has_key(row: dict[str, Any]) -> bool:
+        """Return whether latest state stores the key in any typed Map."""
+
+        return any(
+            bool(row.get(field))
+            for field in ("string_present", "number_present", "boolean_present")
+        )
+
+    def _hydrate_latest_unpinned_values(
+        self,
+        *,
+        project_ids: tuple[str, ...],
+        candidate_ids: tuple[PhysicalSpanIdentity, ...],
+        attribute_key: str,
+        query_timeout_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Hydrate typed state first and JSON only for typed-absent identities."""
+
+        if not candidate_ids:
+            return []
+        typed_rows = self._verify_latest(
+            sql=_LATEST_TYPED_TARGET_SQL,
+            project_ids=project_ids,
+            candidate_ids=candidate_ids,
+            attribute_key=attribute_key,
+            query_timeout_ms=query_timeout_ms,
+        )
+        typed_by_identity = {self._physical_identity(row): row for row in typed_rows}
+        json_ids = tuple(
+            identity
+            for identity in candidate_ids
+            if int(typed_by_identity[identity].get("is_deleted") or 0) == 0
+            and not self._typed_target_has_key(typed_by_identity[identity])
+        )
+        if not json_ids:
+            return [typed_by_identity[identity] for identity in candidate_ids]
+        json_rows = self._verify_latest(
+            sql=_LATEST_JSON_TARGET_SQL,
+            project_ids=project_ids,
+            candidate_ids=json_ids,
+            attribute_key=attribute_key,
+            query_timeout_ms=query_timeout_ms,
+        )
+        for json_row in json_rows:
+            identity = self._physical_identity(json_row)
+            typed_row = typed_by_identity[identity]
+            typed_by_identity[identity] = {
+                **typed_row,
+                "is_deleted": json_row.get("is_deleted"),
+                "legacy_present": json_row.get("legacy_present"),
+                "legacy_value_raw": json_row.get("legacy_value_raw"),
+            }
+        return [typed_by_identity[identity] for identity in candidate_ids]
+
+    def _verify_latest_unpinned_values(
+        self,
+        *,
+        project_ids: tuple[str, ...],
+        candidate_ids: tuple[PhysicalSpanIdentity, ...],
+        candidate_versions: dict[PhysicalSpanIdentity, int],
+        attribute_key: str,
+        query_timeout_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Certify an unpinned mixed-type page, then hydrate narrow lanes."""
+
+        if set(candidate_versions) != set(candidate_ids):
+            raise IncompleteLatestStateReplay(
+                "Attribute value candidates had incomplete version certificates"
+            )
+        version_rows = self._verify_latest(
+            sql=_LATEST_TYPED_VERSION_SQL,
+            project_ids=project_ids,
+            candidate_ids=candidate_ids,
+            query_timeout_ms=query_timeout_ms,
+        )
+        version_by_identity = {
+            self._physical_identity(row): row for row in version_rows
+        }
+        active_ids = tuple(
+            identity
+            for identity in candidate_ids
+            if int(version_by_identity[identity].get("is_deleted") or 0) == 0
+            and int(version_by_identity[identity].get("latest_version", -1))
+            == candidate_versions[identity]
+        )
+        return self._hydrate_latest_unpinned_values(
             project_ids=project_ids,
             candidate_ids=active_ids,
             attribute_key=attribute_key,
@@ -3692,6 +3824,12 @@ class AttributeReadSelector:
         emitted_digests: list[str] = []
         emitted: dict[str, AttributeValueRow] = {}
         needle = normalized_search.casefold()
+        typed_cursor_read = attribute_type in {"string", "number", "boolean"}
+        unpinned_cursor_read = attribute_type is None
+        versioned_cursor_read = typed_cursor_read or unpinned_cursor_read
+        candidate_page_query_cost = (
+            4 if unpinned_cursor_read else 3 if typed_cursor_read else 2
+        )
         candidate_pages = 0
         candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
         cursor_before = before_identity
@@ -3809,11 +3947,27 @@ class AttributeReadSelector:
             return True, len(candidates)
 
         if resume_identity is not None:
-            resume_rows = self._verify_latest(
-                sql=_LATEST_TARGET_SQL,
-                project_ids=projects,
-                candidate_ids=(resume_identity,),
-                attribute_key=key,
+            resume_rows = (
+                self._hydrate_latest_unpinned_values(
+                    project_ids=projects,
+                    candidate_ids=(resume_identity,),
+                    attribute_key=key,
+                )
+                if unpinned_cursor_read
+                else self._verify_latest(
+                    # A typed cursor cannot resume inside a scalar value, but an
+                    # older signed cursor can still carry a defensive checkpoint.
+                    # Keep that replay exact without pulling the legacy JSON
+                    # column for a request pinned to a typed Map family.
+                    sql=(
+                        _LATEST_TYPED_TARGET_SQL
+                        if typed_cursor_read
+                        else _LATEST_TARGET_SQL
+                    ),
+                    project_ids=projects,
+                    candidate_ids=(resume_identity,),
+                    attribute_key=key,
+                )
             )
             resume_row = resume_rows[0] if resume_rows else None
             decoded = (
@@ -3848,22 +4002,28 @@ class AttributeReadSelector:
                 if emitted
                 else ATTRIBUTE_VALUE_CURSOR_DUPLICATE_ONLY_MAX_CANDIDATE_PAGES
             )
-            # Every walk iteration issues one candidate query and one
-            # latest-state verification query. A resumed array row consumes
-            # one verification before this loop, so reserve capacity for the
-            # pair instead of letting the last iteration cross the selector's
-            # global per-operation query ceiling.
-            and self._query_count + 2 <= ATTRIBUTE_READ_MAX_QUERY_COUNT
+            # A pinned JSON page uses a candidate query plus its exact replay;
+            # a pinned scalar adds a version certificate. An unpinned page can
+            # additionally need the isolated JSON lane after typed hydration,
+            # so reserve four queries in that worst case. This prevents the
+            # hard ceiling from interrupting an exact page mid-hydration.
+            and self._query_count + candidate_page_query_cost
+            <= ATTRIBUTE_READ_MAX_QUERY_COUNT
         ):
             segment_start = max(start, current_segment_end - empty_segment_width)
             segment = (segment_start, current_segment_end)
             candidate_ids: tuple[PhysicalSpanIdentity, ...] = ()
+            candidate_versions: dict[PhysicalSpanIdentity, int] = {}
             segment_truncated = False
             widened_probe = (
                 segment_start < current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
             )
             try:
-                candidate_ids, segment_truncated, _ = self._candidate_ids(
+                (
+                    candidate_ids,
+                    segment_truncated,
+                    candidate_versions,
+                ) = self._candidate_ids(
                     projects,
                     segment,
                     predicate=candidate_predicate,
@@ -3878,6 +4038,7 @@ class AttributeReadSelector:
                         or candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                         else None
                     ),
+                    include_versions=versioned_cursor_read,
                 )
             except Exception as exc:
                 if is_read_budget_error(exc) and candidate_limit > (
@@ -3905,16 +4066,35 @@ class AttributeReadSelector:
             if candidate_ids:
                 candidate_pages += 1
                 try:
-                    rows = self._verify_latest(
-                        sql=_LATEST_TARGET_SQL,
-                        project_ids=projects,
-                        candidate_ids=candidate_ids,
-                        attribute_key=key,
-                        query_timeout_ms=(
-                            ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
-                            if candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
-                            else None
-                        ),
+                    replay_timeout_ms = (
+                        ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+                        if candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                        else None
+                    )
+                    rows = (
+                        self._verify_latest_unpinned_values(
+                            project_ids=projects,
+                            candidate_ids=candidate_ids,
+                            candidate_versions=candidate_versions,
+                            attribute_key=key,
+                            query_timeout_ms=replay_timeout_ms,
+                        )
+                        if unpinned_cursor_read
+                        else self._verify_latest_typed_values(
+                            project_ids=projects,
+                            candidate_ids=candidate_ids,
+                            candidate_versions=candidate_versions,
+                            attribute_key=key,
+                            query_timeout_ms=replay_timeout_ms,
+                        )
+                        if typed_cursor_read
+                        else self._verify_latest(
+                            sql=_LATEST_TARGET_SQL,
+                            project_ids=projects,
+                            candidate_ids=candidate_ids,
+                            attribute_key=key,
+                            query_timeout_ms=replay_timeout_ms,
+                        )
                     )
                 except Exception as exc:
                     if is_read_budget_error(exc) and candidate_limit > (
