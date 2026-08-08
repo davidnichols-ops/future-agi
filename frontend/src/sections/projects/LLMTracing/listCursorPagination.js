@@ -2,11 +2,18 @@ const CURSOR_MODE = "cursor";
 const NUMBERED_MODE = "numbered";
 const UNKNOWN_MODE = "unknown";
 const MIXED_VERSION_ERROR_CODE = "LIST_CURSOR_MIXED_VERSION";
+export const LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE =
+  "LIST_CURSOR_CONTINUATION_LIMIT";
+export const LIST_CURSOR_CONTINUATION_NOTICE =
+  "Preparing exact results. Refresh or retry to continue.";
 const DEFAULT_MAX_EMPTY_CONTINUATIONS = 12;
 const DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS = 30_000;
 
 const hasOwn = (value, key) =>
   Object.prototype.hasOwnProperty.call(value || {}, key);
+
+export const isListCursorContinuationLimitError = (error) =>
+  error?.code === LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE;
 
 /**
  * Keep the opaque continuation chain for one immutable grid query.
@@ -249,9 +256,13 @@ const stableRowKey = (rowIdentity, row) => {
  * requested page while `has_more` remains true. Publishing that response to
  * AG Grid would make it infer end-of-data and hide every later match.
  *
- * Overflow is retained for the next visible page. If the local hop/time bound
- * is reached, accumulated rows and the signed checkpoint stay on the same
- * page so a retry can continue without dropping or duplicating rows.
+ * Overflow is retained for the next visible page. The hop/time bound is a
+ * hard safety boundary for this automatic read: returning a pending page and
+ * immediately asking AG Grid to retry would reset the local counter and turn
+ * an always-advancing sparse cursor into an endless loading loop. Fail closed
+ * instead, while retaining the signed checkpoint in pagination state. A
+ * deliberate grid refresh can start a new bounded exact attempt; an empty
+ * transport page is never published as a genuine empty result.
  */
 export const loadExactListPage = async ({
   pagination,
@@ -322,10 +333,22 @@ export const loadExactListPage = async ({
         canPrefetch: false,
       };
     }
-    response =
+    const nextTransportResponse =
       continuationCount === 0
         ? await loadResponse()
         : await nextResponse(metadata.next_cursor);
+    if (!isCurrent()) {
+      return {
+        response,
+        rows: accumulatedRows,
+        metadata,
+        pending: true,
+        stale: true,
+        isLastPage: false,
+        canPrefetch: false,
+      };
+    }
+    response = nextTransportResponse;
     appendRows(rowsFromResponse(response));
     metadata = metadataFromResponse(response) || {};
 
@@ -344,15 +367,9 @@ export const loadExactListPage = async ({
       continuationCount >= maxContinuations ||
       now() - startedAt >= maxElapsedMs
     ) {
-      return {
-        response,
-        rows: [...accumulatedRows],
-        metadata,
-        pending: true,
-        stale: false,
-        isLastPage: false,
-        canPrefetch: false,
-      };
+      const error = new Error("Exact list continuation safety limit reached");
+      error.code = LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE;
+      throw error;
     }
     continuationCount += 1;
     needsResponse = true;

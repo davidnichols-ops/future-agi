@@ -24,6 +24,8 @@ import NoRowsOverlay from "src/sections/project-detail/CompareDrawer/NoRowsOverl
 import { APP_CONSTANTS } from "src/utils/constants";
 import {
   createListCursorPagination,
+  isListCursorContinuationLimitError,
+  LIST_CURSOR_CONTINUATION_NOTICE,
   LIST_CURSOR_MODES,
   loadExactListPage,
   resumePendingListPage,
@@ -74,6 +76,7 @@ const UsersGrid = React.memo(
     );
     const cursorQueryKeyRef = useRef(null);
     const [readError, setReadError] = useState(null);
+    const [continuationNotice, setContinuationNotice] = useState(null);
     const {
       setGridApi,
       searchQuery,
@@ -400,6 +403,7 @@ const UsersGrid = React.memo(
                 : Math.max(total, request.endRow + 1);
 
             setReadError(null);
+            setContinuationNotice(null);
 
             if (pageNumber === 0 && !hasResults) {
               params.api.showNoRowsOverlay();
@@ -451,6 +455,15 @@ const UsersGrid = React.memo(
               params.fail();
               return;
             }
+            if (isListCursorContinuationLimitError(error)) {
+              // Keep existing rows and the exact signed checkpoint. The user
+              // can explicitly retry without seeing a false empty or error
+              // state, and the client never drains an unbounded cursor chain.
+              setReadError(null);
+              setContinuationNotice(LIST_CURSOR_CONTINUATION_NOTICE);
+              params.fail();
+              return;
+            }
             if (
               cursorPagination.current.canRecoverFromContinuationError(
                 pageNumber,
@@ -463,6 +476,7 @@ const UsersGrid = React.memo(
               params.api?.refreshServerSide?.({ purge: true });
               return;
             }
+            setContinuationNotice(null);
             setReadError(QUERY_FAILED_RETRY_MESSAGE);
             setSearchState("error");
             failServerSideGridRead(params);
@@ -665,6 +679,22 @@ const UsersGrid = React.memo(
     };
     return (
       <Box sx={containerStyle}>
+        {continuationNotice && (
+          <Box
+            role="status"
+            sx={{
+              px: 1.5,
+              py: 0.75,
+              fontSize: 12,
+              color: "text.secondary",
+              bgcolor: "action.hover",
+              borderBottom: "1px solid",
+              borderColor: "divider",
+            }}
+          >
+            {continuationNotice}
+          </Box>
+        )}
         <Box
           className={`ag-theme-quartz ${cellHeight && cellHeight !== "Short" ? "cell-wrap" : ""}`}
           sx={gridWrapperStyle}

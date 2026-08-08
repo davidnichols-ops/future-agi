@@ -32,6 +32,8 @@ import { getListTotalState } from "src/sections/projects/LLMTracing/listTotalMet
 import { failServerSideGridRead } from "src/utils/queryReadState";
 import {
   createListCursorPagination,
+  isListCursorContinuationLimitError,
+  LIST_CURSOR_CONTINUATION_NOTICE,
   loadExactListPage,
   resumePendingListPage,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
@@ -82,6 +84,7 @@ const SessionGrid = React.forwardRef(
   ) => {
     const [open, setOpen] = useState(false);
     const [currentRowData, setCurrentRowData] = useState(null);
+    const [continuationNotice, setContinuationNotice] = useState(null);
     const theme = useTheme();
     const agTheme = useAgThemeWith(getSessionGridThemeParams(theme));
     const handleDrawerClose = () => {
@@ -415,6 +418,7 @@ const SessionGrid = React.forwardRef(
                 rowData: rows,
                 rowCount: lastRow,
               });
+              setContinuationNotice(null);
 
               // Prefetch next page so scroll feels instant. Cache the promise
               // (not the resolved value) so a concurrent getRows dedupes.
@@ -442,6 +446,14 @@ const SessionGrid = React.forwardRef(
                 params.fail();
                 return;
               }
+              if (isListCursorContinuationLimitError(error)) {
+                // Preserve the exact continuation checkpoint and any rows
+                // already rendered. This bounded pause is neutral and only a
+                // deliberate refresh/retry resumes the next exact segment.
+                setContinuationNotice(LIST_CURSOR_CONTINUATION_NOTICE);
+                params.fail();
+                return;
+              }
               if (
                 cursorPagination.current.canRecoverFromContinuationError(
                   pageNumber,
@@ -454,6 +466,7 @@ const SessionGrid = React.forwardRef(
                 params.api?.refreshServerSide?.({ purge: true });
                 return;
               }
+              setContinuationNotice(null);
               enqueueSnackbar(
                 "Session data could not be loaded. Please retry.",
                 {
@@ -555,11 +568,30 @@ const SessionGrid = React.forwardRef(
               paddingX: theme.spacing(2),
               paddingBottom: theme.spacing(1),
               flex: 1,
+              display: "flex",
+              flexDirection: "column",
+              minHeight: 0,
             }}
           >
+            {continuationNotice && (
+              <Box
+                role="status"
+                sx={{
+                  px: 1.5,
+                  py: 0.75,
+                  fontSize: 12,
+                  color: "text.secondary",
+                  bgcolor: "action.hover",
+                  borderBottom: "1px solid",
+                  borderColor: "divider",
+                }}
+              >
+                {continuationNotice}
+              </Box>
+            )}
             <Box
               className={`ag-theme-quartz ${className} ${cellHeight && cellHeight !== "Short" ? "cell-wrap" : ""}`}
-              style={{ height: "100%" }}
+              style={{ flex: 1, minHeight: 0 }}
             >
               <AgGridReact
                 ref={gridApiRef}

@@ -44,6 +44,8 @@ import {
 } from "src/utils/queryReadState";
 import {
   createListCursorPagination,
+  isListCursorContinuationLimitError,
+  LIST_CURSOR_CONTINUATION_NOTICE,
   loadExactListPage,
   resumePendingListPage,
 } from "./listCursorPagination";
@@ -103,6 +105,7 @@ const TraceGrid = React.forwardRef(
     const [selectedAll, setSelectedAll] = useState(false);
     const [readMessage, setReadMessage] = useState(null);
     const readMessageRef = useRef(null);
+    const [continuationNotice, setContinuationNotice] = useState(null);
     const [gridLoading, setGridLoading] = useState(enabled);
     const firstPageRequestRef = useRef(0);
     const preserveRowsDuringNextRefreshRef = useRef(false);
@@ -275,6 +278,7 @@ const TraceGrid = React.forwardRef(
                 if (!preserveExistingRows) setGridLoading(true);
                 readMessageRef.current = null;
                 setReadMessage(null);
+                setContinuationNotice(null);
               }
 
               const buildParams = (page) =>
@@ -434,6 +438,7 @@ const TraceGrid = React.forwardRef(
                 rowData: rows,
                 rowCount: lastRow,
               });
+              setContinuationNotice(null);
 
               if (pageNumber === 0 && rows.length === 0) {
                 params.api?.showNoRowsOverlay();
@@ -464,6 +469,14 @@ const TraceGrid = React.forwardRef(
                   .catch(() => {});
               }
             } catch (error) {
+              if (isListCursorContinuationLimitError(error)) {
+                // Keep the signed checkpoint and any existing rows. This is a
+                // bounded exact read awaiting an explicit retry, not an empty
+                // result or a user-visible query failure.
+                setContinuationNotice(LIST_CURSOR_CONTINUATION_NOTICE);
+                params.fail();
+                return;
+              }
               if (
                 cursorPagination.current.canRecoverFromContinuationError(
                   pageNumber,
@@ -693,6 +706,22 @@ const TraceGrid = React.forwardRef(
             }}
           >
             {readMessage}
+          </Box>
+        )}
+        {continuationNotice && (
+          <Box
+            role="status"
+            sx={{
+              px: 1.5,
+              py: 0.75,
+              fontSize: 12,
+              color: "text.secondary",
+              bgcolor: "action.hover",
+              borderBottom: "1px solid",
+              borderColor: "divider",
+            }}
+          >
+            {continuationNotice}
           </Box>
         )}
         <AgGridReact

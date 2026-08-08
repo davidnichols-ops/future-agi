@@ -50,6 +50,8 @@ import {
 } from "src/utils/queryReadState";
 import {
   createListCursorPagination,
+  isListCursorContinuationLimitError,
+  LIST_CURSOR_CONTINUATION_NOTICE,
   loadExactListPage,
   resumePendingListPage,
 } from "./listCursorPagination";
@@ -227,6 +229,7 @@ const SpanGrid = React.forwardRef(
     const [readState, setReadState] = useState("complete");
     const readStateRef = useRef("complete");
     const readMessage = getQueryReadMessage(readState);
+    const [continuationNotice, setContinuationNotice] = useState(null);
     const [gridLoading, setGridLoading] = useState(enabled);
     const firstPageRequestRef = useRef(0);
     const preserveRowsDuringNextRefreshRef = useRef(false);
@@ -456,6 +459,7 @@ const SpanGrid = React.forwardRef(
                 if (!preserveExistingRows) setGridLoading(true);
                 readStateRef.current = "complete";
                 setReadState("complete");
+                setContinuationNotice(null);
               }
 
               const buildParams = (page) =>
@@ -609,6 +613,7 @@ const SpanGrid = React.forwardRef(
                 rowData: rows,
                 rowCount: lastRow,
               });
+              setContinuationNotice(null);
 
               // Prefetch next page so scroll feels instant
               if (exactPage.canPrefetch) {
@@ -624,6 +629,14 @@ const SpanGrid = React.forwardRef(
                   .catch(() => {});
               }
             } catch (error) {
+              if (isListCursorContinuationLimitError(error)) {
+                // Preserve the exact checkpoint and current rows. A deliberate
+                // refresh may continue; do not publish a false empty page or
+                // surface this bounded pause as a query error.
+                setContinuationNotice(LIST_CURSOR_CONTINUATION_NOTICE);
+                params.fail();
+                return;
+              }
               if (
                 cursorPagination.current.canRecoverFromContinuationError(
                   pageNumber,
@@ -788,6 +801,22 @@ const SpanGrid = React.forwardRef(
             }}
           >
             {readMessage}
+          </Box>
+        )}
+        {continuationNotice && (
+          <Box
+            role="status"
+            sx={{
+              px: 1.5,
+              py: 0.75,
+              fontSize: 12,
+              color: "text.secondary",
+              bgcolor: "action.hover",
+              borderBottom: "1px solid",
+              borderColor: "divider",
+            }}
+          >
+            {continuationNotice}
           </Box>
         )}
         <AgGridReact

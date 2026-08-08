@@ -1,7 +1,7 @@
 import React from "react";
 import PropTypes from "prop-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, waitFor } from "src/utils/test-utils";
+import { act, render, screen, waitFor } from "src/utils/test-utils";
 
 const { enqueueSnackbarMock, getMock, gridState, sessionStoreState } =
   vi.hoisted(() => ({
@@ -251,7 +251,7 @@ describe("SessionGrid cursor continuation", () => {
     );
   });
 
-  it("resumes the same visible page after the bounded continuation round", async () => {
+  it("stops automatic retries at the bound and preserves the manual retry cursor", async () => {
     Array.from({ length: 13 }, (_, index) =>
       sessionResponse({
         hasMore: true,
@@ -277,8 +277,14 @@ describe("SessionGrid cursor continuation", () => {
     expect(boundedRound.success).not.toHaveBeenCalled();
     expect(boundedRound.api.showNoRowsOverlay).not.toHaveBeenCalled();
     expect(boundedRound.fail).toHaveBeenCalledTimes(1);
-    expect(boundedRound.api.retryServerSideLoads).toHaveBeenCalledTimes(1);
+    expect(boundedRound.api.retryServerSideLoads).not.toHaveBeenCalled();
+    expect(enqueueSnackbarMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Preparing exact results. Refresh or retry to continue.",
+    );
 
+    // A deliberate retry resumes the retained exact checkpoint. The bounded
+    // automatic read itself never spins or publishes a false empty page.
     const resumedPage = makeParams();
     await getRows(resumedPage);
 
@@ -292,6 +298,7 @@ describe("SessionGrid cursor continuation", () => {
       rowData: [row(99)],
       rowCount: 1,
     });
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
   it("fails instead of looping or displaying a false empty page on a repeated token", async () => {

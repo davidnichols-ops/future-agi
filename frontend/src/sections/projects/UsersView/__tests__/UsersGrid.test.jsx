@@ -266,7 +266,7 @@ describe("UsersGrid deterministic pagination", () => {
     expect(getMock.mock.calls[2][1].params.cursor).toBe("signed-users-page-2");
   });
 
-  it("keeps a bounded sparse continuation on the same visible users page", async () => {
+  it("stops automatic retries at the bound and preserves the manual retry cursor", async () => {
     Array.from({ length: 13 }, (_, index) =>
       usersResponse({
         hasMore: true,
@@ -284,10 +284,17 @@ describe("UsersGrid deterministic pagination", () => {
     expect(boundedRound.success).not.toHaveBeenCalled();
     expect(boundedRound.api.showNoRowsOverlay).not.toHaveBeenCalled();
     expect(boundedRound.fail).toHaveBeenCalledTimes(1);
-    expect(boundedRound.api.retryServerSideLoads).toHaveBeenCalledTimes(1);
+    expect(boundedRound.api.retryServerSideLoads).not.toHaveBeenCalled();
     expect(props.setHasData).not.toHaveBeenCalledWith(false);
-    expect(props.setIsLoading).not.toHaveBeenCalledWith(false);
+    expect(props.setIsLoading).toHaveBeenCalledWith(false);
+    expect(props.setSearchState).not.toHaveBeenCalledWith("error");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Preparing exact results. Refresh or retry to continue.",
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 
+    // A deliberate retry resumes the retained exact checkpoint. The bounded
+    // automatic read itself never spins or publishes a false empty page.
     const resumedPage = makeGridParams();
     await readPage(resumedPage);
 
@@ -301,6 +308,7 @@ describe("UsersGrid deterministic pagination", () => {
       rowData: [row(88)],
       rowCount: 1,
     });
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
   it("clears explicit sorts and keeps deterministic cursor pagination", async () => {

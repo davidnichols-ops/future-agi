@@ -7,9 +7,9 @@ import {
   getEmptyListContinuation,
   loadExactListPage,
   listContinuationParams,
+  LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE,
   LIST_CURSOR_MODES,
   resumeEmptyListPage,
-  resumePendingListPage,
 } from "../listCursorPagination";
 
 describe("list cursor pagination", () => {
@@ -400,6 +400,54 @@ describe("list cursor pagination", () => {
     expect(page.isLastPage).toBe(true);
   });
 
+  it("does not publish no-results while exact empty checkpoints still have more", async () => {
+    const pagination = createListCursorPagination();
+    const page = await loadExactPage({
+      pagination,
+      targetRowCount: 1,
+      responses: [
+        exactResponse([], true, "checkpoint-1"),
+        exactResponse([], true, "checkpoint-2"),
+        exactResponse([], true, "checkpoint-3"),
+        exactResponse([{ id: "older-match" }], false, null),
+      ],
+    });
+
+    expect(page.rows).toEqual([{ id: "older-match" }]);
+    expect(page.pending).toBe(false);
+    expect(page.isLastPage).toBe(true);
+  });
+
+  it("does not write a stale response cursor into a reset query generation", async () => {
+    const pagination = createListCursorPagination();
+    const requestGeneration = pagination.generation();
+    const page = await loadExactListPage({
+      pagination,
+      pageNumber: 0,
+      targetRowCount: 1,
+      loadResponse: async () => {
+        pagination.reset();
+        return exactResponse([{ id: "stale-row" }], true, "stale-cursor");
+      },
+      nextResponse: async () => {
+        throw new Error("A stale request must not continue");
+      },
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      rowIdentity: (row) => row.id,
+      isCurrent: () => pagination.isCurrent(requestGeneration),
+    });
+
+    expect(page.stale).toBe(true);
+    expect(page.rows).toEqual([]);
+    expect(pagination.mode()).toBe(LIST_CURSOR_MODES.UNKNOWN);
+    expect(pagination.requestParams(0, { page_size: 1 })).toEqual({
+      page_size: 1,
+      cursor_mode: true,
+      page_number: 0,
+    });
+  });
+
   it("carries overflow into the next visible page without a skip", async () => {
     const pagination = createListCursorPagination();
     const firstPage = await loadExactPage({
@@ -512,39 +560,67 @@ describe("list cursor pagination", () => {
     expect(page.rows).toEqual([{ id: 1 }, { id: 2 }]);
   });
 
-  it("resumes an accumulated short page after the local hop bound", async () => {
+  it("fails closed at the continuation hop bound instead of auto-looping", async () => {
     const pagination = createListCursorPagination();
-    const pendingPage = await loadExactPage({
-      pagination,
-      targetRowCount: 3,
-      maxContinuations: 1,
-      responses: [
-        exactResponse([{ id: 1 }], true, "after-1"),
-        exactResponse([{ id: 2 }], true, "after-2"),
-      ],
-    });
-    expect(pendingPage.pending).toBe(true);
+    let limitError;
+    try {
+      await loadExactPage({
+        pagination,
+        targetRowCount: 3,
+        maxContinuations: 1,
+        responses: [
+          exactResponse([{ id: 1 }], true, "after-1"),
+          exactResponse([{ id: 2 }], true, "after-2"),
+        ],
+      });
+    } catch (error) {
+      limitError = error;
+    }
+
+    expect(limitError).toBeInstanceOf(Error);
+    expect(limitError.code).toBe(LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE);
+    // The exact checkpoint is retained, but this request does not schedule an
+    // unbounded automatic retry and never publishes the two-row partial page.
     expect(pagination.requestParams(0, { page_size: 3 }).cursor).toBe(
       "after-2",
     );
+  });
 
-    const resume = vi.fn();
-    expect(
-      resumePendingListPage({
-        page: pendingPage,
-        resume,
-        schedule: (callback) => callback(),
-      }),
-    ).toBe(true);
-    expect(resume).toHaveBeenCalledTimes(1);
+  it("fails closed at the continuation deadline instead of auto-looping", async () => {
+    const pagination = createListCursorPagination();
+    let elapsedMs = 0;
+    let responseIndex = 0;
+    const responses = [
+      exactResponse([], true, "after-empty"),
+      exactResponse([{ id: 1 }], true, "after-1"),
+    ];
+    let limitError;
 
-    const completedPage = await loadExactPage({
-      pagination,
-      targetRowCount: 3,
-      responses: [exactResponse([{ id: 3 }], false, null)],
-    });
-    expect(completedPage.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
-    expect(completedPage.isLastPage).toBe(true);
+    try {
+      await loadExactListPage({
+        pagination,
+        pageNumber: 0,
+        targetRowCount: 2,
+        maxElapsedMs: 50,
+        now: () => elapsedMs,
+        loadResponse: async () => responses[responseIndex++],
+        nextResponse: async () => {
+          elapsedMs = 75;
+          return responses[responseIndex++];
+        },
+        rowsFromResponse: (response) => response.rows,
+        metadataFromResponse: (response) => response.metadata,
+        rowIdentity: (row) => row.id,
+      });
+    } catch (error) {
+      limitError = error;
+    }
+
+    expect(limitError).toBeInstanceOf(Error);
+    expect(limitError.code).toBe(LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE);
+    expect(pagination.requestParams(0, { page_size: 2 }).cursor).toBe(
+      "after-1",
+    );
   });
 
   it("fails closed when a non-empty continuation repeats its cursor", async () => {
