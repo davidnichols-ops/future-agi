@@ -111,7 +111,7 @@ def test_agent_graph_cache_identity_invalidates_retired_path_payloads(monkeypatc
     assert identity == {
         "project_id": PROJECT_ID,
         "filters": [FINAL_STATUS_FILTER],
-        "payload_version": 3,
+        "payload_version": 4,
     }
 
 
@@ -176,7 +176,7 @@ def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
 
 
 @pytest.mark.unit
-def test_agent_graph_formatter_separates_hierarchy_and_chronological_path():
+def test_agent_graph_formatter_projects_recorded_parent_edge_to_both_views():
     builder = AgentGraphQueryBuilderV2(project_id=PROJECT_ID, filters=[])
     payload = builder.format_result(
         [
@@ -208,15 +208,15 @@ def test_agent_graph_formatter_separates_hierarchy_and_chronological_path():
             },
             {
                 "row_kind": "path",
-                "source_node": "lookup",
-                "source_type": "tool",
-                "target_node": "answer",
-                "target_type": "llm",
+                "source_node": "agent",
+                "source_type": "agent",
+                "target_node": "lookup",
+                "target_type": "tool",
                 "item_count": 2,
-                "avg_latency_ms": 10,
-                "total_tokens": 8,
-                "total_cost": 0.25,
-                "error_count": 1,
+                "avg_latency_ms": 5,
+                "total_tokens": 0,
+                "total_cost": 0,
+                "error_count": 0,
                 "trace_count": 2,
             },
         ],
@@ -238,9 +238,76 @@ def test_agent_graph_formatter_separates_hierarchy_and_chronological_path():
     ]
     assert payload["edges"][0]["source"] == "agent:agent"
     assert payload["edges"][0]["target"] == "tool:lookup"
-    assert payload["path_edges"][0]["source"] == "tool:lookup"
-    assert payload["path_edges"][0]["target"] == "llm:answer"
+    assert payload["path_edges"] == payload["edges"]
     assert payload["graph_collapsed"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "recorded_parent_edges",
+    [
+        pytest.param(
+            [
+                ("chain:rag-pipeline", "chain:query-enhancement"),
+                ("chain:rag-pipeline", "retriever:retrieval"),
+                ("chain:rag-pipeline", "reranker:reranking"),
+                ("chain:rag-pipeline", "chain:generation"),
+                ("chain:generation", "llm:GenerateContent"),
+                ("chain:rag-pipeline", "evaluator:evaluations"),
+            ],
+            id="rag-pipeline",
+        ),
+        pytest.param(
+            [
+                ("agent:invoke_agent weather-agent", "llm:chat gemini-2.5-flash"),
+                (
+                    "llm:chat gemini-2.5-flash",
+                    "unknown:model_step weather-agent",
+                ),
+                (
+                    "unknown:model_step weather-agent",
+                    "unknown:model_inference weather-agent",
+                ),
+                (
+                    "unknown:model_step weather-agent",
+                    "tool:execute_tool weatherTool",
+                ),
+            ],
+            id="weather-agent",
+        ),
+    ],
+)
+def test_agent_graph_real_shapes_never_invent_sibling_chains(recorded_parent_edges):
+    builder = AgentGraphQueryBuilderV2(project_id=PROJECT_ID, filters=[])
+
+    rows = []
+    for source, target in recorded_parent_edges:
+        source_type, source_name = source.split(":", 1)
+        target_type, target_name = target.split(":", 1)
+        common = {
+            "source_node": source_name,
+            "source_type": source_type,
+            "target_node": target_name,
+            "target_type": target_type,
+            "item_count": 40,
+            "avg_latency_ms": 10,
+            "total_tokens": 0,
+            "total_cost": 0,
+            "error_count": 0,
+            "trace_count": 40,
+        }
+        rows.extend(
+            [
+                {**common, "row_kind": "hierarchy"},
+                {**common, "row_kind": "path"},
+            ]
+        )
+
+    payload = builder.format_result(rows, [])
+
+    expected = set(recorded_parent_edges)
+    assert {(edge["source"], edge["target"]) for edge in payload["edges"]} == expected
+    assert payload["path_edges"] == payload["edges"]
 
 
 @pytest.mark.unit

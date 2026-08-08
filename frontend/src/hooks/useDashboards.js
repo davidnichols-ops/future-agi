@@ -34,6 +34,12 @@ const FILTER_VALUE_TERMINAL_BROWSE_STATUSES = new Set([
 ]);
 const FILTER_VALUE_FOLLOWED_CURSORS_KEY = "__filterValueFollowedCursors";
 
+// The shared Axios instance intentionally has no global timeout. Distinct
+// value browsing is interactive and the API has a 30-second read ceiling, so
+// release the picker shortly after that boundary instead of leaving Load more
+// in a permanent spinner when a proxy/request stalls.
+export const FILTER_VALUE_REQUEST_TIMEOUT_MS = 35_000;
+
 const getFilterValueIdentity = (option) => {
   const value =
     option && typeof option === "object" && "value" in option
@@ -337,6 +343,7 @@ export function useDashboardFilterValues({
         axios
           .get(endpoints.dashboard.filterValues, {
             signal,
+            timeout: FILTER_VALUE_REQUEST_TIMEOUT_MS,
             params: {
               metric_name: metricName,
               metric_type: metricType,

@@ -127,7 +127,12 @@ export function useExactTraceAttributeProperties({
     retainedQuery.data,
   );
   const exactCursorStopped = isAttributeKeyCursorChainStopped(exactQuery.data);
-  const pages = [...retainedPages, ...exactPages];
+  // During an exact lookup, prefer its typed row over a duplicate from an
+  // earlier generic catalog page. The exact row may be the only one carrying
+  // authoritative mixed/structured type metadata needed by filter controls.
+  const pages = debouncedSearch
+    ? [...exactPages, ...retainedPages]
+    : retainedPages;
   const seenKeys = new Set();
   const properties = pages.flatMap((page) =>
     (Array.isArray(page?.result) ? page.result : []).flatMap(
@@ -173,24 +178,39 @@ export function useExactTraceAttributeProperties({
           : "complete";
   const retainedLastPage = retainedPages.at(-1);
   const exactLastPage = exactPages.at(-1);
+  const exactSearchMatched = Boolean(
+    debouncedSearch &&
+      exactPages.some(
+        (page) =>
+          page?.exact_match === true ||
+          (Array.isArray(page?.result) &&
+            page.result.some(({ key }) => key === debouncedSearch)),
+      ),
+  );
   const browseStatus = debouncedSearch
     ? exactLastPage?.browse_status || retainedLastPage?.browse_status
     : retainedLastPage?.browse_status;
   const retainedHasNextPage =
     retainedQuery.hasNextPage || retainedCursorStopped;
+  const shouldAdvanceExact = Boolean(debouncedSearch) && !exactSearchMatched;
   const exactHasNextPage =
-    Boolean(debouncedSearch) && (exactQuery.hasNextPage || exactCursorStopped);
-  const hasNextPage = exactHasNextPage || retainedHasNextPage;
+    shouldAdvanceExact && (exactQuery.hasNextPage || exactCursorStopped);
+  // The base cursor remains cached for browse/partial-search continuation, but
+  // a verified exact key is terminal for the current search. Advancing the
+  // unrelated base catalog after that point produced a no-op Load more loop.
+  const shouldAdvanceRetained = !exactSearchMatched;
+  const hasNextPage =
+    exactHasNextPage || (shouldAdvanceRetained && retainedHasNextPage);
   const fetchNextPage = (...args) => {
     const reads = [];
-    if (retainedCursorStopped) {
+    if (shouldAdvanceRetained && retainedCursorStopped) {
       reads.push(retainedQuery.refetch(...args));
-    } else if (retainedQuery.hasNextPage) {
+    } else if (shouldAdvanceRetained && retainedQuery.hasNextPage) {
       reads.push(retainedQuery.fetchNextPage(...args));
     }
-    if (Boolean(debouncedSearch) && exactCursorStopped) {
+    if (shouldAdvanceExact && exactCursorStopped) {
       reads.push(exactQuery.refetch(...args));
-    } else if (Boolean(debouncedSearch) && exactQuery.hasNextPage) {
+    } else if (shouldAdvanceExact && exactQuery.hasNextPage) {
       reads.push(exactQuery.fetchNextPage(...args));
     }
     return reads.length === 1 ? reads[0] : Promise.allSettled(reads);
@@ -207,6 +227,10 @@ export function useExactTraceAttributeProperties({
     browseStatus,
     browseLimit: retainedLastPage?.browse_limit,
     browseLimitReached: browseStatus === "limit_reached",
+    // This is intentionally raw-key/backend identity, not the picker's fuzzy
+    // punctuation-normalized match. Consumers may use it to terminate search
+    // pagination without conflating keys such as `trace_id` and `trace.id`.
+    exactSearchMatched,
     debouncedSearch,
     isFetching:
       retainedQuery.isFetching ||
@@ -219,21 +243,23 @@ export function useExactTraceAttributeProperties({
       retainedQuery.isSuccess && (!debouncedSearch || exactQuery.isSuccess),
     error: exactQuery.error || retainedQuery.error,
     hasNextPage,
-    // One scroll advances both independent cursors. A long-running/absent
-    // exact lookup therefore cannot starve discovery of older catalog keys
-    // that still match the user's partial text locally.
+    // One scroll advances both independent cursors until an exact key is
+    // verified. A long-running/absent exact lookup therefore cannot starve
+    // discovery of older catalog keys that match partial text locally.
     fetchNextPage,
     refetch,
     isFetchingNextPage:
-      retainedQuery.isFetchingNextPage ||
-      exactQuery.isFetchingNextPage ||
-      (retainedCursorStopped && retainedQuery.isFetching) ||
-      (exactCursorStopped && exactQuery.isFetching),
+      (shouldAdvanceRetained && retainedQuery.isFetchingNextPage) ||
+      (shouldAdvanceExact && exactQuery.isFetchingNextPage) ||
+      (shouldAdvanceRetained &&
+        retainedCursorStopped &&
+        retainedQuery.isFetching) ||
+      (shouldAdvanceExact && exactCursorStopped && exactQuery.isFetching),
     isFetchNextPageError:
-      retainedQuery.isFetchNextPageError ||
-      exactQuery.isFetchNextPageError ||
-      retainedCursorStopped ||
-      exactCursorStopped,
+      (shouldAdvanceRetained && retainedQuery.isFetchNextPageError) ||
+      (shouldAdvanceExact && exactQuery.isFetchNextPageError) ||
+      (shouldAdvanceRetained && retainedCursorStopped) ||
+      (shouldAdvanceExact && exactCursorStopped),
     // Consumers use this completion revision to unlock exactly one new
     // scroll-to-load action even when a valid continuation page contains no
     // previously unseen keys and therefore leaves `data.length` unchanged.

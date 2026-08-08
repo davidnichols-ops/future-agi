@@ -47,6 +47,7 @@ import {
   useWidgetQuery,
   usePreviewQuery,
   useDashboardFilterValues,
+  FILTER_VALUE_REQUEST_TIMEOUT_MS,
 } from "../useDashboards";
 
 const DASHBOARD_LIST_KEY = ["dashboards", "list"];
@@ -232,6 +233,7 @@ describe("useDashboardFilterValues bounded-read state", () => {
       "/tracer/dashboard/filter_values/",
       expect.objectContaining({
         signal: expect.any(AbortSignal),
+        timeout: FILTER_VALUE_REQUEST_TIMEOUT_MS,
         params: expect.objectContaining({
           metric_name: "final_status",
           project_ids: "project-synthetic",

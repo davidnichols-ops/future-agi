@@ -161,9 +161,10 @@ class UserListQueryBuilder(BaseQueryBuilder):
         This query is only a candidate selector.  The caller replays the
         latest physical spans for the returned ids before publishing a row, so
         a stale/tombstoned dimension entry can create extra bounded work but
-        can never become a false list result.  Ordering by the immutable
-        ``first_seen``/UUID tuple gives continuation pages a total order without
-        scanning or grouping the tenant's full span window.
+        can never become a false list result. Ordering by immutable
+        ``first_seen`` plus the lexicographic String form of ``end_user_id``
+        gives continuation pages a total order without scanning or grouping the
+        tenant's full span window.
         """
 
         if limit <= 0:
@@ -197,7 +198,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
                 first_seen < %(before_first_seen)s
                 OR (
                     first_seen = %(before_first_seen)s
-                    AND toString(end_user_id) < %(before_end_user_id)s
+                    AND toString(eu.end_user_id) < %(before_end_user_id)s
                 )
             )
             """
@@ -219,7 +220,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
           {empty_scope_filter}
           {search_filter}
           {continuation_filter}
-        ORDER BY first_seen DESC, eu.end_user_id DESC
+        ORDER BY first_seen DESC, toString(eu.end_user_id) DESC
         LIMIT %(dimension_limit)s
         """
         return query, params

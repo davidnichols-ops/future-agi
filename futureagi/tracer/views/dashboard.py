@@ -6,7 +6,7 @@ import structlog
 from django.conf import settings
 from django.http import Http404
 from django.utils import timezone
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.viewsets import ModelViewSet
@@ -372,28 +372,90 @@ def _canonicalize_persisted_dashboard_filter_for_read(filter_item):
 
 
 def _canonicalize_persisted_dashboard_query_filters_for_read(query_config):
-    """Canonicalize saved filters in memory; never mutate the stored JSON."""
+    """Canonicalize legacy read filters in memory; never mutate caller JSON."""
 
     if not isinstance(query_config, dict):
         return query_config
     restored = dict(query_config)
-    restored["filters"] = [
-        _canonicalize_persisted_dashboard_filter_for_read(filter_item)
-        for filter_item in query_config.get("filters", [])
-    ]
-    metrics = []
-    for metric in query_config.get("metrics", []):
-        if not isinstance(metric, dict):
-            metrics.append(metric)
-            continue
-        metric_copy = dict(metric)
-        metric_copy["filters"] = [
+    filters = query_config.get("filters")
+    if isinstance(filters, list):
+        restored["filters"] = [
             _canonicalize_persisted_dashboard_filter_for_read(filter_item)
-            for filter_item in metric.get("filters", [])
+            for filter_item in filters
         ]
-        metrics.append(metric_copy)
-    restored["metrics"] = metrics
+
+    metrics = query_config.get("metrics")
+    if isinstance(metrics, list):
+        restored_metrics = []
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                restored_metrics.append(metric)
+                continue
+            metric_copy = dict(metric)
+            metric_filters = metric.get("filters")
+            if isinstance(metric_filters, list):
+                metric_copy["filters"] = [
+                    _canonicalize_persisted_dashboard_filter_for_read(filter_item)
+                    for filter_item in metric_filters
+                ]
+            restored_metrics.append(metric_copy)
+        restored["metrics"] = restored_metrics
     return restored
+
+
+class DashboardReadQuerySerializer(DashboardQuerySerializer):
+    """Accept historical filter storage shapes on query/read endpoints only.
+
+    Dashboard writes continue to use the strict canonical serializer.  The
+    read-only query endpoint, however, must be able to replay a saved widget's
+    historical flattened metric filters when the frontend submits that same
+    config as an ad-hoc query.
+    """
+
+    class Meta(DashboardQuerySerializer.Meta):
+        # This adapter changes runtime read compatibility only. Keep the public
+        # request-body component identical to the existing DashboardQuery
+        # contract so generated clients do not see a new schema/ref.
+        ref_name = "DashboardQuery"
+
+    def to_internal_value(self, data):
+        # Compatibility canonicalization must never iterate or silently coerce
+        # malformed collection values. Although FilterListField's parser can
+        # decode an optional empty query-param value, DRF rejects explicit JSON
+        # ``null`` before that parser for this body field. Preserve the existing
+        # DashboardQuery request contract and reject every non-list shape with a
+        # bounded validation error before the read adapter touches it.
+        if isinstance(data, dict):
+            if "filters" in data and not isinstance(data["filters"], list):
+                raise serializers.ValidationError(
+                    {"filters": ["Expected a list of filter objects."]}
+                )
+
+            metrics = data.get("metrics")
+            if "metrics" in data and not isinstance(metrics, list):
+                raise serializers.ValidationError(
+                    {"metrics": ["Expected a list of metric objects."]}
+                )
+
+            if isinstance(metrics, list):
+                metric_errors = [{} for _metric in metrics]
+                has_metric_filter_error = False
+                for index, metric in enumerate(metrics):
+                    if (
+                        isinstance(metric, dict)
+                        and "filters" in metric
+                        and not isinstance(metric["filters"], list)
+                    ):
+                        metric_errors[index] = {
+                            "filters": ["Expected a list of filter objects."]
+                        }
+                        has_metric_filter_error = True
+                if has_metric_filter_error:
+                    raise serializers.ValidationError({"metrics": metric_errors})
+
+        return super().to_internal_value(
+            _canonicalize_persisted_dashboard_query_filters_for_read(data)
+        )
 
 
 def _dashboard_filter_to_internal(filter_item):
@@ -726,7 +788,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
     # ------------------------------------------------------------------
 
     @validated_request(
-        request_serializer=DashboardQuerySerializer,
+        request_serializer=DashboardReadQuerySerializer,
         responses={
             200: DashboardQueryApiResponseSerializer,
             400: ApiErrorResponseSerializer,

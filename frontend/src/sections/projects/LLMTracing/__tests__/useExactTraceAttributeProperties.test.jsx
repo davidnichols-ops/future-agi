@@ -381,7 +381,7 @@ describe("useExactTraceAttributeProperties", () => {
     );
   });
 
-  it("preserves the loaded catalog while continuing supplemental exact search", async () => {
+  it("stops unrelated catalog continuation once supplemental exact search succeeds", async () => {
     mocks.get.mockImplementation((_url, { params }) => {
       if (!params.q) {
         if (params.cursor === "catalog-page-2") {
@@ -451,23 +451,19 @@ describe("useExactTraceAttributeProperties", () => {
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data.map((item) => item.id)).toEqual([
-      "final_category",
       "final_status",
+      "final_category",
     ]);
-    expect(result.current.hasNextPage).toBe(true);
+    expect(result.current.hasNextPage).toBe(false);
+    const completedRequestCount = mocks.get.mock.calls.length;
     await act(async () => result.current.fetchNextPage());
-    await waitFor(() => expect(result.current.data).toHaveLength(3));
+    expect(mocks.get).toHaveBeenCalledTimes(completedRequestCount);
 
-    expect(mocks.get).toHaveBeenCalledWith(
-      "/api/traces/span-attribute-keys/",
-      expect.objectContaining({
-        params: {
-          project_id: "project-synthetic",
-          page_size: 10,
-          cursor: "catalog-page-2",
-        },
-      }),
-    );
+    expect(
+      mocks.get.mock.calls.some(
+        ([, options]) => options.params.cursor === "catalog-page-2",
+      ),
+    ).toBe(false);
     expect(mocks.get).toHaveBeenCalledWith(
       "/api/traces/span-attribute-keys/",
       expect.objectContaining({
@@ -499,13 +495,102 @@ describe("useExactTraceAttributeProperties", () => {
       }),
     );
     expect(result.current.data.map((item) => item.id)).toEqual([
-      "final_category",
-      "final_archive",
       "final_status",
+      "final_category",
     ]);
-    expect(result.current.data[2]).toEqual(
+    expect(result.current.data[0]).toEqual(
       expect.objectContaining({ id: "final_status", type: "string" }),
     );
+    expect(result.current.exactSearchMatched).toBe(true);
+    expect(result.current.hasNextPage).toBe(false);
+  });
+
+  it("does not certify a punctuation-normalized but distinct raw key", async () => {
+    mocks.get.mockImplementation((_url, { params }) =>
+      Promise.resolve({
+        data: params.q
+          ? {
+              result: [{ key: "trace_id", type: "string", count: 1 }],
+              lookup_mode: "exact",
+              exact_match: false,
+              browse_status: "exhausted",
+              has_more: false,
+              next_cursor: null,
+            }
+          : {
+              result: [{ key: "trace_id", type: "string", count: 1 }],
+              browse_mode: "retained_catalog",
+              browse_status: "continuation",
+              has_more: true,
+              next_cursor: "catalog-page-2",
+            },
+      }),
+    );
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "trace.id",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data.map(({ id }) => id)).toEqual(["trace_id"]);
+    expect(result.current.exactSearchMatched).toBe(false);
+    expect(result.current.hasNextPage).toBe(true);
+  });
+
+  it("prefers authoritative exact type metadata over the retained duplicate", async () => {
+    mocks.get.mockImplementation((_url, { params }) =>
+      Promise.resolve({
+        data: params.q
+          ? {
+              result: [
+                {
+                  key: "customer_context",
+                  type: "map",
+                  types: ["map"],
+                  types_exact: true,
+                },
+              ],
+              lookup_mode: "exact",
+              exact_match: true,
+              browse_status: "exhausted",
+              has_more: false,
+              next_cursor: null,
+            }
+          : {
+              result: [{ key: "customer_context", type: "string", count: 1 }],
+              browse_mode: "retained_catalog",
+              browse_status: "continuation",
+              has_more: true,
+              next_cursor: "catalog-page-2",
+            },
+      }),
+    );
+
+    const { result } = renderHook(
+      () =>
+        useExactTraceAttributeProperties({
+          projectId: "project-synthetic",
+          search: "customer_context",
+          source: "traces",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual([
+      expect.objectContaining({
+        id: "customer_context",
+        type: "map",
+        attributeTypes: ["map"],
+        attributeTypesExact: true,
+      }),
+    ]);
     expect(result.current.hasNextPage).toBe(false);
   });
 

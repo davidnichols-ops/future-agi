@@ -13,6 +13,7 @@ from tracer.services.clickhouse.v2.query_builders.dashboard import (
     DashboardQueryBuilderV2,
 )
 from tracer.views.dashboard import (
+    DashboardReadQuerySerializer,
     DashboardViewSet,
     DashboardWidgetViewSet,
     _canonicalize_persisted_dashboard_query_filters_for_read,
@@ -174,6 +175,120 @@ def _canonical_numeric_operator_query(project_id):
         }
     ]
     return query
+
+
+def _malformed_dashboard_collection_query(project_id, location, malformed_value):
+    query = _trace_query(project_id)
+    if location == "filters":
+        query["filters"] = malformed_value
+    elif location == "metrics":
+        query["metrics"] = malformed_value
+    else:
+        query["metrics"][0]["filters"] = malformed_value
+    return query
+
+
+_MALFORMED_DASHBOARD_COLLECTION_VALUES = (
+    None,
+    {"private-internal-value": "must-not-leak"},
+    "private-internal-value",
+    17,
+)
+
+
+@pytest.mark.parametrize(
+    "location",
+    ("filters", "metrics", "metric_filters"),
+)
+@pytest.mark.parametrize(
+    "malformed_value",
+    _MALFORMED_DASHBOARD_COLLECTION_VALUES,
+    ids=("null", "object", "string", "number"),
+)
+def test_dashboard_read_canonicalizer_preserves_malformed_collection_for_validation(
+    location,
+    malformed_value,
+):
+    query = _malformed_dashboard_collection_query(
+        uuid.uuid4(), location, malformed_value
+    )
+    before = json.dumps(query, sort_keys=True)
+
+    restored = _canonicalize_persisted_dashboard_query_filters_for_read(query)
+
+    assert json.dumps(query, sort_keys=True) == before
+    if location == "filters":
+        assert restored["filters"] == malformed_value
+    elif location == "metrics":
+        assert restored["metrics"] == malformed_value
+    else:
+        assert restored["metrics"][0]["filters"] == malformed_value
+
+
+@pytest.mark.parametrize(
+    "location",
+    ("filters", "metrics", "metric_filters"),
+)
+@pytest.mark.parametrize(
+    "malformed_value",
+    _MALFORMED_DASHBOARD_COLLECTION_VALUES,
+    ids=("null", "object", "string", "number"),
+)
+def test_dashboard_read_serializer_rejects_malformed_collections_without_exception(
+    location,
+    malformed_value,
+):
+    query = _malformed_dashboard_collection_query(
+        uuid.uuid4(), location, malformed_value
+    )
+
+    serializer = DashboardReadQuerySerializer(data=query)
+
+    assert not serializer.is_valid()
+    errors = json.dumps(serializer.errors).lower()
+    assert "expected a list" in errors
+    assert "private-internal-value" not in errors
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "location",
+    ("filters", "metrics", "metric_filters"),
+)
+@pytest.mark.parametrize(
+    "malformed_value",
+    _MALFORMED_DASHBOARD_COLLECTION_VALUES,
+    ids=("null", "object", "string", "number"),
+)
+def test_dashboard_query_rejects_malformed_collections_as_sanitized_400(
+    auth_client,
+    observe_project,
+    location,
+    malformed_value,
+):
+    query = _malformed_dashboard_collection_query(
+        observe_project.id, location, malformed_value
+    )
+
+    with patch(
+        "tracer.views.dashboard.read_or_schedule_exact_snapshot",
+        side_effect=AssertionError("validation must stop before dashboard execution"),
+    ):
+        response = auth_client.post(
+            "/tracer/dashboard/query/",
+            query,
+            format="json",
+        )
+
+    assert response.status_code == 400
+    payload = json.dumps(response.json()).lower()
+    assert response.json()["type"] == "validation_error"
+    assert response.json()["code"] == "invalid"
+    assert "expected a list" in payload
+    assert "private-internal-value" not in payload
+    assert "typeerror" not in payload
+    assert "traceback" not in payload
+    assert "internal server" not in payload
 
 
 @pytest.mark.parametrize(

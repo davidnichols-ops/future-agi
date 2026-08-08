@@ -13,6 +13,7 @@ from clickhouse_driver import Client
 
 from conftest import _require_safe_ch25_test_target
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
+from tracer.services.clickhouse.query_builders.user_list import UserListQueryBuilder
 from tracer.services.clickhouse.v2.query_builders.agent_graph import (
     AgentGraphQueryBuilderV2,
 )
@@ -162,6 +163,78 @@ def _execute(ch_client, query, params):
     )
     names = [name for name, _type in columns]
     return [dict(zip(names, row, strict=True)) for row in rows]
+
+
+def test_user_dimension_cursor_keeps_string_tie_order_across_pages(ch_client):
+    """ORDER BY and keyset continuation use the same public String domain."""
+
+    table = f"_test_user_dimension_cursor_{uuid.uuid4().hex[:8]}"
+    organization_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
+    first_seen = datetime(2026, 8, 1, 10, 0, tzinfo=UTC)
+    end_user_ids = [str(uuid.UUID(int=index)) for index in range(1, 42)]
+    ch_client.execute(
+        f"""
+        CREATE TABLE {table} (
+            project_id UUID,
+            end_user_id UUID,
+            organization_id UUID,
+            user_id String,
+            user_id_type String,
+            user_id_hash String,
+            first_seen DateTime64(6, 'UTC'),
+            is_deleted UInt8,
+            version UInt64
+        ) ENGINE = ReplacingMergeTree(version)
+        ORDER BY (organization_id, project_id, end_user_id)
+        """
+    )
+    try:
+        ch_client.execute(
+            f"INSERT INTO {table} VALUES",
+            [
+                (
+                    project_id,
+                    end_user_id,
+                    organization_id,
+                    f"guest-{index:03d}",
+                    "custom",
+                    "",
+                    first_seen,
+                    0,
+                    1,
+                )
+                for index, end_user_id in enumerate(end_user_ids)
+            ],
+        )
+
+        actual: list[str] = []
+        before_first_seen = None
+        before_end_user_id = None
+        while True:
+            builder = UserListQueryBuilder(
+                organization_id=organization_id,
+                project_ids=[project_id],
+            )
+            query, params = builder.build_dimension_candidate_query(
+                limit=7,
+                before_first_seen=before_first_seen,
+                before_end_user_id=before_end_user_id,
+            )
+            query = query.replace(
+                "FROM end_users AS eu FINAL", f"FROM {table} AS eu FINAL"
+            )
+            page = _execute(ch_client, query, params)
+            if not page:
+                break
+            actual.extend(str(row["end_user_id"]) for row in page)
+            before_first_seen = page[-1]["first_seen"]
+            before_end_user_id = str(page[-1]["end_user_id"])
+
+        assert actual == sorted(end_user_ids, reverse=True)
+        assert len(actual) == len(set(actual)) == len(end_user_ids)
+    finally:
+        ch_client.execute(f"DROP TABLE {table}")
 
 
 def test_exact_system_graph_statement_reads_current_latest_state(ch_client):

@@ -33,6 +33,8 @@ from tracer.services.clickhouse.attribute_cursor_state import (
 from tracer.services.clickhouse.attribute_reads import (
     _LATEST_CARDINALITY_SQL,
     _STRATIFIED_CANDIDATE_SQL,
+    ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT,
+    ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT,
     ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT,
     ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES,
     ATTRIBUTE_KEY_CURSOR_MAX_TOKEN_BYTES,
@@ -5680,10 +5682,124 @@ def test_span_attribute_key_cursor_exact_search_continues_until_verified_match(
     assert second.browse_status == "exhausted"
 
 
+def test_span_attribute_key_cursor_exact_json_continuation_is_bounded_and_unique(
+    monkeypatch,
+):
+    stale_identity = (
+        PROJECT_A,
+        "trace-json-stale",
+        "span-z-json-stale",
+        NOW - timedelta(minutes=1),
+    )
+    match_identity = (
+        PROJECT_A,
+        "trace-json-match",
+        "span-a-json-match",
+        stale_identity[3],
+    )
+    ordered_candidates = []
+    ordered_calls = []
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    def candidates(_projects, segment, **kwargs):
+        if not kwargs["ordered"]:
+            return (), False, {}
+        ordered_calls.append((segment, kwargs))
+        before_identity = kwargs.get("before_identity")
+        identity = stale_identity if before_identity is None else match_identity
+        ordered_candidates.append(identity)
+        return (identity,), before_identity is None, {}
+
+    def verify(*_args, **kwargs):
+        rows = []
+        for identity in kwargs.get("candidate_ids", ()):
+            rows.append(
+                {
+                    "project_id": PROJECT_A,
+                    "trace_id": identity[1],
+                    "id": identity[2],
+                    "start_time": identity[3],
+                    "is_deleted": 0,
+                    "string_keys": [],
+                    "number_keys": [],
+                    "boolean_keys": [],
+                    # The first physical candidate represents a stale version:
+                    # exact candidate discovery may admit it, but latest-state
+                    # replay must not publish it or lose the following match.
+                    "attributes_extra": (
+                        "{}"
+                        if identity == stale_identity
+                        else '{"json_only":{"nested":"value"}}'
+                    ),
+                }
+            )
+        return rows
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(selector, "_verify_latest", verify)
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.attribute_reads."
+        "ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES",
+        2,
+    )
+
+    first = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        exact_key="json_only",
+    )
+
+    assert first.rows == ()
+    assert first.has_more is True
+    assert first.next_before_identity == stale_identity
+
+    second = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(days=365),
+        window_end=NOW,
+        segment_end=first.next_segment_end,
+        segment_start=first.next_segment_start,
+        before_identity=first.next_before_identity,
+        resume_identity=first.next_resume_identity,
+        resume_key_offset=first.next_resume_key_offset,
+        seen_key_digests=first.seen_key_digests,
+        exact_key="json_only",
+    )
+
+    assert [row.key for row in second.rows] == ["json_only"]
+    assert second.has_more is False
+    assert second.browse_status == "exhausted"
+    assert ordered_candidates == [stale_identity, match_identity]
+    assert len(set(ordered_candidates)) == len(ordered_candidates)
+    assert all(
+        end - start <= ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+        for (start, end), _kwargs in ordered_calls
+    )
+    assert all(
+        kwargs["attribute_key"] == "json_only"
+        and "JSONHas(attributes_extra, %(attribute_key)s)" in kwargs["predicate"]
+        and "attributes_extra NOT IN" not in kwargs["predicate"]
+        for _segment, kwargs in ordered_calls
+    )
+
+
 def test_span_attribute_key_cursor_exact_search_uses_indexed_typed_probe(
     monkeypatch,
 ):
-    identity = (PROJECT_A, "trace-indexed", "span-indexed", NOW - timedelta(hours=1))
+    identity = (
+        PROJECT_A,
+        "trace-indexed",
+        "span-indexed",
+        NOW - timedelta(minutes=1),
+    )
     candidate_calls = []
     selector = AttributeReadSelector(
         RecordingExecutor(),
@@ -5692,8 +5808,8 @@ def test_span_attribute_key_cursor_exact_search_uses_indexed_typed_probe(
         json_attribute_mode="structured",
     )
 
-    def candidates(_projects, _segment, **kwargs):
-        candidate_calls.append(kwargs)
+    def candidates(_projects, segment, **kwargs):
+        candidate_calls.append((segment, kwargs))
         return (identity,), False, {}
 
     monkeypatch.setattr(selector, "_candidate_ids", candidates)
@@ -5725,10 +5841,422 @@ def test_span_attribute_key_cursor_exact_search_uses_indexed_typed_probe(
     assert [row.key for row in page.rows] == ["final_status"]
     assert page.has_more is False
     assert len(candidate_calls) == 1
-    assert candidate_calls[0]["attribute_key"] == "final_status"
-    assert candidate_calls[0]["ordered"] is False
-    assert "indexHint(has(mapKeys(attrs_string)" in candidate_calls[0]["predicate"]
-    assert "candidate_query_settings" not in candidate_calls[0]
+    probe_segment, probe_kwargs = candidate_calls[0]
+    assert probe_segment[1] - probe_segment[0] <= ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+    assert probe_kwargs["attribute_key"] == "final_status"
+    assert probe_kwargs["ordered"] is False
+    assert "indexHint(has(mapKeys(attrs_string)" in probe_kwargs["predicate"]
+    assert "candidate_query_settings" not in probe_kwargs
+
+
+def test_span_attribute_key_cursor_exact_json_binds_key_in_ordered_sql():
+    executor = RecordingExecutor()
+    selector = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(minutes=1),
+        window_end=NOW,
+        exact_key="llm.invocation_parameters",
+    )
+
+    assert page.rows == ()
+    assert page.has_more is False
+    assert len(executor.calls) == 2
+    typed_probe, ordered_fallback = executor.calls
+    assert "indexHint(has(mapKeys(attrs_string)" in typed_probe.sql
+    assert "ORDER BY\n        start_time DESC" in ordered_fallback.sql
+    assert "mapContains(attrs_string, %(attribute_key)s)" in ordered_fallback.sql
+    assert "JSONHas(attributes_extra, %(attribute_key)s)" in ordered_fallback.sql
+    assert "attributes_extra NOT IN" not in ordered_fallback.sql
+    assert ordered_fallback.params["attribute_key"] == "llm.invocation_parameters"
+    assert ordered_fallback.settings["use_skip_indexes"] == 0
+
+
+def test_span_attribute_key_cursor_exact_sparse_year_grows_empty_windows():
+    ordered_segments = []
+    boundary_identity = (
+        PROJECT_A,
+        "trace-boundary",
+        "span-boundary",
+        NOW - ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+    )
+    returned_boundaries = []
+    typed_probe_count = 0
+
+    def respond(call, _call_number):
+        nonlocal typed_probe_count
+        if "segment_start_us" not in call.params:
+            assert returned_boundaries == [boundary_identity]
+            return [
+                {
+                    "project_id": boundary_identity[0],
+                    "trace_id": boundary_identity[1],
+                    "id": boundary_identity[2],
+                    "start_time": boundary_identity[3],
+                    "is_deleted": 0,
+                    "string_present": 0,
+                    "string_value": "",
+                    "number_present": 0,
+                    "number_value": 0,
+                    "boolean_present": 0,
+                    "boolean_value": 0,
+                    "legacy_present": 0,
+                    "legacy_value_raw": "",
+                }
+            ]
+        if "ORDER BY\n        start_time DESC" not in call.sql:
+            typed_probe_count += 1
+            return []
+        segment = (call.params["segment_start"], call.params["segment_end"])
+        ordered_segments.append(segment)
+        assert call.params["attribute_key"] == "missing_json_key"
+        if segment[0] <= boundary_identity[3] < segment[1] and not returned_boundaries:
+            returned_boundaries.append(boundary_identity)
+            return [
+                {
+                    "project_id": boundary_identity[0],
+                    "trace_id": boundary_identity[1],
+                    "id": boundary_identity[2],
+                    "start_time": boundary_identity[3],
+                }
+            ]
+        return []
+
+    executor = RecordingExecutor(respond)
+    selector = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    window_start = NOW - timedelta(days=365)
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=window_start,
+        window_end=NOW,
+        exact_key="missing_json_key",
+    )
+
+    widths = [end - start for start, end in ordered_segments]
+    assert typed_probe_count == 1
+    assert returned_boundaries == [boundary_identity]
+    assert page.rows == ()
+    assert page.has_more is False
+    assert page.browse_status == "exhausted"
+    assert page.next_segment_end == window_start
+    assert page.metadata.query_count == len(executor.calls)
+    assert page.metadata.query_count == 22
+    assert page.metadata.query_count < ATTRIBUTE_READ_MAX_QUERY_COUNT
+    assert widths[0] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+    # A completely replayed stale/unsupported candidate proves the first
+    # half-open slice empty just like an empty candidate page, so the adjacent
+    # older slice widens and the boundary identity is never revisited.
+    assert widths[1] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT * 2
+    assert max(widths) == ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT
+    assert len(widths) < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
+    assert sum(widths, timedelta()) == timedelta(days=365)
+    assert all(
+        later_end == earlier_start
+        for (earlier_start, _earlier_end), (_later_start, later_end) in zip(
+            ordered_segments,
+            ordered_segments[1:],
+            strict=False,
+        )
+    )
+    assert all(
+        later
+        >= min(
+            earlier * 2,
+            ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT,
+        )
+        or later == widths[-1]
+        for earlier, later in zip(widths, widths[1:], strict=False)
+    )
+
+
+def test_span_attribute_key_cursor_exact_dense_slice_halves_below_five_minutes():
+    identity = (
+        PROJECT_A,
+        "trace-dense-json",
+        "span-dense-json",
+        NOW - timedelta(seconds=10),
+    )
+    attempted_widths = []
+
+    def respond(call, _call_number):
+        if "segment_start_us" in call.params:
+            if "ORDER BY\n        start_time DESC" not in call.sql:
+                return []
+            width = call.params["segment_end"] - call.params["segment_start"]
+            attempted_widths.append(width)
+            if width > ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT:
+                return ReadDeadlineExceeded("dense exact slice exceeded read budget")
+            return [
+                {
+                    "project_id": PROJECT_A,
+                    "trace_id": identity[1],
+                    "id": identity[2],
+                    "start_time": identity[3],
+                }
+            ]
+        return [
+            {
+                "project_id": PROJECT_A,
+                "trace_id": identity[1],
+                "id": identity[2],
+                "start_time": identity[3],
+                "is_deleted": 0,
+                "string_present": 0,
+                "string_value": "",
+                "number_present": 0,
+                "number_value": 0,
+                "boolean_present": 0,
+                "boolean_value": 0,
+                "legacy_present": 1,
+                "legacy_value_raw": '{"nested":"present"}',
+            }
+        ]
+
+    executor = RecordingExecutor(respond)
+    page = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    ).read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(hours=1),
+        window_end=NOW,
+        exact_key="dense_json_key",
+    )
+
+    assert [row.key for row in page.rows] == ["dense_json_key"]
+    assert page.has_more is False
+    assert attempted_widths[0] == ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+    assert attempted_widths[-1] == ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT
+    assert all(
+        later < earlier
+        for earlier, later in zip(attempted_widths, attempted_widths[1:], strict=False)
+    )
+    assert len(executor.calls) <= ATTRIBUTE_READ_MAX_QUERY_COUNT
+
+
+def test_span_attribute_key_cursor_exact_floor_failure_never_loops_with_200():
+    attempted_widths = []
+
+    def respond(call, _call_number):
+        if "segment_start_us" not in call.params:
+            raise AssertionError("candidate failure must not start latest-state replay")
+        if "ORDER BY\n        start_time DESC" not in call.sql:
+            # The independent typed accelerator misses and does not own cursor
+            # progress. Only the key-bound ordered fallback is forced to fail.
+            return []
+        attempted_widths.append(
+            call.params["segment_end"] - call.params["segment_start"]
+        )
+        return ReadDeadlineExceeded("dense exact candidate exceeded read budget")
+
+    selector = AttributeReadSelector(
+        RecordingExecutor(respond),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    with pytest.raises(ReadDeadlineExceeded, match="no physical progress"):
+        selector.read_key_cursor_page(
+            [PROJECT_A],
+            page_size=10,
+            window_start=NOW - timedelta(hours=1),
+            window_end=NOW,
+            exact_key="dense_json_key",
+        )
+
+    assert attempted_widths == [
+        timedelta(minutes=5),
+        timedelta(minutes=2, seconds=30),
+        timedelta(minutes=1, seconds=15),
+        timedelta(seconds=37, microseconds=500_000),
+        ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT,
+    ]
+
+
+def test_span_attribute_key_cursor_exact_replay_budget_halves_without_progress():
+    identity = (
+        PROJECT_A,
+        "trace-replay-dense",
+        "span-replay-dense",
+        NOW - timedelta(seconds=10),
+    )
+    candidate_widths = []
+    replay_widths = []
+    candidate_calls = []
+
+    def respond(call, _call_number):
+        if "segment_start_us" in call.params:
+            if "ORDER BY\n        start_time DESC" not in call.sql:
+                return []
+            width = call.params["segment_end"] - call.params["segment_start"]
+            candidate_widths.append(width)
+            candidate_calls.append(call)
+            return [
+                {
+                    "project_id": identity[0],
+                    "trace_id": identity[1],
+                    "id": identity[2],
+                    "start_time": identity[3],
+                }
+            ]
+        assert candidate_widths
+        replay_widths.append(candidate_widths[-1])
+        assert "JSONExtractRaw(attributes_extra, %(attribute_key)s)" in call.sql
+        assert "string_keys" not in call.sql
+        if candidate_widths[-1] > ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT:
+            return ReadDeadlineExceeded("target replay exceeded read budget")
+        return [
+            {
+                "project_id": identity[0],
+                "trace_id": identity[1],
+                "id": identity[2],
+                "start_time": identity[3],
+                "is_deleted": 0,
+                "string_present": 0,
+                "string_value": "",
+                "number_present": 0,
+                "number_value": 0,
+                "boolean_present": 0,
+                "boolean_value": 0,
+                "legacy_present": 1,
+                "legacy_value_raw": '{"nested":"present"}',
+            }
+        ]
+
+    executor = RecordingExecutor(respond)
+    page = AttributeReadSelector(
+        executor,
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    ).read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(hours=1),
+        window_end=NOW,
+        exact_key="dense_json_key",
+    )
+
+    assert [row.key for row in page.rows] == ["dense_json_key"]
+    assert page.has_more is False
+    assert list(dict.fromkeys(candidate_widths)) == [
+        timedelta(minutes=5),
+        timedelta(minutes=2, seconds=30),
+        timedelta(minutes=1, seconds=15),
+        timedelta(seconds=37, microseconds=500_000),
+        ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT,
+    ]
+    assert replay_widths[-1] == ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT
+    assert all(
+        "candidate_before_start_us" not in call.params for call in candidate_calls
+    )
+    assert len(executor.calls) <= ATTRIBUTE_READ_MAX_QUERY_COUNT
+
+
+@pytest.mark.parametrize(
+    ("segment_end", "segment_start"),
+    [
+        (
+            NOW - timedelta(days=90) + ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+            None,
+        ),
+        (NOW, NOW - timedelta(days=120)),
+    ],
+    ids=("legacy-five-field", "wide-six-field"),
+)
+def test_span_attribute_key_cursor_exact_reanchors_old_cursor_without_skipping(
+    monkeypatch,
+    segment_end,
+    segment_start,
+):
+    checkpoint = (
+        PROJECT_A,
+        "trace-old-cursor",
+        "span-z-old-cursor",
+        NOW - timedelta(days=90),
+    )
+    older_tie = (
+        PROJECT_A,
+        checkpoint[1],
+        "span-a-old-cursor",
+        checkpoint[3],
+    )
+    candidate_calls = []
+    selector = AttributeReadSelector(
+        RecordingExecutor(),
+        now=NOW,
+        typed_only=True,
+        json_attribute_mode="structured",
+    )
+
+    def candidates(_projects, segment, **kwargs):
+        candidate_calls.append((segment, kwargs.get("before_identity")))
+        assert segment[0] <= checkpoint[3] < segment[1]
+        return (older_tie,), False, {}
+
+    monkeypatch.setattr(selector, "_candidate_ids", candidates)
+    monkeypatch.setattr(
+        selector,
+        "_verify_latest",
+        lambda *_args, **_kwargs: [
+            {
+                "project_id": older_tie[0],
+                "trace_id": older_tie[1],
+                "id": older_tie[2],
+                "start_time": older_tie[3],
+                "is_deleted": 0,
+                "string_present": 0,
+                "string_value": "",
+                "number_present": 0,
+                "number_value": 0,
+                "boolean_present": 0,
+                "boolean_value": 0,
+                "legacy_present": 1,
+                "legacy_value_raw": '{"nested":"present"}',
+            }
+        ],
+    )
+
+    page = selector.read_key_cursor_page(
+        [PROJECT_A],
+        page_size=10,
+        window_start=NOW - timedelta(days=180),
+        window_end=NOW,
+        segment_end=segment_end,
+        segment_start=segment_start,
+        before_identity=checkpoint,
+        exact_key="old_json_key",
+    )
+
+    assert [row.key for row in page.rows] == ["old_json_key"]
+    assert page.has_more is False
+    assert candidate_calls == [
+        (
+            (
+                checkpoint[3],
+                checkpoint[3] + ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+            ),
+            checkpoint,
+        )
+    ]
 
 
 def test_span_attribute_key_cursor_exact_typed_budget_falls_back_to_json(
@@ -5746,7 +6274,7 @@ def test_span_attribute_key_cursor_exact_typed_budget_falls_back_to_json(
 
     def candidates(_projects, _segment, **kwargs):
         candidate_calls.append(kwargs)
-        if kwargs["attribute_key"] == "json_only":
+        if not kwargs["ordered"]:
             raise ReadDeadlineExceeded("typed index probe exceeded its budget")
         width = _segment[1] - _segment[0]
         generic_widths.append(width)
@@ -5784,10 +6312,14 @@ def test_span_attribute_key_cursor_exact_typed_budget_falls_back_to_json(
     assert [row.key for row in page.rows] == ["json_only"]
     assert page.rows[0].type == "map"
     assert page.has_more is False
-    assert len(candidate_calls) == 3
-    assert sum(call["attribute_key"] == "json_only" for call in candidate_calls) == 1
-    assert generic_widths == [timedelta(hours=6), timedelta(minutes=5)]
-    assert candidate_calls[-1]["attribute_key"] is None
+    assert len(candidate_calls) == 2
+    assert all(call["attribute_key"] == "json_only" for call in candidate_calls)
+    assert generic_widths == [timedelta(minutes=5)]
+    assert (
+        "JSONHas(attributes_extra, %(attribute_key)s)"
+        in candidate_calls[-1]["predicate"]
+    )
+    assert "attributes_extra NOT IN" not in candidate_calls[-1]["predicate"]
     assert candidate_calls[-1]["candidate_query_settings"] == {"use_skip_indexes": 0}
 
 
@@ -6472,7 +7004,7 @@ def test_span_attribute_key_cursor_exact_json_fallback_shrinks_without_reprobe(
 
     def candidates(_projects, segment, **kwargs):
         nonlocal typed_probe_count
-        if kwargs["attribute_key"] == "json_only":
+        if not kwargs["ordered"]:
             typed_probe_count += 1
             return (), False, {}
         width = segment[1] - segment[0]
@@ -6509,7 +7041,7 @@ def test_span_attribute_key_cursor_exact_json_fallback_shrinks_without_reprobe(
     )
 
     assert typed_probe_count == 1
-    assert generic_widths == [timedelta(hours=6), timedelta(minutes=5)]
+    assert generic_widths == [timedelta(minutes=5)]
     assert [row.key for row in page.rows] == ["json_only"]
     assert page.rows[0].type == "map"
     assert page.has_more is False

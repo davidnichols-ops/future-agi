@@ -168,21 +168,33 @@ export function useExactEvalAttributeFields({
     }),
   );
   const queryReadState = retainedReadState;
+  const exactSearchMatched = Boolean(
+    exactSearch &&
+      exactPages.some(
+        (page) =>
+          page?.exact_match === true ||
+          (Array.isArray(page?.result) &&
+            page.result.some(({ key }) => key === exactSearch)),
+      ),
+  );
   const retainedHasNextPage =
     retainedQuery.hasNextPage || retainedCursorStopped;
+  const shouldAdvanceExact = Boolean(exactSearch) && !exactSearchMatched;
   const exactHasNextPage =
-    Boolean(exactSearch) && (exactQuery.hasNextPage || exactCursorStopped);
-  const hasNextPage = exactHasNextPage || retainedHasNextPage;
+    shouldAdvanceExact && (exactQuery.hasNextPage || exactCursorStopped);
+  const shouldAdvanceRetained = !exactSearchMatched;
+  const hasNextPage =
+    exactHasNextPage || (shouldAdvanceRetained && retainedHasNextPage);
   const fetchNextPage = (...args) => {
     const reads = [];
-    if (retainedCursorStopped) {
+    if (shouldAdvanceRetained && retainedCursorStopped) {
       reads.push(retainedQuery.refetch(...args));
-    } else if (retainedQuery.hasNextPage) {
+    } else if (shouldAdvanceRetained && retainedQuery.hasNextPage) {
       reads.push(retainedQuery.fetchNextPage(...args));
     }
-    if (Boolean(exactSearch) && exactCursorStopped) {
+    if (shouldAdvanceExact && exactCursorStopped) {
       reads.push(exactQuery.refetch(...args));
-    } else if (Boolean(exactSearch) && exactQuery.hasNextPage) {
+    } else if (shouldAdvanceExact && exactQuery.hasNextPage) {
       reads.push(exactQuery.fetchNextPage(...args));
     }
     return reads.length === 1 ? reads[0] : Promise.allSettled(reads);
@@ -203,15 +215,17 @@ export function useExactEvalAttributeFields({
     fetchNextPage,
     hasNextPage,
     isFetchingNextPage:
-      retainedQuery.isFetchingNextPage ||
-      exactQuery.isFetchingNextPage ||
-      (retainedCursorStopped && retainedQuery.isFetching) ||
-      (exactCursorStopped && exactQuery.isFetching),
+      (shouldAdvanceRetained && retainedQuery.isFetchingNextPage) ||
+      (shouldAdvanceExact && exactQuery.isFetchingNextPage) ||
+      (shouldAdvanceRetained &&
+        retainedCursorStopped &&
+        retainedQuery.isFetching) ||
+      (shouldAdvanceExact && exactCursorStopped && exactQuery.isFetching),
     isFetchNextPageError:
-      retainedQuery.isFetchNextPageError ||
-      exactQuery.isFetchNextPageError ||
-      retainedCursorStopped ||
-      exactCursorStopped,
+      (shouldAdvanceRetained && retainedQuery.isFetchNextPageError) ||
+      (shouldAdvanceExact && exactQuery.isFetchNextPageError) ||
+      (shouldAdvanceRetained && retainedCursorStopped) ||
+      (shouldAdvanceExact && exactCursorStopped),
     pageCount: retainedPages.length + exactPages.length,
     browseStatus:
       (exactSearch ? exactPages.at(-1)?.browse_status : undefined) ||

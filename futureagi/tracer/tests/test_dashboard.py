@@ -65,6 +65,7 @@ from tracer.services.exact_aggregation_cache import snapshot_cache_key
 from tracer.utils.graphs_optimized import EvalGraphReadError
 from tracer.views.dashboard import (
     _DASHBOARD_TRACE_READ_SETTINGS,
+    DashboardReadQuerySerializer,
     DashboardViewSet,
     DashboardWidgetViewSet,
     _fetch_exact_dashboard_rows,
@@ -6560,6 +6561,43 @@ class TestDashboardQuerySerializer:
         assert not serializer.is_valid()
         assert "metrics" in serializer.errors
 
+    def test_read_query_serializer_restores_legacy_metric_filters(self):
+        data = {
+            "workflow": "observability",
+            "project_ids": ["proj-1"],
+            "time_range": {"preset": "7D"},
+            "granularity": "day",
+            "metrics": [
+                {
+                    "name": "latency",
+                    "type": "system_metric",
+                    "aggregation": "avg",
+                    "source": "traces",
+                    "filters": [
+                        {
+                            "metric_name": "status",
+                            "metric_type": "system_metric",
+                            "operator": "equal_to",
+                            "source": "traces",
+                            "value": "OK",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        serializer = DashboardReadQuerySerializer(data=data)
+
+        assert serializer.is_valid(), serializer.errors
+        restored = serializer.validated_data["metrics"][0]["filters"][0]
+        assert restored["column_id"] == "status"
+        assert restored["filter_config"] == {
+            "filter_type": "text",
+            "filter_op": "equals",
+            "filter_value": "OK",
+            "col_type": "SYSTEM_METRIC",
+        }
+
     def test_metric_rejects_camel_case_display_name(self):
         data = {
             "workflow": "observability",
@@ -9414,6 +9452,62 @@ def test_dashboard_query_defers_exact_read_without_inline_clickhouse(
     assert captured["namespace"] == "dashboard-query"
     assert captured["identity"]["query_config"]["project_ids"] == [
         str(observe_project.id)
+    ]
+
+
+@pytest.mark.django_db
+def test_dashboard_query_replays_legacy_metric_filter_without_400(
+    auth_client,
+    observe_project,
+):
+    captured = {}
+
+    def _pending(namespace, identity, **kwargs):
+        captured.update(namespace=namespace, identity=identity)
+        return kwargs["pending_payload"]
+
+    with patch(
+        "tracer.views.dashboard.read_or_schedule_exact_snapshot",
+        side_effect=_pending,
+    ):
+        response = auth_client.post(
+            "/tracer/dashboard/query/",
+            {
+                "project_ids": [str(observe_project.id)],
+                "granularity": "day",
+                "time_range": {"preset": "7D"},
+                "metrics": [
+                    {
+                        "id": "latency",
+                        "name": "latency",
+                        "type": "system_metric",
+                        "aggregation": "avg",
+                        "source": "traces",
+                        "filters": [
+                            {
+                                "metric_name": "status",
+                                "metric_type": "system_metric",
+                                "operator": "equal_to",
+                                "source": "traces",
+                                "value": "OK",
+                            }
+                        ],
+                    }
+                ],
+            },
+            format="json",
+        )
+
+    assert response.status_code == 200
+    assert captured["namespace"] == "dashboard-query"
+    assert captured["identity"]["query_config"]["metrics"][0]["filters"] == [
+        {
+            "metric_name": "status",
+            "metric_type": "system_metric",
+            "operator": "equal_to",
+            "source": "traces",
+            "value": "OK",
+        }
     ]
 
 

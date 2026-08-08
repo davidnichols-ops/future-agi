@@ -581,12 +581,57 @@ const normalizePropertySearchText = (value) =>
     .replace(/\s+/g, " ")
     .trim();
 
+// Canonical field identity is deliberately stricter than fuzzy picker search.
+// Attribute ids are case- and punctuation-sensitive backend keys: `trace_id`
+// and `trace.id` must never become the same identity merely because both are
+// convenient fuzzy matches. System fields may additionally match their exact
+// display label (for example `call_id` <-> `Call ID`), while punctuation is
+// still preserved so a raw attribute lookup cannot be shadowed by `Trace ID`.
+const normalizeCanonicalPropertyIdentity = (value) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+
+const propertyMatchesRawId = (property, rawQuery) =>
+  Boolean(rawQuery) && String(property?.id || "").trim() === rawQuery;
+
+const propertyMatchesCanonicalSystemIdentity = (property, rawQuery) => {
+  if (!rawQuery || property?.category !== "system") return false;
+  const query = normalizeCanonicalPropertyIdentity(rawQuery);
+  return [property?.id, property?.name].some(
+    (candidate) => normalizeCanonicalPropertyIdentity(candidate) === query,
+  );
+};
+
+const getUnambiguousCanonicalSystemMatches = (properties, rawQuery) => {
+  const systemMatches = (properties || []).filter((property) =>
+    propertyMatchesCanonicalSystemIdentity(property, rawQuery),
+  );
+  const hasDistinctRawAttribute = (properties || []).some(
+    (property) =>
+      property?.category === "attribute" &&
+      propertyMatchesRawId(property, rawQuery),
+  );
+  return systemMatches.length === 1 && !hasDistinctRawAttribute
+    ? systemMatches
+    : [];
+};
+
+const hasExactSystemRawId = (properties, rawQuery) =>
+  (properties || []).filter(
+    (property) =>
+      property?.category === "system" &&
+      propertyMatchesRawId(property, rawQuery),
+  ).length === 1;
+
 export function filterPropertiesForPicker({
   properties,
   category = "all",
   search = "",
   hasCategorySidebar = true,
 }) {
+  const rawQuery = String(search || "").trim();
   const query = normalizePropertySearchText(search);
   let list = properties || [];
   // Text search is global.  A category selected during an earlier browse must
@@ -596,6 +641,21 @@ export function filterPropertiesForPicker({
     list = list.filter((property) => property.category === category);
   }
   if (!query) return list;
+  const rawIdMatches = list.filter((property) =>
+    propertyMatchesRawId(property, rawQuery),
+  );
+  // A backend key that is already present wins by its raw identity. Do not use
+  // punctuation-normalized equality here: that previously let `trace_id`
+  // conceal the distinct `trace.id` key and its remaining cursor pages.
+  if (rawIdMatches.length > 0) return rawIdMatches;
+  const canonicalSystemMatches = getUnambiguousCanonicalSystemMatches(
+    list,
+    rawQuery,
+  );
+  // Friendly system labels remain exact selections (`call_id` / `Call ID`).
+  // Aliases and fuzzy punctuation matches stay discoverable below but cannot
+  // claim identity or terminate backend attribute discovery.
+  if (canonicalSystemMatches.length > 0) return canonicalSystemMatches;
   return list.filter((property) => {
     const name = normalizePropertySearchText(property.name);
     const id = normalizePropertySearchText(property.id);
@@ -881,6 +941,7 @@ function PropertyPicker({
     queryReadState: exactAttributeReadState,
     browseStatus: exactAttributeBrowseStatus,
     pageCount: exactAttributePageCount,
+    exactSearchMatched: exactAttributeSearchMatched = false,
     debouncedSearch,
     refetch: refetchAttributePages,
   } = useExactTraceAttributeProperties({
@@ -956,6 +1017,22 @@ function PropertyPicker({
   }, [propertiesWithExactAttribute]);
   const visibleProperties = filtered.slice(0, visiblePropertyLimit);
   const hiddenCount = Math.max(filtered.length - visiblePropertyLimit, 0);
+  const propertySearchHasExactSystemRawId = useMemo(
+    () =>
+      hasExactSystemRawId(
+        propertiesWithExactAttribute,
+        String(search || "").trim(),
+      ),
+    [propertiesWithExactAttribute, search],
+  );
+  // Only a backend-certified raw attribute identity or an exact system raw-id
+  // is terminal. Display labels and fuzzy matches are useful for ranking, but
+  // must leave continuation reachable: an older raw attribute may itself be
+  // named `Call ID`, even while the current page shows system `call_id`.
+  const canLoadNextAttributePage =
+    hasNextAttributePage &&
+    !exactAttributeSearchMatched &&
+    !propertySearchHasExactSystemRawId;
   const manualAttributeProperty = useMemo(
     () =>
       debouncedSearch === search.trim() && !exactAttributeLoading
@@ -1011,14 +1088,14 @@ function PropertyPicker({
       if (
         !autoAttributeScrollPageUsedRef.current &&
         (hiddenCount > 0 ||
-          (hasNextAttributePage && !isFetchingNextAttributePage))
+          (canLoadNextAttributePage && !isFetchingNextAttributePage))
       ) {
         if (hiddenCount > 0) revealNextPropertyBatch();
         else loadNextAttributePage();
       }
     },
     [
-      hasNextAttributePage,
+      canLoadNextAttributePage,
       hiddenCount,
       isFetchingNextAttributePage,
       loadNextAttributePage,
@@ -1353,7 +1430,7 @@ function PropertyPicker({
                 </Box>
               )}
               {hiddenCount === 0 &&
-                hasNextAttributePage &&
+                canLoadNextAttributePage &&
                 !isFetchingNextAttributePage && (
                   <Box
                     sx={{ display: "flex", justifyContent: "center", py: 0.5 }}

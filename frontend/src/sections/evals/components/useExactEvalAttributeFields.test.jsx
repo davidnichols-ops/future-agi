@@ -322,6 +322,52 @@ describe("useExactEvalAttributeFields", () => {
     expect(mocks.get).toHaveBeenCalledTimes(completedRequestCount);
   });
 
+  it("does not advance the unrelated retained catalog after an exact key is found", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (params.q) {
+        return Promise.resolve(
+          retainedPage(["final_status"], {
+            lookup_mode: "exact",
+            exact_match: true,
+          }),
+        );
+      }
+      if (params.cursor === "retained-page-2") {
+        return Promise.resolve(retainedPage(["unrelated_older_key"]));
+      }
+      return Promise.resolve(
+        retainedPage(["recent_catalog"], {
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "retained-page-2",
+        }),
+      );
+    });
+
+    const { result } = renderHook(
+      () =>
+        useExactEvalAttributeFields({
+          projectId: "project-synthetic",
+          rowType: "spans",
+          search: "final_status",
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() =>
+      expect(result.current.data).toEqual(["recent_catalog", "final_status"]),
+    );
+    expect(result.current.hasNextPage).toBe(false);
+    const completedRequestCount = mocks.get.mock.calls.length;
+    await act(async () => result.current.fetchNextPage());
+    expect(mocks.get).toHaveBeenCalledTimes(completedRequestCount);
+    expect(
+      mocks.get.mock.calls.some(
+        ([, options]) => options.params.cursor === "retained-page-2",
+      ),
+    ).toBe(false);
+  });
+
   it("reuses retained pages while exact search changes", async () => {
     const exactRequests = [];
     mocks.get.mockImplementation((_url, options) => {

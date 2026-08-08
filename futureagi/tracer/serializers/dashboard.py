@@ -339,6 +339,9 @@ class DashboardQuerySerializer(StrictInputSerializer):
     )
 
     class Meta:
+        # Keep the established OpenAPI component identity explicit so runtime
+        # read-compatibility subclasses can share the same unchanged contract.
+        ref_name = "DashboardQuery"
         swagger_schema_fields = {"additionalProperties": False}
 
     def validate_metrics(self, value):

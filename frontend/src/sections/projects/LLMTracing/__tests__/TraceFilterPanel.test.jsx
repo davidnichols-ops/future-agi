@@ -460,8 +460,223 @@ describe("voice-call property search aliases", () => {
         category: "system",
         apiColType: "SYSTEM_METRIC",
       }),
-      nestedAttribute,
     ]);
+  });
+
+  it("treats the exact Call ID display label as the canonical call_id field", () => {
+    expect(
+      filterPropertiesForPicker({ properties, search: "Call ID" }),
+    ).toEqual([
+      expect.objectContaining({
+        id: "call_id",
+        name: "Call ID",
+        category: "system",
+        apiColType: "SYSTEM_METRIC",
+      }),
+    ]);
+  });
+
+  it("keeps the canonical Call ID visible and stops unrelated attribute continuation", () => {
+    const fetchNextPage = vi.fn();
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [
+        {
+          id: "conversation.transcript.0.tool_calls.0.tool_call.id",
+          name: "conversation.transcript.0.tool_calls.0.tool_call.id",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      isFetching: false,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      browseStatus: "continuation",
+      pageCount: 1,
+      debouncedSearch: "call_id",
+      refetch: vi.fn(),
+    });
+    const { anchorEl } = renderPanel({ properties });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "call_id" },
+    });
+
+    expect(
+      document.querySelector('[data-filter-property-option="call_id"]'),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector(
+        '[data-filter-property-option="conversation.transcript.0.tool_calls.0.tool_call.id"]',
+      ),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Load more attributes" }),
+    ).not.toBeInTheDocument();
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps loading for the Call ID label until an older raw Call ID key is certified", () => {
+    const fetchNextPage = vi.fn();
+    let exactSearchMatched = false;
+    let data = [
+      {
+        id: "recent_attribute",
+        name: "recent_attribute",
+        category: "attribute",
+        type: "string",
+        apiColType: "SPAN_ATTRIBUTE",
+      },
+    ];
+    exactAttributePropertiesMock.mockImplementation(() => ({
+      data,
+      isFetching: false,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      browseStatus: "continuation",
+      pageCount: 1,
+      exactSearchMatched,
+      debouncedSearch: "Call ID",
+      refetch: vi.fn(),
+    }));
+    const { anchorEl, rerenderPanel } = renderPanel({ properties });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "Call ID" },
+    });
+
+    expect(
+      document.querySelector('[data-filter-property-option="call_id"]'),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Load more attributes" }),
+    );
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+
+    data = [
+      {
+        id: "Call ID",
+        name: "Call ID",
+        category: "attribute",
+        type: "string",
+        apiColType: "SPAN_ATTRIBUTE",
+      },
+    ];
+    exactSearchMatched = true;
+    rerenderPanel();
+
+    expect(
+      document.querySelector('[data-filter-property-option="Call ID"]'),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-filter-property-option="call_id"]'),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Load more attributes" }),
+    ).not.toBeInTheDocument();
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps continuation for trace.id when only the distinct trace_id key is loaded", () => {
+    const fetchNextPage = vi.fn();
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [
+        {
+          id: "trace_id",
+          name: "trace_id",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      isFetching: false,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      browseStatus: "continuation",
+      pageCount: 1,
+      exactSearchMatched: false,
+      debouncedSearch: "trace.id",
+      refetch: vi.fn(),
+    });
+    const traceProperties = getTraceFilterFields("trace").map((field) =>
+      toStaticFilterProperty(field),
+    );
+    const { anchorEl } = renderPanel({ properties: traceProperties });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "trace.id" },
+    });
+
+    expect(
+      screen.getByRole("button", { name: "Load more attributes" }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Load more attributes" }),
+    );
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+    document.body.removeChild(anchorEl);
+  });
+
+  it("terminates only after the backend certifies the exact raw trace.id key", () => {
+    const fetchNextPage = vi.fn();
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [
+        {
+          id: "trace.id",
+          name: "trace.id",
+          category: "attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      isFetching: false,
+      fetchNextPage,
+      // Deliberately adversarial: the UI must use backend certification rather
+      // than punctuation-normalized display matching to suppress this flag.
+      hasNextPage: true,
+      isFetchingNextPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      browseStatus: "continuation",
+      pageCount: 1,
+      exactSearchMatched: true,
+      debouncedSearch: "trace.id",
+      refetch: vi.fn(),
+    });
+    const traceProperties = getTraceFilterFields("trace").map((field) =>
+      toStaticFilterProperty(field),
+    );
+    const { anchorEl } = renderPanel({ properties: traceProperties });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "trace.id" },
+    });
+
+    expect(
+      document.querySelector('[data-filter-property-option="trace.id"]'),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-filter-property-option="trace_id"]'),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Load more attributes" }),
+    ).not.toBeInTheDocument();
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    document.body.removeChild(anchorEl);
   });
 
   it("resets a browsed category when property search starts", () => {

@@ -158,6 +158,14 @@ ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT = 512
 # adjacent probes inside one API request instead of exposing empty UI pages.
 ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES = ATTRIBUTE_READ_MAX_QUERY_COUNT
 ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT = timedelta(minutes=5)
+# Exact-key JSON discovery starts at the same production-qualified five-minute
+# slice, but a newly dense interval must not turn that soft starting point into
+# an API failure. Halve an unproven exact slice down to thirty seconds before
+# returning an honest bounded-read failure. Successful empty proofs grow
+# geometrically again, capped at sixty days so a sparse retained year finishes
+# within the 30-query operation without issuing an unbounded JSON parse/sort.
+ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT = timedelta(seconds=30)
+ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT = timedelta(days=60)
 # A missing candidate proves the whole queried slice has no selectable key, so
 # the next adjacent slice may widen.  Dense attribute-free intervals can still
 # exceed the read envelope. On a typed budget failure, jump directly to a
@@ -331,8 +339,9 @@ class AttributeKeyCursorPageRead:
     next_resume_key_offset: int
     seen_key_digests: tuple[str, ...]
     # Accepted only for rolling compatibility with cursors published by pods
-    # that preserved an adaptively widened segment. New reads compress proven
-    # progress into the legacy six-hour checkpoint shape instead.
+    # that preserved an adaptively widened segment. Generic reads compress
+    # proven progress into the legacy six-hour checkpoint shape; exact lookup
+    # keeps a narrower active slice when that is required for safe replay.
     next_segment_start: datetime | None = None
 
 
@@ -2811,7 +2820,7 @@ class AttributeReadSelector:
         cursor also records compact digests of keys already returned, so keys
         repeated on older spans do not reappear on later pages. Exact lookup
         uses an indexed typed-Map accelerator before this same cursor performs
-        the generic latest-state fallback.
+        a key-bound latest-state fallback.
         """
 
         if not continue_operation:
@@ -2900,6 +2909,12 @@ class AttributeReadSelector:
             raise ValueError("invalid attribute-key resume offset")
         if resume_identity is None and resume_key_offset != 0:
             raise ValueError("key offset requires a resume identity")
+        initial_cursor_state = (
+            current_segment_end,
+            before_identity,
+            resume_identity,
+            resume_key_offset,
+        )
 
         seen = tuple(dict.fromkeys(str(value) for value in seen_key_digests))
         if any(
@@ -2937,6 +2952,7 @@ class AttributeReadSelector:
         # budget on the same known-failing shape while walking sparse history.
         max_empty_segment_width = current_segment_end - start
         exact_probe_segment_end: datetime | None = None
+        exact_fallback_started = False
         next_resume_identity: PhysicalSpanIdentity | None = None
         next_resume_key_offset = 0
 
@@ -2974,6 +2990,20 @@ class AttributeReadSelector:
             candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
 
         def row_keys(row: dict[str, Any]) -> tuple[tuple[str, AttributeType], ...]:
+            if exact_key is not None and any(
+                field in row
+                for field in (
+                    "string_present",
+                    "number_present",
+                    "boolean_present",
+                    "legacy_present",
+                )
+            ):
+                decoded = self._decode_target_value(
+                    row,
+                    json_attribute_mode=self._json_attribute_mode,
+                )
+                return () if decoded is None else ((exact_key, decoded[0]),)
             keys, _unsupported = self._browse_row_keys(
                 row,
                 json_attribute_mode=self._json_attribute_mode,
@@ -3024,9 +3054,12 @@ class AttributeReadSelector:
 
         if resume_identity is not None:
             resume_rows = self._verify_latest(
-                sql=_LATEST_BROWSE_SQL,
+                sql=(
+                    _LATEST_TARGET_SQL if exact_key is not None else _LATEST_BROWSE_SQL
+                ),
                 project_ids=projects,
                 candidate_ids=(resume_identity,),
+                attribute_key=exact_key,
             )
             resume_row = resume_rows[0] if resume_rows else None
             if resume_row is not None and self._row_is_active_in_window(
@@ -3057,9 +3090,27 @@ class AttributeReadSelector:
             "OR (indexHint(has(mapKeys(attrs_bool), %(attribute_key)s)) "
             "AND has(attrs_bool.keys, %(attribute_key)s))"
         )
+        # The ordered fallback owns the public physical cursor, so it must
+        # cover both typed Maps and structured JSON. Bind the requested key
+        # before ClickHouse sorts or hydrates candidates: the former generic
+        # predicate selected every attribute-bearing span and only compared
+        # ``exact_key`` after replay, which could read hundreds of MiB for one
+        # rare JSON key. Keep indexHint out of this mixed predicate and disable
+        # skip-index planning below; the independent typed accelerator above
+        # remains the only lane that asks ClickHouse to build Map bloom-index
+        # conditions.
+        exact_fallback_predicate = (
+            "mapContains(attrs_string, %(attribute_key)s) "
+            "OR mapContains(attrs_number, %(attribute_key)s) "
+            "OR mapContains(attrs_bool, %(attribute_key)s)"
+        )
         if self._reads_json_overflow:
             browse_predicate = (
                 f"({browse_predicate}) OR attributes_extra NOT IN ('', '{{}}', 'null')"
+            )
+            exact_fallback_predicate = (
+                f"({exact_fallback_predicate}) "
+                "OR JSONHas(attributes_extra, %(attribute_key)s)"
             )
 
         while (
@@ -3069,18 +3120,44 @@ class AttributeReadSelector:
             and candidate_pages < ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_PAGES
             # Generic browsing needs a candidate/replay pair. An exact search
             # may first spend another pair on the typed Map bloom indexes; it
-            # must still leave room for the generic structured-JSON fallback.
+            # must still leave room for the ordered structured-JSON fallback.
             and self._query_count
             + (
                 4
                 if exact_key is not None
                 and cursor_before is None
                 and active_segment_start is None
-                and exact_probe_segment_end != current_segment_end
+                and exact_probe_segment_end is None
                 else 2
             )
             <= ATTRIBUTE_READ_MAX_QUERY_COUNT
         ):
+            if exact_key is not None and not exact_fallback_started:
+                # Exact typed and JSON lanes both start inside the same safe
+                # five-minute envelope. For a resumed keyset, retain any
+                # already-narrower active slice (including sub-five-minute
+                # budget backoff) and re-anchor only proven progress.
+                initial_exact_width = min(
+                    ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+                    current_segment_end - start,
+                )
+                if active_segment_start is not None:
+                    initial_exact_width = min(
+                        initial_exact_width,
+                        current_segment_end - active_segment_start,
+                    )
+                if cursor_before is not None:
+                    initial_exact_width = min(
+                        initial_exact_width,
+                        current_segment_end - cursor_before[3],
+                    )
+                    anchor_checkpoint_window(
+                        cursor_before,
+                        width=initial_exact_width,
+                    )
+                else:
+                    empty_segment_width = initial_exact_width
+                exact_fallback_started = True
             current_segment_start = (
                 active_segment_start
                 if active_segment_start is not None
@@ -3088,8 +3165,8 @@ class AttributeReadSelector:
             )
             segment = (current_segment_start, current_segment_end)
 
-            # Exact searches get one cheap typed-Map probe at the start of each
-            # physical segment.  Keep this lane independent from the generic
+            # Exact searches get one cheap typed-Map probe at the start of a
+            # fresh request. Keep this lane independent from the ordered
             # predicate: OR-ing JSON overflow into it would prevent ClickHouse
             # from using the existing Map-key bloom indexes.  A miss, stale
             # version, or typed-lane budget failure changes no cursor state;
@@ -3099,7 +3176,7 @@ class AttributeReadSelector:
                 exact_key is not None
                 and cursor_before is None
                 and active_segment_start is None
-                and exact_probe_segment_end != current_segment_end
+                and exact_probe_segment_end is None
             ):
                 try:
                     exact_candidate_ids, _exact_truncated, _ = self._candidate_ids(
@@ -3117,9 +3194,10 @@ class AttributeReadSelector:
                     )
                     candidate_pages += 1
                     exact_rows = self._verify_latest(
-                        sql=_LATEST_TYPED_BROWSE_SQL,
+                        sql=_LATEST_TYPED_TARGET_SQL,
                         project_ids=projects,
                         candidate_ids=exact_candidate_ids,
+                        attribute_key=exact_key,
                         query_timeout_ms=ATTRIBUTE_READ_QUERY_TIMEOUT_MS,
                     )
                     exact_rows_by_identity = {
@@ -3138,10 +3216,9 @@ class AttributeReadSelector:
                 except Exception as exc:
                     if not is_read_budget_error(exc):
                         raise
-                    # The generic lane covers typed Maps too. If this wider
-                    # accelerator times out, do not spend the remaining wall
-                    # retrying it after a fallback shrink; let the five-minute
-                    # generic slice make deterministic progress instead.
+                    # The key-bound ordered lane covers typed Maps too. If this
+                    # accelerator times out, do not retry it after fallback
+                    # backoff; the physical exact walk remains authoritative.
                     exact_probe_segment_end = current_segment_end
                 if emitted:
                     break
@@ -3150,8 +3227,12 @@ class AttributeReadSelector:
                 candidate_ids, segment_truncated, _ = self._candidate_ids(
                     projects,
                     segment,
-                    predicate=browse_predicate,
-                    attribute_key=None,
+                    predicate=(
+                        exact_fallback_predicate
+                        if exact_key is not None
+                        else browse_predicate
+                    ),
+                    attribute_key=exact_key,
                     ordered=True,
                     before_identity=cursor_before,
                     candidate_limit=candidate_limit,
@@ -3166,6 +3247,31 @@ class AttributeReadSelector:
                     candidate_query_settings={"use_skip_indexes": 0},
                 )
             except Exception as exc:
+                if is_read_budget_error(exc) and exact_key is not None:
+                    if candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT:
+                        # The larger duplicate-only batch is optional. Retry at
+                        # the known finite base before shrinking temporal scope.
+                        candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
+                        continue
+                    failed_width = current_segment_end - current_segment_start
+                    exact_floor = min(
+                        ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT,
+                        current_segment_end - start,
+                    )
+                    if failed_width > exact_floor:
+                        retry_width = max(exact_floor, failed_width / 2)
+                        if cursor_before is not None:
+                            anchor_checkpoint_window(
+                                cursor_before,
+                                width=retry_width,
+                            )
+                        else:
+                            empty_segment_width = retry_width
+                        continue
+                    # No physical progress was certified. The invariant below
+                    # turns this into an honest bounded-read failure instead of
+                    # falsely claiming absence or returning a looping cursor.
+                    break
                 if (
                     is_read_budget_error(exc)
                     and active_segment_start is not None
@@ -3221,9 +3327,14 @@ class AttributeReadSelector:
             candidate_pages += 1
             try:
                 rows = self._verify_latest(
-                    sql=_LATEST_BROWSE_SQL,
+                    sql=(
+                        _LATEST_TARGET_SQL
+                        if exact_key is not None
+                        else _LATEST_BROWSE_SQL
+                    ),
                     project_ids=projects,
                     candidate_ids=candidate_ids,
+                    attribute_key=exact_key,
                     query_timeout_ms=(
                         ATTRIBUTE_READ_JSON_QUERY_TIMEOUT_MS
                         if candidate_limit > ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
@@ -3231,6 +3342,33 @@ class AttributeReadSelector:
                     ),
                 )
             except Exception as exc:
+                if is_read_budget_error(exc) and exact_key is not None:
+                    if candidate_limit > 1:
+                        # Hydrating exact latest state can be dominated by one
+                        # large JSON value. Reduce only the finite replay batch;
+                        # candidate/keyset progress remains unpublished until a
+                        # complete replay succeeds.
+                        candidate_limit = max(candidate_limit // 2, 1)
+                        continue
+                    failed_width = current_segment_end - current_segment_start
+                    exact_floor = min(
+                        ATTRIBUTE_KEY_CURSOR_EXACT_MIN_SEGMENT,
+                        current_segment_end - start,
+                    )
+                    if failed_width > exact_floor:
+                        retry_width = max(exact_floor, failed_width / 2)
+                        if cursor_before is not None:
+                            anchor_checkpoint_window(
+                                cursor_before,
+                                width=retry_width,
+                            )
+                        else:
+                            empty_segment_width = retry_width
+                        continue
+                    # Preserve the unchanged physical cursor; the strict
+                    # progress invariant below converts this into an honest
+                    # unavailable response rather than a looping continuation.
+                    break
                 if (
                     is_read_budget_error(exc)
                     and active_segment_start is not None
@@ -3280,14 +3418,22 @@ class AttributeReadSelector:
                     # The ordered page proves all identities above this point
                     # were consumed. Continue through an ordinary keyset slice
                     # instead of issuing another statement over the wide range.
-                    anchor_checkpoint_window(cursor_before)
+                    anchor_checkpoint_window(
+                        cursor_before,
+                        width=(
+                            ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                            if exact_key is not None
+                            else ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                        ),
+                    )
                     continue
                 active_segment_start = current_segment_start
                 if not emitted:
-                    candidate_limit = min(
-                        candidate_limit * 2,
-                        ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT,
-                    )
+                    if exact_key is None:
+                        candidate_limit = min(
+                            candidate_limit * 2,
+                            ATTRIBUTE_KEY_CURSOR_MAX_CANDIDATE_LIMIT,
+                        )
                 else:
                     candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
                 continue
@@ -3295,15 +3441,26 @@ class AttributeReadSelector:
             cursor_before = None
             active_segment_start = None
             candidate_limit = ATTRIBUTE_KEY_CURSOR_CANDIDATE_LIMIT
-            if candidate_ids:
+            if candidate_ids and exact_key is None:
                 empty_segment_width = min(
                     ATTRIBUTE_READ_EXPLICIT_SEGMENT,
                     max_empty_segment_width,
                 )
             else:
+                # A fully replayed exact slice with only stale/deleted or
+                # unsupported candidates is just as strong an absence proof as
+                # an empty candidate page. Widen the next adjacent slice; any
+                # density cliff still falls through the exact halving path.
                 empty_segment_width = min(
                     empty_segment_width * 2,
-                    max_empty_segment_width,
+                    (
+                        min(
+                            max_empty_segment_width,
+                            ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT,
+                        )
+                        if exact_key is not None
+                        else max_empty_segment_width
+                    ),
                 )
 
         next_checkpoint = next_resume_identity or cursor_before
@@ -3316,7 +3473,14 @@ class AttributeReadSelector:
             # Page-size and request-budget exits can occur directly after a
             # successful widened candidate/replay pair. Publish that proven
             # point in the rolling-compatible five-field cursor shape.
-            anchor_checkpoint_window(next_checkpoint)
+            anchor_checkpoint_window(
+                next_checkpoint,
+                width=(
+                    ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                    if exact_key is not None
+                    else ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                ),
+            )
 
         # A positive exact search is terminal even when older physical rows
         # remain: one verified latest-state occurrence proves the selectable
@@ -3336,7 +3500,7 @@ class AttributeReadSelector:
         next_segment_start = (
             active_segment_start if has_more and next_checkpoint is not None else None
         )
-        if next_segment_start is not None:
+        if next_segment_start is not None and exact_key is None:
             legacy_segment_start = max(
                 start,
                 current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT,
@@ -3347,6 +3511,24 @@ class AttributeReadSelector:
                 # five minutes. Publish the five-field rolling-deploy format;
                 # re-reading the larger prefix is safe under before_identity.
                 next_segment_start = None
+        returned_before_identity = (
+            None if next_resume_identity is not None else cursor_before
+        )
+        if exact_key is not None and has_more:
+            next_cursor_state = (
+                current_segment_end,
+                returned_before_identity,
+                next_resume_identity,
+                next_resume_key_offset,
+            )
+            if next_cursor_state == initial_cursor_state:
+                # Never emit a successful cursor that asks the caller to repeat
+                # the identical unproven physical read forever. The API boundary
+                # sanitizes this bounded read failure; no ClickHouse diagnostic
+                # or false "missing key" result reaches the user.
+                raise ReadDeadlineExceeded(
+                    "Exact attribute-key cursor made no physical progress"
+                )
         # A successful cursor page is a complete request, not a sampled
         # aggregate. Endpoint-specific browse_status communicates whether the
         # retained-data walk can continue or exhausted its frozen window. The
@@ -3365,7 +3547,7 @@ class AttributeReadSelector:
             has_more,
             browse_status,
             current_segment_end,
-            None if next_resume_identity is not None else cursor_before,
+            returned_before_identity,
             next_resume_identity,
             next_resume_key_offset,
             seen_after,
