@@ -47,8 +47,7 @@ import {
 } from "src/components/inline-audio/audio-detection";
 import { ID_ONLY_FIELDS } from "src/sections/projects/LLMTracing/idFields";
 import {
-  followEmptyListContinuations,
-  getEmptyListContinuation,
+  collectExactListRows,
   listContinuationParams,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
 import {
@@ -136,8 +135,8 @@ export function buildApiFilterArray(oldFormatFilters, startDate, endDate) {
 }
 
 // Trace/span/session/voice previews opt into signed bounded continuation. Every row is
-// a genuine classified match; checkpoint-only transport pages are followed by
-// the caller below until at least one row is found or the frozen window ends.
+// a genuine classified match; bounded transport pages are accumulated until
+// the 50-row preview is full or the frozen window is exhausted.
 // eslint-disable-next-line react-refresh/only-export-components
 export function buildTaskPreviewListParams({ rowType, projectId, apiFilters }) {
   const cursorCapable = ["voiceCalls", "traces", "spans", "sessions"].includes(
@@ -151,6 +150,20 @@ export function buildTaskPreviewListParams({ rowType, projectId, apiFilters }) {
     ...(cursorCapable ? { cursor_mode: true } : {}),
   };
 }
+
+const taskPreviewRowIdentity = (rowType, row) => {
+  if (rowType === "voiceCalls") {
+    return row?.call_id || row?.id || row?.trace_id || null;
+  }
+  if (rowType === "sessions") {
+    return row?.session_id || row?.id || null;
+  }
+  if (rowType === "traces") {
+    return row?.trace_id || row?.id || null;
+  }
+  const id = row?.span_id || row?.id;
+  return id ? `${row?.trace_id || ""}:${id}:${row?.start_time || ""}` : null;
+};
 
 // Deep search: check if a value (including nested JSON) matches query
 function deepMatch(val, q) {
@@ -322,7 +335,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         requestedCursors.add(nextCursor);
       };
 
-      const continuationResult = (nextCursor) => {
+      const continuationResult = (nextCursor, accumulatedRows = []) => {
         if (!nextCursor) return null;
         // The shared per-attempt follower checks cycles inside one bounded
         // attempt. This second guard covers a cycle that lands exactly on the
@@ -333,6 +346,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         return {
           cursor: nextCursor,
           requestedCursors: [...requestedCursors],
+          rows: accumulatedRows,
         };
       };
 
@@ -342,14 +356,16 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           projectId,
           apiFilters,
         });
-        let resp = await axios.get(endpoints.project.getCallLogs, {
+        const resp = await axios.get(endpoints.project.getCallLogs, {
           params: resumeCursor
             ? listContinuationParams(requestParams, resumeCursor)
             : requestParams,
           signal,
         });
-        resp = await followEmptyListContinuations({
+        const exactRows = await collectExactListRows({
           initialResponse: resp,
+          initialRows: activeListContinuation?.rows || [],
+          targetRowCount: requestParams.page_size,
           rowsFromResponse: (response) => {
             const result = response?.data?.result || response?.data || {};
             return result.results || result.data || result.calls || [];
@@ -363,10 +379,11 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             }),
           onContinuation: recordContinuation,
           isCurrent: () => !signal.aborted,
+          rowIdentity: (row) => taskPreviewRowIdentity(rowType, row),
         });
-        const result = resp.data?.result || resp.data || {};
-        const rowsOut = result.results || result.data || result.calls || [];
-        const nextCursor = getEmptyListContinuation(rowsOut, result);
+        const result =
+          exactRows.response?.data?.result || exactRows.response?.data || {};
+        const rowsOut = exactRows.rows;
         return {
           rows: rowsOut,
           total:
@@ -375,7 +392,9 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             result.total ??
             rowsOut.length,
           columns: [],
-          continuation: continuationResult(nextCursor),
+          continuation: exactRows.pending
+            ? continuationResult(exactRows.nextCursor, rowsOut)
+            : null,
         };
       }
 
@@ -399,14 +418,16 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         projectId,
         apiFilters,
       });
-      let resp = await axios.get(url, {
+      const resp = await axios.get(url, {
         params: resumeCursor
           ? listContinuationParams(requestParams, resumeCursor)
           : requestParams,
         signal,
       });
-      resp = await followEmptyListContinuations({
+      const exactRows = await collectExactListRows({
         initialResponse: resp,
+        initialRows: activeListContinuation?.rows || [],
+        targetRowCount: requestParams.page_size,
         rowsFromResponse: (response) => response?.data?.result?.table || [],
         metadataFromResponse: (response) =>
           response?.data?.result?.metadata || {},
@@ -417,22 +438,21 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           }),
         onContinuation: recordContinuation,
         isCurrent: () => !signal.aborted,
+        rowIdentity: (row) => taskPreviewRowIdentity(rowType, row),
       });
-      const result = resp.data?.result || {};
-      const rowsOut = result.table || result.results || result.data || [];
-      const nextCursor = getEmptyListContinuation(
-        rowsOut,
-        result.metadata || {},
-      );
+      const result = exactRows.response?.data?.result || {};
+      const rowsOut = exactRows.rows;
       return {
         rows: rowsOut,
         total:
           result.metadata?.total_rows ||
           result.total_count ||
           result.total ||
-          (result.table || []).length,
+          rowsOut.length,
         columns: result.config || [],
-        continuation: continuationResult(nextCursor),
+        continuation: exactRows.pending
+          ? continuationResult(exactRows.nextCursor, rowsOut)
+          : null,
       };
     },
     enabled: !!projectId,
@@ -771,14 +791,14 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
             }}
           >
             <Typography variant="body2" sx={{ fontSize: "12px" }}>
-              No match found in the current scan.
+              Preparing the exact preview.
             </Typography>
             <Typography
               variant="caption"
               color="text.secondary"
               sx={{ fontSize: "11px" }}
             >
-              Continue searching older data from the saved position.
+              Continue from the saved position to load the next bounded batch.
             </Typography>
             <Button
               size="small"

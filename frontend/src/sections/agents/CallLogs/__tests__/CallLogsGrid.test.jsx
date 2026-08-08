@@ -166,6 +166,78 @@ describe("CallLogsGrid bounded-read state", () => {
     );
   });
 
+  it("does not request a cursor for a terminal overflow page already buffered locally", async () => {
+    useCallLogsMock.mockReturnValue({
+      data: {
+        ...completeData,
+        has_more: false,
+        next_cursor: null,
+        __exactPage: {
+          pending: false,
+          stale: false,
+          isLastPage: false,
+          canPrefetch: false,
+        },
+      },
+      isLoading: false,
+      error: null,
+      queryKey: ["callLogs", "project", "project-1", 15, {}, 1],
+    });
+
+    render(<CallLogsGrid id="project-1" module="project" hideDrawer />);
+
+    expect(
+      await screen.findByRole("button", { name: /go to page 2/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Next").closest("button")).not.toBeDisabled();
+    await waitFor(() => expect(prefetchCallLogsMock).not.toHaveBeenCalled());
+  });
+
+  it("advances a bounded same-page continuation without returning to its cached start", async () => {
+    useCallLogsMock.mockImplementation(({ paginationRevision }) => ({
+      data: {
+        ...completeData,
+        has_more: paginationRevision === 0,
+        next_cursor: paginationRevision === 0 ? "bounded-checkpoint" : null,
+        __exactPage:
+          paginationRevision === 0
+            ? {
+                pending: true,
+                stale: false,
+                isLastPage: false,
+                canPrefetch: false,
+              }
+            : {
+                pending: false,
+                stale: false,
+                isLastPage: true,
+                canPrefetch: false,
+              },
+      },
+      isLoading: false,
+      error: null,
+      queryKey: [
+        "callLogs",
+        "project",
+        "project-1",
+        15,
+        {},
+        1,
+        paginationRevision,
+      ],
+    }));
+
+    render(<CallLogsGrid id="project-1" module="project" hideDrawer />);
+
+    await waitFor(() =>
+      expect(useCallLogsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ paginationRevision: 1 }),
+      ),
+    );
+    expect(agGridState.props.rowData).toEqual(completeData.results);
+    expect(prefetchCallLogsMock).not.toHaveBeenCalled();
+  });
+
   it("keeps proven rows and cursor navigation usable despite degraded total metadata", async () => {
     useCallLogsMock.mockReturnValue({
       data: {

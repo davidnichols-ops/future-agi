@@ -32,6 +32,7 @@ export const createListCursorPagination = ({
   let generation = 0;
   const cursorByPage = new Map([[0, null]]);
   const transportCursorByPage = new Map();
+  const bufferedVisiblePageByPage = new Map();
 
   const reset = () => {
     generation += 1;
@@ -39,6 +40,7 @@ export const createListCursorPagination = ({
     cursorByPage.clear();
     cursorByPage.set(0, null);
     transportCursorByPage.clear();
+    bufferedVisiblePageByPage.clear();
   };
 
   const disableCursor = () => {
@@ -47,6 +49,7 @@ export const createListCursorPagination = ({
     cursorByPage.clear();
     cursorByPage.set(0, null);
     transportCursorByPage.clear();
+    bufferedVisiblePageByPage.clear();
   };
 
   const requestParams = (pageNumber, baseParams) => {
@@ -159,6 +162,47 @@ export const createListCursorPagination = ({
     cursorByPage.delete(pageNumber + 1);
   };
 
+  const bufferedVisiblePage = (pageNumber) => {
+    const buffered = bufferedVisiblePageByPage.get(pageNumber);
+    if (!buffered) return null;
+    return { ...buffered, rows: [...buffered.rows] };
+  };
+
+  const recordVisibleContinuation = (
+    pageNumber,
+    metadata,
+    { rows, response },
+  ) => {
+    if (!Array.isArray(rows)) {
+      throw new Error("Invalid buffered list rows");
+    }
+    recordEmptyContinuation(pageNumber, metadata);
+    bufferedVisiblePageByPage.set(pageNumber, {
+      rows: [...rows],
+      response,
+      metadata,
+    });
+  };
+
+  const completeVisiblePage = (
+    pageNumber,
+    metadata,
+    { overflowRows = [], response } = {},
+  ) => {
+    if (!Array.isArray(overflowRows)) {
+      throw new Error("Invalid overflow list rows");
+    }
+    bufferedVisiblePageByPage.delete(pageNumber);
+    recordResponse(pageNumber, metadata);
+    if (overflowRows.length > 0) {
+      bufferedVisiblePageByPage.set(pageNumber + 1, {
+        rows: [...overflowRows],
+        response,
+        metadata,
+      });
+    }
+  };
+
   const isLastPage = (metadata, rowCount, pageSize) => {
     if (mode === CURSOR_MODE && hasOwn(metadata, "has_more")) {
       return metadata.has_more === false;
@@ -172,6 +216,9 @@ export const createListCursorPagination = ({
     requestParams,
     recordResponse,
     recordEmptyContinuation,
+    bufferedVisiblePage,
+    recordVisibleContinuation,
+    completeVisiblePage,
     isLastPage,
     mode: () => mode,
     generation: () => generation,
@@ -183,6 +230,267 @@ export const createListCursorPagination = ({
         error?.response?.status === 422 ||
         error?.code === MIXED_VERSION_ERROR_CODE),
   };
+};
+
+const stableRowKey = (rowIdentity, row) => {
+  const identity = rowIdentity(row);
+  if (
+    (typeof identity !== "string" && typeof identity !== "number") ||
+    String(identity).length === 0
+  ) {
+    throw new Error("Exact list row is missing a stable identity");
+  }
+  return `${typeof identity}:${String(identity)}`;
+};
+
+/**
+ * Fill one visible list page from as many bounded transport responses as are
+ * required. A backend response may be non-empty but still shorter than the
+ * requested page while `has_more` remains true. Publishing that response to
+ * AG Grid would make it infer end-of-data and hide every later match.
+ *
+ * Overflow is retained for the next visible page. If the local hop/time bound
+ * is reached, accumulated rows and the signed checkpoint stay on the same
+ * page so a retry can continue without dropping or duplicating rows.
+ */
+export const loadExactListPage = async ({
+  pagination,
+  pageNumber,
+  targetRowCount,
+  loadResponse,
+  nextResponse,
+  rowsFromResponse,
+  metadataFromResponse,
+  rowIdentity,
+  isCurrent = () => true,
+  maxContinuations = DEFAULT_MAX_EMPTY_CONTINUATIONS,
+  maxElapsedMs = DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS,
+  now = () => Date.now(),
+}) => {
+  if (!pagination || typeof pagination.bufferedVisiblePage !== "function") {
+    throw new Error("Exact list pagination is required");
+  }
+  if (!Number.isInteger(pageNumber) || pageNumber < 0) {
+    throw new Error("Invalid exact list page number");
+  }
+  if (!Number.isInteger(targetRowCount) || targetRowCount < 1) {
+    throw new Error("Invalid exact list target row count");
+  }
+  if (typeof rowIdentity !== "function") {
+    throw new Error("Exact list row identity is required");
+  }
+  if (!Number.isInteger(maxContinuations) || maxContinuations < 1) {
+    throw new Error("Invalid list continuation limit");
+  }
+  if (!Number.isFinite(maxElapsedMs) || maxElapsedMs < 1) {
+    throw new Error("Invalid list continuation deadline");
+  }
+
+  const buffered = pagination.bufferedVisiblePage(pageNumber);
+  const accumulatedRows = [];
+  const identities = new Set();
+  const appendRows = (rows) => {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const identity = stableRowKey(rowIdentity, row);
+      if (!identities.has(identity)) {
+        identities.add(identity);
+        accumulatedRows.push(row);
+      }
+    }
+  };
+  appendRows(buffered?.rows);
+
+  let response = buffered?.response;
+  let metadata = buffered?.metadata || {};
+  let continuationCount = 0;
+  const startedAt = now();
+
+  // A terminal overflow from the previous visible page already contains all
+  // rows for this page, so it must not issue a cursor-less transport request.
+  let needsResponse =
+    accumulatedRows.length < targetRowCount &&
+    (!buffered || metadata?.has_more === true);
+  while (needsResponse) {
+    if (!isCurrent()) {
+      return {
+        response,
+        rows: accumulatedRows,
+        metadata,
+        pending: true,
+        stale: true,
+        isLastPage: false,
+        canPrefetch: false,
+      };
+    }
+    response =
+      continuationCount === 0
+        ? await loadResponse()
+        : await nextResponse(metadata.next_cursor);
+    appendRows(rowsFromResponse(response));
+    metadata = metadataFromResponse(response) || {};
+
+    if (
+      accumulatedRows.length >= targetRowCount ||
+      metadata.has_more !== true
+    ) {
+      break;
+    }
+
+    pagination.recordVisibleContinuation(pageNumber, metadata, {
+      rows: accumulatedRows,
+      response,
+    });
+    if (
+      continuationCount >= maxContinuations ||
+      now() - startedAt >= maxElapsedMs
+    ) {
+      return {
+        response,
+        rows: [...accumulatedRows],
+        metadata,
+        pending: true,
+        stale: false,
+        isLastPage: false,
+        canPrefetch: false,
+      };
+    }
+    continuationCount += 1;
+    needsResponse = true;
+  }
+
+  const rows = accumulatedRows.slice(0, targetRowCount);
+  const overflowRows = accumulatedRows.slice(targetRowCount);
+  pagination.completeVisiblePage(pageNumber, metadata, {
+    overflowRows,
+    response,
+  });
+  const isLastPage =
+    overflowRows.length === 0 &&
+    pagination.isLastPage(metadata, rows.length, targetRowCount);
+  return {
+    response,
+    rows,
+    metadata,
+    pending: false,
+    stale: false,
+    isLastPage,
+    // A terminal response can still overflow into one final visible page.
+    // That page is already buffered and has no cursor to prefetch with.
+    canPrefetch:
+      !isLastPage && !(overflowRows.length > 0 && !metadata.has_more),
+  };
+};
+
+export const resumePendingListPage = ({
+  page,
+  resume,
+  schedule = queueMicrotask,
+}) => {
+  if (page?.pending !== true || page?.stale === true) return false;
+  schedule(resume);
+  return true;
+};
+
+/**
+ * Collect an exact fixed-size preview without visible-page state. Callers may
+ * persist `rows` plus `nextCursor` when `pending` is true and pass those rows
+ * back as `initialRows` on the next bounded attempt.
+ */
+export const collectExactListRows = async ({
+  initialResponse,
+  initialRows = [],
+  targetRowCount,
+  rowsFromResponse,
+  metadataFromResponse,
+  nextResponse,
+  rowIdentity,
+  onContinuation,
+  isCurrent = () => true,
+  maxContinuations = DEFAULT_MAX_EMPTY_CONTINUATIONS,
+  maxElapsedMs = DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS,
+  now = () => Date.now(),
+}) => {
+  if (!Number.isInteger(targetRowCount) || targetRowCount < 1) {
+    throw new Error("Invalid exact list target row count");
+  }
+  if (typeof rowIdentity !== "function") {
+    throw new Error("Exact list row identity is required");
+  }
+  if (!Number.isInteger(maxContinuations) || maxContinuations < 1) {
+    throw new Error("Invalid list continuation limit");
+  }
+  if (!Number.isFinite(maxElapsedMs) || maxElapsedMs < 1) {
+    throw new Error("Invalid list continuation deadline");
+  }
+
+  const rows = [];
+  const identities = new Set();
+  const appendRows = (nextRows) => {
+    for (const row of Array.isArray(nextRows) ? nextRows : []) {
+      const identity = stableRowKey(rowIdentity, row);
+      if (!identities.has(identity)) {
+        identities.add(identity);
+        rows.push(row);
+      }
+    }
+  };
+  appendRows(initialRows);
+
+  let response = initialResponse;
+  let metadata = {};
+  let continuationCount = 0;
+  const followed = new Set();
+  const startedAt = now();
+  while (response) {
+    appendRows(rowsFromResponse(response));
+    metadata = metadataFromResponse(response) || {};
+    if (rows.length >= targetRowCount || metadata.has_more !== true) {
+      return {
+        response,
+        rows: rows.slice(0, targetRowCount),
+        metadata,
+        pending: false,
+        stale: false,
+        nextCursor: null,
+      };
+    }
+    if (!isCurrent()) {
+      return {
+        response,
+        rows,
+        metadata,
+        pending: true,
+        stale: true,
+        nextCursor: metadata.next_cursor,
+      };
+    }
+    const nextCursor = metadata.next_cursor;
+    if (typeof nextCursor !== "string" || nextCursor.length === 0) {
+      throw new Error("List response omitted its continuation cursor");
+    }
+    if (followed.has(nextCursor)) {
+      throw new Error("List API returned a repeated continuation cursor");
+    }
+    if (
+      continuationCount >= maxContinuations ||
+      now() - startedAt >= maxElapsedMs
+    ) {
+      return {
+        response,
+        rows,
+        metadata,
+        pending: true,
+        stale: false,
+        nextCursor,
+      };
+    }
+    followed.add(nextCursor);
+    onContinuation?.(metadata);
+    continuationCount += 1;
+    response = await nextResponse(nextCursor);
+  }
+
+  throw new Error("List continuation returned no response");
 };
 
 export const LIST_CURSOR_MODES = Object.freeze({

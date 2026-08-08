@@ -32,8 +32,8 @@ import { getListTotalState } from "src/sections/projects/LLMTracing/listTotalMet
 import { failServerSideGridRead } from "src/utils/queryReadState";
 import {
   createListCursorPagination,
-  followEmptyListContinuations,
-  resumeEmptyListPage,
+  loadExactListPage,
+  resumePendingListPage,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
 
 const getSessionGridThemeParams = (theme) => ({
@@ -51,6 +51,10 @@ const getSessionGridThemeParams = (theme) => ({
 });
 
 const DATASET_ROWS_LIMIT = 25;
+const sessionRowIdentity = (row) => {
+  const id = row?.session_id || row?.id;
+  return id ? `${row?.project_id || ""}:${id}` : null;
+};
 
 const LoadingHeader = () => {
   return <Skeleton variant="text" width={100} height={20} />;
@@ -269,22 +273,21 @@ const SessionGrid = React.forwardRef(
               // dedupes a concurrent getRows for the same page.
               const cached = prefetchCache.current.get(pageNumber);
               prefetchCache.current.delete(pageNumber);
-              let results = cached
-                ? await cached
-                : await axios.get(endpoints.project.projectSessionList(), {
-                    params: buildParams(pageNumber),
-                  });
-              results = await followEmptyListContinuations({
-                initialResponse: results,
+              const exactPage = await loadExactListPage({
+                pagination: cursorPagination.current,
+                pageNumber,
+                targetRowCount: DATASET_ROWS_LIMIT,
+                loadResponse: () =>
+                  cached
+                    ? cached
+                    : axios.get(endpoints.project.projectSessionList(), {
+                        params: buildParams(pageNumber),
+                      }),
                 rowsFromResponse: (response) =>
                   response?.data?.result?.table || [],
                 metadataFromResponse: (response) =>
                   response?.data?.result?.metadata || {},
-                onContinuation: (metadata) =>
-                  cursorPagination.current.recordEmptyContinuation(
-                    pageNumber,
-                    metadata,
-                  ),
+                rowIdentity: sessionRowIdentity,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
                 nextResponse: () =>
@@ -296,6 +299,7 @@ const SessionGrid = React.forwardRef(
                 params.fail();
                 return;
               }
+              const results = exactPage.response;
               const res = results?.data?.result;
               const newCols = normalizeConfigKeys(res?.config);
 
@@ -377,14 +381,11 @@ const SessionGrid = React.forwardRef(
               });
 
               setFilteredColumnDefs(filteredColumns);
-              const rows = res?.table || [];
-              const metadata = res?.metadata || {};
+              const rows = exactPage.rows;
+              const metadata = exactPage.metadata;
               if (
-                resumeEmptyListPage({
-                  rows,
-                  metadata,
-                  pagination: cursorPagination.current,
-                  pageNumber,
+                resumePendingListPage({
+                  page: exactPage,
                   resume: () => {
                     if (cursorPagination.current.isCurrent(requestGeneration)) {
                       params.fail();
@@ -399,7 +400,6 @@ const SessionGrid = React.forwardRef(
               ) {
                 return;
               }
-              cursorPagination.current.recordResponse(pageNumber, metadata);
               const totalState = getListTotalState(metadata);
               params.api.totalRowCount = totalState.totalRowCount;
               params.api.totalRowCountLowerBound =
@@ -408,11 +408,7 @@ const SessionGrid = React.forwardRef(
                 totalState.totalRowCountIsLowerBound;
               useSessionsGridStore.setState(totalState);
 
-              const isLastPage = cursorPagination.current.isLastPage(
-                metadata,
-                rows.length,
-                DATASET_ROWS_LIMIT,
-              );
+              const isLastPage = exactPage.isLastPage;
               const lastRow = isLastPage ? request.startRow + rows.length : -1;
 
               params.success({
@@ -422,7 +418,7 @@ const SessionGrid = React.forwardRef(
 
               // Prefetch next page so scroll feels instant. Cache the promise
               // (not the resolved value) so a concurrent getRows dedupes.
-              if (!isLastPage) {
+              if (exactPage.canPrefetch) {
                 const prefetchGeneration = requestGeneration;
                 const prefetch = axios.get(
                   endpoints.project.projectSessionList(),

@@ -56,6 +56,18 @@ def _attribute_filter(key: str, value: str) -> dict:
     }
 
 
+def _structured_attribute_filter() -> dict:
+    return {
+        "column_id": "langfuse.trace.tags",
+        "filter_config": {
+            "col_type": "SPAN_ATTRIBUTE",
+            "filter_type": "array",
+            "filter_op": "contains",
+            "filter_value": ["vip"],
+        },
+    }
+
+
 def _has_eval_filter(value: bool | str) -> dict:
     return {
         "column_id": "has_eval",
@@ -365,7 +377,7 @@ def test_task_filters_merge_legacy_and_canonical_lists() -> None:
     ("row_type", "identity", "expected_classify_batch"),
     [
         (RowType.SPANS, "id", 200),
-        (RowType.TRACES, "trace_id", 100),
+        (RowType.TRACES, "trace_id", 10),
     ],
 )
 def test_bounded_resolver_returns_only_a_complete_latest_state_page(
@@ -674,7 +686,7 @@ def test_high_limit_workflow_uses_finite_exact_contract(
     assert captured["classify_batch_size"] == 50
     assert captured["page_size"] == 1_000_000
     assert captured["workflow_exact"] is True
-    assert captured["deadline_ms"] == 75 * 60 * 1000
+    assert captured["deadline_ms"] == 170 * 60 * 1000
     assert captured["max_seed_attempts"] == 16_384
     assert captured["max_query_count"] == 32_768
     assert (
@@ -775,7 +787,7 @@ def test_exactly_10k_uses_workflow_query_contract(
     assert captured["page_size"] == 10_000
     assert captured["max_query_count"] == 32_768
     assert captured["max_seed_attempts"] == 16_384
-    assert captured["deadline_ms"] == 75 * 60 * 1000
+    assert captured["deadline_ms"] == 170 * 60 * 1000
 
 
 @pytest.mark.parametrize(
@@ -937,9 +949,10 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
     class ReplayAnalytics:
         def execute_ch_query(self, _query, params, *, timeout_ms, settings):
             assert params["candidate_trace_ids"] == ("trace-a",)
-            assert timeout_ms <= 1_500
-            assert settings["max_execution_time"] == 2
+            assert timeout_ms == 3_000
+            assert settings["max_execution_time"] == 3
             assert settings["max_threads"] == 1
+            assert settings["max_block_size"] == 2_048
             assert settings["max_rows_to_read"] == 5_000_000
             assert settings["max_memory_usage"] == 256 * 1024 * 1024
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
@@ -987,7 +1000,7 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
     ]
     assert captured["deadline_ms"] == 12_000
     assert captured["max_query_count"] == 112
-    assert captured["classify_batch_size"] == 100
+    assert captured["classify_batch_size"] == 10
     phase_one_builder = captured["builder"]
     assert phase_one_builder._bounded_include_filter_witnesses is False
     membership_sql, _ = phase_one_builder.build_filter_match_query_from_seed_rows(
@@ -1009,8 +1022,8 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
     """Exercise the real 100k wire limit through the real bounded reader.
 
     The population is deliberately sparse. Success proves the background
-    workflow exhausts the frozen window and then replays exact any-span
-    witnesses only for the selected newest-first prefix.
+    workflow exhausts the frozen window while returning exact any-span
+    witnesses in the same buffered classifier pass as membership.
     """
 
     window_start = END - timedelta(minutes=10)
@@ -1035,19 +1048,17 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
 
         def execute_ch_query(self, query, params, *, timeout_ms, settings):
             self.calls.append((query, params))
-            assert timeout_ms <= 1_500
+            assert timeout_ms <= 3_000
             assert settings["max_threads"] == 1
             assert settings["max_memory_usage"] == 256 * 1024 * 1024
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
 
             candidate_ids = params.get("candidate_trace_ids")
             if candidate_ids is not None:
-                if "filter_witness_0" not in query:
-                    assert "argMinIf(tuple(grouped_id, latest_start_time)" not in query
-                    rows = [source_rows[trace_id] for trace_id in candidate_ids]
-                    return QueryResult(rows, len(rows), "clickhouse", 1.0)
-
+                assert "filter_witness_0" in query
+                assert "argMinIf(tuple(grouped_id, latest_start_time)" in query
                 assert settings["max_rows_to_read"] == 5_000_000
+                assert settings["max_block_size"] == 2_048
                 rows = [
                     {
                         **source_rows[trace_id],
@@ -1062,6 +1073,8 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
 
             assert "id AS root_span_id" in query
             assert "parent_span_id IS NULL" in query
+            assert "max_rows_to_read" not in settings
+            assert settings["max_block_size"] == 8_192
             rows = [
                 {
                     "trace_id": row["trace_id"],
@@ -1124,15 +1137,31 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
         if "candidate_trace_ids" in params and "filter_witness_0" in query
     ]
     assert len(seed_queries) == 2
-    assert len(membership_queries) == 1
+    assert len(membership_queries) == 0
     assert len(witness_queries) == 1
-    assert captured["classify_batch_size"] == 100
+    assert captured["classify_batch_size"] == 10
     assert captured["workflow_exact"] is True
-    assert captured["builder"]._bounded_include_filter_witnesses is False
+    assert captured["deadline_ms"] == 170 * 60 * 1000
+    assert "max_rows_to_read" not in captured["read_settings"]
+    assert "max_block_size" not in captured["read_settings"]
+    assert captured["classify_read_settings"] == {
+        "max_block_size": 2_048,
+        "max_rows_to_read": 5_000_000,
+    }
+    assert captured["builder"]._bounded_include_filter_witnesses is True
 
 
-def test_trace_eval_witness_replay_uses_hundred_id_batches_with_hard_caps(
+@pytest.mark.parametrize(
+    "filter_item",
+    [
+        _attribute_filter("final_status", "Rejected"),
+        _structured_attribute_filter(),
+    ],
+    ids=["scalar-map", "structured-json"],
+)
+def test_trace_eval_witness_replay_uses_ten_id_batches_with_hard_caps(
     monkeypatch: pytest.MonkeyPatch,
+    filter_item: dict,
 ) -> None:
     witness_start = END - timedelta(minutes=1)
     rows = [
@@ -1141,11 +1170,15 @@ def test_trace_eval_witness_replay_uses_hundred_id_batches_with_hard_caps(
             "root_span_id": f"root-{index:02d}",
             "start_time": witness_start - timedelta(seconds=index),
         }
-        for index in range(205)
+        for index in range(25)
     ]
 
     def fake_read(**kwargs):
         assert kwargs["max_query_count"] == 112
+        assert kwargs["classify_batch_size"] == 10
+        assert kwargs["workflow_exact"] is False
+        assert kwargs["deadline_ms"] == 12_000
+        assert kwargs["builder"]._bounded_include_filter_witnesses is False
         return BoundedFilterPage(
             rows=rows,
             has_more=False,
@@ -1170,18 +1203,18 @@ def test_trace_eval_witness_replay_uses_hundred_id_batches_with_hard_caps(
         def execute_ch_query(self, _query, params, *, timeout_ms, settings):
             trace_ids = params["candidate_trace_ids"]
             self.batch_sizes.append(len(trace_ids))
-            assert len(trace_ids) <= 100
-            assert timeout_ms <= 1_500
+            assert len(trace_ids) <= 10
+            assert timeout_ms == 3_000
             assert settings == {
-                "max_execution_time": 2,
+                "max_execution_time": 3,
+                "timeout_overflow_mode": "throw",
                 "max_threads": 1,
-                "max_block_size": 8192,
-                "max_rows_to_read": 5_000_000,
+                "max_block_size": 2_048,
                 "max_memory_usage": 256 * 1024 * 1024,
                 "max_bytes_to_read": 512 * 1024 * 1024,
                 "read_overflow_mode": "throw",
                 "result_overflow_mode": "throw",
-                "timeout_overflow_mode": "throw",
+                "max_rows_to_read": 5_000_000,
                 "max_result_rows": len(trace_ids),
             }
             by_trace = {row["trace_id"]: row for row in rows}
@@ -1203,18 +1236,97 @@ def test_trace_eval_witness_replay_uses_hundred_id_batches_with_hard_caps(
         salt="task-salt",
         sampling_rate=100.0,
         filters={
-            "filters": [_attribute_filter("final_status", "Rejected")],
+            "filters": [filter_item],
             "date_range": [START, END],
         },
-        limit=250,
-        batch_size=250,
+        limit=25,
+        batch_size=25,
         row_type=RowType.TRACES,
         include_trace_filter_witnesses=True,
     )
 
     assert result.ids == tuple(row["trace_id"] for row in rows)
-    assert analytics.batch_sizes == [100, 100, 5]
+    assert analytics.batch_sizes == [10, 10, 5]
     assert len(result.trace_filter_witnesses) == len(rows)
+
+
+@pytest.mark.unit
+def test_dense_100k_custom_trace_witness_replay_is_a_bounded_fail_safe_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise finite mechanics only; this is not a production latency claim."""
+
+    witness_start = END - timedelta(minutes=1)
+    rows = [
+        {
+            "trace_id": f"trace-{index:06d}",
+            "root_span_id": f"root-{index:06d}",
+            "start_time": witness_start,
+        }
+        for index in range(100_000)
+    ]
+
+    class Builder:
+        @staticmethod
+        def build_filter_match_query(batch, *, include_filter_witnesses):
+            assert include_filter_witnesses is True
+            return "dense-witness", {"candidate_trace_ids": tuple(batch)}
+
+    class Analytics:
+        calls = 0
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.calls += 1
+            assert query == "dense-witness"
+            assert 1 <= len(params["candidate_trace_ids"]) <= 10
+            assert timeout_ms == 3_000
+            assert settings["max_execution_time"] == 3
+            assert settings["max_threads"] == 1
+            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            assert settings["max_result_rows"] == len(params["candidate_trace_ids"])
+            replayed = []
+            for trace_id in params["candidate_trace_ids"]:
+                suffix = trace_id.removeprefix("trace-")
+                replayed.append(
+                    {
+                        "trace_id": trace_id,
+                        "root_span_id": f"root-{suffix}",
+                        "start_time": witness_start,
+                        "filter_witness_0": (f"span-{suffix}", witness_start),
+                    }
+                )
+            return QueryResult(replayed, len(replayed), "clickhouse", 0.0)
+
+    monkeypatch.setattr(
+        row_resolver,
+        "time",
+        SimpleNamespace(monotonic=lambda: 0.0),
+    )
+    analytics = Analytics()
+    replayed = row_resolver._replay_historical_trace_filter_witnesses(
+        analytics,
+        builder=Builder(),
+        rows=rows,
+        phase_one_query_count=1,
+        read_started=0.0,
+        ui_filters=[_attribute_filter("final_status", "Rejected")],
+        project_id=PROJECT_ID,
+        witness_batch_size=10,
+        witness_wall_ms_per_query=3_500,
+        witness_read_settings={
+            **row_resolver._EVAL_TASK_FILTER_CLASSIFY_READ_SETTINGS,
+            **row_resolver._EVAL_TASK_TRACE_WITNESS_EXTRA_READ_SETTINGS,
+        },
+        max_query_count=10_001,
+        total_deadline_seconds=150 * 60,
+        aggregate_deadline_only=True,
+    )
+
+    assert analytics.calls == 10_000
+    assert len(replayed) == 100_000
+    assert replayed[0]["trace_id"] == "trace-000000"
+    assert replayed[-1]["trace_id"] == "trace-099999"
 
 
 def test_trace_eval_witness_routes_to_workflow_before_interactive_replay_cap(
@@ -1223,6 +1335,15 @@ def test_trace_eval_witness_routes_to_workflow_before_interactive_replay_cap(
     def fake_read(**kwargs):
         assert kwargs["max_query_count"] == 32_768
         assert kwargs["workflow_exact"] is True
+        assert kwargs["deadline_ms"] == 170 * 60 * 1000
+        assert kwargs["classify_batch_size"] == 10
+        assert kwargs["builder"]._bounded_include_filter_witnesses is True
+        assert "max_rows_to_read" not in kwargs["read_settings"]
+        assert "max_block_size" not in kwargs["read_settings"]
+        assert kwargs["classify_read_settings"] == {
+            "max_block_size": 2_048,
+            "max_rows_to_read": 5_000_000,
+        }
         return BoundedFilterPage(
             rows=[],
             has_more=False,
@@ -1261,6 +1382,207 @@ def test_trace_eval_witness_routes_to_workflow_before_interactive_replay_cap(
     assert result.ids == ()
 
 
+@pytest.mark.parametrize(
+    ("limit", "rejected"),
+    [(100_000, False), (100_010, True)],
+)
+def test_workflow_one_phase_witness_bound_includes_exact_has_more_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int,
+    rejected: bool,
+) -> None:
+    calls = 0
+
+    def fake_read(**kwargs):
+        nonlocal calls
+        calls += 1
+        assert kwargs["workflow_exact"] is True
+        assert kwargs["classify_batch_size"] == 10
+        return BoundedFilterPage(
+            rows=[],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=0,
+            elapsed_ms=1,
+            query_count=1,
+            rows_returned=0,
+            result_payload_bytes=0,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+    kwargs = {
+        "analytics": object(),
+        "sql": None,
+        "params": None,
+        "project_id": PROJECT_ID,
+        "salt": "task-salt",
+        "sampling_rate": 100.0,
+        "filters": {
+            "filters": [_attribute_filter("final_status", "Rejected")],
+            "date_range": [START, END],
+        },
+        "limit": limit,
+        "batch_size": limit,
+        "row_type": RowType.TRACES,
+        "include_trace_filter_witnesses": True,
+    }
+
+    if rejected:
+        with pytest.raises(
+            row_resolver.EvalTaskReadBudgetExceeded,
+            match="Narrow the time range",
+        ):
+            row_resolver._resolve_bounded_historical_span_ids(**kwargs)
+        assert calls == 0
+    else:
+        result = row_resolver._resolve_bounded_historical_span_ids(**kwargs)
+        assert result.ids == ()
+        assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "malformed_field",
+    ["root_span_id", "filter_witness_0", "project_id"],
+)
+def test_workflow_one_phase_trace_witnesses_fail_closed_on_malformed_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_field: str,
+) -> None:
+    witness_start = END - timedelta(minutes=1)
+    row = {
+        "project_id": PROJECT_ID,
+        "trace_id": "trace-a",
+        "root_span_id": "root-a",
+        "start_time": witness_start,
+        "filter_witness_0": ("span-status", witness_start),
+    }
+    if malformed_field == "project_id":
+        row[malformed_field] = "another-project"
+    else:
+        row.pop(malformed_field)
+
+    def fake_read(**kwargs):
+        assert kwargs["workflow_exact"] is True
+        assert kwargs["builder"]._bounded_include_filter_witnesses is True
+        return BoundedFilterPage(
+            rows=[row],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=1,
+            elapsed_ms=1,
+            query_count=2,
+            rows_returned=1,
+            result_payload_bytes=100,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="Narrow the time range",
+    ):
+        row_resolver._resolve_bounded_historical_span_ids(
+            object(),
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "filters": [_attribute_filter("final_status", "Rejected")],
+                "date_range": [START, END],
+            },
+            limit=41,
+            batch_size=41,
+            row_type=RowType.TRACES,
+            include_trace_filter_witnesses=True,
+        )
+
+
+def test_workflow_one_phase_late_classifier_failure_never_returns_partial_rows() -> (
+    None
+):
+    witness_start = END - timedelta(minutes=1)
+    source_rows = {
+        f"trace-{index:02d}": {
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index:02d}",
+            "root_span_id": f"root-{index:02d}",
+            "start_time": witness_start - timedelta(seconds=index),
+        }
+        for index in range(15)
+    }
+
+    class LateFailureAnalytics:
+        classify_calls = 0
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            assert timeout_ms <= 3_000
+            assert settings["max_threads"] == 1
+            assert settings["max_memory_usage"] == 256 * 1024 * 1024
+            assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+            candidate_ids = params.get("candidate_trace_ids")
+            if candidate_ids is not None:
+                self.classify_calls += 1
+                assert "filter_witness_0" in query
+                assert len(candidate_ids) <= 10
+                if self.classify_calls == 2:
+                    raise TimeoutError("simulated late workflow classifier timeout")
+                rows = [
+                    {
+                        **source_rows[trace_id],
+                        "filter_witness_0": (
+                            f"span-{trace_id}",
+                            source_rows[trace_id]["start_time"],
+                        ),
+                    }
+                    for trace_id in candidate_ids
+                ]
+                return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+            rows = [
+                row
+                for row in source_rows.values()
+                if params["filter_slice_start"]
+                <= row["start_time"]
+                < params["filter_slice_end"]
+            ]
+            return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+    analytics = LateFailureAnalytics()
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="Narrow the time range",
+    ):
+        row_resolver._resolve_bounded_historical_span_ids(
+            analytics,
+            sql=None,
+            params=None,
+            project_id=PROJECT_ID,
+            salt="task-salt",
+            sampling_rate=100.0,
+            filters={
+                "filters": [_attribute_filter("final_status", "Rejected")],
+                "date_range": [START, END],
+            },
+            limit=41,
+            batch_size=41,
+            row_type=RowType.TRACES,
+            include_trace_filter_witnesses=True,
+        )
+    assert analytics.classify_calls == 2
+
+
 def test_trace_eval_witness_replay_never_returns_a_partial_second_phase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1270,7 +1592,7 @@ def test_trace_eval_witness_replay_never_returns_a_partial_second_phase(
             "root_span_id": f"root-{index:02d}",
             "start_time": END - timedelta(seconds=index),
         }
-        for index in range(101)
+        for index in range(15)
     ]
 
     monkeypatch.setattr(
@@ -1293,8 +1615,12 @@ def test_trace_eval_witness_replay_never_returns_a_partial_second_phase(
     class SecondBatchFails:
         calls = 0
 
-        def execute_ch_query(self, _query, params, **_kwargs):
+        def execute_ch_query(self, _query, params, *, timeout_ms, settings):
             self.calls += 1
+            assert len(params["candidate_trace_ids"]) <= 10
+            assert timeout_ms == 3_000
+            assert settings["max_block_size"] == 2_048
+            assert settings["max_result_rows"] == len(params["candidate_trace_ids"])
             if self.calls == 2:
                 raise ValueError("simulated bounded replay failure")
             replayed = [
@@ -1325,8 +1651,8 @@ def test_trace_eval_witness_replay_never_returns_a_partial_second_phase(
                 "filters": [_attribute_filter("final_status", "Rejected")],
                 "date_range": [START, END],
             },
-            limit=25,
-            batch_size=25,
+            limit=15,
+            batch_size=15,
             row_type=RowType.TRACES,
             include_trace_filter_witnesses=True,
         )
@@ -1690,8 +2016,8 @@ def test_task_at_10k_routes_directly_to_bounded_selector_without_legacy_sql(
     ("row_type", "include_witnesses", "interactive_limit", "workflow_limit"),
     [
         (RowType.SESSIONS, False, 5_799, 5_800),
-        (RowType.VOICE_CALLS, False, 5_799, 5_800),
-        (RowType.TRACES, True, 1_600, 1_601),
+        (RowType.VOICE_CALLS, False, 1_249, 1_250),
+        (RowType.TRACES, True, 40, 41),
     ],
 )
 def test_eval_task_switches_envelope_at_exact_mechanical_query_boundary(

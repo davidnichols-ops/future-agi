@@ -118,7 +118,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
   const [page, setPage] = useState(1);
   const [pageLimit, setPageLimit] = useState(15);
   const [totalPages, setTotalPages] = useState(1);
-  const [, advanceCursorTransport] = useState(0);
+  const [cursorTransportRevision, advanceCursorTransport] = useState(0);
   const cursorPagination = useRef(
     createListCursorPagination({ pageParam: "page", pageOffset: 1 }),
   );
@@ -210,13 +210,22 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     }),
     [],
   );
+  const bufferedPage =
+    module === "project"
+      ? cursorPagination.current.bufferedVisiblePage(page - 1)
+      : null;
   const paginationRequest =
     module === "project"
       ? {
           generation: cursorPagination.current.generation(),
-          params: cursorPagination.current.requestParams(page - 1, {
-            page_size: pageLimit,
-          }),
+          // Terminal overflow is already buffered by the preceding visible
+          // page and intentionally has no continuation cursor.
+          params:
+            bufferedPage?.metadata?.has_more === false
+              ? undefined
+              : cursorPagination.current.requestParams(page - 1, {
+                  page_size: pageLimit,
+                }),
         }
       : { generation: null, params: undefined };
   const { data, isLoading, error, queryKey } = useCallLogs({
@@ -227,8 +236,13 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     pageLimit,
     params,
     paginationParams: paginationRequest.params,
+    paginationRevision: cursorTransportRevision,
+    cursorPagination:
+      module === "project" ? cursorPagination.current : undefined,
+    paginationGeneration: paginationRequest.generation,
     enabled,
   });
+  const exactPage = data?.__exactPage || data?.result?.__exactPage || null;
   const readState = useMemo(
     () => getQueryReadState(data, { isError: Boolean(error) }),
     [data, error],
@@ -239,9 +253,11 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
   );
   const hasCursorContinuation =
     module === "project" &&
-    data?.has_more === true &&
-    typeof data?.next_cursor === "string" &&
-    data.next_cursor.length > 0;
+    (exactPage
+      ? exactPage.pending === true || exactPage.isLastPage === false
+      : data?.has_more === true &&
+        typeof data?.next_cursor === "string" &&
+        data.next_cursor.length > 0);
   const hasCursorContract =
     module === "project" &&
     typeof data?.has_more === "boolean" &&
@@ -266,6 +282,14 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
       return;
     }
     try {
+      if (exactPage) {
+        if (exactPage.pending) {
+          // The helper retained rows plus the signed checkpoint on this same
+          // visible page. Change the query key and resume it immediately.
+          advanceCursorTransport((revision) => revision + 1);
+        }
+        return;
+      }
       if (responseRows.length === 0 && hasCursorContinuation) {
         cursorPagination.current.recordEmptyContinuation(page - 1, data);
         // Keep the same visible pagination page. The project query key includes
@@ -289,6 +313,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
   }, [
     data,
     error,
+    exactPage,
     hasCursorContinuation,
     isLoading,
     module,
@@ -300,7 +325,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
   useEffect(() => {
     if (!isLoading) {
       const reportedPages = Number(data?.total_pages) || 1;
-      const continuationFloor = data?.has_more === true ? page + 1 : page;
+      const continuationFloor = hasCursorContinuation ? page + 1 : page;
       setTotalPages(
         isUsableListRead
           ? Math.max(
@@ -315,6 +340,7 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     data?.has_more,
     data?.total_pages,
     hasCursorContract,
+    hasCursorContinuation,
     isLoading,
     isUsableListRead,
     page,
@@ -361,7 +387,12 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
 
   // Prefetch next page so pagination feels instant
   useEffect(() => {
-    if (isUsableListRead && responseRows.length > 0 && page < totalPages) {
+    if (
+      isUsableListRead &&
+      responseRows.length > 0 &&
+      page < totalPages &&
+      (!exactPage || exactPage.canPrefetch)
+    ) {
       const nextPaginationParams =
         module === "project"
           ? cursorPagination.current.requestParams(page, {
@@ -376,6 +407,13 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
         pageLimit,
         params,
         paginationParams: nextPaginationParams,
+        paginationRevision: cursorTransportRevision,
+        cursorPagination:
+          module === "project" ? cursorPagination.current : undefined,
+        paginationGeneration:
+          module === "project"
+            ? cursorPagination.current.generation()
+            : undefined,
       });
     }
   }, [
@@ -388,6 +426,8 @@ const CallLogsGrid = React.forwardRef(function CallLogsGrid(
     selectedVersion,
     pageLimit,
     params,
+    exactPage,
+    cursorTransportRevision,
     isUsableListRead,
     responseRows.length,
   ]);

@@ -204,6 +204,53 @@ describe("SessionGrid cursor continuation", () => {
     });
   });
 
+  it("fills a short nonterminal page and carries overflow into page N", async () => {
+    getMock
+      .mockResolvedValueOnce(
+        sessionResponse({
+          rows: [row(1)],
+          hasMore: true,
+          nextCursor: "after-1",
+          lowerBound: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        sessionResponse({
+          rows: Array.from({ length: 25 }, (_, index) => row(index + 2)),
+          hasMore: true,
+          nextCursor: "after-26",
+          lowerBound: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        sessionResponse({
+          rows: [row(27), row(28)],
+          hasMore: false,
+          nextCursor: null,
+          totalRows: 28,
+        }),
+      );
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const firstPage = makeParams();
+    await getRows(firstPage);
+    expect(firstPage.success).toHaveBeenCalledWith({
+      rowData: Array.from({ length: 25 }, (_, index) => row(index + 1)),
+      rowCount: -1,
+    });
+
+    const secondPage = makeParams({ startRow: 25 });
+    await getRows(secondPage);
+    expect(secondPage.success).toHaveBeenCalledWith({
+      rowData: [row(26), row(27), row(28)],
+      rowCount: 28,
+    });
+    expect(getMock.mock.calls[2][1].params).toEqual(
+      expect.objectContaining({ cursor: "after-26", cursor_mode: true }),
+    );
+  });
+
   it("resumes the same visible page after the bounded continuation round", async () => {
     Array.from({ length: 13 }, (_, index) =>
       sessionResponse({

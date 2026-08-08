@@ -90,11 +90,14 @@ _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE = 80
 # Structured span attributes are decoded from ``span_attributes_raw`` during
 # latest-state replay.  They can also be combined with the native typed Maps,
 # so even the normal 80-trace identity batch can make ClickHouse materialize too
-# many ColumnMap/JSON vectors at once.  Keep those classifiers on the existing
-# production-safe twenty-trace envelope and reduce their input block fourfold.
-# This changes only physical query chunking; every candidate still goes through
-# the same exact latest-state predicate before it can enter a public page.
-_STRUCTURED_ANY_SPAN_CLASSIFY_BATCH_SIZE = _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE
+# many ColumnMap/JSON vectors at once.  Keep those classifiers on the smaller
+# production-qualified envelope and reduce their input block fourfold. This
+# changes only physical query chunking; every candidate still goes through the
+# same exact latest-state predicate before it can enter a public page.
+# The ten-candidate envelope was qualified on the largest production tenant;
+# larger structured batches can exceed the bounded statement profile. Ten
+# keeps identical predicates and order and changes only physical chunking.
+_STRUCTURED_ANY_SPAN_CLASSIFY_BATCH_SIZE = 10
 _STRUCTURED_CLASSIFY_MAX_BLOCK_SIZE = 2_048
 
 # A long-window list gets a small, partitioned sparse-value proof before it
@@ -477,6 +480,35 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 config.get("filter_value", config.get("filterValue")),
             )
             if filter_type in {"array", "map"}:
+                count += 1
+        return count
+
+    def _custom_span_attribute_filter_count(self) -> int:
+        """Count filters that replay custom typed-Map/JSON span state."""
+
+        filter_builder_cls = self._FILTER_BUILDER_CLS
+        promoted_system_keys = set(getattr(filter_builder_cls, "SYSTEM_METRIC_MAP", {}))
+        for mapping_name in (
+            "VOICE_SYSTEM_METRIC_EXPRS",
+            "VOICE_SYSTEM_METRIC_STR_MAP",
+            "VOICE_SYSTEM_METRIC_STR_EXPRS",
+        ):
+            promoted_system_keys.update(getattr(filter_builder_cls, mapping_name, {}))
+
+        count = 0
+        for item in self._bounded_match_filters():
+            if not isinstance(item, dict):
+                continue
+            key = item.get("column_id") or item.get("columnId")
+            if not key or key in {"created_at", "start_time"}:
+                continue
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            if not isinstance(config, dict):
+                continue
+            col_type = str(
+                config.get("col_type") or config.get("colType") or ""
+            ).upper()
+            if col_type == "SPAN_ATTRIBUTE" and key not in promoted_system_keys:
                 count += 1
         return count
 
@@ -987,13 +1019,12 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Keep the candidate-trace latest-state scan below CH's memory ceiling."""
 
         plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
-        if self._structured_attribute_filter_count() and not self._bounded_bulk_scan:
-            # Interactive trace lists and graphs otherwise widen identity-only
-            # classification to 80. Structured JSON/Map replay must stay on
-            # the twenty-trace envelope even when a scalar leaf supplies an
-            # indexed seed. Internal eval/task bulk scans retain their
-            # separately qualified 100-identity population-proof envelope so
-            # a complete 10k+sentinel proof still fits under 128 queries.
+        if self._custom_span_attribute_filter_count():
+            # Custom attributes replay typed-Map or JSON overflow state for
+            # every physical span of each candidate trace. Keep list, graph,
+            # and eval/task classifiers on the same qualified ten-trace
+            # envelope. Built-in denormalized metrics retain their wider
+            # indexed paths.
             return _STRUCTURED_ANY_SPAN_CLASSIFY_BATCH_SIZE
         if (
             not self._bounded_population_proof
@@ -1434,15 +1465,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         """Return the production-safe exact batch behind optional witnesses.
 
         The probe may be unavailable on a locked profile, fail one temporal
-        stratum, or find a broad value. Normal hydrated lists and
-        membership-only bulk evals use the independently qualified
-        100-identity classifier; normal hydrated lists use the safer
-        80-identity interactive envelope. Other internal any-span shapes
-        retain the smaller 20-identity envelope.
+        stratum, or find a broad value. Custom span attributes retain the
+        ten-identity classifier behind this optional optimization. Built-in
+        and internal modes keep their independently bounded envelopes.
         """
 
         if self._candidate_witness_anchor_plan() is None:
             return None
+        if self._custom_span_attribute_filter_count():
+            return _STRUCTURED_ANY_SPAN_CLASSIFY_BATCH_SIZE
         if self.supports_filter_candidate_witness_prefilter_without_hydration():
             return _BULK_IDENTITY_CLASSIFY_BATCH_SIZE
         if not self._bounded_identity_only and not self._bounded_internal_scan:

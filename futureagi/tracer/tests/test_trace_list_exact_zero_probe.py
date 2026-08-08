@@ -146,7 +146,9 @@ def test_generic_trace_positive_zero_probe_falls_back_to_exact_bounded_scan():
             self.results = [
                 [{"trace_id": "raw-witness-is-not-public"}],
                 candidates,
-                candidates,
+                candidates[:10],
+                candidates[10:20],
+                candidates[20:],
                 hydrated,
             ]
 
@@ -178,9 +180,11 @@ def test_generic_trace_positive_zero_probe_falls_back_to_exact_bounded_scan():
         "zero_probe",
         "anchor",
         "classify",
+        "classify",
+        "classify",
         "hydrate",
     ]
-    assert len(executor.calls) == 4
+    assert len(executor.calls) == 6
 
 
 @pytest.mark.unit

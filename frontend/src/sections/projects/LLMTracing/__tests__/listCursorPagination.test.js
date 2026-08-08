@@ -1,15 +1,44 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  collectExactListRows,
   createListCursorPagination,
   followEmptyListContinuations,
   getEmptyListContinuation,
+  loadExactListPage,
   listContinuationParams,
   LIST_CURSOR_MODES,
   resumeEmptyListPage,
+  resumePendingListPage,
 } from "../listCursorPagination";
 
 describe("list cursor pagination", () => {
+  const exactResponse = (rows, hasMore, nextCursor) => ({
+    rows,
+    metadata: { has_more: hasMore, next_cursor: nextCursor },
+  });
+
+  const loadExactPage = ({
+    pagination,
+    pageNumber = 0,
+    responses,
+    targetRowCount = 25,
+    ...options
+  }) => {
+    let responseIndex = 0;
+    return loadExactListPage({
+      pagination,
+      pageNumber,
+      targetRowCount,
+      loadResponse: async () => responses[responseIndex++],
+      nextResponse: async () => responses[responseIndex++],
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      rowIdentity: (row) => row.id,
+      ...options,
+    });
+  };
+
   it("opts page zero into cursor mode while preserving page-zero compatibility", () => {
     const pagination = createListCursorPagination();
 
@@ -348,5 +377,220 @@ describe("list cursor pagination", () => {
       pagination.canRecoverFromContinuationError(1, mixedVersionError),
     ).toBe(true);
     expect(pagination.mode()).toBe(LIST_CURSOR_MODES.CURSOR);
+  });
+
+  it("fills a visible page from non-empty short transport responses", async () => {
+    const pagination = createListCursorPagination();
+    const page = await loadExactPage({
+      pagination,
+      responses: [
+        exactResponse([{ id: 1 }], true, "after-1"),
+        exactResponse(
+          Array.from({ length: 24 }, (_, index) => ({ id: index + 2 })),
+          false,
+          null,
+        ),
+      ],
+    });
+
+    expect(page.rows.map(({ id }) => id)).toEqual(
+      Array.from({ length: 25 }, (_, index) => index + 1),
+    );
+    expect(page.pending).toBe(false);
+    expect(page.isLastPage).toBe(true);
+  });
+
+  it("carries overflow into the next visible page without a skip", async () => {
+    const pagination = createListCursorPagination();
+    const firstPage = await loadExactPage({
+      pagination,
+      responses: [
+        exactResponse([{ id: 1 }], true, "after-1"),
+        exactResponse(
+          Array.from({ length: 25 }, (_, index) => ({ id: index + 2 })),
+          true,
+          "after-26",
+        ),
+      ],
+    });
+
+    expect(firstPage.rows.map(({ id }) => id)).toEqual(
+      Array.from({ length: 25 }, (_, index) => index + 1),
+    );
+    expect(pagination.requestParams(1, { page_size: 25 }).cursor).toBe(
+      "after-26",
+    );
+
+    const secondPage = await loadExactPage({
+      pagination,
+      pageNumber: 1,
+      responses: [exactResponse([{ id: 27 }, { id: 28 }], false, null)],
+    });
+    expect(secondPage.rows.map(({ id }) => id)).toEqual([26, 27, 28]);
+    expect(secondPage.isLastPage).toBe(true);
+  });
+
+  it("publishes terminal overflow on the next page without another request", async () => {
+    const pagination = createListCursorPagination();
+    const firstPage = await loadExactPage({
+      pagination,
+      responses: [
+        exactResponse([{ id: 1 }], true, "after-1"),
+        exactResponse(
+          Array.from({ length: 25 }, (_, index) => ({ id: index + 2 })),
+          false,
+          null,
+        ),
+      ],
+    });
+    expect(firstPage.isLastPage).toBe(false);
+    expect(firstPage.canPrefetch).toBe(false);
+
+    const loadResponse = vi.fn();
+    const secondPage = await loadExactListPage({
+      pagination,
+      pageNumber: 1,
+      targetRowCount: 25,
+      loadResponse,
+      nextResponse: vi.fn(),
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      rowIdentity: (row) => row.id,
+    });
+    expect(loadResponse).not.toHaveBeenCalled();
+    expect(secondPage.rows).toEqual([{ id: 26 }]);
+    expect(secondPage.isLastPage).toBe(true);
+  });
+
+  it("publishes a full nonterminal overflow page without an eager transport request", async () => {
+    const pagination = createListCursorPagination();
+    const firstPage = await loadExactPage({
+      pagination,
+      responses: [
+        exactResponse(
+          Array.from({ length: 50 }, (_, index) => ({ id: index + 1 })),
+          true,
+          "after-50",
+        ),
+      ],
+    });
+    expect(firstPage.rows).toHaveLength(25);
+    expect(firstPage.isLastPage).toBe(false);
+
+    const loadResponse = vi.fn();
+    const secondPage = await loadExactListPage({
+      pagination,
+      pageNumber: 1,
+      targetRowCount: 25,
+      loadResponse,
+      nextResponse: vi.fn(),
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      rowIdentity: (row) => row.id,
+    });
+    expect(loadResponse).not.toHaveBeenCalled();
+    expect(secondPage.rows.map(({ id }) => id)).toEqual(
+      Array.from({ length: 25 }, (_, index) => index + 26),
+    );
+    expect(secondPage.isLastPage).toBe(false);
+    expect(pagination.requestParams(2, { page_size: 25 }).cursor).toBe(
+      "after-50",
+    );
+  });
+
+  it("deduplicates a replayed boundary row by stable identity", async () => {
+    const pagination = createListCursorPagination();
+    const page = await loadExactPage({
+      pagination,
+      targetRowCount: 2,
+      responses: [
+        exactResponse([{ id: 1 }], true, "after-1"),
+        exactResponse([{ id: 1 }, { id: 2 }], false, null),
+      ],
+    });
+
+    expect(page.rows).toEqual([{ id: 1 }, { id: 2 }]);
+  });
+
+  it("resumes an accumulated short page after the local hop bound", async () => {
+    const pagination = createListCursorPagination();
+    const pendingPage = await loadExactPage({
+      pagination,
+      targetRowCount: 3,
+      maxContinuations: 1,
+      responses: [
+        exactResponse([{ id: 1 }], true, "after-1"),
+        exactResponse([{ id: 2 }], true, "after-2"),
+      ],
+    });
+    expect(pendingPage.pending).toBe(true);
+    expect(pagination.requestParams(0, { page_size: 3 }).cursor).toBe(
+      "after-2",
+    );
+
+    const resume = vi.fn();
+    expect(
+      resumePendingListPage({
+        page: pendingPage,
+        resume,
+        schedule: (callback) => callback(),
+      }),
+    ).toBe(true);
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    const completedPage = await loadExactPage({
+      pagination,
+      targetRowCount: 3,
+      responses: [exactResponse([{ id: 3 }], false, null)],
+    });
+    expect(completedPage.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+    expect(completedPage.isLastPage).toBe(true);
+  });
+
+  it("fails closed when a non-empty continuation repeats its cursor", async () => {
+    const pagination = createListCursorPagination();
+    await expect(
+      loadExactPage({
+        pagination,
+        targetRowCount: 3,
+        responses: [
+          exactResponse([{ id: 1 }], true, "same"),
+          exactResponse([{ id: 2 }], true, "same"),
+        ],
+      }),
+    ).rejects.toThrow("repeated continuation cursor");
+  });
+
+  it("collects an exact fixed-size preview across short responses", async () => {
+    const responses = [
+      exactResponse([{ id: 1 }], true, "after-1"),
+      exactResponse([{ id: 2 }, { id: 3 }], true, "after-3"),
+    ];
+    const page = await collectExactListRows({
+      initialResponse: responses[0],
+      targetRowCount: 3,
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      nextResponse: async () => responses[1],
+      rowIdentity: (row) => row.id,
+    });
+    expect(page.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+    expect(page.pending).toBe(false);
+  });
+
+  it("returns resumable rows and cursor when a preview hits its hop bound", async () => {
+    const page = await collectExactListRows({
+      initialResponse: exactResponse([{ id: 2 }], true, "after-2"),
+      initialRows: [{ id: 1 }],
+      targetRowCount: 4,
+      maxContinuations: 1,
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      nextResponse: async () => exactResponse([{ id: 3 }], true, "after-3"),
+      rowIdentity: (row) => row.id,
+    });
+    expect(page.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+    expect(page.pending).toBe(true);
+    expect(page.nextCursor).toBe("after-3");
   });
 });

@@ -24,9 +24,9 @@ import NoRowsOverlay from "src/sections/project-detail/CompareDrawer/NoRowsOverl
 import { APP_CONSTANTS } from "src/utils/constants";
 import {
   createListCursorPagination,
-  followEmptyListContinuations,
   LIST_CURSOR_MODES,
-  resumeEmptyListPage,
+  loadExactListPage,
+  resumePendingListPage,
 } from "../LLMTracing/listCursorPagination";
 import {
   failServerSideGridRead,
@@ -49,6 +49,11 @@ const getUsersGridThemeParams = (theme) => ({
   headerTextColor: theme.palette.text.primary,
   rowHoverColor: "rgba(120,87,252,0.04)",
 });
+
+const userRowIdentity = (row) => {
+  const id = row?.end_user_id || row?.user_id || row?.id;
+  return id ? `${row?.project_id || ""}:${id}` : null;
+};
 
 const UsersGrid = React.memo(
   ({
@@ -311,29 +316,35 @@ const UsersGrid = React.memo(
             const buildParams = (page) =>
               cursorPagination.current.requestParams(page, buildBaseParams());
 
-            let results = await axios.get(endpoints.project.getUsersList(), {
-              params: buildParams(pageNumber),
-            });
+            let results;
+            let exactPage = null;
             if (useCursorPagination) {
-              results = await followEmptyListContinuations({
-                initialResponse: results,
+              exactPage = await loadExactListPage({
+                pagination: cursorPagination.current,
+                pageNumber,
+                targetRowCount: pageSize,
+                loadResponse: () =>
+                  axios.get(endpoints.project.getUsersList(), {
+                    params: buildParams(pageNumber),
+                  }),
                 rowsFromResponse: (response) =>
                   response?.data?.result?.table || [],
                 metadataFromResponse: (response) =>
                   response?.data?.result?.metadata ||
                   response?.data?.result ||
                   {},
-                onContinuation: (metadata) =>
-                  cursorPagination.current.recordEmptyContinuation(
-                    pageNumber,
-                    metadata,
-                  ),
+                rowIdentity: userRowIdentity,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
                 nextResponse: () =>
                   axios.get(endpoints.project.getUsersList(), {
                     params: buildParams(pageNumber),
                   }),
+              });
+              results = exactPage.response;
+            } else {
+              results = await axios.get(endpoints.project.getUsersList(), {
+                params: buildParams(pageNumber),
               });
             }
             if (!cursorPagination.current.isCurrent(requestGeneration)) {
@@ -342,14 +353,11 @@ const UsersGrid = React.memo(
             }
 
             const res = results?.data?.result || {};
-            const userData = res?.table || [];
+            const userData = exactPage?.rows || res?.table || [];
             if (
               useCursorPagination &&
-              resumeEmptyListPage({
-                rows: userData,
-                metadata: res,
-                pagination: cursorPagination.current,
-                pageNumber,
+              resumePendingListPage({
+                page: exactPage,
                 resume: () => {
                   if (cursorPagination.current.isCurrent(requestGeneration)) {
                     params.fail();
@@ -374,15 +382,8 @@ const UsersGrid = React.memo(
               Number.isFinite(reportedTotal) && reportedTotal >= 0
                 ? Math.floor(reportedTotal)
                 : request.startRow + userData.length;
-            if (useCursorPagination) {
-              cursorPagination.current.recordResponse(pageNumber, res);
-            }
             const isLastPage = useCursorPagination
-              ? cursorPagination.current.isLastPage(
-                  res,
-                  userData.length,
-                  pageSize,
-                )
+              ? exactPage.isLastPage
               : Number.isFinite(reportedTotal) && reportedTotal >= 0
                 ? request.startRow + userData.length >= total
                 : userData.length < pageSize;

@@ -50,12 +50,18 @@ import {
 } from "src/utils/queryReadState";
 import {
   createListCursorPagination,
-  followEmptyListContinuations,
-  resumeEmptyListPage,
+  loadExactListPage,
+  resumePendingListPage,
 } from "./listCursorPagination";
 import { getListTotalState } from "./listTotalMetadata";
 
 const ROWS_LIMIT = 25;
+const spanRowIdentity = (row) => {
+  const id = row?.span_id || row?.id;
+  return id
+    ? `${row?.project_id || ""}:${row?.trace_id || ""}:${id}:${row?.start_time || ""}`
+    : null;
+};
 
 const getSpanListColumnDefs = (col) => {
   const colId = col?.id;
@@ -471,23 +477,20 @@ const SpanGrid = React.forwardRef(
               // Use prefetched data if available, otherwise fetch
               const cached = prefetchCache.current.get(pageNumber);
               prefetchCache.current.delete(pageNumber);
-              let results =
-                cached ||
-                (await axios.get(
-                  endpoints.project.getSpansForObserveProject(),
-                  { params: buildParams(pageNumber) },
-                ));
-              results = await followEmptyListContinuations({
-                initialResponse: results,
+              const exactPage = await loadExactListPage({
+                pagination: cursorPagination.current,
+                pageNumber,
+                targetRowCount: ROWS_LIMIT,
+                loadResponse: () =>
+                  cached ||
+                  axios.get(endpoints.project.getSpansForObserveProject(), {
+                    params: buildParams(pageNumber),
+                  }),
                 rowsFromResponse: (response) =>
                   response?.data?.result?.table || [],
                 metadataFromResponse: (response) =>
                   response?.data?.result?.metadata || {},
-                onContinuation: (metadata) =>
-                  cursorPagination.current.recordEmptyContinuation(
-                    pageNumber,
-                    metadata,
-                  ),
+                rowIdentity: spanRowIdentity,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
                 nextResponse: () =>
@@ -502,15 +505,13 @@ const SpanGrid = React.forwardRef(
                 return;
               }
 
+              const results = exactPage.response;
               const res = results?.data?.result;
-              const rows = res?.table || [];
-              const metadata = res?.metadata || {};
+              const rows = exactPage.rows;
+              const metadata = exactPage.metadata;
               if (
-                resumeEmptyListPage({
-                  rows,
-                  metadata,
-                  pagination: cursorPagination.current,
-                  pageNumber,
+                resumePendingListPage({
+                  page: exactPage,
                   resume: () => {
                     if (cursorPagination.current.isCurrent(requestGeneration)) {
                       params.fail();
@@ -592,7 +593,6 @@ const SpanGrid = React.forwardRef(
                 }
               }
 
-              cursorPagination.current.recordResponse(pageNumber, metadata);
               const totalState = getListTotalState(metadata);
               params.api.totalRowCount = totalState.totalRowCount;
               params.api.totalRowCountLowerBound =
@@ -602,11 +602,7 @@ const SpanGrid = React.forwardRef(
               useSpanGridStore.setState(totalState);
 
               // Infinite-scroll: don't expose total upfront → scrollbar grows as you scroll
-              const isLastPage = cursorPagination.current.isLastPage(
-                metadata,
-                rows.length,
-                ROWS_LIMIT,
-              );
+              const isLastPage = exactPage.isLastPage;
               const lastRow = isLastPage ? request.startRow + rows.length : -1;
 
               params.success({
@@ -615,7 +611,7 @@ const SpanGrid = React.forwardRef(
               });
 
               // Prefetch next page so scroll feels instant
-              if (!isLastPage) {
+              if (exactPage.canPrefetch) {
                 axios
                   .get(endpoints.project.getSpansForObserveProject(), {
                     params: buildParams(pageNumber + 1),

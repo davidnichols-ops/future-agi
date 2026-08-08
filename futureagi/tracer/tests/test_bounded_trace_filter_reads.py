@@ -313,7 +313,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.filter_seed_proves_result_order() is False
     assert builder.filter_cursor_seed_keyset_is_safe() is True
     assert builder.recommended_filter_seed_batch_size() == 512
-    assert builder.recommended_filter_classify_batch_size() == 80
+    assert builder.recommended_filter_classify_batch_size() == 10
     assert builder.recommended_filter_initial_slice_width() == timedelta(hours=1)
 
 
@@ -482,7 +482,7 @@ def test_long_window_trace_uses_exact_latest_anchor_over_full_root_batch() -> No
     )
 
     assert builder.recommended_filter_seed_batch_size() == 512
-    assert builder.recommended_filter_classify_batch_size() == 80
+    assert builder.recommended_filter_classify_batch_size() == 10
     assert builder.skip_full_window_filter_anchor_probe() is True
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
@@ -491,7 +491,7 @@ def test_long_window_trace_uses_exact_latest_anchor_over_full_root_batch() -> No
     assert builder.prefer_filter_candidate_witness_probe_first() is False
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
-        == 80
+        == 10
     )
     assert builder.recommended_filter_page_hydration_reserve_ms() == 750
     assert builder.recommended_filter_classify_read_settings() is None
@@ -538,7 +538,7 @@ def test_structured_trace_classifier_uses_memory_safe_batch_and_block(
         ],
     )
 
-    assert builder.recommended_filter_classify_batch_size() == 20
+    assert builder.recommended_filter_classify_batch_size() == 10
     assert builder.recommended_filter_classify_read_settings() == {
         "max_block_size": 2_048
     }
@@ -573,27 +573,29 @@ def test_extreme_structured_multifilter_keeps_scalar_fast_path_independent() -> 
         ],
     )
 
-    assert simple_builder.recommended_filter_classify_batch_size() == 80
+    assert simple_builder.recommended_filter_classify_batch_size() == 10
     assert simple_builder.recommended_filter_classify_read_settings() is None
-    assert structured_builder.recommended_filter_classify_batch_size() == 20
+    assert structured_builder.recommended_filter_classify_batch_size() == 10
     assert structured_builder.recommended_filter_classify_read_settings() == {
         "max_block_size": 2_048
     }
 
 
 @pytest.mark.parametrize(
-    ("include_filter_witnesses", "population_proof"),
-    [(False, False), (True, True)],
+    ("include_filter_witnesses", "population_proof", "fallback_batch"),
+    [(False, False, 10), (True, True, None)],
     ids=["normal", "population-proof"],
 )
-def test_structured_eval_bulk_retains_population_proof_batch_and_block_cap(
+def test_structured_eval_bulk_uses_safe_batch_and_block_cap(
     include_filter_witnesses: bool,
     population_proof: bool,
+    fallback_batch: int | None,
 ) -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[
             _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
             _attribute_filter(
                 "payload",
                 {"state": "Rejected"},
@@ -607,10 +609,41 @@ def test_structured_eval_bulk_retains_population_proof_batch_and_block_cap(
         bounded_population_proof=population_proof,
     )
 
-    assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_classify_batch_size() == 10
     assert builder.recommended_filter_classify_read_settings() == {
         "max_block_size": 2_048
     }
+    assert (
+        builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
+        == fallback_batch
+    )
+
+
+def test_customer_scalar_custom_attributes_use_ten_trace_batches_everywhere() -> None:
+    filters = [
+        _time_filter(),
+        _attribute_filter("call.total_turns", 2, filter_type="number"),
+        _attribute_filter(
+            "conversation.transcript.16.message.role",
+            ["assistant"],
+            operation="in",
+        ),
+    ]
+    interactive = TraceListQueryBuilder(project_id=PROJECT_ID, filters=filters)
+    bulk = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=filters,
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+    )
+
+    assert interactive.recommended_filter_classify_batch_size() == 10
+    assert bulk.recommended_filter_classify_batch_size() == 10
+    assert (
+        bulk.recommended_filter_candidate_witness_fallback_classify_batch_size() == 10
+    )
 
 
 @pytest.mark.parametrize(
@@ -673,7 +706,7 @@ def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
     assert builder.recommended_filter_candidate_witness_probe_total_ms() is None
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
-        == 80
+        == 10
     )
 
     slice_start = START + timedelta(days=100)
@@ -868,7 +901,7 @@ def test_eval_trace_any_span_classifier_uses_production_safe_batch() -> None:
     # Acquiring identity-only roots is cheap; latest-state any-span replay is
     # the high-read phase and must be split independently.
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 20
+    assert builder.recommended_filter_classify_batch_size() == 10
     assert builder.skip_full_window_filter_anchor_probe() is True
     assert builder.recommended_filter_anchor_probe_limit() is None
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None
@@ -893,7 +926,7 @@ def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() ->
         bounded_include_filter_witnesses=False,
     )
 
-    assert builder.recommended_filter_classify_batch_size() == 100
+    assert builder.recommended_filter_classify_batch_size() == 10
     assert (
         builder.supports_filter_candidate_witness_prefilter_without_hydration() is True
     )
@@ -909,7 +942,7 @@ def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() ->
     assert builder.recommended_filter_candidate_witness_probe_strata() == 1
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
-        == 100
+        == 10
     )
     probe_sql, probe_params = builder.build_filter_candidate_witness_probe(
         [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
@@ -1132,7 +1165,7 @@ def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
     assert anchor_params["latest_filter_key_0"] == "final_status"
     assert "latest_filter_param_1" not in anchor_params
     assert builder.recommended_filter_seed_batch_size() == 200
-    assert builder.recommended_filter_classify_batch_size() == 20
+    assert builder.recommended_filter_classify_batch_size() == 10
 
 
 def test_trace_candidate_classifier_prunes_to_request_partitions() -> None:
@@ -1240,7 +1273,7 @@ def test_existing_identity_only_trace_consumer_does_not_add_page_hydration() -> 
     assert builder.use_identity_only_filter_classification() is False
     # Graph/eval/task callers set this mode explicitly and retain their
     # established 50-row envelope; only normal list pages use 100.
-    assert builder.recommended_filter_classify_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 10
     assert "canonical_root_identity.1 AS root_span_id" in sql
     assert "canonical_root_identity.2 AS start_time" in sql
     assert "filter_witness_0" in sql
@@ -2404,7 +2437,7 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
     assert "SELECT id\n" not in match_sql
     assert match_params["candidate_trace_ids"] == ("trace-a",)
     assert builder.filter_seed_proves_result_order() is False
-    assert builder.recommended_filter_classify_batch_size() == 50
+    assert builder.recommended_filter_classify_batch_size() == 10
 
 
 def test_trace_candidate_classifier_enforces_production_proven_512_trace_cap() -> None:
@@ -4609,6 +4642,25 @@ class _WideInitialSliceFakeBuilder(_FakeBuilder):
         return timedelta(hours=1)
 
 
+@dataclass
+class _CursorZeroProbeWideInitialFakeBuilder(_WideInitialSliceFakeBuilder):
+    @staticmethod
+    def supports_filter_exact_zero_probe() -> bool:
+        return True
+
+    @staticmethod
+    def recommended_filter_exact_zero_probe_timeout_ms() -> int:
+        return 1_500
+
+    @staticmethod
+    def recommended_filter_exact_zero_probe_max_bytes() -> int:
+        return 256 * 1024 * 1024
+
+    @staticmethod
+    def build_filter_exact_zero_probe() -> tuple[str, dict[str, Any]]:
+        return "zero_probe", {}
+
+
 class _ClassifierSettingsFakeExecutor(_FakeExecutor):
     def __init__(self, builder: _FakeBuilder):
         super().__init__(builder)
@@ -6191,6 +6243,107 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
     assert "additional_table_filters" not in continuation_call["read_settings"]
 
 
+def test_voice_page_size_500_cursor_publishes_safe_exact_partial_chunk() -> None:
+    from tracer.views.trace import TraceView
+
+    started = END - timedelta(minutes=1)
+    bounded_page = BoundedFilterPage(
+        rows=[
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-a",
+                "root_span_id": "root-a",
+                "span_id": "root-a",
+                "start_time": started,
+                "end_time": started + timedelta(seconds=12),
+                "provider": "vapi",
+            }
+        ],
+        has_more=False,
+        complete=False,
+        status="degraded",
+        error_code="query_budget_exceeded",
+        total_rows_lower_bound=1,
+        elapsed_ms=4_500.0,
+        query_count=48,
+        rows_returned=501,
+        result_payload_bytes=8_192,
+        attempts=(),
+        continuation_slice_start=START,
+        continuation_slice_end=END,
+        continuation_before_start_time=started,
+        continuation_before_id="trace-a",
+    )
+    content_result = QueryResult(
+        data=[
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-a",
+                "span_id": "root-a",
+                "start_time": started,
+                "span_attributes": "{}",
+                "attrs_string": {},
+                "attrs_number": {},
+                "attrs_bool": {},
+                "provider": "vapi",
+            }
+        ],
+        row_count=1,
+        backend_used="clickhouse",
+        query_time_ms=1.0,
+    )
+    view = TraceView.__new__(TraceView)
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.return_value = content_result
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.views.trace.ObservabilityService.process_raw_logs",
+            return_value={"status": "completed"},
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded_page,
+        ) as bounded_reader,
+    ):
+        response = view._list_voice_calls_clickhouse(
+            _observe_trace_request({"cursor_mode": "true"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page": 1,
+                "page_size": 500,
+                "cursor_mode": True,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response.status_code == 200
+    assert [row["trace_id"] for row in response.data["results"]] == ["trace-a"]
+    assert response.data["query_complete"] is True
+    assert response.data["query_status"] == "complete"
+    assert "query_error_code" not in response.data
+    assert response.data["has_more"] is True
+    assert response.data["count_is_lower_bound"] is True
+    assert isinstance(response.data["next_cursor"], str)
+    assert bounded_reader.call_args.kwargs["page_size"] == 500
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is True
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
+
+
 def test_voice_first_page_explicit_sample_publishes_sanitized_degradation() -> None:
     from tracer.serializers.trace import TraceVoiceCallListResponseSerializer
     from tracer.views.trace import TraceView
@@ -7000,6 +7153,461 @@ def test_graph_only_incomplete_rows_do_not_change_exact_list_default() -> None:
         )
 
 
+def test_year_cursor_keeps_one_hour_seed_skips_zero_probe_and_resumes_exactly() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(minutes=5 * (index + 1)),
+        }
+        for index in range(6)
+    ]
+    first_builder = _CursorZeroProbeWideInitialFakeBuilder(
+        rows,
+        start=END - timedelta(days=365),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=2,
+        recommended_seed_batch_size=2,
+    )
+
+    class WidthBoundExecutor(_FakeExecutor):
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            assert query != "zero_probe"
+            if query == "seed" and params["slice_end"] - params[
+                "slice_start"
+            ] > timedelta(minutes=30):
+                self.calls.append((query, params))
+                raise ReadDeadlineExceeded("Code: 307. Memory limit exceeded")
+            return super().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+
+    first_executor = WidthBoundExecutor(first_builder)
+    first = read_bounded_filter_page(
+        builder=first_builder,
+        analytics=first_executor,
+        filters=[_time_filter(END - timedelta(days=365), END)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=8_000,
+        max_seed_attempts=2,
+        max_candidates=2,
+        max_query_count=50,
+        classify_batch_size=2,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    first_seed_params = first_executor.calls[0][1]
+    assert [query for query, _ in first_executor.calls] == ["seed", "seed", "match"]
+    assert first_seed_params["slice_start"] == END - timedelta(hours=1)
+    assert first_seed_params["slice_end"] == END
+    assert first.rows == []
+    assert first.complete is False
+    assert first.continuation_slice_start == END - timedelta(minutes=30)
+    assert first.continuation_slice_end == END
+    assert first.continuation_before_start_time == rows[1]["start_time"]
+    assert first.continuation_before_id == rows[1]["id"]
+
+    second_builder = _CursorZeroProbeWideInitialFakeBuilder(
+        rows,
+        start=END - timedelta(days=365),
+        end=END,
+        recommended_batch_size=2,
+        recommended_seed_batch_size=2,
+    )
+    second_executor = WidthBoundExecutor(second_builder)
+    second = read_bounded_filter_page(
+        builder=second_builder,
+        analytics=second_executor,
+        filters=[_time_filter(END - timedelta(days=365), END)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=8_000,
+        max_seed_attempts=2,
+        max_candidates=2,
+        max_query_count=50,
+        classify_batch_size=2,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+        continuation_slice_start=first.continuation_slice_start,
+        continuation_slice_end=first.continuation_slice_end,
+        continuation_before_start_time=first.continuation_before_start_time,
+        continuation_before_id=first.continuation_before_id,
+    )
+
+    assert second_executor.calls, second
+    second_seed_params = second_executor.calls[0][1]
+    assert second_seed_params["slice_start"] == END - timedelta(minutes=30)
+    assert second_seed_params["slice_end"] == END
+    assert second_seed_params["before_start_time"] == rows[1]["start_time"]
+    assert second_seed_params["before_id"] == rows[1]["id"]
+    assert [row["id"] for row in second.rows] == [rows[2]["id"], rows[3]["id"]]
+    first_candidate_ids = {
+        candidate_id
+        for query, params in first_executor.calls
+        if query == "match"
+        for candidate_id in params["candidate_ids"]
+    }
+    second_candidate_ids = {
+        candidate_id
+        for query, params in second_executor.calls
+        if query == "match"
+        for candidate_id in params["candidate_ids"]
+    }
+    assert first_candidate_ids == {rows[0]["id"], rows[1]["id"]}
+    assert second_candidate_ids == {row["id"] for row in rows[2:]}
+    assert first_candidate_ids.isdisjoint(second_candidate_ids)
+
+
+def test_year_cursor_empty_checkpoint_advances_page_n_without_repeating_slice() -> None:
+    class WidthBoundExecutor(_FakeExecutor):
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            assert query != "zero_probe"
+            if query == "seed" and params["slice_end"] - params[
+                "slice_start"
+            ] > timedelta(minutes=30):
+                self.calls.append((query, params))
+                raise ReadDeadlineExceeded("Code: 307. Memory limit exceeded")
+            return super().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+
+    rows = [
+        {
+            "id": "older-trace",
+            "root_span_id": "older-root",
+            "start_time": END - timedelta(minutes=90),
+        }
+    ]
+    first_builder = _CursorZeroProbeWideInitialFakeBuilder(
+        rows,
+        start=END - timedelta(days=365),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=2,
+        recommended_seed_batch_size=2,
+    )
+    first_executor = WidthBoundExecutor(first_builder)
+    first = read_bounded_filter_page(
+        builder=first_builder,
+        analytics=first_executor,
+        filters=[_time_filter(END - timedelta(days=365), END)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=8_000,
+        max_seed_attempts=2,
+        max_candidates=2,
+        max_query_count=50,
+        classify_batch_size=2,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    first_seed_params = first_executor.calls[0][1]
+    assert [query for query, _ in first_executor.calls] == ["seed", "seed"]
+    assert first_seed_params["slice_start"] == END - timedelta(hours=1)
+    assert first_seed_params["slice_end"] == END
+    assert first.rows == []
+    assert first.complete is False
+    assert first.continuation_slice_start is None
+    assert first.continuation_slice_end == END - timedelta(minutes=30)
+    assert first.continuation_before_start_time is None
+    assert first.continuation_before_id is None
+
+    second_builder = _CursorZeroProbeWideInitialFakeBuilder(
+        rows,
+        start=END - timedelta(days=365),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=2,
+        recommended_seed_batch_size=2,
+    )
+    second_executor = WidthBoundExecutor(second_builder)
+    second = read_bounded_filter_page(
+        builder=second_builder,
+        analytics=second_executor,
+        filters=[_time_filter(END - timedelta(days=365), END)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=8_000,
+        max_seed_attempts=2,
+        max_candidates=2,
+        max_query_count=50,
+        classify_batch_size=2,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+        continuation_slice_end=first.continuation_slice_end,
+    )
+
+    second_seed_params = second_executor.calls[0][1]
+    assert second_seed_params["slice_start"] == END - timedelta(minutes=90)
+    assert second_seed_params["slice_end"] == END - timedelta(minutes=30)
+    assert second.complete is False
+    assert second.rows == []
+    assert second.continuation_slice_start is None
+    assert second.continuation_slice_end == END - timedelta(minutes=60)
+
+
+def test_cursor_seed_uses_page_sentinel_and_ten_candidate_classify_batches() -> None:
+    rows = [
+        {
+            "id": f"trace-{index:02d}",
+            "root_span_id": f"root-{index:02d}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(30)
+    ]
+    builder = _CursorZeroProbeWideInitialFakeBuilder(
+        rows,
+        start=END - timedelta(days=365),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=10,
+        recommended_seed_batch_size=200,
+    )
+
+    class WidthBoundExecutor(_FakeExecutor):
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            assert query != "zero_probe"
+            if query == "seed" and params["slice_end"] - params[
+                "slice_start"
+            ] > timedelta(minutes=30):
+                self.calls.append((query, params))
+                raise ReadDeadlineExceeded("Code: 307. Memory limit exceeded")
+            return super().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+
+    executor = WidthBoundExecutor(builder)
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(END - timedelta(days=365), END)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=8_000,
+        max_seed_attempts=2,
+        max_candidates=200,
+        max_query_count=24,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert executor.calls[0][0] == "seed"
+    assert executor.calls[0][1]["limit"] == 26
+    classify_batches = [
+        params["candidate_ids"] for query, params in executor.calls if query == "match"
+    ]
+    assert [len(batch) for batch in classify_batches] == [10, 10, 6]
+    assert page.complete is False
+    assert page.continuation_slice_start == END - timedelta(minutes=30)
+    assert page.continuation_slice_end == END
+    assert page.continuation_before_start_time == rows[25]["start_time"]
+    assert page.continuation_before_id == rows[25]["id"]
+
+
+def test_year_empty_cursor_chain_is_gap_free_and_terminates() -> None:
+    request_start = END - timedelta(days=365)
+    cursor_start_time = None
+    cursor_order_token = None
+    continuation_slice_start = None
+    continuation_slice_end = None
+    continuation_before_start_time = None
+    continuation_before_id = None
+    seed_intervals: list[tuple[datetime, datetime]] = []
+    pages: list[BoundedFilterPage] = []
+
+    for _ in range(12):
+        builder = _CursorZeroProbeWideInitialFakeBuilder(
+            [],
+            start=request_start,
+            end=END,
+            recommended_batch_size=2,
+            recommended_seed_batch_size=2,
+        )
+        executor = _FakeExecutor(builder)
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(request_start, END)],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=8_000,
+            max_seed_attempts=24,
+            max_candidates=2,
+            max_query_count=50,
+            classify_batch_size=2,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+            cursor_start_time=cursor_start_time,
+            cursor_order_token=cursor_order_token,
+            continuation_slice_start=continuation_slice_start,
+            continuation_slice_end=continuation_slice_end,
+            continuation_before_start_time=continuation_before_start_time,
+            continuation_before_id=continuation_before_id,
+        )
+        pages.append(page)
+        assert all(query != "zero_probe" for query, _params in executor.calls)
+        seed_intervals.extend(
+            (params["slice_start"], params["slice_end"])
+            for query, params in executor.calls
+            if query == "seed"
+        )
+
+        if page.complete:
+            break
+
+        assert page.rows == []
+        assert page.has_more is False
+        assert page.continuation_slice_end is not None
+        if cursor_start_time is None:
+            # Empty transport chunks retain one public order boundary while
+            # the private scan checkpoint advances beneath it.
+            cursor_start_time = (
+                page.continuation_before_start_time or page.continuation_slice_end
+            )
+            cursor_order_token = page.continuation_before_id or "\U0010ffff"
+        continuation_slice_start = page.continuation_slice_start
+        continuation_slice_end = page.continuation_slice_end
+        continuation_before_start_time = page.continuation_before_start_time
+        continuation_before_id = page.continuation_before_id
+    else:
+        pytest.fail("year-long empty cursor chain did not terminate")
+
+    assert len(pages) == 10
+    assert all(not page.complete for page in pages[:-1])
+    assert pages[-1].complete is True
+    assert pages[-1].rows == []
+    assert pages[-1].has_more is False
+    assert pages[-1].continuation_slice_start is None
+    assert pages[-1].continuation_slice_end is None
+    assert pages[-1].continuation_before_start_time is None
+    assert pages[-1].continuation_before_id is None
+    assert seed_intervals[0][1] == END
+    assert seed_intervals[-1][0] == request_start
+    assert all(
+        newer_start == older_end
+        for (newer_start, _newer_end), (_older_start, older_end) in zip(
+            seed_intervals,
+            seed_intervals[1:],
+            strict=False,
+        )
+    )
+
+
+def test_cursor_chain_reaches_later_matches_without_duplicate_or_skip() -> None:
+    request_start = END - timedelta(days=120)
+    match_time = END - timedelta(days=50)
+    rows = [
+        {
+            "id": row_id,
+            "root_span_id": f"root-{row_id}",
+            "start_time": match_time - timedelta(microseconds=index),
+        }
+        for index, row_id in enumerate(("trace-c", "trace-b", "trace-a"))
+    ]
+    cursor_start_time = None
+    cursor_order_token = None
+    continuation_slice_start = None
+    continuation_slice_end = None
+    continuation_before_start_time = None
+    continuation_before_id = None
+    pages: list[BoundedFilterPage] = []
+    published_ids: list[str] = []
+
+    for _ in range(8):
+        builder = _CursorZeroProbeWideInitialFakeBuilder(
+            rows,
+            start=request_start,
+            end=END,
+            recommended_batch_size=2,
+            recommended_seed_batch_size=2,
+        )
+        executor = _FakeExecutor(builder)
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(request_start, END)],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=8_000,
+            max_seed_attempts=24,
+            max_candidates=3,
+            max_query_count=50,
+            classify_batch_size=3,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+            cursor_start_time=cursor_start_time,
+            cursor_order_token=cursor_order_token,
+            continuation_slice_start=continuation_slice_start,
+            continuation_slice_end=continuation_slice_end,
+            continuation_before_start_time=continuation_before_start_time,
+            continuation_before_id=continuation_before_id,
+        )
+        pages.append(page)
+        assert all(query != "zero_probe" for query, _params in executor.calls)
+        published_ids.extend(row["id"] for row in page.rows)
+
+        if page.complete and not page.has_more:
+            break
+
+        if page.rows:
+            cursor_start_time = page.rows[-1]["start_time"]
+            cursor_order_token = page.rows[-1]["id"]
+        elif cursor_start_time is None:
+            cursor_start_time = (
+                page.continuation_before_start_time or page.continuation_slice_end
+            )
+            cursor_order_token = page.continuation_before_id or "\U0010ffff"
+
+        if page.has_more:
+            continuation_slice_start = None
+            continuation_slice_end = None
+            continuation_before_start_time = None
+            continuation_before_id = None
+        else:
+            assert page.continuation_slice_end is not None
+            continuation_slice_start = page.continuation_slice_start
+            continuation_slice_end = page.continuation_slice_end
+            continuation_before_start_time = page.continuation_before_start_time
+            continuation_before_id = page.continuation_before_id
+    else:
+        pytest.fail("later-match cursor chain did not terminate")
+
+    assert len(pages) == 4
+    assert pages[0].rows == []
+    assert pages[0].complete is False
+    assert [row["id"] for row in pages[1].rows] == ["trace-c", "trace-b"]
+    assert pages[1].complete is True
+    assert pages[1].has_more is True
+    assert [row["id"] for row in pages[2].rows] == ["trace-a"]
+    assert pages[2].complete is False
+    assert pages[2].continuation_slice_end is not None
+    assert pages[3].rows == []
+    assert pages[3].complete is True
+    assert pages[3].has_more is False
+    assert published_ids == ["trace-c", "trace-b", "trace-a"]
+    assert len(published_ids) == len(set(published_ids))
+
+
 def test_bounded_continuation_resumes_after_last_fully_classified_seed_page() -> None:
     rows = _rows(1, 2, 3, 4, 5)
     builder = _FakeBuilder(
@@ -7081,10 +7689,11 @@ def test_empty_bounded_continuation_reserves_exact_checkpoint_tail() -> None:
     executor = _IdentityHydrationFakeExecutor(
         builder,
         clock=clock,
-        # The first batch is fully classified with 200 ms left before the
-        # classification deadline. That is enough for the old 25 ms admission
-        # check, but not enough for another production-scale ClickHouse read.
-        durations_ms={"seed": 700, "match_identity": 800},
+        # The first batch is fully classified with 500 ms left before the
+        # classification deadline. That would admit a short-token statement
+        # under the former 250 ms floor, but is not enough for the production
+        # classifier's complete 1.5-second statement envelope.
+        durations_ms={"seed": 500, "match_identity": 700},
     )
 
     with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
@@ -7113,8 +7722,56 @@ def test_empty_bounded_continuation_reserves_exact_checkpoint_tail() -> None:
     assert page.continuation_before_id == "span-1"
     assert [query for query, _ in executor.calls] == ["seed", "match_identity"]
     assert executor.timeouts[1][0] == "match_identity"
-    assert executor.timeouts[1][1] <= 1_000
-    assert page.elapsed_ms <= 1_500
+    assert executor.timeouts[1][1] == 1_200
+    assert page.elapsed_ms <= 1_200
+
+
+def test_cursor_commits_each_exact_classifier_sub_batch() -> None:
+    rows = [
+        {
+            "id": f"trace-{index:02d}",
+            "root_span_id": f"root-{index:02d}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(26)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        match_rows=[],
+        recommended_batch_size=10,
+        recommended_seed_batch_size=200,
+    )
+    clock = _ManualMonotonic()
+    executor = _IdentityHydrationFakeExecutor(
+        builder,
+        clock=clock,
+        durations_ms={"seed": 600, "match_identity": 700},
+    )
+
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter()],
+            key_field="id",
+            page_number=0,
+            page_size=25,
+            deadline_ms=2_600,
+            max_seed_attempts=3,
+            max_candidates=200,
+            max_query_count=12,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+        )
+
+    assert page.complete is False
+    assert page.rows == []
+    assert page.error_code == "deadline_exceeded"
+    assert page.continuation_slice_start is not None
+    assert page.continuation_slice_end is not None
+    assert page.continuation_before_start_time == rows[9]["start_time"]
+    assert page.continuation_before_id == rows[9]["id"]
+    assert [query for query, _ in executor.calls] == ["seed", "match_identity"]
 
 
 def test_partial_identity_cursor_page_is_hydrated_before_publication() -> None:
@@ -10011,6 +10668,96 @@ def test_identity_hydration_supports_the_api_page_size_500_envelope() -> None:
     assert page.query_count == 13
 
 
+def test_cursor_page_size_500_returns_exact_hydrated_chunks_without_repeats() -> None:
+    rows = [
+        {
+            "id": f"trace-{index:03d}",
+            "root_span_id": f"root-{index:03d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+            "trace_name": f"presented-{index:03d}",
+        }
+        for index in range(501)
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=10,
+        recommended_seed_batch_size=501,
+    )
+
+    numbered_executor = _IdentityHydrationFakeExecutor(builder)
+    numbered = read_bounded_filter_page(
+        builder=builder,
+        analytics=numbered_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=500,
+        deadline_ms=5_000,
+        max_query_count=4,
+    )
+    assert numbered.complete is False
+    assert numbered.rows == []
+    assert numbered.error_code == "page_depth_exceeded"
+    assert numbered.query_count == 0
+    assert numbered_executor.calls == []
+
+    first_executor = _IdentityHydrationFakeExecutor(builder)
+    first = read_bounded_filter_page(
+        builder=builder,
+        analytics=first_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=500,
+        deadline_ms=5_000,
+        max_query_count=4,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert first.complete is False
+    assert first.error_code == "query_budget_exceeded"
+    assert [row["id"] for row in first.rows] == [
+        f"trace-{index:03d}" for index in range(20)
+    ]
+    assert first.continuation_slice_start == builder.start
+    assert first.continuation_slice_end == builder.end
+    assert first.continuation_before_start_time == rows[19]["start_time"]
+    assert first.continuation_before_id == rows[19]["id"]
+    assert first.query_count == 4
+
+    second_executor = _IdentityHydrationFakeExecutor(builder)
+    second = read_bounded_filter_page(
+        builder=builder,
+        analytics=second_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=500,
+        deadline_ms=5_000,
+        max_query_count=4,
+        include_incomplete_rows=True,
+        cursor_start_time=first.rows[-1]["start_time"],
+        cursor_order_token=first.rows[-1]["id"],
+        continuation_slice_start=first.continuation_slice_start,
+        continuation_slice_end=first.continuation_slice_end,
+        continuation_before_start_time=first.continuation_before_start_time,
+        continuation_before_id=first.continuation_before_id,
+        bounded_continuation=True,
+    )
+
+    assert second.complete is False
+    assert second.error_code == "query_budget_exceeded"
+    assert [row["id"] for row in second.rows] == [
+        f"trace-{index:03d}" for index in range(20, 40)
+    ]
+    assert not ({row["id"] for row in first.rows} & {row["id"] for row in second.rows})
+    assert second.continuation_before_start_time == rows[39]["start_time"]
+    assert second.continuation_before_id == rows[39]["id"]
+
+
 def test_read_budget_failure_is_degraded_sanitized_and_not_retried() -> None:
     builder = _FakeBuilder([])
     executor = _FakeExecutor(
@@ -10082,6 +10829,60 @@ def test_eval_mode_halves_a_wide_timeout_and_still_covers_the_window() -> None:
     ]
     assert successful_seeds[0].slice_end == END
     assert successful_seeds[-1].slice_start == start
+
+
+def test_cursor_halves_a_wide_seed_failure_and_advances_exact_checkpoint() -> None:
+    start = END - timedelta(hours=2)
+    builder = _WideInitialSliceFakeBuilder([], start=start, end=END)
+
+    class WidthBoundExecutor(_FakeExecutor):
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            if query == "seed" and params["slice_end"] - params[
+                "slice_start"
+            ] > timedelta(minutes=30):
+                self.calls.append((query, params))
+                raise ReadDeadlineExceeded("Code: 307. Memory limit exceeded")
+            return super().execute_ch_query(
+                query, params, timeout_ms=timeout_ms, settings=settings
+            )
+
+    executor = WidthBoundExecutor(builder)
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        max_seed_attempts=64,
+        max_query_count=64,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert page.rows == []
+    assert page.continuation_slice_start is None
+    assert page.continuation_slice_end is None
+    assert any(
+        attempt.error_code == "read_budget_exceeded" for attempt in page.attempts
+    )
+    successful_seeds = [
+        attempt
+        for attempt in page.attempts
+        if attempt.kind == "seed" and attempt.error_code is None
+    ]
+    successful_intervals = [
+        (attempt.slice_start, attempt.slice_end) for attempt in successful_seeds
+    ]
+    assert successful_intervals == [
+        (END - timedelta(minutes=30), END),
+        (END - timedelta(minutes=60), END - timedelta(minutes=30)),
+        (END - timedelta(minutes=90), END - timedelta(minutes=60)),
+        (start, END - timedelta(minutes=90)),
+    ]
+    assert len(successful_intervals) == len(set(successful_intervals))
 
 
 def test_programming_errors_are_not_hidden_as_read_budget_failures() -> None:

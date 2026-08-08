@@ -380,7 +380,7 @@ def test_voice_exact_zero_probe_rejects_single_or_structured_filter_shapes():
 
     assert single_filter.supports_filter_exact_zero_probe() is False
     assert structured_filter.supports_filter_exact_zero_probe() is False
-    assert structured_filter.recommended_filter_classify_batch_size() == 20
+    assert structured_filter.recommended_filter_classify_batch_size() == 10
 
 
 @pytest.mark.unit
@@ -465,7 +465,9 @@ def test_voice_bounded_reader_uses_identity_classification_before_page_hydration
             self.results = [
                 [{"trace_id": "raw-witness"}],
                 candidates,
-                candidates,
+                candidates[:10],
+                candidates[10:20],
+                candidates[20:],
                 hydrated,
             ]
 
@@ -502,6 +504,8 @@ def test_voice_bounded_reader_uses_identity_classification_before_page_hydration
         "zero_probe",
         "seed",
         "classify",
+        "classify",
+        "classify",
         "hydrate",
     ]
     assert "latest_trace_name AS trace_name" not in executor.calls[2][0]
@@ -512,7 +516,7 @@ def test_voice_bounded_reader_uses_identity_classification_before_page_hydration
         == "conversation.transcript.16.message.role"
     )
     assert executor.calls[2][1]["latest_filter_param_1"] == ("assistant",)
-    assert "latest_trace_name AS trace_name" in executor.calls[3][0]
+    assert "latest_trace_name AS trace_name" in executor.calls[5][0]
 
 
 @pytest.mark.unit
@@ -554,8 +558,6 @@ def test_voice_exact_zero_probe_returns_terminal_empty_without_seed_scan():
         page_number=0,
         page_size=25,
         deadline_ms=5_000,
-        include_incomplete_rows=True,
-        bounded_continuation=True,
     )
 
     assert page.complete is True
@@ -606,7 +608,13 @@ def test_voice_exact_zero_probe_failure_preserves_normal_exact_scan(probe_error)
 
         def __init__(self):
             self.calls = 0
-            self.results = [candidates, candidates, hydrated]
+            self.results = [
+                candidates,
+                candidates[:10],
+                candidates[10:20],
+                candidates[20:],
+                hydrated,
+            ]
 
         def execute_ch_query(self, query, params, **kwargs):
             self.calls += 1
@@ -639,6 +647,8 @@ def test_voice_exact_zero_probe_failure_preserves_normal_exact_scan(probe_error)
     assert [attempt.kind for attempt in page.attempts] == [
         "zero_probe",
         "seed",
+        "classify",
+        "classify",
         "classify",
         "hydrate",
     ]

@@ -130,6 +130,84 @@ describe("useCallLogs", () => {
     });
   });
 
+  it("fills one exact visible voice page across short cursor responses", async () => {
+    const pagination = createListCursorPagination({
+      pageParam: "page",
+      pageOffset: 1,
+    });
+    axiosMocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            results: [{ id: "call-1" }],
+            has_more: true,
+            next_cursor: "after-call-1",
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            results: Array.from({ length: 24 }, (_, index) => ({
+              id: `call-${index + 2}`,
+            })),
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      });
+
+    const paginationParams = pagination.requestParams(0, { page_size: 25 });
+    const { result } = renderHook(
+      () =>
+        useCallLogs({
+          module: "project",
+          id: "project-1",
+          page: 1,
+          pageLimit: 25,
+          params: { project_id: "project-1" },
+          paginationParams,
+          paginationRevision: 0,
+          cursorPagination: pagination,
+          paginationGeneration: pagination.generation(),
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.data?.results).toHaveLength(25));
+    expect(axiosMocks.get).toHaveBeenNthCalledWith(
+      1,
+      axiosMocks.projectGetCallLogs,
+      {
+        params: {
+          project_id: "project-1",
+          cursor_mode: true,
+          page: 1,
+          page_size: 25,
+        },
+      },
+    );
+    expect(axiosMocks.get).toHaveBeenNthCalledWith(
+      2,
+      axiosMocks.projectGetCallLogs,
+      {
+        params: {
+          project_id: "project-1",
+          page_size: 25,
+          cursor_mode: true,
+          cursor: "after-call-1",
+        },
+      },
+    );
+    expect(result.current.data.__exactPage).toEqual(
+      expect.objectContaining({
+        pending: false,
+        isLastPage: true,
+        canPrefetch: false,
+      }),
+    );
+  });
+
   it("does not prefetch agent call logs without an agent version", () => {
     const queryClient = { prefetchQuery: vi.fn() };
 
@@ -172,3 +250,4 @@ import {
   prefetchCallLogs,
   useCallLogs,
 } from "../helper";
+import { createListCursorPagination } from "src/sections/projects/LLMTracing/listCursorPagination";

@@ -21,12 +21,14 @@ _ABSOLUTE_MAX_CANDIDATES = 512
 _ABSOLUTE_MAX_QUERIES = 128
 # HTTP list/graph reads intentionally retain the 128-statement contract above.
 # Historical eval reconciliation runs as a heartbeating Temporal activity and
-# may need to select a genuine 100k-row prefix.  Its larger envelope is opt-in,
+# may need to select a genuine 100k-row prefix. Its larger envelope is opt-in,
 # still finite, and keeps every physical statement on the same 512-row,
-# single-threaded, 1.5-second ClickHouse limits.
+# single-threaded, caller-capped ClickHouse limits. Reconciliation owns a
+# three-hour activity timeout; this hard wall leaves ten minutes for buffered
+# validation, materializer hand-off, heartbeats, and scheduler jitter.
 _WORKFLOW_MAX_SEED_ATTEMPTS = 16_384
 _WORKFLOW_MAX_QUERIES = 32_768
-_WORKFLOW_MAX_DEADLINE_MS = 75 * 60 * 1000
+_WORKFLOW_MAX_DEADLINE_MS = 170 * 60 * 1000
 _SELECTIVE_ANCHOR_SENTINEL = 513
 _MAX_OPTIONAL_ANCHOR_STRATA = 4
 # Keep one slow-but-bounded statement within the client deadline so the next
@@ -34,11 +36,13 @@ _MAX_OPTIONAL_ANCHOR_STRATA = 4
 # at 0.79-1.26 s under load; the caller's wall deadline, query count, rows,
 # bytes, memory, and single-thread settings remain the authoritative envelope.
 _QUERY_TIMEOUT_MS = 1_500
-# Do not launch a resumable cursor statement with a token timeout so short that
-# transport/server scheduling alone can consume it. Production heavy-data reads
-# complete in roughly 160-350 ms under the guarded single-thread profile; below
-# this floor we return the last fully classified exact checkpoint instead.
-_BOUNDED_CONTINUATION_MIN_QUERY_HEADROOM_MS = 250
+_MAX_OPT_IN_QUERY_TIMEOUT_MS = 3_000
+# Do not launch a resumable cursor statement with less than its full bounded
+# statement envelope. A short-token final batch can time out even though an
+# exact signed checkpoint already exists. Returning that checkpoint is
+# deterministic and lets the next request resume without retrying or skipping
+# any candidate.
+_BOUNDED_CONTINUATION_MIN_QUERY_HEADROOM_MS = _QUERY_TIMEOUT_MS
 _CANDIDATE_WITNESS_PREFILTER_TIMEOUT_MS = 250
 _CANDIDATE_WITNESS_PREFILTER_MAX_BYTES = 96 * 1024 * 1024
 _CANDIDATE_WITNESS_PREFILTER_STRATA = 8
@@ -291,11 +295,13 @@ def read_bounded_filter_page(
     continuation_before_id: Any = None,
     bounded_continuation: bool = False,
     read_settings: dict[str, Any] | None = None,
+    classify_read_settings: dict[str, Any] | None = None,
     anchor_probe_only: bool = False,
     anchor_probe_limit: int | None = None,
     defer_classification: bool = False,
     graph_key_witness_probe: bool = False,
     workflow_exact: bool = False,
+    query_timeout_ms: int | None = None,
 ) -> BoundedFilterPage:
     """Return one exact numbered page or an explicit sanitized degradation.
 
@@ -325,6 +331,10 @@ def read_bounded_filter_page(
 
     if page_number < 0 or page_size <= 0 or deadline_ms <= 0:
         raise ValueError("page_number, page_size and deadline_ms must be positive")
+    if query_timeout_ms is None:
+        query_timeout_ms = _QUERY_TIMEOUT_MS
+    if not 25 <= query_timeout_ms <= _MAX_OPT_IN_QUERY_TIMEOUT_MS:
+        raise ValueError("query_timeout_ms exceeds the bounded read contract")
     query_contract_limit = (
         _WORKFLOW_MAX_QUERIES if workflow_exact else _ABSOLUTE_MAX_QUERIES
     )
@@ -426,7 +436,7 @@ def read_bounded_filter_page(
     if not 1 <= classify_batch_size <= max_candidates:
         raise ValueError("classify_batch_size exceeds max_candidates")
 
-    classify_read_settings: dict[str, int] = {}
+    effective_classify_read_settings: dict[str, int] = {}
     classify_settings_recommendation = getattr(
         builder, "recommended_filter_classify_read_settings", None
     )
@@ -448,7 +458,28 @@ def read_bounded_filter_page(
                     raise ValueError(
                         "recommended classify read settings must be positive integers"
                     )
-                classify_read_settings[setting_name] = setting_value
+                effective_classify_read_settings[setting_name] = setting_value
+    if classify_read_settings is not None:
+        if not isinstance(classify_read_settings, dict):
+            raise ValueError("classify read settings must be a dict")
+        unsupported_settings = set(classify_read_settings) - {
+            "max_block_size",
+            "max_rows_to_read",
+        }
+        if unsupported_settings:
+            raise ValueError("unsupported classify read setting")
+        for setting_name, raw_value in classify_read_settings.items():
+            if isinstance(raw_value, bool):
+                raise ValueError("classify read settings must be positive integers")
+            setting_value = int(raw_value)
+            if setting_value <= 0:
+                raise ValueError("classify read settings must be positive integers")
+            previous_cap = effective_classify_read_settings.get(setting_name)
+            effective_classify_read_settings[setting_name] = (
+                min(previous_cap, setting_value)
+                if previous_cap is not None
+                else setting_value
+            )
 
     started = monotonic()
     deadline = started + (deadline_ms / 1000)
@@ -777,12 +808,18 @@ def read_bounded_filter_page(
     seed_batch_recommendation = getattr(
         builder, "recommended_filter_seed_batch_size", None
     )
-    candidate_floor = min(
-        int(seed_batch_recommendation())
-        if callable(seed_batch_recommendation)
-        else recommended_batch_size or min(200, max_candidates),
-        max_candidates,
-    )
+    if bounded_continuation:
+        # A cursor can commit one exact ordered prefix and resume from its
+        # signed keyset. Keep each seed page to the requested page plus the
+        # has-more sentinel so a memory-heavy classifier can finish the whole
+        # seed page before the request deadline and publish a forward
+        # checkpoint instead of repeatedly rolling back 200 candidates.
+        requested_candidate_floor = prefix_needed
+    elif callable(seed_batch_recommendation):
+        requested_candidate_floor = int(seed_batch_recommendation())
+    else:
+        requested_candidate_floor = recommended_batch_size or min(200, max_candidates)
+    candidate_floor = min(requested_candidate_floor, max_candidates)
     if not 1 <= candidate_floor <= max_candidates:
         raise ValueError("recommended seed batch size exceeds max_candidates")
     candidate_limit = min(max_candidates, max(candidate_floor, prefix_needed))
@@ -800,7 +837,13 @@ def read_bounded_filter_page(
         "seed_batch_size": candidate_floor,
         "query_contract_limit": query_contract_limit,
     }
-    if bounded_numbered_page_depth_exceeded(
+    # Numbered pages must prove their entire requested prefix in one finite
+    # call. Cursor pages have a different exact contract: they may publish a
+    # shorter, fully classified prefix together with a signed checkpoint and
+    # resume the same visible page. Applying the numbered-page preflight here
+    # made an otherwise valid page_size=500 cursor fail before its first read
+    # when a custom-attribute classifier used the qualified ten-ID batches.
+    if not bounded_continuation and bounded_numbered_page_depth_exceeded(
         **page_depth_kwargs,
     ):
         return BoundedFilterPage(
@@ -1104,7 +1147,7 @@ def read_bounded_filter_page(
         if len(attempts) >= active_query_limit:
             raise _BudgetExceeded("query_budget_exceeded")
         attempt_started = monotonic()
-        statement_timeout_ms = min(_QUERY_TIMEOUT_MS, remaining_ms)
+        statement_timeout_ms = min(query_timeout_ms, remaining_ms)
         if timeout_cap_ms is not None:
             if timeout_cap_ms <= 0:
                 raise ValueError("query timeout cap must be positive")
@@ -1116,7 +1159,10 @@ def read_bounded_filter_page(
                 "max_result_rows": result_limit,
             }
             if kind == "classify":
-                for setting_name, setting_cap in classify_read_settings.items():
+                for (
+                    setting_name,
+                    setting_cap,
+                ) in effective_classify_read_settings.items():
                     settings[setting_name] = min(
                         int(settings.get(setting_name, setting_cap)),
                         setting_cap,
@@ -1257,6 +1303,8 @@ def read_bounded_filter_page(
         nonlocal candidate_witness_probe_attempt_count
         nonlocal candidate_witness_probe_enabled
         nonlocal candidate_witness_probe_started
+        nonlocal before_id
+        nonlocal before_start_time
 
         candidate_identities = list(candidate_seed_rows)
         if defer_classification:
@@ -1549,6 +1597,22 @@ def read_bounded_filter_page(
                     if monotonic() > classification_deadline:
                         raise _BudgetExceeded("deadline_exceeded")
 
+            if (
+                bounded_continuation
+                and stop_on_ordered_prefix
+                and identity_batch
+                and candidate_identities == list(candidate_seed_rows)
+            ):
+                # Each exact classifier chunk resolves one contiguous prefix
+                # of the ordered root seed. Commit that smaller prefix instead
+                # of rolling the whole seed page back when the next chunk has
+                # insufficient deadline headroom. This preserves exactness and
+                # prevents the next cursor request from repeating completed
+                # typed-Map/JSON work.
+                last_classified_seed = candidate_seed_rows[identity_batch[-1]]
+                before_start_time, before_id = seed_row_key(last_classified_seed)
+                checkpoint_continuation()
+
             if stop_on_ordered_prefix and len(matched_by_id) >= prefix_needed:
                 ordered_matches = sorted(
                     matched_by_id.values(), key=result_row_key, reverse=True
@@ -1677,6 +1741,11 @@ def read_bounded_filter_page(
         exact_zero_can_run = bool(
             probe_limits_enforced
             and not workflow_exact
+            # A cursor-mode list can publish a signed exact checkpoint after
+            # each finite seed/classify batch. Spending the optional proof's
+            # statement budget first only delays that guaranteed progress and
+            # can leave no checkpoint when a broad Map witness hits its cap.
+            and not bounded_continuation
             and not defer_classification
             and not graph_key_witness_probe
             and not anchor_probe_only
@@ -2082,7 +2151,12 @@ def read_bounded_filter_page(
                 scheduled_coverage += scheduled_width
                 scheduled_width = min(scheduled_width * 2, max_slice_width)
             active_width = slice_width
-            if scheduled_coverage < remaining_window:
+            # Cursor-mode scans are intentionally resumable across requests.
+            # Do not inflate their first finite slice merely to schedule the
+            # entire request window inside this request's attempt count; that
+            # turns a configured one-hour root seed into a multi-day read on
+            # year-scale projects and can fail before emitting a checkpoint.
+            if not bounded_continuation and scheduled_coverage < remaining_window:
                 active_width = max(active_width, remaining_window / remaining_attempts)
             if forced_width_cap is not None:
                 active_width = min(active_width, forced_width_cap)
@@ -2096,12 +2170,14 @@ def read_bounded_filter_page(
                 active_slice_start = slice_start
             active_width = slice_end - slice_start
 
+            seed_before_start_time = before_start_time
+            seed_before_id = before_id
             seed_query, seed_params = seed_page_builder(
                 slice_start=slice_start,
                 slice_end=slice_end,
                 limit=candidate_limit,
-                before_start_time=before_start_time,
-                before_id=before_id,
+                before_start_time=seed_before_start_time,
+                before_id=seed_before_id,
             )
             try:
                 seed_result = execute(
@@ -2113,7 +2189,11 @@ def read_bounded_filter_page(
                 )
             except _BudgetExceeded as exc:
                 if (
-                    retry_wide_read_budget
+                    # Cursor reads can safely retry a failed wide seed at a
+                    # narrower adjacent window without changing predicates or
+                    # publishing unclassified rows. This prevents a dense
+                    # initial slice from repeatedly returning the same token.
+                    (retry_wide_read_budget or bounded_continuation)
                     and exc.error_code == "read_budget_exceeded"
                     and active_width > _INITIAL_SLICE
                 ):
@@ -2213,7 +2293,10 @@ def read_bounded_filter_page(
                 if not seed_rows:
                     break
                 next_start_time, next_id = seed_row_key(seed_rows[-1])
-                if (next_start_time, next_id) == (before_start_time, before_id):
+                if (next_start_time, next_id) == (
+                    seed_before_start_time,
+                    seed_before_id,
+                ):
                     break
                 if bounded_continuation and pending_identity_candidates:
                     classify_or_buffer_seed_rows(
@@ -2258,9 +2341,9 @@ def read_bounded_filter_page(
         degraded_error_code = exc.error_code
         if bounded_continuation:
             # A classifier may have completed one sub-batch before the next
-            # sub-batch hits a cap. Roll the whole seed page back to the last
-            # committed checkpoint; the signed continuation will replay it,
-            # so no row can be skipped or published twice.
+            # sub-batch hits a cap. Roll unfinished work back to the last fully
+            # classified ordered prefix; the signed continuation resumes after
+            # it, so no row can be skipped or published twice.
             seen_seed_ids.clear()
             seen_seed_ids.update(safe_seen_seed_ids)
             seen_candidate_ids.clear()
@@ -2358,22 +2441,22 @@ def read_bounded_filter_page(
         deferred_candidate_rows=tuple(deferred_candidate_by_id.values()),
         classification_deferred=defer_classification,
         continuation_slice_start=(
-            active_slice_start
+            safe_active_slice_start
             if bounded_continuation and not page_complete and continuation_progressed
             else None
         ),
         continuation_slice_end=(
-            slice_end
+            safe_slice_end
             if bounded_continuation and not page_complete and continuation_progressed
             else None
         ),
         continuation_before_start_time=(
-            before_start_time
+            safe_before_start_time
             if bounded_continuation and not page_complete and continuation_progressed
             else None
         ),
         continuation_before_id=(
-            before_id
+            safe_before_id
             if bounded_continuation and not page_complete and continuation_progressed
             else None
         ),

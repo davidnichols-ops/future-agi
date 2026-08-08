@@ -32,8 +32,7 @@ import { PROJECT_SOURCE } from "src/utils/constants";
 import { getSafeActionErrorMessage } from "src/utils/errorUtils";
 import { canonicalEntries } from "src/utils/utils";
 import {
-  followEmptyListContinuations,
-  getEmptyListContinuation,
+  collectExactListRows,
   listContinuationParams,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
 
@@ -248,6 +247,20 @@ export const buildTracingVoicePreviewListParams = ({
   cursor_mode: true,
 });
 
+const tracingPreviewRowIdentity = (rowType, row) => {
+  if (rowType === "VoiceCall") {
+    return row?.call_id || row?.id || row?.trace_id || null;
+  }
+  if (rowType === "Session") {
+    return row?.session_id || row?.id || null;
+  }
+  if (rowType === "Trace") {
+    return row?.trace_id || row?.id || null;
+  }
+  const id = row?.span_id || row?.id;
+  return id ? `${row?.trace_id || ""}:${id}:${row?.start_time || ""}` : null;
+};
+
 const TracingTestMode = React.forwardRef(
   (
     {
@@ -366,7 +379,12 @@ const TracingTestMode = React.forwardRef(
     const [currentRowIndex, setCurrentRowIndex] = useState(0);
     const [loading, setLoading] = useState(false);
     const [listCursorRevision, advanceListCursor] = useState(0);
-    const listContinuationRef = useRef({ signature: null, cursor: null });
+    const listContinuationRef = useRef({
+      signature: null,
+      cursor: null,
+      rows: [],
+      requestedCursors: [],
+    });
     // Key the last-completed fetch so we can derive "is the current
     // selection stale w.r.t. the last fetch" at render time. React
     // effects run *after* paint, so tracking a `hasFetched` boolean
@@ -504,7 +522,12 @@ const TracingTestMode = React.forwardRef(
     // ── Fetch data when project or rowType changes ──
     useEffect(() => {
       if (!selectedProjectId) {
-        listContinuationRef.current = { signature: null, cursor: null };
+        listContinuationRef.current = {
+          signature: null,
+          cursor: null,
+          rows: [],
+          requestedCursors: [],
+        };
         setColumns([]);
         setRows([]);
         setTotalRows(0);
@@ -519,14 +542,46 @@ const TracingTestMode = React.forwardRef(
       let cancelled = false;
       const fetchKey = `${selectedProjectId}:${rowType}:${effectiveFilterKey}`;
       if (listContinuationRef.current.signature !== fetchKey) {
-        listContinuationRef.current = { signature: fetchKey, cursor: null };
+        listContinuationRef.current = {
+          signature: fetchKey,
+          cursor: null,
+          rows: [],
+          requestedCursors: [],
+        };
       }
       const startingCursor = listContinuationRef.current.cursor;
+      const startingRows = startingCursor
+        ? listContinuationRef.current.rows || []
+        : [];
+      const requestedCursors = new Set(
+        listContinuationRef.current.requestedCursors || [],
+      );
       let continuationPending = false;
 
       const fetchData = async () => {
         if (!startingCursor) setRows([]);
         try {
+          if (startingCursor) {
+            if (requestedCursors.has(startingCursor)) {
+              throw new Error(
+                "List API returned a repeated continuation cursor",
+              );
+            }
+            requestedCursors.add(startingCursor);
+          }
+          const recordContinuation = (metadata) => {
+            const nextCursor = metadata?.next_cursor;
+            if (
+              typeof nextCursor !== "string" ||
+              nextCursor.length === 0 ||
+              requestedCursors.has(nextCursor)
+            ) {
+              throw new Error(
+                "List API returned a repeated continuation cursor",
+              );
+            }
+            requestedCursors.add(nextCursor);
+          };
           if (rowType === "VoiceCall") {
             const requestParams = buildTracingVoicePreviewListParams({
               selectedProjectId,
@@ -535,11 +590,13 @@ const TracingTestMode = React.forwardRef(
             const initialParams = startingCursor
               ? listContinuationParams(requestParams, startingCursor)
               : requestParams;
-            let response = await axios.get(endpoints.project.getCallLogs, {
+            const response = await axios.get(endpoints.project.getCallLogs, {
               params: initialParams,
             });
-            response = await followEmptyListContinuations({
+            const exactRows = await collectExactListRows({
               initialResponse: response,
+              initialRows: startingRows,
+              targetRowCount: requestParams.page_size,
               rowsFromResponse: (nextResponse) => {
                 const result =
                   nextResponse?.data?.result || nextResponse?.data || {};
@@ -551,19 +608,31 @@ const TracingTestMode = React.forwardRef(
                 axios.get(endpoints.project.getCallLogs, {
                   params: listContinuationParams(requestParams, cursor),
                 }),
+              rowIdentity: (row) => tracingPreviewRowIdentity(rowType, row),
+              onContinuation: recordContinuation,
+              isCurrent: () => !cancelled,
             });
-            const { data } = response;
+            const { data } = exactRows.response;
             if (cancelled) return;
             const result = data?.result || data || {};
-            const rowsOut = result.results || result.data || result.calls || [];
-            const nextCursor = getEmptyListContinuation(rowsOut, result);
-            if (nextCursor) {
-              listContinuationRef.current.cursor = nextCursor;
+            const rowsOut = exactRows.rows;
+            if (exactRows.pending) {
+              listContinuationRef.current = {
+                signature: fetchKey,
+                cursor: exactRows.nextCursor,
+                rows: rowsOut,
+                requestedCursors: [...requestedCursors],
+              };
               continuationPending = true;
               advanceListCursor((revision) => revision + 1);
               return;
             }
-            listContinuationRef.current.cursor = null;
+            listContinuationRef.current = {
+              signature: fetchKey,
+              cursor: null,
+              rows: [],
+              requestedCursors: [],
+            };
             const nextReadState = getQueryReadState(data);
             setListReadState(
               rowsOut.length > 0 || nextReadState === "sampled"
@@ -599,9 +668,11 @@ const TracingTestMode = React.forwardRef(
             endpoint = endpoints.project.projectSessionList();
           }
 
-          let response = await axios.get(endpoint, { params: initialParams });
-          response = await followEmptyListContinuations({
+          const response = await axios.get(endpoint, { params: initialParams });
+          const exactRows = await collectExactListRows({
             initialResponse: response,
+            initialRows: startingRows,
+            targetRowCount: params.page_size,
             rowsFromResponse: (nextResponse) =>
               nextResponse?.data?.result?.table || [],
             metadataFromResponse: (nextResponse) =>
@@ -610,24 +681,33 @@ const TracingTestMode = React.forwardRef(
               axios.get(endpoint, {
                 params: listContinuationParams(params, cursor),
               }),
+            rowIdentity: (row) => tracingPreviewRowIdentity(rowType, row),
+            onContinuation: recordContinuation,
+            isCurrent: () => !cancelled,
           });
-          const { data } = response;
+          const { data } = exactRows.response;
           if (cancelled) return;
           const res = data?.result || {};
 
           const cols = res.config || [];
-          const tableRows = res.table || [];
-          const nextCursor = getEmptyListContinuation(
-            tableRows,
-            res.metadata || {},
-          );
-          if (nextCursor) {
-            listContinuationRef.current.cursor = nextCursor;
+          const tableRows = exactRows.rows;
+          if (exactRows.pending) {
+            listContinuationRef.current = {
+              signature: fetchKey,
+              cursor: exactRows.nextCursor,
+              rows: tableRows,
+              requestedCursors: [...requestedCursors],
+            };
             continuationPending = true;
             advanceListCursor((revision) => revision + 1);
             return;
           }
-          listContinuationRef.current.cursor = null;
+          listContinuationRef.current = {
+            signature: fetchKey,
+            cursor: null,
+            rows: [],
+            requestedCursors: [],
+          };
           const nextReadState = getQueryReadState(data);
           setListReadState(
             tableRows.length > 0 || nextReadState === "sampled"
@@ -642,7 +722,12 @@ const TracingTestMode = React.forwardRef(
           setCurrentRowIndex(0);
         } catch {
           if (cancelled) return;
-          listContinuationRef.current.cursor = null;
+          listContinuationRef.current = {
+            signature: fetchKey,
+            cursor: null,
+            rows: [],
+            requestedCursors: [],
+          };
           setListReadState("error");
           setColumns([]);
           setRows([]);

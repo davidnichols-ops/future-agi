@@ -5430,7 +5430,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         preflight_seed_batch_size = int(
             preflight_builder.recommended_filter_seed_batch_size()
         )
-        if bounded_numbered_page_depth_exceeded(
+        if not cursor_requested and bounded_numbered_page_depth_exceeded(
             page_number=page_number,
             page_size=page_size,
             classify_batch_size=preflight_classify_batch_size,
@@ -6030,6 +6030,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 ),
             )
             cursor_has_more = True
+        # A nonterminal cursor chunk is still an exact public result: every
+        # row is latest-state classified and the signed token resumes at the
+        # first unclassified root. Keep totals lower-bound until exhaustion,
+        # but do not expose the selector's internal finite-scan stop as a data
+        # error. Numbered allow_sampled compatibility retains its degraded
+        # metadata below because it has no exact continuation contract.
+        public_chunk_complete = bounded_page.complete or cursor_has_more
         response_data = {
             "count": total_count,
             "count_is_lower_bound": (
@@ -6042,12 +6049,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             "results": results,
             "config": column_config,
             "has_more": cursor_has_more if cursor_enabled else bounded_page.has_more,
-            "query_complete": bounded_page.complete,
-            "query_status": bounded_page.status,
+            "query_complete": public_chunk_complete,
+            "query_status": (
+                "complete" if public_chunk_complete else bounded_page.status
+            ),
         }
         if cursor_enabled:
             response_data["next_cursor"] = next_cursor
-        if bounded_page.error_code:
+        if bounded_page.error_code and not public_chunk_complete:
             response_data["query_error_code"] = bounded_page.error_code
         if response_data["count_is_lower_bound"] and exact_total_explicitly_required(
             request,

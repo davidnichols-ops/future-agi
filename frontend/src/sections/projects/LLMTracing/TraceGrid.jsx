@@ -44,13 +44,17 @@ import {
 } from "src/utils/queryReadState";
 import {
   createListCursorPagination,
-  followEmptyListContinuations,
-  resumeEmptyListPage,
+  loadExactListPage,
+  resumePendingListPage,
 } from "./listCursorPagination";
 import { getListReadMessage, getListTotalState } from "./listTotalMetadata";
 import { getTraceAttributeRequestKey } from "./traceAttributeRequest";
 
 const ROWS_LIMIT = 25;
+const traceRowIdentity = (row) => {
+  const id = row?.trace_id || row?.id;
+  return id ? `${row?.project_id || ""}:${id}` : null;
+};
 const EMPTY_EXTRA_FILTERS = [];
 
 const TraceGrid = React.forwardRef(
@@ -299,23 +303,20 @@ const TraceGrid = React.forwardRef(
               // Use prefetched data if available, otherwise fetch
               const cached = prefetchCache.current.get(pageNumber);
               prefetchCache.current.delete(pageNumber);
-              let results =
-                cached ||
-                (await axios.get(
-                  endpoints.project.getTracesForObserveProject(),
-                  { params: buildParams(pageNumber) },
-                ));
-              results = await followEmptyListContinuations({
-                initialResponse: results,
+              const exactPage = await loadExactListPage({
+                pagination: cursorPagination.current,
+                pageNumber,
+                targetRowCount: ROWS_LIMIT,
+                loadResponse: () =>
+                  cached ||
+                  axios.get(endpoints.project.getTracesForObserveProject(), {
+                    params: buildParams(pageNumber),
+                  }),
                 rowsFromResponse: (response) =>
                   response?.data?.result?.table || [],
                 metadataFromResponse: (response) =>
                   response?.data?.result?.metadata || {},
-                onContinuation: (metadata) =>
-                  cursorPagination.current.recordEmptyContinuation(
-                    pageNumber,
-                    metadata,
-                  ),
+                rowIdentity: traceRowIdentity,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
                 nextResponse: () =>
@@ -330,15 +331,13 @@ const TraceGrid = React.forwardRef(
                 return;
               }
 
+              const results = exactPage.response;
               const res = results?.data?.result;
-              const rows = res?.table || [];
-              const metadata = res?.metadata || {};
+              const rows = exactPage.rows;
+              const metadata = exactPage.metadata;
               if (
-                resumeEmptyListPage({
-                  rows,
-                  metadata,
-                  pagination: cursorPagination.current,
-                  pageNumber,
+                resumePendingListPage({
+                  page: exactPage,
                   resume: () => {
                     if (cursorPagination.current.isCurrent(requestGeneration)) {
                       params.fail();
@@ -417,7 +416,6 @@ const TraceGrid = React.forwardRef(
                 }
               }
 
-              cursorPagination.current.recordResponse(pageNumber, metadata);
               const totalState = getListTotalState(metadata);
               params.api.totalRowCount = totalState.totalRowCount;
               params.api.totalRowCountLowerBound =
@@ -429,11 +427,7 @@ const TraceGrid = React.forwardRef(
               // Infinite-scroll behavior: don't tell AG Grid the total upfront.
               // Use -1 (unknown) so it only extends the scrollbar as pages load.
               // When we get fewer rows than requested, that's the last page.
-              const isLastPage = cursorPagination.current.isLastPage(
-                metadata,
-                rows.length,
-                ROWS_LIMIT,
-              );
+              const isLastPage = exactPage.isLastPage;
               const lastRow = isLastPage ? request.startRow + rows.length : -1;
 
               params.success({
@@ -457,7 +451,7 @@ const TraceGrid = React.forwardRef(
               }, 0);
 
               // Prefetch next page so scroll feels instant
-              if (!isLastPage) {
+              if (exactPage.canPrefetch) {
                 axios
                   .get(endpoints.project.getTracesForObserveProject(), {
                     params: buildParams(pageNumber + 1),

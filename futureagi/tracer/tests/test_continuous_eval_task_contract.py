@@ -57,6 +57,18 @@ def _attribute_filter(key: str = "final_status", value: str = "Rejected") -> dic
     }
 
 
+def _structured_attribute_filter() -> dict:
+    return {
+        "column_id": "langfuse.trace.tags",
+        "filter_config": {
+            "col_type": "SPAN_ATTRIBUTE",
+            "filter_type": "array",
+            "filter_op": "contains",
+            "filter_value": ["vip"],
+        },
+    }
+
+
 def _continuous_task(project, custom_eval_config, *, cursor=True) -> EvalTask:
     now = timezone.now()
     task = EvalTask.objects.create(
@@ -520,6 +532,344 @@ def test_continuous_exact_empty_returns_full_proof_without_ch(
 class _FakeQueryResult:
     def __init__(self, data):
         self.data = data
+
+
+def _continuous_trace_task_for_filter(filter_item: dict) -> SimpleNamespace:
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    return SimpleNamespace(
+        project_id=uuid.uuid4(),
+        id=uuid.uuid4(),
+        run_type=RunType.CONTINUOUS,
+        row_type=RowType.TRACES,
+        continuous_cursor=now - timedelta(minutes=5),
+        start_time=now - timedelta(hours=1),
+        created_at=now - timedelta(hours=1),
+        filters={"filters": [filter_item]},
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("filter_item", "recommended_read_settings"),
+    [
+        (_attribute_filter(), None),
+        (_structured_attribute_filter(), {"max_block_size": 2_048}),
+    ],
+    ids=["scalar-map", "structured-json"],
+)
+def test_continuous_10k_custom_attribute_classifier_has_finite_exact_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    filter_item: dict,
+    recommended_read_settings: dict | None,
+) -> None:
+    """Batch ten can prove all 10k candidates without relaxing one query."""
+
+    ids = tuple(f"trace-{index:05d}" for index in range(10_000))
+    candidates = continuous_candidates.ContinuousCandidates(ids, ids)
+    clock = SimpleNamespace(value=0.0)
+    calls: list[dict] = []
+    builder_kwargs: dict = {}
+
+    class Builder:
+        def __init__(self, **kwargs):
+            builder_kwargs.update(kwargs)
+
+        @staticmethod
+        def supports_bounded_filter_scan() -> bool:
+            return True
+
+        @staticmethod
+        def recommended_filter_classify_batch_size() -> int:
+            return 10
+
+        @staticmethod
+        def recommended_filter_classify_read_settings():
+            return recommended_read_settings
+
+        @staticmethod
+        def build_filter_match_query(batch, *, candidate_full_state):
+            assert candidate_full_state is True
+            return "continuous_classifier", {"candidate_ids": tuple(batch)}
+
+    class Analytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            assert query == "continuous_classifier"
+            calls.append(
+                {
+                    "ids": params["candidate_ids"],
+                    "timeout_ms": timeout_ms,
+                    "settings": settings,
+                }
+            )
+            # Simulate a loaded but successful statement. The old fixed five
+            # second classifier window would fail during the fourth batch.
+            clock.value += 1.4
+            return _FakeQueryResult(
+                [
+                    {
+                        "trace_id": trace_id,
+                        "filter_witness_0": (
+                            f"span-{trace_id}",
+                            datetime(2026, 8, 8, 11, 0, tzinfo=UTC),
+                        ),
+                    }
+                    for trace_id in reversed(params["candidate_ids"])
+                ]
+            )
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        Analytics,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_v2_class",
+        lambda _query_type: Builder,
+    )
+    monkeypatch.setattr(
+        row_resolver,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock.value),
+    )
+
+    resolved = row_resolver._resolve_continuous_rows(
+        _continuous_trace_task_for_filter(filter_item),
+        ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        sampling_rate=100.0,
+    )
+
+    assert row_resolver._continuous_classifier_budget_ms(
+        candidate_count=10_000,
+        classify_size=10,
+    ) == (1_000, 3_505_000)
+    assert len(calls) == 1_000
+    assert all(len(call["ids"]) == 10 for call in calls)
+    assert all(call["timeout_ms"] == 3_000 for call in calls)
+    for call in calls:
+        settings = call["settings"]
+        assert settings["max_execution_time"] == 3
+        assert settings["timeout_overflow_mode"] == "throw"
+        assert settings["max_threads"] == 1
+        assert settings["max_memory_usage"] == 256 * 1024 * 1024
+        assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
+        assert settings["read_overflow_mode"] == "throw"
+        assert settings["max_result_rows"] == 10
+        assert settings["result_overflow_mode"] == "throw"
+        # The application-qualified block cap is universal for eval/task
+        # classifiers; a builder recommendation may only tighten it.
+        assert settings["max_block_size"] == 2_048
+    assert builder_kwargs["bounded_internal_scan"] is True
+    assert builder_kwargs["bounded_identity_only"] is True
+    assert builder_kwargs["bounded_bulk_scan"] is True
+    assert resolved.candidate_ids == ids
+    assert resolved.matched_ids == ids
+    assert resolved.full_state is False
+
+
+@pytest.mark.unit
+def test_continuous_classifier_query_cap_fails_before_first_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = tuple(f"trace-{index:05d}" for index in range(10_000))
+    candidates = continuous_candidates.ContinuousCandidates(ids, ids)
+    calls = 0
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan() -> bool:
+            return True
+
+        @staticmethod
+        def recommended_filter_classify_batch_size() -> int:
+            return 5
+
+        @staticmethod
+        def recommended_filter_classify_read_settings():
+            return None
+
+    class Analytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("preflight must reject before the first query")
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        Analytics,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_v2_class",
+        lambda _query_type: Builder,
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="exceeded its read budget",
+    ):
+        row_resolver._resolve_continuous_rows(
+            _continuous_trace_task_for_filter(_attribute_filter()),
+            ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+            sampling_rate=100.0,
+        )
+
+    assert calls == 0
+
+
+@pytest.mark.unit
+def test_continuous_late_classifier_failure_never_returns_partial_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = tuple(f"trace-{index:02d}" for index in range(25))
+    candidates = continuous_candidates.ContinuousCandidates(ids, ids)
+    calls = 0
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan() -> bool:
+            return True
+
+        @staticmethod
+        def recommended_filter_classify_batch_size() -> int:
+            return 10
+
+        @staticmethod
+        def recommended_filter_classify_read_settings():
+            return {"max_block_size": 2_048}
+
+        @staticmethod
+        def build_filter_match_query(batch, *, candidate_full_state):
+            assert candidate_full_state is True
+            return "continuous_classifier", {"candidate_ids": tuple(batch)}
+
+    class Analytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            nonlocal calls
+            calls += 1
+            assert timeout_ms == 3_000
+            if calls == 2:
+                raise TimeoutError("simulated second-batch timeout")
+            return _FakeQueryResult(
+                [{"trace_id": trace_id} for trace_id in params["candidate_ids"]]
+            )
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        Analytics,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_v2_class",
+        lambda _query_type: Builder,
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="exceeded its read budget",
+    ):
+        row_resolver._resolve_continuous_rows(
+            _continuous_trace_task_for_filter(_structured_attribute_filter()),
+            ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+            sampling_rate=100.0,
+        )
+
+    # The first ten matches were only local buffered state. No ResolvedRowSet
+    # escaped after the second statement invalidated the exact proof.
+    assert calls == 2
+
+
+@pytest.mark.unit
+def test_continuous_missing_later_filter_witness_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete ID set cannot escape with an incomplete witness matrix."""
+
+    ids = tuple(f"trace-{index:02d}" for index in range(15))
+    candidates = continuous_candidates.ContinuousCandidates(ids, ids)
+    calls = 0
+    witness_time = datetime(2026, 8, 8, 11, 0, tzinfo=UTC)
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan() -> bool:
+            return True
+
+        @staticmethod
+        def recommended_filter_classify_batch_size() -> int:
+            return 10
+
+        @staticmethod
+        def recommended_filter_classify_read_settings():
+            return {"max_block_size": 2_048}
+
+        @staticmethod
+        def build_filter_match_query(batch, *, candidate_full_state):
+            assert candidate_full_state is True
+            return "continuous_classifier", {"candidate_ids": tuple(batch)}
+
+    class Analytics:
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            nonlocal calls
+            calls += 1
+            assert query == "continuous_classifier"
+            assert timeout_ms == 3_000
+            rows = [
+                {
+                    "trace_id": trace_id,
+                    "filter_witness_0": (f"span-{trace_id}", witness_time),
+                }
+                for trace_id in params["candidate_ids"]
+            ]
+            if calls == 2:
+                rows[-1].pop("filter_witness_0")
+            return _FakeQueryResult(rows)
+
+    monkeypatch.setattr(
+        continuous_candidates,
+        "discover_continuous_candidates",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService",
+        Analytics,
+    )
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.v2.dispatch.get_v2_class",
+        lambda _query_type: Builder,
+    )
+
+    with pytest.raises(
+        row_resolver.EvalTaskReadBudgetExceeded,
+        match="exceeded its read budget",
+    ):
+        row_resolver._resolve_continuous_rows(
+            _continuous_trace_task_for_filter(_attribute_filter()),
+            ceiling=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+            sampling_rate=100.0,
+        )
+
+    assert calls == 2
 
 
 @pytest.mark.unit
