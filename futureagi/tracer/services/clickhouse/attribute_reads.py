@@ -135,6 +135,25 @@ ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT = timedelta(days=60)
 # inside this short statement budget, retry the *same* cursor position with the
 # ordinary six-hour slice; never publish speculative progress.
 ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS = 750
+# A continuation already owns an exact digest vocabulary.  Before falling back
+# to another physical duplicate walk, prove small adjacent latest-state slices
+# contain only values from that vocabulary.  The first page never uses this
+# path.  Start below the one-hour density that can exceed the project-wide
+# 500k-row envelope when no attribute-key predicate may legally run before
+# argMax, then grow successful proofs to a bounded two-hour slice.
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT = timedelta(minutes=15)
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT = timedelta(minutes=5)
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = timedelta(hours=2)
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 500
+# An unpinned physical page can require candidate, version certificate, typed
+# hydration and isolated JSON hydration.  Leave that full fallback available
+# when a speculative distinct proof cannot certify its slice.
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_QUERY_RESERVE = 4
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_WALL_RESERVE_MS = 3_000
+# Native query cancellation and driver delivery can overshoot a statement cap
+# slightly.  Keep a small scheduling margin in addition to the declared proof
+# timeout so the exact physical fallback still owns its full reserve.
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS = 100
 # De-duplication state lives in immutable server-side chunks.  The signed URL
 # therefore remains fixed width while pagination can continue until the frozen
 # physical window is exhausted; there is no vocabulary-count ceiling.
@@ -721,6 +740,97 @@ _ORDERED_TYPED_VALUE_CANDIDATE_SQL = """
         _version DESC
     LIMIT 1 BY project_id, trace_id, id, start_time
     LIMIT %(candidate_limit)s
+"""
+
+# Optional continuation accelerator for dense, low-cardinality attributes.
+# The inner aggregation deliberately sees every physical version in the slice:
+# filtering tombstones or key-bearing rows before argMax would resurrect a
+# cleared/deleted stale value.  The outer tagged value applies the same stable
+# typed-Map precedence as ``_decode_target_value``.  LIMIT is only an exact
+# result-cardinality sentinel; the ordinary read settings still bound the
+# identity aggregation and a failed/overflowing proof never advances a cursor.
+_VALUE_CURSOR_SEEN_SLICE_SQL = """
+    SELECT
+        value_type,
+        value_string,
+        value_number,
+        value_boolean,
+        value_json_raw,
+        toUInt64(count()) AS value_count
+    FROM
+    (
+        SELECT
+            multiIf(
+                tupleElement(latest_state, 2) != 0, 'string',
+                tupleElement(latest_state, 4) != 0, 'number',
+                tupleElement(latest_state, 6) != 0, 'boolean',
+                tupleElement(latest_state, 8) != 0, 'json',
+                ''
+            ) AS value_type,
+            if(
+                tupleElement(latest_state, 2) != 0,
+                tupleElement(latest_state, 3),
+                ''
+            ) AS value_string,
+            if(
+                tupleElement(latest_state, 2) = 0
+                    AND tupleElement(latest_state, 4) != 0,
+                tupleElement(latest_state, 5),
+                toFloat64(0)
+            ) AS value_number,
+            if(
+                tupleElement(latest_state, 2) = 0
+                    AND tupleElement(latest_state, 4) = 0
+                    AND tupleElement(latest_state, 6) != 0,
+                tupleElement(latest_state, 7),
+                toUInt8(0)
+            ) AS value_boolean,
+            if(
+                tupleElement(latest_state, 2) = 0
+                    AND tupleElement(latest_state, 4) = 0
+                    AND tupleElement(latest_state, 6) = 0
+                    AND tupleElement(latest_state, 8) != 0,
+                tupleElement(latest_state, 9),
+                ''
+            ) AS value_json_raw
+        FROM
+        (
+            SELECT
+                project_id,
+                trace_id,
+                id,
+                start_time,
+                argMax(
+                    tuple(
+                        is_deleted,
+                        mapContains(attrs_string, %(attribute_key)s),
+                        attrs_string[%(attribute_key)s],
+                        mapContains(attrs_number, %(attribute_key)s),
+                        attrs_number[%(attribute_key)s],
+                        mapContains(attrs_bool, %(attribute_key)s),
+                        attrs_bool[%(attribute_key)s],
+                        JSONHas(attributes_extra, %(attribute_key)s),
+                        JSONExtractRaw(attributes_extra, %(attribute_key)s)
+                    ),
+                    _version
+                ) AS latest_state
+            FROM spans AS attribute_source
+            PREWHERE project_id IN %(project_ids)s
+              AND start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)
+              AND start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)
+            WHERE ({frontier_predicate})
+            GROUP BY project_id, trace_id, id, start_time
+        )
+        WHERE tupleElement(latest_state, 1) = 0
+    )
+    WHERE value_type != ''
+    GROUP BY
+        value_type,
+        value_string,
+        value_number,
+        value_boolean,
+        value_json_raw
+    LIMIT %(distinct_limit)s
 """
 
 _LATEST_TARGET_SQL = """
@@ -1435,6 +1545,77 @@ class AttributeReadSelector:
                     versions[identity] = candidate_version
         return tuple(identities), truncated, versions
 
+    def _seen_value_slice_groups(
+        self,
+        *,
+        project_ids: tuple[str, ...],
+        attribute_key: str,
+        segment: tuple[datetime, datetime],
+        before_identity: PhysicalSpanIdentity | None,
+        distinct_limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return an exact finite latest-state vocabulary for one slice.
+
+        This is a speculative continuation accelerator, not a sampled read.
+        The SQL must retain every version until argMax has selected current
+        state; the only pre-aggregation filters are immutable identity/time
+        bounds.  A result at the sentinel limit is therefore discarded rather
+        than interpreted as complete.
+        """
+
+        segment_start, segment_end = segment
+        if not segment_start < segment_end:
+            raise ValueError("invalid filter-value distinct segment")
+        distinct_limit = int(distinct_limit)
+        if not 2 <= distinct_limit <= ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE + 1:
+            raise ValueError("invalid filter-value distinct result limit")
+        params: dict[str, Any] = {
+            "project_ids": project_ids,
+            "attribute_key": attribute_key,
+            "segment_start_us": _unix_microseconds(segment_start),
+            "segment_end_us": _unix_microseconds(segment_end),
+            "distinct_limit": distinct_limit,
+        }
+        frontier_predicate = "1"
+        if before_identity is not None:
+            before_project_id, before_trace_id, before_id, before_start_time = (
+                before_identity
+            )
+            if (
+                before_project_id not in project_ids
+                or not segment_start <= before_start_time < segment_end
+            ):
+                raise ValueError("distinct keyset must stay inside its segment")
+            params.update(
+                {
+                    "distinct_before_start_us": _unix_microseconds(before_start_time),
+                    "distinct_before_id": before_id,
+                    "distinct_before_trace_id": before_trace_id,
+                    "distinct_before_project_id": before_project_id,
+                }
+            )
+            frontier_predicate = (
+                "toUnixTimestamp64Micro(start_time) "
+                "< %(distinct_before_start_us)s "
+                "OR (toUnixTimestamp64Micro(start_time) "
+                "= %(distinct_before_start_us)s AND "
+                "(id < %(distinct_before_id)s "
+                "OR (id = %(distinct_before_id)s AND "
+                "(trace_id < %(distinct_before_trace_id)s "
+                "OR (trace_id = %(distinct_before_trace_id)s AND "
+                "toString(attribute_source.project_id) "
+                "< %(distinct_before_project_id)s)))))"
+            )
+        sql = self._single_project_scope_sql(
+            _VALUE_CURSOR_SEEN_SLICE_SQL, project_ids, params
+        )
+        return self._execute(
+            sql.format(frontier_predicate=frontier_predicate),
+            params,
+            max_result_rows=distinct_limit,
+            query_timeout_ms=ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS,
+        )
+
     def _verify_latest(
         self,
         *,
@@ -1775,6 +1956,44 @@ class AttributeReadSelector:
                 mode=json_attribute_mode,
             )
         return None
+
+    @classmethod
+    def _decode_seen_value_slice_group(
+        cls,
+        row: dict[str, Any],
+        *,
+        json_attribute_mode: JsonAttributeMode,
+    ) -> tuple[AttributeType, Any] | None:
+        """Decode one tagged group from the temporal distinct proof."""
+
+        value_type = str(row.get("value_type") or "")
+        if value_type not in {"string", "number", "boolean", "json"}:
+            raise IncompleteLatestStateReplay(
+                "Attribute distinct proof returned an invalid value type"
+            )
+        try:
+            value_count = int(row["value_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise IncompleteLatestStateReplay(
+                "Attribute distinct proof omitted its value count"
+            ) from exc
+        if value_count < 1:
+            raise IncompleteLatestStateReplay(
+                "Attribute distinct proof returned an invalid value count"
+            )
+        return cls._decode_target_value(
+            {
+                "string_present": value_type == "string",
+                "string_value": row.get("value_string"),
+                "number_present": value_type == "number",
+                "number_value": row.get("value_number"),
+                "boolean_present": value_type == "boolean",
+                "boolean_value": row.get("value_boolean"),
+                "legacy_present": value_type == "json",
+                "legacy_value_raw": row.get("value_json_raw"),
+            },
+            json_attribute_mode=json_attribute_mode,
+        )
 
     @classmethod
     def _browse_row_keys(
@@ -3992,10 +4211,134 @@ class AttributeReadSelector:
             else:
                 cursor_before = resume_identity
 
+        # A continuation can cheaply prove that a whole adjacent temporal
+        # slice contains no *new* logical value, even though the signed state
+        # intentionally stores only opaque digests.  This latest-state query is
+        # never used on page one and never publishes a value: an unseen value,
+        # result sentinel, oversized array, or bounded-read failure falls back
+        # to the ordinary physical cursor at the identical unconsumed frontier.
+        # Successful seen-only proofs may therefore advance by time without
+        # weakening newest-first value reachability.
+        skip_physical_walk = False
+        if (
+            seen_set
+            and unpinned_cursor_read
+            and not needle
+            and next_resume_identity is None
+            and len(emitted) < effective_page_size
+        ):
+            distinct_width = ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT
+            distinct_advanced = False
+            while current_segment_end > start:
+                assert self._deadline is not None
+                remaining_ms = int((self._deadline - self._clock()) * 1000)
+                if (
+                    self._query_count
+                    + 1
+                    + ATTRIBUTE_VALUE_CURSOR_DISTINCT_QUERY_RESERVE
+                    > ATTRIBUTE_READ_MAX_QUERY_COUNT
+                    or remaining_ms
+                    <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_WALL_RESERVE_MS
+                    + ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+                    + ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS
+                ):
+                    # When at least one complete slice was certified, returning
+                    # its advanced continuation is more useful than spending
+                    # the fallback reserve re-reading known duplicates.  With
+                    # no proof yet, retain the original physical path.
+                    skip_physical_walk = distinct_advanced
+                    break
+
+                proof_end = current_segment_end
+                if cursor_before is not None:
+                    # DateTime64(6) identities at the checkpoint timestamp but
+                    # lower in `(id, trace_id, project_id)` remain unconsumed.
+                    # Include that tail while excluding the checkpoint itself.
+                    proof_end = min(
+                        proof_end,
+                        cursor_before[3] + timedelta(microseconds=1),
+                    )
+                proof_start = max(start, proof_end - distinct_width)
+                if proof_start >= proof_end:
+                    break
+                distinct_limit = effective_page_size + 1
+                try:
+                    distinct_rows = self._seen_value_slice_groups(
+                        project_ids=projects,
+                        attribute_key=key,
+                        segment=(proof_start, proof_end),
+                        before_identity=cursor_before,
+                        distinct_limit=distinct_limit,
+                    )
+                except Exception as exc:
+                    if not is_read_budget_error(exc):
+                        raise
+                    if distinct_width > ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT:
+                        distinct_width = max(
+                            ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
+                            distinct_width / 2,
+                        )
+                        continue
+                    # The minimum slice proved nothing.  The physical cursor is
+                    # still exactly where it was before the failed statement.
+                    # If earlier slices did advance, return that proven
+                    # continuation instead of spending their remaining wall
+                    # reserve on an unrelated physical fallback.  The next
+                    # request retries this untouched frontier with a fresh
+                    # operation deadline.
+                    skip_physical_walk = distinct_advanced
+                    break
+
+                proof_is_complete = len(distinct_rows) < distinct_limit
+                known_digests = seen_set.union(emitted)
+                if proof_is_complete:
+                    for distinct_row in distinct_rows:
+                        decoded = self._decode_seen_value_slice_group(
+                            distinct_row,
+                            json_attribute_mode=self._json_attribute_mode,
+                        )
+                        if decoded is None:
+                            continue
+                        attr_type, raw_value = decoded
+                        if (
+                            attr_type == "array"
+                            and isinstance(raw_value, tuple)
+                            and len(raw_value) > ATTRIBUTE_READ_MAX_VALUES
+                        ):
+                            proof_is_complete = False
+                            break
+                        if any(
+                            attribute_value_cursor_digest(attr_type, candidate)
+                            not in known_digests
+                            for candidate in candidates_for(decoded)
+                        ):
+                            proof_is_complete = False
+                            break
+                if not proof_is_complete:
+                    # The speculative query changed no public state. Preserve
+                    # the exact frontier for ordinary ordered discovery.  A
+                    # prior successful proof is still useful progress, so
+                    # publish that continuation and let the next request start
+                    # the physical fallback with its full wall budget.
+                    skip_physical_walk = distinct_advanced
+                    break
+
+                current_segment_end = proof_start
+                cursor_before = None
+                checkpoint_from_widened_segment = False
+                candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                distinct_advanced = True
+                distinct_width = min(
+                    distinct_width * 2,
+                    ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
+                )
+
         while (
             current_segment_end > start
             and len(emitted) < effective_page_size
             and next_resume_identity is None
+            and not skip_physical_walk
             and candidate_pages
             < (
                 ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES
