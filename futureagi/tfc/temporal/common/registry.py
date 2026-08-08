@@ -130,7 +130,14 @@ def _load_usage_temporal_registry(name: str) -> Callable[[], list] | None:
     for module_name in ("ee.cloud.temporal", "ee.usage.temporal"):
         try:
             temporal_module = import_module(module_name)
-        except ImportError:
+        except ModuleNotFoundError as exc:
+            # Treat only the candidate module (or one of its parents) as
+            # optional.  A missing dependency imported *by* that module is a
+            # real packaging error and must remain visible at worker startup.
+            if not exc.name or not (
+                module_name == exc.name or module_name.startswith(f"{exc.name}.")
+            ):
+                raise
             continue
 
         registry = getattr(temporal_module, name, None)
