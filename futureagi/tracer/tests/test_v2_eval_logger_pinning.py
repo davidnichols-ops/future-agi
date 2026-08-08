@@ -123,7 +123,11 @@ def test_v2_list_eval_queries_follow_eval_table_setting(builder_kind, eval_table
     if builder_kind == "span":
         sql, _ = builder.build_eval_query(["span-1"])
     elif builder_kind == "user":
-        sql, _ = builder.build_eval_query(["end-user-1"])
+        # User eval reads are tenant-authorized at runtime and deliberately
+        # compile to no SQL without a finite eval-config scope.
+        sql, _ = builder.build_eval_query(
+            ["end-user-1"], allowed_eval_config_ids=[EVAL_CONFIG_ID]
+        )
     else:
         sql, _ = builder.build_eval_query(["trace-1"])
 

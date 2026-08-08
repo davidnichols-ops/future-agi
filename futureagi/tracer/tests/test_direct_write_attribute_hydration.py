@@ -76,7 +76,7 @@ def test_trace_attribute_hydration_projects_latest_requested_key_value():
     assert params["attr_trace_identities"] == (
         ("00000000-0000-4000-8000-000000000001", "trace-1"),
     )
-    assert params["requested_attribute_keys"] == ("final_status", "nested.flag")
+    assert params["requested_attribute_keys"] == ["final_status", "nested.flag"]
     assert "attribute_value_limit" not in params
 
 
@@ -95,7 +95,9 @@ def test_more_than_5000_historical_values_collapse_to_one_latest_value_per_key()
     assert "argMax(candidate_attribute_value_json, tuple(start_time, id))" in sql
     assert "GROUP BY project_id, trace_id, attribute_key" in sql
     assert "LIMIT" not in sql
-    assert params["requested_attribute_keys"] == ("final_status",)
+    # ARRAY JOIN must receive an Array/list. clickhouse-driver formats a
+    # one-element tuple as a scalar String, which ClickHouse 25 rejects.
+    assert params["requested_attribute_keys"] == ["final_status"]
     assert len(params["attr_trace_identities"]) == len(trace_ids)
 
 

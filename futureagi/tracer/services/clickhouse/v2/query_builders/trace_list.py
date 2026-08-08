@@ -134,7 +134,11 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
         params: dict[str, Any] = {
             **self.params,
             "attr_trace_identities": normalized_trace_identities,
-            "requested_attribute_keys": requested_keys,
+            # clickhouse-driver renders a single-element tuple as a scalar
+            # String. ARRAY JOIN requires an Array even when only one key was
+            # requested, so bind the de-duplicated, insertion-ordered keys as
+            # a list rather than a tuple.
+            "requested_attribute_keys": list(requested_keys),
         }
         query = f"""
         SELECT

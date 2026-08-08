@@ -236,7 +236,7 @@ class TestTracesOfSessionPagination:
             ).get("requested_attribute_keys")
         ]
         assert len(attr_calls) == 1
-        assert attr_calls[0].args[1]["requested_attribute_keys"] == ("final_status",)
+        assert attr_calls[0].args[1]["requested_attribute_keys"] == ["final_status"]
         assert attr_calls[0].args[1]["attr_trace_identities"] == (
             (project_id, trace_id),
         )

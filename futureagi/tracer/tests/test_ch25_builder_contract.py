@@ -299,6 +299,39 @@ class TestListBuilderOutputContract:
                     )
                 finally:
                     builder.filters = original_filters
+            elif name == "build_filter_exact_zero_probe":
+                # This capability-gated voice optimization only compiles for
+                # two or more positive scalar any-span leaves. Exercise the
+                # SQL boundary under that supported public contract.
+                original_filters = builder.filters
+                original_internal_scan = builder._bounded_internal_scan
+                builder.filters = [
+                    *original_filters,
+                    {
+                        "column_id": "contract.numeric",
+                        "filter_config": {
+                            "col_type": "SPAN_ATTRIBUTE",
+                            "filter_type": "number",
+                            "filter_op": "equals",
+                            "filter_value": 1,
+                        },
+                    },
+                    {
+                        "column_id": "contract.text",
+                        "filter_config": {
+                            "col_type": "SPAN_ATTRIBUTE",
+                            "filter_type": "text",
+                            "filter_op": "in",
+                            "filter_value": ["value"],
+                        },
+                    },
+                ]
+                builder._bounded_internal_scan = False
+                try:
+                    result = method()
+                finally:
+                    builder.filters = original_filters
+                    builder._bounded_internal_scan = original_internal_scan
             elif name == "build_filter_navigation_seed_page":
                 start, end = builder.parse_time_range(builder.filters)
                 result = method(

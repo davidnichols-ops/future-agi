@@ -3776,7 +3776,10 @@ class TestUserListQueryBuilder:
             offset=0,
         )
         builder.build()
-        query, _ = builder.build_eval_query(["00000000-0000-0000-0000-000000000003"])
+        query, _ = builder.build_eval_query(
+            ["00000000-0000-0000-0000-000000000003"],
+            allowed_eval_config_ids=["00000000-0000-0000-0000-000000000004"],
+        )
 
         assert "eval_scan.trace_id = toUUIDOrNull(ut.trace_id)" in query
         assert "toString(eval_scan.trace_id)" not in query
@@ -7339,7 +7342,8 @@ class TestVoiceCallListPhase1bMigration:
             "the Phase 1b query must read from the v2 `spans` table."
         )
         assert "builder.build_content_query(" in src
-        assert "root_identities=root_identities" in src
+        assert "batch_span_ids," in src
+        assert "root_identities=batch_identities" in src
 
     def test_phase_1b_reads_v2_spans_table(self):
         """Phase 1b must resolve latest state without broad ``FINAL``."""
