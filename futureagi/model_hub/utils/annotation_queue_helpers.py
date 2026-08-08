@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import structlog
 from django.core.exceptions import ObjectDoesNotExist
@@ -15,6 +15,9 @@ from model_hub.models.choices import (
 )
 from simulate.serializers import CallTranscriptSerializer
 from simulate.utils.stored_transcript_roles import get_displayable_transcript_roles
+
+if TYPE_CHECKING:
+    from model_hub.models.annotation_queues import AutomationRule
 
 logger = structlog.get_logger(__name__)
 
@@ -2954,7 +2957,12 @@ def _evaluate_filter_mode_rule(
     )
 
 
-def evaluate_rule(rule, dry_run=False, user=None, cap=AUTOMATION_RULE_MATCH_LIMIT):
+def evaluate_rule(
+    rule: "AutomationRule",
+    dry_run: bool = False,
+    user: Any | None = None,
+    cap: int = AUTOMATION_RULE_MATCH_LIMIT,
+) -> dict[str, Any]:
     """Evaluate an automation rule and add matching items to the queue.
     Returns dict with 'matched', 'added', 'duplicates' counts.
     """
