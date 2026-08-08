@@ -315,6 +315,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.recommended_filter_seed_batch_size() == 512
     assert builder.recommended_filter_classify_batch_size() == 10
     assert builder.recommended_filter_initial_slice_width() == timedelta(hours=1)
+    assert builder.recommended_filter_max_slice_width() == END - START
 
 
 def test_org_user_trace_seed_is_remap_aware_scoped_and_cursor_ordered() -> None:
@@ -472,7 +473,7 @@ def test_graph_numeric_equality_retains_value_indexed_witness() -> None:
     assert probe_params["latest_filter_param_0"] == 7
 
 
-def test_long_window_trace_uses_exact_latest_anchor_over_full_root_batch() -> None:
+def test_long_window_scalar_trace_uses_exact_classifier_without_witness() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[
@@ -489,12 +490,16 @@ def test_long_window_trace_uses_exact_latest_anchor_over_full_root_batch() -> No
     assert builder.recommended_filter_anchor_probe_strata() is None
     assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
     assert builder.prefer_filter_candidate_witness_probe_first() is False
+    assert builder.recommended_filter_candidate_witness_probe_strata() is None
+    assert builder.recommended_filter_max_query_count() is None
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
         == 10
     )
     assert builder.recommended_filter_page_hydration_reserve_ms() == 750
-    assert builder.recommended_filter_classify_read_settings() is None
+    assert builder.recommended_filter_classify_read_settings() == {
+        "max_block_size": 2_048
+    }
 
 
 def test_long_window_attribute_plus_search_keeps_bounded_root_batch() -> None:
@@ -574,7 +579,9 @@ def test_extreme_structured_multifilter_keeps_scalar_fast_path_independent() -> 
     )
 
     assert simple_builder.recommended_filter_classify_batch_size() == 10
-    assert simple_builder.recommended_filter_classify_read_settings() is None
+    assert simple_builder.recommended_filter_classify_read_settings() == {
+        "max_block_size": 2_048
+    }
     assert structured_builder.recommended_filter_classify_batch_size() == 10
     assert structured_builder.recommended_filter_classify_read_settings() == {
         "max_block_size": 2_048
@@ -678,7 +685,7 @@ def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
         [{"trace_id": "trace-a"}, {"trace_id": "trace-b"}]
     )
 
-    assert "SELECT DISTINCT" in sql
+    assert "SELECT\n" in sql
     assert "grouped_trace_id AS trace_id" in sql
     assert "project_id = %(project_id)s" in sql
     assert "argMax(is_deleted, _peerdb_version) AS latest_is_deleted" in sql
@@ -699,11 +706,15 @@ def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
     assert params["filter_candidate_start_us"] == 1_735_689_600_000_000
     assert params["filter_candidate_end_us"] == 1_767_225_600_000_000
     assert params["latest_filter_key_0"] == "final_status"
+    # A plain typed-Map scalar classifier is faster than a year-window witness
+    # on large tenants, so the query remains available for internal callers but
+    # is not selected speculatively for the interactive list.
     assert builder.prefer_filter_candidate_witness_probe_first() is False
     assert builder.recommended_filter_candidate_witness_probe_strata() is None
     assert builder.recommended_filter_candidate_witness_probe_timeout_ms() is None
     assert builder.recommended_filter_candidate_witness_probe_max_bytes() is None
     assert builder.recommended_filter_candidate_witness_probe_total_ms() is None
+    assert builder.recommended_filter_max_query_count() is None
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
         == 10
@@ -730,6 +741,63 @@ def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
             slice_start=START - timedelta(microseconds=1),
             slice_end=slice_end,
         )
+
+
+def test_nested_array_path_keeps_interactive_candidate_witness() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter(
+                "conversation.transcript.16.message.role",
+                ["assistant"],
+                operation="in",
+            ),
+        ],
+    )
+
+    assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert builder.recommended_filter_candidate_witness_probe_strata() == 1
+    assert builder.recommended_filter_max_query_count() == 128
+
+
+def test_scalar_first_multi_filter_witness_selects_nested_leaf() -> None:
+    nested_key = "conversation.transcript.16.message.role"
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+            _attribute_filter(nested_key, ["assistant"], operation="in"),
+        ],
+    )
+
+    sql, params = builder.build_filter_candidate_witness_probe(
+        [{"trace_id": "trace-a"}]
+    )
+
+    assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert params["latest_filter_key_1"] == nested_key
+    assert "latest_filter_key_1" in sql
+    assert "latest_filter_key_0" not in sql
+
+
+def test_negative_nested_leaf_does_not_enable_scalar_interactive_witness() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+            _attribute_filter(
+                "conversation.transcript.16.message.role",
+                "assistant",
+                operation="not_equals",
+            ),
+        ],
+    )
+
+    assert builder.prefer_filter_candidate_witness_probe_first() is False
+    assert builder.recommended_filter_candidate_witness_probe_strata() is None
 
 
 def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
@@ -760,6 +828,36 @@ def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
     assert params["filter_candidate_witness_limit"] == 2
 
 
+def test_trace_candidate_witness_probe_supports_exact_structured_map_state() -> None:
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter(
+                "payload",
+                {"state": "Rejected"},
+                filter_type="map",
+                operation="contains",
+            ),
+        ],
+    )
+
+    sql, params = builder.build_filter_candidate_witness_probe(
+        [{"trace_id": "trace-a"}]
+    )
+
+    assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert builder.recommended_filter_candidate_witness_probe_strata() == 1
+    assert "trace_id IN %(filter_candidate_trace_ids)s" in sql
+    assert "JSONHas(attributes_extra, %(latest_filter_key_0)s)" in sql
+    assert "latest_json_map_value_0" in sql
+    assert "HAVING max(toUInt8(latest_is_deleted = 0" in sql
+    assert "UNION ALL" not in sql
+    assert params["latest_filter_key_0"] == "payload"
+    assert params["latest_filter_map_key_0_0"] == "state"
+    assert params["latest_filter_map_value_0_0_string"] == "Rejected"
+
+
 @pytest.mark.parametrize(
     "builder",
     [
@@ -768,17 +866,6 @@ def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
             filters=[
                 _time_filter(),
                 _attribute_filter("final_status", "Rejected", operation="not_equals"),
-            ],
-        ),
-        TraceListQueryBuilder(
-            project_id=PROJECT_ID,
-            filters=[
-                _time_filter(),
-                _attribute_filter(
-                    "payload",
-                    {"state": "Rejected"},
-                    filter_type="map",
-                ),
             ],
         ),
         TraceListQueryBuilder(
@@ -808,7 +895,6 @@ def test_org_trace_candidate_witness_probe_keeps_composite_identity() -> None:
     ],
     ids=[
         "negative",
-        "json-map",
         "root",
         "residual",
         "identity-only",
@@ -849,7 +935,13 @@ def test_trace_candidate_latest_anchor_prefilters_multi_filter_and() -> None:
 
     assert builder.prefer_filter_candidate_witness_probe_first() is False
     assert "latest_filter_key_0" in probe_sql
+    # Only one necessary leaf is allowed in each temporal stratum. The exact
+    # classifier below retains both leaves, including when sibling spans in
+    # different strata satisfy them independently.
     assert "latest_filter_key_1" not in probe_sql
+    assert probe_sql.count("FROM spans") == 1
+    assert "UNION ALL" not in probe_sql
+    assert probe_sql.count("max(toUInt8(latest_is_deleted = 0") == 1
     assert "latest_filter_key_0" in classifier_sql
     assert "latest_filter_key_1" in classifier_sql
 
@@ -940,6 +1032,7 @@ def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() ->
     assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
     assert builder.prefer_filter_candidate_witness_probe_first() is True
     assert builder.recommended_filter_candidate_witness_probe_strata() == 1
+    assert builder.recommended_filter_max_query_count() == 128
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
         == 10
@@ -964,13 +1057,6 @@ def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() ->
             ],
             {},
         ),
-        (
-            [
-                _time_filter(),
-                _attribute_filter("payload", {"state": "Rejected"}, filter_type="map"),
-            ],
-            {},
-        ),
         ([_time_filter(), _system_filter("trace_name", "checkout")], {}),
         ([_time_filter(), _annotation_filter("label-a", "Rejected")], {}),
         (
@@ -988,7 +1074,6 @@ def test_eval_trace_membership_only_classifier_buffers_safe_typed_map_probe() ->
     ],
     ids=[
         "negative",
-        "json",
         "root",
         "residual",
         "search",
@@ -1021,6 +1106,32 @@ def test_eval_trace_candidate_prefilter_rejects_non_membership_only_shapes(
         "",
         {},
     )
+
+
+def test_eval_trace_membership_prefilter_accepts_structured_map_state() -> None:
+    builder = TraceListQueryBuilder(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter(
+                "payload",
+                {"state": "Rejected"},
+                filter_type="map",
+                operation="contains",
+            ),
+        ],
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+    )
+
+    sql, _ = builder.build_filter_candidate_witness_probe([{"trace_id": "trace-a"}])
+
+    assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert builder.recommended_filter_candidate_witness_probe_strata() == 1
+    assert builder.recommended_filter_max_query_count() == 128
+    assert "latest_json_map_value_0" in sql
 
 
 def test_eval_trace_any_span_large_prefix_fails_closed_at_query_ceiling() -> None:
@@ -2936,9 +3047,9 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
 
     assert omitted_status == "ok"
     assert omitted_payload["metadata"]["query_complete"] is True
-    assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is True
-    assert explicit_false_response[0] == "error"
-    assert explicit_false_response[1][0] == 503
+    assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is False
+    assert explicit_false_response[0] == "ok"
+    assert explicit_false_response[1]["metadata"]["total_rows_is_lower_bound"] is False
     assert status == "ok"
     assert isinstance(bounded_read.call_args.kwargs["builder"], TraceListQueryBuilderV2)
     assert payload["metadata"]["query_complete"] is True
@@ -2946,7 +3057,7 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
     assert payload["metadata"]["query_count"] == 1
     assert payload["metadata"]["query_rows_returned"] == 0
     assert payload["metadata"]["query_result_payload_bytes"] == 0
-    assert payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert payload["metadata"]["total_rows_is_lower_bound"] is False
     analytics.execute_ch_query.assert_not_called()
 
 
@@ -3552,6 +3663,8 @@ def test_org_trace_content_same_trace_id_is_merged_by_project_identity() -> None
     assert rows_by_project[project_b]["tenant_marker"] == "tenant-b"
     assert rows_by_project[project_b]["config-b"] == 90.0
     assert "config-a" not in rows_by_project[project_b]
+    assert payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert payload["metadata"]["has_more"] is True
     from tracer.services.clickhouse.list_cursor import (
         cursor_scope_for_request,
         decode_list_cursor,
@@ -3851,9 +3964,9 @@ def test_non_observe_trace_list_uses_v2_builder_without_routing_config() -> None
 
     assert omitted_status == "ok"
     assert omitted_payload["metadata"]["query_complete"] is True
-    assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is True
-    assert explicit_false_response[0] == "error"
-    assert explicit_false_response[1][0] == 503
+    assert omitted_payload["metadata"]["total_rows_is_lower_bound"] is False
+    assert explicit_false_response[0] == "ok"
+    assert explicit_false_response[1]["metadata"]["total_rows_is_lower_bound"] is False
     assert status == "ok"
     bounded_kwargs = bounded_read.call_args.kwargs
     assert isinstance(bounded_kwargs["builder"], TraceListQueryBuilderV2)
@@ -3862,7 +3975,7 @@ def test_non_observe_trace_list_uses_v2_builder_without_routing_config() -> None
     assert bounded_kwargs["page_size"] == 25
     assert payload["metadata"]["query_complete"] is True
     assert payload["metadata"]["query_count"] == 2
-    assert payload["metadata"]["total_rows_is_lower_bound"] is True
+    assert payload["metadata"]["total_rows_is_lower_bound"] is False
     assert 0 < bounded_kwargs["deadline_ms"] <= TRACE_LIST_CANDIDATE_DEADLINE_MS
     analytics.get_eval_config_ids_with_data_ch.assert_not_called()
     analytics.execute_ch_query.assert_not_called()
@@ -4633,6 +4746,13 @@ class _ClassifierSettingsFakeBuilder(_FakeBuilder):
     @staticmethod
     def recommended_filter_classify_read_settings() -> dict[str, int]:
         return {"max_block_size": 2_048}
+
+
+@dataclass
+class _RecommendedQueryCountFakeBuilder(_FakeBuilder):
+    @staticmethod
+    def recommended_filter_max_query_count() -> int:
+        return 128
 
 
 @dataclass
@@ -5801,6 +5921,76 @@ def test_observe_trace_empty_cursor_page_without_checkpoint_fails_closed() -> No
     analytics.execute_ch_query.assert_not_called()
 
 
+def test_observe_trace_terminal_cursor_uses_global_seen_total() -> None:
+    from tracer.services.clickhouse.list_cursor import (
+        cursor_scope_for_request,
+        encode_list_cursor,
+    )
+
+    filters = [
+        _time_filter(),
+        _attribute_filter("final_status", "Rejected"),
+    ]
+    cursor_data = {
+        "filters": filters,
+        "page_number": 0,
+        "page_size": 25,
+        "cursor_mode": True,
+    }
+
+    initial_response, *_ = _call_observe_trace_list_with_bounded_page(
+        bounded_page=_complete_empty_page(),
+        request=_observe_trace_request({"cursor_mode": "true"}),
+        validated_data=cursor_data,
+    )
+    assert initial_response[0] == "ok"
+    assert initial_response[1]["metadata"]["total_rows"] == 0
+    assert initial_response[1]["metadata"]["total_rows_exact"] == 0
+
+    numbered_response, *_ = _call_observe_trace_list_with_bounded_page(
+        bounded_page=_complete_empty_page(),
+        request=_observe_trace_request({"allow_sampled": "false"}),
+        validated_data={
+            "filters": filters,
+            "page_number": 3,
+            "page_size": 25,
+            "allow_sampled": False,
+        },
+    )
+    assert numbered_response[0] == "ok"
+    assert numbered_response[1]["metadata"]["total_rows"] == 0
+    assert numbered_response[1]["metadata"]["total_rows_is_lower_bound"] is False
+
+    resumed_request = _observe_trace_request({"cursor_mode": "true"})
+    cursor = encode_list_cursor(
+        resource="observe_traces",
+        scope=cursor_scope_for_request(
+            resumed_request,
+            project_ids=[PROJECT_ID],
+        ),
+        query=cursor_data,
+        page_size=25,
+        window_start=START.replace(tzinfo=UTC),
+        window_end=END.replace(tzinfo=UTC),
+        order=(END.replace(tzinfo=UTC), "trace-z"),
+        seen_rows=75,
+    )
+    resumed_request.query_params["cursor"] = cursor
+    resumed_response, *_ = _call_observe_trace_list_with_bounded_page(
+        bounded_page=_complete_empty_page(),
+        request=resumed_request,
+        validated_data={**cursor_data, "cursor": cursor},
+    )
+
+    assert resumed_response[0] == "ok"
+    resumed_metadata = resumed_response[1]["metadata"]
+    assert resumed_metadata["total_rows"] == 75
+    assert resumed_metadata["total_rows_exact"] == 75
+    assert resumed_metadata["total_rows_is_lower_bound"] is False
+    assert resumed_metadata["has_more"] is False
+    assert resumed_metadata["next_cursor"] is None
+
+
 @pytest.mark.parametrize(
     ("query_params", "validated_allow_sampled"),
     [
@@ -5957,6 +6147,7 @@ def test_observe_trace_incomplete_page_remains_fail_closed_without_explicit_samp
     assert response[2] == {"code": "service_unavailable"}
     assert "DB::Exception" not in str(response)
     assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    assert bounded_reader.call_args.kwargs["retry_wide_read_budget"] is True
     analytics.execute_ch_query.assert_not_called()
 
 
@@ -6647,6 +6838,7 @@ def test_voice_incomplete_page_remains_fail_closed_without_explicit_sample(
     assert response[2] == {"code": "service_unavailable"}
     assert "DB::Exception" not in str(response)
     assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    assert bounded_reader.call_args.kwargs["retry_wide_read_budget"] is True
     analytics.execute_ch_query.assert_not_called()
 
 
@@ -7112,6 +7304,32 @@ def test_classifier_read_setting_caps_only_classifier_statements() -> None:
     assert [query for query, _ in executor.settings_by_query] == ["seed", "match"]
     assert executor.settings_by_query[0][1]["max_block_size"] == 4_096
     assert executor.settings_by_query[1][1]["max_block_size"] == 2_048
+
+
+def test_builder_query_count_recommendation_preserves_sparse_exact_fallback() -> None:
+    rows = _rows(*range(1, 61))
+    builder = _RecommendedQueryCountFakeBuilder(
+        rows,
+        match_rows=[rows[-1]],
+        recommended_batch_size=1,
+        recommended_seed_batch_size=60,
+    )
+    executor = _FakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter()],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert page.rows == [rows[-1]]
+    assert page.query_count > 48
+    assert page.query_count <= 128
 
 
 def test_graph_only_incomplete_rows_do_not_change_exact_list_default() -> None:
@@ -9763,6 +9981,237 @@ def test_broad_candidate_witness_prefilter_falls_through_to_exact_classifier() -
     assert executor.prefilter_settings[0]["max_threads"] == 1
 
 
+def test_cursor_candidate_witness_returns_only_exact_hydrated_matches() -> None:
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+            "trace_name": f"presented-{index}",
+        }
+        for index in range(4)
+    ]
+    builder = _CandidateWitnessHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=[rows[0], rows[2]],
+        recommended_batch_size=4,
+        recommended_seed_batch_size=4,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        witness_ids={"trace-0", "trace-2"},
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is True
+    assert [row["id"] for row in page.rows] == ["trace-0", "trace-2"]
+    assert [query for query, _ in executor.calls].count("prefilter") == 2
+    assert [query for query, _ in executor.calls].count("match_identity") == 1
+    assert [query for query, _ in executor.calls].count("hydrate") == 1
+
+
+def test_cursor_candidate_witness_exact_zero_returns_resumable_checkpoint() -> None:
+    class WideCursorWitnessBuilder(_CandidateWitnessHydrationFakeBuilder):
+        @staticmethod
+        def recommended_filter_candidate_witness_fallback_classify_batch_size():
+            return 100
+
+        def recommended_filter_initial_slice_width(self):
+            return self.end - self.start
+
+        def recommended_filter_max_slice_width(self):
+            return self.end - self.start
+
+    rows = [
+        {
+            "id": f"trace-{index:03d}",
+            "root_span_id": f"root-{index:03d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+        }
+        for index in range(100)
+    ]
+    builder = WideCursorWitnessBuilder(
+        rows,
+        start=END - timedelta(days=365),
+        end=END,
+        match_rows=[],
+        recommended_batch_size=100,
+        recommended_seed_batch_size=100,
+    )
+
+    first_executor = _CandidateWitnessHydrationFakeExecutor(builder, witness_ids=set())
+    first = read_bounded_filter_page(
+        builder=builder,
+        analytics=first_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        max_query_count=4,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert first.complete is False
+    assert first.rows == []
+    assert first.error_code == "query_budget_exceeded"
+    assert first.continuation_slice_start == builder.start
+    assert first.continuation_slice_end == builder.end
+    assert first.continuation_before_start_time == rows[25]["start_time"]
+    assert first.continuation_before_id == rows[25]["id"]
+    assert [query for query, _ in first_executor.calls] == [
+        "seed",
+        "prefilter",
+        "seed",
+    ]
+
+    resumed_executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        witness_ids=set(),
+    )
+    resumed = read_bounded_filter_page(
+        builder=builder,
+        analytics=resumed_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        max_query_count=16,
+        include_incomplete_rows=True,
+        continuation_slice_start=first.continuation_slice_start,
+        continuation_slice_end=first.continuation_slice_end,
+        continuation_before_start_time=first.continuation_before_start_time,
+        continuation_before_id=first.continuation_before_id,
+        bounded_continuation=True,
+    )
+
+    assert resumed.complete is True
+    assert resumed.rows == []
+    assert resumed.has_more is False
+    assert resumed.continuation_slice_end is None
+    assert "prefilter" in [query for query, _ in resumed_executor.calls]
+
+
+def test_cursor_candidate_witness_commits_survivor_prefix_before_later_failure() -> (
+    None
+):
+    rows = [
+        {
+            "id": f"trace-{index:03d}",
+            "root_span_id": f"root-{index:03d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+        }
+        for index in range(30)
+    ]
+    builder = _CandidateWitnessHydrationFakeBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        match_rows=rows[1:],
+        recommended_batch_size=10,
+        recommended_seed_batch_size=30,
+    )
+    witness_ids = {row["id"] for row in rows[1:]}
+
+    class FailSecondClassifier(_CandidateWitnessHydrationFakeExecutor):
+        def __init__(self):
+            super().__init__(builder, witness_ids=witness_ids)
+            self.classifier_calls = 0
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            if query == "match_identity":
+                self.classifier_calls += 1
+                if self.classifier_calls == 2:
+                    self.calls.append((query, params))
+                    self.timeouts.append((query, timeout_ms))
+                    raise ReadDeadlineExceeded("later classifier budget")
+            return super().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+
+    first_executor = FailSecondClassifier()
+    first = read_bounded_filter_page(
+        builder=builder,
+        analytics=first_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        max_query_count=6,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert first.complete is False
+    assert first.error_code == "read_budget_exceeded"
+    assert [row["id"] for row in first.rows] == [
+        f"trace-{index:03d}" for index in range(1, 11)
+    ]
+    assert first.continuation_slice_start == builder.start
+    assert first.continuation_slice_end == builder.end
+    assert first.continuation_before_start_time == rows[10]["start_time"]
+    assert first.continuation_before_id == rows[10]["id"]
+    assert [query for query, _ in first_executor.calls] == [
+        "seed",
+        "prefilter",
+        "match_identity",
+        "match_identity",
+        "hydrate",
+    ]
+
+    resumed_executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        witness_ids=witness_ids,
+    )
+    resumed = read_bounded_filter_page(
+        builder=builder,
+        analytics=resumed_executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+        max_query_count=16,
+        include_incomplete_rows=True,
+        cursor_start_time=first.rows[-1]["start_time"],
+        cursor_order_token=first.rows[-1]["id"],
+        continuation_slice_start=first.continuation_slice_start,
+        continuation_slice_end=first.continuation_slice_end,
+        continuation_before_start_time=first.continuation_before_start_time,
+        continuation_before_id=first.continuation_before_id,
+        bounded_continuation=True,
+    )
+
+    assert resumed.complete is True
+    assert [row["id"] for row in resumed.rows] == [
+        f"trace-{index:03d}" for index in range(11, 30)
+    ]
+    assert resumed.has_more is False
+    assert resumed.continuation_slice_end is None
+    combined_ids = [row["id"] for row in [*first.rows, *resumed.rows]]
+    assert combined_ids == [f"trace-{index:03d}" for index in range(1, 30)]
+    assert len(combined_ids) == len(set(combined_ids))
+
+
 def test_candidate_witness_read_failure_falls_back_to_exact_classifier() -> None:
     rows = [
         {
@@ -9810,6 +10259,46 @@ def test_candidate_witness_read_failure_falls_back_to_exact_classifier() -> None
         "classify",
         "classify",
     ]
+
+
+def test_candidate_witness_uses_custom_attribute_block_cap() -> None:
+    class MemorySafeCandidateBuilder(_CandidateWitnessHydrationFakeBuilder):
+        @staticmethod
+        def recommended_filter_classify_read_settings():
+            return {"max_block_size": 2_048}
+
+    rows = [
+        {
+            "id": f"trace-{index}",
+            "root_span_id": f"root-{index}",
+            "start_time": END - timedelta(seconds=index + 1),
+        }
+        for index in range(3)
+    ]
+    builder = MemorySafeCandidateBuilder(
+        rows,
+        start=END - timedelta(minutes=5),
+        end=END,
+        recommended_batch_size=3,
+        recommended_seed_batch_size=3,
+    )
+    executor = _CandidateWitnessHydrationFakeExecutor(
+        builder,
+        witness_ids={row["id"] for row in rows},
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=builder.start, end=builder.end)],
+        key_field="id",
+        page_number=0,
+        page_size=2,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert executor.prefilter_settings[0]["max_block_size"] == 2_048
 
 
 def test_disabled_candidate_witness_stays_disabled_after_empty_classifier() -> None:
@@ -9956,6 +10445,87 @@ def _stratified_witness_rows(window_end: datetime) -> list[dict[str, Any]]:
         }
         for index in range(4)
     ]
+
+
+def test_candidate_witness_full_window_failure_splits_without_losing_absence_proof() -> (
+    None
+):
+    class OneShotThenSplitBuilder(_StratifiedCandidateWitnessFakeBuilder):
+        @staticmethod
+        def recommended_filter_candidate_witness_probe_strata():
+            return 1
+
+    class FailInitialFullWindowExecutor(_StratifiedCandidateWitnessFakeExecutor):
+        def __init__(self, builder, **kwargs):
+            super().__init__(builder, **kwargs)
+            self.failed_initial_probe = False
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            if query == "prefilter" and not self.failed_initial_probe:
+                self.failed_initial_probe = True
+                self.calls.append((query, params))
+                self.timeouts.append((query, timeout_ms))
+                self.prefilter_settings.append(dict(settings))
+                raise ReadDeadlineExceeded("full-window witness budget")
+            return super().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=settings,
+            )
+
+    window_start = END - timedelta(hours=8)
+    midpoint = window_start + (END - window_start) / 2
+    rows = _stratified_witness_rows(END)
+    builder = OneShotThenSplitBuilder(
+        rows,
+        start=window_start,
+        end=END,
+        match_rows=[rows[0], rows[1]],
+        recommended_batch_size=4,
+        recommended_seed_batch_size=4,
+    )
+    executor = FailInitialFullWindowExecutor(
+        builder,
+        witness_times={
+            "trace-0": END - timedelta(minutes=30),
+            "trace-1": window_start + timedelta(minutes=30),
+        },
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(start=window_start, end=END)],
+        key_field="id",
+        page_number=0,
+        page_size=3,
+        deadline_ms=5_000,
+        max_query_count=32,
+    )
+
+    prefilters = [params for query, params in executor.calls if query == "prefilter"]
+    assert prefilters == [
+        {
+            "candidate_ids": tuple(row["id"] for row in rows),
+            "slice_start": None,
+            "slice_end": None,
+        },
+        {
+            "candidate_ids": tuple(row["id"] for row in rows),
+            "slice_start": midpoint,
+            "slice_end": END,
+        },
+        {
+            "candidate_ids": ("trace-1", "trace-2", "trace-3"),
+            "slice_start": window_start,
+            "slice_end": midpoint,
+        },
+    ]
+    assert [
+        params["candidate_ids"] for query, params in executor.calls if query == "match"
+    ] == [("trace-0", "trace-1")]
+    assert page.complete is True
 
 
 def test_candidate_witness_strata_cover_boundaries_before_excluding() -> None:

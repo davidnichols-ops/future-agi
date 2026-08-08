@@ -111,6 +111,11 @@ _LONG_WINDOW_ANCHOR_SENTINEL = 64
 _LONG_WINDOW_ANCHOR_TIMEOUT_MS = 900
 _LONG_WINDOW_ANCHOR_STRATA = 4
 _LONG_WINDOW_ANCHOR_MAX_BYTES_TO_READ = 192 * 1024 * 1024
+# Candidate witnesses are finite (at most 512 exact trace identities), so try
+# their complete request window in one statement first. The selector splits a
+# resource-limited statement into adjacent half-open children and accepts a
+# negative only after every child succeeds. This avoids paying eight scans for
+# every root batch while preserving chronological fallback for heavy Map/JSON.
 _LONG_WINDOW_CANDIDATE_WITNESS_STRATA = 1
 _LONG_WINDOW_ORDERED_ROOT_INITIAL_SLICE = timedelta(hours=1)
 _UNINDEXED_POSITIVE_MICRO_SEED_WIDTH = timedelta(minutes=5)
@@ -664,6 +669,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         ):
             return None
 
+        request_start, request_end = self._bounded_request_window
+        if request_end - request_start > timedelta(hours=1):
+            # The UNION branches each scan the complete tenant/time window.
+            # That is a useful short-window proof, but on year-wide customer
+            # ranges it can hit the byte ceiling before the bounded selector
+            # starts. Long windows use the finite, candidate-scoped temporal
+            # witness path below instead.
+            return None
+
         plans, residual_filters = self._partition_trace_filter_plans(
             self._bounded_filters()
         )
@@ -1000,7 +1014,13 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return None
 
     def recommended_filter_max_slice_width(self) -> timedelta | None:
-        """Permit one full-window seed only for an exact positive user alias."""
+        """Permit adaptive sparse cursor widening on index-pruned root seeds.
+
+        Cursor mode starts at one hour and doubles only after an exhausted
+        slice. Allowing it to grow to the request window lets empty months be
+        skipped logarithmically; a dense wide read remains safe because the
+        selector halves a read-budget failure before publishing anything.
+        """
 
         request_start, request_end = self._bounded_request_window
         request_width = request_end - request_start
@@ -1011,6 +1031,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and not self._bounded_population_proof
             and request_width >= timedelta(minutes=5)
             and self._positive_exact_end_user_seed_filter() is not None
+        ):
+            return request_width
+        if (
+            not self._bounded_identity_only
+            and not self._bounded_internal_scan
+            and not self._bounded_bulk_scan
+            and not self._bounded_population_proof
+            and request_width > timedelta(hours=1)
+            and self._positive_typed_map_anchor_plan() is not None
         ):
             return request_width
         return None
@@ -1066,9 +1095,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return 50
 
     def recommended_filter_classify_read_settings(self) -> dict[str, int] | None:
-        """Cap classifier blocks that materialize structured attribute columns."""
+        """Cap blocks that materialize custom typed-Map or JSON attributes."""
 
-        if not self._structured_attribute_filter_count():
+        if not self._custom_span_attribute_filter_count():
             return None
         return {"max_block_size": _STRUCTURED_CLASSIFY_MAX_BLOCK_SIZE}
 
@@ -1354,8 +1383,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         params["filter_graph_key_witness"] = 1
         return query, params
 
-    def _candidate_witness_anchor_plan(self) -> LatestFilterPredicate | None:
-        """Return one exact-positive anchor that every final match must satisfy."""
+    def _candidate_witness_plans(self) -> list[LatestFilterPredicate]:
+        """Return positive any-span leaves safe for a finite exact prefilter.
+
+        The probe is scoped to a caller-supplied set of at most 512 trace
+        identities and a bounded time slice.  Unlike a broad raw anchor it can
+        therefore replay the latest physical state, including JSON overflow,
+        without weakening semantics.  Each returned leaf is only a necessary
+        condition; the ordinary classifier still applies root, residual, and
+        every other filter before a row can be published.
+        """
 
         unsupported_internal_mode = (
             self._bounded_identity_only or self._bounded_internal_scan
@@ -1365,17 +1402,66 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             or self._bounded_membership_filters is not None
             or self.search
         ):
-            return None
+            return []
 
         try:
-            anchor = self._positive_typed_map_anchor_plan()
+            plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
         except (TypeError, ValueError):
-            return None
-        # The full classifier still applies every other scalar, JSON, eval, and
-        # annotation leaf.  A single positive typed-Map equality/IN leaf is a
-        # necessary condition even in a multi-filter AND, so it is safe to use
-        # as an exact negative prefilter without changing public semantics.
-        return anchor
+            return []
+
+        positive_operations = {"equals", "in", "contains"}
+        candidates: list[tuple[bool, int, LatestFilterPredicate]] = []
+        plan_index = 0
+        for item in self._bounded_filters():
+            if not isinstance(item, dict):
+                return []
+            key = item.get("column_id") or item.get("columnId")
+            if key in {"created_at", "start_time"}:
+                continue
+            try:
+                item_plans, item_residual = self._partition_trace_filter_plans([item])
+            except (TypeError, ValueError):
+                return []
+            if item_residual:
+                continue
+            if len(item_plans) != 1 or plan_index >= len(plans):
+                return []
+            plan = plans[plan_index]
+            plan_index += 1
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            if not isinstance(config, dict):
+                return []
+            operation = normalize_filter_op(
+                str(config.get("filter_op") or config.get("filterOp") or "")
+            )
+            if (
+                plan.scope == "any"
+                and operation in positive_operations
+                and plan.aggregates
+                and plan.predicate
+            ):
+                candidates.append(
+                    (
+                        self._candidate_witness_filter_is_expensive(item),
+                        plan_index - 1,
+                        plan,
+                    )
+                )
+
+        if plan_index != len(plans):
+            return []
+        # A conjunction needs only one necessary leaf. Prefer the structured
+        # or nested leaf that made the speculative witness worthwhile; using a
+        # preceding scalar leaf would recreate the broad typed-Map scan this
+        # optimization deliberately avoids.
+        candidates.sort(key=lambda item: (not item[0], item[1]))
+        return [plan for _, _, plan in candidates]
+
+    def _candidate_witness_anchor_plan(self) -> LatestFilterPredicate | None:
+        """Return one compatible witness plan for legacy capability checks."""
+
+        plans = self._candidate_witness_plans()
+        return plans[0] if plans else None
 
     def supports_filter_candidate_witness_prefilter_without_hydration(self) -> bool:
         """Allow the exact membership-only historical selector optimization.
@@ -1412,24 +1498,97 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             and self.prefer_filter_candidate_witness_probe_first()
         )
 
-    def prefer_filter_candidate_witness_probe_first(self) -> bool:
-        """Use the finite witness prefilter only for unhydrated bulk reads.
+    @staticmethod
+    def _candidate_witness_filter_is_expensive(item: dict[str, Any]) -> bool:
+        """Return whether one filter has structured/nested replay cost."""
 
-        Normal interactive lists already classify membership/order identities
-        and hydrate only the final page.  On the largest production tenants,
-        their optional witness collapse exceeded its row/byte cap and forced a
-        twenty-identity fallback even though the interactive identity classifier
-        is qualified for 80 candidates.  Bypass that redundant probe for
-        hydrated lists; the historical membership-only bulk reader retains it
-        because it buffers candidates across slices before one exact replay.
+        key = str(item.get("column_id") or item.get("columnId") or "")
+        if key in {"created_at", "start_time"}:
+            return False
+        config = item.get("filter_config") or item.get("filterConfig") or {}
+        if not isinstance(config, dict):
+            return False
+        filter_type = normalize_span_attribute_filter_type(
+            str(config.get("filter_type") or config.get("filterType") or ""),
+            config.get("filter_value", config.get("filterValue")),
+        )
+        if filter_type in {"array", "map"}:
+            return True
+        col_type = str(config.get("col_type") or config.get("colType") or "").upper()
+        return bool(
+            col_type == "SPAN_ATTRIBUTE"
+            and any(component.isdigit() for component in key.split("."))
+        )
+
+    def _interactive_candidate_witness_is_expensive(self) -> bool:
+        """Return whether an interactive filter merits a speculative witness.
+
+        A scalar typed-Map equality such as ``final_status = Rejected`` is
+        already cheaper through the exact finite identity classifier.  Its
+        request-window witness cannot use the time primary key together with
+        trace identity efficiently on large tenants and can exhaust the read
+        byte cap before doing useful work.  Keep the optional witness for the
+        shapes whose exact replay is materially heavier: structured JSON
+        arrays/objects and flattened nested array paths (the numeric component
+        in keys such as ``conversation.transcript.16.message.role``).
         """
 
+        for item in self._bounded_match_filters():
+            if not isinstance(item, dict):
+                continue
+            config = item.get("filter_config") or item.get("filterConfig") or {}
+            if not isinstance(config, dict):
+                continue
+            operation = normalize_filter_op(
+                str(config.get("filter_op") or config.get("filterOp") or "")
+            )
+            if operation not in {"equals", "in", "contains"}:
+                continue
+            if not self._candidate_witness_filter_is_expensive(item):
+                continue
+            try:
+                item_plans, item_residual = self._partition_trace_filter_plans([item])
+            except (TypeError, ValueError):
+                continue
+            if (
+                not item_residual
+                and len(item_plans) == 1
+                and item_plans[0].scope == "any"
+                and item_plans[0].aggregates
+                and item_plans[0].predicate
+            ):
+                return True
+        return False
+
+    def prefer_filter_candidate_witness_probe_first(self) -> bool:
+        """Use a finite temporal witness before expensive long-window replay."""
+
         request_start, request_end = self._bounded_request_window
-        return bool(
-            self.supports_filter_candidate_witness_prefilter_without_hydration()
-            and request_end - request_start > timedelta(hours=1)
-            and self._candidate_witness_anchor_plan() is not None
+        interactive_list = bool(
+            not self._bounded_identity_only
+            and not self._bounded_internal_scan
+            and not self._bounded_bulk_scan
+            and not self._bounded_population_proof
+            and self.project_id is not None
+            and self.project_ids is None
+            and not self.search
         )
+        return bool(
+            (
+                (
+                    interactive_list
+                    and self._interactive_candidate_witness_is_expensive()
+                )
+                or self.supports_filter_candidate_witness_prefilter_without_hydration()
+            )
+            and request_end - request_start > timedelta(hours=1)
+            and self._candidate_witness_plans()
+        )
+
+    def recommended_filter_max_query_count(self) -> int | None:
+        """Reserve the existing hard contract for exact sparse fallbacks."""
+
+        return 128 if self.prefer_filter_candidate_witness_probe_first() else None
 
     def recommended_filter_candidate_witness_probe_strata(self) -> int | None:
         """Resolve the finite candidate batch in one partition-pruned query."""
@@ -1487,15 +1646,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         slice_start: datetime | None = None,
         slice_end: datetime | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Return candidates satisfying one positive Map leaf at latest state.
+        """Return finite candidates satisfying one necessary any-span leaf.
 
-        Raw witnesses are not selective on update-heavy tenants: an old value
-        can admit nearly every trace even after a later version cleared it.
-        Collapse only the finite root-candidate batch by immutable physical span
-        identity and apply the anchor after ``argMax``.  This is an exact
-        negative prefilter for the anchor, not a final result: surviving traces
-        still pass the complete classifier (all leaves, live root, residual
-        relations) before publication.
+        Physical span versions are collapsed first and the selected leaf is
+        reduced at trace scope.  Using exactly one leaf matters because two
+        filters may be satisfied by sibling spans in different temporal
+        strata; ANDing them inside each stratum would be an unsafe negative.
+        Survivors still pass the complete latest-state classifier before
+        publication.
         """
 
         if not isinstance(seed_rows, list) or not seed_rows or len(seed_rows) > 512:
@@ -1562,10 +1720,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             )
         if not anchor.aggregates or not anchor.predicate:
             return "", {}
-        anchor_params = dict(anchor.params)
         params: dict[str, Any] = {
             **self.params,
-            **anchor_params,
+            **anchor.params,
             **candidate_params,
             "filter_candidate_start_us": _unix_microseconds(probe_start),
             "filter_candidate_end_us": _unix_microseconds(probe_end),
@@ -1595,7 +1752,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             else "AND grouped_trace_id IN %(filter_candidate_trace_ids)s"
         )
         query = f"""
-        SELECT DISTINCT
+        SELECT
             {grouped_project_public} grouped_trace_id AS trace_id
         FROM (
             SELECT
@@ -1613,9 +1770,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
               AND start_time < fromUnixTimestamp64Micro(%(filter_candidate_end_us)s)
             GROUP BY {physical_group_by}
         ) AS latest_anchor_spans
-        WHERE latest_is_deleted = 0
+        WHERE 1 = 1
           {candidate_result_fragment}
-          AND ({anchor.predicate})
+        GROUP BY {"grouped_project_id, " if org_scope else ""}grouped_trace_id
+        HAVING max(toUInt8(latest_is_deleted = 0 AND ({anchor.predicate}))) = 1
         LIMIT %(filter_candidate_witness_limit)s
         """
         return query, params

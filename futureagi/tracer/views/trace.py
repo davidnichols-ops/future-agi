@@ -4546,6 +4546,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_state.scan_before_id if cursor_state is not None else None
                 ),
                 bounded_continuation=cursor_enabled,
+                # A strict first page may need to split a scheduled wide seed
+                # after ClickHouse rejects that read budget.  The retry stays
+                # exact and fail-closed: nothing from the failed slice is
+                # published, and the same predicate is retried over adjacent
+                # narrower windows inside the existing query/deadline caps.
+                retry_wide_read_budget=page_number == 0,
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -5293,10 +5299,25 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             )
             cursor_has_more = True
 
-        metadata = {"total_rows": total_count}
+        metadata_total_rows = total_count
+        if (
+            cursor_enabled
+            and bounded_page is not None
+            and bounded_page.complete
+            and not bounded_page.has_more
+        ):
+            # A bounded cursor read reports only this transport's matches.
+            # Once the frozen cursor window is exhausted, the exact global
+            # total is the previously published prefix plus this final page.
+            metadata_total_rows = cursor_seen_rows
+
+        metadata = {"total_rows": metadata_total_rows}
         if bounded_page is not None:
             published_has_more = (
                 bool(bounded_page.complete and bounded_page.has_more) or cursor_has_more
+            )
+            total_rows_is_lower_bound = not (
+                bounded_page.complete and not bounded_page.has_more
             )
             # ``bounded_page.complete`` describes whether this one transport
             # read exhausted/proved the whole requested window.  A signed
@@ -5309,7 +5330,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             public_chunk_complete = bounded_page.complete or cursor_has_more
             metadata.update(
                 {
-                    "total_rows_is_lower_bound": True,
+                    "total_rows_is_lower_bound": total_rows_is_lower_bound,
                     "has_more": published_has_more,
                     "query_complete": public_chunk_complete,
                     "query_status": (
@@ -5532,6 +5553,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 cursor_state.scan_before_id if cursor_state is not None else None
             ),
             bounded_continuation=cursor_enabled,
+            retry_wide_read_budget=page_number == 0,
         )
         if not bounded_page.complete:
             if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -6517,9 +6539,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
         metadata = {"total_rows": total_count}
         if bounded_page is not None:
+            total_rows_is_lower_bound = not (
+                bounded_page.complete and not bounded_page.has_more
+            )
             metadata.update(
                 {
-                    "total_rows_is_lower_bound": True,
+                    "total_rows_is_lower_bound": total_rows_is_lower_bound,
                     "has_more": bounded_page.has_more,
                     "query_complete": bounded_page.complete,
                     "query_status": bounded_page.status,

@@ -416,7 +416,21 @@ def read_bounded_filter_page(
                 "deferred classification requires one bounded graph acquisition"
             )
     if max_query_count is None:
-        max_query_count = min(max_seed_attempts * 2, query_contract_limit)
+        query_count_recommendation = getattr(
+            builder, "recommended_filter_max_query_count", None
+        )
+        raw_query_count_recommendation = (
+            query_count_recommendation()
+            if callable(query_count_recommendation)
+            else None
+        )
+        if raw_query_count_recommendation is None:
+            max_query_count = min(max_seed_attempts * 2, query_contract_limit)
+        else:
+            recommended_query_count = int(raw_query_count_recommendation)
+            if recommended_query_count <= 0:
+                raise ValueError("recommended query count must be positive")
+            max_query_count = min(recommended_query_count, query_contract_limit)
     if not 1 <= max_query_count <= query_contract_limit:
         raise ValueError("max_query_count exceeds the bounded read contract")
 
@@ -901,13 +915,19 @@ def read_bounded_filter_page(
     # filter shapes return no probe and retain the existing exact path.
     candidate_witness_probe_enabled = bool(
         probe_limits_enforced
-        and not bounded_continuation
         and candidate_witness_prefilter_allowed
         and callable(candidate_witness_probe_builder)
         and callable(candidate_witness_probe_preference)
         and candidate_witness_probe_preference()
     )
     candidate_witness_probe_strata = 1
+    # Slice-aware builders advertise their temporal probe contract through the
+    # strata recommendation hook. Legacy one-shot probes expose only
+    # ``build_filter_candidate_witness_probe(rows)`` and must fall straight
+    # back to exact classification after a failed full-window attempt.
+    candidate_witness_probe_supports_slices = callable(
+        candidate_witness_probe_strata_builder
+    )
     if candidate_witness_probe_enabled and callable(
         candidate_witness_probe_strata_builder
     ):
@@ -1158,7 +1178,7 @@ def read_bounded_filter_page(
                 **(read_settings or {}),
                 "max_result_rows": result_limit,
             }
-            if kind == "classify":
+            if kind in {"classify", "prefilter"}:
                 for (
                     setting_name,
                     setting_cap,
@@ -1409,7 +1429,9 @@ def read_bounded_filter_page(
                     candidate_seed_rows[identity]
                     for identity in remaining_probe_identities
                 ]
-                if candidate_witness_probe_strata > 1:
+                if candidate_witness_probe_supports_slices and (
+                    candidate_witness_probe_strata > 1 or probe_depth > 0
+                ):
                     probe_query, probe_params = candidate_witness_probe_builder(
                         probe_rows,
                         slice_start=probe_start,
@@ -1445,9 +1467,9 @@ def read_bounded_filter_page(
                         + (probe_end - probe_start).microseconds
                     )
                     can_split = bool(
-                        candidate_witness_probe_strata > 1
-                        and exc.error_code
+                        exc.error_code
                         in {"read_budget_exceeded", "prefilter_unavailable"}
+                        and candidate_witness_probe_supports_slices
                         and probe_depth < 2
                         and probe_duration_us > 1
                         and candidate_witness_probe_attempt_count + 2
@@ -1597,18 +1619,15 @@ def read_bounded_filter_page(
                     if monotonic() > classification_deadline:
                         raise _BudgetExceeded("deadline_exceeded")
 
-            if (
-                bounded_continuation
-                and stop_on_ordered_prefix
-                and identity_batch
-                and candidate_identities == list(candidate_seed_rows)
-            ):
+            if bounded_continuation and stop_on_ordered_prefix and identity_batch:
                 # Each exact classifier chunk resolves one contiguous prefix
-                # of the ordered root seed. Commit that smaller prefix instead
-                # of rolling the whole seed page back when the next chunk has
-                # insufficient deadline headroom. This preserves exactness and
-                # prevents the next cursor request from repeating completed
-                # typed-Map/JSON work.
+                # of the ordered root seed. A complete witness may have removed
+                # earlier candidates, but those negatives are resolved too and
+                # the surviving identities retain seed order. Commit through
+                # the last classified survivor instead of rolling the whole
+                # seed page back when the next chunk has insufficient deadline
+                # headroom. This preserves exactness and prevents cursor
+                # livelock on a broad-but-not-identical witness result.
                 last_classified_seed = candidate_seed_rows[identity_batch[-1]]
                 before_start_time, before_id = seed_row_key(last_classified_seed)
                 checkpoint_continuation()

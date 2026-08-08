@@ -59,7 +59,7 @@ def test_generic_trace_exact_zero_probe_intersects_independent_span_witnesses():
     builder = TraceListQueryBuilderV2(
         project_id=PROJECT_ID,
         page_size=25,
-        filters=_filters(end),
+        filters=_filters(end, window=timedelta(minutes=5)),
     )
 
     sql, params = builder.build_filter_exact_zero_probe()
@@ -98,7 +98,7 @@ def test_generic_trace_exact_zero_probe_terminal_empty_skips_bounded_scan():
             return _result([])
 
     executor = Executor()
-    filters = _filters(end)
+    filters = _filters(end, window=timedelta(minutes=5))
     page = read_bounded_filter_page(
         builder=TraceListQueryBuilderV2(
             project_id=PROJECT_ID,
@@ -118,6 +118,22 @@ def test_generic_trace_exact_zero_probe_terminal_empty_skips_bounded_scan():
     assert page.error_code is None
     assert [attempt.kind for attempt in page.attempts] == ["zero_probe"]
     assert len(executor.calls) == 1
+
+
+@pytest.mark.unit
+def test_generic_trace_exact_zero_probe_skips_broad_long_window_union():
+    end = datetime(2026, 8, 8, tzinfo=UTC)
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        page_size=25,
+        filters=_filters(end),
+    )
+
+    assert builder.supports_filter_exact_zero_probe() is False
+    assert builder.prefer_filter_candidate_witness_probe_first() is True
+    assert builder.recommended_filter_candidate_witness_probe_strata() == 1
+    with pytest.raises(ValueError, match="exact-zero probe is unavailable"):
+        builder.build_filter_exact_zero_probe()
 
 
 @pytest.mark.unit
