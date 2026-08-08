@@ -97,7 +97,7 @@ def _generate_monthly_invoices_sync(
 
 def _run_monthly_reset_sync(period: str) -> None:
     try:
-        from ee.usage.tasks.monthly_reset import run_monthly_reset
+        from ee.cloud.tasks.monthly_reset import run_monthly_reset
     except ImportError:
         run_monthly_reset = None
 
