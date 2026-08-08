@@ -28560,6 +28560,14 @@ export?: boolean;
  */
 cursor?: string;
 cursor_mode?: boolean;
+/**
+ * JSON-encoded list of visible Users-table fields. Raw-derived metrics are hydrated only when explicitly requested.
+ */
+requested_columns?: string;
+/**
+ * JSON-encoded list of visible custom user attribute keys. Only these keys (plus keys required by filters) are hydrated.
+ */
+attribute_keys?: string;
 };
 
 export type UsageAdminCustomPlanListParams = {

@@ -44387,6 +44387,8 @@ export const tracerUsersListQueryExportDefault = false;
 export const tracerUsersListQueryCursorMax = 4096;
 
 export const tracerUsersListQueryCursorModeDefault = false;
+export const tracerUsersListQueryRequestedColumnsDefault = [];
+export const tracerUsersListQueryAttributeKeysDefault = [];
 
 export const TracerUsersListQueryParams = zod.object({
   "project_id": zod.string().uuid().optional(),
@@ -44397,7 +44399,9 @@ export const TracerUsersListQueryParams = zod.object({
   "filters": zod.string().min(1).default(tracerUsersListQueryFiltersDefault),
   "export": zod.boolean().default(tracerUsersListQueryExportDefault),
   "cursor": zod.string().min(1).max(tracerUsersListQueryCursorMax).optional().describe('Opaque continuation token returned by the previous page. When supplied, do not also send the numbered-page parameter.'),
-  "cursor_mode": zod.boolean().default(tracerUsersListQueryCursorModeDefault)
+  "cursor_mode": zod.boolean().default(tracerUsersListQueryCursorModeDefault),
+  "requested_columns": zod.string().default(tracerUsersListQueryRequestedColumnsDefault).describe('JSON-encoded list of visible Users-table fields. Raw-derived metrics are hydrated only when explicitly requested.'),
+  "attribute_keys": zod.string().default(tracerUsersListQueryAttributeKeysDefault).describe('JSON-encoded list of visible custom user attribute keys. Only these keys (plus keys required by filters) are hydrated.')
 })
 
 export const tracerUsersListResponseStatusDefault = true;

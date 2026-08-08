@@ -37306,6 +37306,20 @@ export const OPENAPI_CONTRACT = Object.freeze({
               "type": "boolean",
               "default": false
             }
+          },
+          "requested_columns": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": []
+            }
+          },
+          "attribute_keys": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": []
+            }
           }
         },
         "responses": {
