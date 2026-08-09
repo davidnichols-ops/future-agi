@@ -59,7 +59,9 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
     ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT,
+    ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE,
     ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+    ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS,
     ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS,
     AttributeCardinalityRead,
     AttributeDetailRead,
@@ -4239,6 +4241,136 @@ def test_filter_value_cursor_seen_temporal_distinct_exhausts_finite_dense_window
     assert "AND (" in sql  # direct source predicate keeps CH skip indexes usable
 
 
+@pytest.mark.parametrize("page_size", (1, 2, 25))
+def test_filter_value_cursor_seen_vocabulary_larger_than_page_exhausts(page_size):
+    values = (
+        "AGENT",
+        "CHAIN",
+        "CONVERSATION",
+        "LLM",
+        "RETRIEVER",
+        "TOOL",
+        "UNKNOWN",
+    )
+    seen_digests = tuple(
+        attribute_value_cursor_digest("string", value) for value in values
+    )
+    executor = RecordingExecutor(
+        lambda *_args: pytest.fail(
+            "a complete seen-only vocabulary must not enter the physical walk"
+        ),
+        distinct_responder=lambda *_args: [
+            _distinct_value_group("string", value) for value in values
+        ],
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "fi.span.kind",
+        page_size=page_size,
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
+        window_end=NOW,
+        seen_value_digests=seen_digests,
+    )
+
+    assert len(executor.calls) == 1
+    distinct_call = executor.calls[0]
+    assert distinct_call.params["distinct_limit"] == len(values) + page_size + 1
+    assert "max_rows_in_distinct" not in distinct_call.settings
+    assert "distinct_overflow_mode" not in distinct_call.settings
+    assert read.rows == ()
+    assert read.seen_value_digests == seen_digests
+    assert read.has_more is False
+    assert read.browse_status == "exhausted"
+    assert read.next_segment_end == NOW - ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
+
+
+def test_filter_value_cursor_proof_result_sentinel_has_a_hard_maximum():
+    seen_digests = tuple(
+        attribute_value_cursor_digest("string", f"seen-{index}")
+        for index in range(ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS)
+    )
+    executor = RecordingExecutor(
+        lambda *_args: pytest.fail("an empty complete proof must not fallback"),
+        distinct_responder=lambda *_args: [],
+    )
+
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "fi.span.kind",
+        page_size=ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE,
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
+        window_end=NOW,
+        seen_value_digests=seen_digests,
+    )
+
+    assert len(executor.calls) == 1
+    distinct_call = executor.calls[0]
+    assert ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS == 4_147
+    assert (
+        distinct_call.params["distinct_limit"]
+        == ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS
+    )
+    assert (
+        distinct_call.settings["max_result_rows"]
+        == ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS
+    )
+    assert read.rows == ()
+    assert read.has_more is False
+    assert read.browse_status == "exhausted"
+
+
+def test_filter_value_cursor_dynamic_proof_rejects_one_unseen_value():
+    seen_values = (
+        "AGENT",
+        "CHAIN",
+        "CONVERSATION",
+        "LLM",
+        "RETRIEVER",
+        "TOOL",
+        "UNKNOWN",
+    )
+    unseen_value = "WORKFLOW"
+    seen_digests = tuple(
+        attribute_value_cursor_digest("string", value) for value in seen_values
+    )
+    candidate = _candidate(
+        PROJECT_A,
+        "unseen-after-proof",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    executor = _value_cursor_executor(
+        [candidate],
+        {str(candidate["id"]): unseen_value},
+    )
+    executor.distinct_responder = lambda *_args: [
+        *(_distinct_value_group("string", value) for value in seen_values),
+        _distinct_value_group("string", unseen_value),
+    ]
+
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "fi.span.kind",
+        page_size=2,
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
+        window_end=NOW,
+        seen_value_digests=seen_digests,
+    )
+
+    proof_call = next(
+        call for call in executor.calls if "distinct_limit" in call.params
+    )
+    candidate_call = next(
+        call for call in executor.calls if "segment_start" in call.params
+    )
+    assert proof_call.params["distinct_limit"] == len(seen_values) + 2 + 1
+    assert proof_call.params["segment_end_us"] == _unix_microseconds(NOW)
+    assert candidate_call.params["segment_end"] == NOW
+    assert read.rows == (AttributeValueRow(unseen_value, "string", 1),)
+
+
 @pytest.mark.parametrize(
     ("horizon_days", "expected_query_count"),
     ((7, 17), (30, 19), (365, 26)),
@@ -4879,6 +5011,54 @@ def test_filter_value_cursor_temporal_distinct_minimum_failure_keeps_original_fr
     assert read.rows == (AttributeValueRow("queued", "string", 1),)
 
 
+def test_filter_value_cursor_typed_distinct_sentinel_is_an_exact_fallback():
+    candidate = _candidate(
+        PROJECT_A,
+        "typed-lane-overflow",
+        start_time=NOW - timedelta(seconds=1),
+    )
+    executor = _value_cursor_executor(
+        [candidate],
+        {str(candidate["id"]): "Rechazado"},
+    )
+    # SQL LIMIT returns the complete two-row overflow sentinel without a
+    # max_rows_in_distinct race. A sentinel is never accepted as a complete
+    # proof and must retain the unchanged ordered fallback.
+    executor.distinct_responder = lambda *_args: [
+        _distinct_value_group("string", "stale-string"),
+        _distinct_value_group("number", 1),
+    ]
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        search="Rechazado",
+        page_size=1,
+        window_start=NOW - timedelta(hours=1),
+        window_end=NOW,
+    )
+
+    distinct_call = next(
+        call for call in executor.calls if "distinct_limit" in call.params
+    )
+    assert distinct_call.params["distinct_limit"] == 2
+    assert "max_rows_in_distinct" not in distinct_call.settings
+    assert "distinct_overflow_mode" not in distinct_call.settings
+    assert distinct_call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+    assert distinct_call.settings["max_threads"] == 1
+    assert distinct_call.settings["max_memory_usage"] == 256 * 1024 * 1024
+    assert distinct_call.settings["max_rows_to_read"] == 500_000
+    assert distinct_call.settings["max_bytes_to_read"] == 1024 * 1024 * 1024
+    assert distinct_call.settings["max_result_rows"] == 2
+    assert distinct_call.settings["max_result_bytes"] == 16 * 1024 * 1024
+    assert distinct_call.settings["read_overflow_mode"] == "throw"
+    assert distinct_call.settings["result_overflow_mode"] == "throw"
+    assert distinct_call.settings["timeout_overflow_mode"] == "throw"
+    assert read.rows == (AttributeValueRow("Rechazado", "string", 1),)
+
+
 def test_filter_value_cursor_code_191_fallback_reanchors_page_n_checkpoint():
     checkpoint_time = NOW - timedelta(minutes=30)
     before_identity = (
@@ -4932,7 +5112,7 @@ def test_filter_value_cursor_code_191_fallback_reanchors_page_n_checkpoint():
     )
     assert distinct_widths[0] == timedelta(hours=6)
     assert distinct_widths[-1] == ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
-    assert all(call.params["distinct_limit"] == 2 for call in distinct_calls)
+    assert all(call.params["distinct_limit"] == 3 for call in distinct_calls)
     assert candidate_call.params["segment_start"] == checkpoint_time
     assert candidate_call.params["segment_end"] == (
         checkpoint_time + ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
@@ -4992,7 +5172,7 @@ def test_filter_value_cursor_distinct_reserve_fallback_reanchors_checkpoint(
         call for call in executor.calls if "segment_start" in call.params
     )
     assert len(distinct_calls) == 1
-    assert distinct_calls[0].params["distinct_limit"] == 2
+    assert distinct_calls[0].params["distinct_limit"] == 3
     assert candidate_call.params["segment_start"] == checkpoint_time
     assert candidate_call.params["segment_end"] == checkpoint_time + timedelta(
         minutes=10

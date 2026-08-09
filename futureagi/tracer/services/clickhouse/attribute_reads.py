@@ -111,6 +111,14 @@ ATTRIBUTE_READ_MAX_PROJECTS = 64
 # of consecutive ``completed`` calls) without allowing one request to become
 # an unbounded distinct scan.
 ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE = 50
+# Maximum SQL/result sentinel for a continuation proof: the exact signed/cache-
+# backed de-duplication prefix, every value that could already have been emitted
+# while resuming the current page, and one overflow row. DISTINCT state remains
+# bounded by the independent read-row, read-byte, memory, statement, and wall
+# limits below rather than max_rows_in_distinct, which races the SQL LIMIT.
+ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS = (
+    ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE + 1
+)
 ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT = 64
 ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT = 512
 # One cursor request is a responsive, exact prefix read rather than a request
@@ -1639,7 +1647,7 @@ class AttributeReadSelector:
         if not segment_start < segment_end:
             raise ValueError("invalid filter-value distinct segment")
         distinct_limit = int(distinct_limit)
-        if not 2 <= distinct_limit <= ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE + 1:
+        if not 2 <= distinct_limit <= ATTRIBUTE_VALUE_CURSOR_PROOF_MAX_RESULT_ROWS:
             raise ValueError("invalid filter-value distinct result limit")
         if not candidate_predicates:
             raise ValueError("distinct proof has no value lanes")
@@ -1787,11 +1795,12 @@ class AttributeReadSelector:
             params,
             max_result_rows=distinct_limit,
             query_timeout_ms=query_timeout_ms,
-            query_settings={
-                **_ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS,
-                "max_rows_in_distinct": distinct_limit,
-                "distinct_overflow_mode": "throw",
-            },
+            # Do not set ``max_rows_in_distinct`` here. ClickHouse checks that
+            # restriction before this query's SQL LIMIT can stop the DISTINCT
+            # transform, causing Code 191 at a safe overflow sentinel. The SQL
+            # LIMIT and max_result_rows cap output; independent read, byte,
+            # memory, statement, and wall limits still bound all work.
+            query_settings=_ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS,
         )
 
     def _verify_latest(
@@ -4609,7 +4618,12 @@ class AttributeReadSelector:
                 proof_start = max(start, proof_end - distinct_width)
                 if proof_start >= proof_end:
                     break
-                distinct_limit = effective_page_size + 1
+                # The proof can advance only when every relevant raw value is
+                # already known.  Include the exact persisted digest prefix,
+                # this page's maximum resumable emissions, and one overflow
+                # sentinel; a vocabulary larger than that remains an ordinary
+                # ordered fallback at the unchanged physical frontier.
+                distinct_limit = len(seen_set) + effective_page_size + 1
                 proof_timeout_ms = planned_proof_timeout_ms
                 try:
                     distinct_rows = self._seen_value_slice_groups(
