@@ -2671,7 +2671,11 @@ def test_filter_value_cursor_search_yields_verified_prefix_without_filling_page(
     assert read.metadata.query_status == "complete"
     assert read.has_more is True
     assert read.browse_status == "continuation"
-    assert read.next_segment_end == NOW - timedelta(hours=6)
+    assert read.next_segment_end == NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+    assert (
+        read.next_segment_start
+        == read.next_segment_end - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+    )
     assert read.next_before_identity is None
     assert len(executor.calls) == 3
     assert "toUInt64(_version) AS candidate_version" in executor.calls[0].sql
@@ -3684,14 +3688,19 @@ def test_filter_value_cursor_first_page_does_not_use_temporal_distinct_proof():
     assert all("distinct_limit" not in call.params for call in executor.calls)
 
 
-def test_filter_value_cursor_seen_temporal_distinct_exhausts_dense_seven_days():
+def test_filter_value_cursor_seen_temporal_distinct_exhausts_finite_dense_window():
     seen_digest = attribute_value_cursor_digest("string", "Rechazado")
+    window = timedelta(minutes=30)
+    # Every successful request certifies at least one minimum-width slice.
+    # Derive the terminal-proof bound from that public progress contract so
+    # this remains valid if the internal per-request query budget changes.
+    max_pages = int(window / ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT) + 1
     segment_end = NOW
     checkpoints = [segment_end]
     pages: list[AttributeValueCursorPageRead] = []
     all_calls: list[QueryCall] = []
 
-    for _ in range(80):
+    for _ in range(max_pages):
         executor = RecordingExecutor(
             lambda *_args: pytest.fail(
                 "a complete seen-only proof must not re-enter the physical walk"
@@ -3706,7 +3715,7 @@ def test_filter_value_cursor_seen_temporal_distinct_exhausts_dense_seven_days():
             [PROJECT_A],
             "final_status",
             page_size=10,
-            window_start=NOW - timedelta(days=7),
+            window_start=NOW - window,
             window_end=NOW,
             segment_end=segment_end,
             seen_value_digests=(seen_digest,),
@@ -3718,9 +3727,11 @@ def test_filter_value_cursor_seen_temporal_distinct_exhausts_dense_seven_days():
             break
         segment_end = read.next_segment_end
 
-    assert len(pages) <= 80
+    assert len(pages) <= max_pages
+    assert all(page.has_more for page in pages[:-1])
     assert pages[-1].browse_status == "exhausted"
-    assert pages[-1].next_segment_end == NOW - timedelta(days=7)
+    assert pages[-1].has_more is False
+    assert pages[-1].next_segment_end == NOW - window
     assert all(page.rows == () for page in pages)
     assert all(
         newer > older
@@ -3771,7 +3782,7 @@ def test_filter_value_cursor_typed_search_distinct_exhausts_seen_matches():
         [PROJECT_A],
         "final_status",
         page_size=10,
-        window_start=NOW - timedelta(minutes=5),
+        window_start=NOW - timedelta(minutes=2),
         window_end=NOW,
         seen_value_digests=(seen_digest,),
         search="rEcHaZ",
@@ -3784,7 +3795,7 @@ def test_filter_value_cursor_typed_search_distinct_exhausts_seen_matches():
     assert read.rows == ()
     assert read.has_more is False
     assert read.browse_status == "exhausted"
-    assert read.next_segment_end == NOW - timedelta(minutes=5)
+    assert read.next_segment_end == NOW - timedelta(minutes=2)
     assert distinct_calls
     assert all(
         call.params["distinct_attribute_type"] == "string"
@@ -3818,7 +3829,7 @@ def test_filter_value_cursor_unpinned_search_distinct_exhausts_seen_typed_match(
         [PROJECT_A],
         "final_status",
         page_size=10,
-        window_start=NOW - timedelta(minutes=5),
+        window_start=NOW - timedelta(minutes=2),
         window_end=NOW,
         seen_value_digests=(attribute_value_cursor_digest("string", seen_value),),
         search="rechazado",
@@ -3838,7 +3849,7 @@ def test_filter_value_cursor_unpinned_search_distinct_exhausts_seen_typed_match(
     assert "'json'" in sql
 
 
-def test_filter_value_cursor_searched_empty_proof_enters_widened_empty_walk():
+def test_filter_value_cursor_searched_empty_proof_keeps_bounded_progress():
     executor = RecordingExecutor(
         distinct_responder=lambda *_args: [],
     )
@@ -3861,19 +3872,18 @@ def test_filter_value_cursor_searched_empty_proof_enters_widened_empty_walk():
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
     ]
-    assert len(distinct_calls) == 1
-    assert candidate_calls
-    assert candidate_calls[0].params["segment_end"] == (
-        NOW - ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT
-    )
-    assert any(
-        call.params["segment_end"] - call.params["segment_start"]
-        > ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT
-        for call in candidate_calls
+    assert distinct_calls
+    assert candidate_calls == []
+    assert all(
+        call.params["segment_end_us"] - call.params["segment_start_us"]
+        <= int(ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT.total_seconds() * 1_000_000)
+        for call in distinct_calls
     )
     assert read.rows == ()
-    assert read.browse_status == "exhausted"
-    assert read.has_more is False
+    assert read.browse_status == "continuation"
+    assert read.has_more is True
+    assert NOW - timedelta(days=7) < read.next_segment_end < NOW
+    assert read.metadata.query_count <= ATTRIBUTE_READ_MAX_QUERY_COUNT
 
 
 def test_filter_value_cursor_unpinned_search_proof_uses_array_member_semantics():
@@ -3893,7 +3903,7 @@ def test_filter_value_cursor_unpinned_search_proof_uses_array_member_semantics()
         [PROJECT_A],
         "final_status",
         page_size=10,
-        window_start=NOW - timedelta(minutes=5),
+        window_start=NOW - timedelta(minutes=2),
         window_end=NOW,
         seen_value_digests=(attribute_value_cursor_digest("array", "Rechazado"),),
         search="rechazado",
@@ -3921,7 +3931,7 @@ def test_filter_value_cursor_raw_stale_seen_match_is_safe_to_skip():
         [PROJECT_A],
         "final_status",
         page_size=10,
-        window_start=NOW - timedelta(minutes=5),
+        window_start=NOW - timedelta(minutes=2),
         window_end=NOW,
         seen_value_digests=(attribute_value_cursor_digest("string", seen_value),),
         search="rechazado",
@@ -3939,7 +3949,7 @@ def test_filter_value_cursor_raw_unseen_tombstone_forces_exact_replay_without_em
     candidate = _candidate(
         PROJECT_A,
         "stale-rechazado",
-        start_time=NOW - timedelta(minutes=1),
+        start_time=NOW - timedelta(seconds=1),
         candidate_version=1,
     )
 
@@ -3975,7 +3985,7 @@ def test_filter_value_cursor_raw_unseen_tombstone_forces_exact_replay_without_em
         [PROJECT_A],
         "final_status",
         page_size=10,
-        window_start=NOW - timedelta(minutes=5),
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
         window_end=NOW,
         seen_value_digests=(attribute_value_cursor_digest("string", "completed"),),
         search="rechazado",
@@ -3991,7 +4001,7 @@ def test_filter_value_cursor_python_casefold_match_is_not_lost_by_sql_prefilter(
     candidate = _candidate(
         PROJECT_A,
         "unicode-casefold",
-        start_time=NOW - timedelta(minutes=1),
+        start_time=NOW - timedelta(seconds=1),
     )
     executor = _value_cursor_executor(
         [candidate],
@@ -4005,7 +4015,7 @@ def test_filter_value_cursor_python_casefold_match_is_not_lost_by_sql_prefilter(
         [PROJECT_A],
         "custom.attribute",
         page_size=10,
-        window_start=NOW - timedelta(minutes=5),
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
         window_end=NOW,
         seen_value_digests=(attribute_value_cursor_digest("string", "other"),),
         search="STRASSE",
@@ -4033,7 +4043,7 @@ def test_filter_value_cursor_escaped_json_array_search_uses_decoded_members():
         [PROJECT_A],
         "custom.attribute",
         page_size=10,
-        window_start=NOW - timedelta(minutes=5),
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
         window_end=NOW,
         seen_value_digests=(attribute_value_cursor_digest("array", member),),
         search=member,
@@ -4141,7 +4151,11 @@ def test_filter_value_cursor_typed_search_unseen_match_falls_back_without_skip()
     assert distinct_call.params["distinct_attribute_search"] == "rechazado"
     assert distinct_call.params["distinct_before_id"] == before_identity[2]
     assert candidate_call.params["candidate_before_id"] == before_identity[2]
-    assert candidate_call.params["segment_end"] == NOW
+    assert candidate_call.params["segment_start"] == checkpoint_time
+    assert (
+        candidate_call.params["segment_end"]
+        == checkpoint_time + ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+    )
     assert read.rows == (AttributeValueRow(matching_unseen_value, "string", 1),)
 
 
@@ -4169,7 +4183,7 @@ def test_filter_value_cursor_typed_search_distinct_binds_scalar_semantics(
         [PROJECT_A],
         "custom.attribute",
         page_size=10,
-        window_start=NOW - timedelta(minutes=5),
+        window_start=NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
         window_end=NOW,
         seen_value_digests=(attribute_value_cursor_digest(attribute_type, seen_value),),
         search=search,
@@ -4238,7 +4252,7 @@ def test_filter_value_cursor_temporal_distinct_unseen_value_falls_back_at_same_k
     assert read.rows == (AttributeValueRow("queued", "string", 1),)
 
 
-def test_filter_value_cursor_temporal_distinct_budget_backoff_returns_proven_slice():
+def test_filter_value_cursor_temporal_distinct_failure_returns_proven_safe_slice():
     candidate = _candidate(
         PROJECT_A,
         "older-unique",
@@ -4282,12 +4296,9 @@ def test_filter_value_cursor_temporal_distinct_budget_backoff_returns_proven_sli
         )
         for call in distinct_calls
     ]
-    assert widths[0] == ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT
-    assert widths[1] == ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT * 2
-    assert widths[-1] == ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
-    assert all(
-        newer > older for newer, older in zip(widths[1:], widths[2:], strict=False)
-    )
+    assert len(widths) == 2
+    assert all(width == ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT for width in widths)
+    assert all(width <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT for width in widths)
     assert not any("segment_start" in call.params for call in executor.calls)
     assert read.rows == ()
     assert read.has_more is True
@@ -5030,11 +5041,11 @@ def test_filter_value_cursor_search_remains_resumable_after_tracking_prefix(
     assert candidate_calls[0]["include_versions"] is True
 
 
-def test_filter_value_cursor_candidate_budget_retries_exact_minimum_frontier():
+def test_filter_value_cursor_candidate_uses_safe_first_attempt():
     candidate = _candidate(
         PROJECT_A,
         "candidate-budget-recovered",
-        start_time=NOW - timedelta(minutes=1),
+        start_time=NOW - timedelta(seconds=1),
     )
     attempted_widths = []
 
@@ -5079,25 +5090,19 @@ def test_filter_value_cursor_candidate_budget_retries_exact_minimum_frontier():
 
     assert read.rows == (AttributeValueRow("recovered", "string", 1),)
     assert read.metadata.query_complete is True
-    assert attempted_widths == [
-        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
-        ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
-    ]
+    assert attempted_widths == [ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT]
     candidate_calls = [
         call for call in executor.calls if "segment_start" in call.params
     ]
-    assert (
-        candidate_calls[0].params["segment_end"]
-        == candidate_calls[1].params["segment_end"]
-    )
+    assert len(candidate_calls) == 1
     assert all("candidate_before_id" not in call.params for call in candidate_calls)
 
 
-def test_filter_value_cursor_replay_budget_retries_exact_minimum_frontier():
+def test_filter_value_cursor_replay_uses_safe_first_attempt():
     candidate = _candidate(
         PROJECT_A,
         "replay-budget-recovered",
-        start_time=NOW - timedelta(minutes=1),
+        start_time=NOW - timedelta(seconds=1),
     )
     attempted_widths = []
     current_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
@@ -5144,18 +5149,15 @@ def test_filter_value_cursor_replay_budget_retries_exact_minimum_frontier():
 
     assert read.rows == (AttributeValueRow("recovered", "string", 1),)
     assert read.metadata.query_complete is True
-    assert attempted_widths == [
-        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
-        ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
-    ]
+    assert attempted_widths == [ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT]
 
 
-def test_filter_value_cursor_persists_last_successful_adaptive_width():
+def test_filter_value_cursor_persists_safe_width_across_legacy_continuation_hint():
     minimum_width = ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
     candidate = _candidate(
         PROJECT_A,
         "adaptive-search-result",
-        start_time=NOW - (minimum_width * 4),
+        start_time=NOW - minimum_width - timedelta(seconds=1),
     )
     attempted_widths = []
 
@@ -5163,8 +5165,6 @@ def test_filter_value_cursor_persists_last_successful_adaptive_width():
         if "segment_start" in call.params:
             width = call.params["segment_end"] - call.params["segment_start"]
             attempted_widths.append(width)
-            if width in {ATTRIBUTE_READ_EXPLICIT_SEGMENT, minimum_width * 4}:
-                return ReadDeadlineExceeded("adaptive deadline")
             if (
                 call.params["segment_start"]
                 <= candidate["start_time"]
@@ -5207,14 +5207,9 @@ def test_filter_value_cursor_persists_last_successful_adaptive_width():
     assert first.rows == ()
     assert first.has_more is True
     assert first.next_before_identity is None
-    assert first.next_segment_end == NOW - (minimum_width * 3)
-    assert first.next_segment_start == NOW - (minimum_width * 5)
-    assert attempted_widths == [
-        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
-        minimum_width,
-        minimum_width * 2,
-        minimum_width * 4,
-    ]
+    assert first.next_segment_end == NOW - minimum_width
+    assert first.next_segment_start == NOW - (minimum_width * 2)
+    assert attempted_widths == [minimum_width]
 
     second_attempt_start = len(attempted_widths)
     second = AttributeReadSelector(
@@ -5228,29 +5223,28 @@ def test_filter_value_cursor_persists_last_successful_adaptive_width():
         window_start=NOW - timedelta(days=1),
         window_end=NOW,
         segment_end=first.next_segment_end,
-        segment_start=first.next_segment_start,
+        segment_start=first.next_segment_end - (minimum_width * 4),
         seen_value_digests=first.seen_value_digests,
     )
 
     assert second.rows == (AttributeValueRow("Rechazado", "string", 1),)
-    assert attempted_widths[second_attempt_start] == minimum_width * 2
-    assert (
-        ATTRIBUTE_READ_EXPLICIT_SEGMENT not in attempted_widths[second_attempt_start:]
-    )
+    assert attempted_widths[second_attempt_start:] == [minimum_width]
 
 
-def test_filter_value_cursor_persists_width_after_later_replay_failure():
+def test_filter_value_cursor_retries_later_replay_failure_at_safe_width():
     minimum_width = ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
     candidate = _candidate(
         PROJECT_A,
-        "adaptive-replay-search-result",
-        start_time=NOW - (minimum_width * 4),
+        "safe-replay-search-result",
+        start_time=NOW - minimum_width - timedelta(seconds=1),
     )
     attempted_widths = []
     current_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+    replay_failures = 0
 
     def respond(call, _):
         nonlocal current_width
+        nonlocal replay_failures
         if "segment_start" in call.params:
             current_width = call.params["segment_end"] - call.params["segment_start"]
             attempted_widths.append(current_width)
@@ -5261,11 +5255,9 @@ def test_filter_value_cursor_persists_width_after_later_replay_failure():
             ):
                 return [candidate]
             return []
-        if current_width in {
-            ATTRIBUTE_READ_EXPLICIT_SEGMENT,
-            minimum_width * 4,
-        }:
-            return ReadDeadlineExceeded("adaptive replay deadline")
+        if replay_failures == 0:
+            replay_failures += 1
+            return ReadDeadlineExceeded("one safe-width replay deadline")
         if "max(_version) AS latest_version" in call.sql:
             return [
                 _target_row(
@@ -5299,14 +5291,9 @@ def test_filter_value_cursor_persists_width_after_later_replay_failure():
     )
 
     assert first.rows == ()
-    assert first.next_segment_end == NOW - (minimum_width * 3)
-    assert first.next_segment_start == NOW - (minimum_width * 5)
-    assert attempted_widths == [
-        ATTRIBUTE_READ_EXPLICIT_SEGMENT,
-        minimum_width,
-        minimum_width * 2,
-        minimum_width * 4,
-    ]
+    assert first.next_segment_end == NOW - minimum_width
+    assert first.next_segment_start == NOW - (minimum_width * 2)
+    assert attempted_widths == [minimum_width]
 
     second_attempt_start = len(attempted_widths)
     second = AttributeReadSelector(
@@ -5325,10 +5312,8 @@ def test_filter_value_cursor_persists_width_after_later_replay_failure():
     )
 
     assert second.rows == (AttributeValueRow("Rechazado", "string", 1),)
-    assert attempted_widths[second_attempt_start] == minimum_width * 2
-    assert (
-        ATTRIBUTE_READ_EXPLICIT_SEGMENT not in attempted_widths[second_attempt_start:]
-    )
+    assert replay_failures == 1
+    assert attempted_widths[second_attempt_start:] == [minimum_width, minimum_width]
 
 
 @pytest.mark.parametrize(

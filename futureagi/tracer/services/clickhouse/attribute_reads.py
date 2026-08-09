@@ -147,11 +147,13 @@ ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS = 750
 # 30-second intervals above the bounded 1 GiB read-volume envelope.
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT = timedelta(seconds=5)
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT = timedelta(seconds=5)
-# A 320-second proof is the largest production-qualified width on Coletia's
-# densest recent partition under the 500k-row / 1 GiB read envelope.  Wider
-# speculative probes repeatedly hit those hard guards and add latency without
-# certifying cursor progress.
-ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = timedelta(seconds=320)
+# Coletia's density is not uniform: the frozen production replay contains
+# adjacent slices where 80s, 40s, 20s, and 10s proofs all cross the existing
+# 500k-row / 1 GiB envelope.  Five seconds is the only width that completed at
+# every observed frontier.  Keep the exact duplicate certificate at that
+# no-failure ceiling instead of using ClickHouse limit exceptions as adaptive
+# control flow.  This does not relax any row, byte, memory, or time guard.
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = timedelta(seconds=5)
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 2_500
 # Dense projects can cross the ordinary row/byte envelope even inside the
 # production-qualified six-hour seed.  A failed statement proves nothing, so
@@ -4130,23 +4132,26 @@ class AttributeReadSelector:
             raise ValueError("invalid filter-value segment cursor")
 
         # Rolling compatibility for cursors issued before candidate segment
-        # bounds preserved DateTime64(6) precision.  Those reads could admit a
-        # checkpoint a few microseconds below the cursor's implied six-hour
-        # lower boundary.  Keep the proven keyset and move only the segment end
-        # backward so the checkpoint is exactly on the next segment's inclusive
-        # lower edge.  The keyset predicate still reaches lower identities at
-        # the same timestamp, and the following adjacent segment starts below
-        # it, so recovery neither repeats nor skips a physical row.
+        # bounds preserved DateTime64(6) precision, and for callers that pass a
+        # bare keyset checkpoint without its segment bounds. Keep the proven
+        # keyset and move only the segment end backward so the checkpoint stays
+        # inside the exact first slice selected for this request. The keyset
+        # predicate still reaches lower identities at the same timestamp, and
+        # the following adjacent segment starts below it, so recovery neither
+        # repeats nor skips a physical row.
         incoming_checkpoint = resume_identity or before_identity
+        incoming_segment_width = (
+            ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+            if normalized_search
+            else ATTRIBUTE_READ_EXPLICIT_SEGMENT
+        )
         if (
-            active_segment_start is None
-            and incoming_checkpoint is not None
-            and incoming_checkpoint[3]
-            < current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
+            incoming_checkpoint is not None
+            and incoming_checkpoint[3] < current_segment_end - incoming_segment_width
         ):
             current_segment_end = min(
                 current_segment_end,
-                incoming_checkpoint[3] + ATTRIBUTE_READ_EXPLICIT_SEGMENT,
+                incoming_checkpoint[3] + incoming_segment_width,
             )
         if (
             incoming_checkpoint is not None
@@ -4187,8 +4192,20 @@ class AttributeReadSelector:
         candidate_pages = 0
         candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
         cursor_before = before_identity
+        # A searched value request has already supplied the selective value
+        # predicate. On a dense tenant the historical six-hour first probe can
+        # exceed the row envelope before LIMIT sees its first matching
+        # identity. Clamp both new requests and wider legacy cursor hints to
+        # the production-qualified five-second ceiling.
         empty_segment_width = (
-            current_segment_end - active_segment_start
+            min(
+                current_segment_end - active_segment_start,
+                ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+            )
+            if normalized_search and active_segment_start is not None
+            else ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+            if normalized_search
+            else current_segment_end - active_segment_start
             if active_segment_start is not None
             else ATTRIBUTE_READ_EXPLICIT_SEGMENT
         )
@@ -4591,16 +4608,12 @@ class AttributeReadSelector:
                 last_successful_segment_width = proven_width
                 distinct_advanced = True
                 if not distinct_rows:
-                    # A searched proof with no relevant latest-state value is
-                    # also an exact empty slice.  Hand the now-advanced
-                    # frontier to the ordinary candidate walk so its
-                    # geometrically widened empty probes can collapse sparse
-                    # retained history.  Repeating two-hour distinct slices
-                    # here would be correct but would expose a long chain of
-                    # empty public continuations.
-                    empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
-                    last_successful_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
-                    break
+                    # A searched proof with no relevant raw value is an exact
+                    # empty slice. Keep walking adjacent safe slices; handing
+                    # this frontier to the geometrically widened physical path
+                    # would reintroduce the known Coletia row/byte failures.
+                    empty_segment_width = proven_width
+                    last_successful_segment_width = proven_width
                 if failed_distinct_ceiling is not None:
                     # Do not immediately retry a request-local width that just
                     # exhausted its read/time budget.  Publish the smaller
@@ -4873,16 +4886,19 @@ class AttributeReadSelector:
                     max_empty_segment_width,
                 )
 
-            # Search is an interactive narrowing operation.  Once one bounded
-            # physical batch has produced verified matches, return that exact
-            # newest-first prefix immediately and let the signed continuation
-            # browse older matches.  Continuing merely to fill ``page_size``
-            # is especially harmful for exact/manual searches with one unique
-            # value: it cannot improve the current prefix but can consume the
-            # request wall.  No global exhaustion is inferred here; unless the
-            # frozen window was actually exhausted, ``browse_status`` below is
+            # Search is an interactive narrowing operation. One fully
+            # certified five-second physical slice is sufficient progress for
+            # this action, whether or not it contains a new value. Returning
+            # its exact newest-first continuation avoids widening an empty
+            # search into a known-unsafe statement merely to fill the current
+            # UI page. No global exhaustion is inferred here; unless the frozen
+            # window was actually exhausted, ``browse_status`` below is
             # ``continuation``.
-            if needle and emitted:
+            if needle:
+                empty_segment_width = min(
+                    ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+                    current_segment_end - start,
+                )
                 break
 
         next_checkpoint = next_resume_identity or cursor_before
