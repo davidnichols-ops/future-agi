@@ -33,7 +33,7 @@ import { logger } from "src/utils/logger";
 import { FILTER_FOR_HAS_EVAL, toBackendFilters } from "../common";
 import { buildDefaultDateEntry } from "./graphFilterUtils";
 import {
-  AGGREGATION_POLL_TIMEOUT_MS,
+  AGGREGATION_REQUEST_TIMEOUT_MS,
   GRAPH_LOADING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
   getAggregationPollDelay,
@@ -41,7 +41,6 @@ import {
   getExactAggregationReadState,
   getExactGraphData,
   getQueryCompletedAt,
-  isAggregationPollBudgetExhausted,
   awaitAggregationRequestWithDeadline,
 } from "src/utils/queryReadState";
 
@@ -149,18 +148,14 @@ const GraphSection = ({
   const forceRefreshRef = useRef(false);
   const pollAttemptRef = useRef(0);
   const pollingRef = useRef(false);
-  const pollStartedAtRef = useRef(null);
   const requestScopeRef = useRef(null);
   const requestGenerationRef = useRef(0);
-  const [pollingTimedOut, setPollingTimedOut] = useState(false);
 
   const resetAggregationBudget = useCallback(() => {
     requestGenerationRef.current += 1;
     requestScopeRef.current = null;
     pollAttemptRef.current = 0;
     pollingRef.current = false;
-    pollStartedAtRef.current = null;
-    setPollingTimedOut(false);
   }, []);
 
   const runAggregationRequest = useCallback(async (scopeKey, request) => {
@@ -169,29 +164,14 @@ const GraphSection = ({
       requestScopeRef.current = scopeKey;
       pollAttemptRef.current = 0;
       pollingRef.current = false;
-      pollStartedAtRef.current = null;
-      setPollingTimedOut(false);
     }
 
     const generation = requestGenerationRef.current;
-    const startedAt = pollStartedAtRef.current ?? Date.now();
-    pollStartedAtRef.current = startedAt;
-    const remaining = Math.max(
-      AGGREGATION_POLL_TIMEOUT_MS - (Date.now() - startedAt),
-      0,
-    );
-    if (remaining === 0) {
-      pollingRef.current = false;
-      setPollingTimedOut(true);
-      throw new Error("Exact aggregation request deadline exceeded");
-    }
-
     return awaitAggregationRequestWithDeadline(request(), {
-      timeoutMs: remaining,
+      timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS,
       isCurrent: () => generation === requestGenerationRef.current,
       onTimeout: () => {
         pollingRef.current = false;
-        setPollingTimedOut(true);
       },
     });
   }, []);
@@ -207,20 +187,9 @@ const GraphSection = ({
     if (!shouldPoll) {
       pollAttemptRef.current = 0;
       pollingRef.current = false;
-      pollStartedAtRef.current = null;
-      setPollingTimedOut(false);
       return;
     }
-
-    if (pollStartedAtRef.current == null) {
-      pollStartedAtRef.current = Date.now();
-    }
-    const exhausted = isAggregationPollBudgetExhausted({
-      attempt: pollAttemptRef.current,
-      startedAt: pollStartedAtRef.current,
-    });
-    pollingRef.current = !exhausted;
-    if (exhausted) setPollingTimedOut(true);
+    pollingRef.current = true;
   }, []);
 
   // Graph APIs
@@ -278,7 +247,6 @@ const GraphSection = ({
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
     refetchInterval: (query) => {
-      if (pollingTimedOut) return false;
       const { isRefreshing, refreshFailed } = getAggregationRefreshState(
         query.state.data,
       );
@@ -353,7 +321,6 @@ const GraphSection = ({
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
     refetchInterval: (query) => {
-      if (pollingTimedOut) return false;
       const { isRefreshing, refreshFailed } = getAggregationRefreshState(
         query.state.data,
       );
@@ -459,38 +426,6 @@ const GraphSection = ({
   );
 
   useEffect(() => {
-    if (!apiGraphData || pollingTimedOut) return undefined;
-    const { isRefreshing, refreshFailed } =
-      getAggregationRefreshState(apiGraphData);
-    const readState = getExactAggregationReadState(apiGraphData);
-    if (
-      !isRefreshing ||
-      refreshFailed ||
-      (readState !== "complete" && readState !== "pending")
-    ) {
-      return undefined;
-    }
-
-    const startedAt = pollStartedAtRef.current ?? Date.now();
-    pollStartedAtRef.current = startedAt;
-    const remaining = Math.max(
-      AGGREGATION_POLL_TIMEOUT_MS - (Date.now() - startedAt),
-      0,
-    );
-    const stopPolling = () => {
-      pollingRef.current = false;
-      setPollingTimedOut(true);
-      notifyAggregationRefresh(false);
-    };
-    if (remaining === 0) {
-      stopPolling();
-      return undefined;
-    }
-    const timer = window.setTimeout(stopPolling, remaining);
-    return () => window.clearTimeout(timer);
-  }, [apiGraphData, notifyAggregationRefresh, pollingTimedOut]);
-
-  useEffect(() => {
     if (!apiGraphData) return;
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(apiGraphData);
@@ -568,7 +503,6 @@ const GraphSection = ({
   const exactGraphData = exactSnapshot?.data;
   const apiGraphRefreshState = getAggregationRefreshState(apiGraphData);
   const apiGraphReadFailed =
-    pollingTimedOut ||
     apiGraphError ||
     apiGraphRefreshState.refreshFailed ||
     (Boolean(apiGraphData) &&

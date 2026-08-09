@@ -48,27 +48,24 @@ describe("getAgentGraphPresentationState", () => {
     expect(state.isError).toBe(false);
   });
 
-  it("turns a pending refresh that exceeds the client budget into a visible error", () => {
-    const state = getAgentGraphPresentationState(
-      {
-        data: {
-          nodes: [],
-          edges: [],
-          path_edges: [],
-          query_complete: false,
-          query_status: "pending",
-          query_sampled: false,
-          query_refreshing: true,
-          query_refresh_failed: false,
-        },
-        isLoading: false,
-        isError: false,
+  it("keeps a server-confirmed long refresh in a neutral loading state", () => {
+    const state = getAgentGraphPresentationState({
+      data: {
+        nodes: [],
+        edges: [],
+        path_edges: [],
+        query_complete: false,
+        query_status: "pending",
+        query_sampled: false,
+        query_refreshing: true,
+        query_refresh_failed: false,
       },
-      { pendingTimedOut: true },
-    );
+      isLoading: false,
+      isError: false,
+    });
 
-    expect(state.isLoading).toBe(false);
-    expect(state.isError).toBe(true);
+    expect(state.isLoading).toBe(true);
+    expect(state.isError).toBe(false);
   });
 
   it("does not keep loading when a pending poll request fails", () => {
@@ -106,6 +103,28 @@ describe("getAgentGraphPresentationState", () => {
       data,
       isLoading: false,
       isError: false,
+    });
+
+    expect(state.data).toBe(data);
+    expect(state.isLoading).toBe(false);
+    expect(state.isError).toBe(false);
+  });
+
+  it("keeps a prior exact graph visible when a refresh poll fails", () => {
+    const data = {
+      nodes: [{ id: "agent:a" }],
+      edges: [],
+      path_edges: [],
+      query_complete: true,
+      query_status: "complete",
+      query_sampled: false,
+      query_refreshing: true,
+      query_refresh_failed: false,
+    };
+    const state = getAgentGraphPresentationState({
+      data,
+      isLoading: false,
+      isError: true,
     });
 
     expect(state.data).toBe(data);

@@ -1,39 +1,37 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import {
+  AGGREGATION_REQUEST_TIMEOUT_MS,
+  awaitAggregationRequestWithDeadline,
   getAggregationPollDelay,
   getAggregationRefreshState,
   getExactAggregationReadState,
 } from "src/utils/queryReadState";
 
-export const AGENT_GRAPH_PENDING_TIMEOUT_MS = 60_000;
-
-export const getAgentGraphPresentationState = (
-  query,
-  { pendingTimedOut = false } = {},
-) => {
+export const getAgentGraphPresentationState = (query) => {
   const readState = query.data
     ? getExactAggregationReadState(query.data)
     : null;
+  const hasExactSnapshot = readState === "complete";
   const { refreshFailed } = getAggregationRefreshState(query.data);
   const failedPendingRefresh =
     readState === "pending" && (refreshFailed || query.isError);
-  const timedOutPendingRefresh = readState === "pending" && pendingTimedOut;
   const hasUnreadablePayload =
     Boolean(query.data) && readState !== "complete" && readState !== "pending";
 
   return {
-    data: readState === "complete" ? query.data : undefined,
+    data: hasExactSnapshot ? query.data : undefined,
     isLoading:
+      !hasExactSnapshot &&
       !query.isError &&
-      !timedOutPendingRefresh &&
       (query.isLoading || (readState === "pending" && !failedPendingRefresh)),
+    // A polling transport/refresh failure must never hide an exact snapshot
+    // already returned by the server. Cold failures still render the generic,
+    // retryable error state below the exactness gate.
     isError:
-      query.isError ||
-      hasUnreadablePayload ||
-      failedPendingRefresh ||
-      timedOutPendingRefresh,
+      !hasExactSnapshot &&
+      (query.isError || hasUnreadablePayload || failedPendingRefresh),
     queryReadState: readState,
   };
 };
@@ -53,21 +51,23 @@ export const useAgentGraph = (
 ) => {
   const forceRefreshRef = useRef(false);
   const pollAttemptRef = useRef(0);
-  const [pendingTimedOut, setPendingTimedOut] = useState(false);
-  const [pollEpoch, setPollEpoch] = useState(0);
 
   const query = useQuery({
     queryKey: ["agent-graph", projectId, filters],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
-      const response = await axios.get(endpoints.project.getAgentGraph(), {
-        params: {
-          project_id: projectId,
-          filters: JSON.stringify(filters || []),
-          ...(refresh ? { refresh: true } : {}),
-        },
-      });
+      const response = await awaitAggregationRequestWithDeadline(
+        axios.get(endpoints.project.getAgentGraph(), {
+          params: {
+            project_id: projectId,
+            filters: JSON.stringify(filters || []),
+            ...(refresh ? { refresh: true } : {}),
+          },
+          signal,
+        }),
+        { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS },
+      );
       return response.data?.result;
     },
     enabled: !!projectId && enabled,
@@ -75,7 +75,6 @@ export const useAgentGraph = (
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
     refetchInterval: (activeQuery) => {
-      if (pendingTimedOut) return false;
       const payload = activeQuery.state.data;
       const { isRefreshing, refreshFailed } =
         getAggregationRefreshState(payload);
@@ -109,35 +108,13 @@ export const useAgentGraph = (
       }
       forceRefreshRef.current = true;
       pollAttemptRef.current = 0;
-      setPendingTimedOut(false);
-      setPollEpoch((value) => value + 1);
       refetch({ cancelRefetch: true });
     };
     window.addEventListener("observe-refresh", handleRefresh);
     return () => window.removeEventListener("observe-refresh", handleRefresh);
   }, [enabled, projectId, refetch]);
 
-  const rawPresentationState = getAgentGraphPresentationState(query);
-  const isLivePending =
-    rawPresentationState.queryReadState === "pending" &&
-    !rawPresentationState.isError;
-  const pendingIdentity = JSON.stringify([projectId, filters || []]);
-
-  useEffect(() => {
-    pollAttemptRef.current = 0;
-    setPendingTimedOut(false);
-    if (!enabled || !projectId || !isLivePending) return undefined;
-
-    const timeout = setTimeout(
-      () => setPendingTimedOut(true),
-      AGENT_GRAPH_PENDING_TIMEOUT_MS,
-    );
-    return () => clearTimeout(timeout);
-  }, [enabled, projectId, pendingIdentity, isLivePending, pollEpoch]);
-
-  const presentationState = getAgentGraphPresentationState(query, {
-    pendingTimedOut,
-  });
+  const presentationState = getAgentGraphPresentationState(query);
 
   return {
     ...query,

@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from "src/utils/test-utils";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import axios from "src/utils/axios";
-import { AGGREGATION_POLL_TIMEOUT_MS } from "src/utils/queryReadState";
+import { AGGREGATION_REQUEST_TIMEOUT_MS } from "src/utils/queryReadState";
 import GraphSection from "../GraphSection";
 
 vi.mock("react-apexcharts", () => ({
@@ -269,6 +269,62 @@ describe("GraphSection exact graph boundary", () => {
     );
   });
 
+  it("keeps polling a server-confirmed exact refresh beyond 500 seconds", async () => {
+    vi.useFakeTimers();
+    axios.post.mockResolvedValue({
+      data: {
+        result: {
+          metric_name: "latency",
+          data: [],
+          query_complete: false,
+          query_status: "pending",
+          query_sampled: false,
+          query_refreshing: true,
+          query_refresh_failed: false,
+        },
+      },
+    });
+
+    renderGraph();
+    fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+    await act(async () => vi.advanceTimersByTimeAsync(500_000));
+
+    expect(axios.post.mock.calls.length).toBeGreaterThan(12);
+    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+
+    axios.post.mockResolvedValueOnce({
+      data: {
+        result: {
+          metric_name: "latency",
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 18,
+              primary_traffic: 2,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+          query_refreshing: false,
+          query_refresh_failed: false,
+        },
+      },
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(8_010));
+
+    expect(screen.getByTestId("apex-chart")).toHaveAttribute(
+      "data-primary-first-y",
+      "18",
+    );
+    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+  });
+
   it("bounds a never-resolving transport, ignores its late response, and restarts on refresh", async () => {
     vi.useFakeTimers();
     let resolveLateRequest;
@@ -290,7 +346,7 @@ describe("GraphSection exact graph boundary", () => {
     ).not.toBeInTheDocument();
 
     await act(async () =>
-      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+      vi.advanceTimersByTimeAsync(AGGREGATION_REQUEST_TIMEOUT_MS),
     );
     expect(
       screen.getByText("We couldn't load this data. Please retry in a moment."),

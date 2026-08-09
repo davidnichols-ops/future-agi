@@ -23,15 +23,13 @@ import {
 } from "./widgetUtils";
 import { toTimeRangePayload } from "./dashboardDateRange";
 import {
-  AGGREGATION_POLL_MAX_ATTEMPTS,
-  AGGREGATION_POLL_TIMEOUT_MS,
+  AGGREGATION_REQUEST_TIMEOUT_MS,
   AGGREGATION_PREPARING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
   getAggregationPollDelay,
   getAggregationRefreshState,
   getExactAggregationReadState,
   getQueryCompletedAt,
-  isAggregationPollBudgetExhausted,
 } from "src/utils/queryReadState";
 
 const CHART_HEIGHT_FALLBACK = 280;
@@ -219,9 +217,9 @@ export default function WidgetChart({
     previousRefreshRequestRef.current = refreshRequestId;
     let active = true;
     let pollTimer = null;
-    let deadlineTimer = null;
+    let requestTimer = null;
+    let requestGeneration = 0;
     let pollAttempt = 0;
-    const pollStartedAt = Date.now();
     let refreshWasQueued = false;
     let settled = false;
 
@@ -232,9 +230,9 @@ export default function WidgetChart({
         window.clearTimeout(pollTimer);
         pollTimer = null;
       }
-      if (deadlineTimer !== null) {
-        window.clearTimeout(deadlineTimer);
-        deadlineTimer = null;
+      if (requestTimer !== null) {
+        window.clearTimeout(requestTimer);
+        requestTimer = null;
       }
       onQuerySettledRef.current?.({
         dashboardId,
@@ -246,58 +244,51 @@ export default function WidgetChart({
       });
     };
 
-    const stopPendingPoll = () => {
-      if (!active || settled) return;
-      setLatestOutcome({
-        signature: querySignature,
-        unavailable: true,
-        retryUnavailable: true,
-      });
-      settle(null, false);
-    };
-
     const schedulePoll = () => {
       if (!active || pollTimer !== null) return;
-      if (
-        isAggregationPollBudgetExhausted({
-          attempt: pollAttempt,
-          startedAt: pollStartedAt,
-        })
-      ) {
-        stopPendingPoll();
-        return;
-      }
-      const remaining = Math.max(
-        AGGREGATION_POLL_TIMEOUT_MS - (Date.now() - pollStartedAt),
-        0,
-      );
-      const delay = Math.min(getAggregationPollDelay(pollAttempt), remaining);
+      const delay = getAggregationPollDelay(pollAttempt);
       pollTimer = window.setTimeout(() => {
         pollTimer = null;
-        if (
-          isAggregationPollBudgetExhausted({
-            attempt: pollAttempt,
-            startedAt: pollStartedAt,
-          })
-        ) {
-          stopPendingPoll();
-          return;
-        }
         pollAttempt += 1;
-        if (pollAttempt > AGGREGATION_POLL_MAX_ATTEMPTS) {
-          stopPendingPoll();
-          return;
-        }
         executeQuery(false);
       }, delay);
     };
 
     const executeQuery = (refresh) => {
+      const generation = requestGeneration + 1;
+      requestGeneration = generation;
+      if (requestTimer !== null) window.clearTimeout(requestTimer);
+      requestTimer = window.setTimeout(() => {
+        if (!active || settled || generation !== requestGeneration) return;
+        requestGeneration += 1;
+        requestTimer = null;
+        if (refreshWasQueued) {
+          schedulePoll();
+          return;
+        }
+        setLatestOutcome({
+          signature: querySignature,
+          unavailable: true,
+          retryUnavailable: true,
+        });
+        settle(null, false);
+      }, AGGREGATION_REQUEST_TIMEOUT_MS);
+
+      const acceptResponse = () => {
+        if (!active || settled || generation !== requestGeneration)
+          return false;
+        if (requestTimer !== null) {
+          window.clearTimeout(requestTimer);
+          requestTimer = null;
+        }
+        return true;
+      };
+
       mutateDashboardQuery(
         { queryConfig, refresh },
         {
           onSuccess: (response) => {
-            if (!active || settled) return;
+            if (!acceptResponse()) return;
             const snapshot = getExactDashboardSnapshot(
               response,
               querySignature,
@@ -350,7 +341,7 @@ export default function WidgetChart({
             settle(null, false);
           },
           onError: () => {
-            if (!active || settled) return;
+            if (!acceptResponse()) return;
             if (refreshWasQueued) {
               setLatestOutcome({
                 signature: querySignature,
@@ -371,16 +362,12 @@ export default function WidgetChart({
       );
     };
 
-    deadlineTimer = window.setTimeout(
-      stopPendingPoll,
-      AGGREGATION_POLL_TIMEOUT_MS,
-    );
     executeQuery(isManualRefresh);
 
     return () => {
       active = false;
       if (pollTimer !== null) window.clearTimeout(pollTimer);
-      if (deadlineTimer !== null) window.clearTimeout(deadlineTimer);
+      if (requestTimer !== null) window.clearTimeout(requestTimer);
     };
   }, [
     mutateDashboardQuery,

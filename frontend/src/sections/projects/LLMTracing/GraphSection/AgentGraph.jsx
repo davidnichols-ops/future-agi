@@ -33,6 +33,7 @@ import Iconify from "src/components/iconify";
 import CustomTooltip from "src/components/tooltip";
 import { error as errorPalette, success } from "src/theme/palette";
 import FullscreenGraphDialog from "./FullscreenGraphDialog";
+import { GRAPH_LOADING_MESSAGE } from "src/utils/queryReadState";
 
 // ---------------------------------------------------------------------------
 // Diff-overlay status (set by buildGraphDiff for the error-feed split view)
@@ -811,10 +812,19 @@ const AgentGraphInner = ({
           display: "flex",
           justifyContent: "center",
           alignItems: "center",
+          flexDirection: "column",
+          gap: 1,
           height: 80,
         }}
       >
         <CircularProgress size={20} />
+        <Typography
+          variant="body2"
+          color="text.secondary"
+          sx={{ fontSize: 13 }}
+        >
+          {GRAPH_LOADING_MESSAGE}
+        </Typography>
       </Box>
     );
   }

@@ -13,6 +13,7 @@ import { alpha } from "@mui/material/styles";
 import Iconify from "src/components/iconify";
 import CustomTooltip from "src/components/tooltip";
 import FullscreenGraphDialog from "./FullscreenGraphDialog";
+import { GRAPH_LOADING_MESSAGE } from "src/utils/queryReadState";
 import {
   PAD,
   COL_WIDTH,
@@ -265,10 +266,15 @@ const AgentPathInner = ({
           display: "flex",
           justifyContent: "center",
           alignItems: "center",
+          flexDirection: "column",
+          gap: 1,
           height: 80,
         }}
       >
         <CircularProgress size={24} />
+        <Typography color="text.secondary" variant="body2">
+          {GRAPH_LOADING_MESSAGE}
+        </Typography>
       </Box>
     );
   }

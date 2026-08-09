@@ -278,6 +278,11 @@ export function getAggregationRefreshState(payload) {
 const AGGREGATION_POLL_DELAYS_MS = [1000, 2000, 4000, 8000];
 export const AGGREGATION_POLL_MAX_ATTEMPTS = 12;
 export const AGGREGATION_POLL_TIMEOUT_MS = 60_000;
+// Bound each HTTP cache-state read independently. Exact aggregation jobs are
+// server-owned and can legitimately run much longer than a minute; the client
+// must not turn an explicit `query_refreshing` state into a false failure just
+// because the background job outlives one request deadline.
+export const AGGREGATION_REQUEST_TIMEOUT_MS = 60_000;
 
 const aggregationRequestError = (code) => {
   const error = new Error("Exact aggregation request did not complete");

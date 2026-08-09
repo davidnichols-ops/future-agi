@@ -2,7 +2,7 @@ import React from "react";
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { act, render, screen, waitFor } from "src/utils/test-utils";
 import WidgetChart from "../WidgetChart";
-import { AGGREGATION_POLL_TIMEOUT_MS } from "src/utils/queryReadState";
+import { AGGREGATION_REQUEST_TIMEOUT_MS } from "src/utils/queryReadState";
 
 const h = vi.hoisted(() => ({
   query: { data: null, isPending: false, isError: false, mutate: vi.fn() },
@@ -286,7 +286,7 @@ describe("WidgetChart — queued exact refresh", () => {
     );
   });
 
-  it("stops a never-settling job, preserves cached exact data, and exposes a retry state", async () => {
+  it("keeps cached exact data while a refresh runs beyond 500 seconds, then publishes completion", async () => {
     vi.useFakeTimers();
     const cachedResponse = queryResult([
       { timestamp: "2026-07-09T00:00:00Z", value: 12 },
@@ -303,6 +303,9 @@ describe("WidgetChart — queued exact refresh", () => {
       },
     };
     const onQuerySettled = vi.fn();
+    const completedResponse = queryResult([
+      { timestamp: "2026-07-09T00:00:00Z", value: 24 },
+    ]);
     h.query.data = cachedResponse;
     h.query.mutate.mockImplementation((_request, options) =>
       options?.onSuccess?.(pendingResponse),
@@ -319,25 +322,26 @@ describe("WidgetChart — queued exact refresh", () => {
 
     expect(screen.getByTestId("apex-line")).toBeInTheDocument();
     expect(h.query.mutate).toHaveBeenCalledOnce();
-    await act(async () =>
-      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
-    );
+    await act(async () => vi.advanceTimersByTimeAsync(500_000));
 
     expect(screen.getByTestId("apex-line")).toBeInTheDocument();
     expect(
-      screen.getByText("We couldn't load this data. Please retry in a moment."),
-    ).toBeInTheDocument();
-    expect(onQuerySettled).toHaveBeenCalledOnce();
-    expect(onQuerySettled).toHaveBeenCalledWith(
-      expect.objectContaining({ exact: false, updatedAt: null }),
-    );
-    const boundedRequestCount = h.query.mutate.mock.calls.length;
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(onQuerySettled).not.toHaveBeenCalled();
+    expect(h.query.mutate.mock.calls.length).toBeGreaterThan(12);
 
-    await act(async () =>
-      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS * 2),
+    h.query.mutate.mockImplementationOnce((_request, options) =>
+      options?.onSuccess?.(completedResponse),
     );
-    expect(h.query.mutate).toHaveBeenCalledTimes(boundedRequestCount);
-    expect(boundedRequestCount).toBeLessThanOrEqual(12);
+    await act(async () => vi.advanceTimersByTimeAsync(8_010));
+
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: true }),
+    );
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
   });
 
   it("times out an unresolved request while preserving the previous exact snapshot", async () => {
@@ -363,7 +367,7 @@ describe("WidgetChart — queued exact refresh", () => {
     expect(onQuerySettled).not.toHaveBeenCalled();
 
     await act(async () =>
-      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+      vi.advanceTimersByTimeAsync(AGGREGATION_REQUEST_TIMEOUT_MS),
     );
 
     expect(screen.getByTestId("apex-line")).toBeInTheDocument();
@@ -376,7 +380,7 @@ describe("WidgetChart — queued exact refresh", () => {
     );
 
     await act(async () =>
-      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS * 2),
+      vi.advanceTimersByTimeAsync(AGGREGATION_REQUEST_TIMEOUT_MS * 2),
     );
     expect(h.query.mutate).toHaveBeenCalledOnce();
     expect(onQuerySettled).toHaveBeenCalledOnce();

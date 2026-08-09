@@ -1,14 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { startOfDay, endOfDay, startOfMinute, subDays } from "date-fns";
 import axios, { endpoints } from "src/utils/axios";
 import {
-  AGGREGATION_POLL_TIMEOUT_MS,
+  AGGREGATION_REQUEST_TIMEOUT_MS,
+  awaitAggregationRequestWithDeadline,
   getAggregationPollDelay,
   getAggregationRefreshState,
   getExactAggregationReadState,
   getQueryCompletedAt,
-  isAggregationPollBudgetExhausted,
 } from "src/utils/queryReadState";
 
 const readAggregationResult = (data) => {
@@ -35,25 +35,16 @@ const readAggregationResult = (data) => {
   };
 };
 
-function useAggregationPollBudget(identity) {
+function useAggregationPolling(identity) {
   const pollAttemptRef = useRef(0);
   const pollingRef = useRef(false);
-  const pollStartedAtRef = useRef(null);
-  const [pollingTimedOut, setPollingTimedOut] = useState(false);
 
   const reset = useCallback(() => {
     pollAttemptRef.current = 0;
     pollingRef.current = false;
-    pollStartedAtRef.current = null;
-    setPollingTimedOut(false);
   }, []);
 
   useEffect(() => reset(), [identity, reset]);
-
-  const markTimedOut = useCallback(() => {
-    pollingRef.current = false;
-    setPollingTimedOut(true);
-  }, []);
 
   const beforeRequest = useCallback(() => {
     if (pollingRef.current) pollAttemptRef.current += 1;
@@ -66,83 +57,27 @@ function useAggregationPollBudget(identity) {
         reset();
         return;
       }
-      if (pollStartedAtRef.current == null) {
-        pollStartedAtRef.current = Date.now();
-      }
-      if (
-        isAggregationPollBudgetExhausted({
-          attempt: pollAttemptRef.current,
-          startedAt: pollStartedAtRef.current,
-        })
-      ) {
-        markTimedOut();
-        return;
-      }
       pollingRef.current = true;
     },
-    [markTimedOut, reset],
+    [reset],
   );
 
-  const refetchInterval = useCallback(
-    (query) => {
-      const data = query.state.data;
-      if (
-        pollingTimedOut ||
-        !data?.queryRefreshing ||
-        data?.queryRefreshFailed
-      ) {
-        if (!pollingTimedOut) {
-          pollAttemptRef.current = 0;
-          pollingRef.current = false;
-          pollStartedAtRef.current = null;
-        }
-        return false;
-      }
-      if (
-        isAggregationPollBudgetExhausted({
-          attempt: pollAttemptRef.current,
-          startedAt: pollStartedAtRef.current,
-        })
-      ) {
-        markTimedOut();
-        return false;
-      }
-      return getAggregationPollDelay(pollAttemptRef.current);
-    },
-    [markTimedOut, pollingTimedOut],
-  );
-
-  const watchPending = useCallback(
-    (active) => {
-      if (!active || pollingTimedOut) return undefined;
-      const startedAt = pollStartedAtRef.current ?? Date.now();
-      pollStartedAtRef.current = startedAt;
-      const remaining = Math.max(
-        AGGREGATION_POLL_TIMEOUT_MS - (Date.now() - startedAt),
-        0,
-      );
-      if (remaining === 0) {
-        markTimedOut();
-        return undefined;
-      }
-      const timer = globalThis.setTimeout(markTimedOut, remaining);
-      return () => globalThis.clearTimeout(timer);
-    },
-    [markTimedOut, pollingTimedOut],
-  );
+  const refetchInterval = useCallback((query) => {
+    const data = query.state.data;
+    if (!data?.queryRefreshing || data?.queryRefreshFailed) {
+      pollAttemptRef.current = 0;
+      pollingRef.current = false;
+      return false;
+    }
+    return getAggregationPollDelay(pollAttemptRef.current);
+  }, []);
 
   return {
     beforeRequest,
-    pollingTimedOut,
     record,
     refetchInterval,
     reset,
-    watchPending,
   };
-}
-
-function useAggregationWallDeadline(watchPending, active, identity) {
-  useEffect(() => watchPending(active), [active, identity, watchPending]);
 }
 
 /**
@@ -192,23 +127,16 @@ export function useEvalUsageChart(
     () => JSON.stringify([templateId, period, dateParams]),
     [dateParams, period, templateId],
   );
-  const {
-    beforeRequest,
-    pollingTimedOut,
-    record,
-    refetchInterval,
-    reset,
-    watchPending,
-  } = useAggregationPollBudget(pollIdentity);
+  const { beforeRequest, record, refetchInterval, reset } =
+    useAggregationPolling(pollIdentity);
   const query = useQuery({
     queryKey: ["evals", "usage-chart", templateId, period, dateParams],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       beforeRequest();
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
-      const { data } = await axios.get(
-        endpoints.develop.eval.getEvalUsage(templateId),
-        {
+      const { data } = await awaitAggregationRequestWithDeadline(
+        axios.get(endpoints.develop.eval.getEvalUsage(templateId), {
           params: {
             page: 0,
             page_size: 1,
@@ -216,7 +144,9 @@ export function useEvalUsageChart(
             ...dateParams,
             ...(refresh ? { refresh: true } : {}),
           },
-        },
+          signal,
+        }),
+        { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS },
       );
       const aggregation = readAggregationResult(data);
       record(aggregation);
@@ -241,12 +171,6 @@ export function useEvalUsageChart(
     retry: false,
     meta: { errorHandled: true },
   });
-  useAggregationWallDeadline(
-    watchPending,
-    query.data?.queryRefreshing === true &&
-      query.data?.queryRefreshFailed !== true,
-    pollIdentity,
-  );
   const refetch = query.refetch;
   const refresh = useCallback(() => {
     reset();
@@ -256,8 +180,7 @@ export function useEvalUsageChart(
 
   return {
     ...query,
-    isError: query.isError || pollingTimedOut,
-    pollingTimedOut,
+    isError: query.isError || query.data?.queryRefreshFailed === true,
     refresh,
   };
 }
@@ -278,14 +201,8 @@ export function useEvalUsageLogs(
     () => JSON.stringify([templateId, period, page, pageSize, dateParams]),
     [dateParams, page, pageSize, period, templateId],
   );
-  const {
-    beforeRequest,
-    pollingTimedOut,
-    record,
-    refetchInterval,
-    reset,
-    watchPending,
-  } = useAggregationPollBudget(pollIdentity);
+  const { beforeRequest, record, refetchInterval, reset } =
+    useAggregationPolling(pollIdentity);
   const query = useQuery({
     queryKey: [
       "evals",
@@ -296,13 +213,12 @@ export function useEvalUsageLogs(
       pageSize,
       dateParams,
     ],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       beforeRequest();
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
-      const { data } = await axios.get(
-        endpoints.develop.eval.getEvalUsage(templateId),
-        {
+      const { data } = await awaitAggregationRequestWithDeadline(
+        axios.get(endpoints.develop.eval.getEvalUsage(templateId), {
           params: {
             page,
             page_size: pageSize,
@@ -310,7 +226,9 @@ export function useEvalUsageLogs(
             ...dateParams,
             ...(refresh ? { refresh: true } : {}),
           },
-        },
+          signal,
+        }),
+        { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS },
       );
       const aggregation = readAggregationResult(data);
       record(aggregation);
@@ -338,12 +256,6 @@ export function useEvalUsageLogs(
     retry: false,
     meta: { errorHandled: true },
   });
-  useAggregationWallDeadline(
-    watchPending,
-    query.data?.queryRefreshing === true &&
-      query.data?.queryRefreshFailed !== true,
-    pollIdentity,
-  );
   const refetch = query.refetch;
   const refresh = useCallback(() => {
     reset();
@@ -353,8 +265,7 @@ export function useEvalUsageLogs(
 
   return {
     ...query,
-    isError: query.isError || pollingTimedOut,
-    pollingTimedOut,
+    isError: query.isError || query.data?.queryRefreshFailed === true,
     refresh,
   };
 }

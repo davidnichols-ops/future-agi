@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen, waitFor } from "src/utils/test-utils";
 import axios from "src/utils/axios";
-import { AGGREGATION_POLL_TIMEOUT_MS } from "src/utils/queryReadState";
+import { AGGREGATION_REQUEST_TIMEOUT_MS } from "src/utils/queryReadState";
 import PrimaryGraph from "../PrimaryGraph";
 
 vi.mock("react-apexcharts", () => ({
@@ -417,6 +417,63 @@ describe("PrimaryGraph", () => {
     );
   });
 
+  it("keeps a cold exact refresh neutral beyond 500 seconds and publishes its eventual snapshot", async () => {
+    vi.useFakeTimers();
+    const pendingResponse = {
+      data: {
+        result: {
+          data: [],
+          query_complete: false,
+          query_status: "pending",
+          query_sampled: false,
+          query_refreshing: true,
+          query_refresh_failed: false,
+        },
+      },
+    };
+    axios.post.mockResolvedValue(pendingResponse);
+
+    renderWithQueryClient(
+      <PrimaryGraph observeIdOverride="project-override" />,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(500_000));
+
+    expect(axios.post.mock.calls.length).toBeGreaterThan(12);
+    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
+
+    axios.post.mockResolvedValueOnce({
+      data: {
+        result: {
+          data: [
+            {
+              timestamp: "2026-08-03T00:00:00Z",
+              value: 42,
+              primary_traffic: 4,
+            },
+          ],
+          query_complete: true,
+          query_status: "complete",
+          query_sampled: false,
+          query_refreshing: false,
+          query_refresh_failed: false,
+        },
+      },
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(8_010));
+
+    expect(screen.getByTestId("apex-chart")).toHaveAttribute(
+      "data-primary-first-y",
+      "42",
+    );
+    expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
+  });
+
   it("bounds a never-resolving refresh, preserves exact data, and ignores its late response", async () => {
     vi.useFakeTimers();
     const exactResponse = {
@@ -459,7 +516,7 @@ describe("PrimaryGraph", () => {
     expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
 
     await act(async () =>
-      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+      vi.advanceTimersByTimeAsync(AGGREGATION_REQUEST_TIMEOUT_MS),
     );
     expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
     expect(
@@ -540,7 +597,7 @@ describe("PrimaryGraph", () => {
     await act(async () => vi.advanceTimersByTimeAsync(10));
 
     await act(async () =>
-      vi.advanceTimersByTimeAsync(AGGREGATION_POLL_TIMEOUT_MS),
+      vi.advanceTimersByTimeAsync(AGGREGATION_REQUEST_TIMEOUT_MS),
     );
     expect(
       screen.getByText("We couldn't load this data. Please retry in a moment."),
