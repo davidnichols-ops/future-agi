@@ -140,16 +140,24 @@ ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS = 750
 # contain only values from that vocabulary.  The first page never uses this
 # path.  Start below the one-hour density that can exceed the project-wide
 # 500k-row envelope when no attribute-key predicate may legally run before
-# argMax, then grow successful proofs to a bounded two-hour slice.
-ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT = timedelta(minutes=15)
-ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT = timedelta(minutes=5)
-ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = timedelta(hours=2)
-ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 500
+# argMax, then grow successful proofs to a bounded production-qualified slice.
+# Start at the production-qualified floor: a failed five-minute probe can consume the
+# request's whole read-volume allowance before the selector gets a chance to
+# retry the same frontier at five seconds.  Coletia contains individual
+# 30-second intervals above the bounded 1 GiB read-volume envelope.
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT = timedelta(seconds=5)
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT = timedelta(seconds=5)
+# A 320-second proof is the largest production-qualified width on Coletia's
+# densest recent partition under the 500k-row / 1 GiB read envelope.  Wider
+# speculative probes repeatedly hit those hard guards and add latency without
+# certifying cursor progress.
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = timedelta(seconds=320)
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 2_500
 # Dense projects can cross the ordinary row/byte envelope even inside the
 # production-qualified six-hour seed.  A failed statement proves nothing, so
 # retry its identical newest-first frontier in this smaller exact slice before
 # exposing an unavailable picker response.
-ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT = timedelta(minutes=5)
+ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT = timedelta(seconds=5)
 # An unpinned physical page can require candidate, version certificate, typed
 # hydration and isolated JSON hydration.  Leave that full fallback available
 # when a speculative distinct proof cannot certify its slice.
@@ -242,6 +250,25 @@ _JSON_VALUE_CANDIDATE_SETTINGS: dict[str, Any] = {
     "max_block_size": 2_048,
     "max_bytes_to_read": 64 * _MIB,
     "max_rows_to_read": 100_000,
+}
+
+# A single indexed Map granule on the largest production tenant exceeds the
+# generic 512 MiB *read-volume* guard even for a 30-second temporal slice.
+# Cursor value reads remain single-threaded, statement- and
+# wall-time bounded, and retain the stricter 256 MiB memory ceiling; this local
+# allowance merely lets ClickHouse finish that one already-selected granule.
+_ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS: dict[str, Any] = {
+    "max_bytes_to_read": 1_024 * _MIB,
+}
+
+# The ordered fallback stops at a 65-row sentinel, but ClickHouse may have to
+# admit one whole physical granule before LIMIT can fire.  Coletia has a
+# 542,110-row granule, just above the generic 500k guard.  This candidate-only
+# ceiling lets that finite keyset seed complete; latest-version replay remains
+# bounded to the returned identities and the memory/byte limits are unchanged.
+_ATTRIBUTE_VALUE_CANDIDATE_MAP_SETTINGS: dict[str, Any] = {
+    "max_bytes_to_read": 1_024 * _MIB,
+    "max_rows_to_read": 1_000_000,
 }
 
 _TYPE_PRIORITY: dict[AttributeType, int] = {
@@ -751,94 +778,54 @@ _ORDERED_TYPED_VALUE_CANDIDATE_SQL = """
     LIMIT %(candidate_limit)s
 """
 
-# Optional continuation accelerator for dense, low-cardinality attributes.
-# The inner aggregation deliberately sees every physical version in the slice:
-# filtering tombstones or key-bearing rows before argMax would resurrect a
-# cleared/deleted stale value.  The outer tagged value applies the same stable
-# typed-Map precedence as ``_decode_target_value``.  LIMIT is only an exact
-# result-cardinality sentinel; the ordinary read settings still bound the
-# identity aggregation and a failed/overflowing proof never advances a cursor.
-_VALUE_CURSOR_SEEN_SLICE_SQL = """
-    SELECT
-        value_type,
-        value_string,
-        value_number,
-        value_boolean,
-        value_json_raw,
-        toUInt64(count()) AS value_count
-    FROM
-    (
-        SELECT
-            multiIf(
-                tupleElement(latest_state, 2) != 0, 'string',
-                tupleElement(latest_state, 4) != 0, 'number',
-                tupleElement(latest_state, 6) != 0, 'boolean',
-                tupleElement(latest_state, 8) != 0, 'json',
-                ''
-            ) AS value_type,
-            if(
-                tupleElement(latest_state, 2) != 0,
-                tupleElement(latest_state, 3),
-                ''
-            ) AS value_string,
-            if(
-                tupleElement(latest_state, 2) = 0
-                    AND tupleElement(latest_state, 4) != 0,
-                tupleElement(latest_state, 5),
-                toFloat64(0)
-            ) AS value_number,
-            if(
-                tupleElement(latest_state, 2) = 0
-                    AND tupleElement(latest_state, 4) = 0
-                    AND tupleElement(latest_state, 6) != 0,
-                tupleElement(latest_state, 7),
-                toUInt8(0)
-            ) AS value_boolean,
-            if(
-                tupleElement(latest_state, 2) = 0
-                    AND tupleElement(latest_state, 4) = 0
-                    AND tupleElement(latest_state, 6) = 0
-                    AND tupleElement(latest_state, 8) != 0,
-                tupleElement(latest_state, 9),
-                ''
-            ) AS value_json_raw
-        FROM
-        (
-            SELECT
-                project_id,
-                trace_id,
-                id,
-                start_time,
-                argMax(
-                    tuple(
-                        is_deleted,
-                        mapContains(attrs_string, %(attribute_key)s),
-                        attrs_string[%(attribute_key)s],
-                        mapContains(attrs_number, %(attribute_key)s),
-                        attrs_number[%(attribute_key)s],
-                        mapContains(attrs_bool, %(attribute_key)s),
-                        attrs_bool[%(attribute_key)s],
-                        JSONHas(attributes_extra, %(attribute_key)s),
-                        JSONExtractRaw(attributes_extra, %(attribute_key)s)
-                    ),
-                    _version
-                ) AS latest_state
-            FROM spans AS attribute_source
-            PREWHERE project_id IN %(project_ids)s
-              AND start_time >= fromUnixTimestamp64Micro(%(segment_start_us)s)
-              AND start_time < fromUnixTimestamp64Micro(%(segment_end_us)s)
-            WHERE ({frontier_predicate})
-            GROUP BY project_id, trace_id, id, start_time
-        )
-        WHERE tupleElement(latest_state, 1) = 0
-    )
-    WHERE value_type != ''
-    GROUP BY
-        value_type,
-        value_string,
-        value_number,
-        value_boolean,
-        value_json_raw
+# Exact searched-continuation certificate.  This query intentionally observes
+# physical versions rather than trying to publish latest state.  Every current
+# live value must occur in at least one physical version, so a complete raw
+# distinct vocabulary is a safe superset.  Stale values and tombstones can only
+# introduce an unseen false positive, which makes the selector fall back at the
+# unchanged frontier.  They can never make it skip a current unseen value.
+_VALUE_CURSOR_SEARCHED_RAW_SUPERSET_SQL = """
+    SELECT DISTINCT
+        tupleElement(raw_value, 1) AS value_type,
+        tupleElement(raw_value, 2) AS value_string,
+        tupleElement(raw_value, 3) AS value_number,
+        tupleElement(raw_value, 4) AS value_boolean,
+        tupleElement(raw_value, 5) AS value_json_raw,
+        toUInt64(1) AS value_count
+    FROM spans AS raw_source
+    ARRAY JOIN [{raw_value_lanes}] AS raw_value
+    PREWHERE {raw_scope_predicate}
+      AND raw_source.start_time
+          >= fromUnixTimestamp64Micro(%(segment_start_us)s)
+      AND raw_source.start_time
+          < fromUnixTimestamp64Micro(%(segment_end_us)s)
+    WHERE ({raw_frontier_predicate})
+      AND ({raw_any_candidate_predicate})
+      AND tupleElement(raw_value, 6) != 0
+      AND tupleElement(raw_value, 7) != 0
+    LIMIT %(distinct_limit)s
+"""
+
+# The common pinned-type path has only one value lane.  Avoid wrapping that
+# scalar in a one-element ARRAY JOIN: on the densest production slice this
+# preserves the identical read set but cuts roughly a fifth of executor wall
+# time.  Multi-type reads still use the tagged-lane query above.
+_VALUE_CURSOR_SEARCHED_RAW_SINGLE_LANE_SQL = """
+    SELECT DISTINCT
+        '{value_type}' AS value_type,
+        {value_string} AS value_string,
+        {value_number} AS value_number,
+        {value_boolean} AS value_boolean,
+        {value_json_raw} AS value_json_raw,
+        toUInt64(1) AS value_count
+    FROM spans AS raw_source
+    PREWHERE {raw_scope_predicate}
+      AND raw_source.start_time
+          >= fromUnixTimestamp64Micro(%(segment_start_us)s)
+      AND raw_source.start_time
+          < fromUnixTimestamp64Micro(%(segment_end_us)s)
+    WHERE ({raw_frontier_predicate})
+      AND ({raw_candidate_predicate})
     LIMIT %(distinct_limit)s
 """
 
@@ -1559,6 +1546,10 @@ class AttributeReadSelector:
         *,
         project_ids: tuple[str, ...],
         attribute_key: str,
+        attribute_type: AttributeType | None,
+        search: str,
+        candidate_predicates: dict[str, str],
+        candidate_predicate_params: dict[str, Any],
         segment: tuple[datetime, datetime],
         before_identity: PhysicalSpanIdentity | None,
         distinct_limit: int,
@@ -1566,10 +1557,13 @@ class AttributeReadSelector:
         """Return an exact finite latest-state vocabulary for one slice.
 
         This is a speculative continuation accelerator, not a sampled read.
-        The SQL must retain every version until argMax has selected current
-        state; the only pre-aggregation filters are immutable identity/time
-        bounds.  A result at the sentinel limit is therefore discarded rather
-        than interpreted as complete.
+        SQL returns a complete distinct superset of raw physical values. Every
+        current live value must occur in that set; stale/tombstoned values only
+        cause conservative fallback. Search is deliberately rechecked in
+        Python because ClickHouse case folding, Float64 formatting, and raw
+        JSON escaping do not equal the public canonical search contract. A
+        result at the sentinel limit is discarded rather than interpreted as
+        complete.
         """
 
         segment_start, segment_end = segment
@@ -1578,14 +1572,23 @@ class AttributeReadSelector:
         distinct_limit = int(distinct_limit)
         if not 2 <= distinct_limit <= ATTRIBUTE_VALUE_CURSOR_MAX_PAGE_SIZE + 1:
             raise ValueError("invalid filter-value distinct result limit")
+        if not candidate_predicates:
+            raise ValueError("distinct proof has no value lanes")
         params: dict[str, Any] = {
             "project_ids": project_ids,
             "attribute_key": attribute_key,
+            "distinct_attribute_type": attribute_type or "",
+            "distinct_attribute_search": search,
             "segment_start_us": _unix_microseconds(segment_start),
             "segment_end_us": _unix_microseconds(segment_end),
             "distinct_limit": distinct_limit,
         }
-        frontier_predicate = "1"
+        reserved = set(params).intersection(candidate_predicate_params)
+        if reserved:
+            raise ValueError("distinct candidate predicate parameter collision")
+        params.update(candidate_predicate_params)
+
+        raw_frontier_predicate = "1"
         if before_identity is not None:
             before_project_id, before_trace_id, before_id, before_start_time = (
                 before_identity
@@ -1603,26 +1606,123 @@ class AttributeReadSelector:
                     "distinct_before_project_id": before_project_id,
                 }
             )
-            frontier_predicate = (
-                "toUnixTimestamp64Micro(start_time) "
+            raw_frontier_predicate = (
+                "toUnixTimestamp64Micro(raw_source.start_time) "
                 "< %(distinct_before_start_us)s "
-                "OR (toUnixTimestamp64Micro(start_time) "
+                "OR (toUnixTimestamp64Micro(raw_source.start_time) "
                 "= %(distinct_before_start_us)s AND "
-                "(id < %(distinct_before_id)s "
-                "OR (id = %(distinct_before_id)s AND "
-                "(trace_id < %(distinct_before_trace_id)s "
-                "OR (trace_id = %(distinct_before_trace_id)s AND "
-                "toString(attribute_source.project_id) "
+                "(raw_source.id < %(distinct_before_id)s "
+                "OR (raw_source.id = %(distinct_before_id)s AND "
+                "(raw_source.trace_id < %(distinct_before_trace_id)s "
+                "OR (raw_source.trace_id = %(distinct_before_trace_id)s AND "
+                "toString(raw_source.project_id) "
                 "< %(distinct_before_project_id)s)))))"
             )
-        sql = self._single_project_scope_sql(
-            _VALUE_CURSOR_SEEN_SLICE_SQL, project_ids, params
-        )
+
+        if len(project_ids) == 1:
+            params["scope_project_id"] = project_ids[0]
+            raw_scope_predicate = "raw_source.project_id = toUUID(%(scope_project_id)s)"
+        else:
+            raw_scope_predicate = "raw_source.project_id IN %(project_ids)s"
+
+        lane_specs = {
+            "string": (
+                "attrs_string[%(attribute_key)s]",
+                "toFloat64(0)",
+                "toUInt8(0)",
+                "''",
+                "mapContains(attrs_string, %(attribute_key)s)",
+            ),
+            "number": (
+                "''",
+                "attrs_number[%(attribute_key)s]",
+                "toUInt8(0)",
+                "''",
+                "mapContains(attrs_number, %(attribute_key)s)",
+            ),
+            "boolean": (
+                "''",
+                "toFloat64(0)",
+                "attrs_bool[%(attribute_key)s]",
+                "''",
+                "mapContains(attrs_bool, %(attribute_key)s)",
+            ),
+            "json": (
+                "''",
+                "toFloat64(0)",
+                "toUInt8(0)",
+                "JSONExtractRaw(attributes_extra, %(attribute_key)s)",
+                "attributes_extra NOT IN ('', '{}', 'null') "
+                "AND JSONHas(attributes_extra, %(attribute_key)s)",
+            ),
+        }
+        raw_value_lanes = []
+        single_lane_parts: tuple[str, str, str, str, str, str] | None = None
+        for value_type, relevance_predicate in candidate_predicates.items():
+            try:
+                (
+                    value_string,
+                    value_number,
+                    value_boolean,
+                    value_json_raw,
+                    presence_predicate,
+                ) = lane_specs[value_type]
+            except KeyError as exc:
+                raise ValueError("invalid distinct proof value lane") from exc
+            raw_value_lanes.append(
+                "tuple("
+                f"'{value_type}', {value_string}, {value_number}, "
+                f"{value_boolean}, {value_json_raw}, "
+                f"toUInt8({presence_predicate}), "
+                f"toUInt8({relevance_predicate}))"
+            )
+            single_lane_parts = (
+                value_type,
+                value_string,
+                value_number,
+                value_boolean,
+                value_json_raw,
+                relevance_predicate,
+            )
+        if len(raw_value_lanes) == 1:
+            assert single_lane_parts is not None
+            (
+                value_type,
+                value_string,
+                value_number,
+                value_boolean,
+                value_json_raw,
+                relevance_predicate,
+            ) = single_lane_parts
+            sql = _VALUE_CURSOR_SEARCHED_RAW_SINGLE_LANE_SQL.format(
+                value_type=value_type,
+                value_string=value_string,
+                value_number=value_number,
+                value_boolean=value_boolean,
+                value_json_raw=value_json_raw,
+                raw_scope_predicate=raw_scope_predicate,
+                raw_frontier_predicate=raw_frontier_predicate,
+                raw_candidate_predicate=relevance_predicate,
+            )
+        else:
+            sql = _VALUE_CURSOR_SEARCHED_RAW_SUPERSET_SQL.format(
+                raw_value_lanes=", ".join(raw_value_lanes),
+                raw_scope_predicate=raw_scope_predicate,
+                raw_frontier_predicate=raw_frontier_predicate,
+                raw_any_candidate_predicate=" OR ".join(
+                    f"({predicate})" for predicate in candidate_predicates.values()
+                ),
+            )
         return self._execute(
-            sql.format(frontier_predicate=frontier_predicate),
+            sql,
             params,
             max_result_rows=distinct_limit,
             query_timeout_ms=ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS,
+            query_settings={
+                **_ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS,
+                "max_rows_in_distinct": distinct_limit,
+                "distinct_overflow_mode": "throw",
+            },
         )
 
     def _verify_latest(
@@ -3947,9 +4047,15 @@ class AttributeReadSelector:
         Physical keyset progress remains monotonic, so the bound never becomes
         a retained-value ceiling.
 
-        Each returned page is exact for its ordered continuation prefix.  A
+        Each returned page is exact for its ordered continuation prefix. A
         finite per-request scan budget yields another continuation rather than
         truncating the vocabulary or publishing sampled/incomplete metadata.
+        ``has_more`` therefore means that older retained values remain
+        reachable through the monotonic cursor; it is not an estimate or a
+        claim that the whole frozen window was exhausted in this request. If a
+        bounded request cannot prove any forward progress, it fails closed and
+        the API returns a generic retriable response instead of a repeated or
+        partial cursor.
         """
 
         if not continue_operation:
@@ -4131,7 +4237,11 @@ class AttributeReadSelector:
             candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
             checkpoint_from_widened_segment = False
 
-        def value_candidate_predicate() -> tuple[str, dict[str, Any]]:
+        def value_candidate_predicate() -> tuple[
+            str,
+            dict[str, Any],
+            dict[str, str],
+        ]:
             """Push the requested key/search into the finite identity seed.
 
             The predicate may admit stale physical versions, but it can never
@@ -4141,33 +4251,15 @@ class AttributeReadSelector:
             on a high-volume project.
             """
 
-            search_suffixes = {
-                "string": (
-                    "positionCaseInsensitiveUTF8("
-                    "attrs_string[%(attribute_key)s], %(attribute_search)s) > 0"
-                ),
-                "number": (
-                    "positionCaseInsensitiveUTF8("
-                    "toString(attrs_number[%(attribute_key)s]), "
-                    "%(attribute_search)s) > 0"
-                ),
-                "boolean": (
-                    "positionCaseInsensitiveUTF8("
-                    "if(attrs_bool[%(attribute_key)s], 'true', 'false'), "
-                    "%(attribute_search)s) > 0"
-                ),
-                "json": (
-                    "positionCaseInsensitiveUTF8("
-                    "JSONExtractRaw(attributes_extra, %(attribute_key)s), "
-                    "%(attribute_search)s) > 0"
-                ),
-            }
             clauses: list[str] = []
-            requested_types = (
+            lane_predicates: dict[str, str] = {}
+            requested_types: set[AttributeType] = (
                 {attribute_type}
                 if attribute_type is not None
-                else {"string", "number", "boolean", "array", "map", "json"}
+                else {"string", "number", "boolean"}
             )
+            if attribute_type is None and self._reads_json_overflow:
+                requested_types.update({"array", "map", "json"})
             for attr_type, column in (
                 ("string", "attrs_string"),
                 ("number", "attrs_number"),
@@ -4179,24 +4271,51 @@ class AttributeReadSelector:
                     f"indexHint(has(mapKeys({column}), %(attribute_key)s)) "
                     f"AND mapContains({column}, %(attribute_key)s)"
                 )
-                if needle:
-                    clause = f"({clause}) AND ({search_suffixes[attr_type]})"
+                if needle and attr_type == "string" and normalized_search.isascii():
+                    # CH case folding is equivalent to Python for ASCII text,
+                    # but not for values such as ``Straße``.  The second arm
+                    # conservatively retains every non-ASCII value for the
+                    # canonical Python search below.
+                    clause = (
+                        f"({clause}) AND ("
+                        "positionCaseInsensitiveUTF8("
+                        "attrs_string[%(attribute_key)s], "
+                        "%(attribute_search)s) > 0 OR "
+                        "length(attrs_string[%(attribute_key)s]) != "
+                        "lengthUTF8(attrs_string[%(attribute_key)s]))"
+                    )
+                elif needle and attr_type == "boolean" and normalized_search.isascii():
+                    clause = (
+                        f"({clause}) AND positionCaseInsensitiveUTF8("
+                        "if(attrs_bool[%(attribute_key)s], 'true', 'false'), "
+                        "%(attribute_search)s) > 0"
+                    )
+                # Number formatting in ClickHouse differs from Python, and
+                # JSON strings/arrays may be escaped.  Their key-bearing lanes
+                # stay conservative and are filtered only after exact replay.
                 clauses.append(f"({clause})")
+                lane_predicates[attr_type] = clause
             if requested_types.intersection({"array", "map", "json"}):
                 clause = (
                     "attributes_extra NOT IN ('', '{}', 'null') "
                     "AND JSONHas(attributes_extra, %(attribute_key)s)"
                 )
-                if needle:
-                    clause = f"({clause}) AND ({search_suffixes['json']})"
                 clauses.append(f"({clause})")
+                lane_predicates["json"] = clause
             if not clauses:
                 raise ValueError("invalid filter-value attribute type")
-            return " OR ".join(clauses), (
-                {"attribute_search": normalized_search} if needle else {}
+            return (
+                " OR ".join(clauses),
+                {"attribute_search": normalized_search} if needle else {},
+                lane_predicates,
             )
 
-        candidate_predicate, candidate_predicate_params = value_candidate_predicate()
+        (
+            candidate_predicate,
+            candidate_predicate_params,
+            proof_candidate_predicates,
+        ) = value_candidate_predicate()
+        proof_candidate_predicate_params = candidate_predicate_params
 
         def candidates_for(decoded: tuple[AttributeType, Any]) -> tuple[Any, ...]:
             attr_type, value = decoded
@@ -4293,25 +4412,52 @@ class AttributeReadSelector:
         # Successful seen-only proofs may therefore advance by time without
         # weakening newest-first value reachability.
         skip_physical_walk = False
+        distinct_proof_supported = unpinned_cursor_read or typed_cursor_read
         if (
             seen_set
-            and unpinned_cursor_read
-            and not needle
+            and distinct_proof_supported
             and next_resume_identity is None
             and len(emitted) < effective_page_size
         ):
             distinct_width = ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT
+            if active_segment_start is not None:
+                # ``next_segment_start`` carries the last fully certified
+                # width without expanding the signed cursor schema.  Reuse it
+                # on the next request so a dense steady-state walk does not
+                # restart at 5s forever; an over-dense frontier still halves
+                # this width before any public progress is published.
+                distinct_width = min(
+                    max(
+                        current_segment_end - active_segment_start,
+                        ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
+                    ),
+                    ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
+                )
             distinct_advanced = False
+            failed_distinct_ceiling: timedelta | None = None
             while current_segment_end > start:
                 assert self._deadline is not None
                 remaining_ms = int((self._deadline - self._clock()) * 1000)
+                # Before the first proof, preserve the complete physical
+                # fallback budget.  Once a complete slice has advanced the
+                # public frontier, the exact response can end at that
+                # checkpoint; reserving an unrelated four-statement fallback
+                # would prevent adaptive proof growth inside the same request.
+                proof_query_reserve = (
+                    0
+                    if distinct_advanced
+                    else ATTRIBUTE_VALUE_CURSOR_DISTINCT_QUERY_RESERVE
+                )
+                proof_wall_reserve_ms = (
+                    0
+                    if distinct_advanced
+                    else ATTRIBUTE_VALUE_CURSOR_DISTINCT_WALL_RESERVE_MS
+                )
                 if (
-                    self._query_count
-                    + 1
-                    + ATTRIBUTE_VALUE_CURSOR_DISTINCT_QUERY_RESERVE
+                    self._query_count + 1 + proof_query_reserve
                     > ATTRIBUTE_READ_MAX_QUERY_COUNT
                     or remaining_ms
-                    <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_WALL_RESERVE_MS
+                    <= proof_wall_reserve_ms
                     + ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
                     + ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS
                 ):
@@ -4319,6 +4465,15 @@ class AttributeReadSelector:
                     # its advanced continuation is more useful than spending
                     # the fallback reserve re-reading known duplicates.  With
                     # no proof yet, retain the original physical path.
+                    if failed_distinct_ceiling is not None and not distinct_advanced:
+                        max_empty_segment_width = min(
+                            max_empty_segment_width,
+                            distinct_width,
+                        )
+                        empty_segment_width = min(
+                            distinct_width,
+                            current_segment_end - start,
+                        )
                     skip_physical_walk = distinct_advanced
                     break
 
@@ -4339,6 +4494,10 @@ class AttributeReadSelector:
                     distinct_rows = self._seen_value_slice_groups(
                         project_ids=projects,
                         attribute_key=key,
+                        attribute_type=attribute_type,
+                        search=normalized_search,
+                        candidate_predicates=proof_candidate_predicates,
+                        candidate_predicate_params=(proof_candidate_predicate_params),
                         segment=(proof_start, proof_end),
                         before_identity=cursor_before,
                         distinct_limit=distinct_limit,
@@ -4346,6 +4505,11 @@ class AttributeReadSelector:
                 except Exception as exc:
                     if not is_read_budget_error(exc):
                         raise
+                    failed_distinct_ceiling = (
+                        distinct_width
+                        if failed_distinct_ceiling is None
+                        else min(failed_distinct_ceiling, distinct_width)
+                    )
                     if distinct_width > ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT:
                         distinct_width = max(
                             ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
@@ -4359,6 +4523,20 @@ class AttributeReadSelector:
                     # reserve on an unrelated physical fallback.  The next
                     # request retries this untouched frontier with a fresh
                     # operation deadline.
+                    if not distinct_advanced:
+                        # A signed continuation may remember a much wider
+                        # successful slice from a previous request.  Once the
+                        # exact proof at this frontier has shown that even the
+                        # minimum slice is dense, do not waste the remaining
+                        # wall budget probing that stale wide width first.
+                        max_empty_segment_width = min(
+                            max_empty_segment_width,
+                            ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+                        )
+                        empty_segment_width = min(
+                            ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+                            current_segment_end - start,
+                        )
                     skip_physical_walk = distinct_advanced
                     break
 
@@ -4373,6 +4551,8 @@ class AttributeReadSelector:
                         if decoded is None:
                             continue
                         attr_type, raw_value = decoded
+                        if attribute_type is not None and attr_type != attribute_type:
+                            continue
                         if (
                             attr_type == "array"
                             and isinstance(raw_value, tuple)
@@ -4380,10 +4560,16 @@ class AttributeReadSelector:
                         ):
                             proof_is_complete = False
                             break
+                        relevant_candidates = (
+                            candidate
+                            for candidate in candidates_for(decoded)
+                            if not needle
+                            or needle in _value_search_text(candidate).casefold()
+                        )
                         if any(
                             attribute_value_cursor_digest(attr_type, candidate)
                             not in known_digests
-                            for candidate in candidates_for(decoded)
+                            for candidate in relevant_candidates
                         ):
                             proof_is_complete = False
                             break
@@ -4400,10 +4586,29 @@ class AttributeReadSelector:
                 cursor_before = None
                 checkpoint_from_widened_segment = False
                 candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
-                empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                proven_width = proof_end - proof_start
+                empty_segment_width = proven_width
+                last_successful_segment_width = proven_width
                 distinct_advanced = True
+                if not distinct_rows:
+                    # A searched proof with no relevant latest-state value is
+                    # also an exact empty slice.  Hand the now-advanced
+                    # frontier to the ordinary candidate walk so its
+                    # geometrically widened empty probes can collapse sparse
+                    # retained history.  Repeating two-hour distinct slices
+                    # here would be correct but would expose a long chain of
+                    # empty public continuations.
+                    empty_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                    last_successful_segment_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
+                    break
+                if failed_distinct_ceiling is not None:
+                    # Do not immediately retry a request-local width that just
+                    # exhausted its read/time budget.  Publish the smaller
+                    # certified slice and let the next request start with a
+                    # fresh deadline at the unchanged next frontier.
+                    break
                 distinct_width = min(
-                    distinct_width * 2,
+                    proven_width * 2,
                     ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
                 )
 
@@ -4460,8 +4665,12 @@ class AttributeReadSelector:
                     before_identity=cursor_before,
                     candidate_limit=candidate_limit,
                     predicate_params=candidate_predicate_params,
+                    candidate_query_settings=_ATTRIBUTE_VALUE_CANDIDATE_MAP_SETTINGS,
                     query_timeout_ms=(
-                        ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+                        ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+                        if current_segment_end - segment_start
+                        <= ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+                        else ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
                         if widened_probe
                         or candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                         else None
@@ -4503,7 +4712,7 @@ class AttributeReadSelector:
                     )
                     if failed_width > retry_width:
                         # The failed read did not advance any public cursor state.
-                        # Retry the same frontier at the five-minute exact floor;
+                        # Retry the same frontier at the five-second exact floor;
                         # a keyset checkpoint must be re-anchored so timestamp ties
                         # below it stay inside the half-open segment.
                         if cursor_before is not None:

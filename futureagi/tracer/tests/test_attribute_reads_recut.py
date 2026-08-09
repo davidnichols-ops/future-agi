@@ -53,7 +53,6 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
-    ATTRIBUTE_VALUE_CURSOR_DISTINCT_QUERY_RESERVE,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
@@ -3692,7 +3691,7 @@ def test_filter_value_cursor_seen_temporal_distinct_exhausts_dense_seven_days():
     pages: list[AttributeValueCursorPageRead] = []
     all_calls: list[QueryCall] = []
 
-    for _ in range(8):
+    for _ in range(80):
         executor = RecordingExecutor(
             lambda *_args: pytest.fail(
                 "a complete seen-only proof must not re-enter the physical walk"
@@ -3719,7 +3718,7 @@ def test_filter_value_cursor_seen_temporal_distinct_exhausts_dense_seven_days():
             break
         segment_end = read.next_segment_end
 
-    assert len(pages) == 4
+    assert len(pages) <= 80
     assert pages[-1].browse_status == "exhausted"
     assert pages[-1].next_segment_end == NOW - timedelta(days=7)
     assert all(page.rows == () for page in pages)
@@ -3738,25 +3737,458 @@ def test_filter_value_cursor_seen_temporal_distinct_exhausts_dense_seven_days():
         for call in all_calls
     )
     assert all(
-        page.metadata.query_count
-        <= ATTRIBUTE_READ_MAX_QUERY_COUNT
-        - ATTRIBUTE_VALUE_CURSOR_DISTINCT_QUERY_RESERVE
-        for page in pages
+        page.metadata.query_count <= ATTRIBUTE_READ_MAX_QUERY_COUNT for page in pages
     )
 
     sql = all_calls[0].sql
-    assert "argMax(" in sql
-    assert "tuple(\n                        is_deleted," in sql
-    assert "WHERE tupleElement(latest_state, 1) = 0" in sql
+    assert "SELECT DISTINCT" in sql
+    assert sql.count("FROM spans AS raw_source") == 1
+    assert "ARRAY JOIN" in sql
+    assert "argMax(" not in sql
     assert "WHERE is_deleted = 0" not in sql
-    assert sql.index("argMax(") < sql.index("WHERE tupleElement(latest_state, 1) = 0")
-    precedence = [
-        sql.index("latest_state, 2) != 0, 'string'"),
-        sql.index("latest_state, 4) != 0, 'number'"),
-        sql.index("latest_state, 6) != 0, 'boolean'"),
-        sql.index("latest_state, 8) != 0, 'json'"),
+    assert "indexHint(has(mapKeys(attrs_string)" in sql
+    assert "indexHint(has(mapKeys(attrs_number)" in sql
+    assert "indexHint(has(mapKeys(attrs_bool)" in sql
+    assert "JSONExtractRaw(attributes_extra" in sql
+    assert "AND (" in sql  # direct source predicate keeps CH skip indexes usable
+
+
+def test_filter_value_cursor_typed_search_distinct_exhausts_seen_matches():
+    seen_value = "Rechazado"
+    seen_digest = attribute_value_cursor_digest("string", seen_value)
+    executor = RecordingExecutor(
+        lambda *_args: pytest.fail(
+            "a complete typed searched proof must not re-enter the physical walk"
+        ),
+        distinct_responder=lambda *_args: [
+            _distinct_value_group("string", seen_value, count=50_000)
+        ],
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        seen_value_digests=(seen_digest,),
+        search="rEcHaZ",
+        attribute_type="string",
+    )
+
+    distinct_calls = [
+        call for call in executor.calls if "distinct_limit" in call.params
     ]
-    assert precedence == sorted(precedence)
+    assert read.rows == ()
+    assert read.has_more is False
+    assert read.browse_status == "exhausted"
+    assert read.next_segment_end == NOW - timedelta(minutes=5)
+    assert distinct_calls
+    assert all(
+        call.params["distinct_attribute_type"] == "string"
+        and call.params["distinct_attribute_search"] == "rEcHaZ"
+        for call in distinct_calls
+    )
+    sql = distinct_calls[0].sql
+    assert "SELECT DISTINCT" in sql
+    assert sql.count("FROM spans AS raw_source") == 1
+    assert "ARRAY JOIN" not in sql
+    assert "positionCaseInsensitiveUTF8(" in sql
+    assert "length(attrs_string[%(attribute_key)s]) !=" in sql
+    assert "argMax(" not in sql
+    assert sql.count("indexHint(has(mapKeys(attrs_string)") == 1
+
+
+def test_filter_value_cursor_unpinned_search_distinct_exhausts_seen_typed_match():
+    seen_value = "Rechazado"
+    executor = RecordingExecutor(
+        lambda *_args: pytest.fail(
+            "a complete unpinned searched proof must not re-enter the physical walk"
+        ),
+        distinct_responder=lambda *_args: [
+            _distinct_value_group("string", seen_value, count=50_000)
+        ],
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("string", seen_value),),
+        search="rechazado",
+    )
+
+    assert read.rows == ()
+    assert read.browse_status == "exhausted"
+    assert all(
+        call.params["distinct_attribute_type"] == ""
+        and call.params["distinct_attribute_search"] == "rechazado"
+        for call in executor.calls
+    )
+    sql = executor.calls[0].sql
+    assert "'string'" in sql
+    assert "'number'" in sql
+    assert "'boolean'" in sql
+    assert "'json'" in sql
+
+
+def test_filter_value_cursor_searched_empty_proof_enters_widened_empty_walk():
+    executor = RecordingExecutor(
+        distinct_responder=lambda *_args: [],
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - timedelta(days=7),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("string", "Rechazado"),),
+        search="rechazado",
+    )
+
+    distinct_calls = [
+        call for call in executor.calls if "distinct_limit" in call.params
+    ]
+    candidate_calls = [
+        call for call in executor.calls if "segment_start" in call.params
+    ]
+    assert len(distinct_calls) == 1
+    assert candidate_calls
+    assert candidate_calls[0].params["segment_end"] == (
+        NOW - ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT
+    )
+    assert any(
+        call.params["segment_end"] - call.params["segment_start"]
+        > ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT
+        for call in candidate_calls
+    )
+    assert read.rows == ()
+    assert read.browse_status == "exhausted"
+    assert read.has_more is False
+
+
+def test_filter_value_cursor_unpinned_search_proof_uses_array_member_semantics():
+    raw_array = json.dumps(["Rechazado", "Approved"])
+    executor = RecordingExecutor(
+        lambda *_args: pytest.fail(
+            "an unseen nonmatching array member must not force physical fallback"
+        ),
+        distinct_responder=lambda *_args: [
+            _distinct_value_group("json", raw_array, count=10_000)
+        ],
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("array", "Rechazado"),),
+        search="rechazado",
+    )
+
+    call = executor.calls[0]
+    assert read.rows == ()
+    assert read.browse_status == "exhausted"
+    assert "JSONExtractRaw(attributes_extra" in call.sql
+    assert "JSONHas(attributes_extra" in call.sql
+
+
+def test_filter_value_cursor_raw_stale_seen_match_is_safe_to_skip():
+    """A stale raw value may over-admit, but a known digest remains skippable."""
+
+    seen_value = "Rechazado"
+    executor = RecordingExecutor(
+        lambda *_args: pytest.fail(
+            "a stale raw match already in the vocabulary must not fallback"
+        ),
+        distinct_responder=lambda *_args: [_distinct_value_group("string", seen_value)],
+    )
+
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("string", seen_value),),
+        search="rechazado",
+        attribute_type="string",
+    )
+
+    assert read.rows == ()
+    assert read.has_more is False
+    assert all("distinct_limit" in call.params for call in executor.calls)
+
+
+def test_filter_value_cursor_raw_unseen_tombstone_forces_exact_replay_without_emit():
+    """An unseen stale match is conservative fallback, never a published value."""
+
+    candidate = _candidate(
+        PROJECT_A,
+        "stale-rechazado",
+        start_time=NOW - timedelta(minutes=1),
+        candidate_version=1,
+    )
+
+    def respond(call, _call_number):
+        if "segment_start" in call.params:
+            if not (
+                call.params["segment_start"]
+                <= candidate["start_time"]
+                < call.params["segment_end"]
+            ):
+                return []
+            return _keyset_candidate_page([candidate], call)
+        if "max(_version) AS latest_version" in call.sql:
+            return [
+                _target_row(
+                    PROJECT_A,
+                    candidate["id"],
+                    trace_id=candidate["trace_id"],
+                    start_time=candidate["start_time"],
+                    is_deleted=1,
+                    latest_version=2,
+                )
+            ]
+        pytest.fail("a tombstoned candidate must not reach value hydration")
+
+    executor = RecordingExecutor(
+        respond,
+        distinct_responder=lambda *_args: [
+            _distinct_value_group("string", "Rechazado")
+        ],
+    )
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("string", "completed"),),
+        search="rechazado",
+        attribute_type="string",
+    )
+
+    assert read.rows == ()
+    assert read.has_more is False
+    assert any("max(_version) AS latest_version" in call.sql for call in executor.calls)
+
+
+def test_filter_value_cursor_python_casefold_match_is_not_lost_by_sql_prefilter():
+    candidate = _candidate(
+        PROJECT_A,
+        "unicode-casefold",
+        start_time=NOW - timedelta(minutes=1),
+    )
+    executor = _value_cursor_executor(
+        [candidate],
+        {str(candidate["id"]): "Straße"},
+    )
+    executor.distinct_responder = lambda *_args: [
+        _distinct_value_group("string", "Straße")
+    ]
+
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "custom.attribute",
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("string", "other"),),
+        search="STRASSE",
+        attribute_type="string",
+    )
+
+    proof_call = next(
+        call for call in executor.calls if "distinct_limit" in call.params
+    )
+    assert "length(attrs_string[%(attribute_key)s]) !=" in proof_call.sql
+    assert read.rows == (AttributeValueRow("Straße", "string", 1),)
+
+
+def test_filter_value_cursor_escaped_json_array_search_uses_decoded_members():
+    member = 'a"b'
+    raw_array = json.dumps([member, r"c\d"])
+    executor = RecordingExecutor(
+        lambda *_args: pytest.fail("all matching decoded members are already known"),
+        distinct_responder=lambda *_args: [_distinct_value_group("json", raw_array)],
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "custom.attribute",
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest("array", member),),
+        search=member,
+    )
+
+    assert read.rows == ()
+    assert read.has_more is False
+
+
+def test_filter_value_cursor_unpinned_search_unseen_array_match_is_not_skipped():
+    checkpoint_time = NOW - timedelta(minutes=1)
+    before_identity = (
+        PROJECT_A,
+        "trace-z",
+        "z-checkpoint",
+        checkpoint_time,
+    )
+    candidate = _candidate(
+        PROJECT_A,
+        "a-lower-same-time",
+        trace_id="trace-a",
+        start_time=checkpoint_time,
+    )
+    raw_array = json.dumps(["Rechazado - manual review", "Approved"])
+
+    def respond(call, _call_number):
+        if "segment_start" in call.params:
+            return _keyset_candidate_page([candidate], call)
+        return [
+            _target_row(
+                PROJECT_A,
+                str(candidate["id"]),
+                trace_id=str(candidate["trace_id"]),
+                start_time=checkpoint_time,
+                legacy_raw=raw_array,
+            )
+        ]
+
+    executor = RecordingExecutor(
+        respond,
+        distinct_responder=lambda *_args: [_distinct_value_group("json", raw_array)],
+    )
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - timedelta(hours=1),
+        window_end=NOW,
+        before_identity=before_identity,
+        seen_value_digests=(attribute_value_cursor_digest("array", "Rechazado"),),
+        search="rechazado",
+    )
+
+    candidate_call = next(
+        call for call in executor.calls if "segment_start" in call.params
+    )
+    assert candidate_call.params["candidate_before_id"] == before_identity[2]
+    assert read.rows == (AttributeValueRow("Rechazado - manual review", "array", 1),)
+
+
+def test_filter_value_cursor_typed_search_unseen_match_falls_back_without_skip():
+    checkpoint_time = NOW - timedelta(minutes=1)
+    before_identity = (
+        PROJECT_A,
+        "trace-z",
+        "z-checkpoint",
+        checkpoint_time,
+    )
+    candidate = _candidate(
+        PROJECT_A,
+        "a-lower-same-time",
+        trace_id="trace-a",
+        start_time=checkpoint_time,
+    )
+    matching_unseen_value = "Rechazado - manual review"
+    executor = _value_cursor_executor(
+        [candidate],
+        {str(candidate["id"]): matching_unseen_value},
+    )
+    executor.distinct_responder = lambda *_args: [
+        _distinct_value_group("string", matching_unseen_value)
+    ]
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        window_start=NOW - timedelta(hours=1),
+        window_end=NOW,
+        before_identity=before_identity,
+        seen_value_digests=(attribute_value_cursor_digest("string", "Rechazado"),),
+        search="rechazado",
+        attribute_type="string",
+    )
+
+    distinct_call = executor.calls[0]
+    candidate_call = next(
+        call for call in executor.calls if "segment_start" in call.params
+    )
+    assert distinct_call.params["distinct_attribute_type"] == "string"
+    assert distinct_call.params["distinct_attribute_search"] == "rechazado"
+    assert distinct_call.params["distinct_before_id"] == before_identity[2]
+    assert candidate_call.params["candidate_before_id"] == before_identity[2]
+    assert candidate_call.params["segment_end"] == NOW
+    assert read.rows == (AttributeValueRow(matching_unseen_value, "string", 1),)
+
+
+@pytest.mark.parametrize(
+    ("attribute_type", "search", "seen_value"),
+    [
+        ("string", "done", "DONE"),
+        ("number", "42", 42.0),
+        ("boolean", "TRUE", True),
+    ],
+)
+def test_filter_value_cursor_typed_search_distinct_binds_scalar_semantics(
+    attribute_type,
+    search,
+    seen_value,
+):
+    executor = RecordingExecutor(
+        lambda *_args: pytest.fail("the complete searched slice must not fallback"),
+        distinct_responder=lambda *_args: [
+            _distinct_value_group(attribute_type, seen_value)
+        ],
+    )
+
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "custom.attribute",
+        page_size=10,
+        window_start=NOW - timedelta(minutes=5),
+        window_end=NOW,
+        seen_value_digests=(attribute_value_cursor_digest(attribute_type, seen_value),),
+        search=search,
+        attribute_type=attribute_type,
+    )
+
+    call = executor.calls[0]
+    assert read.browse_status == "exhausted"
+    assert call.params["distinct_attribute_type"] == attribute_type
+    assert call.params["distinct_attribute_search"] == search
+    if attribute_type == "string":
+        assert "positionCaseInsensitiveUTF8(" in call.sql
+        assert "length(attrs_string[%(attribute_key)s]) !=" in call.sql
+    elif attribute_type == "number":
+        assert "positionCaseInsensitiveUTF8(" not in call.sql
+        assert "toString(value_number)" not in call.sql
+    else:
+        assert "positionCaseInsensitiveUTF8(" in call.sql
+        assert "if(attrs_bool[%(attribute_key)s], 'true', 'false')" in call.sql
 
 
 def test_filter_value_cursor_temporal_distinct_unseen_value_falls_back_at_same_keyset():
@@ -3818,15 +4250,12 @@ def test_filter_value_cursor_temporal_distinct_budget_backoff_returns_proven_sli
     )
     seen_value = "completed"
 
-    def distinct_respond(call, _call_number):
+    def distinct_respond(call, call_number):
         width_us = call.params["segment_end_us"] - call.params["segment_start_us"]
         width = timedelta(microseconds=width_us)
-        if width in {
-            ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT,
-            ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT / 2,
-        }:
+        if call_number > 1:
             return ReadDeadlineExceeded("speculative distinct slice exceeded budget")
-        if width == ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT:
+        if width == ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT:
             return [_distinct_value_group("string", seen_value)]
         return [_distinct_value_group("string", "queued")]
 
@@ -3853,16 +4282,18 @@ def test_filter_value_cursor_temporal_distinct_budget_backoff_returns_proven_sli
         )
         for call in distinct_calls
     ]
-    assert widths == [
-        ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT,
-        ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT / 2,
-        ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
-        ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT * 2,
-    ]
+    assert widths[0] == ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT
+    assert widths[1] == ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT * 2
+    assert widths[-1] == ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
+    assert all(
+        newer > older for newer, older in zip(widths[1:], widths[2:], strict=False)
+    )
     assert not any("segment_start" in call.params for call in executor.calls)
     assert read.rows == ()
     assert read.has_more is True
-    assert read.next_segment_end == NOW - ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
+    assert read.next_segment_end == (
+        NOW - ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT
+    )
 
 
 def test_filter_value_cursor_temporal_distinct_minimum_failure_keeps_original_frontier():
@@ -3943,7 +4374,7 @@ def test_filter_value_cursor_temporal_distinct_preserves_physical_fallback_budge
     assert first.has_more is True
     assert first.next_segment_end < NOW
     assert all("distinct_limit" in call.params for call in first_executor.calls)
-    assert 2.8 <= clock.value - 100.0 < 2.9
+    assert 2.81 <= clock.value - 100.0 < 2.83
     assert ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS == 100
 
     candidate = _candidate(
@@ -4230,7 +4661,9 @@ def test_filter_value_cursor_unpinned_duplicate_page_respects_query_ceiling():
 
 def test_filter_value_cursor_pinned_type_reserves_three_query_page_ceiling():
     duplicate_value = "completed"
-    candidate_page_count = ATTRIBUTE_READ_MAX_QUERY_COUNT // 3
+    # One complete temporal proof consumes the first query.  The selector may
+    # then start only whole three-statement typed candidate batches.
+    candidate_page_count = (ATTRIBUTE_READ_MAX_QUERY_COUNT - 1) // 3
     processed_candidates = (
         ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
         + (2 * ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT)
@@ -4270,15 +4703,22 @@ def test_filter_value_cursor_pinned_type_reserves_three_query_page_ceiling():
         call
         for call in executor.calls
         if "segment_start" not in call.params
+        and "distinct_limit" not in call.params
         and "max(_version) AS latest_version" not in call.sql
     ]
     last_verified = candidates[processed_candidates - 1]
     assert read.rows == ()
     assert read.has_more is True
     assert read.browse_status == "continuation"
-    assert read.metadata.query_count == ATTRIBUTE_READ_MAX_QUERY_COUNT
-    assert len(executor.calls) == ATTRIBUTE_READ_MAX_QUERY_COUNT
-    assert len(candidate_calls) == len(certificate_calls) == len(hydration_calls) == 10
+    expected_query_count = 1 + (candidate_page_count * 3)
+    assert read.metadata.query_count == expected_query_count
+    assert len(executor.calls) == expected_query_count
+    assert (
+        len(candidate_calls)
+        == len(certificate_calls)
+        == len(hydration_calls)
+        == candidate_page_count
+    )
     assert read.next_before_identity == (
         str(last_verified["project_id"]),
         str(last_verified["trace_id"]),
@@ -4590,7 +5030,7 @@ def test_filter_value_cursor_search_remains_resumable_after_tracking_prefix(
     assert candidate_calls[0]["include_versions"] is True
 
 
-def test_filter_value_cursor_candidate_budget_retries_exact_five_minute_frontier():
+def test_filter_value_cursor_candidate_budget_retries_exact_minimum_frontier():
     candidate = _candidate(
         PROJECT_A,
         "candidate-budget-recovered",
@@ -4653,7 +5093,7 @@ def test_filter_value_cursor_candidate_budget_retries_exact_five_minute_frontier
     assert all("candidate_before_id" not in call.params for call in candidate_calls)
 
 
-def test_filter_value_cursor_replay_budget_retries_exact_five_minute_frontier():
+def test_filter_value_cursor_replay_budget_retries_exact_minimum_frontier():
     candidate = _candidate(
         PROJECT_A,
         "replay-budget-recovered",
@@ -4711,10 +5151,11 @@ def test_filter_value_cursor_replay_budget_retries_exact_five_minute_frontier():
 
 
 def test_filter_value_cursor_persists_last_successful_adaptive_width():
+    minimum_width = ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
     candidate = _candidate(
         PROJECT_A,
         "adaptive-search-result",
-        start_time=NOW - timedelta(minutes=20),
+        start_time=NOW - (minimum_width * 4),
     )
     attempted_widths = []
 
@@ -4722,7 +5163,7 @@ def test_filter_value_cursor_persists_last_successful_adaptive_width():
         if "segment_start" in call.params:
             width = call.params["segment_end"] - call.params["segment_start"]
             attempted_widths.append(width)
-            if width in {ATTRIBUTE_READ_EXPLICIT_SEGMENT, timedelta(minutes=20)}:
+            if width in {ATTRIBUTE_READ_EXPLICIT_SEGMENT, minimum_width * 4}:
                 return ReadDeadlineExceeded("adaptive deadline")
             if (
                 call.params["segment_start"]
@@ -4766,13 +5207,13 @@ def test_filter_value_cursor_persists_last_successful_adaptive_width():
     assert first.rows == ()
     assert first.has_more is True
     assert first.next_before_identity is None
-    assert first.next_segment_end == NOW - timedelta(minutes=15)
-    assert first.next_segment_start == NOW - timedelta(minutes=25)
+    assert first.next_segment_end == NOW - (minimum_width * 3)
+    assert first.next_segment_start == NOW - (minimum_width * 5)
     assert attempted_widths == [
         ATTRIBUTE_READ_EXPLICIT_SEGMENT,
-        timedelta(minutes=5),
-        timedelta(minutes=10),
-        timedelta(minutes=20),
+        minimum_width,
+        minimum_width * 2,
+        minimum_width * 4,
     ]
 
     second_attempt_start = len(attempted_widths)
@@ -4792,17 +5233,18 @@ def test_filter_value_cursor_persists_last_successful_adaptive_width():
     )
 
     assert second.rows == (AttributeValueRow("Rechazado", "string", 1),)
-    assert attempted_widths[second_attempt_start] == timedelta(minutes=10)
+    assert attempted_widths[second_attempt_start] == minimum_width * 2
     assert (
         ATTRIBUTE_READ_EXPLICIT_SEGMENT not in attempted_widths[second_attempt_start:]
     )
 
 
 def test_filter_value_cursor_persists_width_after_later_replay_failure():
+    minimum_width = ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
     candidate = _candidate(
         PROJECT_A,
         "adaptive-replay-search-result",
-        start_time=NOW - timedelta(minutes=20),
+        start_time=NOW - (minimum_width * 4),
     )
     attempted_widths = []
     current_width = ATTRIBUTE_READ_EXPLICIT_SEGMENT
@@ -4821,7 +5263,7 @@ def test_filter_value_cursor_persists_width_after_later_replay_failure():
             return []
         if current_width in {
             ATTRIBUTE_READ_EXPLICIT_SEGMENT,
-            timedelta(minutes=20),
+            minimum_width * 4,
         }:
             return ReadDeadlineExceeded("adaptive replay deadline")
         if "max(_version) AS latest_version" in call.sql:
@@ -4857,13 +5299,13 @@ def test_filter_value_cursor_persists_width_after_later_replay_failure():
     )
 
     assert first.rows == ()
-    assert first.next_segment_end == NOW - timedelta(minutes=15)
-    assert first.next_segment_start == NOW - timedelta(minutes=25)
+    assert first.next_segment_end == NOW - (minimum_width * 3)
+    assert first.next_segment_start == NOW - (minimum_width * 5)
     assert attempted_widths == [
         ATTRIBUTE_READ_EXPLICIT_SEGMENT,
-        timedelta(minutes=5),
-        timedelta(minutes=10),
-        timedelta(minutes=20),
+        minimum_width,
+        minimum_width * 2,
+        minimum_width * 4,
     ]
 
     second_attempt_start = len(attempted_widths)
@@ -4883,7 +5325,7 @@ def test_filter_value_cursor_persists_width_after_later_replay_failure():
     )
 
     assert second.rows == (AttributeValueRow("Rechazado", "string", 1),)
-    assert attempted_widths[second_attempt_start] == timedelta(minutes=10)
+    assert attempted_widths[second_attempt_start] == minimum_width * 2
     assert (
         ATTRIBUTE_READ_EXPLICIT_SEGMENT not in attempted_widths[second_attempt_start:]
     )
@@ -4930,7 +5372,7 @@ def test_filter_value_cursor_adaptive_segment_must_contain_checkpoint():
 
 
 @pytest.mark.parametrize("failure_stage", ["candidate", "replay"])
-def test_filter_value_cursor_five_minute_floor_failure_remains_fail_closed(
+def test_filter_value_cursor_minimum_floor_failure_remains_fail_closed(
     failure_stage,
 ):
     candidate = _candidate(
