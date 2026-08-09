@@ -195,6 +195,14 @@ describe("UsersGrid deterministic pagination", () => {
         current_page_index: 0,
         cursor_mode: true,
         page_size: 25,
+        requested_columns: JSON.stringify([
+          "last_active",
+          "total_cost",
+          "num_sessions",
+          "avg_trace_latency",
+          "eval_score",
+        ]),
+        attribute_keys: "[]",
       }),
     );
     expect(config.params).not.toHaveProperty("cursor");

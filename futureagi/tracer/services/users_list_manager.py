@@ -101,6 +101,14 @@ _USER_LIST_EXTRA_METRIC_FIELDS = frozenset(
 _USER_LIST_EVAL_FIELDS = frozenset(
     {"eval_score", "bool_eval_pass_rate", "avg_output_float"}
 )
+# ``requested_columns`` was added after this endpoint had already published all
+# built-in metrics.  An omitted projection must therefore retain that legacy
+# contract; an explicitly supplied empty list remains the bounded opt-out used
+# by projection-aware callers.  Custom attributes cannot be part of this
+# compatibility set because there is no finite key list to project.
+_USER_LIST_OMITTED_PROJECTION_FIELDS = (
+    _USER_LIST_EXTRA_METRIC_FIELDS | _USER_LIST_EVAL_FIELDS
+)
 
 # Hard cap on export rows. Bounds worker memory + latency for the large-workspace
 # case this feature targets (matches agentcc's MAX_EXPORT_ROWS); a hit is logged
@@ -289,12 +297,17 @@ class UsersListManager:
         self.search = search
         self.filters = filters or []
         self.sort_params = sort_params or []
+        requested_column_source = (
+            _USER_LIST_OMITTED_PROJECTION_FIELDS
+            if requested_columns is None
+            else requested_columns
+        )
         self.requested_columns = frozenset(
             UserListQueryBuilderV2.OUTPUT_FILTER_MAP.get(
                 str(column),
                 "bool_eval_pass_rate" if str(column) == "eval_score" else str(column),
             )
-            for column in (requested_columns or ())
+            for column in requested_column_source
             if column
         )
         requested_attribute_keys = [str(key) for key in (attribute_keys or ()) if key]

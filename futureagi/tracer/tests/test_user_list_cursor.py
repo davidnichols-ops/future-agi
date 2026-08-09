@@ -14,6 +14,7 @@ from tracer.services.users_list_manager import (
     UsersListManager,
     _users_attr_enrichment_query,
 )
+from tracer.views.trace import UsersView
 
 pytestmark = pytest.mark.unit
 
@@ -505,6 +506,119 @@ def test_span_attribute_read_is_skipped_when_no_keys_are_requested():
 
     assert attributes == {}
     analytics_cls.assert_not_called()
+
+
+def test_omitted_projection_hydrates_legacy_metrics_and_evals_without_attributes():
+    now = datetime(2026, 8, 5, 12, tzinfo=UTC)
+    project_id = str(uuid.uuid4())
+    manager = UsersListManager(
+        organization_id=str(uuid.uuid4()),
+        allowed_project_ids=[project_id],
+        project_id=project_id,
+        # Deliberately omit requested_columns: this is the legacy wire shape.
+    )
+    expected_metrics = {
+        "num_sessions",
+        "avg_session_duration",
+        "avg_trace_latency",
+        "num_llm_calls",
+        "num_guardrails_triggered",
+        "num_active_days",
+        "num_traces_with_errors",
+    }
+    row = _exact(_candidate(0, now=now))
+    end_user_id = str(row["end_user_id"])
+    builder = MagicMock()
+
+    with (
+        patch.object(
+            manager,
+            "_read_page_metrics",
+            return_value={end_user_id: {"num_sessions": 1}},
+        ) as read_metrics,
+        patch.object(manager, "_read_span_attributes") as read_attributes,
+        patch.object(
+            manager,
+            "_read_evals",
+            return_value={end_user_id: {"bool_eval_pass_rate": 0.75}},
+        ) as read_evals,
+    ):
+        manager._enrich_rows(
+            [row],
+            builder,
+            ReadDeadline.start(10_000),
+            start_date=now - timedelta(days=1),
+            end_date=now,
+        )
+
+    assert manager.metric_keys == expected_metrics
+    assert manager.needs_evals is True
+    assert manager.attribute_keys == ()
+    read_metrics.assert_called_once()
+    read_evals.assert_called_once()
+    read_attributes.assert_not_called()
+    assert row["num_sessions"] == 1
+    assert row["bool_eval_pass_rate"] == 0.75
+
+
+@pytest.mark.parametrize(
+    ("query_params", "validated_columns", "expected"),
+    (
+        ({}, [], None),
+        ({"requested_columns": "[]"}, [], []),
+        (
+            {"requested_columns": '["num_sessions"]'},
+            ["num_sessions"],
+            ["num_sessions"],
+        ),
+    ),
+)
+def test_users_view_preserves_projection_wire_semantics(
+    query_params, validated_columns, expected
+):
+    request = SimpleNamespace(query_params=query_params)
+
+    assert (
+        UsersView._requested_columns_for_request(
+            request, {"requested_columns": validated_columns}
+        )
+        == expected
+    )
+
+
+def test_explicit_empty_projection_remains_a_bounded_enrichment_opt_out():
+    now = datetime(2026, 8, 5, 12, tzinfo=UTC)
+    manager = _manager(requested_columns=[])
+    row = _exact(_candidate(0, now=now))
+
+    with (
+        patch.object(manager, "_read_page_metrics") as read_metrics,
+        patch.object(manager, "_read_span_attributes") as read_attributes,
+        patch.object(manager, "_read_evals") as read_evals,
+    ):
+        manager._enrich_rows(
+            [row],
+            MagicMock(),
+            ReadDeadline.start(10_000),
+            start_date=now - timedelta(days=1),
+            end_date=now,
+        )
+
+    assert manager.metric_keys == frozenset()
+    assert manager.needs_evals is False
+    assert manager.attribute_keys == ()
+    read_metrics.assert_not_called()
+    read_attributes.assert_not_called()
+    read_evals.assert_not_called()
+
+
+def test_explicit_projection_hydrates_only_requested_builtin_metric():
+    manager = _manager(requested_columns=["num_sessions"])
+
+    assert manager.requested_columns == frozenset({"num_sessions"})
+    assert manager.metric_keys == frozenset({"num_sessions"})
+    assert manager.needs_evals is False
+    assert manager.attribute_keys == ()
 
 
 @pytest.mark.parametrize(

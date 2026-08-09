@@ -6846,6 +6846,14 @@ class UsersView(APIView):
     permission_classes = [IsAuthenticated]
     _gm = GeneralMethods()
 
+    @staticmethod
+    def _requested_columns_for_request(request, query_data):
+        """Restore the omitted-vs-explicit-empty distinction after validation."""
+
+        if "requested_columns" not in request.query_params:
+            return None
+        return query_data.get("requested_columns", [])
+
     @validated_request(
         query_serializer=UsersQuerySerializer,
         responses={200: UsersResponseSerializer, **ERROR_RESPONSES},
@@ -6907,7 +6915,13 @@ class UsersView(APIView):
                 search=search.strip() if search else None,
                 filters=query_data.get("filters", []),
                 sort_params=query_data.get("sort_params", []),
-                requested_columns=query_data.get("requested_columns", []),
+                # Preserve the pre-projection API contract when the parameter
+                # is omitted, while retaining an explicit ``[]`` as the
+                # projection-aware opt-out.  The serializer default alone
+                # cannot distinguish those two wire representations.
+                requested_columns=self._requested_columns_for_request(
+                    request, query_data
+                ),
                 attribute_keys=query_data.get("attribute_keys", []),
             )
 

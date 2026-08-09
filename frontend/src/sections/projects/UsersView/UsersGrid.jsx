@@ -195,9 +195,21 @@ const UsersGrid = React.memo(
     }, [columns]);
 
     const requestedProjection = useMemo(() => {
-      const visible = Array.isArray(columns)
-        ? columns.filter((column) => column?.isVisible !== false)
-        : [];
+      // Zustand starts with an empty list and is hydrated in an effect. AG Grid
+      // may ask its initial datasource for rows before that effect-driven store
+      // update is visible, so derive the first projection from the canonical
+      // column config instead of explicitly requesting no metrics.
+      const projectionColumns =
+        Array.isArray(columns) && columns.length > 0
+          ? columns
+          : getUsersColumnConfig().map((column) => ({
+              id: column.field,
+              isVisible: column.hide !== true,
+              groupBy: null,
+            }));
+      const visible = projectionColumns.filter(
+        (column) => column?.isVisible !== false,
+      );
       return {
         requestedColumns: visible
           .filter((column) => column?.groupBy !== "Custom Columns")
