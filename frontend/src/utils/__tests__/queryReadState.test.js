@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   AGGREGATION_POLL_MAX_ATTEMPTS,
   AGGREGATION_POLL_TIMEOUT_MS,
+  awaitAggregationRequestWithDeadline,
   failServerSideGridRead,
   getAttributeLookupMessage,
   getAggregationPollDelay,
@@ -177,6 +178,52 @@ describe("queryReadState", () => {
         now: 1000 + AGGREGATION_POLL_TIMEOUT_MS,
       }),
     ).toBe(true);
+  });
+
+  it("aborts the underlying aggregation request at its transport deadline and ignores late completion", async () => {
+    vi.useFakeTimers();
+    let requestSignal;
+    let resolveLate;
+    const request = awaitAggregationRequestWithDeadline(
+      (signal) => {
+        requestSignal = signal;
+        return new Promise((resolve) => {
+          resolveLate = resolve;
+        });
+      },
+      { timeoutMs: 25 },
+    );
+    const rejection = expect(request).rejects.toMatchObject({
+      code: "aggregation_request_timeout",
+    });
+
+    await vi.advanceTimersByTimeAsync(25);
+
+    expect(requestSignal.aborted).toBe(true);
+    resolveLate("too late");
+    await vi.advanceTimersByTimeAsync(0);
+    await rejection;
+    vi.useRealTimers();
+  });
+
+  it("links caller cancellation to the underlying aggregation transport", async () => {
+    const upstream = new AbortController();
+    let requestSignal;
+    const request = awaitAggregationRequestWithDeadline(
+      (signal) => {
+        requestSignal = signal;
+        return new Promise(() => {});
+      },
+      { timeoutMs: 1000, signal: upstream.signal },
+    );
+    const rejection = expect(request).rejects.toMatchObject({
+      name: "AbortError",
+    });
+
+    upstream.abort();
+
+    expect(requestSignal.aborted).toBe(true);
+    await rejection;
   });
 
   it("recognizes explicit complete metadata", () => {

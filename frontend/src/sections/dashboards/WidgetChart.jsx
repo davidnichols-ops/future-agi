@@ -23,6 +23,7 @@ import {
 } from "./widgetUtils";
 import { toTimeRangePayload } from "./dashboardDateRange";
 import {
+  AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   AGGREGATION_PREPARING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
@@ -218,8 +219,10 @@ export default function WidgetChart({
     let active = true;
     let pollTimer = null;
     let requestTimer = null;
+    let requestController = null;
     let requestGeneration = 0;
     let pollAttempt = 0;
+    let consecutivePollFailures = 0;
     let refreshWasQueued = false;
     let settled = false;
 
@@ -234,6 +237,8 @@ export default function WidgetChart({
         window.clearTimeout(requestTimer);
         requestTimer = null;
       }
+      requestController?.abort();
+      requestController = null;
       onQuerySettledRef.current?.({
         dashboardId,
         widgetId: widget.id,
@@ -257,13 +262,31 @@ export default function WidgetChart({
     const executeQuery = (refresh) => {
       const generation = requestGeneration + 1;
       requestGeneration = generation;
+      requestController?.abort();
+      const controller = new AbortController();
+      requestController = controller;
       if (requestTimer !== null) window.clearTimeout(requestTimer);
+
+      const handleQueuedTransportFailure = () => {
+        consecutivePollFailures += 1;
+        const exhausted =
+          consecutivePollFailures >= AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES;
+        setLatestOutcome({
+          signature: querySignature,
+          unavailable: true,
+          retryUnavailable: exhausted,
+        });
+        if (exhausted) settle(null, false);
+        else schedulePoll();
+      };
+
       requestTimer = window.setTimeout(() => {
         if (!active || settled || generation !== requestGeneration) return;
         requestGeneration += 1;
         requestTimer = null;
+        controller.abort();
         if (refreshWasQueued) {
-          schedulePoll();
+          handleQueuedTransportFailure();
           return;
         }
         setLatestOutcome({
@@ -281,11 +304,12 @@ export default function WidgetChart({
           window.clearTimeout(requestTimer);
           requestTimer = null;
         }
+        if (requestController === controller) requestController = null;
         return true;
       };
 
       mutateDashboardQuery(
-        { queryConfig, refresh },
+        { queryConfig, refresh, signal: controller.signal },
         {
           onSuccess: (response) => {
             if (!acceptResponse()) return;
@@ -296,6 +320,7 @@ export default function WidgetChart({
             const { isRefreshing, refreshFailed } =
               getAggregationRefreshState(response);
             const readState = getExactAggregationReadState(response);
+            consecutivePollFailures = 0;
             if (snapshot) setLastExactSnapshot(snapshot);
 
             if (
@@ -343,12 +368,7 @@ export default function WidgetChart({
           onError: () => {
             if (!acceptResponse()) return;
             if (refreshWasQueued) {
-              setLatestOutcome({
-                signature: querySignature,
-                unavailable: true,
-                retryUnavailable: false,
-              });
-              schedulePoll();
+              handleQueuedTransportFailure();
               return;
             }
             setLatestOutcome({
@@ -366,8 +386,10 @@ export default function WidgetChart({
 
     return () => {
       active = false;
+      requestGeneration += 1;
       if (pollTimer !== null) window.clearTimeout(pollTimer);
       if (requestTimer !== null) window.clearTimeout(requestTimer);
+      requestController?.abort();
     };
   }, [
     mutateDashboardQuery,

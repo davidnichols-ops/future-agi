@@ -33,6 +33,7 @@ import { logger } from "src/utils/logger";
 import { FILTER_FOR_HAS_EVAL, toBackendFilters } from "../common";
 import { buildDefaultDateEntry } from "./graphFilterUtils";
 import {
+  AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   GRAPH_LOADING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
@@ -148,6 +149,9 @@ const GraphSection = ({
   const forceRefreshRef = useRef(false);
   const pollAttemptRef = useRef(0);
   const pollingRef = useRef(false);
+  const consecutiveFailureRef = useRef(0);
+  const [aggregationTransportFailed, setAggregationTransportFailed] =
+    useState(false);
   const requestScopeRef = useRef(null);
   const requestGenerationRef = useRef(0);
 
@@ -156,27 +160,34 @@ const GraphSection = ({
     requestScopeRef.current = null;
     pollAttemptRef.current = 0;
     pollingRef.current = false;
+    consecutiveFailureRef.current = 0;
+    setAggregationTransportFailed(false);
   }, []);
 
-  const runAggregationRequest = useCallback(async (scopeKey, request) => {
-    if (requestScopeRef.current !== scopeKey) {
-      requestGenerationRef.current += 1;
-      requestScopeRef.current = scopeKey;
-      pollAttemptRef.current = 0;
-      pollingRef.current = false;
-    }
-
-    const generation = requestGenerationRef.current;
-    return awaitAggregationRequestWithDeadline(request(), {
-      timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS,
-      isCurrent: () => generation === requestGenerationRef.current,
-      onTimeout: () => {
+  const runAggregationRequest = useCallback(
+    async (scopeKey, signal, request) => {
+      if (requestScopeRef.current !== scopeKey) {
+        requestGenerationRef.current += 1;
+        requestScopeRef.current = scopeKey;
+        pollAttemptRef.current = 0;
         pollingRef.current = false;
-      },
-    });
-  }, []);
+        consecutiveFailureRef.current = 0;
+        setAggregationTransportFailed(false);
+      }
+
+      const generation = requestGenerationRef.current;
+      return awaitAggregationRequestWithDeadline(request, {
+        timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS,
+        signal,
+        isCurrent: () => generation === requestGenerationRef.current,
+      });
+    },
+    [],
+  );
 
   const recordAggregationResponse = useCallback((response) => {
+    consecutiveFailureRef.current = 0;
+    setAggregationTransportFailed(false);
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(response);
     const readState = getExactAggregationReadState(response);
@@ -191,6 +202,16 @@ const GraphSection = ({
     }
     pollingRef.current = true;
   }, []);
+  const recordAggregationFailure = useCallback(() => {
+    if (!pollingRef.current) return;
+    consecutiveFailureRef.current += 1;
+    if (
+      consecutiveFailureRef.current >= AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES
+    ) {
+      pollingRef.current = false;
+      setAggregationTransportFailed(true);
+    }
+  }, []);
 
   // Graph APIs
 
@@ -199,7 +220,7 @@ const GraphSection = ({
     data: traceGraphData,
     isFetching: traceGraphLoading,
     isPending: traceGraphPending,
-    isError: traceGraphError,
+    isError: rawTraceGraphError,
     refetch: refetchTraceGraph,
   } = useQuery({
     queryKey: [
@@ -215,27 +236,34 @@ const GraphSection = ({
       if (pollingRef.current) pollAttemptRef.current += 1;
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
-      const response = await runAggregationRequest(
-        JSON.stringify(queryKey),
-        () =>
-          axios.post(
-            endpoints.project.getTraceGraphData(),
-            {
-              interval: selectedInterval,
-              filters: toBackendFilters(combinedFilters),
-              property: "average",
-              req_data_config: selectedGraphConfig,
-              project_id: observeId,
-            },
-            {
-              params: {
-                allow_sampled: false,
-                ...(refresh ? { refresh: true } : {}),
+      let response;
+      try {
+        response = await runAggregationRequest(
+          JSON.stringify(queryKey),
+          signal,
+          (requestSignal) =>
+            axios.post(
+              endpoints.project.getTraceGraphData(),
+              {
+                interval: selectedInterval,
+                filters: toBackendFilters(combinedFilters),
+                property: "average",
+                req_data_config: selectedGraphConfig,
+                project_id: observeId,
               },
-              signal,
-            },
-          ),
-      );
+              {
+                params: {
+                  allow_sampled: false,
+                  ...(refresh ? { refresh: true } : {}),
+                },
+                signal: requestSignal,
+              },
+            ),
+        );
+      } catch (error) {
+        if (!signal.aborted) recordAggregationFailure();
+        throw error;
+      }
       recordAggregationResponse(response);
       return response;
     },
@@ -252,6 +280,8 @@ const GraphSection = ({
       );
       const readState = getExactAggregationReadState(query.state.data);
       if (
+        consecutiveFailureRef.current >=
+          AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES ||
         !isRefreshing ||
         refreshFailed ||
         (readState !== "complete" && readState !== "pending")
@@ -272,7 +302,7 @@ const GraphSection = ({
     data: spanGraphData,
     isFetching: spanGraphLoading,
     isPending: spanGraphPending,
-    isError: spanGraphError,
+    isError: rawSpanGraphError,
     refetch: refetchSpanGraph,
   } = useQuery({
     queryKey: [
@@ -289,27 +319,34 @@ const GraphSection = ({
       if (pollingRef.current) pollAttemptRef.current += 1;
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
-      const response = await runAggregationRequest(
-        JSON.stringify(queryKey),
-        () =>
-          axios.post(
-            endpoints.project.getSpanGraphData(),
-            {
-              interval: selectedInterval,
-              filters: toBackendFilters(combinedFilters),
-              property: "average",
-              req_data_config: selectedGraphConfig,
-              project_id: observeId,
-            },
-            {
-              params: {
-                allow_sampled: false,
-                ...(refresh ? { refresh: true } : {}),
+      let response;
+      try {
+        response = await runAggregationRequest(
+          JSON.stringify(queryKey),
+          signal,
+          (requestSignal) =>
+            axios.post(
+              endpoints.project.getSpanGraphData(),
+              {
+                interval: selectedInterval,
+                filters: toBackendFilters(combinedFilters),
+                property: "average",
+                req_data_config: selectedGraphConfig,
+                project_id: observeId,
               },
-              signal,
-            },
-          ),
-      );
+              {
+                params: {
+                  allow_sampled: false,
+                  ...(refresh ? { refresh: true } : {}),
+                },
+                signal: requestSignal,
+              },
+            ),
+        );
+      } catch (error) {
+        if (!signal.aborted) recordAggregationFailure();
+        throw error;
+      }
       recordAggregationResponse(response);
       return response;
     },
@@ -326,6 +363,8 @@ const GraphSection = ({
       );
       const readState = getExactAggregationReadState(query.state.data);
       if (
+        consecutiveFailureRef.current >=
+          AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES ||
         !isRefreshing ||
         refreshFailed ||
         (readState !== "complete" && readState !== "pending")
@@ -346,8 +385,10 @@ const GraphSection = ({
     selectedTab === "trace"
       ? traceGraphLoading && traceGraphPending
       : spanGraphLoading && spanGraphPending;
+  const rawApiGraphError =
+    selectedTab === "trace" ? rawTraceGraphError : rawSpanGraphError;
   const apiGraphError =
-    selectedTab === "trace" ? traceGraphError : spanGraphError;
+    aggregationTransportFailed || (rawApiGraphError && !pollingRef.current);
   const apiGraphReadState = getExactAggregationReadState(apiGraphData, {
     isError: apiGraphError,
   });

@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { startOfDay, endOfDay, startOfMinute, subDays } from "date-fns";
 import axios, { endpoints } from "src/utils/axios";
 import {
+  AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   awaitAggregationRequestWithDeadline,
   getAggregationPollDelay,
@@ -38,10 +39,15 @@ const readAggregationResult = (data) => {
 function useAggregationPolling(identity) {
   const pollAttemptRef = useRef(0);
   const pollingRef = useRef(false);
+  const consecutiveFailureRef = useRef(0);
+  const [aggregationTransportFailed, setAggregationTransportFailed] =
+    useState(false);
 
   const reset = useCallback(() => {
     pollAttemptRef.current = 0;
     pollingRef.current = false;
+    consecutiveFailureRef.current = 0;
+    setAggregationTransportFailed(false);
   }, []);
 
   useEffect(() => reset(), [identity, reset]);
@@ -52,6 +58,8 @@ function useAggregationPolling(identity) {
 
   const record = useCallback(
     ({ queryRefreshing, queryRefreshFailed }) => {
+      consecutiveFailureRef.current = 0;
+      setAggregationTransportFailed(false);
       const shouldPoll = queryRefreshing && !queryRefreshFailed;
       if (!shouldPoll) {
         reset();
@@ -62,9 +70,25 @@ function useAggregationPolling(identity) {
     [reset],
   );
 
+  const recordFailure = useCallback(() => {
+    if (!pollingRef.current) return;
+    consecutiveFailureRef.current += 1;
+    if (
+      consecutiveFailureRef.current >= AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES
+    ) {
+      pollingRef.current = false;
+      setAggregationTransportFailed(true);
+    }
+  }, []);
+
   const refetchInterval = useCallback((query) => {
     const data = query.state.data;
-    if (!data?.queryRefreshing || data?.queryRefreshFailed) {
+    if (
+      consecutiveFailureRef.current >=
+        AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES ||
+      !data?.queryRefreshing ||
+      data?.queryRefreshFailed
+    ) {
       pollAttemptRef.current = 0;
       pollingRef.current = false;
       return false;
@@ -72,11 +96,22 @@ function useAggregationPolling(identity) {
     return getAggregationPollDelay(pollAttemptRef.current);
   }, []);
 
+  const isFailureTerminal = useCallback(
+    () =>
+      !pollingRef.current ||
+      consecutiveFailureRef.current >=
+        AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
+    [],
+  );
+
   return {
     beforeRequest,
     record,
+    recordFailure,
     refetchInterval,
     reset,
+    isFailureTerminal,
+    aggregationTransportFailed,
   };
 }
 
@@ -127,27 +162,41 @@ export function useEvalUsageChart(
     () => JSON.stringify([templateId, period, dateParams]),
     [dateParams, period, templateId],
   );
-  const { beforeRequest, record, refetchInterval, reset } =
-    useAggregationPolling(pollIdentity);
+  const {
+    beforeRequest,
+    record,
+    recordFailure,
+    refetchInterval,
+    reset,
+    isFailureTerminal,
+    aggregationTransportFailed,
+  } = useAggregationPolling(pollIdentity);
   const query = useQuery({
     queryKey: ["evals", "usage-chart", templateId, period, dateParams],
     queryFn: async ({ signal }) => {
       beforeRequest();
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
-      const { data } = await awaitAggregationRequestWithDeadline(
-        axios.get(endpoints.develop.eval.getEvalUsage(templateId), {
-          params: {
-            page: 0,
-            page_size: 1,
-            period,
-            ...dateParams,
-            ...(refresh ? { refresh: true } : {}),
-          },
-          signal,
-        }),
-        { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS },
-      );
+      let data;
+      try {
+        ({ data } = await awaitAggregationRequestWithDeadline(
+          (requestSignal) =>
+            axios.get(endpoints.develop.eval.getEvalUsage(templateId), {
+              params: {
+                page: 0,
+                page_size: 1,
+                period,
+                ...dateParams,
+                ...(refresh ? { refresh: true } : {}),
+              },
+              signal: requestSignal,
+            }),
+          { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS, signal },
+        ));
+      } catch (error) {
+        if (!signal.aborted) recordFailure();
+        throw error;
+      }
       const aggregation = readAggregationResult(data);
       record(aggregation);
       const result = aggregation.result || {};
@@ -180,7 +229,10 @@ export function useEvalUsageChart(
 
   return {
     ...query,
-    isError: query.isError || query.data?.queryRefreshFailed === true,
+    isError:
+      aggregationTransportFailed ||
+      (query.isError && isFailureTerminal()) ||
+      query.data?.queryRefreshFailed === true,
     refresh,
   };
 }
@@ -201,8 +253,15 @@ export function useEvalUsageLogs(
     () => JSON.stringify([templateId, period, page, pageSize, dateParams]),
     [dateParams, page, pageSize, period, templateId],
   );
-  const { beforeRequest, record, refetchInterval, reset } =
-    useAggregationPolling(pollIdentity);
+  const {
+    beforeRequest,
+    record,
+    recordFailure,
+    refetchInterval,
+    reset,
+    isFailureTerminal,
+    aggregationTransportFailed,
+  } = useAggregationPolling(pollIdentity);
   const query = useQuery({
     queryKey: [
       "evals",
@@ -217,19 +276,26 @@ export function useEvalUsageLogs(
       beforeRequest();
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
-      const { data } = await awaitAggregationRequestWithDeadline(
-        axios.get(endpoints.develop.eval.getEvalUsage(templateId), {
-          params: {
-            page,
-            page_size: pageSize,
-            period,
-            ...dateParams,
-            ...(refresh ? { refresh: true } : {}),
-          },
-          signal,
-        }),
-        { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS },
-      );
+      let data;
+      try {
+        ({ data } = await awaitAggregationRequestWithDeadline(
+          (requestSignal) =>
+            axios.get(endpoints.develop.eval.getEvalUsage(templateId), {
+              params: {
+                page,
+                page_size: pageSize,
+                period,
+                ...dateParams,
+                ...(refresh ? { refresh: true } : {}),
+              },
+              signal: requestSignal,
+            }),
+          { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS, signal },
+        ));
+      } catch (error) {
+        if (!signal.aborted) recordFailure();
+        throw error;
+      }
       const aggregation = readAggregationResult(data);
       record(aggregation);
       const result = aggregation.result || {};
@@ -265,7 +331,10 @@ export function useEvalUsageLogs(
 
   return {
     ...query,
-    isError: query.isError || query.data?.queryRefreshFailed === true,
+    isError:
+      aggregationTransportFailed ||
+      (query.isError && isFailureTerminal()) ||
+      query.data?.queryRefreshFailed === true,
     refresh,
   };
 }

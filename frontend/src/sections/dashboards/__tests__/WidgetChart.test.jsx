@@ -203,10 +203,13 @@ describe("WidgetChart — queued exact refresh", () => {
     await act(async () => vi.advanceTimersByTime(1000));
 
     expect(h.query.mutate).toHaveBeenCalledTimes(2);
-    expect(h.query.mutate.mock.calls[1][0]).toEqual({
-      queryConfig: baseWidget.query_config,
-      refresh: false,
-    });
+    expect(h.query.mutate.mock.calls[1][0]).toEqual(
+      expect.objectContaining({
+        queryConfig: baseWidget.query_config,
+        refresh: false,
+        signal: expect.any(Object),
+      }),
+    );
     expect(onQuerySettled).toHaveBeenCalledOnce();
     expect(onQuerySettled).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -259,6 +262,52 @@ describe("WidgetChart — queued exact refresh", () => {
     expect(
       screen.getByText("We couldn't load this data. Please retry in a moment."),
     ).toBeInTheDocument();
+  });
+
+  it("stops retrying after three consecutive polling transport failures", async () => {
+    vi.useFakeTimers();
+    const pendingResponse = {
+      data: {
+        result: {
+          metrics: [],
+          query_complete: false,
+          query_status: "pending",
+          query_sampled: false,
+          query_refreshing: true,
+        },
+      },
+    };
+    const onQuerySettled = vi.fn();
+    h.query.mutate
+      .mockImplementationOnce((_request, options) =>
+        options?.onSuccess?.(pendingResponse),
+      )
+      .mockImplementation((_request, options) =>
+        options?.onError?.(new Error("transport failed")),
+      );
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(7_010));
+
+    expect(h.query.mutate).toHaveBeenCalledTimes(4);
+    expect(onQuerySettled).toHaveBeenCalledOnce();
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: false }),
+    );
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(h.query.mutate).toHaveBeenCalledTimes(4);
   });
 
   it("shows a finite retry state for an immediate transport failure", () => {
@@ -363,6 +412,8 @@ describe("WidgetChart — queued exact refresh", () => {
     );
 
     expect(h.query.mutate).toHaveBeenCalledOnce();
+    const requestSignal = h.query.mutate.mock.calls[0][0].signal;
+    expect(requestSignal.aborted).toBe(false);
     expect(screen.getByTestId("apex-line")).toBeInTheDocument();
     expect(onQuerySettled).not.toHaveBeenCalled();
 
@@ -378,12 +429,97 @@ describe("WidgetChart — queued exact refresh", () => {
     expect(onQuerySettled).toHaveBeenCalledWith(
       expect.objectContaining({ exact: false, updatedAt: null }),
     );
+    expect(requestSignal.aborted).toBe(true);
 
     await act(async () =>
       vi.advanceTimersByTimeAsync(AGGREGATION_REQUEST_TIMEOUT_MS * 2),
     );
     expect(h.query.mutate).toHaveBeenCalledOnce();
     expect(onQuerySettled).toHaveBeenCalledOnce();
+  });
+
+  it("aborts a cold hung request and leaves a finite retry state", async () => {
+    vi.useFakeTimers();
+    const onQuerySettled = vi.fn();
+    h.query.mutate.mockImplementation(() => {});
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    const requestSignal = h.query.mutate.mock.calls[0][0].signal;
+    expect(requestSignal.aborted).toBe(false);
+    expect(screen.getByText(PREPARING_MESSAGE)).toBeInTheDocument();
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_REQUEST_TIMEOUT_MS),
+    );
+
+    expect(requestSignal.aborted).toBe(true);
+    expect(screen.queryByText(PREPARING_MESSAGE)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+    expect(onQuerySettled).toHaveBeenCalledOnce();
+  });
+
+  it("aborts an obsolete request and ignores its late response after the query scope changes", () => {
+    const requests = [];
+    const callbacks = [];
+    const onQuerySettled = vi.fn();
+    h.query.mutate.mockImplementation((request, options) => {
+      requests.push(request);
+      callbacks.push(options);
+    });
+
+    const view = render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+    expect(requests).toHaveLength(1);
+
+    const nextWidget = {
+      ...baseWidget,
+      query_config: {
+        metrics: [{ name: "Cost", aggregation: "sum" }],
+      },
+    };
+    view.rerender(
+      <WidgetChart
+        widget={nextWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0].signal.aborted).toBe(true);
+    expect(requests[1].signal.aborted).toBe(false);
+
+    act(() => {
+      callbacks[0].onSuccess(
+        queryResult([{ timestamp: "2026-07-09T00:00:00Z", value: 999 }]),
+      );
+    });
+    expect(onQuerySettled).not.toHaveBeenCalled();
+
+    act(() => {
+      callbacks[1].onSuccess(
+        queryResult([{ timestamp: "2026-07-09T00:00:00Z", value: 24 }]),
+      );
+    });
+    expect(onQuerySettled).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("apex-line")).toBeInTheDocument();
   });
 });
 
@@ -660,10 +796,13 @@ describe("WidgetChart — bounded dashboard read state", () => {
     expect(
       exactResponse.data.result.metrics[0].series[0].data[1].value,
     ).toBeNull();
-    expect(h.query.mutate.mock.calls.at(-1)[0]).toEqual({
-      queryConfig: baseWidget.query_config,
-      refresh: true,
-    });
+    expect(h.query.mutate.mock.calls.at(-1)[0]).toEqual(
+      expect.objectContaining({
+        queryConfig: baseWidget.query_config,
+        refresh: true,
+        signal: expect.any(Object),
+      }),
+    );
     await waitFor(() =>
       expect(screen.queryByText(/sampled estimates/i)).not.toBeInTheDocument(),
     );

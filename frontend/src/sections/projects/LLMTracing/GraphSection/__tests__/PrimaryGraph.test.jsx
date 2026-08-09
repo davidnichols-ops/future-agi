@@ -474,6 +474,51 @@ describe("PrimaryGraph", () => {
     expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
   });
 
+  it("keeps a confirmed pending job neutral during transient failures and stops after three consecutive failures", async () => {
+    vi.useFakeTimers();
+    axios.post
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            data: [],
+            query_complete: false,
+            query_status: "pending",
+            query_sampled: false,
+            query_refreshing: true,
+          },
+        },
+      })
+      .mockRejectedValue(new Error("transport failed"));
+
+    renderWithQueryClient(
+      <PrimaryGraph observeIdOverride="project-override" />,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(axios.post).toHaveBeenCalledTimes(3);
+    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+
+    await act(async () => vi.advanceTimersByTimeAsync(4_000));
+    expect(axios.post).toHaveBeenCalledTimes(4);
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(axios.post).toHaveBeenCalledTimes(4);
+  });
+
   it("bounds a never-resolving refresh, preserves exact data, and ignores its late response", async () => {
     vi.useFakeTimers();
     const exactResponse = {
@@ -513,6 +558,8 @@ describe("PrimaryGraph", () => {
     act(() => window.dispatchEvent(new CustomEvent("observe-refresh")));
     await act(async () => vi.advanceTimersByTimeAsync(10));
     expect(axios.post).toHaveBeenCalledTimes(2);
+    const refreshSignal = axios.post.mock.calls[1][2].signal;
+    expect(refreshSignal.aborted).toBe(false);
     expect(screen.getByTestId("apex-chart")).toBeInTheDocument();
 
     await act(async () =>
@@ -524,6 +571,7 @@ describe("PrimaryGraph", () => {
     ).toBeInTheDocument();
     const boundedRequestCount = axios.post.mock.calls.length;
     expect(boundedRequestCount).toBe(2);
+    expect(refreshSignal.aborted).toBe(true);
 
     resolveLateRefresh({
       data: {
@@ -639,6 +687,59 @@ describe("PrimaryGraph", () => {
         "We couldn't load this data. Please retry in a moment.",
       ),
     ).not.toBeInTheDocument();
+  });
+
+  it("aborts the obsolete transport immediately when the graph scope changes", async () => {
+    vi.useFakeTimers();
+    axios.post
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            data: [
+              {
+                timestamp: "2026-08-03T00:00:00Z",
+                value: 36,
+                primary_traffic: 3,
+              },
+            ],
+            query_complete: true,
+            query_status: "complete",
+            query_sampled: false,
+          },
+        },
+      });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <PrimaryGraph
+          observeIdOverride="project-override"
+          selectedInterval="day"
+        />
+      </QueryClientProvider>,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+    const obsoleteSignal = axios.post.mock.calls[0][2].signal;
+    expect(obsoleteSignal.aborted).toBe(false);
+
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <PrimaryGraph
+          observeIdOverride="project-override"
+          selectedInterval="hour"
+        />
+      </QueryClientProvider>,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+
+    expect(obsoleteSignal.aborted).toBe(true);
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("apex-chart")).toHaveAttribute(
+      "data-primary-first-y",
+      "36",
+    );
   });
 
   it("renders a completed exact response without an intermediate empty label", async () => {

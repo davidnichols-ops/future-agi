@@ -1,7 +1,8 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import axios, { endpoints } from "src/utils/axios";
 import {
+  AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   awaitAggregationRequestWithDeadline,
   getAggregationPollDelay,
@@ -51,24 +52,62 @@ export const useAgentGraph = (
 ) => {
   const forceRefreshRef = useRef(false);
   const pollAttemptRef = useRef(0);
+  const consecutiveFailureRef = useRef(0);
+  const serverPendingRef = useRef(false);
+  const requestScopeRef = useRef(null);
+  const [aggregationTransportFailed, setAggregationTransportFailed] =
+    useState(false);
 
   const query = useQuery({
     queryKey: ["agent-graph", projectId, filters],
-    queryFn: async ({ signal }) => {
+    queryFn: async ({ queryKey, signal }) => {
+      const requestScope = JSON.stringify(queryKey);
+      if (requestScopeRef.current !== requestScope) {
+        requestScopeRef.current = requestScope;
+        pollAttemptRef.current = 0;
+        consecutiveFailureRef.current = 0;
+        serverPendingRef.current = false;
+        setAggregationTransportFailed(false);
+      }
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
-      const response = await awaitAggregationRequestWithDeadline(
-        axios.get(endpoints.project.getAgentGraph(), {
-          params: {
-            project_id: projectId,
-            filters: JSON.stringify(filters || []),
-            ...(refresh ? { refresh: true } : {}),
-          },
-          signal,
-        }),
-        { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS },
-      );
-      return response.data?.result;
+      try {
+        const response = await awaitAggregationRequestWithDeadline(
+          (requestSignal) =>
+            axios.get(endpoints.project.getAgentGraph(), {
+              params: {
+                project_id: projectId,
+                filters: JSON.stringify(filters || []),
+                ...(refresh ? { refresh: true } : {}),
+              },
+              signal: requestSignal,
+            }),
+          { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS, signal },
+        );
+        const result = response.data?.result;
+        const { isRefreshing, refreshFailed } =
+          getAggregationRefreshState(result);
+        const readState = getExactAggregationReadState(result);
+        serverPendingRef.current =
+          isRefreshing &&
+          !refreshFailed &&
+          (readState === "pending" || readState === "complete");
+        consecutiveFailureRef.current = 0;
+        setAggregationTransportFailed(false);
+        return result;
+      } catch (error) {
+        if (!signal.aborted && serverPendingRef.current) {
+          consecutiveFailureRef.current += 1;
+          if (
+            consecutiveFailureRef.current >=
+            AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES
+          ) {
+            serverPendingRef.current = false;
+            setAggregationTransportFailed(true);
+          }
+        }
+        throw error;
+      }
     },
     enabled: !!projectId && enabled,
     staleTime: Infinity,
@@ -80,11 +119,14 @@ export const useAgentGraph = (
         getAggregationRefreshState(payload);
       const readState = getExactAggregationReadState(payload);
       if (
+        consecutiveFailureRef.current >=
+          AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES ||
         !isRefreshing ||
         refreshFailed ||
         (readState !== "pending" && readState !== "complete")
       ) {
         pollAttemptRef.current = 0;
+        serverPendingRef.current = false;
         return false;
       }
       const delay = getAggregationPollDelay(pollAttemptRef.current);
@@ -108,13 +150,24 @@ export const useAgentGraph = (
       }
       forceRefreshRef.current = true;
       pollAttemptRef.current = 0;
+      consecutiveFailureRef.current = 0;
+      serverPendingRef.current = false;
+      setAggregationTransportFailed(false);
       refetch({ cancelRefetch: true });
     };
     window.addEventListener("observe-refresh", handleRefresh);
     return () => window.removeEventListener("observe-refresh", handleRefresh);
   }, [enabled, projectId, refetch]);
 
-  const presentationState = getAgentGraphPresentationState(query);
+  const pollingTransportError =
+    query.isError &&
+    serverPendingRef.current &&
+    consecutiveFailureRef.current < AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES;
+  const presentationState = getAgentGraphPresentationState({
+    ...query,
+    isError:
+      aggregationTransportFailed || (query.isError && !pollingTransportError),
+  });
 
   return {
     ...query,

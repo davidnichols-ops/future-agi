@@ -50,6 +50,7 @@ import { formatDate } from "src/utils/report-utils";
 import { toBackendFilters } from "../common";
 import { combineGraphFilters } from "./graphFilterUtils";
 import {
+  AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   GRAPH_LOADING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
@@ -337,6 +338,9 @@ const PrimaryGraph = ({
   const forceRefreshRef = useRef(false);
   const pollAttemptRef = useRef(0);
   const pollingRef = useRef(false);
+  const consecutiveFailureRef = useRef(0);
+  const [aggregationTransportFailed, setAggregationTransportFailed] =
+    useState(false);
   const requestScopeRef = useRef(null);
   const requestGenerationRef = useRef(0);
   const resetAggregationBudget = useCallback(() => {
@@ -344,25 +348,32 @@ const PrimaryGraph = ({
     requestScopeRef.current = null;
     pollAttemptRef.current = 0;
     pollingRef.current = false;
+    consecutiveFailureRef.current = 0;
+    setAggregationTransportFailed(false);
   }, []);
-  const runAggregationRequest = useCallback(async (scopeKey, request) => {
-    if (requestScopeRef.current !== scopeKey) {
-      requestGenerationRef.current += 1;
-      requestScopeRef.current = scopeKey;
-      pollAttemptRef.current = 0;
-      pollingRef.current = false;
-    }
-
-    const generation = requestGenerationRef.current;
-    return awaitAggregationRequestWithDeadline(request(), {
-      timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS,
-      isCurrent: () => generation === requestGenerationRef.current,
-      onTimeout: () => {
+  const runAggregationRequest = useCallback(
+    async (scopeKey, signal, request) => {
+      if (requestScopeRef.current !== scopeKey) {
+        requestGenerationRef.current += 1;
+        requestScopeRef.current = scopeKey;
+        pollAttemptRef.current = 0;
         pollingRef.current = false;
-      },
-    });
-  }, []);
+        consecutiveFailureRef.current = 0;
+        setAggregationTransportFailed(false);
+      }
+
+      const generation = requestGenerationRef.current;
+      return awaitAggregationRequestWithDeadline(request, {
+        timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS,
+        signal,
+        isCurrent: () => generation === requestGenerationRef.current,
+      });
+    },
+    [],
+  );
   const recordAggregationResponse = useCallback((response) => {
+    consecutiveFailureRef.current = 0;
+    setAggregationTransportFailed(false);
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(response);
     const readState = getExactAggregationReadState(response);
@@ -377,10 +388,20 @@ const PrimaryGraph = ({
     }
     pollingRef.current = true;
   }, []);
+  const recordAggregationFailure = useCallback(() => {
+    if (!pollingRef.current) return;
+    consecutiveFailureRef.current += 1;
+    if (
+      consecutiveFailureRef.current >= AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES
+    ) {
+      pollingRef.current = false;
+      setAggregationTransportFailed(true);
+    }
+  }, []);
   const {
     data: graphData,
     isLoading,
-    isError: graphError,
+    isError: rawGraphError,
     refetch,
   } = useQuery({
     queryKey: [
@@ -395,33 +416,40 @@ const PrimaryGraph = ({
       if (pollingRef.current) pollAttemptRef.current += 1;
       const refresh = forceRefreshRef.current;
       forceRefreshRef.current = false;
-      const response = await runAggregationRequest(
-        JSON.stringify(queryKey),
-        () =>
-          axios.post(
-            apiEndpoint,
-            {
-              interval: selectedInterval,
-              filters: toBackendFilters(combinedFilters),
-              property: "average",
-              req_data_config: {
-                id: metricDef.id,
-                type: metricDef.apiType || "SYSTEM_METRIC",
-                ...(metricDef.outputType && {
-                  output_type: metricDef.outputType,
-                }),
+      let response;
+      try {
+        response = await runAggregationRequest(
+          JSON.stringify(queryKey),
+          signal,
+          (requestSignal) =>
+            axios.post(
+              apiEndpoint,
+              {
+                interval: selectedInterval,
+                filters: toBackendFilters(combinedFilters),
+                property: "average",
+                req_data_config: {
+                  id: metricDef.id,
+                  type: metricDef.apiType || "SYSTEM_METRIC",
+                  ...(metricDef.outputType && {
+                    output_type: metricDef.outputType,
+                  }),
+                },
+                project_id: effectiveObserveId,
               },
-              project_id: effectiveObserveId,
-            },
-            {
-              params: {
-                allow_sampled: false,
-                ...(refresh ? { refresh: true } : {}),
+              {
+                params: {
+                  allow_sampled: false,
+                  ...(refresh ? { refresh: true } : {}),
+                },
+                signal: requestSignal,
               },
-              signal,
-            },
-          ),
-      );
+            ),
+        );
+      } catch (error) {
+        if (!signal.aborted) recordAggregationFailure();
+        throw error;
+      }
       recordAggregationResponse(response);
       return response;
     },
@@ -439,6 +467,8 @@ const PrimaryGraph = ({
       );
       const readState = getExactAggregationReadState(query.state.data);
       if (
+        consecutiveFailureRef.current >=
+          AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES ||
         !isRefreshing ||
         refreshFailed ||
         (readState !== "complete" && readState !== "pending")
@@ -453,6 +483,8 @@ const PrimaryGraph = ({
     retry: false,
     meta: { errorHandled: true },
   });
+  const graphError =
+    aggregationTransportFailed || (rawGraphError && !pollingRef.current);
   const graphReadState = graphError
     ? "error"
     : graphData?.queryReadState || getExactAggregationReadState(graphData);

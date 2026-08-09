@@ -738,6 +738,33 @@ describe("useDashboardQuery error boundary", () => {
     );
   });
 
+  it("forwards saved-widget cancellation to the dashboard transport", async () => {
+    mocks.post.mockResolvedValue({ data: { result: { metrics: [] } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const { result } = renderHook(() => useDashboardQuery(), {
+      wrapper: createQueryWrapper(queryClient),
+    });
+    const controller = new AbortController();
+
+    result.current.mutate({
+      queryConfig: { metrics: [{ name: "Latency" }] },
+      refresh: false,
+      signal: controller.signal,
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mocks.post).toHaveBeenCalledWith(
+      "/tracer/dashboard/query/",
+      {
+        metrics: [{ name: "Latency" }],
+        allow_sampled: false,
+      },
+      { signal: controller.signal },
+    );
+  });
+
   it.each([
     [
       "saved widget",

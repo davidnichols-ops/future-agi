@@ -278,6 +278,7 @@ export function getAggregationRefreshState(payload) {
 const AGGREGATION_POLL_DELAYS_MS = [1000, 2000, 4000, 8000];
 export const AGGREGATION_POLL_MAX_ATTEMPTS = 12;
 export const AGGREGATION_POLL_TIMEOUT_MS = 60_000;
+export const AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES = 3;
 // Bound each HTTP cache-state read independently. Exact aggregation jobs are
 // server-owned and can legitimately run much longer than a minute; the client
 // must not turn an explicit `query_refreshing` state into a false failure just
@@ -296,24 +297,67 @@ const aggregationRequestError = (code) => {
  * caller moved to a new request generation) are deliberately discarded.
  */
 export function awaitAggregationRequestWithDeadline(
-  request,
-  { timeoutMs, isCurrent = () => true, onTimeout = () => {} } = {},
+  requestOrFactory,
+  {
+    timeoutMs,
+    signal: upstreamSignal,
+    isCurrent = () => true,
+    onTimeout = () => {},
+  } = {},
 ) {
   const deadlineMs = Math.max(Number(timeoutMs) || 0, 0);
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    let timer = null;
+    const controller = new AbortController();
+    const abortFromUpstream = () => {
+      const reason =
+        upstreamSignal?.reason ||
+        new DOMException(
+          "Exact aggregation request was cancelled",
+          "AbortError",
+        );
+      controller.abort(reason);
+      finish(reject, reason);
+    };
+    const cleanup = () => {
+      if (timer !== null) globalThis.clearTimeout(timer);
+      upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+    };
     const finish = (callback, value) => {
       if (settled) return;
       settled = true;
-      globalThis.clearTimeout(timer);
+      cleanup();
       callback(value);
     };
-    const timer = globalThis.setTimeout(() => {
+
+    if (upstreamSignal?.aborted) {
+      abortFromUpstream();
+      return;
+    }
+    upstreamSignal?.addEventListener("abort", abortFromUpstream, {
+      once: true,
+    });
+
+    timer = globalThis.setTimeout(() => {
       if (settled) return;
       if (isCurrent()) onTimeout();
-      finish(reject, aggregationRequestError("aggregation_request_timeout"));
+      const error = aggregationRequestError("aggregation_request_timeout");
+      finish(reject, error);
+      controller.abort(error);
     }, deadlineMs);
+
+    let request;
+    try {
+      request =
+        typeof requestOrFactory === "function"
+          ? requestOrFactory(controller.signal)
+          : requestOrFactory;
+    } catch (error) {
+      finish(reject, error);
+      return;
+    }
 
     Promise.resolve(request).then(
       (response) => {

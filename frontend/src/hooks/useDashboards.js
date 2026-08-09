@@ -362,15 +362,20 @@ export function useDashboardQuery() {
       const wrappedRequest = Boolean(request?.queryConfig);
       const queryConfig = wrappedRequest ? request.queryConfig : request;
       const refresh = wrappedRequest && request.refresh === true;
+      const signal = wrappedRequest ? request.signal : undefined;
       const body = {
         ...queryConfig,
         allow_sampled: false,
       };
 
-      return refresh
-        ? axios.post(endpoints.dashboard.query, body, {
-            params: { refresh: true },
-          })
+      if (refresh) {
+        return axios.post(endpoints.dashboard.query, body, {
+          params: { refresh: true },
+          ...(signal ? { signal } : {}),
+        });
+      }
+      return signal
+        ? axios.post(endpoints.dashboard.query, body, { signal })
         : axios.post(endpoints.dashboard.query, body);
     },
     // Dashboard surfaces render a generic retry state. Keep raw backend/DB
