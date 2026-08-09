@@ -6435,7 +6435,7 @@ def _call_observe_trace_list_with_bounded_page(
     return response, bounded_reader, analytics, request
 
 
-def test_observe_trace_legacy_first_page_starts_cursor_compatibility() -> None:
+def test_observe_trace_legacy_first_page_keeps_bounded_compatibility() -> None:
     validated_data = {
         "filters": [
             _time_filter(),
@@ -6453,9 +6453,56 @@ def test_observe_trace_legacy_first_page_starts_cursor_compatibility() -> None:
     )
 
     assert response[0] == "ok"
-    assert validated_data["cursor_mode"] is True
+    assert "cursor_mode" not in validated_data
     bounded_reader.assert_called_once()
-    assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is False
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_trace_legacy_deep_page_keeps_bounded_compatibility() -> None:
+    response, bounded_reader, analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=_complete_empty_page(),
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rechazado"),
+                ],
+                "page_number": 1,
+                "page_size": 25,
+            },
+        )
+    )
+
+    assert response[0] == "ok"
+    bounded_reader.assert_called_once()
+    assert bounded_reader.call_args.kwargs["page_number"] == 1
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is False
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_trace_explicit_cursor_opt_out_is_rejected_before_clickhouse() -> None:
+    response, bounded_reader, analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=_complete_empty_page(),
+            request=_observe_trace_request({"cursor_mode": "false"}),
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rechazado"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": False,
+            },
+        )
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 422
+    assert response[2] == {"code": "cursor_required"}
+    bounded_reader.assert_not_called()
     analytics.execute_ch_query.assert_not_called()
 
 
@@ -6528,7 +6575,7 @@ def test_observe_trace_long_filter_cursor_reaches_bounded_reader() -> None:
     analytics.execute_ch_query.assert_not_called()
 
 
-def test_observe_span_legacy_first_page_starts_cursor_compatibility() -> None:
+def test_observe_span_legacy_first_page_keeps_bounded_compatibility() -> None:
     from tracer.views.observation_span import ObservationSpanView
 
     view = ObservationSpanView.__new__(ObservationSpanView)
@@ -6574,10 +6621,62 @@ def test_observe_span_legacy_first_page_starts_cursor_compatibility() -> None:
         )
 
     assert response[0] == "ok"
-    assert validated_data["cursor_mode"] is True
+    assert "cursor_mode" not in validated_data
     bounded_reader.assert_called_once()
-    assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
-    assert bounded_reader.call_args.kwargs["builder"]._bounded_internal_scan is True
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is False
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    assert bounded_reader.call_args.kwargs["builder"]._bounded_internal_scan is False
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_span_explicit_cursor_opt_out_is_rejected_before_clickhouse() -> None:
+    from tracer.views.observation_span import ObservationSpanView
+
+    view = ObservationSpanView.__new__(ObservationSpanView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    organization = SimpleNamespace(id="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+        query_params={"cursor_mode": "false"},
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page"
+        ) as bounded_reader,
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        response = view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rechazado"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": False,
+            },
+            analytics=analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+
+    assert response[0] == "error"
+    assert response[1][0] == 422
+    assert response[2] == {"code": "cursor_required"}
+    bounded_reader.assert_not_called()
     analytics.execute_ch_query.assert_not_called()
 
 
@@ -6681,6 +6780,83 @@ def test_observe_span_long_filter_cursor_reaches_bounded_reader() -> None:
     bounded_reader.assert_called_once()
     assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
     assert bounded_reader.call_args.kwargs.get("retry_wide_read_budget", False) is False
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_span_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
+    from tracer.views.observation_span import ObservationSpanView
+
+    bounded_page = BoundedFilterPage(
+        rows=[],
+        has_more=False,
+        complete=False,
+        status="degraded",
+        error_code="query_timeout",
+        total_rows_lower_bound=0,
+        elapsed_ms=30_000.0,
+        query_count=2,
+        rows_returned=25,
+        result_payload_bytes=1_024,
+        attempts=(
+            FilterReadAttempt(
+                kind="classify",
+                slice_start=START,
+                slice_end=END,
+                elapsed_ms=30_000.0,
+                rows_returned=0,
+                result_payload_bytes=0,
+                error_code="query_timeout",
+            ),
+        ),
+        continuation_slice_start=START,
+        continuation_slice_end=END,
+    )
+    view = ObservationSpanView.__new__(ObservationSpanView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    organization = SimpleNamespace(id="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+        query_params={"cursor_mode": "true"},
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded_page,
+        ) as bounded_reader,
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        response = view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": True,
+            },
+            analytics=analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2] == {"code": "service_unavailable"}
+    bounded_reader.assert_called_once()
     analytics.execute_ch_query.assert_not_called()
 
 
@@ -6798,12 +6974,15 @@ def test_observe_trace_terminal_cursor_uses_global_seen_total() -> None:
 
     numbered_response, *_ = _call_observe_trace_list_with_bounded_page(
         bounded_page=_complete_empty_page(),
-        request=_observe_trace_request({"allow_sampled": "false"}),
+        request=_observe_trace_request(
+            {"allow_sampled": "false", "cursor_mode": "false"}
+        ),
         validated_data={
             "filters": filters,
             "page_number": 3,
             "page_size": 25,
             "allow_sampled": False,
+            "cursor_mode": False,
         },
     )
     assert numbered_response[0] == "error"
@@ -7121,7 +7300,7 @@ def test_observe_trace_cursor_continuation_without_safe_checkpoint_fails_closed(
     analytics.execute_ch_query.assert_not_called()
 
 
-def test_voice_legacy_first_page_starts_cursor_compatibility() -> None:
+def test_voice_legacy_first_page_keeps_bounded_compatibility() -> None:
     from tracer.views.trace import TraceView
 
     view = TraceView.__new__(TraceView)
@@ -7159,9 +7338,53 @@ def test_voice_legacy_first_page_starts_cursor_compatibility() -> None:
         )
 
     assert response.status_code == 200
-    assert validated_data["cursor_mode"] is True
+    assert "cursor_mode" not in validated_data
     bounded_reader.assert_called_once()
-    assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is False
+    assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_voice_explicit_cursor_opt_out_is_rejected_before_clickhouse() -> None:
+    from tracer.views.trace import TraceView
+
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page"
+        ) as bounded_reader,
+    ):
+        response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params={"cursor_mode": "false"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rechazado"),
+                ],
+                "page": 1,
+                "page_size": 25,
+                "cursor_mode": False,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response[0] == "error"
+    assert response[1][0] == 422
+    assert response[2] == {"code": "cursor_required"}
+    bounded_reader.assert_not_called()
     analytics.execute_ch_query.assert_not_called()
 
 

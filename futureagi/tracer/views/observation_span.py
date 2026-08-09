@@ -1868,24 +1868,16 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 "Long-window span filter is not cursor-safe"
             )
         if not cursor_requested and requires_cursor:
-            if page_number != 0 or "cursor_mode" in request.query_params:
+            if "cursor_mode" in request.query_params:
                 return self._gm.custom_error_response(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     CURSOR_REQUIRED_MESSAGE,
                     code=CURSOR_REQUIRED_CODE,
                 )
-            # Page-zero compatibility for rolling deploys: old clients omit
-            # cursor_mode, but the old backend rejects a new frontend that
-            # sends it. Start the exact cursor contract implicitly and expose
-            # the additive next_cursor fields. Explicit opt-out/deep numbered
-            # requests stay fail-closed.
-            cursor_requested = True
-            cursor_enabled = True
-            validated_data["cursor_mode"] = True
-            builder._bounded_internal_scan = True
             logger.info(
-                "span_list_implicit_cursor_compatibility",
+                "span_list_legacy_numbered_cursor_compatibility",
                 project_id=str(project_id) if project_id else None,
+                page_number=page_number,
             )
         # Custom-sort/time-only legacy reads do not apply the bounded
         # selector's keyset tuple. Advertising a cursor for that path would
@@ -1969,6 +1961,26 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         status.HTTP_422_UNPROCESSABLE_ENTITY,
                         PAGE_DEPTH_EXCEEDED_MESSAGE,
                         code=PAGE_DEPTH_EXCEEDED_CODE,
+                    )
+                failed_attempt = next(
+                    (
+                        attempt
+                        for attempt in bounded_page.attempts
+                        if attempt.error_code is not None
+                    ),
+                    None,
+                )
+                if failed_attempt is not None:
+                    logger.warning(
+                        "span_list_bounded_statement_failed",
+                        project_id=str(project_id) if project_id else None,
+                        page_number=page_number,
+                        error_code=failed_attempt.error_code,
+                    )
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Filtered span data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
                     )
                 logger.warning(
                     "span_list_bounded_read_incomplete",

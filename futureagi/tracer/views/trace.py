@@ -4490,25 +4490,20 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "Long-window trace filter is not cursor-safe"
             )
         if not cursor_requested and requires_cursor:
-            if page_number != 0 or "cursor_mode" in request.query_params:
+            if "cursor_mode" in request.query_params:
                 return self._gm.custom_error_response(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     CURSOR_REQUIRED_MESSAGE,
                     code=CURSOR_REQUIRED_CODE,
                 )
-            # Rolling-upgrade bridge: the deployed frontend predates the
-            # additive cursor fields, while that frontend cannot be deployed
-            # first because the old strict serializers reject ``cursor_mode``.
-            # Treat only an omitted page-zero mode as an exact cursor start and
-            # publish the additive continuation metadata. Explicit opt-out and
-            # deep numbered pages remain rejected rather than replaying a broad
-            # ClickHouse scan. Remove this bridge after all API clients migrate.
-            cursor_requested = True
-            cursor_enabled = True
-            validated_data["cursor_mode"] = True
+            # Temporary rolling-upgrade lane for clients that predate cursor
+            # fields. Keep their complete-or-fail bounded numbered contract on
+            # every page; implicitly publishing a partial cursor chunk would be
+            # silently truncated by an old grid that only checks row count.
             logger.info(
-                "trace_list_implicit_cursor_compatibility",
+                "trace_list_legacy_numbered_cursor_compatibility",
                 project_id=str(project_id) if project_id else None,
+                page_number=page_number,
             )
         # Continuations freeze only the request window and ordered scan
         # checkpoint. ReplacingMergeTree version predicates are not snapshots:
@@ -5560,20 +5555,16 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "Long-window voice-call filter is not cursor-safe"
             )
         if not cursor_requested and requires_cursor:
-            if page_number != 0 or "cursor_mode" in request.query_params:
+            if "cursor_mode" in request.query_params:
                 return self._gm.custom_error_response(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     CURSOR_REQUIRED_MESSAGE,
                     code=CURSOR_REQUIRED_CODE,
                 )
-            # See the trace-list bridge above. Voice pagination is one-based,
-            # so ``page_number == 0`` corresponds to the legacy first page.
-            cursor_requested = True
-            cursor_enabled = True
-            validated_data["cursor_mode"] = True
             logger.info(
-                "voice_call_list_implicit_cursor_compatibility",
+                "voice_call_list_legacy_numbered_cursor_compatibility",
                 project_id=str(project_id),
+                page_number=page_number,
             )
         # The signed cursor carries the immutable window and keyset progress;
         # each page resolves current latest state. A raw version ceiling cannot
