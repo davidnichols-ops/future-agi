@@ -348,3 +348,65 @@ describe.each([
     expect(params.fail).not.toHaveBeenCalled();
   });
 });
+
+describe.each(["trace", "span"])("%s grid loading lifecycle", (kind) => {
+  beforeEach(() => {
+    getMock.mockReset();
+    gridState.api = null;
+    gridState.props = null;
+    resetMetricIds.mockReset();
+  });
+
+  it("settles an empty first page across an equivalent-filter rerender", async () => {
+    let resolveResponse;
+    getMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveResponse = resolve;
+        }),
+    );
+
+    const ref = React.createRef();
+    const props = baseProps();
+    const renderSubject = (filters) =>
+      kind === "trace" ? (
+        <TraceGrid
+          ref={ref}
+          {...props}
+          filters={filters}
+          projectId="project-1"
+        />
+      ) : (
+        <SpanGrid ref={ref} {...props} filters={filters} />
+      );
+    const view = render(renderSubject(props.filters));
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const initialDataSource = gridState.props.serverSideDatasource;
+    const params = makeParams();
+    let pendingRead;
+    act(() => {
+      pendingRead = initialDataSource.getRows(params);
+    });
+    await waitFor(() => expect(resolveResponse).toBeTypeOf("function"));
+
+    view.rerender(renderSubject([{ column_id: "created_at" }]));
+
+    expect(gridState.props.serverSideDatasource).toBe(initialDataSource);
+
+    await act(async () => {
+      resolveResponse(listResponse());
+      await pendingRead;
+    });
+
+    await waitFor(() => expect(gridState.props.loading).toBe(false));
+    expect(params.success).toHaveBeenCalledWith({
+      rowData: [],
+      rowCount: 0,
+    });
+    expect(params.fail).not.toHaveBeenCalled();
+    if (kind === "trace") {
+      expect(params.api.showNoRowsOverlay).toHaveBeenCalledOnce();
+    }
+  });
+});

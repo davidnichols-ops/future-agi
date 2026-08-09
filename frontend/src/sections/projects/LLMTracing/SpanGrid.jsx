@@ -677,13 +677,12 @@ const SpanGrid = React.forwardRef(
       // which would cause dataSource recreation on visibility changes
       // eslint-disable-next-line react-hooks/exhaustive-deps
       [
-        filters,
-        JSON.stringify(extraFilters),
-        JSON.stringify(metricFilters),
-        observeId,
+        // Keep an in-flight semantic request alive when the parent rebuilds
+        // equivalent filter arrays. Resetting the datasource in that case
+        // invalidates the cursor generation and leaves the grid loading after
+        // the completed page has already published its rows/empty result.
+        filterRequestKey,
         setLoading,
-        hasEvalFilter,
-        enabled,
       ],
     );
 

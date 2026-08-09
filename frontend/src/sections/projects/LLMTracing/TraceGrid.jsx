@@ -523,15 +523,14 @@ const TraceGrid = React.forwardRef(
       // eslint-disable-next-line react-hooks/exhaustive-deps
       // eslint-disable-next-line react-hooks/exhaustive-deps
       [
-        filters,
-        JSON.stringify(extraFilters),
-        JSON.stringify(metricFilters),
-        projectId,
+        // Parent views rebuild validated filter arrays while loading column
+        // configuration.  Replacing the datasource for an equivalent request
+        // resets the cursor generation, so the completed first page is treated
+        // as stale and the grid's `loading` state never settles.  The serialized
+        // request key changes for every semantic input used above without
+        // changing for referential-only parent renders.
+        filterRequestKey,
         setLoading,
-        hasEvalFilter,
-        enabled,
-        dateInterval,
-        requestedAttributeKeysKey,
       ],
     );
 
