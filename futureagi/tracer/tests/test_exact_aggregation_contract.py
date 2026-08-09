@@ -2053,7 +2053,6 @@ def test_exact_trace_membership_exhausts_witness_cursor_and_classifies_each_trac
     monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE", 2)
     monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE", 2)
     monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_INITIAL_SLICE", t4 - t1)
-    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_MAX_SLICE", t4 - t1)
 
     trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
         analytics=Analytics(),
@@ -2139,12 +2138,6 @@ def test_exact_trace_membership_fails_closed_on_unproven_witness(monkeypatch, fa
         "EXACT_GRAPH_TRACE_INITIAL_SLICE",
         request_end - request_start,
     )
-    monkeypatch.setattr(
-        exact_module,
-        "EXACT_GRAPH_TRACE_MAX_SLICE",
-        request_end - request_start,
-    )
-
     expected_error = RuntimeError if failure == "classifier_error" else ExactGraphReadError
     with pytest.raises(expected_error):
         _enumerate_exact_trace_ids(
@@ -2154,6 +2147,58 @@ def test_exact_trace_membership_fails_closed_on_unproven_witness(monkeypatch, fa
             annotation_label_ids=None,
             started=exact_module.monotonic(),
         )
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_retains_proven_five_minute_slice_ceiling(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=20)
+    slices = []
+    timeouts = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            slices.append((kwargs["slice_start"], kwargs["slice_end"]))
+            return "WITNESS", {}
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(_query, _params, **kwargs):
+            timeouts.append(kwargs["timeout_ms"])
+            return SimpleNamespace(data=[], columns=[])
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == []
+    assert query_count == 4
+    assert rows_returned == 0
+    assert [end - start for start, end in slices] == [timedelta(minutes=5)] * 4
+    assert all(
+        0 < timeout <= exact_module.EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS
+        for timeout in timeouts
+    )
 
 
 @pytest.mark.unit

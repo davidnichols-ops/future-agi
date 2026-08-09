@@ -96,9 +96,15 @@ EXACT_GRAPH_MEMBERSHIP_BATCH_SIZE = 1_000
 EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE = 200
 EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE = 10
 EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 100
-EXACT_GRAPH_TRACE_SELECTOR_QUERY_TIMEOUT_MS = 3_000
+# Witness work runs only in the exact-snapshot background activity; public
+# graph polls never wait on an individual statement.  The Coletia incident
+# slice reads roughly 1 GiB / 720k physical rows and completes in 3.6--4.2 s
+# with one thread, so the previous 3 s witness ceiling guaranteed Code 159.
+# Keep the cheap, identity-scoped classifier at its original tight ceiling;
+# only the production-proven raw witness scan receives the larger allowance.
+EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS = 15_000
+EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 3_000
 EXACT_GRAPH_TRACE_INITIAL_SLICE = timedelta(minutes=5)
-EXACT_GRAPH_TRACE_MAX_SLICE = timedelta(days=2)
 EXACT_GRAPH_READ_SETTINGS = {
     "max_threads": 1,
     # Attribute maps are several KiB per row on the heaviest tenants.  Smaller
@@ -358,7 +364,7 @@ def _enumerate_exact_trace_ids(
     query_count = 0
     rows_returned = 0
 
-    def remaining_statement_timeout_ms() -> int:
+    def remaining_statement_timeout_ms(statement_ceiling_ms: int) -> int:
         remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
             (monotonic() - started) * 1000
         )
@@ -366,7 +372,7 @@ def _enumerate_exact_trace_ids(
             raise ExactGraphReadError(
                 "Exact trace graph refresh exceeded its bounded deadline."
             )
-        return min(EXACT_GRAPH_TRACE_SELECTOR_QUERY_TIMEOUT_MS, remaining_ms)
+        return min(statement_ceiling_ms, remaining_ms)
 
     def seed_key(row: dict[str, Any]) -> tuple[datetime, Any]:
         seed_start_time = row.get("start_time")
@@ -415,7 +421,9 @@ def _enumerate_exact_trace_ids(
             result = analytics.execute_ch_query(
                 query,
                 params,
-                timeout_ms=remaining_statement_timeout_ms(),
+                timeout_ms=remaining_statement_timeout_ms(
+                    EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS
+                ),
                 settings={
                     **EXACT_GRAPH_READ_SETTINGS,
                     "max_result_rows": len(batch),
@@ -435,7 +443,10 @@ def _enumerate_exact_trace_ids(
 
     slice_end = request_end
     slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, request_end - request_start)
-    max_slice_width = min(EXACT_GRAPH_TRACE_MAX_SLICE, request_end - request_start)
+    # Five minutes is the largest production-proven width for this unindexed
+    # value witness.  Keep that as the initial learned ceiling instead of
+    # repeatedly widening until an exception teaches us the same fact.
+    max_slice_width = slice_width
     while slice_end > request_start:
         slice_start = max(request_start, slice_end - slice_width)
         before_start_time: datetime | None = None
@@ -455,7 +466,9 @@ def _enumerate_exact_trace_ids(
                 result = analytics.execute_ch_query(
                     query,
                     params,
-                    timeout_ms=remaining_statement_timeout_ms(),
+                    timeout_ms=remaining_statement_timeout_ms(
+                        EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS
+                    ),
                     settings={
                         **EXACT_GRAPH_READ_SETTINGS,
                         "max_result_rows": EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE,
