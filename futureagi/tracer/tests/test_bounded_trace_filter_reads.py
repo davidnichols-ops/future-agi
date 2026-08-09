@@ -49,9 +49,7 @@ END = START + timedelta(days=365)
 def _render_driver_sql(sql: str, params: dict[str, Any]) -> str:
     """Render parameters exactly as clickhouse-driver does before transport."""
 
-    context = SimpleNamespace(
-        server_info=SimpleNamespace(get_timezone=lambda: "UTC")
-    )
+    context = SimpleNamespace(server_info=SimpleNamespace(get_timezone=lambda: "UTC"))
     return sql % escape_params(params, context)
 
 
@@ -891,7 +889,8 @@ def test_long_window_scalar_trace_uses_exact_classifier_without_witness() -> Non
     )
     assert builder.recommended_filter_page_hydration_reserve_ms() == 750
     assert builder.recommended_filter_classify_read_settings() == {
-        "max_block_size": 2_048
+        "max_block_size": 2_048,
+        "preferred_max_column_in_block_size_bytes": 1_048_576,
     }
 
 
@@ -938,7 +937,8 @@ def test_structured_trace_classifier_uses_memory_safe_batch_and_block(
 
     assert builder.recommended_filter_classify_batch_size() == 10
     assert builder.recommended_filter_classify_read_settings() == {
-        "max_block_size": 2_048
+        "max_block_size": 2_048,
+        "preferred_max_column_in_block_size_bytes": 1_048_576,
     }
 
 
@@ -973,11 +973,13 @@ def test_extreme_structured_multifilter_keeps_scalar_fast_path_independent() -> 
 
     assert simple_builder.recommended_filter_classify_batch_size() == 10
     assert simple_builder.recommended_filter_classify_read_settings() == {
-        "max_block_size": 2_048
+        "max_block_size": 2_048,
+        "preferred_max_column_in_block_size_bytes": 1_048_576,
     }
     assert structured_builder.recommended_filter_classify_batch_size() == 10
     assert structured_builder.recommended_filter_classify_read_settings() == {
-        "max_block_size": 2_048
+        "max_block_size": 2_048,
+        "preferred_max_column_in_block_size_bytes": 1_048_576,
     }
 
 
@@ -1011,7 +1013,8 @@ def test_structured_eval_bulk_uses_safe_batch_and_block_cap(
 
     assert builder.recommended_filter_classify_batch_size() == 10
     assert builder.recommended_filter_classify_read_settings() == {
-        "max_block_size": 2_048
+        "max_block_size": 2_048,
+        "preferred_max_column_in_block_size_bytes": 1_048_576,
     }
     assert (
         builder.recommended_filter_candidate_witness_fallback_classify_batch_size()
@@ -5378,7 +5381,10 @@ class _FakeExecutor:
 class _ClassifierSettingsFakeBuilder(_FakeBuilder):
     @staticmethod
     def recommended_filter_classify_read_settings() -> dict[str, int]:
-        return {"max_block_size": 2_048}
+        return {
+            "max_block_size": 2_048,
+            "preferred_max_column_in_block_size_bytes": 1_048_576,
+        }
 
 
 @dataclass
@@ -8644,7 +8650,15 @@ def test_classifier_read_setting_caps_only_classifier_statements() -> None:
     assert [row["id"] for row in page.rows] == ["span-0"]
     assert [query for query, _ in executor.settings_by_query] == ["seed", "match"]
     assert executor.settings_by_query[0][1]["max_block_size"] == 4_096
+    assert (
+        "preferred_max_column_in_block_size_bytes"
+        not in executor.settings_by_query[0][1]
+    )
     assert executor.settings_by_query[1][1]["max_block_size"] == 2_048
+    assert (
+        executor.settings_by_query[1][1]["preferred_max_column_in_block_size_bytes"]
+        == 1_048_576
+    )
 
 
 def test_builder_query_count_recommendation_preserves_sparse_exact_fallback() -> None:
@@ -11807,7 +11821,10 @@ def test_candidate_witness_uses_custom_attribute_block_cap() -> None:
     class MemorySafeCandidateBuilder(_CandidateWitnessHydrationFakeBuilder):
         @staticmethod
         def recommended_filter_classify_read_settings():
-            return {"max_block_size": 2_048}
+            return {
+                "max_block_size": 2_048,
+                "preferred_max_column_in_block_size_bytes": 1_048_576,
+            }
 
     rows = [
         {
@@ -11841,6 +11858,10 @@ def test_candidate_witness_uses_custom_attribute_block_cap() -> None:
 
     assert page.complete is True
     assert executor.prefilter_settings[0]["max_block_size"] == 2_048
+    assert (
+        executor.prefilter_settings[0]["preferred_max_column_in_block_size_bytes"]
+        == 1_048_576
+    )
 
 
 def test_disabled_candidate_witness_stays_disabled_after_empty_classifier() -> None:

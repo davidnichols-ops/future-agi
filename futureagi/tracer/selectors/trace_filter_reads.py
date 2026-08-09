@@ -493,7 +493,10 @@ def read_bounded_filter_page(
         if raw_classify_read_settings is not None:
             if not isinstance(raw_classify_read_settings, dict):
                 raise ValueError("recommended classify read settings must be a dict")
-            unsupported_settings = set(raw_classify_read_settings) - {"max_block_size"}
+            unsupported_settings = set(raw_classify_read_settings) - {
+                "max_block_size",
+                "preferred_max_column_in_block_size_bytes",
+            }
             if unsupported_settings:
                 raise ValueError("unsupported recommended classify read setting")
             for setting_name, raw_value in raw_classify_read_settings.items():
@@ -513,6 +516,7 @@ def read_bounded_filter_page(
         unsupported_settings = set(classify_read_settings) - {
             "max_block_size",
             "max_rows_to_read",
+            "preferred_max_column_in_block_size_bytes",
         }
         if unsupported_settings:
             raise ValueError("unsupported classify read setting")

@@ -553,7 +553,13 @@ def _continuous_trace_task_for_filter(filter_item: dict) -> SimpleNamespace:
     ("filter_item", "recommended_read_settings"),
     [
         (_attribute_filter(), None),
-        (_structured_attribute_filter(), {"max_block_size": 2_048}),
+        (
+            _structured_attribute_filter(),
+            {
+                "max_block_size": 2_048,
+                "preferred_max_column_in_block_size_bytes": 1_048_576,
+            },
+        ),
     ],
     ids=["scalar-map", "structured-json"],
 )
@@ -662,6 +668,10 @@ def test_continuous_10k_custom_attribute_classifier_has_finite_exact_budget(
         # The application-qualified block cap is universal for eval/task
         # classifiers; a builder recommendation may only tighten it.
         assert settings["max_block_size"] == 2_048
+        if recommended_read_settings is None:
+            assert "preferred_max_column_in_block_size_bytes" not in settings
+        else:
+            assert settings["preferred_max_column_in_block_size_bytes"] == 1_048_576
     assert builder_kwargs["bounded_internal_scan"] is True
     assert builder_kwargs["bounded_identity_only"] is True
     assert builder_kwargs["bounded_bulk_scan"] is True

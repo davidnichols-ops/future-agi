@@ -953,6 +953,7 @@ def test_trace_eval_classifier_projects_one_physical_witness_per_any_span_leaf(
             assert settings["max_execution_time"] == 3
             assert settings["max_threads"] == 1
             assert settings["max_block_size"] == 2_048
+            assert settings["preferred_max_column_in_block_size_bytes"] == 1_048_576
             assert settings["max_rows_to_read"] == 5_000_000
             assert settings["max_memory_usage"] == 256 * 1024 * 1024
             assert settings["max_bytes_to_read"] == 512 * 1024 * 1024
@@ -1059,6 +1060,7 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
                 assert "argMinIf(tuple(grouped_id, latest_start_time)" in query
                 assert settings["max_rows_to_read"] == 5_000_000
                 assert settings["max_block_size"] == 2_048
+                assert settings["preferred_max_column_in_block_size_bytes"] == 1_048_576
                 rows = [
                     {
                         **source_rows[trace_id],
@@ -1075,6 +1077,7 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
             assert "parent_span_id IS NULL" in query
             assert "max_rows_to_read" not in settings
             assert settings["max_block_size"] == 8_192
+            assert "preferred_max_column_in_block_size_bytes" not in settings
             rows = [
                 {
                     "trace_id": row["trace_id"],
@@ -1144,9 +1147,11 @@ def test_ui_default_100k_trace_task_accepts_a_complete_sparse_population(
     assert captured["deadline_ms"] == 170 * 60 * 1000
     assert "max_rows_to_read" not in captured["read_settings"]
     assert "max_block_size" not in captured["read_settings"]
+    assert "preferred_max_column_in_block_size_bytes" not in captured["read_settings"]
     assert captured["classify_read_settings"] == {
         "max_block_size": 2_048,
         "max_rows_to_read": 5_000_000,
+        "preferred_max_column_in_block_size_bytes": 1_048_576,
     }
     assert captured["builder"]._bounded_include_filter_witnesses is True
 
@@ -1210,6 +1215,7 @@ def test_trace_eval_witness_replay_uses_ten_id_batches_with_hard_caps(
                 "timeout_overflow_mode": "throw",
                 "max_threads": 1,
                 "max_block_size": 2_048,
+                "preferred_max_column_in_block_size_bytes": 1_048_576,
                 "max_memory_usage": 256 * 1024 * 1024,
                 "max_bytes_to_read": 512 * 1024 * 1024,
                 "read_overflow_mode": "throw",
@@ -1340,9 +1346,11 @@ def test_trace_eval_witness_routes_to_workflow_before_interactive_replay_cap(
         assert kwargs["builder"]._bounded_include_filter_witnesses is True
         assert "max_rows_to_read" not in kwargs["read_settings"]
         assert "max_block_size" not in kwargs["read_settings"]
+        assert "preferred_max_column_in_block_size_bytes" not in kwargs["read_settings"]
         assert kwargs["classify_read_settings"] == {
             "max_block_size": 2_048,
             "max_rows_to_read": 5_000_000,
+            "preferred_max_column_in_block_size_bytes": 1_048_576,
         }
         return BoundedFilterPage(
             rows=[],
@@ -1620,6 +1628,7 @@ def test_trace_eval_witness_replay_never_returns_a_partial_second_phase(
             assert len(params["candidate_trace_ids"]) <= 10
             assert timeout_ms == 3_000
             assert settings["max_block_size"] == 2_048
+            assert settings["preferred_max_column_in_block_size_bytes"] == 1_048_576
             assert settings["max_result_rows"] == len(params["candidate_trace_ids"])
             if self.calls == 2:
                 raise ValueError("simulated bounded replay failure")

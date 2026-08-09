@@ -583,19 +583,30 @@ def _filter_classifier_read_settings(builder: Any) -> dict[str, Any]:
     recommended = recommendation()
     if recommended is None:
         return settings
-    if not isinstance(recommended, dict) or set(recommended) - {"max_block_size"}:
+    allowed_recommendations = {
+        "max_block_size",
+        "preferred_max_column_in_block_size_bytes",
+    }
+    if not isinstance(recommended, dict) or set(recommended) - allowed_recommendations:
         raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
-    block_size = recommended.get("max_block_size")
-    if block_size is not None and (
-        isinstance(block_size, bool) or not isinstance(block_size, int)
-    ):
-        raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
-    if block_size is not None:
-        if block_size < 1:
+    for setting_name in allowed_recommendations:
+        recommended_value = recommended.get(setting_name)
+        if recommended_value is None:
+            continue
+        if isinstance(recommended_value, bool) or not isinstance(
+            recommended_value, int
+        ):
             raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
-        # A recommendation may tighten the application-qualified 2,048-row
-        # block but can never relax it for an eval/task classifier.
-        settings["max_block_size"] = min(settings["max_block_size"], block_size)
+        if recommended_value < 1:
+            raise EvalTaskReadBudgetExceeded(_SAFE_UNSUPPORTED_FILTER_MESSAGE)
+        existing_value = settings.get(setting_name)
+        # A recommendation may tighten an application-qualified default but
+        # can never relax it for an eval/task classifier.
+        settings[setting_name] = (
+            min(existing_value, recommended_value)
+            if existing_value is not None
+            else recommended_value
+        )
     return settings
 
 
@@ -1055,8 +1066,14 @@ def _resolve_bounded_historical_span_ids(
     # caps to seeds rejects large projects before their finite workflow budget
     # has a chance to classify the requested prefix.
     bounded_read_settings = _filter_classifier_read_settings(builder)
+    classifier_only_setting_names = {
+        "max_block_size",
+        "preferred_max_column_in_block_size_bytes",
+    }
     bounded_classify_read_settings = {
-        "max_block_size": bounded_read_settings.pop("max_block_size"),
+        setting_name: bounded_read_settings.pop(setting_name)
+        for setting_name in classifier_only_setting_names
+        if setting_name in bounded_read_settings
     }
     if workflow_one_phase_trace_witnesses:
         bounded_classify_read_settings.update(

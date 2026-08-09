@@ -109,6 +109,7 @@ _NORMAL_LIST_IDENTITY_CLASSIFY_BATCH_SIZE = 80
 # keeps identical predicates and order and changes only physical chunking.
 _STRUCTURED_ANY_SPAN_CLASSIFY_BATCH_SIZE = 10
 _STRUCTURED_CLASSIFY_MAX_BLOCK_SIZE = 2_048
+_STRUCTURED_CLASSIFY_MAX_COLUMN_BYTES = 1 * 1024 * 1024
 
 # A long-window list gets a small, partitioned sparse-value proof before it
 # enters the ordered-root fallback. Sixty-four is one global exhaustiveness
@@ -1103,11 +1104,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return 50
 
     def recommended_filter_classify_read_settings(self) -> dict[str, int] | None:
-        """Cap blocks that materialize custom typed-Map or JSON attributes."""
+        """Cap blocks and columns that materialize custom Map/JSON values."""
 
         if not self._custom_span_attribute_filter_count():
             return None
-        return {"max_block_size": _STRUCTURED_CLASSIFY_MAX_BLOCK_SIZE}
+        return {
+            "max_block_size": _STRUCTURED_CLASSIFY_MAX_BLOCK_SIZE,
+            "preferred_max_column_in_block_size_bytes": (
+                _STRUCTURED_CLASSIFY_MAX_COLUMN_BYTES
+            ),
+        }
 
     def use_identity_only_filter_classification(self) -> bool:
         """Defer presentation hydration until the exact public page is proven.
