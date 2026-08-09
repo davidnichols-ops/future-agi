@@ -27,7 +27,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import structlog
-
 from tracer.services.clickhouse.attribute_cursor_state import (
     ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
 )
@@ -135,25 +134,25 @@ ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT = timedelta(days=60)
 # inside this short statement budget, retry the *same* cursor position with the
 # ordinary six-hour slice; never publish speculative progress.
 ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS = 750
-# A continuation already owns an exact digest vocabulary.  Before falling back
-# to another physical duplicate walk, prove small adjacent latest-state slices
-# contain only values from that vocabulary.  The first page never uses this
-# path.  Start below the one-hour density that can exceed the project-wide
-# 500k-row envelope when no attribute-key predicate may legally run before
-# argMax, then grow successful proofs to a bounded production-qualified slice.
+# A searched page or continuation can use a complete raw-value superset before
+# falling back to a physical latest-state walk. Search pages advance only when
+# that superset has no relevant value; continuations may also prove every
+# relevant value is already in their exact digest vocabulary. Start below the
+# one-hour density that can exceed the project-wide 500k-row envelope, then grow
+# successful proofs under the bounded speculative policy below.
 # Start at the production-qualified floor: a failed five-minute probe can consume the
 # request's whole read-volume allowance before the selector gets a chance to
 # retry the same frontier at five seconds.  Coletia contains individual
 # 30-second intervals above the bounded 1 GiB read-volume envelope.
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT = timedelta(seconds=5)
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT = timedelta(seconds=5)
-# Coletia's density is not uniform: the frozen production replay contains
-# adjacent slices where 80s, 40s, 20s, and 10s proofs all cross the existing
-# 500k-row / 1 GiB envelope.  Five seconds is the only width that completed at
-# every observed frontier.  Keep the exact duplicate certificate at that
-# no-failure ceiling instead of using ClickHouse limit exceptions as adaptive
-# control flow.  This does not relax any row, byte, memory, or time guard.
-ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = timedelta(seconds=5)
+# Five seconds is the production-qualified floor on the densest observed
+# frontier.  Complete empty/seen-only proofs may grow geometrically beyond it,
+# but every wider statement is speculative and receives the short timeout
+# below. A failure moves no cursor state and retries the same frontier at a
+# narrower width, so sparse history collapses without turning a dense interval
+# into either a skipped range or a long chain of five-second HTTP pages.
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 2_500
 # Dense projects can cross the ordinary row/byte envelope even inside the
 # production-qualified six-hour seed.  A failed statement proves nothing, so
@@ -1555,8 +1554,9 @@ class AttributeReadSelector:
         segment: tuple[datetime, datetime],
         before_identity: PhysicalSpanIdentity | None,
         distinct_limit: int,
+        query_timeout_ms: int = ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS,
     ) -> list[dict[str, Any]]:
-        """Return an exact finite latest-state vocabulary for one slice.
+        """Return a complete finite raw-value vocabulary superset for one slice.
 
         This is a speculative continuation accelerator, not a sampled read.
         SQL returns a complete distinct superset of raw physical values. Every
@@ -1719,7 +1719,7 @@ class AttributeReadSelector:
             sql,
             params,
             max_result_rows=distinct_limit,
-            query_timeout_ms=ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS,
+            query_timeout_ms=query_timeout_ms,
             query_settings={
                 **_ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS,
                 "max_rows_in_distinct": distinct_limit,
@@ -3348,7 +3348,7 @@ class AttributeReadSelector:
             _utc(segment_start) if segment_start is not None else None
         )
         if active_segment_start is not None and (
-            not has_physical_checkpoint
+            (not has_physical_checkpoint and exact_key is None)
             or not start <= active_segment_start < current_segment_end
         ):
             raise ValueError("invalid attribute-key segment cursor")
@@ -3595,18 +3595,27 @@ class AttributeReadSelector:
             <= ATTRIBUTE_READ_MAX_QUERY_COUNT
         ):
             if exact_key is not None and not exact_fallback_started:
-                # Exact typed and JSON lanes both start inside the same safe
-                # five-minute envelope. For a resumed keyset, retain any
-                # already-narrower active slice (including sub-five-minute
-                # budget backoff) and re-anchor only proven progress.
+                # Exact typed and JSON lanes start inside the same safe
+                # five-minute envelope. A signed continuation may carry the
+                # next geometrically grown width; retain that adaptive hint so
+                # page N does not restart a sparse retained walk at five
+                # minutes. A failed statement still halves at the identical
+                # frontier before any progress is published.
                 initial_exact_width = min(
-                    ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT,
+                    (
+                        ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                        if cursor_before is not None
+                        else current_segment_end - active_segment_start
+                        if active_segment_start is not None
+                        else ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                    ),
+                    ATTRIBUTE_KEY_CURSOR_EXACT_MAX_EMPTY_SEGMENT,
                     current_segment_end - start,
                 )
                 if active_segment_start is not None:
-                    initial_exact_width = min(
-                        initial_exact_width,
-                        current_segment_end - active_segment_start,
+                    active_segment_start = max(
+                        start,
+                        current_segment_end - initial_exact_width,
                     )
                 if cursor_before is not None:
                     initial_exact_width = min(
@@ -3701,9 +3710,13 @@ class AttributeReadSelector:
                     query_timeout_ms=(
                         ATTRIBUTE_KEY_CURSOR_SPECULATIVE_TIMEOUT_MS
                         if cursor_before is None
-                        and active_segment_start is None
-                        and current_segment_end - current_segment_start
-                        > ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT
+                        and (
+                            current_segment_end - current_segment_start
+                            > ATTRIBUTE_KEY_CURSOR_EMPTY_SEGMENT_SOFT_LIMIT
+                            or exact_key is not None
+                            and current_segment_end - current_segment_start
+                            > ATTRIBUTE_KEY_CURSOR_MIN_SEGMENT
+                        )
                         else None
                     ),
                     candidate_query_settings={"use_skip_indexes": 0},
@@ -3728,6 +3741,7 @@ class AttributeReadSelector:
                                 width=retry_width,
                             )
                         else:
+                            active_segment_start = None
                             empty_segment_width = retry_width
                         continue
                     # No physical progress was certified. The invariant below
@@ -3825,6 +3839,7 @@ class AttributeReadSelector:
                                 width=retry_width,
                             )
                         else:
+                            active_segment_start = None
                             empty_segment_width = retry_width
                         continue
                     # Preserve the unchanged physical cursor; the strict
@@ -3960,7 +3975,11 @@ class AttributeReadSelector:
         )
         has_more = browse_status == "continuation"
         next_segment_start = (
-            active_segment_start if has_more and next_checkpoint is not None else None
+            active_segment_start
+            if has_more and next_checkpoint is not None
+            else max(start, current_segment_end - empty_segment_width)
+            if has_more and exact_key is not None
+            else None
         )
         if next_segment_start is not None and exact_key is None:
             legacy_segment_start = max(
@@ -4141,7 +4160,9 @@ class AttributeReadSelector:
         # repeats nor skips a physical row.
         incoming_checkpoint = resume_identity or before_identity
         incoming_segment_width = (
-            ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+            current_segment_end - active_segment_start
+            if active_segment_start is not None
+            else ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
             if normalized_search
             else ATTRIBUTE_READ_EXPLICIT_SEGMENT
         )
@@ -4192,21 +4213,16 @@ class AttributeReadSelector:
         candidate_pages = 0
         candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
         cursor_before = before_identity
-        # A searched value request has already supplied the selective value
-        # predicate. On a dense tenant the historical six-hour first probe can
-        # exceed the row envelope before LIMIT sees its first matching
-        # identity. Clamp both new requests and wider legacy cursor hints to
-        # the production-qualified five-second ceiling.
+        # A searched value request starts at the production-qualified five-second
+        # floor, then grows only after a complete adjacent-slice proof. Signed
+        # continuations retain their next adaptive width so page N does not
+        # restart at the floor. Wider statements remain speculative and fall
+        # back at the identical unconsumed frontier on any read-budget error.
         empty_segment_width = (
-            min(
-                current_segment_end - active_segment_start,
-                ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
-            )
-            if normalized_search and active_segment_start is not None
+            current_segment_end - active_segment_start
+            if active_segment_start is not None
             else ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
             if normalized_search
-            else current_segment_end - active_segment_start
-            if active_segment_start is not None
             else ATTRIBUTE_READ_EXPLICIT_SEGMENT
         )
         max_empty_segment_width = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT
@@ -4420,18 +4436,19 @@ class AttributeReadSelector:
             else:
                 cursor_before = resume_identity
 
-        # A continuation can cheaply prove that a whole adjacent temporal
-        # slice contains no *new* logical value, even though the signed state
-        # intentionally stores only opaque digests.  This latest-state query is
-        # never used on page one and never publishes a value: an unseen value,
-        # result sentinel, oversized array, or bounded-read failure falls back
-        # to the ordinary physical cursor at the identical unconsumed frontier.
-        # Successful seen-only proofs may therefore advance by time without
-        # weakening newest-first value reachability.
+        # A search or continuation can cheaply prove that a whole adjacent
+        # temporal slice contains no relevant *new* logical value. The query
+        # returns a complete raw-value superset and never publishes a value: an
+        # unseen match, result sentinel, oversized array, or bounded-read
+        # failure falls back to the ordinary latest-state cursor at the
+        # identical unconsumed frontier. A searched first page can therefore
+        # skip a slice only when the raw superset contains no matching value;
+        # later pages may additionally skip matches already named by their
+        # server-held digests.
         skip_physical_walk = False
         distinct_proof_supported = unpinned_cursor_read or typed_cursor_read
         if (
-            seen_set
+            (seen_set or needle)
             and distinct_proof_supported
             and next_resume_identity is None
             and len(emitted) < effective_page_size
@@ -4470,12 +4487,17 @@ class AttributeReadSelector:
                     if distinct_advanced
                     else ATTRIBUTE_VALUE_CURSOR_DISTINCT_WALL_RESERVE_MS
                 )
+                planned_proof_timeout_ms = (
+                    ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+                    if distinct_width <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
+                    else ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
+                )
                 if (
                     self._query_count + 1 + proof_query_reserve
                     > ATTRIBUTE_READ_MAX_QUERY_COUNT
                     or remaining_ms
                     <= proof_wall_reserve_ms
-                    + ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+                    + planned_proof_timeout_ms
                     + ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS
                 ):
                     # When at least one complete slice was certified, returning
@@ -4507,6 +4529,12 @@ class AttributeReadSelector:
                 if proof_start >= proof_end:
                     break
                 distinct_limit = effective_page_size + 1
+                proof_timeout_ms = (
+                    ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+                    if proof_end - proof_start
+                    <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
+                    else planned_proof_timeout_ms
+                )
                 try:
                     distinct_rows = self._seen_value_slice_groups(
                         project_ids=projects,
@@ -4518,6 +4546,7 @@ class AttributeReadSelector:
                         segment=(proof_start, proof_end),
                         before_identity=cursor_before,
                         distinct_limit=distinct_limit,
+                        query_timeout_ms=proof_timeout_ms,
                     )
                 except Exception as exc:
                     if not is_read_budget_error(exc):
@@ -4614,12 +4643,12 @@ class AttributeReadSelector:
                     # would reintroduce the known Coletia row/byte failures.
                     empty_segment_width = proven_width
                     last_successful_segment_width = proven_width
-                if failed_distinct_ceiling is not None:
-                    # Do not immediately retry a request-local width that just
-                    # exhausted its read/time budget.  Publish the smaller
-                    # certified slice and let the next request start with a
-                    # fresh deadline at the unchanged next frontier.
-                    break
+                # A completed narrower retry moved past the dense frontier that
+                # rejected the wider statement. Allow the next adjacent slice
+                # to grow again: density is not uniform, and pinning the whole
+                # retained horizon to five seconds would recreate the public
+                # pagination failure this accelerator exists to prevent.
+                failed_distinct_ceiling = None
                 distinct_width = min(
                     proven_width * 2,
                     ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
@@ -4664,6 +4693,11 @@ class AttributeReadSelector:
             widened_probe = (
                 segment_start < current_segment_end - ATTRIBUTE_READ_EXPLICIT_SEGMENT
             )
+            adaptive_search_probe = (
+                bool(needle)
+                and current_segment_end - segment_start
+                > ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+            )
             try:
                 (
                     candidate_ids,
@@ -4684,13 +4718,32 @@ class AttributeReadSelector:
                         if current_segment_end - segment_start
                         <= ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
                         else ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
-                        if widened_probe
+                        if adaptive_search_probe
+                        or widened_probe
                         or candidate_limit > ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
                         else None
                     ),
                     include_versions=versioned_cursor_read,
                 )
             except Exception as exc:
+                if (
+                    is_read_budget_error(exc)
+                    and adaptive_search_probe
+                    and cursor_before is None
+                ):
+                    # A failed speculative width proves nothing. Retry the same
+                    # segment end at half the width; successful earlier slices
+                    # remain committed locally, but no byte of this failed
+                    # interval is skipped. After the narrower slice succeeds,
+                    # geometric growth may resume at its next older frontier.
+                    failed_width = current_segment_end - segment_start
+                    empty_segment_width = max(
+                        ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
+                        failed_width / 2,
+                    )
+                    candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
+                    checkpoint_from_widened_segment = False
+                    continue
                 if is_read_budget_error(exc) and request_has_progress():
                     # This statement certified nothing, but an earlier complete
                     # batch already moved the request-local physical frontier.
@@ -4885,21 +4938,6 @@ class AttributeReadSelector:
                     empty_segment_width * 2,
                     max_empty_segment_width,
                 )
-
-            # Search is an interactive narrowing operation. One fully
-            # certified five-second physical slice is sufficient progress for
-            # this action, whether or not it contains a new value. Returning
-            # its exact newest-first continuation avoids widening an empty
-            # search into a known-unsafe statement merely to fill the current
-            # UI page. No global exhaustion is inferred here; unless the frozen
-            # window was actually exhausted, ``browse_status`` below is
-            # ``continuation``.
-            if needle:
-                empty_segment_width = min(
-                    ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
-                    current_segment_end - start,
-                )
-                break
 
         next_checkpoint = next_resume_identity or cursor_before
         if checkpoint_from_widened_segment and next_checkpoint is not None:

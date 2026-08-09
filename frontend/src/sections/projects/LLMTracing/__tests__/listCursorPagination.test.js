@@ -191,6 +191,31 @@ describe("list cursor pagination", () => {
     });
   });
 
+  it("accepts a terminal empty adaptive-search window without another request", async () => {
+    const nextResponse = vi.fn();
+    const terminal = {
+      rows: [],
+      metadata: {
+        browse_status: "exhausted",
+        has_more: false,
+        next_cursor: null,
+      },
+    };
+
+    const response = await followEmptyListContinuations({
+      initialResponse: terminal,
+      rowsFromResponse: (value) => value.rows,
+      metadataFromResponse: (value) => value.metadata,
+      nextResponse,
+    });
+
+    expect(response).toBe(terminal);
+    expect(nextResponse).not.toHaveBeenCalled();
+    expect(
+      getEmptyListContinuation(response.rows, response.metadata),
+    ).toBeNull();
+  });
+
   it("fails closed instead of looping on a repeated empty cursor", async () => {
     await expect(
       followEmptyListContinuations({
