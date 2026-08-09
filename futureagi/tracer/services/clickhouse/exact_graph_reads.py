@@ -2,9 +2,14 @@
 
 ClickHouse 25.3 cannot share a snapshot across separately executed statements,
 and a version predicate on ``ReplacingMergeTree`` is not time travel after a
-background merge.  Aggregate readers therefore execute each ClickHouse metric
-as one full-window statement, use ``FINAL`` in the query builders, and publish
-only a complete result through ``exact_aggregation_cache``.
+background merge. Most aggregate readers therefore use one full-window
+statement. Filtered trace graphs are the deliberate exception: the background
+worker freezes the request window, exhausts exact trace-list cursor pages, and
+aggregates finite trace-id batches. A late arrival or background merge between
+those statements can affect a refresh, so the sequence is not advertised as
+MVCC; de-duplication prevents duplicate contribution and any partial query
+fails the refresh. Only a complete result may replace the prior snapshot in
+``exact_aggregation_cache``.
 """
 
 from __future__ import annotations
@@ -322,6 +327,7 @@ def _enumerate_exact_trace_ids(
         page_number=0,
         page_size=EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE,
         annotation_label_ids=list(annotation_label_ids or ()),
+        bounded_internal_scan=True,
         bounded_identity_only=True,
         bounded_bulk_scan=True,
         bounded_include_filter_witnesses=False,
