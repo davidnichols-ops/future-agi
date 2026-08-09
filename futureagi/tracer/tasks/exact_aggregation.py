@@ -8,6 +8,7 @@ re-resolve tenant records and publish only a fully complete exact payload.
 from __future__ import annotations
 
 from inspect import unwrap
+from threading import Event, Thread
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,6 +16,10 @@ import structlog
 
 from tfc.temporal import temporal_activity
 from tracer.services.exact_aggregation_cache import (
+    EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS,
+    EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS,
+    EXACT_AGGREGATION_WORKFLOW_EXECUTION_TIMEOUT_SECONDS,
+    EXACT_AGGREGATION_WORKFLOW_RUN_TIMEOUT_SECONDS,
     activate_exact_refresh,
     exact_payload_is_complete,
     finish_exact_refresh,
@@ -23,6 +28,30 @@ from tracer.services.exact_aggregation_cache import (
 )
 
 logger = structlog.get_logger(__name__)
+
+EXACT_AGGREGATION_TASK_QUEUE = "exact_aggregation"
+EXACT_AGGREGATION_LEASE_RENEW_INTERVAL_SECONDS = 60
+
+
+def _renew_exact_refresh_lease_until_stopped(
+    *,
+    namespace: str,
+    identity: dict[str, Any],
+    refresh_token: str,
+    stop_event: Event,
+) -> None:
+    """Keep ownership alive while a synchronous exact read is still executing.
+
+    Temporal cancellation cannot interrupt the thread that executes a synchronous
+    ClickHouse client call.  Renewal therefore lives beside that sync call and
+    continues until the function actually returns, preventing a replacement
+    claim from overlapping the still-running database work.  Every renewal is
+    token-fenced; a stale activity can neither revive nor overwrite a newer
+    owner's lease.
+    """
+
+    while not stop_event.wait(EXACT_AGGREGATION_LEASE_RENEW_INTERVAL_SECONDS):
+        activate_exact_refresh(namespace, identity, refresh_token)
 
 
 def _observe_payload(namespace: str, identity: dict[str, Any]) -> Any:
@@ -186,8 +215,11 @@ def _load_exact_payload(namespace: str, identity: dict[str, Any]) -> Any:
 
 @temporal_activity(
     name="tracer.refresh_exact_aggregation_snapshot",
-    time_limit=60 * 60,
-    queue="tasks_xl",
+    time_limit=EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS,
+    queue=EXACT_AGGREGATION_TASK_QUEUE,
+    schedule_to_start_timeout=EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS,
+    workflow_run_timeout=EXACT_AGGREGATION_WORKFLOW_RUN_TIMEOUT_SECONDS,
+    workflow_execution_timeout=EXACT_AGGREGATION_WORKFLOW_EXECUTION_TIMEOUT_SECONDS,
     # Exact reads can be expensive. Do not multiply ClickHouse load after a
     # timeout; the cache state exposes a sanitized failure and an explicit
     # user refresh creates a new, deduplicated workflow. The activity remains
@@ -203,9 +235,12 @@ def refresh_exact_aggregation_snapshot(
     """Compute then atomically publish one exact snapshot."""
 
     succeeded = False
+    renewal_stop: Event | None = None
+    renewal_thread: Thread | None = None
+    renewal_started = False
     try:
         # A workflow accepted by an old/misconfigured worker can fail before
-        # this function is called.  Claims therefore begin as short dispatch
+        # this function is called.  Claims therefore begin as dispatch
         # leases and are promoted here, before ClickHouse is touched.  A late
         # delivery after lease expiry is fenced out by a newer poll's token.
         if not activate_exact_refresh(
@@ -214,6 +249,20 @@ def refresh_exact_aggregation_snapshot(
             refresh_token,
         ):
             return
+        renewal_stop = Event()
+        renewal_thread = Thread(
+            target=_renew_exact_refresh_lease_until_stopped,
+            kwargs={
+                "namespace": namespace,
+                "identity": identity,
+                "refresh_token": refresh_token,
+                "stop_event": renewal_stop,
+            },
+            name="exact-aggregation-lease-renewal",
+            daemon=True,
+        )
+        renewal_thread.start()
+        renewal_started = True
         payload = _load_exact_payload(namespace, identity)
         if not refresh_claim_is_current(
             namespace,
@@ -240,6 +289,20 @@ def refresh_exact_aggregation_snapshot(
         # diagnostics into the workflow error or activity wrapper logs.
         raise RuntimeError("exact aggregation refresh failed") from None
     finally:
+        if renewal_stop is not None:
+            renewal_stop.set()
+        if renewal_thread is not None and renewal_started:
+            try:
+                renewal_thread.join(timeout=1)
+            except RuntimeError as exc:
+                # Finishing the fenced claim is more important than a local
+                # thread bookkeeping error. A late renewal still cannot revive
+                # a lock once the token-fenced finish removes it.
+                logger.warning(
+                    "exact_aggregation_lease_renewal_join_failed",
+                    namespace=namespace,
+                    error_type=type(exc).__name__,
+                )
         finish_exact_refresh(
             namespace,
             identity,
@@ -248,4 +311,7 @@ def refresh_exact_aggregation_snapshot(
         )
 
 
-__all__ = ["refresh_exact_aggregation_snapshot"]
+__all__ = [
+    "EXACT_AGGREGATION_TASK_QUEUE",
+    "refresh_exact_aggregation_snapshot",
+]

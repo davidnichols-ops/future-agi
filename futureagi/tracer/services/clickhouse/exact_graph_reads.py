@@ -75,9 +75,12 @@ from tracer.utils.helper import get_annotation_labels_for_project
 
 logger = structlog.get_logger(__name__)
 
-# Exact graphs run only in the deduplicated ``tasks_xl`` refresh activity; the
-# HTTP request schedules that work and polls the last complete snapshot.  The
-# production qualification set contains valid exact queries with p95 958s and
+# Exact graphs run only in the deduplicated background refresh activity; the US
+# production deployment admits that activity through the single-slot
+# ``exact_aggregation`` queue, while deployments without that worker retain the
+# compatible ``tasks_xl`` route. The HTTP request schedules the work and polls
+# the last complete snapshot. The production qualification set contains valid exact queries with
+# p95 958s and
 # a 1032.479s ceiling, so the old five-minute ClickHouse deadline rejected
 # healthy work.  The largest production tenant already contains more than
 # 207M physical rows in a twelve-month window.  Give an exact refresh up to
@@ -178,7 +181,7 @@ EXACT_GRAPH_READ_SETTINGS = {
     "max_bytes_to_read": 0,
     # The same observed seven-day read peaked at 1,055,221,165 bytes.  Preserve
     # measured headroom while spilling compact aggregation/sort state early;
-    # the tasks_xl worker has a separate 32-GiB pod limit.
+    # the production exact-aggregation worker has a separate 32-GiB pod limit.
     "max_memory_usage": 1536 * 1024 * 1024,
     "read_overflow_mode": "throw",
     "max_result_rows": EXACT_GRAPH_RESULT_ROW_SENTINEL,
@@ -1454,6 +1457,7 @@ def _matching_trace_ids(
     end_date: datetime,
     predicate: str,
     predicate_params: dict[str, Any],
+    timeout_ms: int,
     settings: dict[str, Any],
 ) -> set[str]:
     if not trace_ids:
@@ -1477,7 +1481,7 @@ def _matching_trace_ids(
             "snapshot_end_date": end_date,
             "candidate_trace_ids": trace_ids,
         },
-        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+        timeout_ms=timeout_ms,
         settings=settings,
     )
     return {
@@ -1495,6 +1499,7 @@ def _matching_span_ids(
     end_date: datetime,
     predicate: str,
     predicate_params: dict[str, Any],
+    timeout_ms: int,
     settings: dict[str, Any],
 ) -> set[str]:
     if not span_ids:
@@ -1520,7 +1525,7 @@ def _matching_span_ids(
             "snapshot_end_date": end_date,
             "candidate_span_ids": span_ids,
         },
-        timeout_ms=EXACT_GRAPH_QUERY_TIMEOUT_MS,
+        timeout_ms=timeout_ms,
         settings=settings,
     )
     matched: set[str] = set()
@@ -1645,6 +1650,14 @@ def read_exact_annotation_graph(
     query_count = 0
     rows_returned = 0
 
+    def remaining_statement_timeout_ms() -> int:
+        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
+            max(monotonic() - started, 0.0) * 1000
+        )
+        if remaining_ms <= 0:
+            raise ExactGraphReadError("exact annotation graph deadline exceeded")
+        return remaining_ms
+
     # PostgreSQL is authoritative for Score. Hold one repeatable-read snapshot
     # while CH checks only those finite annotated identities. Any membership
     # batch failure aborts the refresh before publication.
@@ -1695,6 +1708,7 @@ def read_exact_annotation_graph(
                         end_date=end_date,
                         predicate=trace_predicate,
                         predicate_params=trace_params,
+                        timeout_ms=remaining_statement_timeout_ms(),
                         settings=settings,
                     )
                     if observe_type == "trace"
@@ -1723,6 +1737,7 @@ def read_exact_annotation_graph(
                         end_date=end_date,
                         predicate=span_membership_predicate,
                         predicate_params=span_membership_params,
+                        timeout_ms=remaining_statement_timeout_ms(),
                         settings=settings,
                     )
                     if span_ids

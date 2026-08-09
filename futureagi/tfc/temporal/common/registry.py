@@ -259,6 +259,7 @@ def _ensure_workflows_registered() -> None:
                 "tasks_s",
                 "tasks_l",
                 "tasks_xl",
+                "exact_aggregation",
                 "trace_ingestion",
                 "agent_compass",
             ],
@@ -488,23 +489,48 @@ def _ensure_activities_registered() -> None:
             sample=list(_ACTIVITY_REGISTRY.keys())[:10],
         )
 
-        # Now get all the registered activities
+        # Now get all the registered activities. Exact aggregation is excluded
+        # from the generic queues so an accidental queue override cannot bypass
+        # the production single-slot admission boundary. Keep only tasks_xl as
+        # the explicit compatibility route for deployments not yet running the
+        # dedicated worker.
         from tfc.temporal.drop_in.decorator import get_temporal_activities
 
         drop_in_activities = get_temporal_activities()
+        exact_aggregation_activities = get_temporal_activities(
+            queue="exact_aggregation"
+        )
+        generic_drop_in_activities = [
+            registered_activity
+            for registered_activity in drop_in_activities
+            if registered_activity not in exact_aggregation_activities
+        ]
         log.info("registering_dropin_activities", count=len(drop_in_activities))
 
-        # Register for all queues (activities specify their own queue in metadata)
+        # Generic queues historically register the complete decorator registry.
+        # The exact reader is the sole exception because concurrent execution is
+        # deliberately bounded at the worker queue.
         register_for_queues(
             queues=[
                 "default",
                 "tasks_s",
                 "tasks_l",
-                "tasks_xl",
                 "agent_compass",
                 "trace_ingestion",
             ],
+            activities=generic_drop_in_activities,
+        )
+        register_for_queues(
+            queues=["tasks_xl"],
             activities=drop_in_activities,
+        )
+
+        # Exact graph reads have their own single-slot production worker.  Keep
+        # this queue intentionally narrow: the generic workflow plus only the
+        # activity whose decorator explicitly targets exact aggregation.
+        register_for_queues(
+            queues=["exact_aggregation"],
+            activities=exact_aggregation_activities,
         )
     except Exception as e:
         log.exception("could_not_load_dropin_activities", error=str(e))

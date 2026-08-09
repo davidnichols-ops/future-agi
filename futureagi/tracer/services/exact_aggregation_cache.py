@@ -26,18 +26,51 @@ logger = structlog.get_logger(__name__)
 
 _CACHE_VERSION = 1
 _DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60
-_DEFAULT_REFRESH_LOCK_SECONDS = 60 * 60
-# A refresh claim starts as a short dispatch lease.  The activity promotes it
-# to the long running lease before it touches ClickHouse.  This matters during
-# rolling deploys: an older Temporal worker can accept the generic workflow but
-# reject a newly-registered activity type before our activity function runs.
-# Such a terminal workflow failure has no ``finally`` block in this process, so
-# a one-hour pre-start claim would otherwise leave every poll falsely pending.
-_DEFAULT_REFRESH_DISPATCH_SECONDS = 10 * 60
+EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS = 60 * 60
+EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS = 12 * 60 * 60
+EXACT_AGGREGATION_WORKFLOW_RUN_TIMEOUT_SECONDS = 14 * 60 * 60
+EXACT_AGGREGATION_WORKFLOW_EXECUTION_TIMEOUT_SECONDS = 24 * 60 * 60
+# The running lease must outlive the Temporal start-to-close timeout.  Without
+# this margin, a replacement claim could start while the timed-out worker's
+# synchronous ClickHouse call is still unwinding.  Token fencing would protect
+# publication, but it would not protect ClickHouse from overlapping work.
+_DEFAULT_REFRESH_LOCK_SECONDS = EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS + 5 * 60
+# A refresh claim starts as a dispatch lease and is promoted to the shorter
+# running lease before it touches ClickHouse.  The dedicated worker deliberately
+# admits one activity at a time, so valid work can wait behind another exact read.
+# Keep this lease beyond TaskRunnerWorkflow's twelve-hour schedule-to-start
+# ceiling; terminal-workflow reconciliation still releases incompatible-worker
+# failures immediately when a client polls.
+_DEFAULT_REFRESH_DISPATCH_SECONDS = (
+    EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS + 60 * 60
+)
 _DEFAULT_REFRESH_RECONCILE_SECONDS = 5
 _DEFAULT_REFRESH_STATUS_TIMEOUT_SECONDS = 0.5
 _DEFAULT_REFRESH_FAILURE_SECONDS = 5 * 60
 _CACHE_FENCE_FALLBACK_LOCK = RLock()
+_ALLOWED_EXACT_AGGREGATION_TASK_QUEUES = frozenset({"tasks_xl", "exact_aggregation"})
+
+_REDIS_ATOMIC_REFRESH_CLAIM_SCRIPT = """
+local claimed = redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3], 'NX')
+if not claimed then
+    return 0
+end
+redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
+return 1
+"""
+
+_REDIS_FENCED_ROLLBACK_REFRESH_CLAIM_SCRIPT = """
+local removed = 0
+if redis.call('GET', KEYS[2]) == ARGV[2] then
+    redis.call('DEL', KEYS[2])
+    removed = removed + 1
+end
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    redis.call('DEL', KEYS[1])
+    removed = removed + 1
+end
+return removed
+"""
 
 _REDIS_FENCED_PUBLISH_SCRIPT = """
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
@@ -181,7 +214,7 @@ def _ttl_seconds() -> int | None:
 
 def _refresh_lock_seconds() -> int:
     return max(
-        60,
+        _DEFAULT_REFRESH_LOCK_SECONDS,
         int(
             getattr(
                 settings,
@@ -194,16 +227,13 @@ def _refresh_lock_seconds() -> int:
 
 def _refresh_dispatch_seconds() -> int:
     return max(
-        5,
-        min(
-            _refresh_lock_seconds(),
-            int(
-                getattr(
-                    settings,
-                    "EXACT_AGGREGATION_REFRESH_DISPATCH_SECONDS",
-                    _DEFAULT_REFRESH_DISPATCH_SECONDS,
-                )
-            ),
+        _DEFAULT_REFRESH_DISPATCH_SECONDS,
+        int(
+            getattr(
+                settings,
+                "EXACT_AGGREGATION_REFRESH_DISPATCH_SECONDS",
+                _DEFAULT_REFRESH_DISPATCH_SECONDS,
+            )
         ),
     )
 
@@ -244,6 +274,22 @@ def _refresh_status_timeout_seconds() -> float:
     )
     # Reconciliation runs on an HTTP poll. Keep Temporal impairment bounded.
     return min(2.0, max(0.05, configured))
+
+
+def _configured_exact_aggregation_task_queue() -> str | None:
+    """Return an explicitly supported queue, or fail closed on configuration drift."""
+
+    task_queue = str(
+        getattr(settings, "EXACT_AGGREGATION_TASK_QUEUE", "tasks_xl")
+    ).strip()
+    if task_queue in _ALLOWED_EXACT_AGGREGATION_TASK_QUEUES:
+        return task_queue
+    logger.error(
+        "exact_aggregation_task_queue_invalid",
+        configured_queue=task_queue,
+        allowed_queues=sorted(_ALLOWED_EXACT_AGGREGATION_TASK_QUEUES),
+    )
+    return None
 
 
 def _decorate(snapshot: ExactAggregationSnapshot) -> Any:
@@ -498,8 +544,105 @@ def exact_refresh_state(namespace: str, identity: Any) -> str | None:
     return None
 
 
+def _release_partial_refresh_claim_fallback(
+    lock_key: str,
+    state_key: str,
+    token: str,
+) -> None:
+    """Best-effort rollback for process-local caches after a partial claim write."""
+
+    try:
+        if cache.get(lock_key) != token:
+            return
+    except Exception:
+        # Without a successful ownership read, deleting could clear a newer
+        # owner's lock. Let the bounded dispatch lease expire instead.
+        return
+
+    try:
+        stored_state = cache.get(state_key)
+    except Exception:
+        stored_state = None
+    if isinstance(stored_state, dict) and stored_state.get("token") == token:
+        try:
+            cache.delete(state_key)
+        except Exception:
+            pass
+
+    # Re-read immediately before deletion so a replacement observed during
+    # cleanup is never cleared. Redis deployments never use this fallback;
+    # their claim is one Lua operation.
+    try:
+        if cache.get(lock_key) == token:
+            cache.delete(lock_key)
+    except Exception:
+        pass
+
+
+def _recover_ambiguous_redis_refresh_claim(
+    *,
+    namespace: str,
+    token: str,
+    raw_client: Any,
+    redis_lock_key: Any,
+    redis_state_key: Any,
+    encoded_token: Any,
+    encoded_dispatch_state: Any,
+) -> str | None:
+    """Resolve an indeterminate Redis claim response without overlapping work.
+
+    A connection can fail after Redis has completed the Lua script but before
+    the client receives its result.  Reading both primary-backed keys lets the
+    caller continue with the exact token when the whole claim landed.  A
+    partial write is removed only through value-fenced Lua comparisons.  If
+    Redis is still unavailable, the bounded dispatch TTL is the safe fallback.
+    """
+
+    try:
+        stored_lock, stored_state = raw_client.mget(
+            redis_lock_key,
+            redis_state_key,
+        )
+    except Exception:
+        logger.warning(
+            "exact_aggregation_refresh_claim_readback_failed",
+            namespace=namespace,
+            exc_info=True,
+        )
+        return None
+
+    lock_owned = stored_lock == encoded_token
+    state_owned = stored_state == encoded_dispatch_state
+    if lock_owned and state_owned:
+        logger.warning(
+            "exact_aggregation_refresh_claim_recovered",
+            namespace=namespace,
+        )
+        return token
+
+    if not lock_owned and not state_owned:
+        return None
+
+    try:
+        raw_client.eval(
+            _REDIS_FENCED_ROLLBACK_REFRESH_CLAIM_SCRIPT,
+            2,
+            redis_lock_key,
+            redis_state_key,
+            encoded_token,
+            encoded_dispatch_state,
+        )
+    except Exception:
+        logger.warning(
+            "exact_aggregation_refresh_claim_rollback_failed",
+            namespace=namespace,
+            exc_info=True,
+        )
+    return None
+
+
 def begin_exact_refresh(namespace: str, identity: Any) -> str | None:
-    """Atomically claim the short pre-activity dispatch lease for a query.
+    """Atomically claim the pre-activity dispatch lease for a query.
 
     The worker must call :func:`activate_exact_refresh` before doing any work.
     If no compatible Temporal worker starts the activity, both keys expire and
@@ -508,20 +651,73 @@ def begin_exact_refresh(namespace: str, identity: Any) -> str | None:
 
     token = uuid4().hex
     dispatch_seconds = _refresh_dispatch_seconds()
+    lock_key = _refresh_lock_key(namespace, identity)
+    state_key = _refresh_state_key(namespace, identity)
+    dispatch_state = {
+        "status": "running",
+        "token": token,
+        "phase": "dispatch",
+    }
     try:
-        claimed = cache.add(
-            _refresh_lock_key(namespace, identity),
-            token,
-            timeout=dispatch_seconds,
-        )
-        if not claimed:
+        redis_client = _redis_cache_client()
+        if redis_client is not None:
+            raw_client = redis_client.get_client(write=True)
+            redis_lock_key = redis_client.make_key(lock_key)
+            redis_state_key = redis_client.make_key(state_key)
+            encoded_token = redis_client.encode(token)
+            encoded_dispatch_state = redis_client.encode(dispatch_state)
+            try:
+                claimed = raw_client.eval(
+                    _REDIS_ATOMIC_REFRESH_CLAIM_SCRIPT,
+                    2,
+                    redis_lock_key,
+                    redis_state_key,
+                    encoded_token,
+                    encoded_dispatch_state,
+                    dispatch_seconds * 1000,
+                )
+            except Exception:
+                logger.warning(
+                    "exact_aggregation_refresh_claim_failed",
+                    namespace=namespace,
+                    exc_info=True,
+                )
+                return _recover_ambiguous_redis_refresh_claim(
+                    namespace=namespace,
+                    token=token,
+                    raw_client=raw_client,
+                    redis_lock_key=redis_lock_key,
+                    redis_state_key=redis_state_key,
+                    encoded_token=encoded_token,
+                    encoded_dispatch_state=encoded_dispatch_state,
+                )
+            return token if claimed else None
+
+        # LocMemCache and the test caches do not expose a Redis client. Keep
+        # their two operations in one process-local critical section, verify
+        # both writes, and token-fence rollback if the state write is partial.
+        with _CACHE_FENCE_FALLBACK_LOCK:
+            if not cache.add(lock_key, token, timeout=dispatch_seconds):
+                return None
+            try:
+                cache.set(state_key, dispatch_state, timeout=dispatch_seconds)
+                if (
+                    cache.get(lock_key) == token
+                    and cache.get(state_key) == dispatch_state
+                ):
+                    return token
+            except Exception:
+                logger.warning(
+                    "exact_aggregation_refresh_claim_state_write_failed",
+                    namespace=namespace,
+                    exc_info=True,
+                )
+
+            # Cleanup intentionally re-reads ownership. A backend failure may
+            # have happened after writing, or the lease may already have been
+            # replaced; never delete a replacement.
+            _release_partial_refresh_claim_fallback(lock_key, state_key, token)
             return None
-        cache.set(
-            _refresh_state_key(namespace, identity),
-            {"status": "running", "token": token, "phase": "dispatch"},
-            timeout=dispatch_seconds,
-        )
-        return token
     except Exception:
         logger.warning(
             "exact_aggregation_refresh_claim_failed",
@@ -839,6 +1035,15 @@ def read_or_schedule_exact_snapshot(
     if previous is None and state == "failed" and not refresh:
         return _decorate_refresh_state(pending_payload, state)
 
+    task_queue = _configured_exact_aggregation_task_queue()
+    if task_queue is None:
+        # A typo must never create a long-lived claim for a queue with no
+        # worker. Preserve an existing exact snapshot, otherwise expose only
+        # the existing sanitized failed-refresh envelope.
+        if previous is not None:
+            return _decorate_refresh_state(previous, "failed")
+        return _decorate_refresh_state(pending_payload, "failed")
+
     token = begin_exact_refresh(namespace, normalized_identity)
     if token is None and state == "running":
         if _release_terminal_dispatch_claim(namespace, normalized_identity):
@@ -858,7 +1063,7 @@ def read_or_schedule_exact_snapshot(
                     "identity": normalized_identity,
                     "refresh_token": token,
                 },
-                queue="tasks_xl",
+                queue=task_queue,
                 task_id=_exact_refresh_workflow_task_id(token),
                 id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
                 # Keep the HTTP API boundary bounded if Temporal is impaired.
@@ -907,6 +1112,10 @@ def read_or_schedule_exact_snapshot(
 
 
 __all__ = [
+    "EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS",
+    "EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS",
+    "EXACT_AGGREGATION_WORKFLOW_EXECUTION_TIMEOUT_SECONDS",
+    "EXACT_AGGREGATION_WORKFLOW_RUN_TIMEOUT_SECONDS",
     "activate_exact_refresh",
     "begin_exact_refresh",
     "exact_refresh_state",

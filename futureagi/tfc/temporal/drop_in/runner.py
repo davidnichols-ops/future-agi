@@ -242,13 +242,21 @@ async def _start_activity_async(
                 time_limit=activity_metadata.get("time_limit"),
                 max_retries=activity_metadata.get("max_retries"),
                 retry_delay=activity_metadata.get("retry_delay"),
+                schedule_to_start_timeout=activity_metadata.get(
+                    "schedule_to_start_timeout"
+                ),
             ),
             id=workflow_id,
             task_queue=queue,
-            # Prevent stuck workflows - auto-timeout after 24 hours
-            execution_timeout=timedelta(hours=24),
-            # Prevent single run from running forever - 13 hours max
-            run_timeout=timedelta(hours=13),
+            # Existing activities retain the historical 24h/13h defaults.
+            # Long-queued activities can opt into validated metadata overrides.
+            execution_timeout=timedelta(
+                seconds=activity_metadata.get("workflow_execution_timeout")
+                or 24 * 60 * 60
+            ),
+            run_timeout=timedelta(
+                seconds=activity_metadata.get("workflow_run_timeout") or 13 * 60 * 60
+            ),
             **_extra_start_kwargs,
         )
 

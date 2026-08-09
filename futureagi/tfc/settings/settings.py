@@ -34,6 +34,15 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_TYPE = os.getenv("ENV_TYPE", "local").lower()
 _IS_LOCAL = ENV_TYPE in ("local", "test")
 
+# Exact analytics continue to use the existing XL queue unless a deployment
+# explicitly provisions the dedicated single-slot worker.  This keeps local,
+# development, EU, and self-hosted installs compatible while allowing the US
+# ClickHouse cluster to opt into strict refresh admission.
+EXACT_AGGREGATION_TASK_QUEUE = os.getenv(
+    "EXACT_AGGREGATION_TASK_QUEUE",
+    "tasks_xl",
+)
+
 
 def _split_env(name: str, default: str = "") -> list[str]:
     """Parse a comma-separated env var into a list."""
@@ -506,7 +515,9 @@ EE_LICENSE_PRIVATE_KEY = os.environ.get("EE_LICENSE_PRIVATE_KEY", "").replace(
 FUTUREAGI_CLOUD_API_KEY = os.environ.get("FUTUREAGI_CLOUD_API_KEY", "")
 
 # Activation signing key (cloud control plane uses this to mint service tokens)
-ACTIVATION_PRIVATE_KEY = os.environ.get("ACTIVATION_PRIVATE_KEY", "").replace("\\n", "\n")
+ACTIVATION_PRIVATE_KEY = os.environ.get("ACTIVATION_PRIVATE_KEY", "").replace(
+    "\\n", "\n"
+)
 ACTIVATION_KEY_ID = os.environ.get("ACTIVATION_KEY_ID", "default")
 ACTIVATION_SIGNING_SERVICE_URL = os.environ.get("ACTIVATION_SIGNING_SERVICE_URL", "")
 ACTIVATION_TOKEN_ISSUER = os.environ.get(

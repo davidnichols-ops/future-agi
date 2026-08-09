@@ -10,6 +10,7 @@ import pytest
 from clickhouse_driver.errors import ServerException
 from django.core.cache import cache
 from django.db import DatabaseError
+from django.test import override_settings
 
 from tracer.services.clickhouse.exact_graph_reads import (
     ExactGraphReadError,
@@ -36,6 +37,10 @@ from tracer.services.clickhouse.query_builders.simulation_dashboard import (
     SIMULATION_AGGREGATIONS,
 )
 from tracer.services.exact_aggregation_cache import (
+    EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS,
+    EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS,
+    EXACT_AGGREGATION_WORKFLOW_EXECUTION_TIMEOUT_SECONDS,
+    EXACT_AGGREGATION_WORKFLOW_RUN_TIMEOUT_SECONDS,
     _exact_refresh_workflow_task_id,
     begin_exact_refresh,
     exact_payload_is_complete,
@@ -499,6 +504,7 @@ def test_refresh_failure_serves_prior_exact_snapshot_without_replacing_it():
 
 
 @pytest.mark.unit
+@override_settings(EXACT_AGGREGATION_TASK_QUEUE="exact_aggregation")
 def test_cold_miss_is_pending_poll_dedupes_then_exact_publish_becomes_visible():
     cache.clear()
     identity = {"project": "p", "metric": "traffic"}
@@ -525,7 +531,7 @@ def test_cold_miss_is_pending_poll_dedupes_then_exact_publish_becomes_visible():
     assert second["query_status"] == "pending"
     assert enqueue.call_count == 1
     task_kwargs = enqueue.call_args.kwargs["kwargs"]
-    assert enqueue.call_args.kwargs["queue"] == "tasks_xl"
+    assert enqueue.call_args.kwargs["queue"] == "exact_aggregation"
     assert enqueue.call_args.kwargs["task_id"].startswith("exact-aggregation-")
     from temporalio.common import WorkflowIDConflictPolicy
 
@@ -950,10 +956,456 @@ def test_concurrent_cold_requests_enqueue_only_one_refresh():
 
 
 @pytest.mark.unit
-def test_refresh_claim_uses_short_dispatch_lease_then_activity_promotes_it(
+@override_settings(EXACT_AGGREGATION_TASK_QUEUE="exact_aggregation")
+def test_distinct_exact_identities_enqueue_independently_on_admitted_queue():
+    """The worker queue, rather than identity coalescing, serializes unique reads."""
+
+    cache.clear()
+    pending = {
+        "metric_name": "cost",
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+    identities = [
+        {"project": "p", "metric": "cost"},
+        {"project": "p", "metric": "latency"},
+    ]
+
+    with patch(
+        "tracer.tasks.exact_aggregation.refresh_exact_aggregation_snapshot.apply_async"
+    ) as enqueue:
+        for identity in identities:
+            read_or_schedule_exact_snapshot(
+                "test-distinct",
+                identity,
+                refresh=False,
+                pending_payload=pending,
+            )
+
+    assert enqueue.call_count == 2
+    assert {call.kwargs["queue"] for call in enqueue.call_args_list} == {
+        "exact_aggregation"
+    }
+    assert len({call.kwargs["task_id"] for call in enqueue.call_args_list}) == len(
+        identities
+    )
+
+
+@pytest.mark.unit
+@override_settings(EXACT_AGGREGATION_TASK_QUEUE="tasks_xl")
+def test_exact_refresh_defaults_to_existing_xl_queue_without_dedicated_worker():
+    cache.clear()
+    pending = {
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+
+    with patch(
+        "tracer.tasks.exact_aggregation.refresh_exact_aggregation_snapshot.apply_async"
+    ) as enqueue:
+        read_or_schedule_exact_snapshot(
+            "test-default-queue",
+            {"project": "p", "metric": "cost"},
+            refresh=False,
+            pending_payload=pending,
+        )
+
+    assert enqueue.call_args.kwargs["queue"] == "tasks_xl"
+
+
+@pytest.mark.unit
+@override_settings(EXACT_AGGREGATION_TASK_QUEUE="typo_unpolled_queue")
+def test_invalid_exact_refresh_queue_fails_closed_without_claim_or_dispatch():
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    cache.clear()
+    identity = {"project": "p", "metric": "cost"}
+    pending = {
+        "data": [],
+        "query_complete": False,
+        "query_status": "pending",
+        "query_sampled": False,
+    }
+
+    with patch(
+        "tracer.tasks.exact_aggregation.refresh_exact_aggregation_snapshot.apply_async"
+    ) as enqueue:
+        result = read_or_schedule_exact_snapshot(
+            "test-invalid-queue",
+            identity,
+            refresh=True,
+            pending_payload=pending,
+        )
+
+    enqueue.assert_not_called()
+    assert result["query_refresh_failed"] is True
+    assert result["query_refreshing"] is False
+    assert (
+        cache.get(cache_module._refresh_lock_key("test-invalid-queue", identity))
+        is None
+    )
+
+
+@pytest.mark.unit
+def test_partial_fallback_claim_write_releases_only_its_own_lock(monkeypatch):
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    class StateWriteFailsCache:
+        def __init__(self):
+            self.values = {}
+
+        def add(self, key, value, *, timeout):
+            del timeout
+            if key in self.values:
+                return False
+            self.values[key] = value
+            return True
+
+        def set(self, key, value, *, timeout):
+            del value, timeout
+            if key.endswith(":refresh-state"):
+                raise RuntimeError("state cache unavailable")
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+    failing_cache = StateWriteFailsCache()
+    monkeypatch.setattr(cache_module, "cache", failing_cache)
+    identity = {"project": "p", "metric": "latency"}
+
+    assert cache_module.begin_exact_refresh("partial-claim", identity) is None
+    assert failing_cache.values == {}
+
+
+@pytest.mark.unit
+def test_partial_fallback_claim_cleanup_never_deletes_replacement_owner(monkeypatch):
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    class ReplacementWinsCache:
+        def __init__(self):
+            self.values = {}
+            self.deleted = []
+            self.lock_key = None
+
+        def add(self, key, value, *, timeout):
+            del timeout
+            self.lock_key = key
+            self.values[key] = value
+            return True
+
+        def set(self, key, value, *, timeout):
+            del key, value, timeout
+            # Model the original lease expiring while the state backend fails,
+            # followed by a different process claiming the same identity.
+            self.values[self.lock_key] = "replacement-token"
+            raise RuntimeError("state cache unavailable")
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def delete(self, key):
+            self.deleted.append(key)
+            self.values.pop(key, None)
+
+    racing_cache = ReplacementWinsCache()
+    monkeypatch.setattr(cache_module, "cache", racing_cache)
+
+    assert (
+        cache_module.begin_exact_refresh(
+            "replacement-race",
+            {"project": "p", "metric": "traffic"},
+        )
+        is None
+    )
+    assert racing_cache.values[racing_cache.lock_key] == "replacement-token"
+    assert racing_cache.deleted == []
+
+
+@pytest.mark.unit
+def test_redis_refresh_claim_creates_lock_and_state_in_one_lua_operation(monkeypatch):
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    captured = {}
+
+    class RawClient:
+        def eval(self, *args):
+            captured["args"] = args
+            return 1
+
+    class RedisAdapter:
+        def get_client(self, *, write):
+            assert write is True
+            return RawClient()
+
+        def make_key(self, key):
+            return f"redis:{key}"
+
+        def encode(self, value):
+            return value
+
+    monkeypatch.setattr(
+        cache_module,
+        "_redis_cache_client",
+        lambda: RedisAdapter(),
+    )
+
+    token = cache_module.begin_exact_refresh(
+        "redis-atomic-claim",
+        {"project": "p", "metric": "traffic"},
+    )
+
+    assert token
+    script, key_count, lock_key, state_key, encoded_token, state, ttl_ms = captured[
+        "args"
+    ]
+    assert script == cache_module._REDIS_ATOMIC_REFRESH_CLAIM_SCRIPT
+    assert key_count == 2
+    assert lock_key.endswith(":refresh-lock")
+    assert state_key.endswith(":refresh-state")
+    assert encoded_token == token
+    assert state == {"status": "running", "token": token, "phase": "dispatch"}
+    assert ttl_ms == cache_module._refresh_dispatch_seconds() * 1000
+
+
+@pytest.mark.unit
+def test_redis_refresh_claim_recovers_after_post_success_response_failure(monkeypatch):
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    class RawClient:
+        def __init__(self):
+            self.values = {}
+            self.claim_calls = 0
+
+        def eval(self, script, key_count, *parts):
+            assert script == cache_module._REDIS_ATOMIC_REFRESH_CLAIM_SCRIPT
+            assert key_count == 2
+            lock_key, state_key, token, state, _ttl_ms = parts
+            self.values[lock_key] = token
+            self.values[state_key] = state
+            self.claim_calls += 1
+            raise ConnectionError("response lost after Redis committed")
+
+        def mget(self, *keys):
+            return [self.values.get(key) for key in keys]
+
+    class RedisAdapter:
+        def __init__(self):
+            self.raw = RawClient()
+
+        def get_client(self, *, write):
+            assert write is True
+            return self.raw
+
+        @staticmethod
+        def make_key(key):
+            return f"redis:{key}"
+
+        @staticmethod
+        def encode(value):
+            return value
+
+    adapter = RedisAdapter()
+    monkeypatch.setattr(cache_module, "_redis_cache_client", lambda: adapter)
+
+    token = cache_module.begin_exact_refresh(
+        "redis-post-success",
+        {"project": "p", "metric": "traffic"},
+    )
+
+    assert token
+    assert adapter.raw.claim_calls == 1
+    assert sorted(adapter.raw.values.values(), key=str) == sorted(
+        [
+            token,
+            {"status": "running", "token": token, "phase": "dispatch"},
+        ],
+        key=str,
+    )
+
+
+@pytest.mark.unit
+def test_redis_refresh_claim_fenced_cleanup_removes_partial_ambiguous_write(
     monkeypatch,
 ):
-    """Only an activity that actually starts may hold the one-hour lease."""
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    class RawClient:
+        def __init__(self):
+            self.values = {}
+            self.scripts = []
+
+        def eval(self, script, key_count, *parts):
+            self.scripts.append(script)
+            assert key_count == 2
+            lock_key, state_key = parts[:2]
+            if script == cache_module._REDIS_ATOMIC_REFRESH_CLAIM_SCRIPT:
+                token, _state, _ttl_ms = parts[2:]
+                self.values[lock_key] = token
+                raise ConnectionError("state write failed after lock write")
+            assert script == cache_module._REDIS_FENCED_ROLLBACK_REFRESH_CLAIM_SCRIPT
+            token, state = parts[2:]
+            if self.values.get(state_key) == state:
+                self.values.pop(state_key, None)
+            if self.values.get(lock_key) == token:
+                self.values.pop(lock_key, None)
+            return 1
+
+        def mget(self, *keys):
+            return [self.values.get(key) for key in keys]
+
+    class RedisAdapter:
+        def __init__(self):
+            self.raw = RawClient()
+
+        def get_client(self, *, write):
+            assert write is True
+            return self.raw
+
+        @staticmethod
+        def make_key(key):
+            return f"redis:{key}"
+
+        @staticmethod
+        def encode(value):
+            return value
+
+    adapter = RedisAdapter()
+    monkeypatch.setattr(cache_module, "_redis_cache_client", lambda: adapter)
+
+    token = cache_module.begin_exact_refresh(
+        "redis-partial-ambiguous",
+        {"project": "p", "metric": "traffic"},
+    )
+
+    assert token is None
+    assert adapter.raw.values == {}
+    assert adapter.raw.scripts == [
+        cache_module._REDIS_ATOMIC_REFRESH_CLAIM_SCRIPT,
+        cache_module._REDIS_FENCED_ROLLBACK_REFRESH_CLAIM_SCRIPT,
+    ]
+
+
+@pytest.mark.unit
+def test_redis_refresh_claim_fenced_cleanup_preserves_replacement_owner(monkeypatch):
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    replacement_token = "replacement-token"
+
+    class RawClient:
+        def __init__(self):
+            self.values = {}
+
+        def eval(self, script, key_count, *parts):
+            assert key_count == 2
+            lock_key, state_key = parts[:2]
+            if script == cache_module._REDIS_ATOMIC_REFRESH_CLAIM_SCRIPT:
+                token, _state, _ttl_ms = parts[2:]
+                self.values[lock_key] = token
+                raise ConnectionError("state write failed after lock write")
+            assert script == cache_module._REDIS_FENCED_ROLLBACK_REFRESH_CLAIM_SCRIPT
+            token, state = parts[2:]
+            if self.values.get(state_key) == state:
+                self.values.pop(state_key, None)
+            if self.values.get(lock_key) == token:
+                self.values.pop(lock_key, None)
+            return 0
+
+        def mget(self, *keys):
+            observed = [self.values.get(key) for key in keys]
+            # The old lease expires and a replacement wins after readback but
+            # before rollback. The Lua value fence must preserve its lock.
+            self.values[keys[0]] = replacement_token
+            return observed
+
+    class RedisAdapter:
+        def __init__(self):
+            self.raw = RawClient()
+
+        def get_client(self, *, write):
+            assert write is True
+            return self.raw
+
+        @staticmethod
+        def make_key(key):
+            return f"redis:{key}"
+
+        @staticmethod
+        def encode(value):
+            return value
+
+    adapter = RedisAdapter()
+    monkeypatch.setattr(cache_module, "_redis_cache_client", lambda: adapter)
+
+    token = cache_module.begin_exact_refresh(
+        "redis-replacement-race",
+        {"project": "p", "metric": "traffic"},
+    )
+
+    assert token is None
+    assert list(adapter.raw.values.values()) == [replacement_token]
+
+
+@pytest.mark.unit
+def test_redis_refresh_claim_readback_outage_leaves_bounded_claim(monkeypatch):
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    class RawClient:
+        def __init__(self):
+            self.values = {}
+            self.ttl_ms = None
+
+        def eval(self, script, key_count, *parts):
+            assert script == cache_module._REDIS_ATOMIC_REFRESH_CLAIM_SCRIPT
+            assert key_count == 2
+            lock_key, state_key, token, state, self.ttl_ms = parts
+            self.values[lock_key] = token
+            self.values[state_key] = state
+            raise ConnectionError("response lost after Redis committed")
+
+        def mget(self, *_keys):
+            raise ConnectionError("Redis still unavailable")
+
+    class RedisAdapter:
+        def __init__(self):
+            self.raw = RawClient()
+
+        def get_client(self, *, write):
+            assert write is True
+            return self.raw
+
+        @staticmethod
+        def make_key(key):
+            return f"redis:{key}"
+
+        @staticmethod
+        def encode(value):
+            return value
+
+    adapter = RedisAdapter()
+    monkeypatch.setattr(cache_module, "_redis_cache_client", lambda: adapter)
+
+    token = cache_module.begin_exact_refresh(
+        "redis-readback-outage",
+        {"project": "p", "metric": "traffic"},
+    )
+
+    assert token is None
+    assert len(adapter.raw.values) == 2
+    assert adapter.raw.ttl_ms == cache_module._refresh_dispatch_seconds() * 1000
+
+
+@pytest.mark.unit
+def test_refresh_claim_uses_queue_dispatch_lease_then_activity_promotes_it(
+    monkeypatch,
+):
+    """Only an activity that actually starts may hold the running lease."""
 
     from tracer.services import exact_aggregation_cache as cache_module
 
@@ -978,24 +1430,64 @@ def test_refresh_claim_uses_short_dispatch_lease_then_activity_promotes_it(
 
     recording_cache = RecordingCache()
     monkeypatch.setattr(cache_module, "cache", recording_cache)
-    monkeypatch.setattr(cache_module, "_refresh_dispatch_seconds", lambda: 600)
-    monkeypatch.setattr(cache_module, "_refresh_lock_seconds", lambda: 3600)
+    dispatch_seconds = 13 * 60 * 60
+    running_seconds = EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS + 5 * 60
+    monkeypatch.setattr(
+        cache_module,
+        "_refresh_dispatch_seconds",
+        lambda: dispatch_seconds,
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "_refresh_lock_seconds",
+        lambda: running_seconds,
+    )
     identity = {"project": "p", "metric": "latency"}
 
     token = cache_module.begin_exact_refresh("observe-lease-test", identity)
 
     assert token
-    assert [timeout for _op, _key, timeout in recording_cache.timeouts] == [600, 600]
+    assert [timeout for _op, _key, timeout in recording_cache.timeouts] == [
+        dispatch_seconds,
+        dispatch_seconds,
+    ]
     assert cache_module.activate_exact_refresh("observe-lease-test", identity, token)
     assert [timeout for _op, _key, timeout in recording_cache.timeouts[-2:]] == [
-        3600,
-        3600,
+        running_seconds,
+        running_seconds,
     ]
 
 
 @pytest.mark.unit
+def test_exact_refresh_lease_settings_cannot_undercut_temporal_timeouts(monkeypatch):
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    monkeypatch.setattr(
+        cache_module.settings,
+        "EXACT_AGGREGATION_REFRESH_DISPATCH_SECONDS",
+        10 * 60,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cache_module.settings,
+        "EXACT_AGGREGATION_REFRESH_LOCK_SECONDS",
+        EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS,
+        raising=False,
+    )
+
+    assert (
+        cache_module._refresh_dispatch_seconds()
+        > EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS
+    )
+    assert (
+        cache_module._refresh_lock_seconds()
+        > EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS
+    )
+
+
+@pytest.mark.unit
 def test_dispatch_lease_survives_queue_delay_then_promotes_to_running(monkeypatch):
-    """A healthy tasks_xl backlog must not expire the pre-start claim."""
+    """A healthy exact queue backlog must not expire the pre-start claim."""
 
     from tracer.services import exact_aggregation_cache as cache_module
 
@@ -1035,8 +1527,18 @@ def test_dispatch_lease_survives_queue_delay_then_promotes_to_running(monkeypatc
 
     expiring_cache = ExpiringCache()
     monkeypatch.setattr(cache_module, "cache", expiring_cache)
-    monkeypatch.setattr(cache_module, "_refresh_dispatch_seconds", lambda: 600)
-    monkeypatch.setattr(cache_module, "_refresh_lock_seconds", lambda: 3600)
+    dispatch_seconds = 13 * 60 * 60
+    running_seconds = EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS + 5 * 60
+    monkeypatch.setattr(
+        cache_module,
+        "_refresh_dispatch_seconds",
+        lambda: dispatch_seconds,
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "_refresh_lock_seconds",
+        lambda: running_seconds,
+    )
     namespace = "observe-delayed-start"
     identity = {"project": "p", "metric": "latency"}
 
@@ -1049,12 +1551,13 @@ def test_dispatch_lease_survives_queue_delay_then_promotes_to_running(monkeypatc
         "task-exact-delayed",
     )
 
-    expiring_cache.advance(9 * 60)
+    # More than ten minutes, and nearly the full Temporal schedule-to-start
+    # window, remains a valid queued claim.
+    expiring_cache.advance(11 * 60 * 60)
     assert cache_module.activate_exact_refresh(namespace, identity, token)
 
-    # We are now past the original dispatch deadline, but activity promotion
-    # owns an independent one-hour lease.
-    expiring_cache.advance(2 * 60)
+    # Promotion owns an independent lease longer than the activity timeout.
+    expiring_cache.advance(EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS)
     assert cache_module.refresh_claim_is_current(namespace, identity, token)
 
 
@@ -1111,6 +1614,170 @@ def test_expired_dispatch_replacement_fences_the_delayed_old_activity(monkeypatc
     assert cache_module.activate_exact_refresh(namespace, identity, old_token) is False
     assert cache_module.activate_exact_refresh(namespace, identity, new_token) is True
     assert cache_module.refresh_claim_is_current(namespace, identity, new_token)
+
+
+@pytest.mark.unit
+def test_running_lease_margin_prevents_timeout_overlap_and_fences_old_token(
+    monkeypatch,
+):
+    """No replacement is admitted while a timed-out sync query may unwind."""
+
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    class ExpiringCache:
+        def __init__(self):
+            self.now = 0
+            self.values = {}
+
+        def _live_value(self, key):
+            stored = self.values.get(key)
+            if stored is None:
+                return None
+            value, expires_at = stored
+            if expires_at is not None and expires_at <= self.now:
+                self.values.pop(key, None)
+                return None
+            return value
+
+        def add(self, key, value, *, timeout):
+            if self._live_value(key) is not None:
+                return False
+            self.set(key, value, timeout=timeout)
+            return True
+
+        def set(self, key, value, *, timeout):
+            self.values[key] = (value, self.now + timeout)
+
+        def get(self, key):
+            return self._live_value(key)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    expiring_cache = ExpiringCache()
+    running_seconds = EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS + 5 * 60
+    monkeypatch.setattr(cache_module, "cache", expiring_cache)
+    monkeypatch.setattr(
+        cache_module,
+        "_refresh_dispatch_seconds",
+        lambda: 13 * 60 * 60,
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "_refresh_lock_seconds",
+        lambda: running_seconds,
+    )
+    namespace = "observe-running-timeout-fence"
+    identity = {"project": "p", "metric": "traffic"}
+
+    old_token = cache_module.begin_exact_refresh(namespace, identity)
+    assert old_token
+    assert cache_module.activate_exact_refresh(namespace, identity, old_token)
+
+    expiring_cache.advance(EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS)
+    assert cache_module.refresh_claim_is_current(namespace, identity, old_token)
+    assert cache_module.begin_exact_refresh(namespace, identity) is None
+
+    expiring_cache.advance(5 * 60 + 1)
+    new_token = cache_module.begin_exact_refresh(namespace, identity)
+    assert new_token and new_token != old_token
+    assert cache_module.activate_exact_refresh(namespace, identity, old_token) is False
+    cache_module.finish_exact_refresh(
+        namespace,
+        identity,
+        old_token,
+        succeeded=False,
+    )
+    assert cache_module.refresh_claim_is_current(namespace, identity, new_token)
+
+
+@pytest.mark.unit
+def test_running_lease_keepalive_covers_the_actual_sync_query_lifetime(monkeypatch):
+    """A timed-out wrapper cannot outlive the lease protecting its CH thread."""
+
+    from tracer.tasks import exact_aggregation as task_module
+
+    renewals = []
+
+    class StopAfterTwoRenewals:
+        def wait(self, timeout):
+            assert timeout == task_module.EXACT_AGGREGATION_LEASE_RENEW_INTERVAL_SECONDS
+            return len(renewals) >= 2
+
+    monkeypatch.setattr(
+        task_module,
+        "activate_exact_refresh",
+        lambda namespace, identity, token: (
+            renewals.append((namespace, identity, token)) or True
+        ),
+    )
+
+    task_module._renew_exact_refresh_lease_until_stopped(
+        namespace="observe-sync-overrun",
+        identity={"project": "p", "metric": "traffic"},
+        refresh_token="current-token",
+        stop_event=StopAfterTwoRenewals(),
+    )
+
+    assert renewals == [
+        (
+            "observe-sync-overrun",
+            {"project": "p", "metric": "traffic"},
+            "current-token",
+        ),
+        (
+            "observe-sync-overrun",
+            {"project": "p", "metric": "traffic"},
+            "current-token",
+        ),
+    ]
+
+
+@pytest.mark.unit
+def test_keeper_start_failure_still_releases_the_fenced_refresh_claim(monkeypatch):
+    from tracer.tasks import exact_aggregation as task_module
+
+    finished = []
+
+    class ThreadThatCannotStart:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread unavailable")
+
+        def join(self, *, timeout):
+            pytest.fail(f"an unstarted keeper must not be joined ({timeout=})")
+
+    monkeypatch.setattr(task_module, "Thread", ThreadThatCannotStart)
+    monkeypatch.setattr(task_module, "Event", lambda: SimpleNamespace(set=lambda: None))
+    monkeypatch.setattr(task_module, "activate_exact_refresh", lambda *_args: True)
+    monkeypatch.setattr(
+        task_module,
+        "finish_exact_refresh",
+        lambda namespace, identity, token, *, succeeded: finished.append(
+            (namespace, identity, token, succeeded)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="exact aggregation refresh failed"):
+        task_module.refresh_exact_aggregation_snapshot.run_sync(
+            namespace="observe-keeper-start-failure",
+            identity={"project": "p", "metric": "traffic"},
+            refresh_token="current-token",
+        )
+
+    assert finished == [
+        (
+            "observe-keeper-start-failure",
+            {"project": "p", "metric": "traffic"},
+            "current-token",
+            False,
+        )
+    ]
 
 
 @pytest.mark.unit
@@ -1267,9 +1934,8 @@ def test_terminal_status_racing_with_activity_promotion_cannot_clear_running_cla
 
 
 @pytest.mark.unit
-@pytest.mark.django_db
 def test_expired_unstarted_dispatch_is_reclaimed_by_an_ordinary_poll(monkeypatch):
-    """A Temporal pre-activity failure must not leave a one-hour pending UI."""
+    """A terminal Temporal pre-activity failure is reclaimed without TTL wait."""
 
     from tracer.services import exact_aggregation_cache as cache_module
     from tracer.tasks import exact_aggregation as task_module
@@ -1295,7 +1961,7 @@ def test_expired_unstarted_dispatch_is_reclaimed_by_an_ordinary_poll(monkeypatch
         )
         first_task = enqueue.call_args
 
-        # Model the short dispatch lease expiring because a mixed-version
+        # Model the dispatch lease expiring because a mixed-version
         # worker rejected the unknown activity before this function ran.
         cache.delete(cache_module._refresh_lock_key(namespace, identity))
         cache.delete(cache_module._refresh_state_key(namespace, identity))
@@ -1390,7 +2056,6 @@ def test_cold_miss_enqueue_failure_releases_claim_and_fails_closed():
 
 
 @pytest.mark.unit
-@pytest.mark.django_db
 def test_background_worker_publishes_only_after_complete_loader(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 
@@ -1427,7 +2092,6 @@ def test_background_worker_publishes_only_after_complete_loader(monkeypatch):
 
 
 @pytest.mark.unit
-@pytest.mark.django_db
 def test_background_worker_failure_leaves_cache_unpublished_and_retryable(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 
@@ -1465,21 +2129,68 @@ def test_background_worker_failure_leaves_cache_unpublished_and_retryable(monkey
 
 
 @pytest.mark.unit
-def test_exact_refresh_is_registered_on_existing_temporal_xl_worker():
+def test_exact_refresh_has_a_dedicated_minimal_temporal_queue():
     from tfc.temporal.common.registry import (
         TEMPORAL_ACTIVITY_MODULES,
+        get_activities_for_queue,
         get_workflows_for_queue,
     )
-    from tfc.temporal.drop_in.decorator import _ACTIVITY_REGISTRY
+    from tfc.temporal.drop_in.decorator import (
+        _ACTIVITY_REGISTRY,
+        _ACTIVITY_WRAPPERS,
+    )
     from tfc.temporal.drop_in.workflow import TaskRunnerWorkflow
-    from tracer.tasks.exact_aggregation import refresh_exact_aggregation_snapshot
+    from tracer.services import exact_aggregation_cache as cache_module
+    from tracer.tasks.exact_aggregation import (
+        EXACT_AGGREGATION_TASK_QUEUE,
+        refresh_exact_aggregation_snapshot,
+    )
 
     metadata = _ACTIVITY_REGISTRY[refresh_exact_aggregation_snapshot.name]
-    assert metadata["queue"] == "tasks_xl"
-    assert metadata["time_limit"] == 60 * 60
+    assert metadata["queue"] == EXACT_AGGREGATION_TASK_QUEUE
+    assert metadata["time_limit"] == EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS
     assert metadata["max_retries"] == 0
+    assert (
+        metadata["schedule_to_start_timeout"]
+        == EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS
+    )
+    assert (
+        metadata["workflow_run_timeout"]
+        == EXACT_AGGREGATION_WORKFLOW_RUN_TIMEOUT_SECONDS
+    )
+    assert (
+        metadata["workflow_execution_timeout"]
+        == EXACT_AGGREGATION_WORKFLOW_EXECUTION_TIMEOUT_SECONDS
+    )
+    assert metadata["workflow_run_timeout"] > (
+        metadata["schedule_to_start_timeout"] + metadata["time_limit"]
+    )
     assert "tracer.tasks" in TEMPORAL_ACTIVITY_MODULES
-    assert TaskRunnerWorkflow in get_workflows_for_queue("tasks_xl")
+    assert get_workflows_for_queue(EXACT_AGGREGATION_TASK_QUEUE) == [TaskRunnerWorkflow]
+    assert get_activities_for_queue(EXACT_AGGREGATION_TASK_QUEUE) == [
+        _ACTIVITY_WRAPPERS[refresh_exact_aggregation_snapshot.name]
+    ]
+    # Keep the activity registered on the former generic queue during rollout
+    # so already-scheduled workflows can finish on an old queue worker. New
+    # dispatches are asserted above to target only the admitted queue.
+    assert _ACTIVITY_WRAPPERS[
+        refresh_exact_aggregation_snapshot.name
+    ] in get_activities_for_queue("tasks_xl")
+    for generic_queue in (
+        "default",
+        "tasks_s",
+        "tasks_l",
+        "agent_compass",
+        "trace_ingestion",
+    ):
+        assert _ACTIVITY_WRAPPERS[
+            refresh_exact_aggregation_snapshot.name
+        ] not in get_activities_for_queue(generic_queue)
+    assert (
+        cache_module._refresh_dispatch_seconds()
+        > EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS
+    )
+    assert cache_module._refresh_lock_seconds() > metadata["time_limit"]
 
 
 @pytest.mark.unit
@@ -1496,7 +2207,6 @@ def test_exact_refresh_workflow_id_is_deterministic_and_opaque_per_claim():
 
 
 @pytest.mark.unit
-@pytest.mark.django_db
 def test_redelivered_exact_refresh_cannot_publish_after_claim_finished(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 
@@ -5150,6 +5860,51 @@ def test_annotation_membership_batches_use_current_state_without_ceilings(
     )
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
+
+
+@pytest.mark.unit
+def test_annotation_membership_batches_share_one_whole_refresh_deadline(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    analytics = _RelationSnapshotAnalytics()
+    start = datetime(2026, 1, 1)
+    end = datetime(2026, 1, 3)
+    score = {
+        "trace_id": "44444444-4444-4444-8444-444444444441",
+        "observation_span_id": None,
+        "created_at": datetime(2026, 1, 2, 1),
+        "value": {"rating": 4},
+    }
+    label = SimpleNamespace(name="quality", type="numeric")
+    monkeypatch.setattr(
+        exact_module,
+        "Score",
+        SimpleNamespace(no_workspace_objects=_ScoreManager(score)),
+    )
+    monkeypatch.setattr(
+        exact_module,
+        "get_annotation_labels_for_project",
+        lambda _project_id: SimpleNamespace(get=lambda **_kwargs: label),
+    )
+    monkeypatch.setattr(exact_module.transaction, "atomic", nullcontext)
+    monkeypatch.setattr(exact_module, "connection", SimpleNamespace(vendor="sqlite"))
+    clock = iter((0.0, exact_module.EXACT_GRAPH_QUERY_TIMEOUT_MS / 1000 + 0.001))
+    monkeypatch.setattr(exact_module, "monotonic", lambda: next(clock))
+
+    with pytest.raises(ExactGraphReadError, match="deadline exceeded"):
+        read_exact_annotation_graph(
+            analytics=analytics,
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=[_time_filter(start, end)],
+            interval="day",
+            req_data_config={
+                "id": "55555555-5555-4555-8555-555555555555",
+                "output_type": "float",
+            },
+            observe_type="trace",
+        )
+
+    assert analytics.main_calls == []
 
 
 @pytest.mark.unit

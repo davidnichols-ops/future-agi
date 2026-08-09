@@ -92,6 +92,25 @@ class TestDecoratorDefaults:
         assert meta["queue"] == "custom"
         assert meta["time_limit"] == 42
 
+    def test_workflow_timeout_override_requires_queue_and_activity_margin(self):
+        with pytest.raises(ValueError, match="must exceed"):
+            _decorate(
+                "test_invalid_workflow_margin",
+                time_limit=60 * 60,
+                schedule_to_start_timeout=12 * 60 * 60,
+                workflow_run_timeout=13 * 60 * 60,
+            )
+
+    def test_execution_timeout_override_must_exceed_run_timeout(self):
+        with pytest.raises(ValueError, match="must exceed"):
+            _decorate(
+                "test_invalid_execution_margin",
+                time_limit=60 * 60,
+                schedule_to_start_timeout=12 * 60 * 60,
+                workflow_run_timeout=14 * 60 * 60,
+                workflow_execution_timeout=14 * 60 * 60,
+            )
+
 
 # =============================================================================
 # TaskRunnerInput dataclass
@@ -198,6 +217,9 @@ class TestRunnerInputConstruction:
             max_retries=2,
             retry_delay=15,
             queue="trace_ingestion",
+            schedule_to_start_timeout=12 * 60 * 60,
+            workflow_run_timeout=14 * 60 * 60,
+            workflow_execution_timeout=24 * 60 * 60,
         )
 
         captured = {}
@@ -205,6 +227,8 @@ class TestRunnerInputConstruction:
         async def _capture_start_workflow(workflow_run, run_input, **kwargs):
             captured["input"] = run_input
             captured["task_queue"] = kwargs.get("task_queue")
+            captured["run_timeout"] = kwargs.get("run_timeout")
+            captured["execution_timeout"] = kwargs.get("execution_timeout")
             return MagicMock()
 
         fake_client = MagicMock()
@@ -230,6 +254,9 @@ class TestRunnerInputConstruction:
         assert run_input.time_limit == 3600
         assert run_input.max_retries == 2
         assert run_input.retry_delay == 15
+        assert run_input.schedule_to_start_timeout == 12 * 60 * 60
+        assert captured["run_timeout"] == timedelta(hours=14)
+        assert captured["execution_timeout"] == timedelta(hours=24)
 
     @pytest.mark.asyncio
     async def test_runner_passes_none_when_activity_unknown(self):
@@ -263,6 +290,7 @@ class TestRunnerInputConstruction:
         assert run_input.time_limit is None
         assert run_input.max_retries is None
         assert run_input.retry_delay is None
+        assert run_input.schedule_to_start_timeout is None
 
 
 @pytest.mark.unit
