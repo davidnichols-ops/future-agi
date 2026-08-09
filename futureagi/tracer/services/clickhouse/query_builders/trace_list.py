@@ -1992,8 +1992,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         before_start_time: datetime | None = None,
         before_id: Any = None,
         _unindexed_positive_micro_seed: bool = False,
+        _deduplicate_traces: bool = False,
     ) -> tuple[str, dict[str, Any]]:
-        """Return a bounded root-order superset for latest-state classification."""
+        """Return a bounded root-order superset for latest-state classification.
+
+        ``_deduplicate_traces`` is reserved for the asynchronous exact graph
+        reader. It collapses sibling-span witnesses to one trace identity per
+        slice before keyset pagination; normal trace-list pagination retains
+        physical witness identities and behavior unchanged.
+        """
 
         if not self.supports_bounded_filter_scan():
             raise ValueError("unsupported bounded trace filter scan")
@@ -2108,7 +2115,46 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             if not slice_start <= before_start_time < slice_end:
                 raise ValueError("trace keyset must stay inside its slice")
             params["filter_before_start_us"] = _unix_microseconds(before_start_time)
-            if any_span_plans:
+            if _deduplicate_traces:
+                if self.project_ids is not None:
+                    if not (
+                        isinstance(before_id, tuple)
+                        and len(before_id) == 2
+                        and all(isinstance(value, str) for value in before_id)
+                    ):
+                        raise ValueError(
+                            "deduplicated org trace keyset must be a "
+                            "(trace_id, project_id) tuple"
+                        )
+                    params["filter_before_id"] = before_id[0]
+                    params["filter_before_project_id"] = before_id[1]
+                    keyset_fragment = """
+              AND (
+                  toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
+                  OR (
+                      toUnixTimestamp64Micro(start_time) = %(filter_before_start_us)s
+                      AND (
+                          trace_id < %(filter_before_id)s
+                          OR (
+                              trace_id = %(filter_before_id)s
+                              AND toString(project_id) < %(filter_before_project_id)s
+                          )
+                      )
+                  )
+              )
+            """
+                else:
+                    params["filter_before_id"] = str(before_id)
+                    keyset_fragment = """
+              AND (
+                  toUnixTimestamp64Micro(start_time) < %(filter_before_start_us)s
+                  OR (
+                      toUnixTimestamp64Micro(start_time) = %(filter_before_start_us)s
+                      AND trace_id < %(filter_before_id)s
+                  )
+              )
+            """
+            elif any_span_plans:
                 if not (
                     isinstance(before_id, tuple)
                     and len(before_id) == 3
@@ -2179,6 +2225,47 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                   )
               )
             """
+
+        if _deduplicate_traces:
+            # Exact graphs need trace identities, not every matching sibling
+            # span. Collapse the raw necessary-superset witness inside the
+            # slice before applying the outer keyset. Applying the keyset to
+            # raw spans first would let a trace reappear from an older sibling
+            # on the next page and recreate the production fanout failure.
+            deduplicated_order = (
+                "ORDER BY start_time DESC, trace_id DESC, "
+                "toString(project_id) DESC"
+                if self.project_ids is not None
+                else "ORDER BY start_time DESC, trace_id DESC"
+            )
+            deduplicated_root_fragment = (
+                "" if any_span_plans else "AND (parent_span_id IS NULL OR parent_span_id = '')"
+            )
+            query = f"""
+        SELECT project_id, trace_id, start_time
+        FROM (
+            SELECT
+                project_id,
+                trace_id,
+                max(start_time) AS start_time
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              AND is_deleted = 0
+              {project_version_fragment}
+              {deduplicated_root_fragment}
+              AND start_time >= fromUnixTimestamp64Micro(%(filter_slice_start_us)s)
+              AND start_time < fromUnixTimestamp64Micro(%(filter_slice_end_us)s)
+            WHERE 1 = 1
+              {predicate_fragment}{datetime_fragment}
+              {sampling_fragment}
+            GROUP BY project_id, trace_id
+        ) AS deduplicated_trace_witnesses
+        WHERE 1 = 1
+          {keyset_fragment}
+        {deduplicated_order}
+        LIMIT %(filter_seed_limit)s
+        """
+            return query, params
 
         if any_span_plans:
             select_fragment = "project_id, trace_id, id AS matched_span_id, start_time"

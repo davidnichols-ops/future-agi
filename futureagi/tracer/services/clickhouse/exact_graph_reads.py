@@ -460,6 +460,7 @@ def _enumerate_exact_trace_ids(
                 limit=EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE,
                 before_start_time=before_start_time,
                 before_id=before_order_token,
+                _deduplicate_traces=True,
             )
             query_count += 1
             try:

@@ -1991,18 +1991,12 @@ def test_exact_trace_membership_exhausts_witness_cursor_and_classifies_each_trac
     seed_pages = iter(
         [
             [
-                {"trace_id": "trace-3", "matched_span_id": "span-3", "start_time": t3},
-                {"trace_id": "trace-2", "matched_span_id": "span-2", "start_time": t2},
+                {"trace_id": "trace-3", "start_time": t3},
+                {"trace_id": "trace-2", "start_time": t2},
             ],
             [
-                {
-                    "trace_id": "trace-2",
-                    "matched_span_id": "span-2b",
-                    "start_time": t1 + timedelta(hours=2),
-                },
-                {"trace_id": "trace-1", "matched_span_id": "span-1", "start_time": t1},
+                {"trace_id": "trace-1", "start_time": t1},
             ],
-            [],
         ]
     )
 
@@ -2023,15 +2017,21 @@ def test_exact_trace_membership_exhausts_witness_cursor_and_classifies_each_trac
 
         @staticmethod
         def bounded_filter_seed_identity(row):
-            return row["matched_span_id"]
+            return row["trace_id"]
 
         @staticmethod
         def bounded_filter_seed_order_token(row):
-            return row["matched_span_id"]
+            return row["trace_id"]
 
         @staticmethod
         def build_filter_seed_page(**kwargs):
-            seed_calls.append((kwargs["before_start_time"], kwargs["before_id"]))
+            seed_calls.append(
+                (
+                    kwargs["before_start_time"],
+                    kwargs["before_id"],
+                    kwargs["_deduplicate_traces"],
+                )
+            )
             return "WITNESS", {}
 
         @staticmethod
@@ -2063,12 +2063,11 @@ def test_exact_trace_membership_exhausts_witness_cursor_and_classifies_each_trac
     )
 
     assert trace_ids == ["trace-3", "trace-2", "trace-1"]
-    assert query_count == 5
-    assert rows_returned == 7
+    assert query_count == 4
+    assert rows_returned == 6
     assert seed_calls == [
-        (None, None),
-        (t2, "span-2"),
-        (t1, "span-1"),
+        (None, None, True),
+        (t2, "trace-2", True),
     ]
 
 
@@ -2199,6 +2198,172 @@ def test_exact_trace_membership_retains_proven_five_minute_slice_ceiling(monkeyp
         0 < timeout <= exact_module.EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS
         for timeout in timeouts
     )
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_deduplicates_across_slices_and_classifies_latest_state(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=20)
+    classified_batches = []
+    deduplicate_flags = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            deduplicate_flags.append(kwargs["_deduplicate_traces"])
+            return "WITNESS", {"slice_end": kwargs["slice_end"]}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            ids = tuple(row["trace_id"] for row in rows)
+            classified_batches.append(ids)
+            return "CLASSIFY", {"ids": ids}
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(query, params, **_kwargs):
+            if query == "CLASSIFY":
+                # ``trace-stale`` is a raw necessary witness whose latest row
+                # is tombstoned or fails another filter. The exact classifier,
+                # not the seed, remains the membership authority.
+                return SimpleNamespace(
+                    data=[
+                        {"trace_id": trace_id}
+                        for trace_id in params["ids"]
+                        if trace_id != "trace-stale"
+                    ],
+                    columns=["trace_id"],
+                )
+            minute = int((params["slice_end"] - request_start).total_seconds() / 60)
+            pages = {
+                20: [
+                    {"trace_id": "trace-stale", "start_time": request_end},
+                    {"trace_id": "trace-kept", "start_time": request_end},
+                ],
+                15: [
+                    {"trace_id": "trace-stale", "start_time": request_end},
+                    {"trace_id": "trace-other", "start_time": request_end},
+                ],
+                10: [],
+                5: [{"trace_id": "trace-kept", "start_time": request_start}],
+            }
+            return SimpleNamespace(data=pages[minute], columns=[])
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE", 10)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE", 10)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == ["trace-kept", "trace-other"]
+    assert classified_batches == [
+        ("trace-stale", "trace-kept"),
+        ("trace-other",),
+    ]
+    assert query_count == 6
+    assert rows_returned == 7
+    assert deduplicate_flags == [True, True, True, True]
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_fails_closed_after_partial_deduplicated_walk(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=10)
+    classifier_calls = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            return "WITNESS", {"slice_end": kwargs["slice_end"]}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            ids = tuple(row["trace_id"] for row in rows)
+            classifier_calls.append(ids)
+            return "CLASSIFY", {"ids": ids}
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(query, params, **_kwargs):
+            if query == "CLASSIFY":
+                return SimpleNamespace(
+                    data=[{"trace_id": trace_id} for trace_id in params["ids"]],
+                    columns=["trace_id"],
+                )
+            if params["slice_end"] == request_end:
+                return SimpleNamespace(
+                    data=[{"trace_id": "trace-new", "start_time": request_end}],
+                    columns=[],
+                )
+            raise RuntimeError("later witness failed")
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE", 10)
+
+    with pytest.raises(RuntimeError, match="later witness failed"):
+        _enumerate_exact_trace_ids(
+            analytics=Analytics(),
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(request_start, request_end),
+            annotation_label_ids=None,
+            started=exact_module.monotonic(),
+        )
+
+    # A proven early batch must never be returned/published when a later
+    # required slice fails.
+    assert classifier_calls == [("trace-new",)]
 
 
 @pytest.mark.unit

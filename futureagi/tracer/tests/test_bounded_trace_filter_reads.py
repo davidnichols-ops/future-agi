@@ -318,6 +318,56 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.recommended_filter_max_slice_width() == END - START
 
 
+def test_exact_graph_trace_seed_deduplicates_siblings_before_outer_keyset() -> None:
+    filters = [
+        _time_filter(),
+        _attribute_filter("final_status", ["Rejected"], operation="in"),
+        _attribute_filter("channel", ["voice"], operation="in"),
+    ]
+    builder = TraceListQueryBuilderV2(project_id=PROJECT_ID, filters=filters)
+    checkpoint = END - timedelta(minutes=2)
+
+    seed_sql, seed_params = builder.build_filter_seed_page(
+        slice_start=END - timedelta(minutes=5),
+        slice_end=END,
+        limit=200,
+        before_start_time=checkpoint,
+        before_id="trace-m",
+        _deduplicate_traces=True,
+    )
+    match_sql, match_params = builder.build_filter_identity_match_query_from_seed_rows(
+        [
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-a",
+                "start_time": checkpoint,
+            }
+        ]
+    )
+
+    assert "id AS matched_span_id" not in seed_sql
+    assert "max(start_time) AS start_time" in seed_sql
+    assert "GROUP BY project_id, trace_id" in seed_sql
+    assert seed_sql.count("FROM spans") == 1
+    outer_keyset = seed_sql.split(") AS deduplicated_trace_witnesses", 1)[1]
+    assert "filter_before_start_us" in outer_keyset
+    assert "trace_id < %(filter_before_id)s" in outer_keyset
+    assert seed_params["filter_before_id"] == "trace-m"
+    assert seed_params["filter_before_start_us"] == int(
+        checkpoint.replace(tzinfo=UTC).timestamp() * 1_000_000
+    )
+    # The seed uses one necessary positive anchor. Every filter, deletion,
+    # and latest physical version remains authoritative in the classifier.
+    assert seed_params["latest_filter_key_0"] == "final_status"
+    assert "latest_filter_key_1" not in seed_params
+    assert match_params["latest_filter_key_0"] == "final_status"
+    assert match_params["latest_filter_key_1"] == "channel"
+    assert "argMax(is_deleted, _version)" in match_sql
+    assert "latest_is_deleted = 0" in match_sql
+    assert "latest_attr_exists_0" in match_sql
+    assert "latest_attr_exists_1" in match_sql
+
+
 def test_org_user_trace_seed_is_remap_aware_scoped_and_cursor_ordered() -> None:
     project_b = "00000000-0000-4000-8000-000000000002"
     start = END - timedelta(days=180)
