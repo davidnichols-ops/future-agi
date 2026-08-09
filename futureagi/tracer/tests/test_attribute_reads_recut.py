@@ -3247,32 +3247,42 @@ def test_filter_value_cursor_distinct_growth_stops_before_observed_density_cliff
     assert not any("segment_start" in call.params for call in executor.calls)
 
 
-def test_filter_value_cursor_resource_telemetry_shrinks_before_adjacent_byte_cliff():
-    # Integrated production evidence through the last successful proof, then a
-    # conservative half-width read over the beginning of the adjacent slice
-    # that previously raised TOO_MANY_BYTES at the same 320 s width.
-    observed_proofs = (
-        (5, 234.840, 21_420, 52_918_976),
-        (10, 285.617, 21_420, 90_916_980),
-        (20, 229.947, 21_420, 90_916_980),
-        (40, 293.742, 21_420, 90_916_980),
-        (80, 335.757, 38_299, 158_435_053),
-        (160, 332.233, 58_458, 241_914_449),
-        (320, 529.732, 148_494, 595_674_646),
-        (160, 400.000, 74_247, 297_837_323),
-    )
+@pytest.mark.parametrize(
+    ("incoming_width", "query_time_ms", "read_rows", "read_bytes"),
+    (
+        (320, 584.935, 148_494, 595_674_646),
+        (160, 503.092, 111_456, 439_934_579),
+    ),
+)
+def test_filter_value_cursor_resource_telemetry_sizes_below_adjacent_byte_cliff(
+    incoming_width,
+    query_time_ms,
+    read_rows,
+    read_bytes,
+):
+    # Exact successful statements immediately before the two production byte
+    # cliffs. A continuation can carry either learned width across a deploy;
+    # size its next adjacent proof to <=25% projected cap utilization instead
+    # of learning the density jump from TOO_MANY_BYTES.
+    expected_next_width = 80
 
     def distinct_respond(call, call_number):
-        expected_width, query_time_ms, read_rows, read_bytes = observed_proofs[
-            call_number - 1
-        ]
         width_us = call.params["segment_end_us"] - call.params["segment_start_us"]
-        assert width_us == expected_width * 1_000_000
+        if call_number == 1:
+            assert width_us == incoming_width * 1_000_000
+            return AttributeQueryPage(
+                data=[],
+                query_time_ms=query_time_ms,
+                read_rows=read_rows,
+                read_bytes=read_bytes,
+            )
+        assert call_number == 2
+        assert width_us == expected_next_width * 1_000_000
         return AttributeQueryPage(
             data=[],
-            query_time_ms=query_time_ms,
-            read_rows=read_rows,
-            read_bytes=read_bytes,
+            query_time_ms=200.0,
+            read_rows=20_000,
+            read_bytes=80_000_000,
         )
 
     executor = RecordingExecutor(distinct_responder=distinct_respond)
@@ -3282,8 +3292,9 @@ def test_filter_value_cursor_resource_telemetry_shrinks_before_adjacent_byte_cli
         page_size=10,
         search="value-that-does-not-exist",
         attribute_type="string",
-        window_start=NOW - timedelta(seconds=795),
+        window_start=NOW - timedelta(seconds=incoming_width + expected_next_width),
         window_end=NOW,
+        segment_start=NOW - timedelta(seconds=incoming_width),
     )
 
     proof_calls = [call for call in executor.calls if "distinct_limit" in call.params]
@@ -3291,19 +3302,21 @@ def test_filter_value_cursor_resource_telemetry_shrinks_before_adjacent_byte_cli
         (call.params["segment_end_us"] - call.params["segment_start_us"]) // 1_000_000
         for call in proof_calls
     ]
-    assert ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION == 0.5
-    assert widths == [5, 10, 20, 40, 80, 160, 320, 160]
-    assert all(
-        newer.params["segment_start_us"] == older.params["segment_end_us"]
-        for newer, older in zip(proof_calls, proof_calls[1:], strict=False)
+    assert ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION == 0.25
+    assert widths == [incoming_width, expected_next_width]
+    assert (
+        proof_calls[0].params["segment_start_us"]
+        == proof_calls[1].params["segment_end_us"]
     )
-    assert proof_calls[6].settings["max_bytes_to_read"] == 1_024 * 1024 * 1024
-    assert proof_calls[6].settings["max_rows_to_read"] == 500_000
+    assert proof_calls[0].settings["max_bytes_to_read"] == 1_024 * 1024 * 1024
+    assert proof_calls[0].settings["max_rows_to_read"] == 500_000
     assert read.rows == ()
     assert read.browse_status == "exhausted"
     assert read.has_more is False
-    assert read.next_segment_end == NOW - timedelta(seconds=795)
-    assert read.metadata.query_count == len(proof_calls) == len(observed_proofs)
+    assert read.next_segment_end == NOW - timedelta(
+        seconds=incoming_width + expected_next_width
+    )
+    assert read.metadata.query_count == len(proof_calls) == 2
     assert not any("segment_start" in call.params for call in executor.calls)
 
 

@@ -165,13 +165,13 @@ ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_S
 # timeout, while still allowing its 438 ms predecessor to grow once.
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 2_500
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS = 500
-# Retain at least two-times resource headroom before carrying the same width
+# Retain at least four-times resource headroom before carrying the same width
 # into an adjacent slice, whose density is not known yet. A proof at or above
-# half of either native read cap shrinks the next width; a proof below one
-# quarter may still double when its time telemetry is also cheap. Values in
+# one quarter of either native read cap shrinks the next width; a proof below
+# one eighth may still double when its time telemetry is also cheap. Values in
 # between freeze the width. Missing progress telemetry preserves the legacy
 # time-only policy for compatible external executors.
-ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION = 0.5
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION = 0.25
 # Dense projects can cross the ordinary row/byte envelope even inside the
 # production-qualified six-hour seed.  A failed statement proves nothing, so
 # retry its identical newest-first frontier in this smaller exact slice before
@@ -4707,9 +4707,10 @@ class AttributeReadSelector:
                 # A completed proof advances this exact half-open slice before
                 # deciding how to read the next adjacent one. Native progress
                 # is the only proactive signal of row/byte pressure: preserve
-                # two-times headroom for unknown adjacent density, shrinking a
-                # width already at half a cap and freezing intermediate widths.
-                # Cheap, low-volume slices still grow geometrically.
+                # four-times headroom for unknown adjacent density, shrinking
+                # a width already at one quarter of a cap and freezing
+                # intermediate widths. Cheap, low-volume slices still grow
+                # geometrically.
                 failed_distinct_ceiling = None
                 resource_utilizations = []
                 for consumed, cap in (
@@ -4735,10 +4736,17 @@ class AttributeReadSelector:
                     < ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION
                 )
                 if resource_requires_shrink:
-                    distinct_width = max(
-                        ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
-                        proven_width / 2,
-                    )
+                    assert peak_resource_utilization is not None
+                    distinct_width = proven_width
+                    while (
+                        distinct_width > ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
+                        and peak_resource_utilization * (distinct_width / proven_width)
+                        >= ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION
+                    ):
+                        distinct_width = max(
+                            ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
+                            distinct_width / 2,
+                        )
                     # The signed continuation field is a safe next-width hint,
                     # not a coverage claim. Carry the narrower width if the
                     # request wall ends before it can be exercised.
