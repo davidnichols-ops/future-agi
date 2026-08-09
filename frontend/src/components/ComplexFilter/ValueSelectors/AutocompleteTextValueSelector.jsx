@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import PropTypes from "prop-types";
 import { Autocomplete, TextField, CircularProgress } from "@mui/material";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
@@ -158,7 +158,11 @@ const AutocompleteTextValueSelector = ({
     debouncedInput,
   ];
   const nextPageRequestRef = useRef(null);
+  const autoScrollPageUsedRef = useRef(false);
   const paginationIdentity = JSON.stringify(queryKey);
+  useEffect(() => {
+    autoScrollPageUsedRef.current = false;
+  }, [paginationIdentity]);
   const {
     data,
     isLoading,
@@ -203,18 +207,14 @@ const AutocompleteTextValueSelector = ({
           ...(isFreshChainRead
             ? []
             : cachedPages.flatMap(
-                (page) =>
-                  page?.data?.result?.[FOLLOWED_CURSORS_KEY] || [],
+                (page) => page?.data?.result?.[FOLLOWED_CURSORS_KEY] || [],
               )),
           pageParam,
         ].filter((cursor) => typeof cursor === "string" && cursor.length > 0),
       );
       const initialResponse = await requestPage(pageParam);
       const checkedResult = (response) =>
-        validateBrowseCursor(
-          response?.data?.result || {},
-          followedCursors,
-        );
+        validateBrowseCursor(response?.data?.result || {}, followedCursors);
       // The shared guard follows at most 12 empty checkpoints per UI action.
       // Its 30-second elapsed check is deliberately soft and runs between
       // completed requests; cancellation of an in-flight request remains the
@@ -323,11 +323,7 @@ const AutocompleteTextValueSelector = ({
   );
   const cursorChainStopped = (() => {
     const pages = data?.pages || [];
-    if (
-      pages.some((page) =>
-        isBrowseCursorStopped(page?.data?.result || {}),
-      )
-    ) {
+    if (pages.some((page) => isBrowseCursorStopped(page?.data?.result || {}))) {
       return true;
     }
     const lastResult = normalizeBrowseMetadata(
@@ -342,8 +338,7 @@ const AutocompleteTextValueSelector = ({
       ),
     );
     for (const page of pages) {
-      for (const cursor of
-        page?.data?.result?.[FOLLOWED_CURSORS_KEY] || []) {
+      for (const cursor of page?.data?.result?.[FOLLOWED_CURSORS_KEY] || []) {
         consumedCursors.add(cursor);
       }
     }
@@ -476,14 +471,28 @@ const AutocompleteTextValueSelector = ({
         )
       }
       loading={isLoading}
+      onOpen={() => {
+        autoScrollPageUsedRef.current = false;
+      }}
       ListboxProps={{
         onScroll: (event) => {
           const list = event.currentTarget;
+          const isNearBottom =
+            list.scrollTop + list.clientHeight >= list.scrollHeight - 24;
+          if (!isNearBottom) {
+            autoScrollPageUsedRef.current = false;
+            return;
+          }
           if (
             hasNextPage &&
             !isFetchingNextPage &&
-            list.scrollTop + list.clientHeight >= list.scrollHeight - 24
+            !autoScrollPageUsedRef.current
           ) {
+            // One deliberate trip to the bottom advances one page. Browsers
+            // can emit more momentum/resize scroll events after a fast page
+            // render; letting each event fetch would silently drain the whole
+            // cursor chain and make "Load more" appear endless.
+            autoScrollPageUsedRef.current = true;
             requestNextPage();
           }
         },
