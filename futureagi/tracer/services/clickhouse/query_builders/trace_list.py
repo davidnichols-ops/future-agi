@@ -2010,14 +2010,24 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             raise ValueError("trace keyset values must be provided together")
 
         request_start, request_end = self.parse_time_range(self.filters)
-        if not request_start <= slice_start < slice_end <= request_end:
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
+        root_plans = [plan for plan in plans if plan.scope == "root"]
+        any_span_plans = [plan for plan in plans if plan.scope == "any"]
+        allowed_start, allowed_end = request_start, request_end
+        if _deduplicate_traces and any_span_plans:
+            # A trace's datetime filter applies to its canonical root. Child
+            # spans that satisfy an any-span attribute may start just outside
+            # that root window, so the exact graph witness walk must retain
+            # the same adjacent-day envelope as the list and monolithic exact
+            # graph readers. The latest-state classifier below still applies
+            # the original root datetime bounds before membership is accepted.
+            allowed_start -= timedelta(days=1)
+            allowed_end += timedelta(days=1)
+        if not allowed_start <= slice_start < slice_end <= allowed_end:
             raise ValueError("trace seed slice must stay inside the request window")
         self.start_date, self.end_date = request_start, request_end
         self.params.update({"start_date": request_start, "end_date": request_end})
 
-        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
-        root_plans = [plan for plan in plans if plan.scope == "root"]
-        any_span_plans = [plan for plan in plans if plan.scope == "any"]
         # One directly-indexable any-span leaf is a complete candidate anchor:
         # every trace satisfying all filters must contain a span satisfying
         # this leaf. The classifier below applies every leaf against global
@@ -2233,21 +2243,24 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             # raw spans first would let a trace reappear from an older sibling
             # on the next page and recreate the production fanout failure.
             deduplicated_order = (
-                "ORDER BY start_time DESC, trace_id DESC, "
+                "ORDER BY witness_start_time DESC, trace_id DESC, "
                 "toString(project_id) DESC"
                 if self.project_ids is not None
-                else "ORDER BY start_time DESC, trace_id DESC"
+                else "ORDER BY witness_start_time DESC, trace_id DESC"
+            )
+            deduplicated_keyset_fragment = keyset_fragment.replace(
+                "(start_time)", "(witness_start_time)"
             )
             deduplicated_root_fragment = (
                 "" if any_span_plans else "AND (parent_span_id IS NULL OR parent_span_id = '')"
             )
             query = f"""
-        SELECT project_id, trace_id, start_time
+        SELECT project_id, trace_id, witness_start_time AS start_time
         FROM (
             SELECT
                 project_id,
                 trace_id,
-                max(start_time) AS start_time
+                max(start_time) AS witness_start_time
             FROM {self.TABLE}
             PREWHERE {self.project_filter_sql()}
               AND is_deleted = 0
@@ -2261,7 +2274,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             GROUP BY project_id, trace_id
         ) AS deduplicated_trace_witnesses
         WHERE 1 = 1
-          {keyset_fragment}
+          {deduplicated_keyset_fragment}
         {deduplicated_order}
         LIMIT %(filter_seed_limit)s
         """
@@ -2311,6 +2324,21 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         LIMIT %(filter_seed_limit)s
         """
         return query, params
+
+    def exact_graph_filter_witness_range(self) -> tuple[datetime, datetime]:
+        """Return the exhaustive raw-witness window for an exact trace graph.
+
+        Public trace time filters bind to the canonical root span. Any-span
+        attributes can be carried by a child just outside that root window;
+        list and monolithic graph membership therefore inspect one adjacent
+        day on either side. Root-only filters need no wider witness walk.
+        """
+
+        request_start, request_end = self.parse_time_range(self.filters)
+        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
+        if any(plan.scope == "any" for plan in plans):
+            return request_start - timedelta(days=1), request_end + timedelta(days=1)
+        return request_start, request_end
 
     def build_filter_match_query(
         self,
@@ -2388,6 +2416,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         plans, residual_filters = self._partition_trace_filter_plans(match_filters)
         root_plans = [plan for plan in plans if plan.scope == "root"]
         any_span_plans = [plan for plan in plans if plan.scope == "any"]
+        candidate_witness_start = request_start
+        candidate_witness_end = request_end
+        if scope_to_request_window and any_span_plans:
+            candidate_witness_start -= timedelta(days=1)
+            candidate_witness_end += timedelta(days=1)
         params: dict[str, Any] = {
             **self.params,
             "candidate_trace_ids": trace_ids,
@@ -2401,19 +2434,26 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     "candidate_end_date": request_end,
                     "candidate_start_date_us": _unix_microseconds(request_start),
                     "candidate_end_date_us": _unix_microseconds(request_end),
+                    "candidate_witness_start_date_us": _unix_microseconds(
+                        candidate_witness_start
+                    ),
+                    "candidate_witness_end_date_us": _unix_microseconds(
+                        candidate_witness_end
+                    ),
                 }
             )
         candidate_time_fragment = ""
         if scope_to_request_window:
             # start_time is part of the immutable physical span identity. All
-            # versions of an in-window span therefore stay in the same daily
-            # partition, so pruning outside partitions before argMax cannot
-            # hide a newer version or change latest-state membership.
+            # versions of a witness span therefore stay in the same daily
+            # partition, so pruning outside the list/oracle's adjacent-day
+            # envelope before argMax cannot hide a newer version. Canonical
+            # root membership remains bound to the original request window.
             candidate_time_fragment = """
-                  AND toDate(start_time) >= toDate(fromUnixTimestamp64Micro(%(candidate_start_date_us)s))
-                  AND toDate(start_time) <= toDate(fromUnixTimestamp64Micro(%(candidate_end_date_us)s))
-                  AND start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)
-                  AND start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)
+                  AND toDate(start_time) >= toDate(fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s))
+                  AND toDate(start_time) <= toDate(fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s))
+                  AND start_time >= fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s)
+                  AND start_time < fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s)
             """
         project_version_fragment = ""
         if self.project_version_id:
@@ -2483,13 +2523,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         # ``start_time`` is part of the immutable physical span identity
         # ``(project_id, trace_id, id, start_time)``.  Gate each any-span leaf
-        # after version collapse, not only the canonical root: a stale raw
-        # in-window seed must not let a different current span outside the
-        # requested half-open window satisfy the trace filter.
+        # after version collapse, not only the canonical root. Trace datetime
+        # applies to the root, while children may legitimately lie within the
+        # adjacent-day witness envelope used by the public list and monolithic
+        # exact graph readers.
         if scope_to_request_window:
             any_span_window_condition = """(
-                    latest_start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)
-                    AND latest_start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)
+                    latest_start_time >= fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s)
+                    AND latest_start_time < fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s)
                 )"""
             any_span_having = " AND ".join(
                 (f"countIf({any_span_window_condition} AND ({plan.predicate})) > 0")

@@ -346,11 +346,12 @@ def test_exact_graph_trace_seed_deduplicates_siblings_before_outer_keyset() -> N
     )
 
     assert "id AS matched_span_id" not in seed_sql
-    assert "max(start_time) AS start_time" in seed_sql
+    assert "max(start_time) AS witness_start_time" in seed_sql
     assert "GROUP BY project_id, trace_id" in seed_sql
     assert seed_sql.count("FROM spans") == 1
     outer_keyset = seed_sql.split(") AS deduplicated_trace_witnesses", 1)[1]
     assert "filter_before_start_us" in outer_keyset
+    assert "toUnixTimestamp64Micro(witness_start_time)" in outer_keyset
     assert "trace_id < %(filter_before_id)s" in outer_keyset
     assert seed_params["filter_before_id"] == "trace-m"
     assert seed_params["filter_before_start_us"] == int(
@@ -366,6 +367,54 @@ def test_exact_graph_trace_seed_deduplicates_siblings_before_outer_keyset() -> N
     assert "latest_is_deleted = 0" in match_sql
     assert "latest_attr_exists_0" in match_sql
     assert "latest_attr_exists_1" in match_sql
+
+
+def test_exact_graph_any_span_witness_keeps_adjacent_child_and_root_time_contract() -> (
+    None
+):
+    filters = [
+        _time_filter(),
+        _attribute_filter("final_status", ["Rejected"], operation="in"),
+    ]
+    builder = TraceListQueryBuilderV2(project_id=PROJECT_ID, filters=filters)
+    child_start = START - timedelta(minutes=1)
+
+    assert builder.exact_graph_filter_witness_range() == (
+        START - timedelta(days=1),
+        END + timedelta(days=1),
+    )
+    seed_sql, seed_params = builder.build_filter_seed_page(
+        slice_start=child_start,
+        slice_end=START,
+        limit=200,
+        _deduplicate_traces=True,
+    )
+    match_sql, match_params = builder.build_filter_identity_match_query_from_seed_rows(
+        [
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-root-inside-child-outside",
+                "start_time": child_start,
+            }
+        ]
+    )
+
+    assert seed_params["filter_slice_start"] == child_start
+    assert seed_params["filter_slice_end"] == START
+    assert "max(start_time) AS witness_start_time" in seed_sql
+    assert match_params["candidate_start_date"] == START
+    assert match_params["candidate_end_date"] == END
+    assert match_params["candidate_witness_start_date_us"] == int(
+        (START - timedelta(days=1)).replace(tzinfo=UTC).timestamp() * 1_000_000
+    )
+    assert match_params["candidate_witness_end_date_us"] == int(
+        (END + timedelta(days=1)).replace(tzinfo=UTC).timestamp() * 1_000_000
+    )
+    assert "candidate_witness_start_date_us" in match_sql
+    assert "candidate_witness_end_date_us" in match_sql
+    canonical_root = match_sql.split("AS canonical_root_identity", 1)[0]
+    assert "candidate_start_date_us" in canonical_root
+    assert "candidate_end_date_us" in canonical_root
 
 
 def test_org_user_trace_seed_is_remap_aware_scoped_and_cursor_ordered() -> None:
@@ -1378,7 +1427,7 @@ def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
     assert builder.recommended_filter_classify_batch_size() == 10
 
 
-def test_trace_candidate_classifier_prunes_to_request_partitions() -> None:
+def test_trace_candidate_classifier_prunes_to_adjacent_witness_partitions() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
@@ -1387,19 +1436,28 @@ def test_trace_candidate_classifier_prunes_to_request_partitions() -> None:
     sql, params = builder.build_filter_match_query(["trace-a"])
 
     prewhere = sql.split("GROUP BY trace_id, id, start_time", 1)[0]
-    assert "toDate(fromUnixTimestamp64Micro(%(candidate_start_date_us)s))" in prewhere
-    assert "toDate(fromUnixTimestamp64Micro(%(candidate_end_date_us)s))" in prewhere
     assert (
-        "start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)"
+        "toDate(fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s))"
         in prewhere
     )
     assert (
-        "start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)" in prewhere
+        "toDate(fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s))"
+        in prewhere
+    )
+    assert (
+        "start_time >= fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s)"
+        in prewhere
+    )
+    assert (
+        "start_time < fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s)"
+        in prewhere
     )
     assert params["candidate_start_date"] == START
     assert params["candidate_end_date"] == END
     assert params["candidate_start_date_us"] == 1_735_689_600_000_000
     assert params["candidate_end_date_us"] == 1_767_225_600_000_000
+    assert params["candidate_witness_start_date_us"] == 1_735_603_200_000_000
+    assert params["candidate_witness_end_date_us"] == 1_767_312_000_000_000
 
 
 def test_root_seed_replay_does_not_trust_one_raw_physical_root_id() -> None:
@@ -2619,24 +2677,35 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
     assert match_sql.count("FROM spans") == 1
     assert match_sql.count("GROUP BY grouped_trace_id") == 1
     assert match_sql.count("countIf(") == 3
-    # Canonical root + both independent any-span leaves are constrained to
-    # the same half-open request window after latest-version collapse. The
-    # root gate is used by argMaxIf and HAVING. Each any-span leaf uses the
-    # gate once to project its physical witness and once in its countIf HAVING.
+    # Canonical-root selection remains constrained to the half-open request
+    # window after latest-version collapse. Each independent any-span leaf
+    # uses the adjacent-day witness gate once to project its physical witness
+    # and once in its countIf HAVING, matching list/monolithic graph semantics.
     any_span_leaf_count = 2
-    expected_window_gate_uses = 2 + (2 * any_span_leaf_count)
     assert match_sql.count("argMinIf(") == any_span_leaf_count
     assert (
         match_sql.count(
             "latest_start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)"
         )
-        == expected_window_gate_uses
+        == 2
     )
     assert (
         match_sql.count(
             "latest_start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)"
         )
-        == expected_window_gate_uses
+        == 2
+    )
+    assert (
+        match_sql.count(
+            "latest_start_time >= fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s)"
+        )
+        == 2 * any_span_leaf_count
+    )
+    assert (
+        match_sql.count(
+            "latest_start_time < fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s)"
+        )
+        == 2 * any_span_leaf_count
     )
     first_match_filter = "mapContains(span_attr_str, %(latest_filter_key_0)s)"
     second_match_filter = "mapContains(span_attr_str, %(latest_filter_key_1)s)"

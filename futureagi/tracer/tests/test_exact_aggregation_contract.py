@@ -2016,6 +2016,10 @@ def test_exact_trace_membership_exhausts_witness_cursor_and_classifies_each_trac
             return t1, t4
 
         @staticmethod
+        def exact_graph_filter_witness_range():
+            return t1, t4
+
+        @staticmethod
         def bounded_filter_seed_identity(row):
             return row["trace_id"]
 
@@ -2100,6 +2104,10 @@ def test_exact_trace_membership_fails_closed_on_unproven_witness(monkeypatch, fa
             return request_start, request_end
 
         @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
         def bounded_filter_seed_identity(row):
             return row["matched_span_id"]
 
@@ -2170,6 +2178,10 @@ def test_exact_trace_membership_retains_proven_five_minute_slice_ceiling(monkeyp
             return request_start, request_end
 
         @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
         def build_filter_seed_page(**kwargs):
             slices.append((kwargs["slice_start"], kwargs["slice_end"]))
             return "WITNESS", {}
@@ -2201,6 +2213,99 @@ def test_exact_trace_membership_retains_proven_five_minute_slice_ceiling(monkeyp
 
 
 @pytest.mark.unit
+def test_exact_trace_membership_finds_child_outside_root_window(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=10)
+    witness_start = request_start - timedelta(days=1)
+    witness_end = request_end + timedelta(days=1)
+    root_start = request_start + timedelta(minutes=1)
+    child_start = request_start - timedelta(minutes=1)
+    seed_slices = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return witness_start, witness_end
+
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            seed_slices.append((kwargs["slice_start"], kwargs["slice_end"]))
+            return "WITNESS", {
+                "slice_start": kwargs["slice_start"],
+                "slice_end": kwargs["slice_end"],
+            }
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            return "CLASSIFY", {
+                "ids": tuple(row["trace_id"] for row in rows),
+                "root_start": root_start,
+            }
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(query, params, **_kwargs):
+            if query == "CLASSIFY":
+                assert request_start <= params["root_start"] < request_end
+                return SimpleNamespace(
+                    data=[{"trace_id": trace_id} for trace_id in params["ids"]],
+                    columns=["trace_id"],
+                )
+            assert params["slice_start"] <= child_start < params["slice_end"]
+            assert not request_start <= child_start < request_end
+            return SimpleNamespace(
+                data=[
+                    {
+                        "trace_id": "trace-root-inside-child-outside",
+                        "start_time": child_start,
+                    }
+                ],
+                columns=[],
+            )
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(
+        exact_module,
+        "EXACT_GRAPH_TRACE_INITIAL_SLICE",
+        witness_end - witness_start,
+    )
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == ["trace-root-inside-child-outside"]
+    assert query_count == 2
+    assert rows_returned == 2
+    assert seed_slices == [(witness_start, witness_end)]
+
+
+@pytest.mark.unit
 def test_exact_trace_membership_deduplicates_across_slices_and_classifies_latest_state(
     monkeypatch,
 ):
@@ -2221,6 +2326,10 @@ def test_exact_trace_membership_deduplicates_across_slices_and_classifies_latest
 
         @staticmethod
         def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
             return request_start, request_end
 
         @staticmethod
@@ -2314,6 +2423,10 @@ def test_exact_trace_membership_fails_closed_after_partial_deduplicated_walk(
 
         @staticmethod
         def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
             return request_start, request_end
 
         @staticmethod

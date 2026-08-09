@@ -356,6 +356,15 @@ def _enumerate_exact_trace_ids(
     request_start, request_end = builder.parse_time_range(filters)
     if request_start >= request_end:
         return [], 0, 0
+    witness_start, witness_end = builder.exact_graph_filter_witness_range()
+    if not (
+        witness_start <= request_start < request_end <= witness_end
+        and witness_start >= request_start - timedelta(days=1)
+        and witness_end <= request_end + timedelta(days=1)
+    ):
+        raise ExactGraphReadError(
+            "Exact trace graph witness returned an invalid time range."
+        )
 
     trace_ids: list[str] = []
     seen_matched_trace_ids: set[str] = set()
@@ -441,14 +450,14 @@ def _enumerate_exact_trace_ids(
                     seen_matched_trace_ids.add(trace_id)
                     trace_ids.append(trace_id)
 
-    slice_end = request_end
-    slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, request_end - request_start)
+    slice_end = witness_end
+    slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, witness_end - witness_start)
     # Five minutes is the largest production-proven width for this unindexed
     # value witness.  Keep that as the initial learned ceiling instead of
     # repeatedly widening until an exception teaches us the same fact.
     max_slice_width = slice_width
-    while slice_end > request_start:
-        slice_start = max(request_start, slice_end - slice_width)
+    while slice_end > witness_start:
+        slice_start = max(witness_start, slice_end - slice_width)
         before_start_time: datetime | None = None
         before_order_token: Any = None
         retry_narrower = False
