@@ -155,6 +155,7 @@ def score_filter_tables(ch_client):
             trace_name String,
             trace_session_id Nullable(UUID),
             name String,
+            service_name String DEFAULT '',
             observation_type String,
             status Nullable(String),
             start_time DateTime64(6, 'UTC'),

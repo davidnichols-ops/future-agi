@@ -3366,7 +3366,7 @@ def test_org_trace_candidate_identity_tuple_executes_on_ch25(
 def test_trace_candidate_typed_map_prefilter_executes_exact_latest_state_on_ch25(
     ch_client, bounded_span_table
 ) -> None:
-    """The finite witness prefilter is tenant/time scoped and latest-state exact."""
+    """The finite witness prefilter is tenant scoped and latest-state exact."""
 
     project_id = "00000000-0000-4000-8000-000000000601"
     other_project_id = "00000000-0000-4000-8000-000000000602"
@@ -3458,7 +3458,9 @@ def test_trace_candidate_typed_map_prefilter_executes_exact_latest_state_on_ch25
                 1,
                 value="Rejected",
             ),
-            # The upper bound is exclusive.
+            # Candidate witnesses are intentionally global: the authoritative
+            # classifier, not this necessary-leaf superset, enforces the root
+            # request window.
             span_version(
                 "trace-at-end",
                 "span-at-end",
@@ -3527,4 +3529,8 @@ def test_trace_candidate_typed_map_prefilter_executes_exact_latest_state_on_ch25
 
     rows = ch_client.execute(query, params)
 
-    assert {row[0] for row in rows} == {"trace-live", "trace-at-start"}
+    assert {row[0] for row in rows} == {
+        "trace-live",
+        "trace-at-start",
+        "trace-at-end",
+    }

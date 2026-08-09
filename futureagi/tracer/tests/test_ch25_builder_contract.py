@@ -300,11 +300,18 @@ class TestListBuilderOutputContract:
                 finally:
                     builder.filters = original_filters
             elif name == "build_filter_exact_zero_probe":
-                # This capability-gated voice optimization only compiles for
-                # two or more positive scalar any-span leaves in a short
-                # request window. Exercise the SQL boundary under that
-                # supported public contract instead of asking the optional
-                # accelerator to compile the generic 24-hour fixture.
+                # The generic trace and voice builders intentionally disable
+                # request-window-only zero proofs because a matching child may
+                # live outside the canonical root window. Pin that fail-closed
+                # contract; only compile SQL if a future builder explicitly
+                # advertises a globally sound implementation.
+                if not builder.supports_filter_exact_zero_probe():
+                    with pytest.raises(
+                        ValueError,
+                        match="exact-zero probe is unavailable",
+                    ):
+                        method()
+                    continue
                 original_filters = builder.filters
                 original_internal_scan = builder._bounded_internal_scan
                 original_request_window = builder._bounded_request_window
@@ -359,6 +366,27 @@ class TestListBuilderOutputContract:
                 )
             elif name == "build_filter_navigation_target_query":
                 result = method(target_id="contract-navigation-target", result_limit=2)
+            elif name == "build_exact_graph_candidate_witness_probe":
+                result = method(limit=2)
+            elif name == "build_exact_graph_latest_anchor_partition":
+                start, end = builder.parse_time_range(builder.filters)
+                result = method(partition_start=start, partition_end=end, limit=2)
+            elif name == "build_exact_graph_latest_root_partition":
+                start, end = builder.parse_time_range(builder.filters)
+                result = method(
+                    partition_start=start,
+                    partition_end=end,
+                    request_start=start,
+                    request_end=end,
+                    limit=2,
+                )
+            elif name == "build_exact_graph_root_membership_query":
+                start, end = builder.parse_time_range(builder.filters)
+                result = method(
+                    candidate_trace_ids=["dummy-trace-id"],
+                    request_start=start,
+                    request_end=end,
+                )
             elif name == "build_candidate_cursor_page_query":
                 # This deliberately narrow fast path exists only for one
                 # positive, resolved end-user filter. Exercise its emitted SQL

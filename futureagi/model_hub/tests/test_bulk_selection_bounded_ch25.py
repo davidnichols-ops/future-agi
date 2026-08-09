@@ -60,6 +60,7 @@ def spans_table(ch_client):
             trace_name String,
             trace_session_id Nullable(String),
             name String,
+            service_name String DEFAULT '',
             observation_type String,
             status Nullable(String),
             start_time DateTime64(6, 'UTC'),
