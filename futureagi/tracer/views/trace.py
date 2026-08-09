@@ -56,9 +56,12 @@ from tracer.models.project_version import ProjectVersion
 from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession
 from tracer.selectors.trace_filter_reads import (
+    CURSOR_REQUIRED_CODE,
+    CURSOR_REQUIRED_MESSAGE,
     PAGE_DEPTH_EXCEEDED_CODE,
     PAGE_DEPTH_EXCEEDED_MESSAGE,
     bounded_numbered_page_depth_exceeded,
+    long_filtered_read_requires_cursor,
     numbered_page_depth_exceeded,
 )
 from tracer.serializers.filters import (
@@ -4476,6 +4479,37 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             annotation_label_ids=annotation_label_ids,
             annotation_label_ids_by_project=annotation_label_ids_by_project,
         )
+        requires_cursor = builder.requires_cursor_for_long_filtered_read()
+        if requires_cursor and not cursor_supported:
+            # A long filtered request must never escape to the legacy broad
+            # query merely because its filter shape cannot carry a cursor.
+            # Fail before the first ClickHouse call; the public endpoint
+            # converts this domain error into its sanitized invalid-filter
+            # response.
+            raise UnsupportedFilterShapeError(
+                "Long-window trace filter is not cursor-safe"
+            )
+        if not cursor_requested and requires_cursor:
+            if page_number != 0 or "cursor_mode" in request.query_params:
+                return self._gm.custom_error_response(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    CURSOR_REQUIRED_MESSAGE,
+                    code=CURSOR_REQUIRED_CODE,
+                )
+            # Rolling-upgrade bridge: the deployed frontend predates the
+            # additive cursor fields, while that frontend cannot be deployed
+            # first because the old strict serializers reject ``cursor_mode``.
+            # Treat only an omitted page-zero mode as an exact cursor start and
+            # publish the additive continuation metadata. Explicit opt-out and
+            # deep numbered pages remain rejected rather than replaying a broad
+            # ClickHouse scan. Remove this bridge after all API clients migrate.
+            cursor_requested = True
+            cursor_enabled = True
+            validated_data["cursor_mode"] = True
+            logger.info(
+                "trace_list_implicit_cursor_compatibility",
+                project_id=str(project_id) if project_id else None,
+            )
         # Continuations freeze only the request window and ordered scan
         # checkpoint. ReplacingMergeTree version predicates are not snapshots:
         # background merges may remove the older row they depend on. Every
@@ -4546,12 +4580,6 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_state.scan_before_id if cursor_state is not None else None
                 ),
                 bounded_continuation=cursor_enabled,
-                # A strict first page may need to split a scheduled wide seed
-                # after ClickHouse rejects that read budget.  The retry stays
-                # exact and fail-closed: nothing from the failed slice is
-                # published, and the same predicate is retried over adjacent
-                # narrower windows inside the existing query/deadline caps.
-                retry_wide_read_budget=page_number == 0,
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -4565,6 +4593,26 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         status.HTTP_422_UNPROCESSABLE_ENTITY,
                         PAGE_DEPTH_EXCEEDED_MESSAGE,
                         code=PAGE_DEPTH_EXCEEDED_CODE,
+                    )
+                failed_attempt = next(
+                    (
+                        attempt
+                        for attempt in bounded_page.attempts
+                        if attempt.error_code is not None
+                    ),
+                    None,
+                )
+                if failed_attempt is not None:
+                    logger.warning(
+                        "trace_list_bounded_statement_failed",
+                        project_id=str(project_id) if project_id else None,
+                        page_number=page_number,
+                        error_code=failed_attempt.error_code,
+                    )
+                    return self._gm.custom_error_response(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Filtered trace data is temporarily unavailable. Please retry.",
+                        code="service_unavailable",
                     )
                 logger.warning(
                     "trace_list_bounded_read_incomplete",
@@ -5499,6 +5547,34 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             remove_simulation_calls=sim_flag,
             annotation_label_ids=annotation_label_ids,
         )
+        voice_request_start, voice_request_end = builder.parse_time_range(filters)
+        requires_cursor = long_filtered_read_requires_cursor(
+            filters,
+            request_start=voice_request_start,
+            request_end=voice_request_end,
+        )
+        if requires_cursor and not cursor_supported:
+            # Cursor-ineligible long filters cannot safely fall through to a
+            # broad voice-root scan.
+            raise UnsupportedFilterShapeError(
+                "Long-window voice-call filter is not cursor-safe"
+            )
+        if not cursor_requested and requires_cursor:
+            if page_number != 0 or "cursor_mode" in request.query_params:
+                return self._gm.custom_error_response(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    CURSOR_REQUIRED_MESSAGE,
+                    code=CURSOR_REQUIRED_CODE,
+                )
+            # See the trace-list bridge above. Voice pagination is one-based,
+            # so ``page_number == 0`` corresponds to the legacy first page.
+            cursor_requested = True
+            cursor_enabled = True
+            validated_data["cursor_mode"] = True
+            logger.info(
+                "voice_call_list_implicit_cursor_compatibility",
+                project_id=str(project_id),
+            )
         # The signed cursor carries the immutable window and keyset progress;
         # each page resolves current latest state. A raw version ceiling cannot
         # survive ReplacingMergeTree background merges.
@@ -5553,7 +5629,6 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 cursor_state.scan_before_id if cursor_state is not None else None
             ),
             bounded_continuation=cursor_enabled,
-            retry_wide_read_budget=page_number == 0,
         )
         if not bounded_page.complete:
             if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -5567,6 +5642,26 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     PAGE_DEPTH_EXCEEDED_MESSAGE,
                     code=PAGE_DEPTH_EXCEEDED_CODE,
+                )
+            failed_attempt = next(
+                (
+                    attempt
+                    for attempt in bounded_page.attempts
+                    if attempt.error_code is not None
+                ),
+                None,
+            )
+            if failed_attempt is not None:
+                logger.warning(
+                    "voice_call_list_bounded_statement_failed",
+                    project_id=str(project_id),
+                    page_number=page_number,
+                    error_code=failed_attempt.error_code,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Voice call data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
                 )
             logger.warning(
                 "voice_call_list_bounded_read_incomplete",

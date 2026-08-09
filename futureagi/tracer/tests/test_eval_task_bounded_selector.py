@@ -434,7 +434,7 @@ def test_bounded_resolver_returns_only_a_complete_latest_state_page(
     assert captured["max_query_count"] == 128
     assert captured["max_candidates"] == 512
     assert captured["classify_batch_size"] == expected_classify_batch
-    assert captured["retry_wide_read_budget"] is True
+    assert captured.get("retry_wide_read_budget", False) is False
     assert captured["builder"].supports_bounded_filter_scan() is True
     assert captured["builder"]._bounded_identity_only is True
     if row_type == RowType.TRACES:

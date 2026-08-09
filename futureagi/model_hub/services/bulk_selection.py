@@ -230,7 +230,6 @@ def _read_bounded_bulk_page(
         max_candidates=_BULK_BOUNDED_MAX_CANDIDATES,
         max_query_count=_BULK_BOUNDED_MAX_QUERY_COUNT,
         classify_batch_size=classify_batch_size,
-        retry_wide_read_budget=True,
     )
     if not page.complete:
         raise BulkSelectionReadIncomplete(page.error_code or "scan_budget_exceeded")

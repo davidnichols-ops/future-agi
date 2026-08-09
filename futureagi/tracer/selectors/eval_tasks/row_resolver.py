@@ -1076,7 +1076,6 @@ def _resolve_bounded_historical_span_ids(
             max_candidates=_EVAL_TASK_MAX_CANDIDATES,
             max_query_count=phase_one_query_count,
             classify_batch_size=classify_batch_size,
-            retry_wide_read_budget=True,
             read_settings=bounded_read_settings,
             classify_read_settings=bounded_classify_read_settings,
             workflow_exact=workflow_exact,

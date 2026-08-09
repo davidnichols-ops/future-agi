@@ -74,6 +74,39 @@ PAGE_DEPTH_EXCEEDED_MESSAGE = (
     "The requested page is beyond the supported numbered-page depth. "
     "Request an earlier page or narrow the filter time range."
 )
+CURSOR_REQUIRED_CODE = "cursor_required"
+CURSOR_REQUIRED_MESSAGE = (
+    "Long-range filtered lists require cursor pagination. "
+    "Enable cursor mode or narrow the time range."
+)
+
+
+def long_filtered_read_requires_cursor(
+    filters: list[dict[str, Any]],
+    *,
+    request_start: datetime,
+    request_end: datetime,
+    search: str | None = None,
+) -> bool:
+    """Return whether a filtered window needs a resumable cursor contract.
+
+    Numbered pagination has no signed scan checkpoint.  Keep the legacy lane
+    for time-only and short-window reads, but require cursor pagination before
+    a user-supplied filter/search can start a scan spanning more than one hour.
+    Internal builder predicates (for example the voice-root invariant) are not
+    present in ``filters`` and therefore do not turn a time-only request into a
+    filtered request.
+    """
+
+    has_non_time_filter = any(
+        (item.get("column_id") or item.get("columnId"))
+        not in {"created_at", "start_time"}
+        for item in filters
+    )
+    return bool(
+        (has_non_time_filter or search)
+        and request_end - request_start > timedelta(hours=1)
+    )
 
 
 class FilterPageBuilder(Protocol):
@@ -308,7 +341,8 @@ def read_bounded_filter_page(
     Seed reads cover adjacent half-open time slices in descending order. Each
     seed is only an identity/order superset; every ID is reclassified against
     global latest state before it can enter the page. A failed read is never
-    retried as control flow, and a partial prefix is never exposed as page N.
+    hidden as a complete response; even the legacy opt-in retry path remains
+    explicitly degraded. A partial prefix is never exposed as page N.
     Graph callers may opt into proven-but-incomplete page-zero rows; numbered
     list/eval callers retain the exact/empty default.
     ``anchor_probe_only`` stops after a selective-anchor sentinel instead of
@@ -2232,7 +2266,7 @@ def read_bounded_filter_page(
                     # narrower adjacent window without changing predicates or
                     # publishing unclassified rows. This prevents a dense
                     # initial slice from repeatedly returning the same token.
-                    (retry_wide_read_budget or bounded_continuation)
+                    retry_wide_read_budget
                     and exc.error_code == "read_budget_exceeded"
                     and active_width > _INITIAL_SLICE
                 ):
@@ -2399,6 +2433,19 @@ def read_bounded_filter_page(
             active_slice_start = safe_active_slice_start
             before_start_time = safe_before_start_time
             before_id = safe_before_id
+
+    # A response may never claim completeness after any ClickHouse statement
+    # failed, even if a later narrower/speculative fallback happened to find a
+    # sufficient prefix. Logical row correctness is not enough: hiding the
+    # failed statement makes production query regressions invisible and can
+    # turn a partially covered window into a false exact result.
+    failed_attempt = next(
+        (attempt for attempt in attempts if attempt.error_code is not None),
+        None,
+    )
+    if failed_attempt is not None:
+        page_complete = False
+        degraded_error_code = failed_attempt.error_code
 
     ordered_matches = sorted(matched_by_id.values(), key=result_row_key, reverse=True)
     offset = page_number * page_size

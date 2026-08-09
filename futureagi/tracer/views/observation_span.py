@@ -66,6 +66,8 @@ from tracer.models.project_version import ProjectVersion
 from tracer.models.span_notes import SpanNotes
 from tracer.models.trace import Trace
 from tracer.selectors.trace_filter_reads import (
+    CURSOR_REQUIRED_CODE,
+    CURSOR_REQUIRED_MESSAGE,
     PAGE_DEPTH_EXCEEDED_CODE,
     PAGE_DEPTH_EXCEEDED_MESSAGE,
     bounded_numbered_page_depth_exceeded,
@@ -1858,6 +1860,33 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             annotation_label_ids_by_project=annotation_label_ids_by_project,
             bounded_internal_scan=cursor_enabled,
         )
+        requires_cursor = builder.requires_cursor_for_long_filtered_read()
+        if requires_cursor and not cursor_supported:
+            # A cursor-ineligible long filter must fail closed before any
+            # broad legacy ClickHouse read can be attempted.
+            raise UnsupportedFilterShapeError(
+                "Long-window span filter is not cursor-safe"
+            )
+        if not cursor_requested and requires_cursor:
+            if page_number != 0 or "cursor_mode" in request.query_params:
+                return self._gm.custom_error_response(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    CURSOR_REQUIRED_MESSAGE,
+                    code=CURSOR_REQUIRED_CODE,
+                )
+            # Page-zero compatibility for rolling deploys: old clients omit
+            # cursor_mode, but the old backend rejects a new frontend that
+            # sends it. Start the exact cursor contract implicitly and expose
+            # the additive next_cursor fields. Explicit opt-out/deep numbered
+            # requests stay fail-closed.
+            cursor_requested = True
+            cursor_enabled = True
+            validated_data["cursor_mode"] = True
+            builder._bounded_internal_scan = True
+            logger.info(
+                "span_list_implicit_cursor_compatibility",
+                project_id=str(project_id) if project_id else None,
+            )
         # Custom-sort/time-only legacy reads do not apply the bounded
         # selector's keyset tuple. Advertising a cursor for that path would
         # replay the first page forever, so keep its existing numbered-page
@@ -1927,7 +1956,6 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_state.scan_before_id if cursor_state is not None else None
                 ),
                 bounded_continuation=cursor_enabled,
-                retry_wide_read_budget=True,
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:

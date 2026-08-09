@@ -262,6 +262,21 @@ class SpanListQueryBuilder(BaseQueryBuilder):
             not in {"created_at", "start_time"}
         ]
 
+    def requires_cursor_for_long_filtered_read(self) -> bool:
+        """Whether exact numbered pagination is unsafe for this list window.
+
+        A numbered page has no signed scan checkpoint to resume after a finite
+        request budget.  Once an attribute-filtered window exceeds the safe
+        short-read lane, callers must use the existing cursor contract instead
+        of risking a wide ClickHouse sort or a falsely exhausted prefix.
+        """
+
+        request_start, request_end = self._bounded_request_window
+        return bool(
+            self._active_non_time_filters()
+            and request_end - request_start > timedelta(hours=1)
+        )
+
     def bounded_filter_degraded_error_code(self) -> str | None:
         """Explain why a supported filter must not use the broad legacy read."""
 

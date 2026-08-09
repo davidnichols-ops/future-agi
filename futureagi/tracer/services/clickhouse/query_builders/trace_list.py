@@ -423,6 +423,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             not in {"created_at", "start_time"}
         ]
 
+    def requires_cursor_for_long_filtered_read(self) -> bool:
+        """Whether a long filtered list must retain a signed scan checkpoint."""
+
+        request_start, request_end = self._bounded_request_window
+        return bool(
+            (self._active_non_time_filters() or self.search)
+            and request_end - request_start > timedelta(hours=1)
+        )
+
     def _positive_exact_end_user_seed_filter(self) -> dict[str, Any] | None:
         """Return the sole exact user alias filter eligible for root seeding.
 

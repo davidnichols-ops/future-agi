@@ -13,6 +13,7 @@ from django.test import override_settings
 from tracer.selectors.trace_filter_reads import (
     MAX_NUMBERED_PAGE_WORK_ROWS,
     BoundedFilterPage,
+    FilterReadAttempt,
     bounded_numbered_page_depth_exceeded,
     numbered_page_depth_exceeded,
     read_bounded_filter_page,
@@ -53,6 +54,10 @@ def _time_filter(start: datetime = START, end: datetime = END) -> dict[str, Any]
             "filter_value": [start.isoformat(), end.isoformat()],
         },
     }
+
+
+def _short_time_filter() -> dict[str, Any]:
+    return _time_filter(start=END - timedelta(minutes=30), end=END)
 
 
 def _has_eval_filter(value: bool | str) -> dict[str, Any]:
@@ -316,6 +321,52 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert builder.recommended_filter_classify_batch_size() == 10
     assert builder.recommended_filter_initial_slice_width() == timedelta(hours=1)
     assert builder.recommended_filter_max_slice_width() == END - START
+
+
+@pytest.mark.parametrize(
+    "builder_cls",
+    [SpanListQueryBuilderV2, TraceListQueryBuilderV2],
+)
+def test_long_filtered_lists_require_cursor_before_clickhouse(builder_cls) -> None:
+    long_builder = builder_cls(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+        ],
+        page_number=0,
+        page_size=25,
+    )
+    short_builder = builder_cls(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(start=END - timedelta(minutes=30), end=END),
+            _attribute_filter("final_status", ["Rejected"], operation="in"),
+        ],
+        page_number=0,
+        page_size=25,
+    )
+    time_only_builder = builder_cls(
+        project_id=PROJECT_ID,
+        filters=[_time_filter()],
+        page_number=0,
+        page_size=25,
+    )
+    search_builder = None
+    if builder_cls is TraceListQueryBuilderV2:
+        search_builder = builder_cls(
+            project_id=PROJECT_ID,
+            filters=[_time_filter()],
+            search="Rechazado",
+            page_number=0,
+            page_size=25,
+        )
+
+    assert long_builder.requires_cursor_for_long_filtered_read() is True
+    assert short_builder.requires_cursor_for_long_filtered_read() is False
+    assert time_only_builder.requires_cursor_for_long_filtered_read() is False
+    if search_builder is not None:
+        assert search_builder.requires_cursor_for_long_filtered_read() is True
 
 
 def test_exact_graph_trace_seed_deduplicates_siblings_before_outer_keyset() -> None:
@@ -3450,7 +3501,7 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
@@ -3465,7 +3516,7 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
@@ -3481,7 +3532,7 @@ def test_observe_trace_list_uses_v2_builder_when_routing_is_disabled() -> None:
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
@@ -3611,7 +3662,7 @@ def test_trace_list_nonempty_page_enrichments_share_wall_budget(
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
@@ -3880,7 +3931,7 @@ def test_page_500_slow_candidate_admits_every_exact_enrichment_wave():
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
@@ -4292,7 +4343,7 @@ def test_trace_list_enrichment_timeout_is_sanitized_503_not_empty_200() -> None:
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
@@ -4704,7 +4755,7 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("prompt_slug", "agent_2_identity_disclosure"),
                 ],
                 "page_number": 0,
@@ -4719,7 +4770,7 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("prompt_slug", "agent_2_identity_disclosure"),
                 ],
                 "page_number": 0,
@@ -4735,7 +4786,7 @@ def test_task_create_prompt_slug_equals_uses_bounded_span_route_contract() -> No
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("prompt_slug", "agent_2_identity_disclosure"),
                 ],
                 "page_number": 0,
@@ -4959,7 +5010,7 @@ def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
@@ -4978,7 +5029,7 @@ def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
     assert (
         bounded_read.call_args.kwargs["deadline_ms"] <= SPAN_LIST_CANDIDATE_DEADLINE_MS
     )
-    assert bounded_read.call_args.kwargs["retry_wide_read_budget"] is True
+    assert bounded_read.call_args.kwargs.get("retry_wide_read_budget", False) is False
     assert (
         SPAN_LIST_CANDIDATE_DEADLINE_MS + SPAN_LIST_ENRICHMENT_TIMEOUT_MS
         <= SPAN_LIST_WALL_DEADLINE_MS
@@ -4991,7 +5042,7 @@ def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
 @override_settings(
     CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "SPAN_LIST"},
 )
-def test_span_numbered_page_retries_wide_reads_but_incomplete_stays_503() -> None:
+def test_span_numbered_page_does_not_retry_failed_wide_reads() -> None:
     from tracer.views.observation_span import (
         SPAN_LIST_CANDIDATE_DEADLINE_MS,
         ObservationSpanView,
@@ -5026,7 +5077,7 @@ def test_span_numbered_page_retries_wide_reads_but_incomplete_stays_503() -> Non
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 3,
@@ -5043,7 +5094,7 @@ def test_span_numbered_page_retries_wide_reads_but_incomplete_stays_503() -> Non
     assert response[2] == {"code": "service_unavailable"}
     assert "DB::Exception" not in str(response)
     assert bounded_read.call_args.kwargs["page_number"] == 3
-    assert bounded_read.call_args.kwargs["retry_wide_read_budget"] is True
+    assert bounded_read.call_args.kwargs.get("retry_wide_read_budget", False) is False
     assert (
         bounded_read.call_args.kwargs["deadline_ms"] <= SPAN_LIST_CANDIDATE_DEADLINE_MS
     )
@@ -5093,7 +5144,7 @@ def test_trace_route_returns_sanitized_degraded_page_for_filtered_sort() -> None
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
@@ -5151,7 +5202,7 @@ def test_span_route_returns_sanitized_degraded_page_for_filtered_end_user() -> N
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 0,
@@ -6384,6 +6435,255 @@ def _call_observe_trace_list_with_bounded_page(
     return response, bounded_reader, analytics, request
 
 
+def test_observe_trace_legacy_first_page_starts_cursor_compatibility() -> None:
+    validated_data = {
+        "filters": [
+            _time_filter(),
+            _attribute_filter("final_status", "Rechazado"),
+        ],
+        "page_number": 0,
+        "page_size": 25,
+    }
+
+    response, bounded_reader, analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=_complete_empty_page(),
+            validated_data=validated_data,
+        )
+    )
+
+    assert response[0] == "ok"
+    assert validated_data["cursor_mode"] is True
+    bounded_reader.assert_called_once()
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_trace_long_cursor_unsupported_filter_fails_before_clickhouse() -> None:
+    from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+        UnsupportedFilterShapeError,
+    )
+    from tracer.views.trace import TraceView
+
+    view = TraceView.__new__(TraceView)
+    request = _observe_trace_request()
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch("tracer.views.trace.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch("tracer.views.trace.snapshot_cursor_supported", return_value=False),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page"
+        ) as bounded_reader,
+        pytest.raises(UnsupportedFilterShapeError, match="not cursor-safe"),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        view._list_traces_of_session_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rechazado"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+            },
+            analytics=analytics,
+            org_project_ids=None,
+            org=request.organization,
+        )
+
+    bounded_reader.assert_not_called()
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_trace_long_filter_cursor_reaches_bounded_reader() -> None:
+    response, bounded_reader, analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=_complete_empty_page(),
+            request=_observe_trace_request({"cursor_mode": "true"}),
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rechazado"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": True,
+            },
+        )
+    )
+
+    assert response[0] == "ok"
+    bounded_reader.assert_called_once()
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
+    assert bounded_reader.call_args.kwargs.get("retry_wide_read_budget", False) is False
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_span_legacy_first_page_starts_cursor_compatibility() -> None:
+    from tracer.views.observation_span import ObservationSpanView
+
+    view = ObservationSpanView.__new__(ObservationSpanView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    organization = SimpleNamespace(id="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+        query_params={},
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=_complete_empty_page(),
+        ) as bounded_reader,
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        validated_data = {
+            "filters": [
+                _time_filter(),
+                _attribute_filter("final_status", "Rechazado"),
+            ],
+            "page_number": 0,
+            "page_size": 25,
+        }
+        response = view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data=validated_data,
+            analytics=analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+
+    assert response[0] == "ok"
+    assert validated_data["cursor_mode"] is True
+    bounded_reader.assert_called_once()
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
+    assert bounded_reader.call_args.kwargs["builder"]._bounded_internal_scan is True
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_span_long_cursor_unsupported_filter_fails_before_clickhouse() -> None:
+    from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+        UnsupportedFilterShapeError,
+    )
+    from tracer.views.observation_span import ObservationSpanView
+
+    view = ObservationSpanView.__new__(ObservationSpanView)
+    organization = SimpleNamespace(id="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+        query_params={},
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.views.observation_span.snapshot_cursor_supported",
+            return_value=False,
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page"
+        ) as bounded_reader,
+        pytest.raises(UnsupportedFilterShapeError, match="not cursor-safe"),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rechazado"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+            },
+            analytics=analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+
+    bounded_reader.assert_not_called()
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_observe_span_long_filter_cursor_reaches_bounded_reader() -> None:
+    from tracer.views.observation_span import ObservationSpanView
+
+    view = ObservationSpanView.__new__(ObservationSpanView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    organization = SimpleNamespace(id="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+        query_params={"cursor_mode": "true"},
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=_complete_empty_page(),
+        ) as bounded_reader,
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        response = view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rechazado"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": True,
+            },
+            analytics=analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+
+    assert response[0] == "ok"
+    bounded_reader.assert_called_once()
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
+    assert bounded_reader.call_args.kwargs.get("retry_wide_read_budget", False) is False
+    analytics.execute_ch_query.assert_not_called()
+
+
 def test_org_user_trace_endpoint_proves_six_month_empty_page_in_one_seed() -> None:
     """A sparse/no-match user page must not walk ninety two-day slices."""
 
@@ -6399,7 +6699,7 @@ def test_org_user_trace_endpoint_proves_six_month_empty_page_in_one_seed() -> No
         backend_used="clickhouse",
         query_time_ms=1.0,
     )
-    request = _observe_trace_request()
+    request = _observe_trace_request({"cursor_mode": "true"})
     view = TraceView.__new__(TraceView)
     view._gm = SimpleNamespace(
         success_response=lambda payload: ("ok", payload),
@@ -6420,6 +6720,7 @@ def test_org_user_trace_endpoint_proves_six_month_empty_page_in_one_seed() -> No
                 "filters": filters,
                 "page_number": 0,
                 "page_size": 25,
+                "cursor_mode": True,
                 "allow_sampled": False,
             },
             analytics=analytics,
@@ -6505,9 +6806,9 @@ def test_observe_trace_terminal_cursor_uses_global_seen_total() -> None:
             "allow_sampled": False,
         },
     )
-    assert numbered_response[0] == "ok"
-    assert numbered_response[1]["metadata"]["total_rows"] == 0
-    assert numbered_response[1]["metadata"]["total_rows_is_lower_bound"] is False
+    assert numbered_response[0] == "error"
+    assert numbered_response[1][0] == 422
+    assert numbered_response[2] == {"code": "cursor_required"}
 
     resumed_request = _observe_trace_request({"cursor_mode": "true"})
     cursor = encode_list_cursor(
@@ -6663,6 +6964,56 @@ def test_observe_trace_exact_cursor_chunk_is_enriched_ordered_and_continuable(
     assert len(analytics.calls) == 3
 
 
+def test_observe_trace_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
+    bounded_page = BoundedFilterPage(
+        rows=[],
+        has_more=False,
+        complete=False,
+        status="degraded",
+        error_code="query_timeout",
+        total_rows_lower_bound=0,
+        elapsed_ms=30_000.0,
+        query_count=2,
+        rows_returned=25,
+        result_payload_bytes=1_024,
+        attempts=(
+            FilterReadAttempt(
+                kind="classify",
+                slice_start=START,
+                slice_end=END,
+                elapsed_ms=30_000.0,
+                rows_returned=0,
+                result_payload_bytes=0,
+                error_code="query_timeout",
+            ),
+        ),
+        continuation_slice_start=START,
+        continuation_slice_end=END,
+    )
+
+    response, bounded_reader, analytics, _request = (
+        _call_observe_trace_list_with_bounded_page(
+            bounded_page=bounded_page,
+            request=_observe_trace_request({"cursor_mode": "true"}),
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": True,
+            },
+        )
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2] == {"code": "service_unavailable"}
+    bounded_reader.assert_called_once()
+    analytics.execute_ch_query.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("query_params", "validated_allow_sampled"),
     [({}, None), ({"allow_sampled": "false"}, False)],
@@ -6673,7 +7024,7 @@ def test_observe_trace_incomplete_page_remains_fail_closed_without_explicit_samp
 ) -> None:
     validated_data: dict[str, Any] = {
         "filters": [
-            _time_filter(),
+            _short_time_filter(),
             _attribute_filter("final_status", "Rejected"),
         ],
         "page_number": 0,
@@ -6695,7 +7046,7 @@ def test_observe_trace_incomplete_page_remains_fail_closed_without_explicit_samp
     assert response[2] == {"code": "service_unavailable"}
     assert "DB::Exception" not in str(response)
     assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
-    assert bounded_reader.call_args.kwargs["retry_wide_read_budget"] is True
+    assert bounded_reader.call_args.kwargs.get("retry_wide_read_budget", False) is False
     analytics.execute_ch_query.assert_not_called()
 
 
@@ -6706,7 +7057,7 @@ def test_observe_trace_later_page_does_not_publish_an_incomplete_sample() -> Non
             request=_observe_trace_request({"allow_sampled": "true"}),
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page_number": 1,
@@ -6767,6 +7118,91 @@ def test_observe_trace_cursor_continuation_without_safe_checkpoint_fails_closed(
     assert response[1][0] == 503
     assert response[2] == {"code": "service_unavailable"}
     assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is True
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_voice_legacy_first_page_starts_cursor_compatibility() -> None:
+    from tracer.views.trace import TraceView
+
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    analytics = mock.MagicMock()
+    validated_data = {
+        "filters": [
+            _time_filter(),
+            _attribute_filter("final_status", "Rechazado"),
+        ],
+        "page": 1,
+        "page_size": 25,
+    }
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=_complete_empty_page(),
+        ) as bounded_reader,
+    ):
+        response = view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params={}),
+            project_id=PROJECT_ID,
+            validated_data=validated_data,
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response.status_code == 200
+    assert validated_data["cursor_mode"] is True
+    bounded_reader.assert_called_once()
+    assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
+    analytics.execute_ch_query.assert_not_called()
+
+
+def test_voice_long_cursor_unsupported_filter_fails_before_clickhouse() -> None:
+    from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+        UnsupportedFilterShapeError,
+    )
+    from tracer.views.trace import TraceView
+
+    view = TraceView.__new__(TraceView)
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch("tracer.views.trace.snapshot_cursor_supported", return_value=False),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page"
+        ) as bounded_reader,
+        pytest.raises(UnsupportedFilterShapeError, match="not cursor-safe"),
+    ):
+        view._list_voice_calls_clickhouse(
+            SimpleNamespace(query_params={}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rechazado"),
+                ],
+                "page": 1,
+                "page_size": 25,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    bounded_reader.assert_not_called()
     analytics.execute_ch_query.assert_not_called()
 
 
@@ -7083,6 +7519,78 @@ def test_voice_page_size_500_cursor_publishes_safe_exact_partial_chunk() -> None
     assert bounded_reader.call_args.kwargs["bounded_continuation"] is True
 
 
+def test_voice_cursor_does_not_mask_failed_clickhouse_attempt() -> None:
+    from tracer.views.trace import TraceView
+
+    bounded_page = BoundedFilterPage(
+        rows=[],
+        has_more=False,
+        complete=False,
+        status="degraded",
+        error_code="query_timeout",
+        total_rows_lower_bound=0,
+        elapsed_ms=30_000.0,
+        query_count=2,
+        rows_returned=25,
+        result_payload_bytes=1_024,
+        attempts=(
+            FilterReadAttempt(
+                kind="classify",
+                slice_start=START,
+                slice_end=END,
+                elapsed_ms=30_000.0,
+                rows_returned=0,
+                result_payload_bytes=0,
+                error_code="query_timeout",
+            ),
+        ),
+        continuation_slice_start=START,
+        continuation_slice_end=END,
+    )
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs)
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded_page,
+        ) as bounded_reader,
+    ):
+        response = view._list_voice_calls_clickhouse(
+            _observe_trace_request({"cursor_mode": "true"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page": 1,
+                "page_size": 25,
+                "cursor_mode": True,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2] == {"code": "service_unavailable"}
+    bounded_reader.assert_called_once()
+    analytics.execute_ch_query.assert_not_called()
+
+
 def test_voice_first_page_explicit_sample_publishes_sanitized_degradation() -> None:
     from tracer.serializers.trace import TraceVoiceCallListResponseSerializer
     from tracer.views.trace import TraceView
@@ -7113,7 +7621,7 @@ def test_voice_first_page_explicit_sample_publishes_sanitized_degradation() -> N
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page": 1,
@@ -7212,7 +7720,7 @@ def test_voice_first_page_explicit_sample_hydrates_only_proven_rows() -> None:
             project_id=PROJECT_ID,
             validated_data={
                 "filters": [
-                    _time_filter(),
+                    _short_time_filter(),
                     _attribute_filter("final_status", "Rejected"),
                 ],
                 "page": 1,
@@ -7386,7 +7894,7 @@ def test_voice_incomplete_page_remains_fail_closed_without_explicit_sample(
     assert response[2] == {"code": "service_unavailable"}
     assert "DB::Exception" not in str(response)
     assert bounded_reader.call_args.kwargs["include_incomplete_rows"] is False
-    assert bounded_reader.call_args.kwargs["retry_wide_read_budget"] is True
+    assert bounded_reader.call_args.kwargs.get("retry_wide_read_budget", False) is False
     analytics.execute_ch_query.assert_not_called()
 
 
@@ -7942,7 +8450,7 @@ def test_year_cursor_keeps_one_hour_seed_skips_zero_probe_and_resumes_exactly() 
             assert query != "zero_probe"
             if query == "seed" and params["slice_end"] - params[
                 "slice_start"
-            ] > timedelta(minutes=30):
+            ] > timedelta(hours=1):
                 self.calls.append((query, params))
                 raise ReadDeadlineExceeded("Code: 307. Memory limit exceeded")
             return super().execute_ch_query(
@@ -7961,7 +8469,7 @@ def test_year_cursor_keeps_one_hour_seed_skips_zero_probe_and_resumes_exactly() 
         page_number=0,
         page_size=2,
         deadline_ms=8_000,
-        max_seed_attempts=2,
+        max_seed_attempts=1,
         max_candidates=2,
         max_query_count=50,
         classify_batch_size=2,
@@ -7970,12 +8478,12 @@ def test_year_cursor_keeps_one_hour_seed_skips_zero_probe_and_resumes_exactly() 
     )
 
     first_seed_params = first_executor.calls[0][1]
-    assert [query for query, _ in first_executor.calls] == ["seed", "seed", "match"]
+    assert [query for query, _ in first_executor.calls] == ["seed", "match"]
     assert first_seed_params["slice_start"] == END - timedelta(hours=1)
     assert first_seed_params["slice_end"] == END
     assert first.rows == []
     assert first.complete is False
-    assert first.continuation_slice_start == END - timedelta(minutes=30)
+    assert first.continuation_slice_start == END - timedelta(hours=1)
     assert first.continuation_slice_end == END
     assert first.continuation_before_start_time == rows[1]["start_time"]
     assert first.continuation_before_id == rows[1]["id"]
@@ -7996,7 +8504,7 @@ def test_year_cursor_keeps_one_hour_seed_skips_zero_probe_and_resumes_exactly() 
         page_number=0,
         page_size=2,
         deadline_ms=8_000,
-        max_seed_attempts=2,
+        max_seed_attempts=1,
         max_candidates=2,
         max_query_count=50,
         classify_batch_size=2,
@@ -8010,7 +8518,7 @@ def test_year_cursor_keeps_one_hour_seed_skips_zero_probe_and_resumes_exactly() 
 
     assert second_executor.calls, second
     second_seed_params = second_executor.calls[0][1]
-    assert second_seed_params["slice_start"] == END - timedelta(minutes=30)
+    assert second_seed_params["slice_start"] == END - timedelta(hours=1)
     assert second_seed_params["slice_end"] == END
     assert second_seed_params["before_start_time"] == rows[1]["start_time"]
     assert second_seed_params["before_id"] == rows[1]["id"]
@@ -8028,7 +8536,7 @@ def test_year_cursor_keeps_one_hour_seed_skips_zero_probe_and_resumes_exactly() 
         for candidate_id in params["candidate_ids"]
     }
     assert first_candidate_ids == {rows[0]["id"], rows[1]["id"]}
-    assert second_candidate_ids == {row["id"] for row in rows[2:]}
+    assert second_candidate_ids == {rows[2]["id"], rows[3]["id"]}
     assert first_candidate_ids.isdisjoint(second_candidate_ids)
 
 
@@ -8038,7 +8546,7 @@ def test_year_cursor_empty_checkpoint_advances_page_n_without_repeating_slice() 
             assert query != "zero_probe"
             if query == "seed" and params["slice_end"] - params[
                 "slice_start"
-            ] > timedelta(minutes=30):
+            ] > timedelta(days=366):
                 self.calls.append((query, params))
                 raise ReadDeadlineExceeded("Code: 307. Memory limit exceeded")
             return super().execute_ch_query(
@@ -8072,7 +8580,7 @@ def test_year_cursor_empty_checkpoint_advances_page_n_without_repeating_slice() 
         page_number=0,
         page_size=2,
         deadline_ms=8_000,
-        max_seed_attempts=2,
+        max_seed_attempts=1,
         max_candidates=2,
         max_query_count=50,
         classify_batch_size=2,
@@ -8081,13 +8589,13 @@ def test_year_cursor_empty_checkpoint_advances_page_n_without_repeating_slice() 
     )
 
     first_seed_params = first_executor.calls[0][1]
-    assert [query for query, _ in first_executor.calls] == ["seed", "seed"]
+    assert [query for query, _ in first_executor.calls] == ["seed"]
     assert first_seed_params["slice_start"] == END - timedelta(hours=1)
     assert first_seed_params["slice_end"] == END
     assert first.rows == []
     assert first.complete is False
     assert first.continuation_slice_start is None
-    assert first.continuation_slice_end == END - timedelta(minutes=30)
+    assert first.continuation_slice_end == END - timedelta(hours=1)
     assert first.continuation_before_start_time is None
     assert first.continuation_before_id is None
 
@@ -8108,7 +8616,7 @@ def test_year_cursor_empty_checkpoint_advances_page_n_without_repeating_slice() 
         page_number=0,
         page_size=2,
         deadline_ms=8_000,
-        max_seed_attempts=2,
+        max_seed_attempts=1,
         max_candidates=2,
         max_query_count=50,
         classify_batch_size=2,
@@ -8118,12 +8626,12 @@ def test_year_cursor_empty_checkpoint_advances_page_n_without_repeating_slice() 
     )
 
     second_seed_params = second_executor.calls[0][1]
-    assert second_seed_params["slice_start"] == END - timedelta(minutes=90)
-    assert second_seed_params["slice_end"] == END - timedelta(minutes=30)
+    assert second_seed_params["slice_start"] == END - timedelta(hours=2)
+    assert second_seed_params["slice_end"] == END - timedelta(hours=1)
     assert second.complete is False
     assert second.rows == []
     assert second.continuation_slice_start is None
-    assert second.continuation_slice_end == END - timedelta(minutes=60)
+    assert second.continuation_slice_end == END - timedelta(hours=2)
 
 
 def test_cursor_seed_uses_page_sentinel_and_ten_candidate_classify_batches() -> None:
@@ -8149,7 +8657,7 @@ def test_cursor_seed_uses_page_sentinel_and_ten_candidate_classify_batches() -> 
             assert query != "zero_probe"
             if query == "seed" and params["slice_end"] - params[
                 "slice_start"
-            ] > timedelta(minutes=30):
+            ] > timedelta(hours=1):
                 self.calls.append((query, params))
                 raise ReadDeadlineExceeded("Code: 307. Memory limit exceeded")
             return super().execute_ch_query(
@@ -8168,7 +8676,7 @@ def test_cursor_seed_uses_page_sentinel_and_ten_candidate_classify_batches() -> 
         page_number=0,
         page_size=25,
         deadline_ms=8_000,
-        max_seed_attempts=2,
+        max_seed_attempts=1,
         max_candidates=200,
         max_query_count=24,
         include_incomplete_rows=True,
@@ -8182,7 +8690,7 @@ def test_cursor_seed_uses_page_sentinel_and_ten_candidate_classify_batches() -> 
     ]
     assert [len(batch) for batch in classify_batches] == [10, 10, 6]
     assert page.complete is False
-    assert page.continuation_slice_start == END - timedelta(minutes=30)
+    assert page.continuation_slice_start == END - timedelta(hours=1)
     assert page.continuation_slice_end == END
     assert page.continuation_before_start_time == rows[25]["start_time"]
     assert page.continuation_before_id == rows[25]["id"]
@@ -8926,8 +9434,8 @@ def test_initial_cursor_sparse_anchor_timeout_preserves_exact_fallback() -> None
         bounded_continuation=True,
     )
 
-    assert page.complete is True
-    assert page.error_code is None
+    assert page.complete is False
+    assert page.error_code == "read_budget_exceeded"
     assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
     assert [query for query, _ in executor.calls] == [
         "anchor",
@@ -9091,8 +9599,10 @@ def test_partitioned_anchor_wall_budget_honors_minimum_statement_boundary(
             deadline_ms=2_200,
         )
 
-    assert page.complete is True
-    assert page.error_code is None
+    assert page.complete is (expected_anchor_calls == 1)
+    assert page.error_code == (
+        None if expected_anchor_calls == 1 else "read_budget_exceeded"
+    )
     anchor_timeouts = [
         timeout for query, timeout in executor.timeouts if query == "anchor"
     ]
@@ -9131,7 +9641,7 @@ def test_anchor_budget_boundary_skips_probe_but_preserves_fallback() -> None:
     ]
 
 
-def test_long_window_indexed_anchor_timeout_falls_back_without_degrading() -> None:
+def test_long_window_indexed_anchor_timeout_fallback_remains_incomplete() -> None:
     rows = _rows(1, 2, 3)
     builder = _SmallAnchorFakeBuilder(rows, seed_proves_order=False)
     executor = _TimedAnchorFakeExecutor(builder, fail_anchor=True)
@@ -9146,8 +9656,9 @@ def test_long_window_indexed_anchor_timeout_falls_back_without_degrading() -> No
         deadline_ms=5_000,
     )
 
-    assert page.complete is True
-    assert [row["id"] for row in page.rows] == ["span-0", "span-1"]
+    assert page.complete is False
+    assert page.error_code == "read_budget_exceeded"
+    assert page.rows == []
     assert [query for query, _ in executor.calls] == [
         "anchor",
         "ordered_seed",
@@ -10653,8 +11164,9 @@ def test_unhydrated_membership_prefilter_failure_falls_back_to_exact_classifier(
         deadline_ms=5_000,
     )
 
-    assert page.complete is True
-    assert page.rows == [rows[1]]
+    assert page.complete is False
+    assert page.error_code == "read_budget_exceeded"
+    assert page.rows == []
     assert [query for query, _ in executor.calls] == [
         "seed",
         "seed",
@@ -10988,7 +11500,8 @@ def test_candidate_witness_read_failure_falls_back_to_exact_classifier() -> None
         deadline_ms=5_000,
     )
 
-    assert page.complete is True
+    assert page.complete is False
+    assert page.error_code == "read_budget_exceeded"
     assert page.rows == []
     assert [query for query, _ in executor.calls] == [
         "seed",
@@ -11164,7 +11677,8 @@ def test_candidate_witness_runtime_failure_falls_back_to_exact_classifier(
         deadline_ms=5_000,
     )
 
-    assert page.complete is True
+    assert page.complete is False
+    assert page.error_code == "prefilter_unavailable"
     assert page.rows == []
     assert [query for query, _ in executor.calls] == [
         "seed",
@@ -11269,7 +11783,8 @@ def test_candidate_witness_full_window_failure_splits_without_losing_absence_pro
     assert [
         params["candidate_ids"] for query, params in executor.calls if query == "match"
     ] == [("trace-0", "trace-1")]
-    assert page.complete is True
+    assert page.complete is False
+    assert page.error_code == "read_budget_exceeded"
 
 
 def test_candidate_witness_strata_cover_boundaries_before_excluding() -> None:
@@ -11413,7 +11928,8 @@ def test_candidate_witness_stratum_failure_discards_every_partial_negative() -> 
         params["slice_end"] - params["slice_start"] == timedelta(minutes=15)
         for params in prefilters
     )
-    assert page.complete is True
+    assert page.complete is False
+    assert page.error_code == "read_budget_exceeded"
 
 
 def test_candidate_witness_extra_identity_invalidates_optional_proof() -> None:
@@ -12102,7 +12618,7 @@ def test_read_budget_failure_is_degraded_sanitized_and_not_retried() -> None:
     assert "SELECT customer_payload" not in repr(page)
 
 
-def test_eval_mode_halves_a_wide_timeout_and_still_covers_the_window() -> None:
+def test_opt_in_retry_never_hides_a_failed_eval_read() -> None:
     start = END - timedelta(hours=2)
     builder = _FakeBuilder([], start=start, end=END)
 
@@ -12131,7 +12647,8 @@ def test_eval_mode_halves_a_wide_timeout_and_still_covers_the_window() -> None:
         retry_wide_read_budget=True,
     )
 
-    assert page.complete is True
+    assert page.complete is False
+    assert page.error_code == "read_budget_exceeded"
     assert page.rows == []
     assert any(
         attempt.error_code == "read_budget_exceeded" for attempt in page.attempts
@@ -12145,7 +12662,7 @@ def test_eval_mode_halves_a_wide_timeout_and_still_covers_the_window() -> None:
     assert successful_seeds[-1].slice_start == start
 
 
-def test_numbered_retry_keeps_learned_safe_width_across_adjacent_slices() -> None:
+def test_opt_in_numbered_retry_never_hides_a_failed_read() -> None:
     start = END - timedelta(hours=2)
     builder = _WideInitialSliceFakeBuilder([], start=start, end=END)
 
@@ -12173,7 +12690,8 @@ def test_numbered_retry_keeps_learned_safe_width_across_adjacent_slices() -> Non
         retry_wide_read_budget=True,
     )
 
-    assert page.complete is True
+    assert page.complete is False
+    assert page.error_code == "read_budget_exceeded"
     failed_wide_seeds = [
         attempt
         for attempt in page.attempts
@@ -12201,7 +12719,7 @@ def test_numbered_retry_keeps_learned_safe_width_across_adjacent_slices() -> Non
     )
 
 
-def test_cursor_halves_a_wide_seed_failure_and_advances_exact_checkpoint() -> None:
+def test_cursor_does_not_retry_a_failed_wide_seed() -> None:
     start = END - timedelta(hours=2)
     builder = _WideInitialSliceFakeBuilder([], start=start, end=END)
 
@@ -12231,13 +12749,13 @@ def test_cursor_halves_a_wide_seed_failure_and_advances_exact_checkpoint() -> No
         bounded_continuation=True,
     )
 
-    assert page.complete is True
+    assert page.complete is False
+    assert page.error_code == "read_budget_exceeded"
     assert page.rows == []
     assert page.continuation_slice_start is None
     assert page.continuation_slice_end is None
-    assert any(
-        attempt.error_code == "read_budget_exceeded" for attempt in page.attempts
-    )
+    assert [query for query, _params in executor.calls] == ["seed"]
+    assert page.attempts[0].error_code == "read_budget_exceeded"
     successful_seeds = [
         attempt
         for attempt in page.attempts
@@ -12246,13 +12764,7 @@ def test_cursor_halves_a_wide_seed_failure_and_advances_exact_checkpoint() -> No
     successful_intervals = [
         (attempt.slice_start, attempt.slice_end) for attempt in successful_seeds
     ]
-    assert successful_intervals == [
-        (END - timedelta(minutes=30), END),
-        (END - timedelta(minutes=60), END - timedelta(minutes=30)),
-        (END - timedelta(minutes=90), END - timedelta(minutes=60)),
-        (start, END - timedelta(minutes=90)),
-    ]
-    assert len(successful_intervals) == len(set(successful_intervals))
+    assert successful_intervals == []
 
 
 def test_programming_errors_are_not_hidden_as_read_budget_failures() -> None:
