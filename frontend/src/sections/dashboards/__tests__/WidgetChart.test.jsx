@@ -335,6 +335,37 @@ describe("WidgetChart — queued exact refresh", () => {
     );
   });
 
+  it("leaves a cold spinner after the component deadline even when the mutation adapter stays pending", async () => {
+    vi.useFakeTimers();
+    h.query.isPending = true;
+    h.query.mutate.mockImplementation(() => {});
+    const onQuerySettled = vi.fn();
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    expect(screen.getByRole("progressbar")).toBeInTheDocument();
+
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(AGGREGATION_REQUEST_TIMEOUT_MS),
+    );
+
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("We couldn't load this data. Please retry in a moment."),
+    ).toBeInTheDocument();
+    expect(onQuerySettled).toHaveBeenCalledOnce();
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: false, updatedAt: null }),
+    );
+  });
+
   it("keeps cached exact data while a refresh runs beyond 500 seconds, then publishes completion", async () => {
     vi.useFakeTimers();
     const cachedResponse = queryResult([

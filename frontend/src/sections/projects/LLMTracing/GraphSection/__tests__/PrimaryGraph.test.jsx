@@ -476,6 +476,16 @@ describe("PrimaryGraph", () => {
 
   it("keeps a confirmed pending job neutral during transient failures and stops after three consecutive failures", async () => {
     vi.useFakeTimers();
+    const refreshStates = [];
+    const recordRefreshState = (event) => {
+      if (event.detail?.observeId === "project-override") {
+        refreshStates.push(event.detail.refreshing);
+      }
+    };
+    window.addEventListener(
+      "observe-aggregation-refresh-state",
+      recordRefreshState,
+    );
     axios.post
       .mockResolvedValueOnce({
         data: {
@@ -495,6 +505,7 @@ describe("PrimaryGraph", () => {
     );
     await act(async () => vi.advanceTimersByTimeAsync(10));
     expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+    expect(refreshStates.at(-1)).toBe(true);
 
     await act(async () => vi.advanceTimersByTimeAsync(1_000));
     expect(axios.post).toHaveBeenCalledTimes(2);
@@ -514,9 +525,15 @@ describe("PrimaryGraph", () => {
     expect(
       screen.getByText("We couldn't load this data. Please retry in a moment."),
     ).toBeInTheDocument();
+    expect(refreshStates.at(-1)).toBe(false);
 
     await act(async () => vi.advanceTimersByTimeAsync(60_000));
     expect(axios.post).toHaveBeenCalledTimes(4);
+    expect(refreshStates.at(-1)).toBe(false);
+    window.removeEventListener(
+      "observe-aggregation-refresh-state",
+      recordRefreshState,
+    );
   });
 
   it("bounds a never-resolving refresh, preserves exact data, and ignores its late response", async () => {

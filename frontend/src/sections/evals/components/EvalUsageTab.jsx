@@ -149,11 +149,14 @@ const EvalUsageTab = ({
   // exact snapshot for the same query stays visible during refresh/polling.
   const chartUnavailable = !displayChartData;
   const logsUnavailable = !displayLogsData;
-  const isRefreshing =
-    chartFetching ||
-    logsFetching ||
-    chartData?.queryRefreshing ||
-    logsData?.queryRefreshing;
+  // Retained exact/pending data can still carry query_refreshing=true after
+  // this client has exhausted its bounded transport retries. A terminal hook
+  // error wins over that stale server metadata so Refresh/Retry is available.
+  const chartRefreshing =
+    !chartError && (chartFetching || chartData?.queryRefreshing);
+  const logsRefreshing =
+    !logsError && (logsFetching || logsData?.queryRefreshing);
+  const isRefreshing = chartRefreshing || logsRefreshing;
   const completedAt = displayChartData?.queryCompletedAt
     ? new Date(displayChartData.queryCompletedAt)
     : null;
@@ -464,7 +467,7 @@ const EvalUsageTab = ({
               <Typography variant="caption" color="text.secondary">
                 {chartError ? QUERY_FAILED_RETRY_MESSAGE : "Loading results…"}
               </Typography>
-              {!chartData?.queryRefreshing && (
+              {!chartRefreshing && (
                 <Button size="small" onClick={handleRefresh}>
                   Retry
                 </Button>
@@ -571,7 +574,7 @@ const EvalUsageTab = ({
                 <Typography variant="caption" color="text.secondary">
                   {logsError ? QUERY_FAILED_RETRY_MESSAGE : "Loading results…"}
                 </Typography>
-                {!logsData?.queryRefreshing && (
+                {!logsRefreshing && (
                   <Button size="small" onClick={() => refreshLogs()}>
                     Retry
                   </Button>

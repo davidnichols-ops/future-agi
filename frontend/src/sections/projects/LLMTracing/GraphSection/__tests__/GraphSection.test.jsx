@@ -325,6 +325,67 @@ describe("GraphSection exact graph boundary", () => {
     expect(screen.queryByText("Loading graph data…")).not.toBeInTheDocument();
   });
 
+  it.each(["trace", "spans"])(
+    "publishes a terminal non-refreshing state after three %s polling transport failures",
+    async (selectedTab) => {
+      vi.useFakeTimers();
+      const refreshStates = [];
+      const recordRefreshState = (event) => {
+        if (event.detail?.observeId === "project-1") {
+          refreshStates.push(event.detail.refreshing);
+        }
+      };
+      window.addEventListener(
+        "observe-aggregation-refresh-state",
+        recordRefreshState,
+      );
+      axios.post
+        .mockResolvedValueOnce({
+          data: {
+            result: {
+              metric_name: "latency",
+              data: [],
+              query_complete: false,
+              query_status: "pending",
+              query_sampled: false,
+              query_refreshing: true,
+            },
+          },
+        })
+        .mockRejectedValue(new Error("transport failed"));
+
+      renderGraph({ selectedTab });
+      fireEvent.click(screen.getByRole("button", { name: "Select latency" }));
+      await act(async () => vi.advanceTimersByTimeAsync(10));
+
+      expect(refreshStates.at(-1)).toBe(true);
+
+      // Split timer advancement across event-loop turns so React commits the
+      // terminal state before any later interval can be scheduled.
+      await act(async () => vi.advanceTimersByTimeAsync(1_000));
+      expect(axios.post).toHaveBeenCalledTimes(2);
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(axios.post).toHaveBeenCalledTimes(3);
+      await act(async () => vi.advanceTimersByTimeAsync(4_000));
+
+      expect(axios.post).toHaveBeenCalledTimes(4);
+      expect(
+        screen.getByText(
+          "We couldn't load this data. Please retry in a moment.",
+        ),
+      ).toBeInTheDocument();
+      expect(refreshStates.at(-1)).toBe(false);
+
+      await act(async () => vi.advanceTimersByTimeAsync(60_000));
+      expect(axios.post).toHaveBeenCalledTimes(4);
+      expect(refreshStates.at(-1)).toBe(false);
+      window.removeEventListener(
+        "observe-aggregation-refresh-state",
+        recordRefreshState,
+      );
+    },
+  );
+
   it("bounds a never-resolving transport, ignores its late response, and restarts on refresh", async () => {
     vi.useFakeTimers();
     let resolveLateRequest;

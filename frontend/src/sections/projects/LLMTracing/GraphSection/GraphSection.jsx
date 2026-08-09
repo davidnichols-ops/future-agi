@@ -275,6 +275,10 @@ const GraphSection = ({
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
     refetchInterval: (query) => {
+      // The inactive span query shares this component's polling refs. It must
+      // not reset the active trace query's failure counter from its own empty
+      // state, otherwise a failed trace poll can run forever.
+      if (selectedTab !== "trace") return false;
       const { isRefreshing, refreshFailed } = getAggregationRefreshState(
         query.state.data,
       );
@@ -358,6 +362,9 @@ const GraphSection = ({
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
     refetchInterval: (query) => {
+      // Symmetric guard for trace mode; only the selected graph owns the
+      // shared retry budget.
+      if (selectedTab !== "spans") return false;
       const { isRefreshing, refreshFailed } = getAggregationRefreshState(
         query.state.data,
       );
@@ -467,6 +474,14 @@ const GraphSection = ({
   );
 
   useEffect(() => {
+    // A terminal client-side transport failure overrides retained
+    // query_refreshing metadata. Unlock the shared Reload control so the user
+    // can start a fresh exact request.
+    if (apiGraphError) {
+      setRefreshUnavailable(true);
+      notifyAggregationRefresh(false);
+      return;
+    }
     if (!apiGraphData) return;
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(apiGraphData);
@@ -510,25 +525,12 @@ const GraphSection = ({
     }
   }, [
     apiGraphData,
+    apiGraphError,
     apiGraphReadState,
     graphSnapshotKey,
     notifyAggregationRefresh,
     observeId,
   ]);
-
-  useEffect(() => {
-    if (apiGraphError) {
-      setRefreshUnavailable(true);
-      const { isRefreshing, refreshFailed } =
-        getAggregationRefreshState(apiGraphData);
-      const refreshReadState = getExactAggregationReadState(apiGraphData);
-      notifyAggregationRefresh(
-        isRefreshing &&
-          !refreshFailed &&
-          (refreshReadState === "complete" || refreshReadState === "pending"),
-      );
-    }
-  }, [apiGraphData, apiGraphError, notifyAggregationRefresh]);
 
   const currentExactSnapshot =
     apiGraphData && apiGraphReadState === "complete"

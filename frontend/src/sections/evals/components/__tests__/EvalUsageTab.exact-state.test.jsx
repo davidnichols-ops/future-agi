@@ -26,9 +26,7 @@ vi.mock("src/sections/projects/DateTimeRangePicker", () => ({
       </button>
       <button
         type="button"
-        onClick={() =>
-          setParentDateFilter(["2026-08-01", "2026-08-02"])
-        }
+        onClick={() => setParentDateFilter(["2026-08-01", "2026-08-02"])}
       >
         Change custom range
       </button>
@@ -159,6 +157,45 @@ describe("EvalUsageTab exact read states", () => {
     expect(h.refetchLogs).toHaveBeenCalledTimes(2);
   });
 
+  it("enables refresh and both retries when terminal failures retain pending server metadata", () => {
+    h.chart = {
+      data: {
+        stats: {},
+        chart: [],
+        queryPending: true,
+        queryRefreshing: true,
+      },
+      isLoading: false,
+      isFetching: false,
+      isError: true,
+      refresh: h.refetchChart,
+    };
+    h.logs = {
+      data: {
+        table: [],
+        pagination: {},
+        queryPending: true,
+        queryRefreshing: true,
+      },
+      isLoading: false,
+      isFetching: false,
+      isError: true,
+      refresh: h.refetchLogs,
+    };
+
+    render(<EvalUsageTab templateId="eval-1" />);
+
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+    const retryButtons = screen.getAllByRole("button", { name: "Retry" });
+    expect(retryButtons).toHaveLength(2);
+
+    fireEvent.click(retryButtons[0]);
+    expect(h.refetchChart).toHaveBeenCalledOnce();
+    expect(h.refetchLogs).toHaveBeenCalledOnce();
+    fireEvent.click(retryButtons[1]);
+    expect(h.refetchLogs).toHaveBeenCalledTimes(2);
+  });
+
   it("does not publish empty chart or table states before the first response", () => {
     h.chart = {
       data: undefined,
@@ -239,11 +276,15 @@ describe("EvalUsageTab exact read states", () => {
 
     render(<EvalUsageTab templateId="eval-1" />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Select custom range" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Select custom range" }),
+    );
     fireEvent.click(screen.getByRole("button", { name: "Go to page 4" }));
     expect(screen.getByText("Page 3")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Change custom range" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Change custom range" }),
+    );
     expect(screen.getByText("Page 0")).toBeInTheDocument();
   });
 

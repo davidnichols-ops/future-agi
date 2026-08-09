@@ -81,6 +81,16 @@ function useAggregationPolling(identity) {
     }
   }, []);
 
+  // A 2xx body that violates the exact-aggregation contract is deterministic,
+  // not a transient transport outage. Stop polling immediately so retained
+  // pending metadata cannot hide the failure or disable an explicit retry.
+  const recordTerminalFailure = useCallback(() => {
+    pollAttemptRef.current = 0;
+    pollingRef.current = false;
+    consecutiveFailureRef.current = AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES;
+    setAggregationTransportFailed(true);
+  }, []);
+
   const refetchInterval = useCallback((query) => {
     const data = query.state.data;
     if (
@@ -108,6 +118,7 @@ function useAggregationPolling(identity) {
     beforeRequest,
     record,
     recordFailure,
+    recordTerminalFailure,
     refetchInterval,
     reset,
     isFailureTerminal,
@@ -166,6 +177,7 @@ export function useEvalUsageChart(
     beforeRequest,
     record,
     recordFailure,
+    recordTerminalFailure,
     refetchInterval,
     reset,
     isFailureTerminal,
@@ -197,7 +209,13 @@ export function useEvalUsageChart(
         if (!signal.aborted) recordFailure();
         throw error;
       }
-      const aggregation = readAggregationResult(data);
+      let aggregation;
+      try {
+        aggregation = readAggregationResult(data);
+      } catch (error) {
+        recordTerminalFailure();
+        throw error;
+      }
       record(aggregation);
       const result = aggregation.result || {};
       return {
@@ -227,12 +245,20 @@ export function useEvalUsageChart(
     return refetch({ cancelRefetch: true });
   }, [refetch, reset]);
 
+  const terminalError =
+    !query.isFetching &&
+    (aggregationTransportFailed ||
+      (query.isError && isFailureTerminal()) ||
+      query.data?.queryRefreshFailed === true);
+  const data =
+    terminalError && query.data?.queryRefreshing
+      ? { ...query.data, queryRefreshing: false }
+      : query.data;
+
   return {
     ...query,
-    isError:
-      aggregationTransportFailed ||
-      (query.isError && isFailureTerminal()) ||
-      query.data?.queryRefreshFailed === true,
+    data,
+    isError: terminalError,
     refresh,
   };
 }
@@ -257,6 +283,7 @@ export function useEvalUsageLogs(
     beforeRequest,
     record,
     recordFailure,
+    recordTerminalFailure,
     refetchInterval,
     reset,
     isFailureTerminal,
@@ -296,7 +323,13 @@ export function useEvalUsageLogs(
         if (!signal.aborted) recordFailure();
         throw error;
       }
-      const aggregation = readAggregationResult(data);
+      let aggregation;
+      try {
+        aggregation = readAggregationResult(data);
+      } catch (error) {
+        recordTerminalFailure();
+        throw error;
+      }
       record(aggregation);
       const result = aggregation.result || {};
       return {
@@ -329,12 +362,20 @@ export function useEvalUsageLogs(
     return refetch({ cancelRefetch: true });
   }, [refetch, reset]);
 
+  const terminalError =
+    !query.isFetching &&
+    (aggregationTransportFailed ||
+      (query.isError && isFailureTerminal()) ||
+      query.data?.queryRefreshFailed === true);
+  const data =
+    terminalError && query.data?.queryRefreshing
+      ? { ...query.data, queryRefreshing: false }
+      : query.data;
+
   return {
     ...query,
-    isError:
-      aggregationTransportFailed ||
-      (query.isError && isFailureTerminal()) ||
-      query.data?.queryRefreshFailed === true,
+    data,
+    isError: terminalError,
     refresh,
   };
 }

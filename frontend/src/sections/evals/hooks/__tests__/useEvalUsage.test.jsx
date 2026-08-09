@@ -178,6 +178,88 @@ describe("useEvalUsage date params", () => {
     expect(result.current.data?.chart).toHaveLength(1);
   });
 
+  it("makes retry available after three chart polling transport failures and recovers explicitly", async () => {
+    vi.useFakeTimers();
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            stats: {},
+            chart: [],
+            query_complete: false,
+            query_status: "pending",
+            query_sampled: false,
+            query_refreshing: true,
+          },
+        },
+      })
+      .mockRejectedValueOnce(new Error("transport failed 1"))
+      .mockRejectedValueOnce(new Error("transport failed 2"))
+      .mockRejectedValueOnce(new Error("transport failed 3"));
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () => useEvalUsageChart("t1", "30d", "30D", null),
+      { wrapper },
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(7_010));
+
+    expect(mocks.get).toHaveBeenCalledTimes(4);
+    expect(result.current.isError).toBe(true);
+    expect(result.current.data?.queryPending).toBe(true);
+    expect(result.current.data?.queryRefreshing).toBe(false);
+
+    mocks.get.mockResolvedValueOnce({
+      data: {
+        result: exactResult({
+          chart: [{ timestamp: "2026-08-03T00:00:00Z", calls: 2 }],
+        }),
+      },
+    });
+    await act(async () => result.current.refresh());
+
+    expect(mocks.get).toHaveBeenCalledTimes(5);
+    expect(mocks.get.mock.calls[4][1].params.refresh).toBe(true);
+    expect(result.current.isError).toBe(false);
+    expect(result.current.data?.queryRefreshing).toBe(false);
+    expect(result.current.data?.chart).toHaveLength(1);
+  });
+
+  it("stops chart polling immediately when a pending job returns an invalid 2xx contract", async () => {
+    vi.useFakeTimers();
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            stats: {},
+            chart: [],
+            query_complete: false,
+            query_status: "pending",
+            query_sampled: false,
+            query_refreshing: true,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: { result: { stats: {}, chart: [] } },
+      });
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () => useEvalUsageChart("t1", "30d", "30D", null),
+      { wrapper },
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_010));
+
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(result.current.isError).toBe(true);
+    expect(result.current.data?.queryPending).toBe(true);
+    expect(result.current.data?.queryRefreshing).toBe(false);
+
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps a server-confirmed chart refresh pending beyond 500 seconds and accepts completion", async () => {
     vi.useFakeTimers();
     const pending = {
@@ -346,6 +428,89 @@ describe("useEvalUsageLogs response mapping", () => {
     expect(result.current.data?.queryPending).toBe(false);
     expect(result.current.data?.table).toHaveLength(24);
     expect(result.current.data?.pagination.total).toBe(24);
+  });
+
+  it("makes retry available after three log polling transport failures and recovers explicitly", async () => {
+    vi.useFakeTimers();
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            table: [],
+            logs: {},
+            query_complete: false,
+            query_status: "pending",
+            query_sampled: false,
+            query_refreshing: true,
+          },
+        },
+      })
+      .mockRejectedValueOnce(new Error("transport failed 1"))
+      .mockRejectedValueOnce(new Error("transport failed 2"))
+      .mockRejectedValueOnce(new Error("transport failed 3"));
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () => useEvalUsageLogs("t1", { dateOption: "30D" }),
+      { wrapper },
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(7_010));
+
+    expect(mocks.get).toHaveBeenCalledTimes(4);
+    expect(result.current.isError).toBe(true);
+    expect(result.current.data?.queryPending).toBe(true);
+    expect(result.current.data?.queryRefreshing).toBe(false);
+
+    mocks.get.mockResolvedValueOnce({
+      data: {
+        result: exactResult({
+          table: [{ row_id: "recovered" }],
+          logs: { total: 1, page: 0 },
+        }),
+      },
+    });
+    await act(async () => result.current.refresh());
+
+    expect(mocks.get).toHaveBeenCalledTimes(5);
+    expect(mocks.get.mock.calls[4][1].params.refresh).toBe(true);
+    expect(result.current.isError).toBe(false);
+    expect(result.current.data?.queryRefreshing).toBe(false);
+    expect(result.current.data?.table?.[0]?.row_id).toBe("recovered");
+  });
+
+  it("stops log polling immediately when a pending job returns an invalid 2xx contract", async () => {
+    vi.useFakeTimers();
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            table: [],
+            logs: {},
+            query_complete: false,
+            query_status: "pending",
+            query_sampled: false,
+            query_refreshing: true,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: { result: { table: [], logs: {} } },
+      });
+    const wrapper = createQueryWrapper();
+    const { result } = renderHook(
+      () => useEvalUsageLogs("t1", { dateOption: "30D" }),
+      { wrapper },
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_010));
+
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(result.current.isError).toBe(true);
+    expect(result.current.data?.queryPending).toBe(true);
+    expect(result.current.data?.queryRefreshing).toBe(false);
+
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(mocks.get).toHaveBeenCalledTimes(2);
   });
 
   it("keeps a server-confirmed log refresh pending beyond 500 seconds", async () => {

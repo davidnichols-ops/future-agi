@@ -557,6 +557,14 @@ const PrimaryGraph = ({
   );
 
   useEffect(() => {
+    // Client-side retry exhaustion is terminal for this request scope even if
+    // the retained server snapshot still says query_refreshing=true. Publish
+    // false so ObserveHeader releases Reload for an explicit retry.
+    if (graphError) {
+      setRefreshUnavailable(true);
+      notifyAggregationRefresh(false);
+      return;
+    }
     if (!graphData) return;
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(graphData);
@@ -601,24 +609,11 @@ const PrimaryGraph = ({
   }, [
     effectiveObserveId,
     graphData,
+    graphError,
     graphReadState,
     notifyAggregationRefresh,
     snapshotKey,
   ]);
-
-  useEffect(() => {
-    if (graphError) {
-      setRefreshUnavailable(true);
-      const { isRefreshing, refreshFailed } =
-        getAggregationRefreshState(graphData);
-      const refreshReadState = getExactAggregationReadState(graphData);
-      notifyAggregationRefresh(
-        isRefreshing &&
-          !refreshFailed &&
-          (refreshReadState === "complete" || refreshReadState === "pending"),
-      );
-    }
-  }, [graphData, graphError, notifyAggregationRefresh]);
 
   // A completed response is already safe to render in this render pass. Do
   // not wait for the persistence effect below: that one-frame gap used to

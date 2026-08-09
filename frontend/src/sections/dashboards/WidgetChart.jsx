@@ -557,7 +557,11 @@ export default function WidgetChart({
       formatValueWithConfig(val, cfg, { fallbackDecimals, includeUnit });
   const formatVal = makeFormatter(leftAxisFormatConfig);
 
-  if (queryMutation.isPending && !exactSnapshot) {
+  // Some mutation adapters/interceptors can leave `isPending` true even after
+  // this component's independently bounded request has timed out. Once the
+  // current query scope is terminal, render the retry state instead of letting
+  // the adapter's stale pending flag mask it forever.
+  if (queryMutation.isPending && !exactSnapshot && !retryUnavailable) {
     return (
       <Box
         ref={containerRef}
