@@ -7,6 +7,7 @@ to avoid sandbox validation issues.
 """
 
 from collections.abc import Callable
+from importlib import import_module
 
 # =============================================================================
 # Registry Storage
@@ -122,6 +123,28 @@ def register_for_queues(
 # =============================================================================
 # Lazy Loading (separate for workflows and activities)
 # =============================================================================
+
+
+def _load_usage_temporal_registry(name: str) -> Callable[[], list] | None:
+    """Load cloud usage Temporal hooks, with legacy EE compatibility."""
+    for module_name in ("ee.cloud.temporal", "ee.usage.temporal"):
+        try:
+            temporal_module = import_module(module_name)
+        except ModuleNotFoundError as exc:
+            # Treat only the candidate module (or one of its parents) as
+            # optional.  A missing dependency imported *by* that module is a
+            # real packaging error and must remain visible at worker startup.
+            if not exc.name or not (
+                module_name == exc.name or module_name.startswith(f"{exc.name}.")
+            ):
+                raise
+            continue
+
+        registry = getattr(temporal_module, name, None)
+        if callable(registry):
+            return registry
+
+    return None
 
 
 def _ensure_workflows_registered() -> None:
@@ -355,10 +378,7 @@ def _ensure_workflows_registered() -> None:
     # Register billing/usage workflows for default queue
     # UsageConsumerWorkflow (long-running singleton) + MonthlyResetWorkflow
     try:
-        try:
-            from ee.usage.temporal import get_workflows as get_billing_workflows
-        except ImportError:
-            get_billing_workflows = None
+        get_billing_workflows = _load_usage_temporal_registry("get_workflows")
 
         if get_billing_workflows is not None:
             register_for_queues(
@@ -788,10 +808,7 @@ def _ensure_activities_registered() -> None:
 
     # Register usage metering activities (consumer, sync, monthly reset)
     try:
-        try:
-            from ee.usage.temporal import get_activities as get_usage_activities
-        except ImportError:
-            get_usage_activities = None
+        get_usage_activities = _load_usage_temporal_registry("get_activities")
 
         if get_usage_activities is not None:
             usage_activities = get_usage_activities()
