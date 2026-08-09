@@ -561,6 +561,83 @@ describe("TaskLivePreview sparse cursor continuation", () => {
     expect(spanListCalls).toBe(2);
   });
 
+  it("loads the preview through the legacy numbered fallback", async () => {
+    let spanListCalls = 0;
+    mocks.get.mockImplementation(async (url, config) => {
+      if (url === "/spans/") {
+        spanListCalls += 1;
+        if (spanListCalls === 1) {
+          const error = new Error("legacy cursor field");
+          error.response = {
+            status: 400,
+            data: {
+              attr: "cursor_mode",
+              detail: "cursor_mode: Unknown field.",
+            },
+          };
+          throw error;
+        }
+        expect(config.params).toEqual(
+          expect.objectContaining({ page_number: 0 }),
+        );
+        expect(config.params).not.toHaveProperty("cursor_mode");
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-legacy",
+                  trace_id: "trace-legacy",
+                  input: "legacy preview value",
+                },
+              ],
+              metadata: { total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-legacy/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-legacy" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-legacy",
+                    input: "legacy preview value",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PreviewHarness />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText("Row 1 of 1");
+    expect(screen.getByText(/legacy preview value/)).toBeVisible();
+    expect(spanListCalls).toBe(2);
+    const firstSpanRequest = mocks.get.mock.calls.find(
+      ([url]) => url === "/spans/",
+    );
+    expect(firstSpanRequest[1].params).toEqual(
+      expect.objectContaining({ cursor_mode: true, page_number: 0 }),
+    );
+  });
+
   it("fails closed without looping when the API repeats a signed cursor", async () => {
     mocks.get.mockResolvedValue({
       data: {

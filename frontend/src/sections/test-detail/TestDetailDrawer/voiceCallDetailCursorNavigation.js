@@ -1,4 +1,7 @@
-import { listContinuationParams } from "src/sections/projects/LLMTracing/listCursorPagination";
+import {
+  isLegacyListCursorValidationError,
+  listContinuationParams,
+} from "src/sections/projects/LLMTracing/listCursorPagination";
 
 const DEFAULT_MAX_RESPONSES_PER_ATTEMPT = 13;
 const DEFAULT_ATTEMPT_DEADLINE_MS = 30_000;
@@ -148,6 +151,9 @@ export const createVoiceCallDetailCursorNavigator = ({
   let started = false;
   let terminal = false;
   let nextCursor = null;
+  let legacyMode = false;
+  let legacyPage = 1;
+  let legacyFallbackAttempted = false;
 
   const appendRows = (nextRows) => {
     for (const row of Array.isArray(nextRows) ? nextRows : []) {
@@ -191,26 +197,50 @@ export const createVoiceCallDetailCursorNavigator = ({
         return resultFor(index, { pending: true });
       }
 
-      const requestParams = !started
-        ? {
-            ...params,
-            page_size: pageSize,
-            cursor_mode: true,
-            page: 1,
-          }
-        : listContinuationParams(
-            { ...params, page_size: pageSize },
-            nextCursor,
-          );
+      const requestParams = legacyMode
+        ? { ...params, page_size: pageSize, page: legacyPage }
+        : !started
+          ? {
+              ...params,
+              page_size: pageSize,
+              cursor_mode: true,
+              page: 1,
+            }
+          : listContinuationParams(
+              { ...params, page_size: pageSize },
+              nextCursor,
+            );
       const remainingMs = Math.max(0, maxElapsedMs - (now() - startedAt));
       if (remainingMs === 0) {
         return resultFor(index, { pending: true });
       }
-      const requestResult = await requestWithinDeadline({
-        request,
-        params: requestParams,
-        remainingMs,
-      });
+      let requestResult;
+      try {
+        requestResult = await requestWithinDeadline({
+          request,
+          params: requestParams,
+          remainingMs,
+        });
+      } catch (error) {
+        if (
+          legacyFallbackAttempted ||
+          !isLegacyListCursorValidationError(error)
+        ) {
+          throw error;
+        }
+        // A cursor continuation may have reached an older pod. Restart from
+        // legacy page one so row indexes remain deterministic; never combine a
+        // partial cursor prefix with numbered pages from a different contract.
+        legacyFallbackAttempted = true;
+        legacyMode = true;
+        legacyPage = 1;
+        started = false;
+        nextCursor = null;
+        rows.length = 0;
+        identities.clear();
+        followedCursors.clear();
+        continue;
+      }
       if (requestResult.deadlineReached) {
         return resultFor(index, { pending: true });
       }
@@ -218,10 +248,25 @@ export const createVoiceCallDetailCursorNavigator = ({
       responseCount += 1;
       started = true;
 
-      appendRows(rowsFromResponse(response));
+      const responseRows = rowsFromResponse(response);
+      appendRows(responseRows);
       const payload = payloadFromResponse(response);
       if (!hasOwn(payload, "has_more") || !hasOwn(payload, "next_cursor")) {
-        throw new Error("Voice-call list does not support exact cursors");
+        if (!legacyMode) {
+          throw new Error("Voice-call list does not support exact cursors");
+        }
+        const nextPage = Number(payload?.next);
+        if (
+          responseRows.length < pageSize ||
+          payload?.next == null ||
+          !Number.isInteger(nextPage) ||
+          nextPage <= legacyPage
+        ) {
+          terminal = true;
+        } else {
+          legacyPage = nextPage;
+        }
+        continue;
       }
 
       if (payload.has_more === false) {

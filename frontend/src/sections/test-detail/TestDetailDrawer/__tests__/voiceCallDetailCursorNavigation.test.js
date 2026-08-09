@@ -16,6 +16,66 @@ const response = ({ rows = [], hasMore, nextCursor }) => ({
 });
 
 describe("voice-call detail exact cursor navigation", () => {
+  it("restarts page-one navigation once when an old backend rejects cursor fields", async () => {
+    const cursorValidationError = Object.assign(
+      new Error("cursor_mode: Unknown field."),
+      {
+        response: {
+          status: 400,
+          data: {
+            attr: "cursor_mode",
+            detail: "cursor_mode: Unknown field.",
+            details: { cursor_mode: ["Unknown field."] },
+          },
+        },
+      },
+    );
+    const request = vi
+      .fn()
+      .mockRejectedValueOnce(cursorValidationError)
+      .mockResolvedValueOnce({
+        data: {
+          results: [{ id: "legacy-call-0" }, { id: "legacy-call-1" }],
+          next: 2,
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          results: [{ id: "legacy-call-2" }],
+          next: null,
+        },
+      });
+    const navigator = createVoiceCallDetailCursorNavigator({
+      request,
+      baseParams: { project_id: "project-1" },
+      pageSize: 2,
+    });
+
+    await expect(navigator.loadRow(2)).resolves.toMatchObject({
+      row: { id: "legacy-call-2" },
+      pending: false,
+      terminal: true,
+    });
+    expect(request.mock.calls.map(([params]) => params)).toEqual([
+      {
+        project_id: "project-1",
+        page_size: 2,
+        cursor_mode: true,
+        page: 1,
+      },
+      {
+        project_id: "project-1",
+        page_size: 2,
+        page: 1,
+      },
+      {
+        project_id: "project-1",
+        page_size: 2,
+        page: 2,
+      },
+    ]);
+  });
+
   it("walks from page one to a deep row using signed cursors only", async () => {
     const request = vi
       .fn()

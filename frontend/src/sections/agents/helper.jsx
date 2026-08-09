@@ -871,19 +871,21 @@ export const useCallLogs = ({
         ...params,
       };
       if (isProjectModule && cursorPagination) {
+        const cursorBaseParams = { page_size: pageLimit, ...params };
         const exactPage = await loadExactListPage({
           pagination: cursorPagination,
           pageNumber: page - 1,
           targetRowCount: pageLimit,
           loadResponse: () =>
             axios.get(getEndpoint(), {
-              params: paginationParams
-                ? { ...params, ...paginationParams }
-                : baseParams,
+              params: cursorPagination.requestParams(
+                page - 1,
+                cursorBaseParams,
+              ),
             }),
           nextResponse: (cursor) =>
             axios.get(getEndpoint(), {
-              params: listContinuationParams(baseParams, cursor),
+              params: listContinuationParams(cursorBaseParams, cursor),
             }),
           rowsFromResponse: (response) => {
             const result = response?.data?.result || response?.data || {};
@@ -968,19 +970,21 @@ export const prefetchCallLogs = (
     queryFn: async () => {
       const baseParams = { page, page_size: pageLimit, ...params };
       if (isProjectModule && cursorPagination) {
+        const cursorBaseParams = { page_size: pageLimit, ...params };
         const exactPage = await loadExactListPage({
           pagination: cursorPagination,
           pageNumber: page - 1,
           targetRowCount: pageLimit,
           loadResponse: () =>
             axios.get(endpoint, {
-              params: paginationParams
-                ? { ...params, ...paginationParams }
-                : baseParams,
+              params: cursorPagination.requestParams(
+                page - 1,
+                cursorBaseParams,
+              ),
             }),
           nextResponse: (cursor) =>
             axios.get(endpoint, {
-              params: listContinuationParams(baseParams, cursor),
+              params: listContinuationParams(cursorBaseParams, cursor),
             }),
           rowsFromResponse: (response) => {
             const result = response?.data?.result || response?.data || {};

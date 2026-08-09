@@ -178,6 +178,67 @@ describe("SessionGrid cursor continuation", () => {
     expect(params.success).toHaveBeenCalledTimes(1);
   });
 
+  it("consumes a rejected cursor prefetch before retrying the page as numbered", async () => {
+    let rejectPrefetch;
+    const prefetchedCursorPage = new Promise((_resolve, reject) => {
+      rejectPrefetch = reject;
+    });
+    const legacyCursorError = {
+      response: {
+        status: 400,
+        data: {
+          attr: "cursor_mode",
+          detail: "cursor_mode: Unknown field.",
+          details: { cursor_mode: ["Unknown field."] },
+        },
+      },
+    };
+    getMock
+      .mockResolvedValueOnce(
+        sessionResponse({
+          rows: Array.from({ length: 25 }, (_, index) => row(index)),
+          hasMore: true,
+          nextCursor: "signed-after-25",
+          totalRows: 25,
+          lowerBound: true,
+        }),
+      )
+      .mockReturnValueOnce(prefetchedCursorPage)
+      .mockResolvedValueOnce(
+        sessionResponse({ rows: [row(25)], totalRows: 26 }),
+      );
+    renderGrid();
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const firstPage = makeParams();
+    await getRows(firstPage);
+    expect(getMock).toHaveBeenCalledTimes(2);
+
+    const secondPage = makeParams({ startRow: 25 });
+    const secondPageRead =
+      gridState.props.serverSideDatasource.getRows(secondPage);
+    rejectPrefetch(legacyCursorError);
+    await act(async () => secondPageRead);
+
+    expect(getMock).toHaveBeenCalledTimes(3);
+    expect(getMock.mock.calls[1][1].params).toEqual(
+      expect.objectContaining({
+        cursor_mode: true,
+        cursor: "signed-after-25",
+      }),
+    );
+    expect(getMock.mock.calls[2][1].params).toEqual(
+      expect.objectContaining({ page_number: 1 }),
+    );
+    expect(getMock.mock.calls[2][1].params).not.toHaveProperty("cursor_mode");
+    expect(getMock.mock.calls[2][1].params).not.toHaveProperty("cursor");
+    expect(secondPage.success).toHaveBeenCalledWith({
+      rowData: [row(25)],
+      rowCount: 26,
+    });
+    expect(secondPage.fail).not.toHaveBeenCalled();
+  });
+
   it("follows an empty checkpoint and publishes only the first genuine match", async () => {
     getMock
       .mockResolvedValueOnce(

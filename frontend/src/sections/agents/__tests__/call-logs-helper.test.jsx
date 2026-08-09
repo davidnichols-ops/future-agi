@@ -218,6 +218,66 @@ describe("useCallLogs", () => {
     );
   });
 
+  it("retries voice page one once without cursor fields on a legacy API", async () => {
+    const pagination = createListCursorPagination({
+      pageParam: "page",
+      pageOffset: 1,
+    });
+    axiosMocks.get
+      .mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            attr: "cursor_mode",
+            detail: "cursor_mode: Unknown field.",
+            details: { cursor_mode: ["Unknown field."] },
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            results: [{ id: "legacy-call" }],
+            count: 1,
+            total_pages: 1,
+          },
+        },
+      });
+
+    const paginationParams = pagination.requestParams(0, { page_size: 25 });
+    const { result } = renderHook(
+      () =>
+        useCallLogs({
+          module: "project",
+          id: "project-1",
+          page: 1,
+          pageLimit: 25,
+          params: { project_id: "project-1" },
+          paginationParams,
+          cursorPagination: pagination,
+          paginationGeneration: pagination.generation(),
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() =>
+      expect(result.current.data?.results).toEqual([{ id: "legacy-call" }]),
+    );
+    expect(axiosMocks.get).toHaveBeenCalledTimes(2);
+    expect(axiosMocks.get.mock.calls[0][1].params).toEqual({
+      project_id: "project-1",
+      page_size: 25,
+      cursor_mode: true,
+      page: 1,
+    });
+    expect(axiosMocks.get.mock.calls[1][1].params).toEqual({
+      project_id: "project-1",
+      page_size: 25,
+      page: 1,
+    });
+    expect(pagination.mode()).toBe("numbered");
+  });
+
   it("does not prefetch agent call logs without an agent version", () => {
     const queryClient = { prefetchQuery: vi.fn() };
 

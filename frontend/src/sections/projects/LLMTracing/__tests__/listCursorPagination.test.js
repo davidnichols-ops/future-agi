@@ -5,10 +5,12 @@ import {
   createListCursorPagination,
   followEmptyListContinuations,
   getEmptyListContinuation,
+  isLegacyListCursorValidationError,
   loadExactListPage,
   listContinuationParams,
   LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE,
   LIST_CURSOR_MODES,
+  requestListWithLegacyCursorFallback,
   resumeEmptyListPage,
 } from "../listCursorPagination";
 
@@ -38,6 +40,148 @@ describe("list cursor pagination", () => {
       ...options,
     });
   };
+
+  const legacyUnknownFieldError = (field = "cursor_mode") => ({
+    response: {
+      status: 400,
+      data: {
+        status: false,
+        type: "validation_error",
+        code: "invalid",
+        attr: field,
+        detail: `${field}: Unknown field.`,
+        details: { [field]: ["Unknown field."] },
+      },
+    },
+  });
+
+  it("recognizes only legacy unknown cursor-field validation errors", () => {
+    expect(
+      isLegacyListCursorValidationError(legacyUnknownFieldError("cursor_mode")),
+    ).toBe(true);
+    expect(
+      isLegacyListCursorValidationError(legacyUnknownFieldError("cursor")),
+    ).toBe(true);
+    expect(
+      isLegacyListCursorValidationError({
+        response: {
+          status: 400,
+          data: { detail: "cursor: The continuation cursor is invalid." },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      isLegacyListCursorValidationError({
+        response: {
+          status: 400,
+          data: {
+            attr: "filters",
+            detail: "filters: Unknown field.",
+            details: { filters: ["Unknown field."] },
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("never translates a rejected continuation cursor into first-page numbered data", async () => {
+    const error = legacyUnknownFieldError("cursor");
+    const request = vi.fn().mockRejectedValue(error);
+
+    await expect(
+      requestListWithLegacyCursorFallback({
+        request,
+        params: {
+          project_id: "p1",
+          cursor_mode: true,
+          cursor: "signed-continuation",
+        },
+      }),
+    ).rejects.toEqual(error);
+    expect(request).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledWith({
+      project_id: "p1",
+      cursor_mode: true,
+      cursor: "signed-continuation",
+    });
+  });
+
+  it("retries page zero once without cursor fields on a legacy API", async () => {
+    const pagination = createListCursorPagination();
+    const calls = [];
+    let attempt = 0;
+
+    const page = await loadExactListPage({
+      pagination,
+      pageNumber: 0,
+      targetRowCount: 25,
+      loadResponse: async () => {
+        calls.push(pagination.requestParams(0, { project_id: "p1" }));
+        attempt += 1;
+        if (attempt === 1) throw legacyUnknownFieldError();
+        return { rows: [{ id: "legacy-row" }], metadata: { total_rows: 1 } };
+      },
+      nextResponse: vi.fn(),
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      rowIdentity: (row) => row.id,
+    });
+
+    expect(calls).toEqual([
+      { project_id: "p1", cursor_mode: true, page_number: 0 },
+      { project_id: "p1", page_number: 0 },
+    ]);
+    expect(page.rows).toEqual([{ id: "legacy-row" }]);
+    expect(page.stale).toBe(false);
+    expect(pagination.mode()).toBe(LIST_CURSOR_MODES.NUMBERED);
+  });
+
+  it("does not loop when the legacy numbered retry also fails", async () => {
+    const pagination = createListCursorPagination();
+    const loadResponse = vi.fn().mockRejectedValue(legacyUnknownFieldError());
+
+    await expect(
+      loadExactListPage({
+        pagination,
+        pageNumber: 0,
+        targetRowCount: 25,
+        loadResponse,
+        nextResponse: vi.fn(),
+        rowsFromResponse: () => [],
+        metadataFromResponse: () => ({}),
+        rowIdentity: (row) => row.id,
+      }),
+    ).rejects.toEqual(legacyUnknownFieldError());
+    expect(loadResponse).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the new-backend cursor contract without a legacy retry", async () => {
+    const pagination = createListCursorPagination();
+    const loadResponse = vi
+      .fn()
+      .mockResolvedValue(
+        exactResponse([{ id: "new-row" }], true, "signed-next"),
+      );
+
+    const page = await loadExactListPage({
+      pagination,
+      pageNumber: 0,
+      targetRowCount: 1,
+      loadResponse,
+      nextResponse: vi.fn(),
+      rowsFromResponse: (response) => response.rows,
+      metadataFromResponse: (response) => response.metadata,
+      rowIdentity: (row) => row.id,
+    });
+
+    expect(loadResponse).toHaveBeenCalledTimes(1);
+    expect(page.rows).toEqual([{ id: "new-row" }]);
+    expect(pagination.mode()).toBe(LIST_CURSOR_MODES.CURSOR);
+    expect(pagination.requestParams(1, {})).toEqual({
+      cursor_mode: true,
+      cursor: "signed-next",
+    });
+  });
 
   it("opts page zero into cursor mode while preserving page-zero compatibility", () => {
     const pagination = createListCursorPagination();

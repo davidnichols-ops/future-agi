@@ -296,4 +296,55 @@ describe.each([
     });
     expect(resumedRound.api.refreshServerSide).not.toHaveBeenCalled();
   });
+
+  it("retries the first page once as numbered against a strict legacy API", async () => {
+    getMock
+      .mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            attr: "cursor_mode",
+            detail: "cursor_mode: Unknown field.",
+            details: { cursor_mode: ["Unknown field."] },
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            config: [],
+            table: [row],
+            metadata: { total_rows: 1 },
+          },
+        },
+      });
+
+    renderGrid(kind);
+    await waitFor(() => expect(gridState.props).not.toBeNull());
+
+    const params = makeParams();
+    await getRows(params);
+
+    expect(getMock).toHaveBeenCalledTimes(2);
+    expect(getMock).toHaveBeenNthCalledWith(
+      1,
+      endpoint,
+      expect.objectContaining({
+        params: expect.objectContaining({
+          cursor_mode: true,
+          page_number: 0,
+        }),
+      }),
+    );
+    expect(getMock.mock.calls[1][1].params).toEqual(
+      expect.objectContaining({ page_number: 0 }),
+    );
+    expect(getMock.mock.calls[1][1].params).not.toHaveProperty("cursor_mode");
+    expect(getMock.mock.calls[1][1].params).not.toHaveProperty("cursor");
+    expect(params.success).toHaveBeenCalledWith({
+      rowData: [row],
+      rowCount: 1,
+    });
+    expect(params.fail).not.toHaveBeenCalled();
+  });
 });

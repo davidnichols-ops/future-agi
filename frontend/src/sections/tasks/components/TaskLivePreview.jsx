@@ -52,6 +52,7 @@ import {
   createListCursorProtocolError,
   isListCursorProtocolError,
   listContinuationParams,
+  requestListWithLegacyCursorFallback,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
 import {
   ANNOTATION_COLUMN_IDS,
@@ -380,18 +381,28 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         };
       };
 
+      const requestList = (url, params, { voice = false } = {}) =>
+        requestListWithLegacyCursorFallback({
+          request: (nextParams) =>
+            axios.get(url, { params: nextParams, signal }),
+          params,
+          pageParam: voice ? "page" : "page_number",
+          firstPage: voice ? 1 : 0,
+        });
+
       if (rowType === "voiceCalls") {
         const requestParams = buildTaskPreviewListParams({
           rowType,
           projectId,
           apiFilters,
         });
-        const resp = await axios.get(endpoints.project.getCallLogs, {
-          params: resumeCursor
+        const resp = await requestList(
+          endpoints.project.getCallLogs,
+          resumeCursor
             ? listContinuationParams(requestParams, resumeCursor)
             : requestParams,
-          signal,
-        });
+          { voice: true },
+        );
         const exactRows = await collectExactListRows({
           initialResponse: resp,
           initialRows: activeListContinuation?.rows || [],
@@ -403,10 +414,11 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
           metadataFromResponse: (response) =>
             response?.data?.result || response?.data || {},
           nextResponse: (cursor) =>
-            axios.get(endpoints.project.getCallLogs, {
-              params: listContinuationParams(requestParams, cursor),
-              signal,
-            }),
+            requestList(
+              endpoints.project.getCallLogs,
+              listContinuationParams(requestParams, cursor),
+              { voice: true },
+            ),
           onContinuation: recordContinuation,
           isCurrent: () => !signal.aborted,
           rowIdentity: (row) => taskPreviewRowIdentity(rowType, row),
@@ -448,12 +460,12 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         projectId,
         apiFilters,
       });
-      const resp = await axios.get(url, {
-        params: resumeCursor
+      const resp = await requestList(
+        url,
+        resumeCursor
           ? listContinuationParams(requestParams, resumeCursor)
           : requestParams,
-        signal,
-      });
+      );
       const exactRows = await collectExactListRows({
         initialResponse: resp,
         initialRows: activeListContinuation?.rows || [],
@@ -462,10 +474,7 @@ const TaskLivePreview = forwardRef(function TaskLivePreview(
         metadataFromResponse: (response) =>
           response?.data?.result?.metadata || {},
         nextResponse: (cursor) =>
-          axios.get(url, {
-            params: listContinuationParams(requestParams, cursor),
-            signal,
-          }),
+          requestList(url, listContinuationParams(requestParams, cursor)),
         onContinuation: recordContinuation,
         isCurrent: () => !signal.aborted,
         rowIdentity: (row) => taskPreviewRowIdentity(rowType, row),

@@ -36,6 +36,7 @@ import {
   createListCursorProtocolError,
   isListCursorProtocolError,
   listContinuationParams,
+  requestListWithLegacyCursorFallback,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
 
 import {
@@ -611,6 +612,14 @@ const TracingTestMode = React.forwardRef(
             }
             requestedCursors.add(nextCursor);
           };
+          const requestList = (endpoint, params, { voice = false } = {}) =>
+            requestListWithLegacyCursorFallback({
+              request: (nextParams) =>
+                axios.get(endpoint, { params: nextParams }),
+              params,
+              pageParam: voice ? "page" : "page_number",
+              firstPage: voice ? 1 : 0,
+            });
           if (rowType === "VoiceCall") {
             const requestParams = buildTracingVoicePreviewListParams({
               selectedProjectId,
@@ -619,9 +628,11 @@ const TracingTestMode = React.forwardRef(
             const initialParams = startingCursor
               ? listContinuationParams(requestParams, startingCursor)
               : requestParams;
-            const response = await axios.get(endpoints.project.getCallLogs, {
-              params: initialParams,
-            });
+            const response = await requestList(
+              endpoints.project.getCallLogs,
+              initialParams,
+              { voice: true },
+            );
             const exactRows = await collectExactListRows({
               initialResponse: response,
               initialRows: startingRows,
@@ -634,9 +645,11 @@ const TracingTestMode = React.forwardRef(
               metadataFromResponse: (nextResponse) =>
                 nextResponse?.data?.result || nextResponse?.data || {},
               nextResponse: (cursor) =>
-                axios.get(endpoints.project.getCallLogs, {
-                  params: listContinuationParams(requestParams, cursor),
-                }),
+                requestList(
+                  endpoints.project.getCallLogs,
+                  listContinuationParams(requestParams, cursor),
+                  { voice: true },
+                ),
               rowIdentity: (row) => tracingPreviewRowIdentity(rowType, row),
               onContinuation: recordContinuation,
               isCurrent: () => !cancelled,
@@ -707,7 +720,7 @@ const TracingTestMode = React.forwardRef(
             endpoint = endpoints.project.projectSessionList();
           }
 
-          const response = await axios.get(endpoint, { params: initialParams });
+          const response = await requestList(endpoint, initialParams);
           const exactRows = await collectExactListRows({
             initialResponse: response,
             initialRows: startingRows,
@@ -717,9 +730,7 @@ const TracingTestMode = React.forwardRef(
             metadataFromResponse: (nextResponse) =>
               nextResponse?.data?.result?.metadata || {},
             nextResponse: (cursor) =>
-              axios.get(endpoint, {
-                params: listContinuationParams(params, cursor),
-              }),
+              requestList(endpoint, listContinuationParams(params, cursor)),
             rowIdentity: (row) => tracingPreviewRowIdentity(rowType, row),
             onContinuation: recordContinuation,
             isCurrent: () => !cancelled,

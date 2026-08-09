@@ -13,6 +13,94 @@ const DEFAULT_EMPTY_CONTINUATION_DEADLINE_MS = 30_000;
 const hasOwn = (value, key) =>
   Object.prototype.hasOwnProperty.call(value || {}, key);
 
+const LEGACY_CURSOR_FIELDS = new Set(["cursor", "cursor_mode"]);
+
+const unknownFieldMessage = (value) =>
+  typeof value === "string" && /unknown field/i.test(value);
+
+/**
+ * Match only the strict-validation response emitted by API versions that
+ * predate the additive list cursor fields. Invalid/expired cursors and other
+ * HTTP 400 responses must remain visible to the caller.
+ */
+export const isLegacyListCursorValidationError = (error) => {
+  if (error?.response?.status !== 400) return false;
+
+  const body = error?.response?.data;
+  if (!body || typeof body !== "object") return false;
+
+  const details = body.details;
+  if (details && typeof details === "object") {
+    for (const field of LEGACY_CURSOR_FIELDS) {
+      const messages = details[field];
+      if (
+        (Array.isArray(messages) && messages.some(unknownFieldMessage)) ||
+        unknownFieldMessage(messages)
+      ) {
+        return true;
+      }
+    }
+  }
+
+  const attr = typeof body.attr === "string" ? body.attr : null;
+  const messages = [body.detail, body.message, body.error, body.result].filter(
+    (value) => typeof value === "string",
+  );
+  if (
+    attr &&
+    LEGACY_CURSOR_FIELDS.has(attr) &&
+    messages.some(unknownFieldMessage)
+  ) {
+    return true;
+  }
+
+  return messages.some((message) =>
+    /(?:^|\b)(?:cursor_mode|cursor)\s*:\s*unknown field\b/i.test(message),
+  );
+};
+
+export const legacyNumberedListParams = (
+  params,
+  { pageParam = "page_number", firstPage = 0 } = {},
+) => {
+  if (typeof pageParam !== "string" || pageParam.length === 0) {
+    throw new Error("Invalid legacy list page parameter");
+  }
+  if (!Number.isInteger(firstPage) || firstPage < 0) {
+    throw new Error("Invalid legacy list first page");
+  }
+  const {
+    cursor: _cursor,
+    cursor_mode: _cursorMode,
+    page: _page,
+    page_number: _pageNumber,
+    ...baseParams
+  } = params || {};
+  return { ...baseParams, [pageParam]: firstPage };
+};
+
+/** One-shot compatibility request for a strict pre-cursor API deployment. */
+export const requestListWithLegacyCursorFallback = async ({
+  request,
+  params,
+  pageParam = "page_number",
+  firstPage = 0,
+}) => {
+  if (typeof request !== "function") {
+    throw new Error("List request is required");
+  }
+  try {
+    return await request(params);
+  } catch (error) {
+    const hasContinuationCursor =
+      typeof params?.cursor === "string" && params.cursor.length > 0;
+    if (hasContinuationCursor || !isLegacyListCursorValidationError(error)) {
+      throw error;
+    }
+    return request(legacyNumberedListParams(params, { pageParam, firstPage }));
+  }
+};
+
 export const isListCursorContinuationLimitError = (error) =>
   error?.code === LIST_CURSOR_CONTINUATION_LIMIT_ERROR_CODE;
 
@@ -96,14 +184,21 @@ export const createListCursorPagination = ({
     seenCursors.clear();
   };
 
-  const disableCursor = () => {
-    generation += 1;
+  // An initial request rejected by a strict pre-cursor serializer is still the
+  // same logical grid generation. Switch transport contracts without making
+  // the successful retry look stale to the caller's generation guard.
+  const fallbackToNumbered = () => {
     mode = NUMBERED_MODE;
     cursorByPage.clear();
     cursorByPage.set(0, null);
     transportCursorByPage.clear();
     bufferedVisiblePageByPage.clear();
     seenCursors.clear();
+  };
+
+  const disableCursor = () => {
+    generation += 1;
+    fallbackToNumbered();
   };
 
   const requestParams = (pageNumber, baseParams) => {
@@ -296,6 +391,7 @@ export const createListCursorPagination = ({
   return {
     reset,
     disableCursor,
+    fallbackToNumbered,
     requestParams,
     recordResponse,
     recordEmptyContinuation,
@@ -375,7 +471,7 @@ export const loadExactListPage = async ({
     throw new Error("Invalid list continuation deadline");
   }
 
-  const buffered = pagination.bufferedVisiblePage(pageNumber);
+  let buffered = pagination.bufferedVisiblePage(pageNumber);
   const accumulatedRows = [];
   const identities = new Set();
   const appendRows = (rows) => {
@@ -392,6 +488,7 @@ export const loadExactListPage = async ({
   let response = buffered?.response;
   let metadata = buffered?.metadata || {};
   let continuationCount = 0;
+  let legacyFallbackAttempted = false;
   const startedAt = now();
 
   // A terminal overflow from the previous visible page already contains all
@@ -418,10 +515,30 @@ export const loadExactListPage = async ({
     // a false repeated-cursor protocol error.
     const resumeBufferedCheckpoint =
       continuationCount === 0 && buffered && metadata?.has_more === true;
-    const nextTransportResponse =
-      continuationCount === 0 && !resumeBufferedCheckpoint
-        ? await loadResponse()
-        : await nextResponse(metadata.next_cursor);
+    let nextTransportResponse;
+    try {
+      nextTransportResponse =
+        continuationCount === 0 && !resumeBufferedCheckpoint
+          ? await loadResponse()
+          : await nextResponse(metadata.next_cursor);
+    } catch (error) {
+      if (
+        legacyFallbackAttempted ||
+        !isLegacyListCursorValidationError(error)
+      ) {
+        throw error;
+      }
+      legacyFallbackAttempted = true;
+      pagination.fallbackToNumbered();
+      buffered = null;
+      accumulatedRows.length = 0;
+      identities.clear();
+      response = undefined;
+      metadata = {};
+      continuationCount = 0;
+      needsResponse = true;
+      continue;
+    }
     if (!isCurrent()) {
       return {
         response,

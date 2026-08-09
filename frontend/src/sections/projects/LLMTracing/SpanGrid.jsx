@@ -486,17 +486,22 @@ const SpanGrid = React.forwardRef(
                 });
 
               // Use prefetched data if available, otherwise fetch
-              const cached = prefetchCache.current.get(pageNumber);
+              let cached = prefetchCache.current.get(pageNumber);
               prefetchCache.current.delete(pageNumber);
               const exactPage = await loadExactListPage({
                 pagination: cursorPagination.current,
                 pageNumber,
                 targetRowCount: ROWS_LIMIT,
-                loadResponse: () =>
-                  cached ||
-                  axios.get(endpoints.project.getSpansForObserveProject(), {
-                    params: buildParams(pageNumber),
-                  }),
+                loadResponse: () => {
+                  const prefetched = cached;
+                  cached = undefined;
+                  return (
+                    prefetched ||
+                    axios.get(endpoints.project.getSpansForObserveProject(), {
+                      params: buildParams(pageNumber),
+                    })
+                  );
+                },
                 rowsFromResponse: (response) =>
                   response?.data?.result?.table || [],
                 metadataFromResponse: (response) =>

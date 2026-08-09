@@ -516,6 +516,79 @@ describe("TracingTestMode exact task attribute mapping", () => {
     expect(spanListCalls).toBe(2);
   });
 
+  it("loads eval preview rows through the strict legacy cursor fallback", async () => {
+    let spanListCalls = 0;
+    mocks.get.mockImplementation(async (url, config) => {
+      if (url === `/projects/${PROJECT_ID}`) {
+        return { data: { result: { id: PROJECT_ID, source: "api" } } };
+      }
+      if (url === "/spans/") {
+        spanListCalls += 1;
+        if (spanListCalls === 1) {
+          const error = new Error("legacy cursor field");
+          error.response = {
+            status: 400,
+            data: {
+              attr: "cursor_mode",
+              detail: "cursor_mode: Unknown field.",
+            },
+          };
+          throw error;
+        }
+        expect(config.params).toEqual(
+          expect.objectContaining({ page_number: 0 }),
+        );
+        expect(config.params).not.toHaveProperty("cursor_mode");
+        return {
+          data: {
+            result: {
+              config: [],
+              table: [
+                {
+                  span_id: "span-legacy-eval",
+                  trace_id: "trace-legacy-eval",
+                  input: "legacy eval preview",
+                },
+              ],
+              metadata: { total_rows: 1 },
+            },
+          },
+        };
+      }
+      if (url === "/traces/trace-legacy-eval/") {
+        return {
+          data: {
+            result: {
+              trace: { trace_id: "trace-legacy-eval" },
+              observation_spans: [
+                {
+                  observation_span: {
+                    id: "span-legacy-eval",
+                    input: "legacy eval preview",
+                  },
+                  children: [],
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+
+    renderTaskMapping(vi.fn());
+
+    expect(await screen.findByText("Row 1 of 1")).toBeInTheDocument();
+    expect(spanListCalls).toBe(2);
+    const spanRequests = mocks.get.mock.calls.filter(
+      ([url]) => url === "/spans/",
+    );
+    expect(spanRequests[0][1].params).toEqual(
+      expect.objectContaining({ cursor_mode: true, page_number: 0 }),
+    );
+    expect(spanRequests[1][1].params).not.toHaveProperty("cursor_mode");
+  });
+
   it.each([
     [
       "degraded",

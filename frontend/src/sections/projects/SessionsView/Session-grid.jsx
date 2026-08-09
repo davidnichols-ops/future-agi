@@ -281,18 +281,22 @@ const SessionGrid = React.forwardRef(
 
               // Await the in-flight prefetch promise if present, else fetch —
               // dedupes a concurrent getRows for the same page.
-              const cached = prefetchCache.current.get(pageNumber);
+              let cached = prefetchCache.current.get(pageNumber);
               prefetchCache.current.delete(pageNumber);
               const exactPage = await loadExactListPage({
                 pagination: cursorPagination.current,
                 pageNumber,
                 targetRowCount: DATASET_ROWS_LIMIT,
-                loadResponse: () =>
-                  cached
-                    ? cached
-                    : axios.get(endpoints.project.projectSessionList(), {
-                        params: buildParams(pageNumber),
-                      }),
+                loadResponse: () => {
+                  const prefetched = cached;
+                  cached = undefined;
+                  return (
+                    prefetched ||
+                    axios.get(endpoints.project.projectSessionList(), {
+                      params: buildParams(pageNumber),
+                    })
+                  );
+                },
                 rowsFromResponse: (response) =>
                   response?.data?.result?.table || [],
                 metadataFromResponse: (response) =>
