@@ -369,52 +369,197 @@ def test_exact_graph_trace_seed_deduplicates_siblings_before_outer_keyset() -> N
     assert "latest_attr_exists_1" in match_sql
 
 
-def test_exact_graph_any_span_witness_keeps_adjacent_child_and_root_time_contract() -> (
+def test_exact_graph_root_seed_keeps_root_window_and_classifies_children_globally() -> (
     None
 ):
     filters = [
         _time_filter(),
         _attribute_filter("final_status", ["Rejected"], operation="in"),
     ]
-    builder = TraceListQueryBuilderV2(project_id=PROJECT_ID, filters=filters)
-    child_start = START - timedelta(minutes=1)
-
-    assert builder.exact_graph_filter_witness_range() == (
-        START - timedelta(days=1),
-        END + timedelta(days=1),
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=filters,
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
     )
-    seed_sql, seed_params = builder.build_filter_seed_page(
-        slice_start=child_start,
-        slice_end=START,
+    checkpoint = END - timedelta(minutes=1)
+
+    assert builder.exact_graph_filter_witness_range() == (START, END)
+    seed_sql, seed_params = builder.build_filter_ordered_seed_page(
+        slice_start=START,
+        slice_end=END,
         limit=200,
-        _deduplicate_traces=True,
+        before_start_time=checkpoint,
+        before_id="trace-m",
     )
     match_sql, match_params = builder.build_filter_identity_match_query_from_seed_rows(
         [
             {
                 "project_id": PROJECT_ID,
-                "trace_id": "trace-root-inside-child-outside",
-                "start_time": child_start,
+                "trace_id": "trace-root-inside-child-three-days-late",
+                "start_time": checkpoint,
             }
         ]
     )
 
-    assert seed_params["filter_slice_start"] == child_start
-    assert seed_params["filter_slice_end"] == START
-    assert "max(start_time) AS witness_start_time" in seed_sql
+    assert seed_params["filter_slice_start"] == START
+    assert seed_params["filter_slice_end"] == END
+    assert "parent_span_id IS NULL" in seed_sql
+    assert "filter_slice_start_us" in seed_sql
+    assert "filter_slice_end_us" in seed_sql
+    assert "filter_before_start_us" in seed_sql
+    assert "LIMIT 1 BY trace_id" in seed_sql
+    assert seed_params["filter_seed_limit"] == 200
     assert match_params["candidate_start_date"] == START
     assert match_params["candidate_end_date"] == END
-    assert match_params["candidate_witness_start_date_us"] == int(
-        (START - timedelta(days=1)).replace(tzinfo=UTC).timestamp() * 1_000_000
-    )
-    assert match_params["candidate_witness_end_date_us"] == int(
-        (END + timedelta(days=1)).replace(tzinfo=UTC).timestamp() * 1_000_000
-    )
-    assert "candidate_witness_start_date_us" in match_sql
-    assert "candidate_witness_end_date_us" in match_sql
+    assert "candidate_witness_start_date_us" not in match_params
+    assert "candidate_witness_end_date_us" not in match_params
+    physical_scan = match_sql.split("FROM spans", 1)[1].split("GROUP BY", 1)[0]
+    assert "trace_id IN %(candidate_trace_ids)s" in physical_scan
+    assert "candidate_witness_start_date_us" not in physical_scan
+    assert "candidate_witness_end_date_us" not in physical_scan
+    assert "start_time >=" not in physical_scan
+    assert "start_time <" not in physical_scan
     canonical_root = match_sql.split("AS canonical_root_identity", 1)[0]
     assert "candidate_start_date_us" in canonical_root
     assert "candidate_end_date_us" in canonical_root
+    assert "latest_start_time >=" in canonical_root
+    assert "latest_start_time <" in canonical_root
+    assert "countIf(latest_attr_exists_0" in match_sql
+    assert "latest_is_deleted = 0" in match_sql
+    assert "argMax(is_deleted, _version)" in match_sql
+
+
+@pytest.mark.parametrize(
+    ("missing_requirement", "expected_error"),
+    [
+        (
+            "bounded_internal_scan",
+            "bounded_global_span_witnesses requires internal membership-only",
+        ),
+        ("bounded_identity_only", "bounded_bulk_scan requires bounded_identity_only"),
+        (
+            "bounded_bulk_scan",
+            "bounded_global_span_witnesses requires internal membership-only",
+        ),
+        (
+            "bounded_include_filter_witnesses",
+            "bounded_global_span_witnesses requires internal membership-only",
+        ),
+    ],
+)
+def test_global_span_witness_mode_rejects_non_membership_only_builder(
+    missing_requirement: str,
+    expected_error: str,
+) -> None:
+    kwargs = {
+        "bounded_internal_scan": True,
+        "bounded_identity_only": True,
+        "bounded_bulk_scan": True,
+        "bounded_include_filter_witnesses": False,
+        "bounded_global_span_witnesses": True,
+    }
+    kwargs[missing_requirement] = (
+        True if missing_requirement == "bounded_include_filter_witnesses" else False
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=expected_error,
+    ):
+        TraceListQueryBuilderV2(
+            project_id=PROJECT_ID,
+            filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+            **kwargs,
+        )
+
+
+def test_exact_graph_global_classifier_preserves_org_composite_identity() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    builder = TraceListQueryBuilderV2(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
+    )
+    started = END - timedelta(minutes=1)
+
+    sql, params = builder.build_filter_identity_match_query_from_seed_rows(
+        [
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "shared-trace",
+                "start_time": started,
+            },
+            {
+                "project_id": project_b,
+                "trace_id": "shared-trace",
+                "start_time": started,
+            },
+        ]
+    )
+
+    assert params["candidate_trace_ids"] == ("shared-trace",)
+    assert params["candidate_trace_identities"] == (
+        (PROJECT_ID, "shared-trace"),
+        (project_b, "shared-trace"),
+    )
+    physical_scan = sql.split("FROM spans", 1)[1].split("GROUP BY", 1)[0]
+    assert "(project_id, trace_id) IN %(candidate_trace_identities)s" in physical_scan
+    assert "candidate_witness_start_date_us" not in params
+    assert "candidate_witness_end_date_us" not in params
+    assert "start_time >=" not in physical_scan
+    assert "start_time <" not in physical_scan
+    assert (
+        "(grouped_project_id, grouped_trace_id) "
+        "IN %(candidate_trace_identities)s" in sql
+    )
+    canonical_root = sql.split("AS canonical_root_identity", 1)[0]
+    assert "candidate_start_date_us" in canonical_root
+    assert "candidate_end_date_us" in canonical_root
+
+
+def test_exact_graph_global_classifier_collapses_mutations_before_tombstone_filter() -> (
+    None
+):
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
+    )
+
+    sql, _ = builder.build_filter_identity_match_query_from_seed_rows(
+        [
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-mutated-after-root-window",
+                "start_time": END - timedelta(minutes=1),
+            }
+        ]
+    )
+
+    physical_scan = sql.split("FROM spans", 1)[1].split("GROUP BY", 1)[0]
+    assert "is_deleted = 0" not in physical_scan
+    assert "argMax(is_deleted, _version) AS latest_is_deleted" in sql
+    assert "WHERE latest_is_deleted = 0" in sql
+    assert "argMax(mapContains(attrs_string" in sql
+    assert "candidate_witness_start_date_us" not in sql
 
 
 def test_exact_graph_bulk_classifier_accepts_200_and_rejects_201_identities() -> None:

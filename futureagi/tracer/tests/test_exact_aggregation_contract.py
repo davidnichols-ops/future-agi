@@ -2386,12 +2386,11 @@ def test_exact_trace_membership_exhausts_witness_cursor_and_classifies_each_trac
             return row["trace_id"]
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             seed_calls.append(
                 (
                     kwargs["before_start_time"],
                     kwargs["before_id"],
-                    kwargs["_deduplicate_traces"],
                 )
             )
             return "WITNESS", {}
@@ -2428,8 +2427,8 @@ def test_exact_trace_membership_exhausts_witness_cursor_and_classifies_each_trac
     assert query_count == 4
     assert rows_returned == 6
     assert seed_calls == [
-        (None, None, True),
-        (t2, "trace-2", True),
+        (None, None),
+        (t2, "trace-2"),
     ]
 
 
@@ -2474,7 +2473,7 @@ def test_exact_trace_membership_fails_closed_on_unproven_witness(monkeypatch, fa
             return row["matched_span_id"]
 
         @staticmethod
-        def build_filter_seed_page(**_kwargs):
+        def build_filter_ordered_seed_page(**_kwargs):
             return "WITNESS", {}
 
         @staticmethod
@@ -2542,7 +2541,7 @@ def test_exact_trace_membership_widens_empty_slices_logarithmically(monkeypatch)
             return request_start, request_end
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             slices.append((kwargs["slice_start"], kwargs["slice_end"]))
             return "WITNESS", {}
 
@@ -2609,7 +2608,7 @@ def test_exact_trace_membership_keeps_expensive_successful_slices_narrow(monkeyp
             return request_start, request_end
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             slices.append((kwargs["slice_start"], kwargs["slice_end"]))
             return "WITNESS", {}
 
@@ -2666,7 +2665,7 @@ def test_exact_trace_membership_retries_same_upper_bound_then_recovers_below_fai
             return request_start, request_end
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             return "WITNESS", {
                 "slice_start": kwargs["slice_start"],
                 "slice_end": kwargs["slice_end"],
@@ -2748,7 +2747,7 @@ def test_exact_trace_membership_can_fallback_below_five_minutes(monkeypatch):
             return request_start, request_end
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             return "WITNESS", {
                 "slice_start": kwargs["slice_start"],
                 "slice_end": kwargs["slice_end"],
@@ -2815,7 +2814,7 @@ def test_exact_trace_membership_recovers_from_hot_newest_to_sparse_old_history(
             return request_start, request_end
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             return "WITNESS", {
                 "slice_start": kwargs["slice_start"],
                 "slice_end": kwargs["slice_end"],
@@ -2897,7 +2896,7 @@ def test_exact_trace_membership_fails_closed_at_minimum_slice(monkeypatch):
             return request_start, request_end
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             return "WITNESS", {
                 "slice_start": kwargs["slice_start"],
                 "slice_end": kwargs["slice_end"],
@@ -2956,7 +2955,7 @@ def test_exact_trace_membership_enforces_whole_refresh_deadline(monkeypatch):
             return request_start, request_end
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             return "WITNESS", {
                 "slice_start": kwargs["slice_start"],
                 "slice_end": kwargs["slice_end"],
@@ -2987,22 +2986,21 @@ def test_exact_trace_membership_enforces_whole_refresh_deadline(monkeypatch):
 
 
 @pytest.mark.unit
-def test_exact_trace_membership_walks_adjacent_day_witness_in_logarithmic_queries(
+def test_exact_trace_membership_seeds_in_window_root_and_classifies_child_over_day_late(
     monkeypatch,
 ):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     request_start = datetime(2026, 8, 1)
     request_end = request_start + timedelta(minutes=10)
-    witness_start = request_start - timedelta(days=1)
-    witness_end = request_end + timedelta(days=1)
-    root_start = request_start + timedelta(minutes=1)
-    child_start = request_start - timedelta(minutes=1)
+    root_start = request_end - timedelta(minutes=1)
+    child_start = request_end + timedelta(days=3)
     seed_slices = []
+    constructor_kwargs = {}
 
     class Builder:
-        def __init__(self, **_kwargs):
-            pass
+        def __init__(self, **kwargs):
+            constructor_kwargs.update(kwargs)
 
         @staticmethod
         def supports_bounded_filter_scan():
@@ -3014,7 +3012,7 @@ def test_exact_trace_membership_walks_adjacent_day_witness_in_logarithmic_querie
 
         @staticmethod
         def exact_graph_filter_witness_range():
-            return witness_start, witness_end
+            return request_start, request_end
 
         @staticmethod
         def bounded_filter_seed_identity(row):
@@ -3025,7 +3023,7 @@ def test_exact_trace_membership_walks_adjacent_day_witness_in_logarithmic_querie
             return row["trace_id"]
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             seed_slices.append((kwargs["slice_start"], kwargs["slice_end"]))
             return "WITNESS", {
                 "slice_start": kwargs["slice_start"],
@@ -3037,6 +3035,7 @@ def test_exact_trace_membership_walks_adjacent_day_witness_in_logarithmic_querie
             return "CLASSIFY", {
                 "ids": tuple(row["trace_id"] for row in rows),
                 "root_start": root_start,
+                "child_start": child_start,
             }
 
     class Analytics:
@@ -3044,19 +3043,19 @@ def test_exact_trace_membership_walks_adjacent_day_witness_in_logarithmic_querie
         def execute_ch_query(query, params, **_kwargs):
             if query == "CLASSIFY":
                 assert request_start <= params["root_start"] < request_end
+                assert params["child_start"] > request_end + timedelta(days=1)
                 return SimpleNamespace(
                     data=[{"trace_id": trace_id} for trace_id in params["ids"]],
                     columns=["trace_id"],
                     query_time_ms=1,
                 )
-            if not params["slice_start"] <= child_start < params["slice_end"]:
+            if not params["slice_start"] <= root_start < params["slice_end"]:
                 return SimpleNamespace(data=[], columns=[], query_time_ms=1)
-            assert not request_start <= child_start < request_end
             return SimpleNamespace(
                 data=[
                     {
-                        "trace_id": "trace-root-inside-child-outside",
-                        "start_time": child_start,
+                        "trace_id": "trace-root-inside-child-three-days-late",
+                        "start_time": root_start,
                     }
                 ],
                 columns=[],
@@ -3073,16 +3072,101 @@ def test_exact_trace_membership_walks_adjacent_day_witness_in_logarithmic_querie
         started=exact_module.monotonic(),
     )
 
-    assert trace_ids == ["trace-root-inside-child-outside"]
-    assert query_count == 11
+    assert constructor_kwargs["bounded_global_span_witnesses"] is True
+    assert trace_ids == ["trace-root-inside-child-three-days-late"]
+    assert query_count == len(seed_slices) + 1
     assert rows_returned == 2
-    assert len(seed_slices) == 10
-    assert seed_slices[0][1] == witness_end
+    assert seed_slices[0][1] == request_end
     assert all(
         previous[0] == following[1]
         for previous, following in zip(seed_slices, seed_slices[1:], strict=False)
     )
-    assert seed_slices[-1][0] == witness_start
+    assert seed_slices[-1][0] == request_start
+    assert all(
+        request_start <= slice_start < slice_end <= request_end
+        for slice_start, slice_end in seed_slices
+    )
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_rejects_seed_when_latest_live_root_is_outside_window(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=5)
+    stale_root_start = request_start + timedelta(minutes=1)
+    moved_root_start = request_end + timedelta(days=2)
+
+    class Builder:
+        def __init__(self, **kwargs):
+            assert kwargs["bounded_global_span_witnesses"] is True
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def build_filter_ordered_seed_page(**_kwargs):
+            return "ROOT_SEED", {}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            return "CLASSIFY", {
+                "ids": tuple(row["trace_id"] for row in rows),
+                "moved_root_start": moved_root_start,
+            }
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(query, params, **_kwargs):
+            if query == "ROOT_SEED":
+                return SimpleNamespace(
+                    data=[
+                        {
+                            "trace_id": "trace-root-moved-out",
+                            "start_time": stale_root_start,
+                        }
+                    ],
+                    columns=[],
+                    query_time_ms=1,
+                )
+            assert query == "CLASSIFY"
+            assert params["moved_root_start"] >= request_end
+            # The latest-state classifier is authoritative: a stale in-window
+            # raw root is only a candidate, never publishable membership.
+            return SimpleNamespace(data=[], columns=["trace_id"], query_time_ms=1)
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == []
+    assert query_count == 2
+    assert rows_returned == 1
 
 
 @pytest.mark.unit
@@ -3133,7 +3217,7 @@ def test_exact_trace_membership_exhausts_200_identity_classifier_boundary(monkey
             return row["trace_id"]
 
         @staticmethod
-        def build_filter_seed_page(**_kwargs):
+        def build_filter_ordered_seed_page(**_kwargs):
             return "WITNESS", {}
 
         @staticmethod
@@ -3178,7 +3262,7 @@ def test_exact_trace_membership_deduplicates_across_slices_and_classifies_latest
     request_start = datetime(2026, 8, 1)
     request_end = request_start + timedelta(minutes=20)
     classified_batches = []
-    deduplicate_flags = []
+    ordered_seed_calls = []
 
     class Builder:
         def __init__(self, **_kwargs):
@@ -3205,8 +3289,8 @@ def test_exact_trace_membership_deduplicates_across_slices_and_classifies_latest
             return row["trace_id"]
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
-            deduplicate_flags.append(kwargs["_deduplicate_traces"])
+        def build_filter_ordered_seed_page(**kwargs):
+            ordered_seed_calls.append((kwargs["slice_start"], kwargs["slice_end"]))
             return "WITNESS", {"slice_end": kwargs["slice_end"]}
 
         @staticmethod
@@ -3268,7 +3352,11 @@ def test_exact_trace_membership_deduplicates_across_slices_and_classifies_latest
     ]
     assert query_count == 6
     assert rows_returned == 7
-    assert deduplicate_flags == [True, True, True, True]
+    assert len(ordered_seed_calls) == 4
+    assert all(
+        request_start <= slice_start < slice_end <= request_end
+        for slice_start, slice_end in ordered_seed_calls
+    )
 
 
 @pytest.mark.unit
@@ -3306,7 +3394,7 @@ def test_exact_trace_membership_fails_closed_after_partial_deduplicated_walk(
             return row["trace_id"]
 
         @staticmethod
-        def build_filter_seed_page(**kwargs):
+        def build_filter_ordered_seed_page(**kwargs):
             return "WITNESS", {"slice_end": kwargs["slice_end"]}
 
         @staticmethod

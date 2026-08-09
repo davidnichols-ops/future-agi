@@ -212,6 +212,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         bounded_bulk_scan: bool = False,
         bounded_include_filter_witnesses: bool = True,
         bounded_population_proof: bool = False,
+        bounded_global_span_witnesses: bool = False,
         bounded_sampling_salt: str | None = None,
         bounded_sampling_rate: float | None = None,
         **kwargs: Any,
@@ -269,6 +270,17 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             raise ValueError(
                 "bounded_population_proof requires one-project internal "
                 "identity-only bulk classification"
+            )
+        self._bounded_global_span_witnesses = bool(bounded_global_span_witnesses)
+        if self._bounded_global_span_witnesses and not (
+            self._bounded_internal_scan
+            and self._bounded_identity_only
+            and self._bounded_bulk_scan
+            and not self._bounded_include_filter_witnesses
+        ):
+            raise ValueError(
+                "bounded_global_span_witnesses requires internal membership-only "
+                "bulk classification"
             )
         if (bounded_sampling_salt is None) != (bounded_sampling_rate is None):
             raise ValueError(
@@ -2252,7 +2264,9 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 "(start_time)", "(witness_start_time)"
             )
             deduplicated_root_fragment = (
-                "" if any_span_plans else "AND (parent_span_id IS NULL OR parent_span_id = '')"
+                ""
+                if any_span_plans
+                else "AND (parent_span_id IS NULL OR parent_span_id = '')"
             )
             query = f"""
         SELECT project_id, trace_id, witness_start_time AS start_time
@@ -2326,18 +2340,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return query, params
 
     def exact_graph_filter_witness_range(self) -> tuple[datetime, datetime]:
-        """Return the exhaustive raw-witness window for an exact trace graph.
+        """Return the canonical-root enumeration window for an exact graph.
 
-        Public trace time filters bind to the canonical root span. Any-span
-        attributes can be carried by a child just outside that root window;
-        list and monolithic graph membership therefore inspect one adjacent
-        day on either side. Root-only filters need no wider witness walk.
+        Public trace time filters bind to the canonical root span, so the
+        exhaustive seed walk stays exactly inside that half-open window. Once
+        a finite root batch is known, the exact graph classifier uses project
+        and trace identity (and ``idx_trace_id``) to inspect child witnesses at
+        any timestamp. No maximum trace duration is assumed here.
         """
 
         request_start, request_end = self.parse_time_range(self.filters)
-        plans, _ = self._partition_trace_filter_plans(self._bounded_filters())
-        if any(plan.scope == "any" for plan in plans):
-            return request_start - timedelta(days=1), request_end + timedelta(days=1)
         return request_start, request_end
 
     def build_filter_match_query(
@@ -2413,12 +2425,22 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # Preserve an explicit user time filter, however, because that *is*
         # part of the task's selection contract.
         scope_to_request_window = not candidate_full_state or has_explicit_time_filter
+        # Exact aggregate refreshes first enumerate a finite set of canonical
+        # roots inside the requested window. For that internal mode, project +
+        # trace identity is the complete child-membership bound: a child may be
+        # written days after its root, and ingestion enforces no maximum trace
+        # duration. Keep the root predicate windowed below while removing the
+        # heuristic physical child-time envelope. Normal list/task classifiers
+        # retain their existing time-scoped behavior.
+        scope_span_witnesses_to_request_window = (
+            scope_to_request_window and not self._bounded_global_span_witnesses
+        )
         plans, residual_filters = self._partition_trace_filter_plans(match_filters)
         root_plans = [plan for plan in plans if plan.scope == "root"]
         any_span_plans = [plan for plan in plans if plan.scope == "any"]
         candidate_witness_start = request_start
         candidate_witness_end = request_end
-        if scope_to_request_window and any_span_plans:
+        if scope_span_witnesses_to_request_window and any_span_plans:
             candidate_witness_start -= timedelta(days=1)
             candidate_witness_end += timedelta(days=1)
         params: dict[str, Any] = {
@@ -2434,6 +2456,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     "candidate_end_date": request_end,
                     "candidate_start_date_us": _unix_microseconds(request_start),
                     "candidate_end_date_us": _unix_microseconds(request_end),
+                }
+            )
+        if scope_span_witnesses_to_request_window:
+            params.update(
+                {
                     "candidate_witness_start_date_us": _unix_microseconds(
                         candidate_witness_start
                     ),
@@ -2443,7 +2470,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 }
             )
         candidate_time_fragment = ""
-        if scope_to_request_window:
+        if scope_span_witnesses_to_request_window:
             # start_time is part of the immutable physical span identity. All
             # versions of a witness span therefore stay in the same daily
             # partition, so pruning outside the list/oracle's adjacent-day
@@ -2524,10 +2551,10 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # ``start_time`` is part of the immutable physical span identity
         # ``(project_id, trace_id, id, start_time)``.  Gate each any-span leaf
         # after version collapse, not only the canonical root. Trace datetime
-        # applies to the root, while children may legitimately lie within the
-        # adjacent-day witness envelope used by the public list and monolithic
-        # exact graph readers.
-        if scope_to_request_window:
+        # applies to the root. Normal list/task reads retain their adjacent-day
+        # child envelope; an exact graph's finite identity classifier evaluates
+        # child witnesses globally because no maximum trace duration is enforced.
+        if scope_span_witnesses_to_request_window:
             any_span_window_condition = """(
                     latest_start_time >= fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s)
                     AND latest_start_time < fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s)
@@ -2584,7 +2611,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 witness_alias = f"filter_witness_{witness_index}"
                 witness_aliases.append(witness_alias)
                 witness_condition = f"({plan.predicate})"
-                if scope_to_request_window:
+                if scope_span_witnesses_to_request_window:
                     witness_condition = (
                         f"{any_span_window_condition} AND {witness_condition}"
                     )
@@ -2654,8 +2681,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                         query_mode=self._FILTER_BUILDER_CLS.QUERY_MODE_TRACE,
                         annotation_label_ids=branch_label_ids,
                         project_id=candidate_project_id,
-                        score_date_scope=scope_to_request_window,
-                        span_date_scope=scope_to_request_window,
+                        score_date_scope=scope_span_witnesses_to_request_window,
+                        span_date_scope=scope_span_witnesses_to_request_window,
                         candidate_ids_param="candidate_trace_ids",
                         strict_trace_project_correlation=True,
                         annotation_label_set_known=branch_label_set_known,
@@ -2704,8 +2731,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     annotation_label_ids=self.annotation_label_ids,
                     project_id=self.project_id,
                     project_ids=self.project_ids,
-                    score_date_scope=scope_to_request_window,
-                    span_date_scope=scope_to_request_window,
+                    score_date_scope=scope_span_witnesses_to_request_window,
+                    span_date_scope=scope_span_witnesses_to_request_window,
                     candidate_ids_param="candidate_trace_ids",
                     strict_enduser_project_correlation=True,
                 )
@@ -2938,6 +2965,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return self._build_filter_match_query_from_seed_rows(
             candidate_rows,
             candidate_identity_only=True,
+            include_filter_witnesses=self._bounded_include_filter_witnesses,
         )
 
     def build_filter_page_hydration_query(

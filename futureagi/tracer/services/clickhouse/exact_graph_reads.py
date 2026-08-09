@@ -364,16 +364,15 @@ def _enumerate_exact_trace_ids(
     annotation_label_ids: tuple[str, ...] | None,
     started: float,
 ) -> tuple[list[str], int, int]:
-    """Exhaust raw witnesses and classify every candidate against latest state.
+    """Exhaust canonical roots and classify every candidate against latest state.
 
-    A positive any-span leaf is a necessary (not sufficient) membership
-    witness: every exact match must have at least one physical row that reaches
-    this cursor. Root-only and residual filter shapes seed roots instead. The
-    seed cursor is partitioned into adjacent half-open time slices and is
-    exhaustive within each slice; its rows never enter the result directly.
-    Every de-duplicated trace identity crosses the same latest-state,
-    multi-filter classifier used by trace lists. This avoids walking and
-    hydrating every public root merely to discover a selective attribute.
+    Trace time filters bind to canonical roots. The root cursor is partitioned
+    into adjacent half-open time slices and is exhaustive within the requested
+    window; its rows never enter the result directly. Every de-duplicated,
+    finite trace identity crosses a latest-state multi-filter classifier whose
+    child witnesses are not time-scoped. This remains exact when a child is
+    written more than a day after its in-window root, without scanning project
+    history or relying on a maximum trace duration.
 
     De-duplication is defensive against multiple matching sibling spans and a
     merge/late arrival between statements; the read is not presented as MVCC.
@@ -390,6 +389,7 @@ def _enumerate_exact_trace_ids(
         bounded_identity_only=True,
         bounded_bulk_scan=True,
         bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
     )
     if not builder.supports_bounded_filter_scan():
         raise ExactGraphReadError(
@@ -399,14 +399,10 @@ def _enumerate_exact_trace_ids(
     request_start, request_end = builder.parse_time_range(filters)
     if request_start >= request_end:
         return [], 0, 0
-    witness_start, witness_end = builder.exact_graph_filter_witness_range()
-    if not (
-        witness_start <= request_start < request_end <= witness_end
-        and witness_start >= request_start - timedelta(days=1)
-        and witness_end <= request_end + timedelta(days=1)
-    ):
+    root_seed_start, root_seed_end = builder.exact_graph_filter_witness_range()
+    if (root_seed_start, root_seed_end) != (request_start, request_end):
         raise ExactGraphReadError(
-            "Exact trace graph witness returned an invalid time range."
+            "Exact trace graph root seed returned an invalid time range."
         )
 
     trace_ids: list[str] = []
@@ -493,20 +489,20 @@ def _enumerate_exact_trace_ids(
                     seen_matched_trace_ids.add(trace_id)
                     trace_ids.append(trace_id)
 
-    slice_end = witness_end
-    slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, witness_end - witness_start)
+    slice_end = root_seed_end
+    slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, root_seed_end - root_seed_start)
     # Empty and sparse history widens logarithmically up to a bounded physical
     # read. Once width W fails, retry the same upper bound at W/2 and retain
     # that narrower ceiling until adjacent successful slices have completely
     # covered the failed interval. Growth may then resume below (and never
     # re-probe) that failed region.
     learned_slice_ceiling = min(
-        witness_end - witness_start,
+        root_seed_end - root_seed_start,
         EXACT_GRAPH_TRACE_MAX_SLICE,
     )
     failed_region_start: datetime | None = None
-    while slice_end > witness_start:
-        slice_start = max(witness_start, slice_end - slice_width)
+    while slice_end > root_seed_start:
+        slice_start = max(root_seed_start, slice_end - slice_width)
         before_start_time: datetime | None = None
         before_order_token: Any = None
         retry_narrower = False
@@ -515,13 +511,12 @@ def _enumerate_exact_trace_ids(
         slice_rows_returned = 0
 
         while True:
-            query, params = builder.build_filter_seed_page(
+            query, params = builder.build_filter_ordered_seed_page(
                 slice_start=slice_start,
                 slice_end=slice_end,
                 limit=EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE,
                 before_start_time=before_start_time,
                 before_id=before_order_token,
-                _deduplicate_traces=True,
             )
             query_count += 1
             query_started = monotonic()
@@ -540,7 +535,7 @@ def _enumerate_exact_trace_ids(
             except Exception as exc:
                 if is_read_budget_error(exc) and slice_width > min(
                     EXACT_GRAPH_TRACE_MIN_SLICE,
-                    slice_end - witness_start,
+                    slice_end - root_seed_start,
                 ):
                     # No raw row is publishable. Retrying the same upper bound
                     # with a narrower half-open slice cannot create a gap; any
@@ -551,7 +546,7 @@ def _enumerate_exact_trace_ids(
                     )
                     narrowed_width = min(
                         narrowed_width,
-                        slice_end - witness_start,
+                        slice_end - root_seed_start,
                     )
                     if narrowed_width >= slice_width:
                         raise
@@ -626,7 +621,7 @@ def _enumerate_exact_trace_ids(
         if retry_narrower:
             continue
         slice_end = slice_start
-        if slice_end <= witness_start:
+        if slice_end <= root_seed_start:
             break
 
         if failed_region_start is not None and slice_end <= failed_region_start:
@@ -636,7 +631,7 @@ def _enumerate_exact_trace_ids(
             failed_region_start = None
             learned_slice_ceiling = min(
                 EXACT_GRAPH_TRACE_MAX_SLICE,
-                slice_end - witness_start,
+                slice_end - root_seed_start,
             )
 
         # A single, cheap terminal page proves this whole slice sparse enough
@@ -652,10 +647,10 @@ def _enumerate_exact_trace_ids(
                 slice_width * 2,
                 learned_slice_ceiling,
                 EXACT_GRAPH_TRACE_MAX_SLICE,
-                slice_end - witness_start,
+                slice_end - root_seed_start,
             )
         else:
-            slice_width = min(slice_width, slice_end - witness_start)
+            slice_width = min(slice_width, slice_end - root_seed_start)
 
     return trace_ids, query_count, rows_returned
 
