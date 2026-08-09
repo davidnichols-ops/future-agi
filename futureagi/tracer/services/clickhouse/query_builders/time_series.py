@@ -377,6 +377,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         contribution_predicates: tuple[str, ...],
         scan_start_param: str,
         scan_end_param: str,
+        candidate_trace_ids_param: str | None = None,
     ) -> str:
         """Collapse physical versions to one narrow current-row tuple.
 
@@ -425,6 +426,11 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             for expression in scalar_expressions
         )
         tombstone_index = scalar_aliases.index("is_deleted") + 1
+        candidate_trace_fragment = (
+            f"\n                  AND trace_id IN %({candidate_trace_ids_param})s"
+            if candidate_trace_ids_param
+            else ""
+        )
         return f"""(
             SELECT
                 trace_id,
@@ -441,7 +447,7 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
                 FROM {self.RAW_TABLE}
                 PREWHERE {self.project_filter_sql()}
                   AND start_time >= %({scan_start_param})s
-                  AND start_time < %({scan_end_param})s
+                  AND start_time < %({scan_end_param})s{candidate_trace_fragment}
                 GROUP BY
                     project_id,
                     observation_type,
@@ -452,6 +458,95 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             ) AS graph_physical_versions
             WHERE tupleElement(graph_latest_row, {tombstone_index}) = 0
         ) AS graph_latest_spans"""
+
+    def build_exact_trace_contribution_batch(
+        self,
+        trace_ids: list[str] | tuple[str, ...],
+    ) -> tuple[str, dict[str, Any]]:
+        """Return exact additive bucket states for a finite matched-trace batch.
+
+        Trace membership is intentionally absent here.  The asynchronous exact
+        reader first exhausts the trace list's latest-state cursor and passes
+        only fully classified identities to this method.  Constraining the raw
+        latest-state collapse by those immutable identities prevents the
+        tenant-wide per-trace hash state that can exceed ClickHouse memory.
+
+        Every output column is additive across batches.  The caller must merge
+        all batches before deriving averages or publishing a snapshot.
+        """
+
+        if not self.exact_snapshot or self.observe_type != "trace":
+            raise ValueError(
+                "exact trace contribution batches require an exact trace builder"
+            )
+        normalized_trace_ids = tuple(
+            dict.fromkeys(str(trace_id) for trace_id in trace_ids if trace_id)
+        )
+        if not normalized_trace_ids:
+            return "", {}
+        if len(normalized_trace_ids) > 512:
+            raise ValueError("exact trace contribution batch exceeds 512 identities")
+        if self.start_date is None or self.end_date is None:
+            self.start_date, self.end_date = self.parse_time_range(self.filters)
+        self.params.update(
+            {
+                "start_date": self.start_date,
+                "end_date": self.end_date,
+                "graph_candidate_trace_ids": normalized_trace_ids,
+            }
+        )
+
+        from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
+            compile_exact_graph_row_predicates,
+        )
+
+        exact_filter_plan = compile_exact_graph_row_predicates(
+            self.filters,
+            project_id=str(self.project_id),
+            observe_type=self.observe_type,
+            annotation_label_ids=self.annotation_label_ids,
+        )
+        self.params.update(exact_filter_plan.params)
+        output_window = "start_time >= %(start_date)s AND start_time < %(end_date)s"
+        contribution_terms = [
+            output_window,
+            *(
+                f"graph_contribution_match_{index} = 1"
+                for index in range(len(exact_filter_plan.contribution_predicates))
+            ),
+        ]
+        contribution_condition = " AND ".join(
+            f"({predicate})" for predicate in contribution_terms
+        )
+        latest_source = self._exact_latest_scalar_source(
+            row_predicates=(),
+            contribution_predicates=exact_filter_plan.contribution_predicates,
+            scan_start_param="start_date",
+            scan_end_param="end_date",
+            candidate_trace_ids_param="graph_candidate_trace_ids",
+        )
+        bucket_fn = self.time_bucket_expr(self.interval)
+        query = f"""
+        SELECT
+            {bucket_fn}(start_time) AS time_bucket,
+            sumIf(toInt64(latency_ms), {contribution_condition}) AS latency_sum,
+            sumIf(toInt64(total_tokens), {contribution_condition})
+                AS total_tokens,
+            sumIf(cost, {contribution_condition}) AS cost_sum,
+            countIf({contribution_condition}) AS traffic_count,
+            sumIf(toInt64(prompt_tokens), {contribution_condition})
+                AS prompt_tokens,
+            sumIf(toInt64(completion_tokens), {contribution_condition})
+                AS completion_tokens,
+            countIf(
+                ({contribution_condition})
+                AND upper(status) IN ('ERROR', 'ERRORED', 'FAILED')
+            ) AS error_count
+        FROM {latest_source}
+        GROUP BY time_bucket
+        ORDER BY time_bucket
+        """
+        return query, self.params
 
     def _build_exact_raw_query(
         self,

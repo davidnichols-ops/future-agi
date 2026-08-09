@@ -10,8 +10,10 @@ only a complete result through ``exact_aggregation_cache``.
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from time import monotonic
 from typing import Any
 
@@ -24,6 +26,9 @@ from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.services.annotation_label_source import AnnotationScoreReadUnavailable
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
+from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
+    compile_exact_graph_row_predicates,
+)
 from tracer.services.clickhouse.query_builders.agent_graph import (
     AGENT_GRAPH_MAX_RESULT_BYTES,
     AGENT_GRAPH_RESULT_ROW_SENTINEL,
@@ -55,6 +60,9 @@ from tracer.services.clickhouse.v2.query_builders.filters import (
 from tracer.services.clickhouse.v2.query_builders.user_time_series import (
     UserTimeSeriesQueryBuilderV2,
 )
+from tracer.services.clickhouse.v2.query_builders.trace_list import (
+    TraceListQueryBuilderV2,
+)
 from tracer.utils.helper import get_annotation_labels_for_project
 
 logger = structlog.get_logger(__name__)
@@ -74,6 +82,14 @@ EXACT_GRAPH_QUERY_TIMEOUT_MS = 3_300_000
 # CH25.3 cannot stitch independently changing ReplacingMergeTree snapshots.
 EXACT_GRAPH_MAX_BUCKETS_PER_PARTITION = 31
 EXACT_GRAPH_MEMBERSHIP_BATCH_SIZE = 1_000
+# Filtered trace graphs cannot retain tenant-wide per-trace membership state in
+# one ClickHouse query under the production memory envelope.  The background
+# refresh exhausts the exact trace-list cursor instead, then aggregates only
+# finite classified identity batches.  Neither value is a result ceiling.
+EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE = 200
+EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 100
+EXACT_GRAPH_TRACE_SELECTOR_PAGE_DEADLINE_MS = 120_000
+EXACT_GRAPH_TRACE_SELECTOR_QUERY_TIMEOUT_MS = 3_000
 EXACT_GRAPH_READ_SETTINGS = {
     "max_threads": 1,
     # Attribute maps are several KiB per row on the heaviest tenants.  Smaller
@@ -253,6 +269,269 @@ def _system_metric_payload(
     }
 
 
+def _frozen_trace_membership_filters(
+    filters: list[dict[str, Any]],
+    *,
+    start_date: datetime,
+    end_date: datetime,
+) -> list[dict[str, Any]]:
+    """Canonicalize positive datetime bounds to one frozen half-open window."""
+
+    frozen = [
+        deepcopy(item)
+        for item in filters or []
+        if (item.get("column_id") or item.get("columnId"))
+        not in {"created_at", "start_time"}
+        or BaseQueryBuilder.is_datetime_complement_filter(item)
+    ]
+    frozen.append(
+        {
+            "column_id": "start_time",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "datetime",
+                "filter_op": "between",
+                "filter_value": [start_date, end_date],
+            },
+        }
+    )
+    return frozen
+
+
+def _enumerate_exact_trace_ids(
+    *,
+    analytics: Any,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    annotation_label_ids: tuple[str, ...] | None,
+    started: float,
+) -> tuple[list[str], int, int]:
+    """Exhaust exact cursor pages, failing before publication on any partial page.
+
+    Each returned identity has passed the trace list's current-latest-state,
+    multi-filter classifier.  Page boundaries are canonical root
+    ``(start_time, trace_id)`` keysets.  De-duplication is defensive against a
+    merge/late arrival between statements; it is not presented as MVCC.
+    """
+
+    from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+
+    builder = TraceListQueryBuilderV2(
+        project_id=str(project_id),
+        filters=filters,
+        page_number=0,
+        page_size=EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE,
+        annotation_label_ids=list(annotation_label_ids or ()),
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+    )
+    if not builder.supports_bounded_filter_scan():
+        raise ExactGraphReadError(
+            "Filtered trace graph membership cannot be evaluated exactly."
+        )
+
+    trace_ids: list[str] = []
+    seen_trace_ids: set[str] = set()
+    cursor_start_time: datetime | None = None
+    cursor_order_token: Any = None
+    query_count = 0
+    rows_returned = 0
+
+    while True:
+        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
+            (monotonic() - started) * 1000
+        )
+        if remaining_ms < EXACT_GRAPH_TRACE_SELECTOR_QUERY_TIMEOUT_MS:
+            raise ExactGraphReadError(
+                "Exact trace graph refresh exceeded its bounded deadline."
+            )
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=analytics,
+            filters=filters,
+            key_field="trace_id",
+            page_number=0,
+            page_size=EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE,
+            deadline_ms=min(
+                EXACT_GRAPH_TRACE_SELECTOR_PAGE_DEADLINE_MS,
+                remaining_ms,
+            ),
+            max_seed_attempts=128,
+            max_candidates=512,
+            max_query_count=128,
+            include_incomplete_rows=False,
+            cursor_start_time=cursor_start_time,
+            cursor_order_token=cursor_order_token,
+            bounded_continuation=False,
+            retry_wide_read_budget=True,
+            query_timeout_ms=EXACT_GRAPH_TRACE_SELECTOR_QUERY_TIMEOUT_MS,
+        )
+        query_count += int(page.query_count)
+        rows_returned += int(page.rows_returned)
+        if not page.complete:
+            raise ExactGraphReadError(
+                "Exact trace graph membership did not complete. Retry."
+            )
+
+        for row in page.rows:
+            trace_id = str(row.get("trace_id") or "")
+            if not trace_id:
+                raise ExactGraphReadError(
+                    "Exact trace graph membership returned an invalid identity."
+                )
+            if trace_id not in seen_trace_ids:
+                seen_trace_ids.add(trace_id)
+                trace_ids.append(trace_id)
+
+        if not page.has_more:
+            break
+        if not page.rows:
+            raise ExactGraphReadError(
+                "Exact trace graph cursor did not make forward progress."
+            )
+        last_row = page.rows[-1]
+        next_start_time = last_row.get("start_time")
+        next_order_token = builder.bounded_filter_row_order_token(last_row)
+        if not isinstance(next_start_time, datetime) or not next_order_token:
+            raise ExactGraphReadError(
+                "Exact trace graph cursor returned an invalid checkpoint."
+            )
+        if (next_start_time, next_order_token) == (
+            cursor_start_time,
+            cursor_order_token,
+        ):
+            raise ExactGraphReadError(
+                "Exact trace graph cursor did not make forward progress."
+            )
+        cursor_start_time, cursor_order_token = next_start_time, next_order_token
+
+    return trace_ids, query_count, rows_returned
+
+
+def _merge_exact_trace_contribution_rows(
+    batches: list[tuple[list[Any], list[str]]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Merge additive bucket states only after all required batches succeed."""
+
+    merged: dict[Any, dict[str, Any]] = {}
+    for rows, columns in batches:
+        for row in rows:
+            bucket = _row_value(row, columns, "time_bucket", None)
+            if bucket is None:
+                raise ExactGraphReadError(
+                    "Exact trace contribution batch returned an invalid bucket."
+                )
+            state = merged.setdefault(
+                bucket,
+                {
+                    "latency_sum": 0,
+                    "total_tokens": 0,
+                    "cost_sum": Decimal(0),
+                    "traffic_count": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "error_count": 0,
+                },
+            )
+            state["latency_sum"] += int(
+                _row_value(row, columns, "latency_sum", 0) or 0
+            )
+            state["total_tokens"] += int(
+                _row_value(row, columns, "total_tokens", 0) or 0
+            )
+            state["cost_sum"] += Decimal(
+                str(_row_value(row, columns, "cost_sum", 0) or 0)
+            )
+            state["traffic_count"] += int(
+                _row_value(row, columns, "traffic_count", 0) or 0
+            )
+            state["prompt_tokens"] += int(
+                _row_value(row, columns, "prompt_tokens", 0) or 0
+            )
+            state["completion_tokens"] += int(
+                _row_value(row, columns, "completion_tokens", 0) or 0
+            )
+            state["error_count"] += int(
+                _row_value(row, columns, "error_count", 0) or 0
+            )
+
+    rows: list[dict[str, Any]] = []
+    for bucket in sorted(merged):
+        state = merged[bucket]
+        count = int(state["traffic_count"])
+        denominator = max(count, 1)
+        rows.append(
+            {
+                "time_bucket": bucket,
+                "avg_latency": state["latency_sum"] / denominator,
+                "total_tokens": state["total_tokens"],
+                "avg_cost": float(state["cost_sum"] / denominator),
+                "traffic_count": count,
+                "prompt_tokens": state["prompt_tokens"],
+                "completion_tokens": state["completion_tokens"],
+                "error_rate": state["error_count"] * 100.0 / denominator,
+            }
+        )
+    columns = [
+        "time_bucket",
+        "avg_latency",
+        "total_tokens",
+        "avg_cost",
+        "traffic_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "error_rate",
+    ]
+    return rows, columns
+
+
+def _read_exact_filtered_trace_graph(
+    *,
+    analytics: Any,
+    builder: TimeSeriesQueryBuilder,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    annotation_label_ids: tuple[str, ...] | None,
+    started: float,
+) -> tuple[dict[str, list[dict[str, Any]]], int, int]:
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=analytics,
+        project_id=project_id,
+        filters=filters,
+        annotation_label_ids=annotation_label_ids,
+        started=started,
+    )
+    batches: list[tuple[list[Any], list[str]]] = []
+    for offset in range(0, len(trace_ids), EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE):
+        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
+            (monotonic() - started) * 1000
+        )
+        if remaining_ms <= 0:
+            raise ExactGraphReadError(
+                "Exact trace graph refresh exceeded its bounded deadline."
+            )
+        query, params = builder.build_exact_trace_contribution_batch(
+            trace_ids[
+                offset : offset + EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE
+            ]
+        )
+        result = analytics.execute_ch_query(
+            query,
+            params,
+            timeout_ms=remaining_ms,
+            settings=EXACT_GRAPH_READ_SETTINGS,
+        )
+        batch_rows = list(result.data or [])
+        batch_columns = list(result.columns or [])
+        batches.append((batch_rows, batch_columns))
+        query_count += 1
+        rows_returned += len(batch_rows)
+
+    merged_rows, merged_columns = _merge_exact_trace_contribution_rows(batches)
+    return builder.format_result(merged_rows, merged_columns), query_count, rows_returned
+
+
 def read_exact_system_graph(
     *,
     analytics: Any,
@@ -285,6 +564,7 @@ def read_exact_system_graph(
             ),
         )
 
+    annotation_label_ids = _annotation_label_ids_for_filters(project_id, filters)
     builder = TimeSeriesQueryBuilder(
         project_id=str(project_id),
         filters=filters,
@@ -293,8 +573,39 @@ def read_exact_system_graph(
         observe_type=observe_type,
         start_date=start_date,
         end_date=end_date,
-        annotation_label_ids=_annotation_label_ids_for_filters(project_id, filters),
+        annotation_label_ids=annotation_label_ids,
     )
+    exact_filter_plan = compile_exact_graph_row_predicates(
+        filters,
+        project_id=str(project_id),
+        observe_type=observe_type,
+        annotation_label_ids=annotation_label_ids,
+    )
+    if str(observe_type or "").strip().lower() == "trace" and (
+        exact_filter_plan.predicates
+    ):
+        frozen_filters = _frozen_trace_membership_filters(
+            filters,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        metrics, query_count, rows_returned = _read_exact_filtered_trace_graph(
+            analytics=analytics,
+            builder=builder,
+            project_id=str(project_id),
+            filters=frozen_filters,
+            annotation_label_ids=annotation_label_ids,
+            started=started,
+        )
+        return _system_metric_payload(
+            metrics,
+            metric_id,
+            _metadata(
+                started=started,
+                query_count=query_count,
+                rows_returned=rows_returned,
+            ),
+        )
     query, params = builder.build()
     result = analytics.execute_ch_query(
         query,
