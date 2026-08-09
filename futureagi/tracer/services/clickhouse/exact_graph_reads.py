@@ -100,14 +100,24 @@ EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE = 200
 EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE = 200
 EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 100
 # Witness work runs only in the exact-snapshot background activity; public
-# graph polls never wait on an individual statement.  The Coletia incident
-# slice reads roughly 1 GiB / 720k physical rows and completes in 3.6--4.2 s
-# with one thread, so the previous 3 s witness ceiling guaranteed Code 159.
-# Keep the cheap, identity-scoped classifier at its original tight ceiling;
-# only the production-proven raw witness scan receives the larger allowance.
+# graph polls never wait on an individual statement.  Production qualification
+# includes raw witness slices whose valid bounded reads exceed the former
+# three-second ceiling. Keep the cheap, identity-scoped classifier at its
+# original tight ceiling; only the raw witness scan receives more time.
 EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS = 15_000
 EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 3_000
 EXACT_GRAPH_TRACE_INITIAL_SLICE = timedelta(minutes=5)
+# A failed raw witness slice is retried at the same upper bound so no interval
+# is skipped. Thirty seconds bounds retry fan-out while still allowing a hot
+# five-minute partition to be divided without a schema or index dependency.
+EXACT_GRAPH_TRACE_MIN_SLICE = timedelta(seconds=30)
+# Even proven-empty history must not collapse a long unindexed time predicate
+# into an arbitrarily large statement. Two days preserves logarithmic widening
+# for ordinary ranges and puts an explicit ceiling on each physical read.
+EXACT_GRAPH_TRACE_MAX_SLICE = timedelta(days=2)
+# Widen only cheap, fully exhausted slices. QueryResult exposes the measured
+# ClickHouse wall time; the monotonic fallback keeps alternate executors safe.
+EXACT_GRAPH_TRACE_GROWTH_QUERY_TIME_MS = 2_000
 EXACT_GRAPH_READ_SETTINGS = {
     "max_threads": 1,
     # Attribute maps are several KiB per row on the heaviest tenants.  Smaller
@@ -455,15 +465,24 @@ def _enumerate_exact_trace_ids(
 
     slice_end = witness_end
     slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, witness_end - witness_start)
-    # Five minutes is the largest production-proven width for this unindexed
-    # value witness.  Keep that as the initial learned ceiling instead of
-    # repeatedly widening until an exception teaches us the same fact.
-    max_slice_width = slice_width
+    # Empty and sparse history widens logarithmically up to a bounded physical
+    # read. Once width W fails, retry the same upper bound at W/2 and retain
+    # that narrower ceiling until adjacent successful slices have completely
+    # covered the failed interval. Growth may then resume below (and never
+    # re-probe) that failed region.
+    learned_slice_ceiling = min(
+        witness_end - witness_start,
+        EXACT_GRAPH_TRACE_MAX_SLICE,
+    )
+    failed_region_start: datetime | None = None
     while slice_end > witness_start:
         slice_start = max(witness_start, slice_end - slice_width)
         before_start_time: datetime | None = None
         before_order_token: Any = None
         retry_narrower = False
+        slice_query_count = 0
+        slice_query_time_ms = 0.0
+        slice_rows_returned = 0
 
         while True:
             query, params = builder.build_filter_seed_page(
@@ -475,6 +494,7 @@ def _enumerate_exact_trace_ids(
                 _deduplicate_traces=True,
             )
             query_count += 1
+            query_started = monotonic()
             try:
                 result = analytics.execute_ch_query(
                     query,
@@ -488,26 +508,43 @@ def _enumerate_exact_trace_ids(
                     },
                 )
             except Exception as exc:
-                if (
-                    is_read_budget_error(exc)
-                    and slice_width > EXACT_GRAPH_TRACE_INITIAL_SLICE
+                if is_read_budget_error(exc) and slice_width > min(
+                    EXACT_GRAPH_TRACE_MIN_SLICE,
+                    slice_end - witness_start,
                 ):
                     # No raw row is publishable. Retrying the same upper bound
                     # with a narrower half-open slice cannot create a gap; any
                     # already classified duplicate is removed by trace identity.
-                    slice_width = max(
-                        EXACT_GRAPH_TRACE_INITIAL_SLICE, slice_width / 2
+                    narrowed_width = max(
+                        EXACT_GRAPH_TRACE_MIN_SLICE,
+                        slice_width / 2,
                     )
-                    # Remember the largest width that has proved safe during
-                    # this refresh. Growing straight back to a failed width
-                    # makes every adjacent slice pay the same timeout and can
-                    # churn the database connection without making progress.
-                    max_slice_width = min(max_slice_width, slice_width)
+                    narrowed_width = min(
+                        narrowed_width,
+                        slice_end - witness_start,
+                    )
+                    if narrowed_width >= slice_width:
+                        raise
+                    failed_region_start = min(
+                        failed_region_start or slice_start,
+                        slice_start,
+                    )
+                    slice_width = narrowed_width
+                    learned_slice_ceiling = min(
+                        learned_slice_ceiling,
+                        narrowed_width,
+                    )
                     retry_narrower = True
                     break
                 raise
 
             seed_rows = sorted(result.data or [], key=seed_key, reverse=True)
+            measured_query_time_ms = getattr(result, "query_time_ms", None)
+            if not isinstance(measured_query_time_ms, (int, float)):
+                measured_query_time_ms = (monotonic() - query_started) * 1000
+            slice_query_count += 1
+            slice_query_time_ms += max(float(measured_query_time_ms), 0.0)
+            slice_rows_returned += len(seed_rows)
             rows_returned += len(seed_rows)
             if len(seed_rows) > EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE:
                 raise ExactGraphReadError(
@@ -559,7 +596,36 @@ def _enumerate_exact_trace_ids(
         if retry_narrower:
             continue
         slice_end = slice_start
-        slice_width = min(slice_width * 2, max_slice_width)
+        if slice_end <= witness_start:
+            break
+
+        if failed_region_start is not None and slice_end <= failed_region_start:
+            # The failed half-open interval is now fully covered by successful
+            # narrower reads. It is safe to recover growth for older, disjoint
+            # history without retrying the same failed region.
+            failed_region_start = None
+            learned_slice_ceiling = min(
+                EXACT_GRAPH_TRACE_MAX_SLICE,
+                slice_end - witness_start,
+            )
+
+        # A single, cheap terminal page proves this whole slice sparse enough
+        # to widen. Paginated or expensive slices retain their current width;
+        # growth occurs only after complete cursor exhaustion and never crosses
+        # a ceiling learned from a failed statement.
+        if (
+            slice_query_count == 1
+            and slice_rows_returned < EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE
+            and slice_query_time_ms <= EXACT_GRAPH_TRACE_GROWTH_QUERY_TIME_MS
+        ):
+            slice_width = min(
+                slice_width * 2,
+                learned_slice_ceiling,
+                EXACT_GRAPH_TRACE_MAX_SLICE,
+                slice_end - witness_start,
+            )
+        else:
+            slice_width = min(slice_width, slice_end - witness_start)
 
     return trace_ids, query_count, rows_returned
 

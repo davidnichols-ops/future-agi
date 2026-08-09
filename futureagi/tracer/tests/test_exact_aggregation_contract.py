@@ -2145,7 +2145,9 @@ def test_exact_trace_membership_fails_closed_on_unproven_witness(monkeypatch, fa
         "EXACT_GRAPH_TRACE_INITIAL_SLICE",
         request_end - request_start,
     )
-    expected_error = RuntimeError if failure == "classifier_error" else ExactGraphReadError
+    expected_error = (
+        RuntimeError if failure == "classifier_error" else ExactGraphReadError
+    )
     with pytest.raises(expected_error):
         _enumerate_exact_trace_ids(
             analytics=Analytics(),
@@ -2157,7 +2159,7 @@ def test_exact_trace_membership_fails_closed_on_unproven_witness(monkeypatch, fa
 
 
 @pytest.mark.unit
-def test_exact_trace_membership_retains_proven_five_minute_slice_ceiling(monkeypatch):
+def test_exact_trace_membership_widens_empty_slices_logarithmically(monkeypatch):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     request_start = datetime(2026, 8, 1)
@@ -2190,7 +2192,77 @@ def test_exact_trace_membership_retains_proven_five_minute_slice_ceiling(monkeyp
         @staticmethod
         def execute_ch_query(_query, _params, **kwargs):
             timeouts.append(kwargs["timeout_ms"])
+            # Alternate executors may not expose QueryResult.query_time_ms;
+            # the monotonic wall-time fallback must retain adaptive growth.
             return SimpleNamespace(data=[], columns=[])
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == []
+    assert query_count == 3
+    assert rows_returned == 0
+    assert [end - start for start, end in slices] == [
+        timedelta(minutes=5),
+        timedelta(minutes=10),
+        timedelta(minutes=5),
+    ]
+    assert slices[0][1] == request_end
+    assert all(
+        previous[0] == following[1]
+        for previous, following in zip(slices, slices[1:], strict=False)
+    )
+    assert slices[-1][0] == request_start
+    assert all(
+        0 < timeout <= exact_module.EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS
+        for timeout in timeouts
+    )
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_keeps_expensive_successful_slices_narrow(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=20)
+    slices = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            slices.append((kwargs["slice_start"], kwargs["slice_end"]))
+            return "WITNESS", {}
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(_query, _params, **_kwargs):
+            return SimpleNamespace(
+                data=[],
+                columns=[],
+                query_time_ms=(exact_module.EXACT_GRAPH_TRACE_GROWTH_QUERY_TIME_MS + 1),
+            )
 
     monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
 
@@ -2206,14 +2278,360 @@ def test_exact_trace_membership_retains_proven_five_minute_slice_ceiling(monkeyp
     assert query_count == 4
     assert rows_returned == 0
     assert [end - start for start, end in slices] == [timedelta(minutes=5)] * 4
-    assert all(
-        0 < timeout <= exact_module.EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS
-        for timeout in timeouts
-    )
 
 
 @pytest.mark.unit
-def test_exact_trace_membership_finds_child_outside_root_window(monkeypatch):
+def test_exact_trace_membership_retries_same_upper_bound_then_recovers_below_failure(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=30)
+    attempted_slices = []
+    successful_slices = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            return "WITNESS", {
+                "slice_start": kwargs["slice_start"],
+                "slice_end": kwargs["slice_end"],
+            }
+
+    class Analytics:
+        failed_interval = None
+
+        @staticmethod
+        def execute_ch_query(_query, params, **_kwargs):
+            interval = (params["slice_start"], params["slice_end"])
+            attempted_slices.append(interval)
+            if (
+                interval[1] - interval[0] == timedelta(minutes=10)
+                and Analytics.failed_interval is None
+            ):
+                Analytics.failed_interval = interval
+                raise ServerException("bounded read exceeded", code=159)
+            successful_slices.append(interval)
+            return SimpleNamespace(data=[], columns=[], query_time_ms=1)
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == []
+    assert query_count == 6
+    assert rows_returned == 0
+    assert [end - start for start, end in attempted_slices] == [
+        timedelta(minutes=5),
+        timedelta(minutes=10),
+        timedelta(minutes=5),
+        timedelta(minutes=5),
+        timedelta(minutes=10),
+        timedelta(minutes=5),
+    ]
+    assert attempted_slices[1][1] == attempted_slices[2][1]
+    assert successful_slices[0][1] == request_end
+    assert all(
+        previous[0] == following[1]
+        for previous, following in zip(
+            successful_slices,
+            successful_slices[1:],
+            strict=False,
+        )
+    )
+    assert successful_slices[-1][0] == request_start
+    assert Analytics.failed_interval not in successful_slices
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_can_fallback_below_five_minutes(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=10)
+    attempted_widths = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            return "WITNESS", {
+                "slice_start": kwargs["slice_start"],
+                "slice_end": kwargs["slice_end"],
+            }
+
+    class Analytics:
+        failed = False
+
+        @staticmethod
+        def execute_ch_query(_query, params, **_kwargs):
+            width = params["slice_end"] - params["slice_start"]
+            attempted_widths.append(width)
+            if not Analytics.failed:
+                Analytics.failed = True
+                raise ServerException("bounded read exceeded", code=159)
+            return SimpleNamespace(data=[], columns=[], query_time_ms=1)
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == []
+    assert query_count == 4
+    assert rows_returned == 0
+    assert attempted_widths == [
+        timedelta(minutes=5),
+        timedelta(minutes=2, seconds=30),
+        timedelta(minutes=2, seconds=30),
+        timedelta(minutes=5),
+    ]
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_recovers_from_hot_newest_to_sparse_old_history(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 7, 1)
+    request_end = request_start + timedelta(days=30)
+    attempted_slices = []
+    successful_slices = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            return "WITNESS", {
+                "slice_start": kwargs["slice_start"],
+                "slice_end": kwargs["slice_end"],
+            }
+
+    class Analytics:
+        failed = False
+        failed_interval = None
+
+        @staticmethod
+        def execute_ch_query(_query, params, **_kwargs):
+            interval = (params["slice_start"], params["slice_end"])
+            attempted_slices.append(interval)
+            if not Analytics.failed:
+                Analytics.failed = True
+                Analytics.failed_interval = interval
+                raise ServerException("hot newest partition", code=159)
+            successful_slices.append(interval)
+            return SimpleNamespace(data=[], columns=[], query_time_ms=1)
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    attempted_widths = [end - start for start, end in attempted_slices]
+    assert trace_ids == []
+    assert rows_returned == 0
+    assert query_count == len(attempted_slices) < 30
+    assert attempted_widths[:6] == [
+        timedelta(minutes=5),
+        timedelta(minutes=2, seconds=30),
+        timedelta(minutes=2, seconds=30),
+        timedelta(minutes=5),
+        timedelta(minutes=10),
+        timedelta(minutes=20),
+    ]
+    assert max(attempted_widths) == exact_module.EXACT_GRAPH_TRACE_MAX_SLICE
+    assert Analytics.failed_interval not in successful_slices
+    assert successful_slices[0][1] == request_end
+    assert all(
+        previous[0] == following[1]
+        for previous, following in zip(
+            successful_slices,
+            successful_slices[1:],
+            strict=False,
+        )
+    )
+    assert successful_slices[-1][0] == request_start
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_fails_closed_at_minimum_slice(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=5)
+    attempted_widths = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            return "WITNESS", {
+                "slice_start": kwargs["slice_start"],
+                "slice_end": kwargs["slice_end"],
+            }
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(_query, params, **_kwargs):
+            attempted_widths.append(params["slice_end"] - params["slice_start"])
+            raise ServerException("bounded read exceeded", code=159)
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    with pytest.raises(ServerException, match="bounded read exceeded"):
+        _enumerate_exact_trace_ids(
+            analytics=Analytics(),
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(request_start, request_end),
+            annotation_label_ids=None,
+            started=exact_module.monotonic(),
+        )
+
+    assert attempted_widths == [
+        timedelta(minutes=5),
+        timedelta(minutes=2, seconds=30),
+        timedelta(minutes=1, seconds=15),
+        timedelta(seconds=37, milliseconds=500),
+        exact_module.EXACT_GRAPH_TRACE_MIN_SLICE,
+    ]
+    assert min(attempted_widths) == exact_module.EXACT_GRAPH_TRACE_MIN_SLICE
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_enforces_whole_refresh_deadline(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=20)
+    clock = [0.0]
+    calls = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            return "WITNESS", {
+                "slice_start": kwargs["slice_start"],
+                "slice_end": kwargs["slice_end"],
+            }
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(_query, params, **kwargs):
+            calls.append((dict(params), kwargs["timeout_ms"]))
+            clock[0] += 0.06
+            return SimpleNamespace(data=[], columns=[], query_time_ms=60)
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_QUERY_TIMEOUT_MS", 100)
+    monkeypatch.setattr(exact_module, "monotonic", lambda: clock[0])
+
+    with pytest.raises(ExactGraphReadError, match="bounded deadline"):
+        _enumerate_exact_trace_ids(
+            analytics=Analytics(),
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(request_start, request_end),
+            annotation_label_ids=None,
+            started=0.0,
+        )
+
+    assert len(calls) == 2
+    assert [timeout for _params, timeout in calls] == [100, 40]
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_walks_adjacent_day_witness_in_logarithmic_queries(
+    monkeypatch,
+):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     request_start = datetime(2026, 8, 1)
@@ -2271,8 +2689,10 @@ def test_exact_trace_membership_finds_child_outside_root_window(monkeypatch):
                 return SimpleNamespace(
                     data=[{"trace_id": trace_id} for trace_id in params["ids"]],
                     columns=["trace_id"],
+                    query_time_ms=1,
                 )
-            assert params["slice_start"] <= child_start < params["slice_end"]
+            if not params["slice_start"] <= child_start < params["slice_end"]:
+                return SimpleNamespace(data=[], columns=[], query_time_ms=1)
             assert not request_start <= child_start < request_end
             return SimpleNamespace(
                 data=[
@@ -2282,14 +2702,10 @@ def test_exact_trace_membership_finds_child_outside_root_window(monkeypatch):
                     }
                 ],
                 columns=[],
+                query_time_ms=1,
             )
 
     monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
-    monkeypatch.setattr(
-        exact_module,
-        "EXACT_GRAPH_TRACE_INITIAL_SLICE",
-        witness_end - witness_start,
-    )
 
     trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
         analytics=Analytics(),
@@ -2300,9 +2716,15 @@ def test_exact_trace_membership_finds_child_outside_root_window(monkeypatch):
     )
 
     assert trace_ids == ["trace-root-inside-child-outside"]
-    assert query_count == 2
+    assert query_count == 11
     assert rows_returned == 2
-    assert seed_slices == [(witness_start, witness_end)]
+    assert len(seed_slices) == 10
+    assert seed_slices[0][1] == witness_end
+    assert all(
+        previous[0] == following[1]
+        for previous, following in zip(seed_slices, seed_slices[1:], strict=False)
+    )
+    assert seed_slices[-1][0] == witness_start
 
 
 @pytest.mark.unit
@@ -2463,7 +2885,11 @@ def test_exact_trace_membership_deduplicates_across_slices_and_classifies_latest
                 10: [],
                 5: [{"trace_id": "trace-kept", "start_time": request_start}],
             }
-            return SimpleNamespace(data=pages[minute], columns=[])
+            return SimpleNamespace(
+                data=pages[minute],
+                columns=[],
+                query_time_ms=(exact_module.EXACT_GRAPH_TRACE_GROWTH_QUERY_TIME_MS + 1),
+            )
 
     monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
     monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE", 10)
