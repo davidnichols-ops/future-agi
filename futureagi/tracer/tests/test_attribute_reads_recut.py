@@ -49,6 +49,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_READ_VALUE_CANDIDATE_LIMIT,
     ATTRIBUTE_READ_VALUE_TOTAL_CANDIDATE_PAGE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT,
+    ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_GUARD_MARGIN_MS,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
@@ -3123,11 +3124,94 @@ def test_filter_value_cursor_searched_absence_exhausts_horizon_logarithmically(
     assert read.next_segment_start is None
     assert read.metadata.query_count == len(proof_calls) == expected_query_count
     assert read.metadata.query_count < ATTRIBUTE_READ_MAX_QUERY_COUNT
-    assert proof_calls[0].timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
     assert all(
-        call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
-        for call in proof_calls[1:]
+        call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+        for call in proof_calls
     )
+    assert not any("segment_start" in call.params for call in executor.calls)
+
+
+def test_filter_value_cursor_distinct_growth_stops_before_observed_density_cliff():
+    class ManualClock:
+        value = 100.0
+
+        def __call__(self):
+            return self.value
+
+    clock = ManualClock()
+    # Sanitized production boundary: 160 s completed in 438 ms, 320 s in
+    # 659 ms, and the immediately adjacent doubled 640 s proof timed out at
+    # the former 750 ms ceiling. The selector must learn from the successful
+    # 320 s statement instead of issuing that timeout as density control flow.
+    observed_query_times_ms = {
+        5: 233.245,
+        10: 266.528,
+        20: 276.246,
+        40: 280.907,
+        80: 376.221,
+        160: 437.890,
+        320: 658.726,
+    }
+
+    def distinct_respond(call, _call_number):
+        width_us = call.params["segment_end_us"] - call.params["segment_start_us"]
+        width_seconds = width_us // 1_000_000
+        if width_seconds > 320:
+            pytest.fail("successful proof telemetry must prevent the 640 s timeout")
+        query_time_ms = observed_query_times_ms[width_seconds]
+        clock.value += query_time_ms / 1_000
+        return AttributeQueryPage(data=[], query_time_ms=query_time_ms)
+
+    executor = RecordingExecutor(distinct_responder=distinct_respond)
+    read = AttributeReadSelector(
+        executor,
+        now=NOW,
+        wall_timeout_ms=6_000,
+        clock=clock,
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="value-that-does-not-exist",
+        attribute_type="string",
+        window_start=NOW - timedelta(hours=1),
+        window_end=NOW,
+    )
+
+    proof_calls = [call for call in executor.calls if "distinct_limit" in call.params]
+    widths = [
+        timedelta(
+            microseconds=(
+                call.params["segment_end_us"] - call.params["segment_start_us"]
+            )
+        )
+        for call in proof_calls
+    ]
+    assert ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS == 500
+    assert widths == [
+        timedelta(seconds=5),
+        timedelta(seconds=10),
+        timedelta(seconds=20),
+        timedelta(seconds=40),
+        timedelta(seconds=80),
+        timedelta(seconds=160),
+        timedelta(seconds=320),
+        timedelta(seconds=320),
+        timedelta(seconds=320),
+    ]
+    assert all(
+        newer.params["segment_start_us"] == older.params["segment_end_us"]
+        for newer, older in zip(proof_calls, proof_calls[1:], strict=False)
+    )
+    assert all(
+        call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+        for call in proof_calls
+    )
+    assert read.rows == ()
+    assert read.has_more is True
+    assert read.next_segment_end == NOW - timedelta(seconds=1_275)
+    assert read.next_segment_start == read.next_segment_end - timedelta(seconds=320)
+    assert read.metadata.query_count == len(proof_calls) == 9
     assert not any("segment_start" in call.params for call in executor.calls)
 
 
@@ -4030,15 +4114,7 @@ def test_filter_value_cursor_seen_temporal_distinct_exhausts_finite_dense_window
         for call in all_calls
     )
     assert all(
-        call.timeout_ms
-        == (
-            ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
-            if call.params["segment_end_us"] - call.params["segment_start_us"]
-            <= int(
-                ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT.total_seconds() * 1_000_000
-            )
-            else ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
-        )
+        call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
         for call in all_calls
     )
     assert all(
@@ -4106,10 +4182,9 @@ def test_filter_value_cursor_duplicate_only_search_exhausts_horizon_logarithmica
     assert read.has_more is False
     assert read.next_segment_end == NOW - horizon
     assert read.metadata.query_count == len(executor.calls) == expected_query_count
-    assert executor.calls[0].timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
     assert all(
-        call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
-        for call in executor.calls[1:]
+        call.timeout_ms == ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
+        for call in executor.calls
     )
 
 

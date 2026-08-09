@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import structlog
+
 from tracer.services.clickhouse.attribute_cursor_state import (
     ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
 )
@@ -130,9 +131,11 @@ ATTRIBUTE_VALUE_CURSOR_DUPLICATE_ONLY_MAX_CANDIDATE_PAGES = (
 # finite number of statements, while the selector's independent six-second /
 # 30-query ceilings remain the hard request bound.
 ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT = timedelta(days=60)
-# A widened slice is an optional accelerator.  If ClickHouse cannot prove it
-# inside this short statement budget, retry the *same* cursor position with the
-# ordinary six-hour slice; never publish speculative progress.
+# A widened physical candidate slice is an optional accelerator.  If
+# ClickHouse cannot read it inside this short statement budget, retry the
+# *same* cursor position with the ordinary six-hour slice; never publish
+# speculative progress. Raw distinct proofs have their own qualified timeout
+# and proactive growth telemetry below.
 ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS = 750
 # A searched page or continuation can use a complete raw-value superset before
 # falling back to a physical latest-state walk. Search pages advance only when
@@ -148,12 +151,20 @@ ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT = timedelta(seconds=5)
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT = timedelta(seconds=5)
 # Five seconds is the production-qualified floor on the densest observed
 # frontier.  Complete empty/seen-only proofs may grow geometrically beyond it,
-# but every wider statement is speculative and receives the short timeout
-# below. A failure moves no cursor state and retries the same frontier at a
-# narrower width, so sparse history collapses without turning a dense interval
-# into either a skipped range or a long chain of five-second HTTP pages.
+# but every statement retains the finite proof timeout below and only a cheap
+# success can widen the next adjacent slice. A failure moves no cursor state and
+# retries the same frontier at a narrower width, so sparse history collapses
+# without turning a dense interval into either a skipped range or a long chain
+# of five-second HTTP pages.
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_SEGMENT
+# Complete raw proofs use the production-qualified 2.5 s ceiling at every
+# width. Widen only while the previous successful proof was comfortably cheap:
+# this preserves logarithmic sparse traversal without using a timeout exception
+# to discover the first dense width. The threshold is deliberately below the
+# 658 ms successful boundary observed immediately before a 750 ms doubled-slice
+# timeout, while still allowing its 438 ms predecessor to grow once.
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 2_500
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS = 500
 # Dense projects can cross the ordinary row/byte envelope even inside the
 # production-qualified six-hour seed.  A failed statement proves nothing, so
 # retry its identical newest-first frontier in this smaller exact slice before
@@ -1107,6 +1118,7 @@ class AttributeReadSelector:
         self._deadline: float | None = None
         self._window_end = _utc(now or datetime.now(UTC))
         self._query_count = 0
+        self._last_query_time_ms: float | None = None
         # ``typed_only`` remains the compatibility switch for callers that
         # must never touch the JSON overflow.  Filter pickers opt into
         # ``structured`` explicitly: bounded predicates support JSON array and
@@ -1212,6 +1224,7 @@ class AttributeReadSelector:
 
         self._deadline = self._clock() + self._wall_timeout_seconds
         self._query_count = 0
+        self._last_query_time_ms = None
 
     def _execute(
         self,
@@ -1250,6 +1263,7 @@ class AttributeReadSelector:
                     ATTRIBUTE_READ_EXACT_KEY_QUERY_TIMEOUT_MS,
                 )
             )
+            self._last_query_time_ms = None
             page = self._executor.execute(
                 query,
                 params,
@@ -1266,6 +1280,12 @@ class AttributeReadSelector:
             raise IncompleteLatestStateReplay(
                 "Attribute query returned an invalid result envelope"
             )
+        try:
+            measured_query_time_ms = float(page.query_time_ms)
+        except (TypeError, ValueError):
+            measured_query_time_ms = math.inf
+        if math.isfinite(measured_query_time_ms) and measured_query_time_ms >= 0:
+            self._last_query_time_ms = measured_query_time_ms
         return page.data
 
     def _windows(
@@ -4487,11 +4507,7 @@ class AttributeReadSelector:
                     if distinct_advanced
                     else ATTRIBUTE_VALUE_CURSOR_DISTINCT_WALL_RESERVE_MS
                 )
-                planned_proof_timeout_ms = (
-                    ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
-                    if distinct_width <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
-                    else ATTRIBUTE_VALUE_CURSOR_SPECULATIVE_TIMEOUT_MS
-                )
+                planned_proof_timeout_ms = ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
                 if (
                     self._query_count + 1 + proof_query_reserve
                     > ATTRIBUTE_READ_MAX_QUERY_COUNT
@@ -4529,12 +4545,7 @@ class AttributeReadSelector:
                 if proof_start >= proof_end:
                     break
                 distinct_limit = effective_page_size + 1
-                proof_timeout_ms = (
-                    ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS
-                    if proof_end - proof_start
-                    <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
-                    else planned_proof_timeout_ms
-                )
+                proof_timeout_ms = planned_proof_timeout_ms
                 try:
                     distinct_rows = self._seen_value_slice_groups(
                         project_ids=projects,
@@ -4548,6 +4559,7 @@ class AttributeReadSelector:
                         distinct_limit=distinct_limit,
                         query_timeout_ms=proof_timeout_ms,
                     )
+                    proof_query_time_ms = self._last_query_time_ms
                 except Exception as exc:
                     if not is_read_budget_error(exc):
                         raise
@@ -4643,16 +4655,24 @@ class AttributeReadSelector:
                     # would reintroduce the known Coletia row/byte failures.
                     empty_segment_width = proven_width
                     last_successful_segment_width = proven_width
-                # A completed narrower retry moved past the dense frontier that
-                # rejected the wider statement. Allow the next adjacent slice
-                # to grow again: density is not uniform, and pinning the whole
-                # retained horizon to five seconds would recreate the public
-                # pagination failure this accelerator exists to prevent.
+                # A completed proof advances this exact half-open slice before
+                # deciding how to read the next adjacent one. Grow only from a
+                # comfortably cheap success. An expensive success retains its
+                # proven width, avoiding a doubled timeout as normal density
+                # discovery; once an older adjacent slice becomes cheap again,
+                # geometric sparse traversal resumes without a gap.
                 failed_distinct_ceiling = None
-                distinct_width = min(
-                    proven_width * 2,
-                    ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
-                )
+                if (
+                    proof_query_time_ms is not None
+                    and proof_query_time_ms
+                    <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS
+                ):
+                    distinct_width = min(
+                        proven_width * 2,
+                        ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
+                    )
+                else:
+                    distinct_width = proven_width
 
         while (
             current_segment_end > start
