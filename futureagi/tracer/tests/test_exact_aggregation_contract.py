@@ -1934,6 +1934,7 @@ def test_terminal_status_racing_with_activity_promotion_cannot_clear_running_cla
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 def test_expired_unstarted_dispatch_is_reclaimed_by_an_ordinary_poll(monkeypatch):
     """A terminal Temporal pre-activity failure is reclaimed without TTL wait."""
 
