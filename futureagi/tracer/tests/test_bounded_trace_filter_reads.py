@@ -1553,6 +1553,113 @@ def test_time_only_span_cursor_exposes_tightly_bounded_sparse_probe() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "attribute_filter",
+    [
+        _attribute_filter("final_status", ["Rejected"], operation="in"),
+        _attribute_filter("reviewed", True, filter_type="boolean"),
+    ],
+)
+def test_long_window_span_string_and_bool_skip_speculative_full_window_anchor(
+    attribute_filter: dict[str, Any],
+) -> None:
+    builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), attribute_filter],
+        page_size=25,
+    )
+
+    assert builder.supports_filter_anchor_probe() is True
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.recommended_filter_anchor_probe_timeout_ms() is None
+    assert builder.recommended_filter_anchor_probe_strata() is None
+    assert builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
+    assert builder.skip_full_window_filter_anchor_probe() is True
+
+
+@pytest.mark.parametrize(
+    ("operation", "value"),
+    [("equals", 7), ("in", [7, 8])],
+)
+def test_long_window_span_numeric_value_index_retains_bounded_anchor(
+    operation: str,
+    value: object,
+) -> None:
+    builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter(
+                "attempt",
+                value,
+                filter_type="number",
+                operation=operation,
+            ),
+        ],
+        page_size=25,
+    )
+
+    assert builder.recommended_filter_anchor_probe_limit() == 64
+    assert builder.recommended_filter_anchor_probe_timeout_ms() == 300
+    assert builder.recommended_filter_anchor_probe_strata() == 4
+    assert (
+        builder.recommended_filter_anchor_probe_max_bytes_to_read() == 96 * 1024 * 1024
+    )
+    assert builder.skip_full_window_filter_anchor_probe() is False
+
+
+def test_long_window_span_mixed_text_numeric_uses_numeric_value_index_anchor() -> None:
+    builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter("final_status", "Rejected"),
+            _attribute_filter("attempt", 7, filter_type="number"),
+        ],
+        page_size=25,
+    )
+
+    assert builder.recommended_filter_anchor_probe_limit() == 64
+    assert builder.skip_full_window_filter_anchor_probe() is False
+    sql, _params = builder.build_filter_anchor_probe(limit=64)
+    assert "has(mapValues(attrs_number)" in sql
+    assert "attrs_string" in sql
+
+
+def test_long_window_span_numeric_range_has_no_full_window_value_anchor() -> None:
+    builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(),
+            _attribute_filter(
+                "attempt",
+                7,
+                filter_type="number",
+                operation="greater_than",
+            ),
+        ],
+        page_size=25,
+    )
+
+    assert builder.supports_filter_anchor_probe() is False
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.skip_full_window_filter_anchor_probe() is False
+
+
+def test_short_window_span_string_filter_retains_default_anchor_contract() -> None:
+    builder = SpanListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[
+            _time_filter(END - timedelta(minutes=30), END),
+            _attribute_filter("final_status", "Rejected"),
+        ],
+        page_size=25,
+    )
+
+    assert builder.recommended_filter_anchor_probe_limit() is None
+    assert builder.skip_full_window_filter_anchor_probe() is False
+
+
 def test_negative_only_trace_filter_skips_long_window_anchor() -> None:
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
@@ -4768,7 +4875,10 @@ def test_non_observe_span_list_uses_direct_v2_builder_without_dispatch() -> None
 )
 def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
     from tracer.views.observation_span import (
+        SPAN_LIST_CANDIDATE_DEADLINE_MS,
+        SPAN_LIST_ENRICHMENT_TIMEOUT_MS,
         SPAN_LIST_READ_SETTINGS,
+        SPAN_LIST_WALL_DEADLINE_MS,
         ObservationSpanView,
     )
 
@@ -4864,11 +4974,80 @@ def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
     assert status_name == "ok"
     assert payload["table"][0]["span_id"] == "span-a"
     assert payload["metadata"]["query_count"] == 2
-    assert 0 <= payload["metadata"]["query_elapsed_ms"] < 3_000
-    assert bounded_read.call_args.kwargs["deadline_ms"] <= 2_200
+    assert 0 <= payload["metadata"]["query_elapsed_ms"] < SPAN_LIST_WALL_DEADLINE_MS
+    assert (
+        bounded_read.call_args.kwargs["deadline_ms"] <= SPAN_LIST_CANDIDATE_DEADLINE_MS
+    )
+    assert bounded_read.call_args.kwargs["retry_wide_read_budget"] is True
+    assert (
+        SPAN_LIST_CANDIDATE_DEADLINE_MS + SPAN_LIST_ENRICHMENT_TIMEOUT_MS
+        <= SPAN_LIST_WALL_DEADLINE_MS
+    )
     assert len(analytics.calls) == 1
-    assert 0 < analytics.calls[0][1] <= 900
+    assert 0 < analytics.calls[0][1] <= SPAN_LIST_ENRICHMENT_TIMEOUT_MS
     assert analytics.calls[0][2] == SPAN_LIST_READ_SETTINGS
+
+
+@override_settings(
+    CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "SPAN_LIST"},
+)
+def test_span_numbered_page_retries_wide_reads_but_incomplete_stays_503() -> None:
+    from tracer.views.observation_span import (
+        SPAN_LIST_CANDIDATE_DEADLINE_MS,
+        ObservationSpanView,
+    )
+
+    view = ObservationSpanView.__new__(ObservationSpanView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    organization = SimpleNamespace(id="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+    )
+    analytics = mock.MagicMock()
+
+    with (
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=_incomplete_empty_page("read_budget_exceeded"),
+        ) as bounded_read,
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        response = view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 3,
+                "page_size": 25,
+                "allow_sampled": True,
+            },
+            analytics=analytics,
+            org_project_ids=None,
+            org=organization,
+        )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert response[2] == {"code": "service_unavailable"}
+    assert "DB::Exception" not in str(response)
+    assert bounded_read.call_args.kwargs["page_number"] == 3
+    assert bounded_read.call_args.kwargs["retry_wide_read_budget"] is True
+    assert (
+        bounded_read.call_args.kwargs["deadline_ms"] <= SPAN_LIST_CANDIDATE_DEADLINE_MS
+    )
+    analytics.execute_ch_query.assert_not_called()
 
 
 def test_trace_route_returns_sanitized_degraded_page_for_filtered_sort() -> None:
@@ -11964,6 +12143,62 @@ def test_eval_mode_halves_a_wide_timeout_and_still_covers_the_window() -> None:
     ]
     assert successful_seeds[0].slice_end == END
     assert successful_seeds[-1].slice_start == start
+
+
+def test_numbered_retry_keeps_learned_safe_width_across_adjacent_slices() -> None:
+    start = END - timedelta(hours=2)
+    builder = _WideInitialSliceFakeBuilder([], start=start, end=END)
+
+    class WidthBoundExecutor(_FakeExecutor):
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            if query == "seed" and params["slice_end"] - params[
+                "slice_start"
+            ] > timedelta(minutes=30):
+                self.calls.append((query, params))
+                raise ReadDeadlineExceeded("Code: 159. Timeout exceeded")
+            return super().execute_ch_query(
+                query, params, timeout_ms=timeout_ms, settings=settings
+            )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=WidthBoundExecutor(builder),
+        filters=[_time_filter(start=start, end=END)],
+        key_field="id",
+        page_number=3,
+        page_size=25,
+        deadline_ms=5_000,
+        max_seed_attempts=64,
+        max_query_count=64,
+        retry_wide_read_budget=True,
+    )
+
+    assert page.complete is True
+    failed_wide_seeds = [
+        attempt
+        for attempt in page.attempts
+        if attempt.kind == "seed" and attempt.error_code == "read_budget_exceeded"
+    ]
+    assert len(failed_wide_seeds) == 1
+    successful_intervals = [
+        (attempt.slice_start, attempt.slice_end)
+        for attempt in page.attempts
+        if attempt.kind == "seed" and attempt.error_code is None
+    ]
+    assert successful_intervals == [
+        (END - timedelta(minutes=30), END),
+        (END - timedelta(minutes=60), END - timedelta(minutes=30)),
+        (END - timedelta(minutes=90), END - timedelta(minutes=60)),
+        (start, END - timedelta(minutes=90)),
+    ]
+    assert all(
+        older_end == newer_start
+        for (newer_start, _newer_end), (_older_start, older_end) in zip(
+            successful_intervals,
+            successful_intervals[1:],
+            strict=False,
+        )
+    )
 
 
 def test_cursor_halves_a_wide_seed_failure_and_advances_exact_checkpoint() -> None:

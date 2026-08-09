@@ -1817,13 +1817,11 @@ def test_span_text_map_anchor_stays_optional_for_lists_but_graphs_sample():
     )
 
     assert list_builder.supports_filter_anchor_probe() is True
-    assert list_builder.recommended_filter_anchor_probe_limit() == 64
-    assert list_builder.recommended_filter_anchor_probe_timeout_ms() == 300
-    assert list_builder.recommended_filter_anchor_probe_strata() == 4
-    assert (
-        list_builder.recommended_filter_anchor_probe_max_bytes_to_read()
-        == 96 * 1024 * 1024
-    )
+    assert list_builder.recommended_filter_anchor_probe_limit() is None
+    assert list_builder.recommended_filter_anchor_probe_timeout_ms() is None
+    assert list_builder.recommended_filter_anchor_probe_strata() is None
+    assert list_builder.recommended_filter_anchor_probe_max_bytes_to_read() is None
+    assert list_builder.skip_full_window_filter_anchor_probe() is True
     assert graph_builder.supports_filter_anchor_probe() is True
     assert graph_builder.requires_unindexed_graph_sample_slice() is True
     assert graph_builder.recommended_filter_anchor_probe_limit() is None

@@ -1102,6 +1102,10 @@ def read_bounded_filter_page(
         if continuation_slice_end is not None
         else (cursor_key[1] if use_cursor_seed_keyset else None)
     )
+    # Once a statement proves a width unsafe, retain the narrower ceiling for
+    # every older adjacent slice in this request. Resetting it after one
+    # successful half-width read makes the next slice double back to the same
+    # known-bad width and repeatedly burns the per-statement timeout.
     forced_width_cap: timedelta | None = None
     page_complete = False
     degraded_error_code: str | None = None
@@ -2232,13 +2236,17 @@ def read_bounded_filter_page(
                     and exc.error_code == "read_budget_exceeded"
                     and active_width > _INITIAL_SLICE
                 ):
-                    forced_width_cap = max(_INITIAL_SLICE, active_width / 2)
+                    reduced_width_cap = max(_INITIAL_SLICE, active_width / 2)
+                    forced_width_cap = (
+                        reduced_width_cap
+                        if forced_width_cap is None
+                        else min(forced_width_cap, reduced_width_cap)
+                    )
                     active_slice_start = None
                     before_start_time = None
                     before_id = None
                     continue
                 raise
-            forced_width_cap = None
             seed_rows = sorted(seed_result.data, key=seed_row_key, reverse=True)
             new_candidate_rows: list[dict[str, Any]] = []
             for row in seed_rows:

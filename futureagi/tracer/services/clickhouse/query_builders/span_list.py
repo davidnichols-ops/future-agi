@@ -523,8 +523,29 @@ class SpanListQueryBuilder(BaseQueryBuilder):
                 return plan
         return None
 
+    def _selective_typed_map_anchor_plan(self) -> Any | None:
+        """Return a scalar Map anchor backed by the numeric value index."""
+
+        for plan in self._filter_anchor_plans():
+            predicate = str(plan.raw_witness_predicate or plan.seed_predicate or "")
+            if (
+                plan.raw_witness_rank == 0
+                and re.search(r"\bmapContains\(span_attr_num,", predicate)
+                and self._plan_uses_selective_graph_anchor(plan)
+            ):
+                return plan
+        return None
+
     def recommended_filter_anchor_probe_limit(self) -> int | None:
-        """Use a small exact value sentinel for long-window list reads."""
+        """Recommend only value-indexed or time-only cursor sentinels.
+
+        String and boolean full-window Map sentinels are speculative: the
+        ordered seed and latest-state classifier still have to run when one
+        saturates. On large tenants that optional query can consume the
+        statement deadline before the exact path starts. Numeric equality/IN
+        retains the value-indexed sentinel, while other filtered lists begin
+        directly with finite adjacent time slices.
+        """
 
         if self._supports_time_only_cursor_sparse_probe():
             return min(
@@ -535,10 +556,26 @@ class SpanListQueryBuilder(BaseQueryBuilder):
         if (
             not self._bounded_anchor_probe
             and request_end - request_start > timedelta(hours=1)
-            and self._positive_typed_map_anchor_plan() is not None
+            and self._selective_typed_map_anchor_plan() is not None
         ):
             return _LONG_WINDOW_VALUE_ANCHOR_SENTINEL
         return None
+
+    def skip_full_window_filter_anchor_probe(self) -> bool:
+        """Skip speculative scalar-Map anchors outside short list windows.
+
+        Graph callers provide an explicit per-stratum anchor limit and are not
+        covered by this full-window list recommendation.  Time-only cursor
+        reads retain their separate 26-row sparse probe.
+        """
+
+        request_start, request_end = self._bounded_request_window
+        return bool(
+            not self._bounded_anchor_probe
+            and request_end - request_start > timedelta(hours=1)
+            and self._positive_typed_map_anchor_plan() is not None
+            and self._selective_typed_map_anchor_plan() is None
+        )
 
     def recommended_filter_anchor_probe_timeout_ms(self) -> int | None:
         if self.recommended_filter_anchor_probe_limit() is not None:

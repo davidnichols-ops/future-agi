@@ -165,8 +165,8 @@ from tracer.utils.sql_queries import SQL_query_handler
 
 logger = structlog.get_logger(__name__)
 
-SPAN_LIST_WALL_DEADLINE_MS = 3_000
-SPAN_LIST_CANDIDATE_DEADLINE_MS = 2_200
+SPAN_LIST_WALL_DEADLINE_MS = 5_000
+SPAN_LIST_CANDIDATE_DEADLINE_MS = 4_100
 SPAN_LIST_ENRICHMENT_TIMEOUT_MS = 900
 SPAN_LIST_READ_SETTINGS = {
     "max_threads": 1,
@@ -1927,6 +1927,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     cursor_state.scan_before_id if cursor_state is not None else None
                 ),
                 bounded_continuation=cursor_enabled,
+                retry_wide_read_budget=True,
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
