@@ -15,7 +15,6 @@ from tracer.services.clickhouse.exact_graph_reads import (
     ExactGraphReadError,
     _annotation_label_ids_for_filters,
     _enumerate_exact_trace_ids,
-    _exact_span_partitions,
     _filter_relation_requirements,
     _merge_exact_trace_contribution_rows,
     output_bucket_partitions,
@@ -118,49 +117,46 @@ def test_output_partitions_only_cut_on_bucket_boundaries():
 
 
 @pytest.mark.unit
-def test_exact_span_partitions_are_adjacent_and_keep_identity_versions_together():
+def test_exact_span_scan_aligns_partial_window_to_storage_identity_hour():
     start = datetime(2026, 8, 1, 0, 2)
     end = datetime(2026, 8, 1, 0, 14)
 
-    partitions = tuple(_exact_span_partitions(start, end))
+    class Analytics:
+        def __init__(self):
+            self.calls = []
 
-    assert partitions == (
-        (start, datetime(2026, 8, 1, 0, 7)),
-        (datetime(2026, 8, 1, 0, 7), datetime(2026, 8, 1, 0, 12)),
-        (datetime(2026, 8, 1, 0, 12), end),
-    )
-    assert all(
-        left[1] == right[0]
-        for left, right in zip(partitions, partitions[1:], strict=False)
+        def execute_ch_query(self, query, params, **_kwargs):
+            self.calls.append((query, dict(params)))
+            return SimpleNamespace(data=[], columns=["time_bucket"])
+
+    analytics = Analytics()
+    result = read_exact_system_graph(
+        analytics=analytics,
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(start, end),
+        interval="minute",
+        metric_id="traffic",
+        observe_type="span",
     )
 
-    # Direct-write span versions retain their immutable start_time. A live row
-    # and its later tombstone at an exact boundary therefore both belong to the
-    # next half-open slice; the latest-state argMax cannot be split or revived.
-    identity_versions = (
-        {"id": "span-1", "start_time": partitions[1][0], "version": 1},
-        {
-            "id": "span-1",
-            "start_time": partitions[1][0],
-            "version": 2,
-            "is_deleted": 1,
-        },
-    )
-    memberships = [
-        [
-            index
-            for index, (partition_start, partition_end) in enumerate(partitions)
-            if partition_start <= version["start_time"] < partition_end
-        ]
-        for version in identity_versions
-    ]
-    assert memberships == [[1], [1]]
+    assert len(analytics.calls) == 1
+    query, params = analytics.calls[0]
+    assert params["graph_partition_start"] == datetime(2026, 8, 1, 0, 0)
+    assert params["graph_partition_end"] == datetime(2026, 8, 1, 1, 0)
+    assert params["graph_contribution_start"] == start
+    assert params["graph_contribution_end"] == end
+    prewhere = query.split("PREWHERE", 1)[1].split("GROUP BY", 1)[0]
+    assert "graph_partition_start" in prewhere
+    assert "graph_partition_end" in prewhere
+    assert "graph_contribution_start" not in prewhere
+    assert "graph_contribution_end" not in prewhere
+    assert result["query_count"] == 1
 
 
 @pytest.mark.unit
 def test_exact_span_sparse_partitions_grow_without_gaps_or_duplicates():
-    start = datetime(2026, 8, 1)
-    end = start + timedelta(hours=3)
+    start = datetime(2026, 8, 1, 0, 2)
+    end = datetime(2026, 8, 1, 3, 14)
 
     class Analytics:
         def __init__(self):
@@ -171,6 +167,8 @@ def test_exact_span_sparse_partitions_grow_without_gaps_or_duplicates():
                 (
                     params["graph_partition_start"],
                     params["graph_partition_end"],
+                    params["graph_contribution_start"],
+                    params["graph_contribution_end"],
                 )
             )
             return SimpleNamespace(
@@ -189,17 +187,24 @@ def test_exact_span_sparse_partitions_grow_without_gaps_or_duplicates():
         observe_type="span",
     )
 
-    widths = [right - left for left, right in analytics.attempts]
+    widths = [right - left for left, right, *_rest in analytics.attempts]
     assert widths == [
-        timedelta(minutes=5),
-        timedelta(minutes=10),
-        timedelta(minutes=20),
-        timedelta(minutes=40),
-        timedelta(minutes=80),
-        timedelta(minutes=25),
+        timedelta(hours=1),
+        timedelta(hours=2),
+        timedelta(hours=1),
     ]
-    assert analytics.attempts[0][0] == start
-    assert analytics.attempts[-1][1] == end
+    assert analytics.attempts[0] == (
+        datetime(2026, 8, 1, 0, 0),
+        datetime(2026, 8, 1, 1, 0),
+        start,
+        datetime(2026, 8, 1, 1, 0),
+    )
+    assert analytics.attempts[-1] == (
+        datetime(2026, 8, 1, 3, 0),
+        datetime(2026, 8, 1, 4, 0),
+        datetime(2026, 8, 1, 3, 0),
+        end,
+    )
     assert all(
         left[1] == right[0]
         for left, right in zip(
@@ -208,14 +213,14 @@ def test_exact_span_sparse_partitions_grow_without_gaps_or_duplicates():
             strict=False,
         )
     )
-    assert result["query_count"] == 6
+    assert result["query_count"] == 3
     assert result["query_complete"] is True
 
 
 @pytest.mark.unit
 def test_exact_span_budget_retry_halves_same_cursor_and_learns_ceiling():
     start = datetime(2026, 8, 1)
-    end = start + timedelta(minutes=40)
+    end = start + timedelta(hours=8)
 
     class Analytics:
         def __init__(self):
@@ -227,7 +232,7 @@ def test_exact_span_budget_retry_halves_same_cursor_and_learns_ceiling():
                 params["graph_partition_end"],
             )
             self.attempts.append(attempt)
-            if attempt[1] - attempt[0] > timedelta(minutes=10):
+            if attempt[1] - attempt[0] > timedelta(hours=2):
                 raise ServerException("private detail", code=159)
             return SimpleNamespace(
                 data=[],
@@ -246,20 +251,20 @@ def test_exact_span_budget_retry_halves_same_cursor_and_learns_ceiling():
     )
 
     assert [right - left for left, right in analytics.attempts] == [
-        timedelta(minutes=5),
-        timedelta(minutes=10),
-        timedelta(minutes=20),
-        timedelta(minutes=10),
-        timedelta(minutes=10),
-        timedelta(minutes=5),
+        timedelta(hours=1),
+        timedelta(hours=2),
+        timedelta(hours=4),
+        timedelta(hours=2),
+        timedelta(hours=2),
+        timedelta(hours=1),
     ]
-    # The failed 20-minute attempt and its 10-minute retry start at the same
+    # The failed four-hour attempt and its two-hour retry start at the same
     # cursor. Only successful intervals form the final exact cover.
     assert analytics.attempts[2][0] == analytics.attempts[3][0]
     successful = [
         attempt
         for attempt in analytics.attempts
-        if attempt[1] - attempt[0] <= timedelta(minutes=10)
+        if attempt[1] - attempt[0] <= timedelta(hours=2)
     ]
     assert successful[0][0] == start
     assert successful[-1][1] == end
@@ -273,7 +278,7 @@ def test_exact_span_budget_retry_halves_same_cursor_and_learns_ceiling():
 @pytest.mark.unit
 def test_exact_span_adaptive_reader_does_not_retry_programming_errors():
     start = datetime(2026, 8, 1)
-    end = start + timedelta(minutes=30)
+    end = start + timedelta(hours=2)
 
     class Analytics:
         def __init__(self):
@@ -1779,23 +1784,24 @@ def _exact_multi_filters(start: datetime, end: datetime) -> list[dict]:
 def test_exact_span_partition_boundary_does_not_revive_a_winning_tombstone():
     start = datetime(2026, 8, 1)
     end = start + timedelta(minutes=12)
-    boundary = start + timedelta(minutes=5)
     physical_rows = [
-        # Both versions have the immutable boundary timestamp and must be read
-        # together by the second half-open partition. The winning tombstone
-        # excludes the identity instead of letting v1 leak from partition one.
+        # ``start_time`` comes from the producer and the stateless collector can
+        # receive a corrected value on a newer re-poll. These two rows share the
+        # table's actual RMT identity because its time component is the hour.
+        # A five-minute PREWHERE split would revive v1; an hour-aligned scan
+        # resolves the tombstone before applying the requested output bounds.
         {
-            "id": "deleted-at-boundary",
+            "id": "moved-across-five-minute-cut",
             "trace_id": "trace-deleted",
-            "start_time": boundary,
+            "start_time": start + timedelta(minutes=4, seconds=59),
             "version": 1,
             "is_deleted": 0,
             "final_status": "Rechazado",
         },
         {
-            "id": "deleted-at-boundary",
+            "id": "moved-across-five-minute-cut",
             "trace_id": "trace-deleted",
-            "start_time": boundary,
+            "start_time": start + timedelta(minutes=5, seconds=1),
             "version": 2,
             "is_deleted": 1,
             "final_status": "Rechazado",
@@ -1863,7 +1869,11 @@ def test_exact_span_partition_boundary_does_not_revive_a_winning_tombstone():
             self.physical_ids_by_partition.append([row["id"] for row in partition_rows])
             latest = {}
             for row in partition_rows:
-                identity = (row["trace_id"], row["id"], row["start_time"])
+                identity = (
+                    row["trace_id"],
+                    row["id"],
+                    row["start_time"].replace(minute=0, second=0, microsecond=0),
+                )
                 if (
                     identity not in latest
                     or row["version"] > latest[identity]["version"]
@@ -1872,7 +1882,11 @@ def test_exact_span_partition_boundary_does_not_revive_a_winning_tombstone():
             matches = [
                 row
                 for row in latest.values()
-                if not row["is_deleted"] and row["final_status"] == "Rechazado"
+                if not row["is_deleted"]
+                and row["final_status"] == "Rechazado"
+                and params["graph_contribution_start"]
+                <= row["start_time"]
+                < params["graph_contribution_end"]
             ]
             data = [
                 {
@@ -1912,12 +1926,17 @@ def test_exact_span_partition_boundary_does_not_revive_a_winning_tombstone():
     )
 
     assert analytics.physical_ids_by_partition == [
-        ["latest-match", "latest-match"],
-        ["deleted-at-boundary", "deleted-at-boundary"],
-        ["tail-match"],
+        [
+            "moved-across-five-minute-cut",
+            "moved-across-five-minute-cut",
+            "latest-match",
+            "latest-match",
+            "tail-match",
+            "outside-end",
+        ]
     ]
     assert sum(point["value"] for point in result["data"]) == 2
-    assert result["query_count"] == 3
+    assert result["query_count"] == 1
     assert result["query_sampled"] is False
 
 
@@ -2150,7 +2169,10 @@ def test_exact_system_graph_compiles_relations_in_one_project_scoped_statement(
     analytics = _RelationSnapshotAnalytics()
     _stub_annotation_label_ids(monkeypatch, exact_module)
     start = datetime(2026, 1, 1)
-    end = datetime(2026, 4, 15)
+    # This is a SQL-shape contract, not a partition-volume test. Keep it to one
+    # storage-identity hour so a mock without execution timing cannot expand a
+    # multi-month window into thousands of deterministic base statements.
+    end = start + timedelta(minutes=5)
 
     class _ProjectConfigs:
         @staticmethod
@@ -2273,7 +2295,7 @@ def test_exact_system_graph_combines_scalar_array_map_and_legacy_json(observe_ty
         observe_type=observe_type,
     )
 
-    assert len(analytics.partition_calls) == 3
+    assert len(analytics.partition_calls) == 1
     query, params, settings = analytics.partition_calls[0]
     assert "attrs_string" in query
     assert "JSONExtractArrayRaw(attributes_extra" in query
@@ -2282,7 +2304,9 @@ def test_exact_system_graph_combines_scalar_array_map_and_legacy_json(observe_ty
     assert params["start_date"] == start
     assert params["end_date"] == end
     assert params["graph_partition_start"] == start
-    assert params["graph_partition_end"] == start + timedelta(minutes=5)
+    assert params["graph_partition_end"] == start + timedelta(hours=1)
+    assert params["graph_contribution_start"] == start
+    assert params["graph_contribution_end"] == end
     assert params["graph_filter_2_latest_filter_key_2"] == "tags"
     assert params["graph_filter_3_latest_filter_key_3"] == "profile"
     assert params["graph_filter_4_latest_filter_key_4"] == "legacy_payload"
@@ -2306,7 +2330,7 @@ def test_exact_system_graph_combines_scalar_array_map_and_legacy_json(observe_ty
     assert "AS latency_sum" in query
     assert "AS cost_sum" in query
     assert "AS error_count" in query
-    assert result["query_count"] == 3
+    assert result["query_count"] == 1
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
@@ -3562,6 +3586,60 @@ def test_exact_trace_contribution_merge_preserves_additive_cost_and_error_state(
 
 
 @pytest.mark.unit
+def test_exact_contribution_merge_fails_closed_above_final_row_limit(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_MAX_RESULT_ROWS", 1)
+    columns = [
+        "time_bucket",
+        "latency_sum",
+        "total_tokens",
+        "cost_sum",
+        "traffic_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "error_count",
+    ]
+    rows = [
+        {
+            "time_bucket": datetime(2026, 8, 1, hour),
+            "traffic_count": 1,
+        }
+        for hour in (0, 1)
+    ]
+
+    with pytest.raises(ExactGraphReadError, match="bounded row limit"):
+        _merge_exact_trace_contribution_rows([(rows, columns)])
+
+
+@pytest.mark.unit
+def test_exact_contribution_merge_fails_closed_above_final_byte_limit(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_MAX_RESULT_BYTES", 1)
+    columns = [
+        "time_bucket",
+        "latency_sum",
+        "total_tokens",
+        "cost_sum",
+        "traffic_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "error_count",
+    ]
+
+    with pytest.raises(ExactGraphReadError, match="bounded byte limit"):
+        _merge_exact_trace_contribution_rows(
+            [
+                (
+                    [{"time_bucket": datetime(2026, 8, 1), "traffic_count": 1}],
+                    columns,
+                )
+            ]
+        )
+
+
+@pytest.mark.unit
 def test_exact_trace_graph_discards_all_batches_when_any_contribution_fails(
     monkeypatch,
 ):
@@ -3643,7 +3721,7 @@ def test_exact_span_graph_merges_additive_partitions_only_after_all_succeed():
         observe_type="span",
     )
 
-    assert len(analytics.calls) == 3
+    assert len(analytics.calls) == 1
     assert [
         (
             call[1]["graph_partition_start"],
@@ -3651,9 +3729,7 @@ def test_exact_span_graph_merges_additive_partitions_only_after_all_succeed():
         )
         for call in analytics.calls
     ] == [
-        (start, start + timedelta(minutes=5)),
-        (start + timedelta(minutes=5), start + timedelta(minutes=10)),
-        (start + timedelta(minutes=10), end),
+        (start, start + timedelta(hours=1)),
     ]
     assert all(0 < call[2] <= 15_000 for call in analytics.calls)
     assert all(call[3]["max_threads"] == 1 for call in analytics.calls)
@@ -3667,10 +3743,10 @@ def test_exact_span_graph_merges_additive_partitions_only_after_all_succeed():
         {
             "timestamp": start.isoformat(),
             "value": 15.0,
-            "primary_traffic": 6,
+            "primary_traffic": 2,
         }
     ]
-    assert result["query_count"] == 3
+    assert result["query_count"] == 1
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
 
@@ -3682,7 +3758,7 @@ def test_exact_span_graph_fails_closed_before_merging_a_partial_partition(
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     start = datetime(2026, 8, 1)
-    end = start + timedelta(minutes=6)
+    end = start + timedelta(hours=2)
 
     class Analytics:
         calls = 0
@@ -3936,7 +4012,7 @@ def test_exact_graph_does_not_retry_programming_errors():
 
 
 @pytest.mark.unit
-def test_filtered_exact_span_window_uses_five_minute_additive_statements():
+def test_filtered_exact_span_window_uses_hour_aligned_additive_statements():
     analytics = _ConcurrentArrivalAnalytics()
     start = datetime(2026, 1, 1)
     end = start + timedelta(minutes=12)
@@ -3961,7 +4037,7 @@ def test_filtered_exact_span_window_uses_five_minute_additive_statements():
         observe_type="span",
     )
 
-    assert len(analytics.partition_calls) == 3
+    assert len(analytics.partition_calls) == 1
     query, params, settings = analytics.partition_calls[0]
     assert "additional_table_filters" not in settings
     assert "snapshot_version_ceiling" not in params
@@ -3974,14 +4050,18 @@ def test_filtered_exact_span_window_uses_five_minute_additive_statements():
     assert (params["start_date"], params["end_date"]) == (start, end)
     assert (params["graph_partition_start"], params["graph_partition_end"]) == (
         start,
-        start + timedelta(minutes=5),
+        start + timedelta(hours=1),
+    )
+    assert (params["graph_contribution_start"], params["graph_contribution_end"]) == (
+        start,
+        end,
     )
     assert "AS latency_sum" in query
     assert "AS cost_sum" in query
     assert settings["max_threads"] == 1
     assert settings["max_rows_to_read"] == 2_000_000
     assert settings["max_bytes_to_read"] == 4 * 1024 * 1024 * 1024
-    assert result["query_count"] == 3
+    assert result["query_count"] == 1
     assert "query_snapshot_version_ceiling" not in result
     assert result["query_complete"] is True
     assert result["query_status"] == "complete"

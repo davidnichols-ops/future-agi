@@ -555,21 +555,35 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         partition_end: datetime,
         exact_filter_plan: Any | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Return additive exact span states for one half-open time slice.
+        """Return additive exact span states for one storage-identity range.
 
-        Span filters are row-local, so each slice can collapse current state,
-        apply every scalar/array/Map/legacy-JSON predicate, and emit only
-        additive metric states. ``start_time`` is immutable for a span identity;
-        all versions and its winning tombstone therefore land in the same slice.
-        The caller merges states only after every requested slice succeeds.
+        The physical scan bounds must be whole hours because the spans table's
+        replacement key contains ``toStartOfHour(start_time)``. The direct
+        writer can receive a corrected exact timestamp on a newer version, so
+        an arbitrary event-time cut before ``argMax`` is not exact. Scan every
+        version in each covered hour, collapse current state first, and only
+        then apply the intersection with the requested output window. The
+        caller merges states only after every required scan succeeds.
         """
 
         if not self.exact_snapshot or self.observe_type != "span":
             raise ValueError("exact span partitions require an exact span builder")
         if self.start_date is None or self.end_date is None:
             self.start_date, self.end_date = self.parse_time_range(self.filters)
-        if not (self.start_date <= partition_start < partition_end <= self.end_date):
-            raise ValueError("exact span partition must be inside the request window")
+        if not (
+            partition_start < partition_end
+            and partition_start.minute == 0
+            and partition_start.second == 0
+            and partition_start.microsecond == 0
+            and partition_end.minute == 0
+            and partition_end.second == 0
+            and partition_end.microsecond == 0
+        ):
+            raise ValueError("exact span partition must use whole-hour scan bounds")
+        contribution_start = max(partition_start, self.start_date)
+        contribution_end = min(partition_end, self.end_date)
+        if contribution_start >= contribution_end:
+            raise ValueError("exact span partition must overlap the request window")
 
         if exact_filter_plan is None:
             from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
@@ -589,13 +603,15 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
                 "end_date": self.end_date,
                 "graph_partition_start": partition_start,
                 "graph_partition_end": partition_end,
+                "graph_contribution_start": contribution_start,
+                "graph_contribution_end": contribution_end,
             }
         )
 
         contribution_terms = [
             (
-                "start_time >= %(graph_partition_start)s "
-                "AND start_time < %(graph_partition_end)s"
+                "start_time >= %(graph_contribution_start)s "
+                "AND start_time < %(graph_contribution_end)s"
             ),
             *(
                 f"graph_contribution_match_{index} = 1"

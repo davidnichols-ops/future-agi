@@ -4,18 +4,19 @@ ClickHouse 25.3 cannot share a snapshot across separately executed statements,
 and a version predicate on ``ReplacingMergeTree`` is not time travel after a
 background merge. Most aggregate readers therefore use one full-window
 statement. Filtered trace graphs use finite identity batches; filtered span
-graphs use adjacent half-open event-time partitions because span membership is
-row-local and ``start_time`` is immutable for an identity. A late arrival or
-background merge between statements can affect a refresh, so neither sequence
-is advertised as MVCC. Both freeze the requested window, prevent duplicate
-contribution, and fail before publication if any required read fails. Only a
-complete result may replace the prior snapshot in ``exact_aggregation_cache``.
+graphs scan adjacent whole-hour ranges because ``toStartOfHour(start_time)`` is
+part of the table's replacement identity. A late arrival or background merge
+between statements can affect a refresh, so neither sequence is advertised as
+MVCC. Both freeze the requested window and any PostgreSQL-resolved membership
+once, prevent duplicate contribution, and fail before publication if any
+required read fails. Only a complete result may replace the prior snapshot in
+``exact_aggregation_cache``.
 """
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
-from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -120,19 +121,25 @@ EXACT_GRAPH_TRACE_MAX_SLICE = timedelta(days=2)
 # ClickHouse wall time; the monotonic fallback keeps alternate executors safe.
 EXACT_GRAPH_TRACE_GROWTH_QUERY_TIME_MS = 2_000
 # Span membership is row-local. Resolve latest state and emit additive bucket
-# states over adjacent, half-open windows small enough for the measured Coletia
-# production envelope. A span's immutable ``start_time`` is part of its
-# identity, so every ReplacingMergeTree version (including a winning tombstone)
-# remains in exactly one partition. The caller withholds all results until every
-# partition succeeds.
-EXACT_GRAPH_SPAN_PARTITION_WIDTH = timedelta(minutes=5)
+# states over adjacent, half-open storage-identity windows. The spans table's
+# replacement key contains ``toStartOfHour(start_time)`` (not exact start_time),
+# and the stateless collector accepts a producer-corrected start timestamp on a
+# newer version. Therefore an exact partition may never bisect an hour: every
+# version that ClickHouse considers one RMT identity, including a winning
+# tombstone, must reach the same argMax. Requested first/last partial-hour bounds
+# are applied only after that collapse. The caller withholds all results until
+# every required partition succeeds.
+EXACT_GRAPH_SPAN_PARTITION_WIDTH = timedelta(hours=1)
 EXACT_GRAPH_SPAN_MAX_PARTITION_WIDTH = timedelta(days=1)
 # A result-row count cannot reveal how many physical rows ClickHouse scanned.
 # Grow only when the executor's measured statement latency proves that the
-# current slice was cheap.  The dense Coletia five-minute qualification slice
-# takes ~842 ms, so it remains pinned to the proven five-minute floor.
+# current slice was cheap. All growth/retry widths remain integer multiples of
+# the one-hour storage-identity floor.
 EXACT_GRAPH_SPAN_GROW_BELOW_QUERY_MS = 250.0
 EXACT_GRAPH_SPAN_PARTITION_QUERY_TIMEOUT_MS = 15_000
+EXACT_GRAPH_MAX_RESULT_ROWS = 10_000
+EXACT_GRAPH_RESULT_ROW_SENTINEL = EXACT_GRAPH_MAX_RESULT_ROWS + 1
+EXACT_GRAPH_MAX_RESULT_BYTES = 32 * 1024 * 1024
 EXACT_GRAPH_READ_SETTINGS = {
     "max_threads": 1,
     # Attribute maps are several KiB per row on the heaviest tenants.  Smaller
@@ -174,8 +181,8 @@ EXACT_GRAPH_READ_SETTINGS = {
     # the tasks_xl worker has a separate 32-GiB pod limit.
     "max_memory_usage": 1536 * 1024 * 1024,
     "read_overflow_mode": "throw",
-    "max_result_rows": 10_001,
-    "max_result_bytes": 32 * 1024 * 1024,
+    "max_result_rows": EXACT_GRAPH_RESULT_ROW_SENTINEL,
+    "max_result_bytes": EXACT_GRAPH_MAX_RESULT_BYTES,
     "result_overflow_mode": "throw",
     "timeout_overflow_mode": "throw",
 }
@@ -191,19 +198,6 @@ EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS = {
 
 class ExactGraphReadError(RuntimeError):
     """A complete exact graph refresh could not be produced."""
-
-
-def _exact_span_partitions(
-    start_date: datetime,
-    end_date: datetime,
-) -> Iterator[tuple[datetime, datetime]]:
-    """Yield gap-free half-open span windows no wider than five minutes."""
-
-    cursor = start_date
-    while cursor < end_date:
-        partition_end = min(cursor + EXACT_GRAPH_SPAN_PARTITION_WIDTH, end_date)
-        yield cursor, partition_end
-        cursor = partition_end
 
 
 def output_bucket_partitions(
@@ -669,7 +663,13 @@ def _enumerate_exact_trace_ids(
 def _merge_exact_trace_contribution_rows(
     batches: list[tuple[list[Any], list[str]]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Merge additive bucket states only after all required reads succeed."""
+    """Merge additive bucket states only after all required reads succeed.
+
+    Individual statements have ClickHouse transport limits, but partitioning
+    could otherwise accumulate a larger result in Python. Enforce the same
+    public row/byte envelope on the final merged payload before formatting or
+    cache publication.
+    """
 
     merged: dict[Any, dict[str, Any]] = {}
     for rows, columns in batches:
@@ -709,6 +709,11 @@ def _merge_exact_trace_contribution_rows(
             )
             state["error_count"] += int(_row_value(row, columns, "error_count", 0) or 0)
 
+    if len(merged) > EXACT_GRAPH_MAX_RESULT_ROWS:
+        raise ExactGraphReadError(
+            "Exact graph contribution result exceeded its bounded row limit."
+        )
+
     rows: list[dict[str, Any]] = []
     for bucket in sorted(merged):
         state = merged[bucket]
@@ -725,6 +730,15 @@ def _merge_exact_trace_contribution_rows(
                 "completion_tokens": state["completion_tokens"],
                 "error_rate": state["error_count"] * 100.0 / denominator,
             }
+        )
+    encoded_size = len(
+        json.dumps(rows, default=str, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+    if encoded_size > EXACT_GRAPH_MAX_RESULT_BYTES:
+        raise ExactGraphReadError(
+            "Exact graph contribution result exceeded its bounded byte limit."
         )
     columns = [
         "time_bucket",
@@ -798,24 +812,31 @@ def _read_exact_filtered_span_graph(
 ) -> tuple[dict[str, list[dict[str, Any]]], int, int]:
     """Merge exact row-local span states after every bounded read succeeds.
 
-    The result list is intentionally retained privately until the final slice
+    The result list is intentionally retained privately until the final scan
     completes. Any timeout, read-budget error, or malformed result propagates
     before formatting, so the background refresh cannot publish a partial
-    graph over the prior complete snapshot. The first slice uses the production
-    qualified five-minute floor. Cheap successful slices may double up to one
-    day; a resource failure halves and retries the exact same cursor, and the
-    failed width becomes a ceiling for the remainder of this refresh.
+    graph over the prior complete snapshot. Physical scans start/end on whole
+    hours, matching the RMT sorting identity. The first/last query still scans
+    its complete hour, then applies the frozen request bounds to winning rows.
+    Cheap successful scans may double by whole hours up to one day; a resource
+    failure halves and retries the exact same cursor, and the failed width
+    becomes a ceiling for the remainder of this refresh. Separate statements
+    cannot be MVCC on CH25.3; any relational membership embedded in the filter
+    plan was resolved once by the caller and is reused unchanged here.
     """
 
     batches: list[tuple[list[Any], list[str]]] = []
     query_count = 0
     rows_returned = 0
-    partition_start = start_date
-    request_width = end_date - start_date
-    partition_width = min(EXACT_GRAPH_SPAN_PARTITION_WIDTH, request_width)
-    max_partition_width = min(EXACT_GRAPH_SPAN_MAX_PARTITION_WIDTH, request_width)
-    while partition_start < end_date:
-        partition_end = min(partition_start + partition_width, end_date)
+    partition_start = start_date.replace(minute=0, second=0, microsecond=0)
+    partition_limit = end_date.replace(minute=0, second=0, microsecond=0)
+    if partition_limit < end_date:
+        partition_limit += EXACT_GRAPH_SPAN_PARTITION_WIDTH
+    scan_width = partition_limit - partition_start
+    partition_width = min(EXACT_GRAPH_SPAN_PARTITION_WIDTH, scan_width)
+    max_partition_width = min(EXACT_GRAPH_SPAN_MAX_PARTITION_WIDTH, scan_width)
+    while partition_start < partition_limit:
+        partition_end = min(partition_start + partition_width, partition_limit)
         remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
             (monotonic() - started) * 1000
         )
