@@ -31,14 +31,14 @@ from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.services.annotation_label_source import AnnotationScoreReadUnavailable
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
-from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
-    compile_exact_graph_row_predicates,
-)
 from tracer.services.clickhouse.query_builders.agent_graph import (
     AGENT_GRAPH_MAX_RESULT_BYTES,
     AGENT_GRAPH_RESULT_ROW_SENTINEL,
 )
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
+from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
+    compile_exact_graph_row_predicates,
+)
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     compile_exact_graph_filter_predicates,
     compile_span_attribute_row_predicate,
@@ -62,11 +62,11 @@ from tracer.services.clickhouse.v2.query_builders.filters import (
     ClickHouseFilterBuilderV2,
     rewrite_v1_sql_to_v2,
 )
-from tracer.services.clickhouse.v2.query_builders.user_time_series import (
-    UserTimeSeriesQueryBuilderV2,
-)
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
+)
+from tracer.services.clickhouse.v2.query_builders.user_time_series import (
+    UserTimeSeriesQueryBuilderV2,
 )
 from tracer.utils.helper import get_annotation_labels_for_project
 
@@ -440,9 +440,7 @@ def _merge_exact_trace_contribution_rows(
                     "error_count": 0,
                 },
             )
-            state["latency_sum"] += int(
-                _row_value(row, columns, "latency_sum", 0) or 0
-            )
+            state["latency_sum"] += int(_row_value(row, columns, "latency_sum", 0) or 0)
             state["total_tokens"] += int(
                 _row_value(row, columns, "total_tokens", 0) or 0
             )
@@ -458,9 +456,7 @@ def _merge_exact_trace_contribution_rows(
             state["completion_tokens"] += int(
                 _row_value(row, columns, "completion_tokens", 0) or 0
             )
-            state["error_count"] += int(
-                _row_value(row, columns, "error_count", 0) or 0
-            )
+            state["error_count"] += int(_row_value(row, columns, "error_count", 0) or 0)
 
     rows: list[dict[str, Any]] = []
     for bucket in sorted(merged):
@@ -518,9 +514,7 @@ def _read_exact_filtered_trace_graph(
                 "Exact trace graph refresh exceeded its bounded deadline."
             )
         query, params = builder.build_exact_trace_contribution_batch(
-            trace_ids[
-                offset : offset + EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE
-            ]
+            trace_ids[offset : offset + EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE]
         )
         result = analytics.execute_ch_query(
             query,
@@ -535,7 +529,11 @@ def _read_exact_filtered_trace_graph(
         rows_returned += len(batch_rows)
 
     merged_rows, merged_columns = _merge_exact_trace_contribution_rows(batches)
-    return builder.format_result(merged_rows, merged_columns), query_count, rows_returned
+    return (
+        builder.format_result(merged_rows, merged_columns),
+        query_count,
+        rows_returned,
+    )
 
 
 def read_exact_system_graph(

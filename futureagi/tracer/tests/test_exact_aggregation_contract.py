@@ -2,6 +2,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -10,10 +11,13 @@ from clickhouse_driver.errors import ServerException
 from django.core.cache import cache
 from django.db import DatabaseError
 
+from tracer.selectors.trace_filter_reads import BoundedFilterPage
 from tracer.services.clickhouse.exact_graph_reads import (
     ExactGraphReadError,
     _annotation_label_ids_for_filters,
+    _enumerate_exact_trace_ids,
     _filter_relation_requirements,
+    _merge_exact_trace_contribution_rows,
     output_bucket_partitions,
     read_exact_all_system_metrics,
     read_exact_annotation_graph,
@@ -1974,49 +1978,358 @@ def test_exact_system_graph_combines_scalar_array_map_and_legacy_json(observe_ty
     assert result["query_sampled"] is False
 
 
+def _bounded_page(
+    rows,
+    *,
+    has_more=False,
+    complete=True,
+    query_count=1,
+    status="complete",
+    error_code=None,
+):
+    return BoundedFilterPage(
+        rows=list(rows),
+        has_more=has_more,
+        complete=complete,
+        status=status,
+        error_code=error_code,
+        total_rows_lower_bound=len(rows),
+        elapsed_ms=1,
+        query_count=query_count,
+        rows_returned=len(rows),
+        result_payload_bytes=1,
+        attempts=(),
+    )
+
+
 @pytest.mark.unit
-def test_exact_trace_graph_routes_every_span_read_through_one_statement_source():
-    analytics = _ConcurrentArrivalAnalytics()
-    start = datetime(2026, 8, 1)
-    end = datetime(2026, 8, 5)
+def test_exact_trace_membership_exhausts_monotonic_pages_without_repeating_ids(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    t3 = datetime(2026, 8, 3)
+    t2 = datetime(2026, 8, 2)
+    calls = []
+    pages = iter(
+        [
+            _bounded_page(
+                [
+                    {"trace_id": "trace-3", "start_time": t3},
+                    {"trace_id": "trace-2", "start_time": t2},
+                ],
+                has_more=True,
+                query_count=3,
+            ),
+            _bounded_page(
+                [
+                    {"trace_id": "trace-2", "start_time": t2},
+                    {"trace_id": "trace-1", "start_time": datetime(2026, 8, 1)},
+                ],
+                query_count=2,
+            ),
+        ]
+    )
+
+    class Builder:
+        def __init__(self, **kwargs):
+            assert kwargs["bounded_internal_scan"] is True
+            assert kwargs["bounded_identity_only"] is True
+            assert kwargs["bounded_bulk_scan"] is True
+            assert kwargs["bounded_include_filter_witnesses"] is False
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def bounded_filter_row_order_token(row):
+            return row["trace_id"]
+
+    def read_page(**kwargs):
+        calls.append((kwargs["cursor_start_time"], kwargs["cursor_order_token"]))
+        return next(pages)
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        read_page,
+    )
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=object(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(datetime(2026, 8, 1), datetime(2026, 8, 4)),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == ["trace-3", "trace-2", "trace-1"]
+    assert query_count == 5
+    assert rows_returned == 4
+    assert calls == [(None, None), (t2, "trace-2")]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["incomplete", "no_progress"])
+def test_exact_trace_membership_fails_closed_on_unproven_cursor(monkeypatch, failure):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    checkpoint = datetime(2026, 8, 2)
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def bounded_filter_row_order_token(row):
+            return row["trace_id"]
+
+    if failure == "incomplete":
+        pages = iter(
+            [_bounded_page([], complete=False, status="timeout", error_code="timeout")]
+        )
+    else:
+        repeated = _bounded_page(
+            [{"trace_id": "trace-2", "start_time": checkpoint}],
+            has_more=True,
+        )
+        pages = iter([repeated, repeated])
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        lambda **_kwargs: next(pages),
+    )
+
+    with pytest.raises(ExactGraphReadError):
+        _enumerate_exact_trace_ids(
+            analytics=object(),
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(datetime(2026, 8, 1), datetime(2026, 8, 4)),
+            annotation_label_ids=None,
+            started=exact_module.monotonic(),
+        )
+
+
+@pytest.mark.unit
+def test_exact_trace_graph_zero_membership_issues_no_contribution_query(monkeypatch):
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        lambda **_kwargs: _bounded_page([], query_count=2),
+    )
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(*_args, **_kwargs):
+            pytest.fail("zero membership must not issue a contribution query")
 
     result = read_exact_system_graph(
-        analytics=analytics,
+        analytics=Analytics(),
         project_id="11111111-1111-4111-8111-111111111111",
-        filters=_exact_multi_filters(start, end),
+        filters=_exact_multi_filters(datetime(2026, 8, 1), datetime(2026, 8, 4)),
         interval="day",
         metric_id="traffic",
         observe_type="trace",
     )
 
-    query, params, settings = analytics.partition_calls[0]
-    # Every outer contribution and scalar predicate is evaluated on one
-    # physical latest-state row stream inside one ClickHouse statement.
-    assert query.count("FROM spans") == 1
-    assert "FROM spans FINAL" not in query
-    assert "argMax(" in query
-    assert "AS latest_spans" not in query
-    assert "SELECT DISTINCT trace_id" not in query
-    assert "JOIN spans" not in query
-    assert "PREWHERE project_id = %(project_id)s" in query
-    assert "snapshot_version_ceiling" not in params
-    assert "additional_table_filters" not in settings
-    assert settings["optimize_move_to_prewhere_if_final"] == 0
-    assert settings["use_skip_indexes_if_final"] == 0
-    # Separate bucket flags let two sibling spans independently satisfy
-    # final_status and confidence; the compact trace aggregate retains every
-    # exact additive output-bucket state without buffering raw Map columns.
-    assert "OVER (PARTITION BY trace_id) AS graph_match_" not in query
-    assert query.count("AS graph_bucket_match_") == 2
-    assert query.count("max(graph_bucket_match_") == 2
-    assert "graph_match_0 = 1" in query
-    assert "graph_match_1 = 1" in query
-    assert "groupArrayIf(" in query
-    assert len(analytics.partition_calls) == 1
-    assert result["query_count"] == 1
-    assert "query_snapshot_version_ceiling" not in result
+    assert result["query_count"] == 2
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
+    assert all(point["value"] == 0 for point in result["data"])
+
+
+@pytest.mark.unit
+def test_exact_trace_graph_merges_all_contribution_batches_before_averages(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    bucket = datetime(2026, 8, 1)
+    selected = [
+        {"trace_id": "trace-3", "start_time": datetime(2026, 8, 3)},
+        {"trace_id": "trace-2", "start_time": datetime(2026, 8, 2)},
+        {"trace_id": "trace-1", "start_time": datetime(2026, 8, 1)},
+    ]
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE", 2)
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        lambda **_kwargs: _bounded_page(selected, query_count=4),
+    )
+
+    class Analytics:
+        def __init__(self):
+            self.calls = []
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.calls.append((query, dict(params), timeout_ms, dict(settings)))
+            count = len(params["graph_candidate_trace_ids"])
+            return SimpleNamespace(
+                data=[
+                    {
+                        "time_bucket": bucket,
+                        "latency_sum": 10 * count,
+                        "total_tokens": 7 * count,
+                        "cost_sum": Decimal("0.10") * count,
+                        "traffic_count": count,
+                        "prompt_tokens": 4 * count,
+                        "completion_tokens": 3 * count,
+                        "error_count": 1,
+                    }
+                ],
+                columns=[
+                    "time_bucket",
+                    "latency_sum",
+                    "total_tokens",
+                    "cost_sum",
+                    "traffic_count",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "error_count",
+                ],
+            )
+
+    analytics = Analytics()
+    result = read_exact_system_graph(
+        analytics=analytics,
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(datetime(2026, 8, 1), datetime(2026, 8, 4)),
+        interval="day",
+        metric_id="latency",
+        observe_type="trace",
+    )
+
+    assert len(analytics.calls) == 2
+    assert [call[1]["graph_candidate_trace_ids"] for call in analytics.calls] == [
+        ("trace-3", "trace-2"),
+        ("trace-1",),
+    ]
+    assert all(
+        "trace_id IN %(graph_candidate_trace_ids)s" in call[0]
+        for call in analytics.calls
+    )
+    # final_status and confidence establish trace membership on possibly
+    # different siblings; they are intentionally absent from the all-live-span
+    # contribution scan once that identity membership has been proven.
+    assert all("attrs_string" not in call[0] for call in analytics.calls)
+    observed = next(point for point in result["data"] if point["value"])
+    assert observed["value"] == 10
+    assert observed["primary_traffic"] == 3
+    assert result["query_count"] == 6
+    assert result["query_sampled"] is False
+
+
+@pytest.mark.unit
+def test_exact_trace_contribution_merge_preserves_additive_cost_and_error_state():
+    bucket = datetime(2026, 8, 1)
+    rows, columns = _merge_exact_trace_contribution_rows(
+        [
+            (
+                [
+                    {
+                        "time_bucket": bucket,
+                        "latency_sum": 30,
+                        "total_tokens": 9,
+                        "cost_sum": Decimal("0.30"),
+                        "traffic_count": 2,
+                        "prompt_tokens": 5,
+                        "completion_tokens": 4,
+                        "error_count": 1,
+                    }
+                ],
+                [
+                    "time_bucket",
+                    "latency_sum",
+                    "total_tokens",
+                    "cost_sum",
+                    "traffic_count",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "error_count",
+                ],
+            ),
+            (
+                [
+                    {
+                        "time_bucket": bucket,
+                        "latency_sum": 30,
+                        "total_tokens": 6,
+                        "cost_sum": Decimal("0.15"),
+                        "traffic_count": 1,
+                        "prompt_tokens": 4,
+                        "completion_tokens": 2,
+                        "error_count": 1,
+                    }
+                ],
+                [
+                    "time_bucket",
+                    "latency_sum",
+                    "total_tokens",
+                    "cost_sum",
+                    "traffic_count",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "error_count",
+                ],
+            ),
+        ]
+    )
+
+    assert columns[-1] == "error_rate"
+    assert rows == [
+        {
+            "time_bucket": bucket,
+            "avg_latency": 20,
+            "total_tokens": 15,
+            "avg_cost": 0.15,
+            "traffic_count": 3,
+            "prompt_tokens": 9,
+            "completion_tokens": 6,
+            "error_rate": pytest.approx(200 / 3),
+        }
+    ]
+
+
+@pytest.mark.unit
+def test_exact_trace_graph_discards_all_batches_when_any_contribution_fails(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE", 1)
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        lambda **_kwargs: _bounded_page(
+            [
+                {"trace_id": "trace-2", "start_time": datetime(2026, 8, 2)},
+                {"trace_id": "trace-1", "start_time": datetime(2026, 8, 1)},
+            ]
+        ),
+    )
+
+    class Analytics:
+        def __init__(self):
+            self.calls = 0
+
+        def execute_ch_query(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise ServerException("private detail", code=159)
+            return SimpleNamespace(data=[], columns=[])
+
+    with pytest.raises(ServerException):
+        read_exact_system_graph(
+            analytics=Analytics(),
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(datetime(2026, 8, 1), datetime(2026, 8, 4)),
+            interval="day",
+            metric_id="traffic",
+            observe_type="trace",
+        )
 
 
 @pytest.mark.unit
