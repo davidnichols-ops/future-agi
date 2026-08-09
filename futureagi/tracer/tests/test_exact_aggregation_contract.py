@@ -1,7 +1,7 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,7 +11,6 @@ from clickhouse_driver.errors import ServerException
 from django.core.cache import cache
 from django.db import DatabaseError
 
-from tracer.selectors.trace_filter_reads import BoundedFilterPage
 from tracer.services.clickhouse.exact_graph_reads import (
     ExactGraphReadError,
     _annotation_label_ids_for_filters,
@@ -1978,56 +1977,32 @@ def test_exact_system_graph_combines_scalar_array_map_and_legacy_json(observe_ty
     assert result["query_sampled"] is False
 
 
-def _bounded_page(
-    rows,
-    *,
-    has_more=False,
-    complete=True,
-    query_count=1,
-    status="complete",
-    error_code=None,
-):
-    return BoundedFilterPage(
-        rows=list(rows),
-        has_more=has_more,
-        complete=complete,
-        status=status,
-        error_code=error_code,
-        total_rows_lower_bound=len(rows),
-        elapsed_ms=1,
-        query_count=query_count,
-        rows_returned=len(rows),
-        result_payload_bytes=1,
-        attempts=(),
-    )
-
-
 @pytest.mark.unit
-def test_exact_trace_membership_exhausts_monotonic_pages_without_repeating_ids(
+def test_exact_trace_membership_exhausts_witness_cursor_and_classifies_each_trace_once(
     monkeypatch,
 ):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
+    t4 = datetime(2026, 8, 4)
     t3 = datetime(2026, 8, 3)
     t2 = datetime(2026, 8, 2)
-    calls = []
-    pages = iter(
+    t1 = datetime(2026, 8, 1)
+    seed_calls = []
+    seed_pages = iter(
         [
-            _bounded_page(
-                [
-                    {"trace_id": "trace-3", "start_time": t3},
-                    {"trace_id": "trace-2", "start_time": t2},
-                ],
-                has_more=True,
-                query_count=3,
-            ),
-            _bounded_page(
-                [
-                    {"trace_id": "trace-2", "start_time": t2},
-                    {"trace_id": "trace-1", "start_time": datetime(2026, 8, 1)},
-                ],
-                query_count=2,
-            ),
+            [
+                {"trace_id": "trace-3", "matched_span_id": "span-3", "start_time": t3},
+                {"trace_id": "trace-2", "matched_span_id": "span-2", "start_time": t2},
+            ],
+            [
+                {
+                    "trace_id": "trace-2",
+                    "matched_span_id": "span-2b",
+                    "start_time": t1 + timedelta(hours=2),
+                },
+                {"trace_id": "trace-1", "matched_span_id": "span-1", "start_time": t1},
+            ],
+            [],
         ]
     )
 
@@ -2043,39 +2018,76 @@ def test_exact_trace_membership_exhausts_monotonic_pages_without_repeating_ids(
             return True
 
         @staticmethod
-        def bounded_filter_row_order_token(row):
-            return row["trace_id"]
+        def parse_time_range(_filters):
+            return t1, t4
 
-    def read_page(**kwargs):
-        calls.append((kwargs["cursor_start_time"], kwargs["cursor_order_token"]))
-        return next(pages)
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["matched_span_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["matched_span_id"]
+
+        @staticmethod
+        def build_filter_seed_page(**kwargs):
+            seed_calls.append((kwargs["before_start_time"], kwargs["before_id"]))
+            return "WITNESS", {}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            return "CLASSIFY", {"ids": tuple(row["trace_id"] for row in rows)}
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(query, params, **_kwargs):
+            if query == "WITNESS":
+                return SimpleNamespace(data=next(seed_pages), columns=[])
+            assert query == "CLASSIFY"
+            return SimpleNamespace(
+                data=[{"trace_id": trace_id} for trace_id in params["ids"]],
+                columns=["trace_id"],
+            )
 
     monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
-    monkeypatch.setattr(
-        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
-        read_page,
-    )
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE", 2)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE", 2)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_INITIAL_SLICE", t4 - t1)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_MAX_SLICE", t4 - t1)
 
     trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
-        analytics=object(),
+        analytics=Analytics(),
         project_id="11111111-1111-4111-8111-111111111111",
-        filters=_exact_multi_filters(datetime(2026, 8, 1), datetime(2026, 8, 4)),
+        filters=_exact_multi_filters(t1, t4),
         annotation_label_ids=None,
         started=exact_module.monotonic(),
     )
 
     assert trace_ids == ["trace-3", "trace-2", "trace-1"]
     assert query_count == 5
-    assert rows_returned == 4
-    assert calls == [(None, None), (t2, "trace-2")]
+    assert rows_returned == 7
+    assert seed_calls == [
+        (None, None),
+        (t2, "span-2"),
+        (t1, "span-1"),
+    ]
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("failure", ["incomplete", "no_progress"])
-def test_exact_trace_membership_fails_closed_on_unproven_cursor(monkeypatch, failure):
+@pytest.mark.parametrize("failure", ["classifier_error", "no_progress"])
+def test_exact_trace_membership_fails_closed_on_unproven_witness(monkeypatch, failure):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
+    request_start = datetime(2026, 8, 1)
+    request_end = datetime(2026, 8, 3)
     checkpoint = datetime(2026, 8, 2)
+    repeated = [
+        {
+            "trace_id": "trace-2",
+            "matched_span_id": "span-2",
+            "start_time": checkpoint,
+        }
+    ]
 
     class Builder:
         def __init__(self, **_kwargs):
@@ -2086,31 +2098,59 @@ def test_exact_trace_membership_fails_closed_on_unproven_cursor(monkeypatch, fai
             return True
 
         @staticmethod
-        def bounded_filter_row_order_token(row):
-            return row["trace_id"]
+        def parse_time_range(_filters):
+            return request_start, request_end
 
-    if failure == "incomplete":
-        pages = iter(
-            [_bounded_page([], complete=False, status="timeout", error_code="timeout")]
-        )
-    else:
-        repeated = _bounded_page(
-            [{"trace_id": "trace-2", "start_time": checkpoint}],
-            has_more=True,
-        )
-        pages = iter([repeated, repeated])
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["matched_span_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["matched_span_id"]
+
+        @staticmethod
+        def build_filter_seed_page(**_kwargs):
+            return "WITNESS", {}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            return "CLASSIFY", {"ids": tuple(row["trace_id"] for row in rows)}
+
+    class Analytics:
+        def __init__(self):
+            self.seed_calls = 0
+
+        def execute_ch_query(self, query, params, **_kwargs):
+            if query == "CLASSIFY":
+                if failure == "classifier_error":
+                    raise RuntimeError("classifier failed")
+                return SimpleNamespace(
+                    data=[{"trace_id": trace_id} for trace_id in params["ids"]],
+                    columns=["trace_id"],
+                )
+            self.seed_calls += 1
+            return SimpleNamespace(data=repeated, columns=[])
 
     monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE", 1)
     monkeypatch.setattr(
-        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
-        lambda **_kwargs: next(pages),
+        exact_module,
+        "EXACT_GRAPH_TRACE_INITIAL_SLICE",
+        request_end - request_start,
+    )
+    monkeypatch.setattr(
+        exact_module,
+        "EXACT_GRAPH_TRACE_MAX_SLICE",
+        request_end - request_start,
     )
 
-    with pytest.raises(ExactGraphReadError):
+    expected_error = RuntimeError if failure == "classifier_error" else ExactGraphReadError
+    with pytest.raises(expected_error):
         _enumerate_exact_trace_ids(
-            analytics=object(),
+            analytics=Analytics(),
             project_id="11111111-1111-4111-8111-111111111111",
-            filters=_exact_multi_filters(datetime(2026, 8, 1), datetime(2026, 8, 4)),
+            filters=_exact_multi_filters(request_start, request_end),
             annotation_label_ids=None,
             started=exact_module.monotonic(),
         )
@@ -2118,9 +2158,12 @@ def test_exact_trace_membership_fails_closed_on_unproven_cursor(monkeypatch, fai
 
 @pytest.mark.unit
 def test_exact_trace_graph_zero_membership_issues_no_contribution_query(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
     monkeypatch.setattr(
-        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
-        lambda **_kwargs: _bounded_page([], query_count=2),
+        exact_module,
+        "_enumerate_exact_trace_ids",
+        lambda **_kwargs: ([], 2, 0),
     )
 
     class Analytics:
@@ -2157,8 +2200,9 @@ def test_exact_trace_graph_merges_all_contribution_batches_before_averages(
     ]
     monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE", 2)
     monkeypatch.setattr(
-        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
-        lambda **_kwargs: _bounded_page(selected, query_count=4),
+        exact_module,
+        "_enumerate_exact_trace_ids",
+        lambda **_kwargs: ([row["trace_id"] for row in selected], 4, len(selected)),
     )
 
     class Analytics:
@@ -2227,17 +2271,15 @@ def test_exact_trace_graph_merges_all_contribution_batches_before_averages(
 def test_exact_trace_graph_delegates_scalar_array_map_and_json_membership(
     monkeypatch,
 ):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
     captured_filters = []
 
-    def read_page(**kwargs):
+    def enumerate_ids(**kwargs):
         captured_filters.extend(kwargs["filters"])
-        return _bounded_page(
-            [{"trace_id": "trace-1", "start_time": datetime(2026, 8, 1)}]
-        )
+        return ["trace-1"], 1, 1
 
-    monkeypatch.setattr(
-        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", read_page
-    )
+    monkeypatch.setattr(exact_module, "_enumerate_exact_trace_ids", enumerate_ids)
 
     class Analytics:
         def __init__(self):
@@ -2360,13 +2402,9 @@ def test_exact_trace_graph_discards_all_batches_when_any_contribution_fails(
 
     monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE", 1)
     monkeypatch.setattr(
-        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
-        lambda **_kwargs: _bounded_page(
-            [
-                {"trace_id": "trace-2", "start_time": datetime(2026, 8, 2)},
-                {"trace_id": "trace-1", "start_time": datetime(2026, 8, 1)},
-            ]
-        ),
+        exact_module,
+        "_enumerate_exact_trace_ids",
+        lambda **_kwargs: (["trace-2", "trace-1"], 1, 2),
     )
 
     class Analytics:
@@ -2525,12 +2563,15 @@ def test_exact_membership_preserves_known_empty_annotation_label_set(
 def test_exact_graph_budget_failure_does_not_publish_or_split_contribution_batch(
     monkeypatch,
 ):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
     analytics = _BudgetSplittingAnalytics()
     start = datetime(2026, 8, 1, 0, 0)
     end = datetime(2026, 8, 1, 4, 0)
     monkeypatch.setattr(
-        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
-        lambda **_kwargs: _bounded_page([{"trace_id": "trace-1", "start_time": start}]),
+        exact_module,
+        "_enumerate_exact_trace_ids",
+        lambda **_kwargs: (["trace-1"], 0, 0),
     )
 
     with pytest.raises(ServerException):

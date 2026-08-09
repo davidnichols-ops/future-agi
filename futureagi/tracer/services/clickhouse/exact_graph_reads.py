@@ -4,12 +4,12 @@ ClickHouse 25.3 cannot share a snapshot across separately executed statements,
 and a version predicate on ``ReplacingMergeTree`` is not time travel after a
 background merge. Most aggregate readers therefore use one full-window
 statement. Filtered trace graphs are the deliberate exception: the background
-worker freezes the request window, exhausts exact trace-list cursor pages, and
-aggregates finite trace-id batches. A late arrival or background merge between
-those statements can affect a refresh, so the sequence is not advertised as
-MVCC; de-duplication prevents duplicate contribution and any partial query
-fails the refresh. Only a complete result may replace the prior snapshot in
-``exact_aggregation_cache``.
+worker freezes the request window, exhausts a necessary raw filter-witness
+cursor, exact-classifies finite trace-id batches, and aggregates the proven
+identities. A late arrival or background merge between those statements can
+affect a refresh, so the sequence is not advertised as MVCC; de-duplication
+prevents duplicate contribution and any partial query fails the refresh. Only
+a complete result may replace the prior snapshot in ``exact_aggregation_cache``.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from time import monotonic
 from typing import Any
@@ -48,6 +48,7 @@ from tracer.services.clickhouse.query_builders.session_filters import (
     build_session_id_filter_clause,
 )
 from tracer.services.clickhouse.query_builders.user_list import UserListQueryBuilder
+from tracer.services.clickhouse.read_budget import is_read_budget_error
 from tracer.services.clickhouse.v2.id_remap_sql import (
     resolved_id_expr,
     survivor_map_subquery,
@@ -89,12 +90,15 @@ EXACT_GRAPH_MAX_BUCKETS_PER_PARTITION = 31
 EXACT_GRAPH_MEMBERSHIP_BATCH_SIZE = 1_000
 # Filtered trace graphs cannot retain tenant-wide per-trace membership state in
 # one ClickHouse query under the production memory envelope.  The background
-# refresh exhausts the exact trace-list cursor instead, then aggregates only
-# finite classified identity batches.  Neither value is a result ceiling.
+# refresh exhausts a necessary raw filter-witness cursor, classifies every
+# finite identity batch against latest state, then aggregates only proven trace
+# identities.  Neither value is a result ceiling.
 EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE = 200
+EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE = 10
 EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 100
-EXACT_GRAPH_TRACE_SELECTOR_PAGE_DEADLINE_MS = 120_000
 EXACT_GRAPH_TRACE_SELECTOR_QUERY_TIMEOUT_MS = 3_000
+EXACT_GRAPH_TRACE_INITIAL_SLICE = timedelta(minutes=5)
+EXACT_GRAPH_TRACE_MAX_SLICE = timedelta(days=2)
 EXACT_GRAPH_READ_SETTINGS = {
     "max_threads": 1,
     # Attribute maps are several KiB per row on the heaviest tenants.  Smaller
@@ -311,15 +315,21 @@ def _enumerate_exact_trace_ids(
     annotation_label_ids: tuple[str, ...] | None,
     started: float,
 ) -> tuple[list[str], int, int]:
-    """Exhaust exact cursor pages, failing before publication on any partial page.
+    """Exhaust raw witnesses and classify every candidate against latest state.
 
-    Each returned identity has passed the trace list's current-latest-state,
-    multi-filter classifier.  Page boundaries are canonical root
-    ``(start_time, trace_id)`` keysets.  De-duplication is defensive against a
-    merge/late arrival between statements; it is not presented as MVCC.
+    A positive any-span leaf is a necessary (not sufficient) membership
+    witness: every exact match must have at least one physical row that reaches
+    this cursor. Root-only and residual filter shapes seed roots instead. The
+    seed cursor is partitioned into adjacent half-open time slices and is
+    exhaustive within each slice; its rows never enter the result directly.
+    Every de-duplicated trace identity crosses the same latest-state,
+    multi-filter classifier used by trace lists. This avoids walking and
+    hydrating every public root merely to discover a selective attribute.
+
+    De-duplication is defensive against multiple matching sibling spans and a
+    merge/late arrival between statements; the read is not presented as MVCC.
+    Any seed or classifier failure aborts before publication.
     """
-
-    from tracer.selectors.trace_filter_reads import read_bounded_filter_page
 
     builder = TraceListQueryBuilderV2(
         project_id=str(project_id),
@@ -337,80 +347,181 @@ def _enumerate_exact_trace_ids(
             "Filtered trace graph membership cannot be evaluated exactly."
         )
 
+    request_start, request_end = builder.parse_time_range(filters)
+    if request_start >= request_end:
+        return [], 0, 0
+
     trace_ids: list[str] = []
-    seen_trace_ids: set[str] = set()
-    cursor_start_time: datetime | None = None
-    cursor_order_token: Any = None
+    seen_matched_trace_ids: set[str] = set()
+    seen_candidate_trace_ids: set[str] = set()
+    seen_seed_ids: set[Any] = set()
     query_count = 0
     rows_returned = 0
 
-    while True:
+    def remaining_statement_timeout_ms() -> int:
         remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
             (monotonic() - started) * 1000
         )
-        if remaining_ms < EXACT_GRAPH_TRACE_SELECTOR_QUERY_TIMEOUT_MS:
+        if remaining_ms < 25:
             raise ExactGraphReadError(
                 "Exact trace graph refresh exceeded its bounded deadline."
             )
-        page = read_bounded_filter_page(
-            builder=builder,
-            analytics=analytics,
-            filters=filters,
-            key_field="trace_id",
-            page_number=0,
-            page_size=EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE,
-            deadline_ms=min(
-                EXACT_GRAPH_TRACE_SELECTOR_PAGE_DEADLINE_MS,
-                remaining_ms,
-            ),
-            max_seed_attempts=128,
-            max_candidates=512,
-            max_query_count=128,
-            include_incomplete_rows=False,
-            cursor_start_time=cursor_start_time,
-            cursor_order_token=cursor_order_token,
-            bounded_continuation=False,
-            retry_wide_read_budget=True,
-            query_timeout_ms=EXACT_GRAPH_TRACE_SELECTOR_QUERY_TIMEOUT_MS,
-        )
-        query_count += int(page.query_count)
-        rows_returned += int(page.rows_returned)
-        if not page.complete:
-            raise ExactGraphReadError(
-                "Exact trace graph membership did not complete. Retry."
-            )
+        return min(EXACT_GRAPH_TRACE_SELECTOR_QUERY_TIMEOUT_MS, remaining_ms)
 
-        for row in page.rows:
-            trace_id = str(row.get("trace_id") or "")
-            if not trace_id:
-                raise ExactGraphReadError(
-                    "Exact trace graph membership returned an invalid identity."
-                )
-            if trace_id not in seen_trace_ids:
-                seen_trace_ids.add(trace_id)
-                trace_ids.append(trace_id)
+    def seed_key(row: dict[str, Any]) -> tuple[datetime, Any]:
+        seed_start_time = row.get("start_time")
+        if not isinstance(seed_start_time, datetime):
+            raise ExactGraphReadError(
+                "Exact trace graph witness returned an invalid checkpoint."
+            )
+        order_token = builder.bounded_filter_seed_order_token(row)
+        try:
+            hash(order_token)
+        except TypeError:
+            raise ExactGraphReadError(
+                "Exact trace graph witness returned an invalid checkpoint."
+            ) from None
+        return seed_start_time, order_token
 
-        if not page.has_more:
-            break
-        if not page.rows:
-            raise ExactGraphReadError(
-                "Exact trace graph cursor did not make forward progress."
-            )
-        last_row = page.rows[-1]
-        next_start_time = last_row.get("start_time")
-        next_order_token = builder.bounded_filter_row_order_token(last_row)
-        if not isinstance(next_start_time, datetime) or not next_order_token:
-            raise ExactGraphReadError(
-                "Exact trace graph cursor returned an invalid checkpoint."
-            )
-        if (next_start_time, next_order_token) == (
-            cursor_start_time,
-            cursor_order_token,
+    def classify(candidate_rows: list[dict[str, Any]]) -> None:
+        nonlocal query_count, rows_returned
+        for offset in range(
+            0, len(candidate_rows), EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE
         ):
-            raise ExactGraphReadError(
-                "Exact trace graph cursor did not make forward progress."
+            batch = candidate_rows[
+                offset : offset + EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE
+            ]
+            if not batch:
+                continue
+            candidate_ids = {str(row.get("trace_id") or "") for row in batch}
+            if "" in candidate_ids:
+                raise ExactGraphReadError(
+                    "Exact trace graph witness returned an invalid identity."
+                )
+            query, params = builder.build_filter_identity_match_query_from_seed_rows(
+                batch
             )
-        cursor_start_time, cursor_order_token = next_start_time, next_order_token
+            if not query:
+                raise ExactGraphReadError(
+                    "Exact trace graph classifier could not be constructed."
+                )
+            query_count += 1
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=remaining_statement_timeout_ms(),
+                settings={
+                    **EXACT_GRAPH_READ_SETTINGS,
+                    "max_result_rows": len(batch),
+                },
+            )
+            classified_rows = list(result.data or [])
+            rows_returned += len(classified_rows)
+            for row in classified_rows:
+                trace_id = str(row.get("trace_id") or "")
+                if not trace_id or trace_id not in candidate_ids:
+                    raise ExactGraphReadError(
+                        "Exact trace graph classifier returned an invalid identity."
+                    )
+                if trace_id not in seen_matched_trace_ids:
+                    seen_matched_trace_ids.add(trace_id)
+                    trace_ids.append(trace_id)
+
+    slice_end = request_end
+    slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, request_end - request_start)
+    while slice_end > request_start:
+        slice_start = max(request_start, slice_end - slice_width)
+        before_start_time: datetime | None = None
+        before_order_token: Any = None
+        retry_narrower = False
+
+        while True:
+            query, params = builder.build_filter_seed_page(
+                slice_start=slice_start,
+                slice_end=slice_end,
+                limit=EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE,
+                before_start_time=before_start_time,
+                before_id=before_order_token,
+            )
+            query_count += 1
+            try:
+                result = analytics.execute_ch_query(
+                    query,
+                    params,
+                    timeout_ms=remaining_statement_timeout_ms(),
+                    settings={
+                        **EXACT_GRAPH_READ_SETTINGS,
+                        "max_result_rows": EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE,
+                    },
+                )
+            except Exception as exc:
+                if (
+                    is_read_budget_error(exc)
+                    and slice_width > EXACT_GRAPH_TRACE_INITIAL_SLICE
+                ):
+                    # No raw row is publishable. Retrying the same upper bound
+                    # with a narrower half-open slice cannot create a gap; any
+                    # already classified duplicate is removed by trace identity.
+                    slice_width = max(
+                        EXACT_GRAPH_TRACE_INITIAL_SLICE, slice_width / 2
+                    )
+                    retry_narrower = True
+                    break
+                raise
+
+            seed_rows = sorted(result.data or [], key=seed_key, reverse=True)
+            rows_returned += len(seed_rows)
+            if len(seed_rows) > EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE:
+                raise ExactGraphReadError(
+                    "Exact trace graph witness exceeded its bounded page."
+                )
+
+            new_candidate_rows: list[dict[str, Any]] = []
+            for row in seed_rows:
+                trace_id = str(row.get("trace_id") or "")
+                if not trace_id:
+                    raise ExactGraphReadError(
+                        "Exact trace graph witness returned an invalid identity."
+                    )
+                seed_identity = builder.bounded_filter_seed_identity(row)
+                try:
+                    hash(seed_identity)
+                except TypeError:
+                    raise ExactGraphReadError(
+                        "Exact trace graph witness returned an invalid identity."
+                    ) from None
+                if seed_identity in seen_seed_ids:
+                    continue
+                seen_seed_ids.add(seed_identity)
+                if trace_id in seen_candidate_trace_ids:
+                    continue
+                seen_candidate_trace_ids.add(trace_id)
+                new_candidate_rows.append(row)
+
+            classify(new_candidate_rows)
+            if len(seed_rows) < EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE:
+                break
+            if not seed_rows:
+                raise ExactGraphReadError(
+                    "Exact trace graph witness cursor did not make forward progress."
+                )
+            next_start_time, next_order_token = seed_key(seed_rows[-1])
+            if (next_start_time, next_order_token) == (
+                before_start_time,
+                before_order_token,
+            ):
+                raise ExactGraphReadError(
+                    "Exact trace graph witness cursor did not make forward progress."
+                )
+            before_start_time, before_order_token = (
+                next_start_time,
+                next_order_token,
+            )
+
+        if retry_narrower:
+            continue
+        slice_end = slice_start
+        slice_width = min(slice_width * 2, EXACT_GRAPH_TRACE_MAX_SLICE)
 
     return trace_ids, query_count, rows_returned
 
