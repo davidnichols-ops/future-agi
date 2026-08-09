@@ -4879,6 +4879,128 @@ def test_filter_value_cursor_temporal_distinct_minimum_failure_keeps_original_fr
     assert read.rows == (AttributeValueRow("queued", "string", 1),)
 
 
+def test_filter_value_cursor_code_191_fallback_reanchors_page_n_checkpoint():
+    checkpoint_time = NOW - timedelta(minutes=30)
+    before_identity = (
+        PROJECT_A,
+        "trace-page-16",
+        "span-z-page-16",
+        checkpoint_time,
+    )
+    candidate = _candidate(
+        PROJECT_A,
+        "span-a-page-17",
+        trace_id=before_identity[1],
+        start_time=checkpoint_time,
+    )
+    executor = _value_cursor_executor(
+        [candidate],
+        {str(candidate["id"]): "queued"},
+    )
+    executor.distinct_responder = lambda *_args: ServerException(
+        "DB::Exception: Limit for rows to read exceeded: max rows: 2, "
+        "current rows: 5 (LIMIT_FOR_SET_SIZE_EXCEEDED)",
+        code=191,
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "fi.span.kind",
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_start=NOW - timedelta(hours=6),
+        before_identity=before_identity,
+        seen_value_digests=(attribute_value_cursor_digest("string", "completed"),),
+    )
+
+    distinct_calls = [
+        call for call in executor.calls if "distinct_limit" in call.params
+    ]
+    distinct_widths = [
+        timedelta(
+            microseconds=(
+                call.params["segment_end_us"] - call.params["segment_start_us"]
+            )
+        )
+        for call in distinct_calls
+    ]
+    candidate_call = next(
+        call for call in executor.calls if "segment_start" in call.params
+    )
+    assert distinct_widths[0] == timedelta(hours=6)
+    assert distinct_widths[-1] == ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT
+    assert all(call.params["distinct_limit"] == 2 for call in distinct_calls)
+    assert candidate_call.params["segment_start"] == checkpoint_time
+    assert candidate_call.params["segment_end"] == (
+        checkpoint_time + ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+    )
+    assert candidate_call.params["candidate_before_id"] == before_identity[2]
+    assert read.rows == (AttributeValueRow("queued", "string", 1),)
+
+
+def test_filter_value_cursor_distinct_reserve_fallback_reanchors_checkpoint(
+    monkeypatch,
+):
+    checkpoint_time = NOW - timedelta(minutes=15)
+    before_identity = (
+        PROJECT_A,
+        "trace-reserve-page",
+        "span-z-reserve-page",
+        checkpoint_time,
+    )
+    candidate = _candidate(
+        PROJECT_A,
+        "span-a-reserve-page",
+        trace_id=before_identity[1],
+        start_time=checkpoint_time,
+    )
+    executor = _value_cursor_executor(
+        [candidate],
+        {str(candidate["id"]): "queued"},
+    )
+    executor.distinct_responder = lambda *_args: ServerException(
+        "DB::Exception: Limit for rows to read exceeded: max rows: 2, "
+        "current rows: 5 (LIMIT_FOR_SET_SIZE_EXCEEDED)",
+        code=191,
+    )
+    # Admit one proof and exactly preserve the four-query unpinned fallback.
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.attribute_reads.ATTRIBUTE_READ_MAX_QUERY_COUNT",
+        5,
+    )
+
+    read = AttributeReadSelector(
+        executor, now=NOW, json_attribute_mode="arrays"
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "fi.span.kind",
+        page_size=1,
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+        segment_start=NOW - timedelta(minutes=20),
+        before_identity=before_identity,
+        seen_value_digests=(attribute_value_cursor_digest("string", "completed"),),
+    )
+
+    distinct_calls = [
+        call for call in executor.calls if "distinct_limit" in call.params
+    ]
+    candidate_call = next(
+        call for call in executor.calls if "segment_start" in call.params
+    )
+    assert len(distinct_calls) == 1
+    assert distinct_calls[0].params["distinct_limit"] == 2
+    assert candidate_call.params["segment_start"] == checkpoint_time
+    assert candidate_call.params["segment_end"] == checkpoint_time + timedelta(
+        minutes=10
+    )
+    assert candidate_call.params["candidate_before_id"] == before_identity[2]
+    assert read.rows == (AttributeValueRow("queued", "string", 1),)
+
+
 def test_filter_value_cursor_temporal_distinct_preserves_physical_fallback_budget():
     class ManualClock:
         value = 100.0

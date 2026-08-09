@@ -4341,6 +4341,25 @@ class AttributeReadSelector:
             candidate_limit = ATTRIBUTE_VALUE_CURSOR_CANDIDATE_LIMIT
             checkpoint_from_widened_segment = False
 
+        def narrow_physical_fallback(*, width: timedelta) -> None:
+            """Keep a bounded fallback and its keyset on the same frontier."""
+
+            nonlocal empty_segment_width
+            nonlocal max_empty_segment_width
+
+            fallback_width = min(width, current_segment_end - start)
+            max_empty_segment_width = min(
+                max_empty_segment_width,
+                fallback_width,
+            )
+            if cursor_before is not None:
+                anchor_checkpoint_window(
+                    cursor_before,
+                    width=fallback_width,
+                )
+            else:
+                empty_segment_width = fallback_width
+
         def value_candidate_predicate() -> tuple[
             str,
             dict[str, Any],
@@ -4572,13 +4591,8 @@ class AttributeReadSelector:
                     # the fallback reserve re-reading known duplicates.  With
                     # no proof yet, retain the original physical path.
                     if failed_distinct_ceiling is not None and not distinct_advanced:
-                        max_empty_segment_width = min(
-                            max_empty_segment_width,
-                            distinct_width,
-                        )
-                        empty_segment_width = min(
-                            distinct_width,
-                            current_segment_end - start,
+                        narrow_physical_fallback(
+                            width=distinct_width,
                         )
                     skip_physical_walk = distinct_advanced
                     break
@@ -4640,13 +4654,8 @@ class AttributeReadSelector:
                         # exact proof at this frontier has shown that even the
                         # minimum slice is dense, do not waste the remaining
                         # wall budget probing that stale wide width first.
-                        max_empty_segment_width = min(
-                            max_empty_segment_width,
-                            ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
-                        )
-                        empty_segment_width = min(
-                            ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
-                            current_segment_end - start,
+                        narrow_physical_fallback(
+                            width=ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT,
                         )
                     skip_physical_walk = distinct_advanced
                     break
