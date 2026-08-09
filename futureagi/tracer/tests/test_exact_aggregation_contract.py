@@ -2306,6 +2306,90 @@ def test_exact_trace_membership_finds_child_outside_root_window(monkeypatch):
 
 
 @pytest.mark.unit
+def test_exact_trace_membership_exhausts_200_identity_classifier_boundary(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=5)
+    checkpoint = request_end - timedelta(minutes=1)
+    ordered_ids = [f"trace-{index:030d}" for index in range(400, -1, -1)]
+    seed_pages = iter(
+        [
+            [
+                {"trace_id": trace_id, "start_time": checkpoint}
+                for trace_id in ordered_ids[:200]
+            ],
+            [
+                {"trace_id": trace_id, "start_time": checkpoint}
+                for trace_id in ordered_ids[200:400]
+            ],
+            [{"trace_id": ordered_ids[-1], "start_time": checkpoint}],
+        ]
+    )
+    classifier_batches = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def build_filter_seed_page(**_kwargs):
+            return "WITNESS", {}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            ids = tuple(row["trace_id"] for row in rows)
+            classifier_batches.append(ids)
+            return "CLASSIFY", {"ids": ids}
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(query, params, **_kwargs):
+            if query == "WITNESS":
+                return SimpleNamespace(data=next(seed_pages), columns=[])
+            return SimpleNamespace(
+                data=[{"trace_id": trace_id} for trace_id in params["ids"]],
+                columns=["trace_id"],
+            )
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert exact_module.EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE == 200
+    assert trace_ids == ordered_ids
+    assert [len(batch) for batch in classifier_batches] == [200, 200, 1]
+    assert query_count == 6
+    assert rows_returned == 802
+
+
+@pytest.mark.unit
 def test_exact_trace_membership_deduplicates_across_slices_and_classifies_latest_state(
     monkeypatch,
 ):

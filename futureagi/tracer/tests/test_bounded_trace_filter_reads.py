@@ -417,6 +417,34 @@ def test_exact_graph_any_span_witness_keeps_adjacent_child_and_root_time_contrac
     assert "candidate_end_date_us" in canonical_root
 
 
+def test_exact_graph_bulk_classifier_accepts_200_and_rejects_201_identities() -> None:
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+    )
+
+    rows = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index:030d}",
+            "start_time": END - timedelta(minutes=1),
+        }
+        for index in range(201)
+    ]
+    sql, params = builder.build_filter_identity_match_query_from_seed_rows(rows[:200])
+
+    assert len(params["candidate_trace_ids"]) == 200
+    # The production EXPLAIN gate separately measures the fully rendered SQL;
+    # this local guard ensures the builder payload stays comfortably below a
+    # conservative 64-KiB parser envelope before transport interpolation.
+    assert len((sql + repr(params)).encode()) < 64 * 1024
+    with pytest.raises(ValueError, match="candidate trace batch exceeds bounded limit"):
+        builder.build_filter_identity_match_query_from_seed_rows(rows)
+
+
 def test_org_user_trace_seed_is_remap_aware_scoped_and_cursor_ordered() -> None:
     project_b = "00000000-0000-4000-8000-000000000002"
     start = END - timedelta(days=180)

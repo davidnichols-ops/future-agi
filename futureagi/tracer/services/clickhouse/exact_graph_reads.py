@@ -94,7 +94,10 @@ EXACT_GRAPH_MEMBERSHIP_BATCH_SIZE = 1_000
 # finite identity batch against latest state, then aggregates only proven trace
 # identities.  Neither value is a result ceiling.
 EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE = 200
-EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE = 10
+# The bounded-bulk classifier enforces the same 200-identity ceiling. Using
+# that complete finite page avoids rescanning the adjacent-day partitions once
+# per ten traces (92 serial scans on the production dense-slice fixture).
+EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE = 200
 EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 100
 # Witness work runs only in the exact-snapshot background activity; public
 # graph polls never wait on an individual statement.  The Coletia incident
