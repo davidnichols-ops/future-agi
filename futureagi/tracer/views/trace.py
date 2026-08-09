@@ -6,7 +6,7 @@ import math
 import re
 import traceback
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -212,6 +212,7 @@ TRACE_LIST_READ_SETTINGS = {
     "result_overflow_mode": "throw",
     "timeout_overflow_mode": "throw",
 }
+_VOICE_CONTENT_MAX_QUERY_ATTEMPTS = 64
 TRACE_NAVIGATION_CANDIDATE_LIMIT = 4_095
 TRACE_NAVIGATION_SCAN_PAGE_SIZE = 200
 TRACE_NAVIGATION_MAX_QUERIES = 128
@@ -222,6 +223,35 @@ _OPTIONAL_USER_ENRICHMENT_ERROR_CODES = frozenset({497})
 
 class AnnotationScoreReadBoundExceeded(ReadDeadlineExceeded):
     """Exact annotation hydration cannot fit its bounded read contract."""
+
+
+class VoiceContentHydrationIncomplete(RuntimeError):
+    """Exact selected voice-root content could not be reconstructed."""
+
+
+def _voice_content_identity(
+    project_id: Any,
+    trace_id: Any,
+    span_id: Any,
+    start_time: Any,
+) -> tuple[str, str, str, int] | None:
+    """Normalize a physical root identity at DateTime64(6) precision."""
+
+    project = str(project_id or "")
+    trace = str(trace_id or "")
+    span = str(span_id or "")
+    if not project or not trace or not span or not isinstance(start_time, datetime):
+        return None
+    utc_start = (
+        start_time.replace(tzinfo=UTC)
+        if start_time.tzinfo is None
+        else start_time.astimezone(UTC)
+    )
+    delta = utc_start - datetime(1970, 1, 1, tzinfo=UTC)
+    epoch_microseconds = (
+        delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+    )
+    return project, trace, span, epoch_microseconds
 
 
 def _clickhouse_error_code(exc: Exception) -> int | None:
@@ -5688,10 +5718,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         span_ids = [
             str(row.get("root_span_id") or row.get("span_id") or "")
             for row in page_rows
-            if row.get("root_span_id") or row.get("span_id")
         ]
         attrs_map = {}
-        if span_ids:
+        if page_rows:
             root_identities = [
                 (
                     str(row.get("project_id") or project_id),
@@ -5701,16 +5730,42 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
                 for row in page_rows
             ]
-            hydrated_rows = []
+            normalized_root_identities = [
+                _voice_content_identity(*identity) for identity in root_identities
+            ]
+            if any(identity is None for identity in normalized_root_identities) or len(
+                set(normalized_root_identities)
+            ) != len(normalized_root_identities):
+                logger.warning(
+                    "voice_call_content_identity_invalid",
+                    project_id=str(project_id),
+                    page_number=page_number,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Voice call data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+
+            content_query_attempts = 0
             content_batch_size = 200
-            for batch_start in range(0, len(root_identities), content_batch_size):
-                batch_end = batch_start + content_batch_size
-                batch_identities = root_identities[batch_start:batch_end]
-                batch_span_ids = span_ids[batch_start:batch_end]
+
+            def hydrate_content_batch(
+                batch_identities: list[tuple[str, str, str, Any]],
+                batch_span_ids: list[str],
+            ) -> list[dict[str, Any]]:
+                """Hydrate exact roots, splitting only a CH memory failure."""
+
+                nonlocal content_query_attempts
+                if content_query_attempts >= _VOICE_CONTENT_MAX_QUERY_ATTEMPTS:
+                    raise ReadDeadlineExceeded(
+                        "voice content hydration query budget exceeded"
+                    )
                 attrs_query, attrs_params = builder.build_content_query(
                     batch_span_ids,
                     root_identities=batch_identities,
                 )
+                content_query_attempts += 1
                 try:
                     content_timeout_ms = read_deadline.remaining_ms(1_500)
                     attrs_result = analytics.execute_ch_query(
@@ -5719,43 +5774,105 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         timeout_ms=content_timeout_ms,
                         settings={
                             **page_read_settings,
-                            "max_result_rows": content_batch_size,
+                            "max_result_rows": len(batch_identities),
                             "result_overflow_mode": "throw",
                         },
                     )
                 except Exception as exc:
-                    if not is_read_budget_error(exc):
+                    if _clickhouse_error_code(exc) != 241 or len(batch_identities) == 1:
                         raise
-                    logger.warning(
-                        "voice_call_content_read_budget_exceeded",
-                        project_id=str(project_id),
-                        page_number=page_number,
+                    midpoint = len(batch_identities) // 2
+                    return hydrate_content_batch(
+                        batch_identities[:midpoint],
+                        batch_span_ids[:midpoint],
+                    ) + hydrate_content_batch(
+                        batch_identities[midpoint:],
+                        batch_span_ids[midpoint:],
                     )
-                    return self._gm.custom_error_response(
-                        status.HTTP_503_SERVICE_UNAVAILABLE,
-                        "Voice call data is temporarily unavailable. Please retry.",
-                        code="service_unavailable",
+
+                expected_identities = [
+                    _voice_content_identity(*identity) for identity in batch_identities
+                ]
+                actual_identities = [
+                    _voice_content_identity(
+                        row.get("project_id") or project_id,
+                        row.get("trace_id"),
+                        row.get("span_id"),
+                        row.get("start_time"),
                     )
-                if len(attrs_result.data) != len(batch_identities):
-                    logger.warning(
-                        "voice_call_content_replay_incomplete",
-                        project_id=str(project_id),
-                        page_number=page_number,
-                        expected_rows=len(batch_identities),
-                        actual_rows=len(attrs_result.data),
+                    for row in attrs_result.data
+                ]
+                if (
+                    any(identity is None for identity in expected_identities)
+                    or any(identity is None for identity in actual_identities)
+                    or len(set(expected_identities)) != len(expected_identities)
+                    or len(set(actual_identities)) != len(actual_identities)
+                    or set(actual_identities) != set(expected_identities)
+                ):
+                    raise VoiceContentHydrationIncomplete(
+                        "voice content hydration identity mismatch"
                     )
-                    return self._gm.custom_error_response(
-                        status.HTTP_503_SERVICE_UNAVAILABLE,
-                        "Voice call data is temporarily unavailable. Please retry.",
-                        code="service_unavailable",
+                return list(attrs_result.data)
+
+            try:
+                hydrated_rows = []
+                for batch_start in range(0, len(root_identities), content_batch_size):
+                    batch_end = batch_start + content_batch_size
+                    hydrated_rows.extend(
+                        hydrate_content_batch(
+                            root_identities[batch_start:batch_end],
+                            span_ids[batch_start:batch_end],
+                        )
                     )
-                hydrated_rows.extend(attrs_result.data)
+
+                hydrated_identities = [
+                    _voice_content_identity(
+                        row.get("project_id") or project_id,
+                        row.get("trace_id"),
+                        row.get("span_id"),
+                        row.get("start_time"),
+                    )
+                    for row in hydrated_rows
+                ]
+                if (
+                    any(identity is None for identity in hydrated_identities)
+                    or len(set(hydrated_identities)) != len(hydrated_identities)
+                    or set(hydrated_identities) != set(normalized_root_identities)
+                ):
+                    raise VoiceContentHydrationIncomplete(
+                        "voice content hydration global identity mismatch"
+                    )
+            except VoiceContentHydrationIncomplete:
+                logger.warning(
+                    "voice_call_content_replay_incomplete",
+                    project_id=str(project_id),
+                    page_number=page_number,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Voice call data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            except Exception as exc:
+                if not is_read_budget_error(exc):
+                    raise
+                logger.warning(
+                    "voice_call_content_read_budget_exceeded",
+                    project_id=str(project_id),
+                    page_number=page_number,
+                    error_code=_clickhouse_error_code(exc),
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Voice call data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
 
             for arow in hydrated_rows:
                 sid = str(arow.get("span_id", ""))
-                attr_identity = (
-                    str(arow.get("project_id") or project_id),
-                    str(arow.get("trace_id") or ""),
+                attr_identity = _voice_content_identity(
+                    arow.get("project_id") or project_id,
+                    arow.get("trace_id"),
                     sid,
                     arow.get("start_time"),
                 )
@@ -5873,8 +5990,8 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             provider = row.get("provider") or "vapi"
 
             # Get span_attributes from CH CDC table (Phase 1b)
-            attr_identity = (
-                str(row.get("project_id") or project_id),
+            attr_identity = _voice_content_identity(
+                row.get("project_id") or project_id,
                 trace_id,
                 span_id,
                 row.get("start_time"),

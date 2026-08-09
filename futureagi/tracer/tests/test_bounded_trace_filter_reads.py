@@ -7591,6 +7591,8 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
             {
                 "project_id": PROJECT_ID,
                 "trace_id": "trace-b",
+                "root_span_id": "root-b",
+                "span_id": "root-b",
                 "start_time": first_started,
                 "end_time": first_started + timedelta(seconds=5),
             }
@@ -7611,6 +7613,8 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
             {
                 "project_id": PROJECT_ID,
                 "trace_id": "trace-a",
+                "root_span_id": "root-a",
+                "span_id": "root-a",
                 "start_time": second_started,
                 "end_time": second_started + timedelta(seconds=5),
             }
@@ -7628,6 +7632,35 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
     )
     view = TraceView.__new__(TraceView)
     analytics = mock.MagicMock()
+    cursor_rows_by_span_id = {
+        row["span_id"]: row for row in [*first_page.rows, *terminal_page.rows]
+    }
+
+    def hydrate_cursor_page(_query, params, **_kwargs):
+        hydrated = []
+        for span_id in params["content_span_ids"]:
+            selected = cursor_rows_by_span_id[span_id]
+            hydrated.append(
+                {
+                    "project_id": selected["project_id"],
+                    "trace_id": selected["trace_id"],
+                    "span_id": span_id,
+                    "start_time": selected["start_time"],
+                    "span_attributes": "{}",
+                    "attrs_string": {},
+                    "attrs_number": {},
+                    "attrs_bool": {},
+                    "provider": "vapi",
+                }
+            )
+        return QueryResult(
+            data=hydrated,
+            row_count=len(hydrated),
+            backend_used="clickhouse",
+            query_time_ms=1.0,
+        )
+
+    analytics.execute_ch_query.side_effect = hydrate_cursor_page
     request_query = {"cursor_mode": "true"}
     initial_data = {
         "filters": [_time_filter()],
@@ -8131,10 +8164,340 @@ def test_voice_page_size_500_hydrates_content_in_bounded_batches() -> None:
         len(call.args[1]["content_root_identities"])
         for call in analytics.execute_ch_query.call_args_list
     ] == [200, 200, 100]
-    assert all(
-        call.kwargs["settings"]["max_result_rows"] == 200
+    assert [
+        call.kwargs["settings"]["max_result_rows"]
         for call in analytics.execute_ch_query.call_args_list
+    ] == [200, 200, 100]
+
+
+def _voice_hydration_rows(count: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index:03d}",
+            "root_span_id": f"root-{index:03d}",
+            "span_id": f"root-{index:03d}",
+            "start_time": END - timedelta(microseconds=index + 1),
+            "end_time": END - timedelta(microseconds=index),
+            "provider": "vapi",
+        }
+        for index in range(count)
+    ]
+
+
+def _run_voice_hydration_case(
+    page_rows: list[dict[str, Any]],
+    hydrate_side_effect: Any,
+) -> tuple[Any, mock.MagicMock, mock.MagicMock]:
+    from tracer.views.trace import TraceView
+
+    bounded_page = BoundedFilterPage(
+        rows=page_rows,
+        has_more=False,
+        complete=True,
+        status="complete",
+        error_code=None,
+        total_rows_lower_bound=len(page_rows),
+        elapsed_ms=100.0,
+        query_count=2,
+        rows_returned=len(page_rows),
+        result_payload_bytes=512,
+        attempts=(),
     )
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.side_effect = hydrate_side_effect
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.views.trace.ObservabilityService.process_raw_logs",
+            return_value={"status": "completed"},
+        ) as process_raw_logs,
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded_page,
+        ),
+    ):
+        response = view._list_voice_calls_clickhouse(
+            _observe_trace_request({"cursor_mode": "true"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [_time_filter()],
+                "page": 1,
+                "page_size": max(25, len(page_rows)),
+                "cursor_mode": True,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+    return response, analytics, process_raw_logs
+
+
+def test_voice_content_hydration_rejects_mixed_missing_root_identity() -> None:
+    page_rows = _voice_hydration_rows(2)
+    page_rows[1].pop("root_span_id")
+    page_rows[1].pop("span_id")
+
+    response, analytics, process_raw_logs = _run_voice_hydration_case(
+        page_rows,
+        AssertionError("hydration must not run for an incomplete identity"),
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    analytics.execute_ch_query.assert_not_called()
+    process_raw_logs.assert_not_called()
+
+
+def test_voice_content_hydration_recursively_splits_only_code241_exactly() -> None:
+    page_rows = _voice_hydration_rows(6)
+    row_by_span_id = {row["span_id"]: row for row in page_rows}
+    attempted_batch_sizes = []
+
+    def hydrate(_query, params, **kwargs):
+        span_ids = list(params["content_span_ids"])
+        attempted_batch_sizes.append(len(span_ids))
+        assert kwargs["settings"]["max_block_size"] == 8_192
+        assert "preferred_max_column_in_block_size_bytes" not in kwargs["settings"]
+        if len(span_ids) > 1:
+            raise ReadDeadlineExceeded("Code: 241. Memory limit exceeded")
+        selected = row_by_span_id[span_ids[0]]
+        return QueryResult(
+            data=[
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": selected["trace_id"],
+                    "span_id": selected["span_id"],
+                    "start_time": selected["start_time"],
+                    "span_attributes": f'{{"marker":"{selected["span_id"]}"}}',
+                    "attrs_string": {},
+                    "attrs_number": {},
+                    "attrs_bool": {},
+                    "provider": "vapi",
+                }
+            ],
+            row_count=1,
+            backend_used="clickhouse",
+            query_time_ms=25.0,
+        )
+
+    response, analytics, process_raw_logs = _run_voice_hydration_case(
+        page_rows, hydrate
+    )
+
+    assert response.status_code == 200
+    assert [row["trace_id"] for row in response.data["results"]] == [
+        row["trace_id"] for row in page_rows
+    ]
+    assert [row["marker"] for row in response.data["results"]] == [
+        row["span_id"] for row in page_rows
+    ]
+    assert attempted_batch_sizes == [6, 3, 1, 2, 1, 1, 3, 1, 2, 1, 1]
+    assert analytics.execute_ch_query.call_count == 11
+    assert process_raw_logs.call_count == 6
+
+
+@pytest.mark.parametrize("mismatch", ["duplicate_missing", "unrequested"])
+def test_voice_content_hydration_rejects_equal_count_identity_mismatch(
+    mismatch: str,
+) -> None:
+    page_rows = _voice_hydration_rows(2)
+
+    def hydrate(_query, _params, **_kwargs):
+        first = page_rows[0]
+        second = page_rows[1]
+        returned = (
+            [first, first] if mismatch == "duplicate_missing" else [first, second]
+        )
+        if mismatch == "unrequested":
+            returned = [
+                first,
+                {
+                    **second,
+                    "trace_id": "trace-unrequested",
+                    "span_id": "root-unrequested",
+                },
+            ]
+        return QueryResult(
+            data=[
+                {
+                    "project_id": row["project_id"],
+                    "trace_id": row["trace_id"],
+                    "span_id": row["span_id"],
+                    "start_time": row["start_time"],
+                    "span_attributes": "{}",
+                    "attrs_string": {},
+                    "attrs_number": {},
+                    "attrs_bool": {},
+                    "provider": "vapi",
+                }
+                for row in returned
+            ],
+            row_count=2,
+            backend_used="clickhouse",
+            query_time_ms=25.0,
+        )
+
+    response, analytics, process_raw_logs = _run_voice_hydration_case(
+        page_rows, hydrate
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    analytics.execute_ch_query.assert_called_once()
+    process_raw_logs.assert_not_called()
+
+
+def test_voice_content_hydration_does_not_split_a_later_timeout() -> None:
+    page_rows = _voice_hydration_rows(6)
+    attempted_batch_sizes = []
+
+    def hydrate(_query, params, **_kwargs):
+        attempted_batch_sizes.append(len(params["content_span_ids"]))
+        if len(attempted_batch_sizes) == 1:
+            raise ReadDeadlineExceeded("Code: 241. Memory limit exceeded")
+        raise ReadDeadlineExceeded("read deadline exceeded")
+
+    response, analytics, process_raw_logs = _run_voice_hydration_case(
+        page_rows, hydrate
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert attempted_batch_sizes == [6, 3]
+    assert analytics.execute_ch_query.call_count == 2
+    process_raw_logs.assert_not_called()
+
+
+def test_voice_content_hydration_attempt_cap_is_atomic() -> None:
+    page_rows = _voice_hydration_rows(33)
+    row_by_span_id = {row["span_id"]: row for row in page_rows}
+
+    def hydrate(_query, params, **_kwargs):
+        span_ids = list(params["content_span_ids"])
+        if len(span_ids) > 1:
+            raise ReadDeadlineExceeded("Code: 241. Memory limit exceeded")
+        selected = row_by_span_id[span_ids[0]]
+        return QueryResult(
+            data=[
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": selected["trace_id"],
+                    "span_id": selected["span_id"],
+                    "start_time": selected["start_time"],
+                    "span_attributes": "{}",
+                    "attrs_string": {},
+                    "attrs_number": {},
+                    "attrs_bool": {},
+                    "provider": "vapi",
+                }
+            ],
+            row_count=1,
+            backend_used="clickhouse",
+            query_time_ms=25.0,
+        )
+
+    response, analytics, process_raw_logs = _run_voice_hydration_case(
+        page_rows, hydrate
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    assert analytics.execute_ch_query.call_count == 64
+    process_raw_logs.assert_not_called()
+
+
+def test_voice_content_identity_normalizes_naive_and_aware_utc() -> None:
+    from tracer.views.trace import _voice_content_identity
+
+    naive = datetime(2026, 6, 7, 12, 34, 56, 789012)
+    aware = naive.replace(tzinfo=UTC)
+
+    assert _voice_content_identity(PROJECT_ID, "trace", "span", naive) == (
+        _voice_content_identity(PROJECT_ID, "trace", "span", aware)
+    )
+
+
+def test_voice_content_hydration_budget_failure_is_atomic_and_sanitized() -> None:
+    from tracer.views.trace import TraceView
+
+    started = END - timedelta(minutes=1)
+    bounded_page = BoundedFilterPage(
+        rows=[
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": "trace-a",
+                "root_span_id": "root-a",
+                "span_id": "root-a",
+                "start_time": started,
+                "end_time": started + timedelta(seconds=12),
+                "provider": "vapi",
+            }
+        ],
+        has_more=True,
+        complete=True,
+        status="complete",
+        error_code=None,
+        total_rows_lower_bound=2,
+        elapsed_ms=1_000.0,
+        query_count=4,
+        rows_returned=1,
+        result_payload_bytes=256,
+        attempts=(),
+    )
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.side_effect = ReadDeadlineExceeded(
+        "Code: 241. Memory limit exceeded; secret-host.internal"
+    )
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded_page,
+        ),
+    ):
+        response = view._list_voice_calls_clickhouse(
+            _observe_trace_request({"cursor_mode": "true"}),
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [_time_filter()],
+                "page": 1,
+                "page_size": 25,
+                "cursor_mode": True,
+            },
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert response == (
+        "error",
+        (503, "Voice call data is temporarily unavailable. Please retry."),
+        {"code": "service_unavailable"},
+    )
+    assert "secret-host" not in str(response)
+    analytics.execute_ch_query.assert_called_once()
 
 
 @pytest.mark.parametrize(
