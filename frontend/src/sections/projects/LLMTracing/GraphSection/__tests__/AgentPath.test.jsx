@@ -4,6 +4,13 @@ import { describe, expect, it } from "vitest";
 import AgentPath from "../AgentPath";
 
 describe("AgentPath failure state", () => {
+  it("shows loading before validating absent pending data", () => {
+    render(<AgentPath data={undefined} isLoading isError={false} />);
+
+    expect(screen.getByRole("progressbar")).toBeInTheDocument();
+    expect(screen.getByText("Loading graph data…")).toBeInTheDocument();
+  });
+
   it("shows a sanitized retry message instead of a false empty state", () => {
     render(<AgentPath data={undefined} isLoading={false} isError />);
 

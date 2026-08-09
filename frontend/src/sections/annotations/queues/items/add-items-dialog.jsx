@@ -63,6 +63,7 @@ import DateRangePill, {
 import FilterChips from "src/sections/projects/LLMTracing/FilterChips";
 import TraceFilterPanel from "src/sections/projects/LLMTracing/TraceFilterPanel";
 import { apiPath } from "src/api/contracts/api-surface";
+import { ModelHubDevelopsGetDatasetTableListResponse } from "src/generated/api-contracts/api.zod";
 import { useDashboardFilterValues } from "src/hooks/useDashboards";
 import {
   getPickerOptionLabel,
@@ -101,6 +102,21 @@ import {
   ExactSelectorContinuationNotice,
   useExactSelectorDataSource,
 } from "./exact-selector-pagination";
+import {
+  parseSessionSelectorPage,
+  parseSpanSelectorPage,
+  parseTraceSelectorPage,
+  sessionSelectorMetadataFromResponse,
+  sessionSelectorRowIdentity,
+  sessionSelectorRowsFromResponse,
+  spanSelectorMetadataFromResponse,
+  spanSelectorRowIdentity,
+  spanSelectorRowsFromResponse,
+  traceSelectorMetadataFromResponse,
+  traceSelectorRowIdentity,
+  traceSelectorRowsFromResponse,
+} from "./telemetry-selector-contract";
+import { spanSourceIdsFromPhysicalRowIds } from "src/sections/projects/LLMTracing/spanPhysicalIdentity";
 
 const panelFilterToApi = (panel) =>
   panelFilterToApiBase(panel, { includeMeta: true });
@@ -193,20 +209,6 @@ const createEmptyVoiceSelectionMeta = () => ({
   totalMatching: null,
   totalMatchingIsLowerBound: false,
 });
-
-const selectorRowsFromResponse = (response) =>
-  response?.data?.result?.table || [];
-const selectorMetadataFromResponse = (response) =>
-  response?.data?.result?.metadata || {};
-const traceSelectorRowIdentity = (row) => row?.trace_id || row?.traceId || null;
-const spanSelectorRowIdentity = (row) => {
-  const spanId = row?.span_id || row?.spanId || row?.id;
-  return spanId
-    ? `${row?.trace_id || row?.traceId || ""}:${spanId}:${row?.start_time || ""}`
-    : null;
-};
-const sessionSelectorRowIdentity = (row) =>
-  row?.session_id || row?.sessionId || row?.id || null;
 
 export const getSelectorPageTotalState = (metadata, loadedLowerBound) => {
   const totalState = getListTotalState(metadata);
@@ -527,6 +529,34 @@ export function buildSimulationSelectorFilterFields(columnOrder = []) {
 // ---------------------------------------------------------------------------
 const MAX_PAGINATION_PAGES = 100;
 
+export const assertExactEnumerationComplete = ({ hasMore, sourceLabel }) => {
+  if (!hasMore) return;
+  throw new Error(
+    `All matching ${sourceLabel} could not be resolved safely. Narrow the filters and retry.`,
+  );
+};
+
+const parseDatasetEnumerationPage = (response) => {
+  const parsed = ModelHubDevelopsGetDatasetTableListResponse.parse(
+    response?.data,
+  );
+  if (parsed.status !== true) {
+    throw new Error("Dataset list response was not successful");
+  }
+  const result = parsed.result;
+  if (!Array.isArray(result.table)) {
+    throw new Error("Dataset list response is missing table rows");
+  }
+  if (
+    !result.metadata ||
+    !Number.isInteger(result.metadata.total_rows) ||
+    result.metadata.total_rows < 0
+  ) {
+    throw new Error("Dataset list response is missing an exact row count");
+  }
+  return { rows: result.table, totalRows: result.metadata.total_rows };
+};
+
 async function fetchAllDatasetRowIds(
   queryClient,
   datasetId,
@@ -551,113 +581,29 @@ async function fetchAllDatasetRowIds(
       { enabled: true, staleTime: 30000, pageSize: DATASET_ROWS_LIMIT },
     );
     const data = await queryClient.fetchQuery(queryOptions);
-    const rows = data?.data?.result?.table ?? [];
-    const totalRows = data?.data?.result?.metadata?.total_rows ?? 0;
+    const { rows, totalRows } = parseDatasetEnumerationPage(data);
 
     rows.forEach((row) => {
-      if (row.row_id && !excludedIds.has(row.row_id)) {
+      if (typeof row?.row_id !== "string" || row.row_id.length === 0) {
+        throw new Error("Dataset list returned a row without an identity");
+      }
+      if (!excludedIds.has(row.row_id)) {
         allIds.push(row.row_id);
       }
     });
 
     page += 1;
     hasMore = page * DATASET_ROWS_LIMIT < totalRows;
+    if (hasMore && rows.length === 0) {
+      throw new Error("Dataset list pagination did not make progress");
+    }
   }
 
+  assertExactEnumerationComplete({ hasMore, sourceLabel: "dataset rows" });
   return allIds;
 }
 
 const SPAN_ROWS_LIMIT = 20;
-
-// ---------------------------------------------------------------------------
-// Fetch all trace IDs / span IDs matching the current filters, paginating
-// through the list endpoints. Mirrors fetchAllDatasetRowIds — used by the
-// selectAll enumeration path when the backend filter-mode resolver isn't
-// available for a source type.
-// ---------------------------------------------------------------------------
-async function fetchAllTraceIds(
-  projectId,
-  excludedIds,
-  filters,
-  projectVersionId,
-) {
-  const serializedFilters = JSON.stringify(filters || []);
-  const allIds = [];
-  const excluded = excludedIds || new Set();
-  let page = 0;
-  let hasMore = true;
-
-  while (hasMore && page < MAX_PAGINATION_PAGES) {
-    const resp = await axios.get(endpoints.project.getTraceList(), {
-      params: {
-        project: projectId,
-        project_version_id: projectVersionId,
-        page_number: page,
-        page_size: TRACE_ROWS_LIMIT,
-        filters: serializedFilters,
-      },
-    });
-    const res = resp?.data?.result;
-    const rows = res?.table ?? [];
-    const metadata = res?.metadata ?? {};
-    const totalRows = metadata.totalRows ?? metadata.total_rows ?? 0;
-
-    rows.forEach((row) => {
-      const id = row.rowId || row.trace_id || row.id;
-      if (id && !excluded.has(id)) allIds.push(id);
-    });
-
-    page += 1;
-    hasMore =
-      metadata.has_more ??
-      metadata.hasMore ??
-      page * TRACE_ROWS_LIMIT < totalRows;
-  }
-
-  return allIds;
-}
-
-async function fetchAllSpanIds(
-  projectId,
-  excludedIds,
-  filters,
-  projectVersionId,
-) {
-  const serializedFilters = JSON.stringify(filters || []);
-  const allIds = [];
-  const excluded = excludedIds || new Set();
-  let page = 0;
-  let hasMore = true;
-
-  while (hasMore && page < MAX_PAGINATION_PAGES) {
-    const resp = await axios.get(endpoints.project.getSpanList(), {
-      params: {
-        project: projectId,
-        project_version_id: projectVersionId,
-        page_number: page,
-        page_size: SPAN_ROWS_LIMIT,
-        filters: serializedFilters,
-      },
-    });
-    const res = resp?.data?.result;
-    const rows = res?.table ?? [];
-    const metadata = res?.metadata ?? {};
-    const totalRows = metadata.totalRows ?? metadata.total_rows ?? 0;
-
-    rows.forEach((row) => {
-      const id = row.rowId || row.span_id || row.id;
-      if (id && !excluded.has(id)) allIds.push(id);
-    });
-
-    page += 1;
-    hasMore =
-      metadata.has_more ??
-      metadata.hasMore ??
-      page * SPAN_ROWS_LIMIT < totalRows;
-  }
-
-  return allIds;
-}
 
 // ---------------------------------------------------------------------------
 // Main component – Drawer-based
@@ -726,6 +672,12 @@ export default function AddItemsDialog({ open, onClose, queueId, queue }) {
           sourceType === "call_execution");
 
       if (isBackendFilterMode) {
+        const excludedIds =
+          sourceType === "observation_span"
+            ? spanSourceIdsFromPhysicalRowIds(
+                Array.from(selectAllInfo.excludedIds || []),
+              )
+            : Array.from(selectAllInfo.excludedIds || []);
         addItems(
           {
             queueId,
@@ -734,7 +686,7 @@ export default function AddItemsDialog({ open, onClose, queueId, queue }) {
               source_type: sourceType,
               project_id: selectAllInfo.projectId,
               filter: selectAllInfo.filters || [],
-              exclude_ids: Array.from(selectAllInfo.excludedIds || []),
+              exclude_ids: excludedIds,
               ...(sourceType === "trace" && isVoiceTraceSelection
                 ? { is_voice_call: true }
                 : {}),
@@ -757,67 +709,35 @@ export default function AddItemsDialog({ open, onClose, queueId, queue }) {
 
       let itemsToAdd;
       if (selectionMode === "selectAll" && selectAllInfo) {
-        // Dataset-row selectAll still enumerates client-side — no backend
-        // filter-mode resolver for datasets yet.
+        // Every telemetry source was handled by backend filter mode above.
+        // Dataset rows still need client-side enumeration; that enumerator
+        // fails closed if it cannot prove it reached the terminal page.
+        if (sourceType !== "dataset_row") {
+          throw new Error("This selection cannot be resolved exactly");
+        }
         setIsResolving(true);
         try {
-          let allIds;
-          if (sourceType === "dataset_row") {
-            allIds = await fetchAllDatasetRowIds(
-              queryClient,
-              selectAllInfo.datasetId,
-              selectAllInfo.excludedIds,
-              selectAllInfo.filters,
-              selectAllInfo.search,
-            );
-            itemsToAdd = allIds.map((id) => ({
-              source_type: "dataset_row",
-              source_id: id,
-            }));
-          } else if (sourceType === "observation_span") {
-            allIds = await fetchAllSpanIds(
-              selectAllInfo.projectId,
-              selectAllInfo.excludedIds,
-              selectAllInfo.filters,
-              selectAllInfo.projectVersionId,
-            );
-            itemsToAdd = allIds.map((id) => ({
-              source_type: "observation_span",
-              source_id: id,
-            }));
-          } else {
-            // sourceType === "trace": fetch trace IDs then convert to root spans
-            const traceIds = await fetchAllTraceIds(
-              selectAllInfo.projectId,
-              selectAllInfo.excludedIds,
-              selectAllInfo.filters,
-              selectAllInfo.projectVersionId,
-            );
-            const rootSpanMap = await fetchRootSpans(
-              traceIds,
-              selectAllInfo.projectId ? [selectAllInfo.projectId] : [],
-            );
-            const mappedIds = traceIds
-              .map((traceId) => rootSpanMap[traceId])
-              .filter(Boolean);
-            const droppedCount = traceIds.length - mappedIds.length;
-            if (droppedCount > 0) {
-              enqueueSnackbar(
-                `${droppedCount} trace${droppedCount !== 1 ? "s" : ""} skipped — no root span found yet`,
-                { variant: "warning" },
-              );
-            }
-            itemsToAdd = mappedIds.map((id) => ({
-              source_type: "observation_span",
-              source_id: id,
-            }));
-          }
+          const allIds = await fetchAllDatasetRowIds(
+            queryClient,
+            selectAllInfo.datasetId,
+            selectAllInfo.excludedIds,
+            selectAllInfo.filters,
+            selectAllInfo.search,
+          );
+          itemsToAdd = allIds.map((id) => ({
+            source_type: "dataset_row",
+            source_id: id,
+          }));
         } finally {
           setIsResolving(false);
         }
       } else {
         let ids = Array.from(selectedIds);
         let effectiveSourceType = sourceType;
+
+        if (sourceType === "observation_span") {
+          ids = spanSourceIdsFromPhysicalRowIds(ids);
+        }
 
         // Voice/simulator projects keep `source_type: "trace"` — matches
         // the "Add to queue" flow on the voice observability page so the
@@ -2164,7 +2084,7 @@ function TraceSelector({
   const onTracePageLoaded = useCallback((exactPage, params) => {
     setTraceReadFailed(false);
     const newColumns = normalizeConfigKeys(
-      exactPage.response?.data?.result?.config,
+      parseTraceSelectorPage(exactPage.response).config,
     );
     if (newColumns) {
       setColumns((previous) =>
@@ -2185,8 +2105,8 @@ function TraceSelector({
     targetRowCount: TRACE_ROWS_LIMIT,
     getBaseParams: getTraceBaseParams,
     request: requestTracePage,
-    rowsFromResponse: selectorRowsFromResponse,
-    metadataFromResponse: selectorMetadataFromResponse,
+    rowsFromResponse: traceSelectorRowsFromResponse,
+    metadataFromResponse: traceSelectorMetadataFromResponse,
     rowIdentity: traceSelectorRowIdentity,
     onPageLoaded: onTracePageLoaded,
     onFailure: onTracePageFailure,
@@ -2882,7 +2802,7 @@ function SpanSelector({ onSetSelection, onSelectAll }) {
   const onSpanPageLoaded = useCallback((exactPage, params) => {
     setSpanReadFailed(false);
     const newColumns = normalizeConfigKeys(
-      exactPage.response?.data?.result?.config,
+      parseSpanSelectorPage(exactPage.response).config,
     );
     if (newColumns) {
       setColumns((previous) =>
@@ -2903,8 +2823,8 @@ function SpanSelector({ onSetSelection, onSelectAll }) {
     targetRowCount: SPAN_ROWS_LIMIT,
     getBaseParams: getSpanBaseParams,
     request: requestSpanPage,
-    rowsFromResponse: selectorRowsFromResponse,
-    metadataFromResponse: selectorMetadataFromResponse,
+    rowsFromResponse: spanSelectorRowsFromResponse,
+    metadataFromResponse: spanSelectorMetadataFromResponse,
     rowIdentity: spanSelectorRowIdentity,
     onPageLoaded: onSpanPageLoaded,
     onFailure: onSpanPageFailure,
@@ -3006,7 +2926,7 @@ function SpanSelector({ onSetSelection, onSelectAll }) {
         const visibleRowIds = [];
         const rendered = event.api.getRenderedNodes?.() || [];
         rendered.forEach((node) => {
-          const rowId = node?.data?.span_id ?? node?.data?.spanId ?? node?.id;
+          const rowId = spanSelectorRowIdentity(node?.data);
           if (rowId && !excludedIds.has(rowId)) visibleRowIds.push(rowId);
         });
         const totalState = getSelectorSelectAllTotalState(
@@ -3347,7 +3267,7 @@ function SpanSelector({ onSetSelection, onSelectAll }) {
               onGridReady={onGridReady}
               onSelectionChanged={onSelectionChanged}
               context={{ disableCellNavigation: true }}
-              getRowId={(d) => d?.data?.span_id ?? d?.data?.spanId}
+              getRowId={(d) => spanSelectorRowIdentity(d?.data)}
               animateRows={false}
               blockLoadDebounceMillis={300}
             />
@@ -3494,7 +3414,7 @@ function SessionSelector({ onSetSelection, onSelectAll }) {
   const onSessionPageLoaded = useCallback((exactPage, params) => {
     setSessionReadFailed(false);
     const newColumns = normalizeConfigKeys(
-      exactPage.response?.data?.result?.config,
+      parseSessionSelectorPage(exactPage.response).config,
     );
     if (newColumns) {
       setColumns((previous) =>
@@ -3515,8 +3435,8 @@ function SessionSelector({ onSetSelection, onSelectAll }) {
     targetRowCount: SESSION_ROWS_LIMIT,
     getBaseParams: getSessionBaseParams,
     request: requestSessionPage,
-    rowsFromResponse: selectorRowsFromResponse,
-    metadataFromResponse: selectorMetadataFromResponse,
+    rowsFromResponse: sessionSelectorRowsFromResponse,
+    metadataFromResponse: sessionSelectorMetadataFromResponse,
     rowIdentity: sessionSelectorRowIdentity,
     onPageLoaded: onSessionPageLoaded,
     onFailure: onSessionPageFailure,

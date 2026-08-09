@@ -23,7 +23,7 @@ import { useGetTraceDetail } from "src/api/project/trace-detail";
 import { useErrorFeedOverview } from "src/api/errorFeed/error-feed";
 import EvalIOPanel from "./EvalIOPanel";
 import VoiceEvalPanel from "./VoiceEvalPanel";
-import { buildGraphDiff } from "./buildGraphDiff";
+import { buildGraphDiff, comparisonGraphForMode } from "./buildGraphDiff";
 import { useErrorFeedStore } from "../store";
 import { TOKEN_PRICE_USD, TRACE_STATUS } from "../constants";
 
@@ -1062,6 +1062,16 @@ function TraceGraphCompare({ failingTraceId, workingTraceId, mode }) {
 
   const failLoading = !!failingTraceId && failQ.isLoading && !failQ.data;
   const passLoading = !!workingTraceId && passQ.isLoading && !passQ.data;
+  const failRenderGraph = comparisonGraphForMode(
+    mode,
+    failGraph,
+    failAnnotated,
+  );
+  const passRenderGraph = comparisonGraphForMode(
+    mode,
+    passGraph,
+    passAnnotated,
+  );
 
   const NoWorkingNotice = !workingTraceId && (
     <Box
@@ -1144,14 +1154,14 @@ function TraceGraphCompare({ failingTraceId, workingTraceId, mode }) {
           accentColor="#DB2F2D"
           traceShortId={failingTraceId ? failingTraceId.slice(0, 8) : null}
         >
-          {renderSide(failAnnotated, failLoading, "failing trace")}
+          {renderSide(failRenderGraph, failLoading, "failing trace")}
         </CompareColumn>
         <CompareColumn
           title="Working trace"
           accentColor="#5ACE6D"
           traceShortId={workingTraceId ? workingTraceId.slice(0, 8) : null}
         >
-          {renderSide(passAnnotated, passLoading, "working trace")}
+          {renderSide(passRenderGraph, passLoading, "working trace")}
         </CompareColumn>
       </Box>
     </Stack>

@@ -209,7 +209,10 @@ const AgentPathInner = ({
   const [isHovering, setIsHovering] = useState(false);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [zoom, setZoom] = useState(1);
-  const layout = useMemo(() => computeSankeyLayout(data), [data]);
+  const layout = useMemo(
+    () => (isLoading || isError || !data ? null : computeSankeyLayout(data)),
+    [data, isError, isLoading],
+  );
   const natural = useMemo(() => computeNaturalSize(layout), [layout]);
 
   useEffect(() => {

@@ -12,6 +12,13 @@ const nodes = [
   { id: "llm:answer", name: "answer", type: "llm", span_count: 2 },
 ];
 
+const pathEdge = (source, target, transitionCount = 1, patch = {}) => ({
+  source,
+  target,
+  transition_count: transitionCount,
+  ...patch,
+});
+
 describe("computeSankeyLayout Agent Path contract", () => {
   const rankOf = (layout, nodeId) =>
     layout.columns.find((column) =>
@@ -51,26 +58,33 @@ describe("computeSankeyLayout Agent Path contract", () => {
     expect(layout.columns.flatMap((column) => column.nodes)).toHaveLength(3);
   });
 
-  it("accepts camelCase pathEdges during generated-client normalization", () => {
-    const layout = computeSankeyLayout({
-      nodes,
-      pathEdges: [
-        { source: "agent:root", target: "llm:answer", transitionCount: 2 },
-      ],
-    });
+  it("rejects a legacy or missing path projection", () => {
+    expect(() =>
+      computeSankeyLayout({
+        nodes,
+        pathEdges: [
+          { source: "agent:root", target: "llm:answer", transitionCount: 2 },
+        ],
+      }),
+    ).toThrow("missing canonical path_edges");
+  });
 
-    expect(layout.flows[0]).toEqual(
-      expect.objectContaining({ count: 2, target: "llm:answer" }),
-    );
+  it("rejects a path edge that references an unknown node", () => {
+    expect(() =>
+      computeSankeyLayout({
+        nodes,
+        path_edges: [pathEdge("agent:root", "tool:missing")],
+      }),
+    ).toThrow("references an unknown node");
   });
 
   it("uses longest DAG rank when paths converge", () => {
     const layout = computeSankeyLayout({
       nodes,
       path_edges: [
-        { source: "agent:root", target: "llm:answer" },
-        { source: "agent:root", target: "tool:lookup" },
-        { source: "tool:lookup", target: "llm:answer" },
+        pathEdge("agent:root", "llm:answer"),
+        pathEdge("agent:root", "tool:lookup"),
+        pathEdge("tool:lookup", "llm:answer"),
       ],
     });
 
@@ -83,9 +97,9 @@ describe("computeSankeyLayout Agent Path contract", () => {
     const layout = computeSankeyLayout({
       nodes,
       path_edges: [
-        { source: "agent:root", target: "tool:lookup" },
-        { source: "tool:lookup", target: "agent:root" },
-        { source: "tool:lookup", target: "llm:answer" },
+        pathEdge("agent:root", "tool:lookup"),
+        pathEdge("tool:lookup", "agent:root"),
+        pathEdge("tool:lookup", "llm:answer"),
       ],
     });
 
@@ -110,7 +124,7 @@ describe("computeSankeyLayout Agent Path contract", () => {
           transition_count: 4,
           is_self_loop: true,
         },
-        { source: "agent:root", target: "llm:answer" },
+        pathEdge("agent:root", "llm:answer"),
       ],
     });
 

@@ -42,6 +42,7 @@ import {
   canNavigateToNextVoiceCallDetail,
   createVoiceCallDetailCursorNavigator,
   createVoiceCallDetailRequestGuard,
+  getVoiceCallRowIdentity,
   getLegacyVoiceCallNavigationTotal,
 } from "./voiceCallDetailCursorNavigation";
 import { LIST_CURSOR_CONTINUATION_NOTICE } from "src/sections/projects/LLMTracing/listCursorPagination";
@@ -270,7 +271,7 @@ const TestDetailSideDrawerChild = ({
 
   const navigationContextSignature = JSON.stringify({
     drawerQueryKey,
-    rowIdentity: data?.call_id || data?.id || data?.trace_id || null,
+    rowIdentity: getVoiceCallRowIdentity(data),
     rowIndex: updatedRowIndex,
     urlModule,
     urlOrigin,
@@ -374,10 +375,12 @@ const TestDetailSideDrawerChild = ({
         baseParams: projectVoiceNavigatorParams,
         pageSize: standardPageLimit,
         request: (requestParams, requestOptions) =>
-          axios.get(endpoints.project.getCallLogs, {
-            params: requestParams,
-            ...(requestOptions || {}),
-          }),
+          axios
+            .get(endpoints.project.getCallLogs, {
+              params: requestParams,
+              ...(requestOptions || {}),
+            })
+            .then((response) => response.data),
       });
     }
     return projectVoiceNavigatorRef.current;

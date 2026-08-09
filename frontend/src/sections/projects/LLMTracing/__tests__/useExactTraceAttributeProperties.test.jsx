@@ -186,8 +186,24 @@ describe("useExactTraceAttributeProperties", () => {
     ]);
   });
 
-  it("keeps prior keys and makes a repeated retained cursor degraded and retryable", async () => {
+  it("retries a repeated retained cursor once, then terminalizes with prior keys intact", async () => {
     mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: [{ key: "recent.attribute", type: "string" }],
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "same-cursor",
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: [],
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "same-cursor",
+        },
+      })
       .mockResolvedValueOnce({
         data: {
           result: [{ key: "recent.attribute", type: "string" }],
@@ -225,6 +241,19 @@ describe("useExactTraceAttributeProperties", () => {
     expect(result.current.data.map(({ id }) => id)).toEqual([
       "recent.attribute",
     ]);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.cursorRetryExhausted).toBe(true));
+
+    expect(mocks.get).toHaveBeenCalledTimes(4);
+    expect(result.current.hasNextPage).toBe(false);
+    expect(result.current.isFetchNextPageError).toBe(false);
+    expect(result.current.data.map(({ id }) => id)).toEqual([
+      "recent.attribute",
+    ]);
+
+    await act(async () => result.current.fetchNextPage());
+    expect(mocks.get).toHaveBeenCalledTimes(4);
   });
 
   it("keeps an unchanged exhausted catalog after a successful cached refetch", async () => {

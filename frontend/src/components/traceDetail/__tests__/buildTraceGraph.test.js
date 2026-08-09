@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { TracerTraceAgentGraphResponse } from "src/generated/api-contracts/api.zod";
 import { buildTraceGraph } from "../buildTraceGraph";
 
 const entry = (id, name, start, end, children = [], attrs = {}) => ({
@@ -20,6 +21,9 @@ const edgePairs = (graph) =>
     )
     .map((edge) => `${edge.source}->${edge.target}`)
     .sort();
+
+const pathPairs = (graph) =>
+  graph.path_edges.map((edge) => `${edge.source}->${edge.target}`).sort();
 
 describe("buildTraceGraph inferred execution", () => {
   it("builds a local fork and joins the next sibling from every branch", () => {
@@ -55,6 +59,11 @@ describe("buildTraceGraph inferred execution", () => {
     expect(edgePairs(graph)).toEqual([
       "agent:guard->agent:answer",
       "agent:lookup->agent:answer",
+      "agent:root->agent:guard",
+      "agent:root->agent:lookup",
+    ]);
+    expect(pathPairs(graph)).toEqual([
+      "agent:root->agent:answer",
       "agent:root->agent:guard",
       "agent:root->agent:lookup",
     ]);
@@ -162,5 +171,50 @@ describe("buildTraceGraph inferred execution", () => {
     ]);
 
     expect(edgePairs(graph)).toContain("alpha->beta");
+    expect(graph.path_edges).toEqual([]);
+  });
+
+  it("emits the canonical graph fields without inventing camelCase aliases", () => {
+    const graph = buildTraceGraph([
+      entry(
+        "root",
+        "root",
+        "2026-08-06T10:00:00.000Z",
+        "2026-08-06T10:00:01.000Z",
+      ),
+    ]);
+    const root = graph.nodes.find((node) => node.id === "agent:root");
+
+    expect(root).toEqual(
+      expect.objectContaining({
+        span_count: 1,
+        avg_latency_ms: 0,
+        total_tokens: 0,
+        total_cost: 0,
+        error_count: 0,
+        trace_count: 1,
+      }),
+    );
+    expect(root).not.toHaveProperty("spanCount");
+    expect(graph.edges[0]).toEqual(
+      expect.objectContaining({
+        transition_count: 1,
+        avg_latency_ms: 0,
+        total_tokens: 0,
+        total_cost: 0,
+        error_count: 0,
+        trace_count: 1,
+        is_self_loop: false,
+      }),
+    );
+    expect(() =>
+      TracerTraceAgentGraphResponse.parse({ status: true, result: graph }),
+    ).not.toThrow();
+  });
+
+  it("rejects a malformed span-tree payload instead of rendering empty data", () => {
+    expect(() => buildTraceGraph(null)).toThrow(
+      "Trace graph requires a span-tree array",
+    );
   });
 });

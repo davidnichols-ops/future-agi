@@ -8,6 +8,26 @@
  */
 import * as zod from 'zod';
 
+type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+const jsonValueSchema: zod.ZodType<JsonValue> =
+  zod.lazy(() =>
+    zod.union([
+      zod.string(),
+      zod.number(),
+      zod.boolean(),
+      zod.null(),
+      zod.array(jsonValueSchema),
+      zod.record(jsonValueSchema),
+    ]),
+  );
+
 /**
  * GET /accounts/2fa/recovery-codes/ - Get remaining count.
  */
@@ -9525,26 +9545,6 @@ export const apiTracesSpanAttributeDetailListResponseQueryElapsedMsMin = 0;
 
 
 
-type SpanAttributeJsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | SpanAttributeJsonValue[]
-  | { [key: string]: SpanAttributeJsonValue };
-
-const spanAttributeJsonValueSchema: zod.ZodType<SpanAttributeJsonValue> =
-  zod.lazy(() =>
-    zod.union([
-      zod.string(),
-      zod.number(),
-      zod.boolean(),
-      zod.null(),
-      zod.array(spanAttributeJsonValueSchema),
-      zod.record(spanAttributeJsonValueSchema),
-    ]),
-  );
-
 export const ApiTracesSpanAttributeDetailListResponse = zod.object({
   "key": zod.string().min(1),
   "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']),
@@ -9556,7 +9556,7 @@ export const ApiTracesSpanAttributeDetailListResponse = zod.object({
   "unique_values": zod.number().min(apiTracesSpanAttributeDetailListResponseTypesItemUniqueValuesMin)
 })).optional(),
   "top_values": zod.array(zod.object({
-  "value": spanAttributeJsonValueSchema,
+  "value": jsonValueSchema.describe('Any valid JSON value.'),
   "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']).optional(),
   "count": zod.number(),
   "percentage": zod.number()
@@ -9664,7 +9664,7 @@ export const ApiTracesSpanAttributeValuesListQueryParams = zod.object({
 
 export const ApiTracesSpanAttributeValuesListResponse = zod.object({
   "result": zod.array(zod.object({
-  "value": spanAttributeJsonValueSchema,
+  "value": jsonValueSchema.describe('Any valid JSON value.'),
   "count": zod.number(),
   "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']).optional()
 })),
@@ -34630,7 +34630,7 @@ export const TracerDashboardFilterValuesResponse = zod.object({
   "status": zod.boolean().default(tracerDashboardFilterValuesResponseStatusDefault),
   "result": zod.object({
   "values": zod.array(zod.object({
-  "value": spanAttributeJsonValueSchema,
+  "value": jsonValueSchema.describe('Any valid JSON value.'),
   "label": zod.string().min(1),
   "type": zod.enum(['string', 'number', 'boolean', 'array', 'map', 'json']).optional(),
   "name": zod.string().min(1).optional(),
@@ -38843,87 +38843,86 @@ export const TracerObservationSpanGetTraceIdByIndexSpansAsObserveResponse = zod.
 /**
  * List spans filtered by project ID and project version ID with optimized queries.
  */
+export const tracerObservationSpanListSpansQueryFiltersDefault = `[]`;
+
+export const tracerObservationSpanListSpansQueryPageNumberDefault = 0;
+export const tracerObservationSpanListSpansQueryPageNumberMin = 0;
+
+export const tracerObservationSpanListSpansQueryPageSizeDefault = 30;
+export const tracerObservationSpanListSpansQueryPageSizeMax = 500;
+
+
+
 export const TracerObservationSpanListSpansQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),
-  "limit": zod.number().optional().describe('Number of results to return per page.')
+  "limit": zod.number().optional().describe('Number of results to return per page.'),
+  "project_version_id": zod.string().uuid(),
+  "filters": zod.string().min(1).default(tracerObservationSpanListSpansQueryFiltersDefault),
+  "page_number": zod.number().min(tracerObservationSpanListSpansQueryPageNumberMin).default(tracerObservationSpanListSpansQueryPageNumberDefault).describe('Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range.'),
+  "page_size": zod.number().min(1).max(tracerObservationSpanListSpansQueryPageSizeMax).default(tracerObservationSpanListSpansQueryPageSizeDefault),
+  "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.')
 })
 
 
-export const tracerObservationSpanListSpansResponseResultsItemParentSpanIdMax = 255;
 
-export const tracerObservationSpanListSpansResponseResultsItemNameMax = 2000;
 
-export const tracerObservationSpanListSpansResponseResultsItemModelMax = 255;
 
-export const tracerObservationSpanListSpansResponseResultsItemLatencyMsMin = -2147483648;
-export const tracerObservationSpanListSpansResponseResultsItemLatencyMsMax = 2147483647;
 
-export const tracerObservationSpanListSpansResponseResultsItemPromptTokensMin = -2147483648;
-export const tracerObservationSpanListSpansResponseResultsItemPromptTokensMax = 2147483647;
 
-export const tracerObservationSpanListSpansResponseResultsItemCompletionTokensMin = -2147483648;
-export const tracerObservationSpanListSpansResponseResultsItemCompletionTokensMax = 2147483647;
 
-export const tracerObservationSpanListSpansResponseResultsItemTotalTokensMin = -2147483648;
-export const tracerObservationSpanListSpansResponseResultsItemTotalTokensMax = 2147483647;
 
-export const tracerObservationSpanListSpansResponseResultsItemEvalIdMax = 255;
 
-export const tracerObservationSpanListSpansResponseResultsItemProviderMax = 255;
+export const tracerObservationSpanListSpansResponseResultMetadataTotalRowsMin = 0;
+
+export const tracerObservationSpanListSpansResponseResultMetadataTotalRowsExactMin = 0;
+
+
+
+export const tracerObservationSpanListSpansResponseResultMetadataQueryElapsedMsMin = 0;
+
+export const tracerObservationSpanListSpansResponseResultMetadataQueryCountMin = 0;
+
+export const tracerObservationSpanListSpansResponseResultMetadataQueryRowsReturnedMin = 0;
+
+export const tracerObservationSpanListSpansResponseResultMetadataQueryResultPayloadBytesMin = 0;
 
 
 
 export const TracerObservationSpanListSpansResponse = zod.object({
-  "count": zod.number(),
-  "next": zod.string().url().optional(),
-  "previous": zod.string().url().optional(),
-  "results": zod.array(zod.object({
-  "id": zod.string().min(1).optional(),
-  "project": zod.string().uuid(),
-  "project_version": zod.string().uuid().optional(),
-  "trace": zod.string().uuid(),
-  "parent_span_id": zod.string().max(tracerObservationSpanListSpansResponseResultsItemParentSpanIdMax).optional(),
-  "name": zod.string().min(1).max(tracerObservationSpanListSpansResponseResultsItemNameMax),
-  "observation_type": zod.enum(['tool', 'chain', 'llm', 'retriever', 'embedding', 'agent', 'reranker', 'unknown', 'guardrail', 'evaluator', 'conversation']),
-  "start_time": zod.string().datetime({"offset":true}).optional(),
-  "end_time": zod.string().datetime({"offset":true}).optional(),
-  "input": zod.object({
-
-}).passthrough().optional(),
-  "output": zod.object({
-
-}).passthrough().optional(),
-  "model": zod.string().max(tracerObservationSpanListSpansResponseResultsItemModelMax).optional(),
-  "model_parameters": zod.object({
-
-}).passthrough().optional(),
-  "latency_ms": zod.number().min(tracerObservationSpanListSpansResponseResultsItemLatencyMsMin).max(tracerObservationSpanListSpansResponseResultsItemLatencyMsMax).optional(),
-  "org_id": zod.string().uuid().optional(),
-  "org_user_id": zod.string().uuid().optional(),
-  "prompt_tokens": zod.number().min(tracerObservationSpanListSpansResponseResultsItemPromptTokensMin).max(tracerObservationSpanListSpansResponseResultsItemPromptTokensMax).optional(),
-  "completion_tokens": zod.number().min(tracerObservationSpanListSpansResponseResultsItemCompletionTokensMin).max(tracerObservationSpanListSpansResponseResultsItemCompletionTokensMax).optional(),
-  "total_tokens": zod.number().min(tracerObservationSpanListSpansResponseResultsItemTotalTokensMin).max(tracerObservationSpanListSpansResponseResultsItemTotalTokensMax).optional(),
-  "response_time": zod.number().optional(),
-  "eval_id": zod.string().max(tracerObservationSpanListSpansResponseResultsItemEvalIdMax).optional(),
-  "cost": zod.number().optional(),
-  "status": zod.enum(['UNSET', 'OK', 'ERROR']).optional(),
-  "status_message": zod.string().optional(),
-  "tags": zod.object({
-
-}).passthrough().optional(),
+  "status": zod.boolean(),
+  "result": zod.object({
+  "column_config": zod.array(zod.object({
+  "id": zod.string().min(1),
+  "name": zod.string().min(1),
+  "is_visible": zod.boolean(),
+  "group_by": zod.string().min(1).nullish(),
+  "output_type": zod.string().min(1).nullish(),
+  "reverse_output": zod.boolean().nullish(),
+  "annotation_label_type": zod.string().min(1).nullish(),
+  "choices": zod.array(zod.string().min(1).nullable()).nullish(),
+  "settings": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "choices_map": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "eval_template_id": zod.string().min(1).nullish(),
+  "annotators": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "source_field": zod.string().min(1).nullish(),
+  "parent_eval_id": zod.string().min(1).nullish()
+})),
   "metadata": zod.object({
-
-}).passthrough().optional(),
-  "span_events": zod.object({
-
-}).passthrough().optional(),
-  "provider": zod.string().max(tracerObservationSpanListSpansResponseResultsItemProviderMax).optional(),
-  "provider_logo": zod.string().optional(),
-  "span_attributes": zod.string().optional(),
-  "custom_eval_config": zod.string().uuid().optional(),
-  "eval_status": zod.enum(['NotStarted', 'Queued', 'Running', 'Completed', 'Editing', 'Inactive', 'Failed', 'PartialRun', 'ExperimentEvaluation', 'Uploading', 'PartialExtracted', 'Processing', 'Deleting', 'PartialCompleted', 'OptimizationEvaluation', 'Error', 'Cancelled']).optional(),
-  "prompt_version": zod.string().uuid().optional()
-}))
+  "total_rows": zod.number().min(tracerObservationSpanListSpansResponseResultMetadataTotalRowsMin),
+  "total_rows_exact": zod.number().min(tracerObservationSpanListSpansResponseResultMetadataTotalRowsExactMin).nullish(),
+  "total_rows_is_lower_bound": zod.boolean().optional(),
+  "has_more": zod.boolean().optional(),
+  "next_cursor": zod.string().min(1).nullish(),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'degraded']).optional(),
+  "query_error_code": zod.string().min(1).nullish(),
+  "query_elapsed_ms": zod.number().min(tracerObservationSpanListSpansResponseResultMetadataQueryElapsedMsMin).optional(),
+  "query_count": zod.number().min(tracerObservationSpanListSpansResponseResultMetadataQueryCountMin).optional(),
+  "query_rows_returned": zod.number().min(tracerObservationSpanListSpansResponseResultMetadataQueryRowsReturnedMin).optional(),
+  "query_result_payload_bytes": zod.number().min(tracerObservationSpanListSpansResponseResultMetadataQueryResultPayloadBytesMin).optional()
+}),
+  "table": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.')))
+})
 })
 
 
@@ -38952,7 +38951,13 @@ export const TracerObservationSpanListSpansObserveQueryParams = zod.object({
   "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.')
 })
 
+export const tracerObservationSpanListSpansObserveResponseResultMetadataTotalRowsMin = 0;
 
+export const tracerObservationSpanListSpansObserveResponseResultMetadataTotalRowsExactMin = 0;
+
+
+
+export const tracerObservationSpanListSpansObserveResponseResultMetadataQueryElapsedMsMin = 0;
 
 export const tracerObservationSpanListSpansObserveResponseResultMetadataQueryCountMin = 0;
 
@@ -38975,43 +38980,35 @@ export const TracerObservationSpanListSpansObserveResponse = zod.object({
   "status": zod.boolean(),
   "result": zod.object({
   "metadata": zod.object({
-  "total_rows": zod.number(),
-  "total_rows_exact": zod.number().optional(),
+  "total_rows": zod.number().min(tracerObservationSpanListSpansObserveResponseResultMetadataTotalRowsMin),
+  "total_rows_exact": zod.number().min(tracerObservationSpanListSpansObserveResponseResultMetadataTotalRowsExactMin).nullish(),
   "total_rows_is_lower_bound": zod.boolean().optional(),
   "has_more": zod.boolean().optional(),
-  "next_cursor": zod.string().min(1).optional(),
+  "next_cursor": zod.string().min(1).nullish(),
   "query_complete": zod.boolean().optional(),
   "query_status": zod.enum(['complete', 'degraded']).optional(),
-  "query_error_code": zod.string().min(1).optional(),
-  "query_elapsed_ms": zod.number().optional(),
+  "query_error_code": zod.string().min(1).nullish(),
+  "query_elapsed_ms": zod.number().min(tracerObservationSpanListSpansObserveResponseResultMetadataQueryElapsedMsMin).optional(),
   "query_count": zod.number().min(tracerObservationSpanListSpansObserveResponseResultMetadataQueryCountMin).optional(),
   "query_rows_returned": zod.number().min(tracerObservationSpanListSpansObserveResponseResultMetadataQueryRowsReturnedMin).optional(),
   "query_result_payload_bytes": zod.number().min(tracerObservationSpanListSpansObserveResponseResultMetadataQueryResultPayloadBytesMin).optional()
 }),
-  "table": zod.array(zod.record(zod.string(), zod.object({
-
-}).passthrough().describe('Any valid JSON value.'))),
+  "table": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))),
   "config": zod.array(zod.object({
   "id": zod.string().min(1),
   "name": zod.string().min(1),
   "is_visible": zod.boolean(),
-  "group_by": zod.string().min(1).optional(),
-  "output_type": zod.string().min(1).optional(),
-  "reverse_output": zod.boolean().optional(),
-  "annotation_label_type": zod.string().min(1).optional(),
-  "choices": zod.array(zod.string().min(1)).optional(),
-  "settings": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "choices_map": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "eval_template_id": zod.string().min(1).optional(),
-  "annotators": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "source_field": zod.string().min(1).optional(),
-  "parent_eval_id": zod.string().min(1).optional()
+  "group_by": zod.string().min(1).nullish(),
+  "output_type": zod.string().min(1).nullish(),
+  "reverse_output": zod.boolean().nullish(),
+  "annotation_label_type": zod.string().min(1).nullish(),
+  "choices": zod.array(zod.string().min(1).nullable()).nullish(),
+  "settings": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "choices_map": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "eval_template_id": zod.string().min(1).nullish(),
+  "annotators": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "source_field": zod.string().min(1).nullish(),
+  "parent_eval_id": zod.string().min(1).nullish()
 }))
 })
 })
@@ -42103,42 +42100,34 @@ export const TracerTraceSessionListSessionsResponse = zod.object({
   "result": zod.object({
   "metadata": zod.object({
   "total_rows": zod.number(),
-  "total_rows_exact": zod.number().optional(),
+  "total_rows_exact": zod.number().nullish(),
   "total_rows_is_lower_bound": zod.boolean().optional(),
   "has_more": zod.boolean().optional(),
-  "next_cursor": zod.string().min(1).optional(),
+  "next_cursor": zod.string().min(1).nullish(),
   "query_complete": zod.boolean().optional(),
   "query_status": zod.enum(['complete', 'degraded']).optional(),
-  "query_error_code": zod.string().min(1).optional(),
+  "query_error_code": zod.string().min(1).nullish(),
   "query_elapsed_ms": zod.number().optional(),
   "query_count": zod.number().min(tracerTraceSessionListSessionsResponseResultMetadataQueryCountMin).optional(),
   "query_rows_returned": zod.number().min(tracerTraceSessionListSessionsResponseResultMetadataQueryRowsReturnedMin).optional(),
   "query_result_payload_bytes": zod.number().min(tracerTraceSessionListSessionsResponseResultMetadataQueryResultPayloadBytesMin).optional()
 }),
-  "table": zod.array(zod.record(zod.string(), zod.object({
-
-}).passthrough().describe('Any valid JSON value.'))),
+  "table": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))),
   "config": zod.array(zod.object({
   "id": zod.string().min(1),
   "name": zod.string().min(1),
   "is_visible": zod.boolean(),
-  "group_by": zod.string().min(1).optional(),
-  "output_type": zod.string().min(1).optional(),
-  "reverse_output": zod.boolean().optional(),
-  "annotation_label_type": zod.string().min(1).optional(),
-  "choices": zod.array(zod.string().min(1)).optional(),
-  "settings": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "choices_map": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "eval_template_id": zod.string().min(1).optional(),
-  "annotators": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "source_field": zod.string().min(1).optional(),
-  "parent_eval_id": zod.string().min(1).optional()
+  "group_by": zod.string().min(1).nullish(),
+  "output_type": zod.string().min(1).nullish(),
+  "reverse_output": zod.boolean().nullish(),
+  "annotation_label_type": zod.string().min(1).nullish(),
+  "choices": zod.array(zod.string().min(1).nullable()).nullish(),
+  "settings": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "choices_map": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "eval_template_id": zod.string().min(1).nullish(),
+  "annotators": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "source_field": zod.string().min(1).nullish(),
+  "parent_eval_id": zod.string().min(1).nullish()
 }))
 })
 })
@@ -42333,39 +42322,119 @@ export const TracerTraceAgentGraphQueryParams = zod.object({
   "refresh": zod.boolean().default(tracerTraceAgentGraphQueryRefreshDefault).describe('Recompute and atomically replace the last exact graph snapshot.')
 })
 
-export const tracerTraceAgentGraphResponseResultsItemNameMax = 2000;
 
-export const tracerTraceAgentGraphResponseResultsItemExternalIdMax = 255;
+
+
+export const tracerTraceAgentGraphResponseResultNodesItemSpanCountMin = 0;
+
+export const tracerTraceAgentGraphResponseResultNodesItemAvgLatencyMsMin = 0;
+
+export const tracerTraceAgentGraphResponseResultNodesItemTotalTokensMin = 0;
+
+export const tracerTraceAgentGraphResponseResultNodesItemTotalCostMin = 0;
+
+export const tracerTraceAgentGraphResponseResultNodesItemErrorCountMin = 0;
+
+export const tracerTraceAgentGraphResponseResultNodesItemTraceCountMin = 0;
+
+export const tracerTraceAgentGraphResponseResultNodesItemMemberCountMin = 0;
+
+
+
+export const tracerTraceAgentGraphResponseResultEdgesItemTransitionCountMin = 0;
+
+export const tracerTraceAgentGraphResponseResultEdgesItemAvgLatencyMsMin = 0;
+
+export const tracerTraceAgentGraphResponseResultEdgesItemTotalTokensMin = 0;
+
+export const tracerTraceAgentGraphResponseResultEdgesItemTotalCostMin = 0;
+
+export const tracerTraceAgentGraphResponseResultEdgesItemErrorCountMin = 0;
+
+export const tracerTraceAgentGraphResponseResultEdgesItemTraceCountMin = 0;
+
+
+
+export const tracerTraceAgentGraphResponseResultPathEdgesItemTransitionCountMin = 0;
+
+export const tracerTraceAgentGraphResponseResultPathEdgesItemAvgLatencyMsMin = 0;
+
+export const tracerTraceAgentGraphResponseResultPathEdgesItemTotalTokensMin = 0;
+
+export const tracerTraceAgentGraphResponseResultPathEdgesItemTotalCostMin = 0;
+
+export const tracerTraceAgentGraphResponseResultPathEdgesItemErrorCountMin = 0;
+
+export const tracerTraceAgentGraphResponseResultPathEdgesItemTraceCountMin = 0;
+
+
+export const tracerTraceAgentGraphResponseResultOmittedNodeCountMin = 0;
+
+export const tracerTraceAgentGraphResponseResultQueryCountMin = 0;
+
+export const tracerTraceAgentGraphResponseResultQueryRowsReturnedMin = 0;
+
+export const tracerTraceAgentGraphResponseResultQueryElapsedMsMin = 0;
 
 
 
 export const TracerTraceAgentGraphResponse = zod.object({
-  "count": zod.number(),
-  "next": zod.string().url().optional(),
-  "previous": zod.string().url().optional(),
-  "results": zod.array(zod.object({
-  "id": zod.string().uuid().optional(),
-  "project": zod.string().uuid(),
-  "project_version": zod.string().uuid().optional(),
-  "name": zod.string().max(tracerTraceAgentGraphResponseResultsItemNameMax).optional(),
-  "metadata": zod.object({
-
-}).passthrough().optional(),
-  "input": zod.object({
-
-}).passthrough().optional(),
-  "output": zod.object({
-
-}).passthrough().optional(),
-  "error": zod.object({
-
-}).passthrough().optional(),
-  "session": zod.string().uuid().optional(),
-  "external_id": zod.string().max(tracerTraceAgentGraphResponseResultsItemExternalIdMax).optional(),
-  "tags": zod.object({
-
-}).passthrough().optional()
-}))
+  "status": zod.boolean(),
+  "result": zod.object({
+  "nodes": zod.array(zod.object({
+  "id": zod.string().min(1),
+  "name": zod.string().min(1),
+  "type": zod.string().min(1),
+  "span_count": zod.number().min(tracerTraceAgentGraphResponseResultNodesItemSpanCountMin),
+  "avg_latency_ms": zod.number().min(tracerTraceAgentGraphResponseResultNodesItemAvgLatencyMsMin),
+  "total_tokens": zod.number().min(tracerTraceAgentGraphResponseResultNodesItemTotalTokensMin),
+  "total_cost": zod.number().min(tracerTraceAgentGraphResponseResultNodesItemTotalCostMin),
+  "error_count": zod.number().min(tracerTraceAgentGraphResponseResultNodesItemErrorCountMin),
+  "trace_count": zod.number().min(tracerTraceAgentGraphResponseResultNodesItemTraceCountMin).nullable(),
+  "trace_count_exact": zod.boolean().optional(),
+  "is_aggregate": zod.boolean().optional(),
+  "member_count": zod.number().min(tracerTraceAgentGraphResponseResultNodesItemMemberCountMin).optional()
+})),
+  "edges": zod.array(zod.object({
+  "source": zod.string().min(1),
+  "target": zod.string().min(1),
+  "transition_count": zod.number().min(tracerTraceAgentGraphResponseResultEdgesItemTransitionCountMin),
+  "avg_latency_ms": zod.number().min(tracerTraceAgentGraphResponseResultEdgesItemAvgLatencyMsMin),
+  "total_tokens": zod.number().min(tracerTraceAgentGraphResponseResultEdgesItemTotalTokensMin),
+  "total_cost": zod.number().min(tracerTraceAgentGraphResponseResultEdgesItemTotalCostMin),
+  "error_count": zod.number().min(tracerTraceAgentGraphResponseResultEdgesItemErrorCountMin),
+  "trace_count": zod.number().min(tracerTraceAgentGraphResponseResultEdgesItemTraceCountMin).nullable(),
+  "trace_count_exact": zod.boolean().optional(),
+  "is_self_loop": zod.boolean(),
+  "is_aggregate": zod.boolean().optional()
+})),
+  "path_edges": zod.array(zod.object({
+  "source": zod.string().min(1),
+  "target": zod.string().min(1),
+  "transition_count": zod.number().min(tracerTraceAgentGraphResponseResultPathEdgesItemTransitionCountMin),
+  "avg_latency_ms": zod.number().min(tracerTraceAgentGraphResponseResultPathEdgesItemAvgLatencyMsMin),
+  "total_tokens": zod.number().min(tracerTraceAgentGraphResponseResultPathEdgesItemTotalTokensMin),
+  "total_cost": zod.number().min(tracerTraceAgentGraphResponseResultPathEdgesItemTotalCostMin),
+  "error_count": zod.number().min(tracerTraceAgentGraphResponseResultPathEdgesItemErrorCountMin),
+  "trace_count": zod.number().min(tracerTraceAgentGraphResponseResultPathEdgesItemTraceCountMin).nullable(),
+  "trace_count_exact": zod.boolean().optional(),
+  "is_self_loop": zod.boolean(),
+  "is_aggregate": zod.boolean().optional()
+})),
+  "graph_collapsed": zod.boolean().optional(),
+  "graph_node_limit": zod.number().min(1).optional(),
+  "omitted_node_count": zod.number().min(tracerTraceAgentGraphResponseResultOmittedNodeCountMin).optional(),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'pending']).optional(),
+  "query_sampled": zod.boolean().optional(),
+  "query_count": zod.number().min(tracerTraceAgentGraphResponseResultQueryCountMin).optional(),
+  "query_rows_returned": zod.number().min(tracerTraceAgentGraphResponseResultQueryRowsReturnedMin).optional(),
+  "query_elapsed_ms": zod.number().min(tracerTraceAgentGraphResponseResultQueryElapsedMsMin).optional(),
+  "query_completed_at": zod.string().datetime({"offset":true}).optional(),
+  "query_cached": zod.boolean().optional(),
+  "query_refresh_failed": zod.boolean().optional(),
+  "query_refreshing": zod.boolean().optional()
+})
 })
 
 
@@ -42795,39 +42864,60 @@ export const TracerTraceListTracesQueryParams = zod.object({
   "allow_sampled": zod.boolean().optional().describe('Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.')
 })
 
-export const tracerTraceListTracesResponseResultsItemNameMax = 2000;
 
-export const tracerTraceListTracesResponseResultsItemExternalIdMax = 255;
+
+
+
+
+
+
+
+
+
+
+export const tracerTraceListTracesResponseResultMetadataQueryCountMin = 0;
+
+export const tracerTraceListTracesResponseResultMetadataQueryRowsReturnedMin = 0;
+
+export const tracerTraceListTracesResponseResultMetadataQueryResultPayloadBytesMin = 0;
 
 
 
 export const TracerTraceListTracesResponse = zod.object({
-  "count": zod.number(),
-  "next": zod.string().url().optional(),
-  "previous": zod.string().url().optional(),
-  "results": zod.array(zod.object({
-  "id": zod.string().uuid().optional(),
-  "project": zod.string().uuid(),
-  "project_version": zod.string().uuid().optional(),
-  "name": zod.string().max(tracerTraceListTracesResponseResultsItemNameMax).optional(),
+  "status": zod.boolean(),
+  "result": zod.object({
+  "column_config": zod.array(zod.object({
+  "id": zod.string().min(1),
+  "name": zod.string().min(1),
+  "is_visible": zod.boolean(),
+  "group_by": zod.string().min(1).nullish(),
+  "output_type": zod.string().min(1).nullish(),
+  "reverse_output": zod.boolean().nullish(),
+  "annotation_label_type": zod.string().min(1).nullish(),
+  "choices": zod.array(zod.string().min(1).nullable()).nullish(),
+  "settings": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "choices_map": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "eval_template_id": zod.string().min(1).nullish(),
+  "annotators": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "source_field": zod.string().min(1).nullish(),
+  "parent_eval_id": zod.string().min(1).nullish()
+})),
   "metadata": zod.object({
-
-}).passthrough().optional(),
-  "input": zod.object({
-
-}).passthrough().optional(),
-  "output": zod.object({
-
-}).passthrough().optional(),
-  "error": zod.object({
-
-}).passthrough().optional(),
-  "session": zod.string().uuid().optional(),
-  "external_id": zod.string().max(tracerTraceListTracesResponseResultsItemExternalIdMax).optional(),
-  "tags": zod.object({
-
-}).passthrough().optional()
-}))
+  "total_rows": zod.number(),
+  "total_rows_exact": zod.number().nullish(),
+  "total_rows_is_lower_bound": zod.boolean().optional(),
+  "has_more": zod.boolean().optional(),
+  "next_cursor": zod.string().min(1).nullish(),
+  "query_complete": zod.boolean().optional(),
+  "query_status": zod.enum(['complete', 'degraded']).optional(),
+  "query_error_code": zod.string().min(1).nullish(),
+  "query_elapsed_ms": zod.number().optional(),
+  "query_count": zod.number().min(tracerTraceListTracesResponseResultMetadataQueryCountMin).optional(),
+  "query_rows_returned": zod.number().min(tracerTraceListTracesResponseResultMetadataQueryRowsReturnedMin).optional(),
+  "query_result_payload_bytes": zod.number().min(tracerTraceListTracesResponseResultMetadataQueryResultPayloadBytesMin).optional()
+}),
+  "table": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.')))
+})
 })
 
 
@@ -42886,42 +42976,34 @@ export const TracerTraceListTracesOfSessionResponse = zod.object({
   "result": zod.object({
   "metadata": zod.object({
   "total_rows": zod.number(),
-  "total_rows_exact": zod.number().optional(),
+  "total_rows_exact": zod.number().nullish(),
   "total_rows_is_lower_bound": zod.boolean().optional(),
   "has_more": zod.boolean().optional(),
-  "next_cursor": zod.string().min(1).optional(),
+  "next_cursor": zod.string().min(1).nullish(),
   "query_complete": zod.boolean().optional(),
   "query_status": zod.enum(['complete', 'degraded']).optional(),
-  "query_error_code": zod.string().min(1).optional(),
+  "query_error_code": zod.string().min(1).nullish(),
   "query_elapsed_ms": zod.number().optional(),
   "query_count": zod.number().min(tracerTraceListTracesOfSessionResponseResultMetadataQueryCountMin).optional(),
   "query_rows_returned": zod.number().min(tracerTraceListTracesOfSessionResponseResultMetadataQueryRowsReturnedMin).optional(),
   "query_result_payload_bytes": zod.number().min(tracerTraceListTracesOfSessionResponseResultMetadataQueryResultPayloadBytesMin).optional()
 }),
-  "table": zod.array(zod.record(zod.string(), zod.object({
-
-}).passthrough().describe('Any valid JSON value.'))),
+  "table": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))),
   "config": zod.array(zod.object({
   "id": zod.string().min(1),
   "name": zod.string().min(1),
   "is_visible": zod.boolean(),
-  "group_by": zod.string().min(1).optional(),
-  "output_type": zod.string().min(1).optional(),
-  "reverse_output": zod.boolean().optional(),
-  "annotation_label_type": zod.string().min(1).optional(),
-  "choices": zod.array(zod.string().min(1)).optional(),
-  "settings": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "choices_map": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "eval_template_id": zod.string().min(1).optional(),
-  "annotators": zod.object({
-
-}).passthrough().optional().describe('Any valid JSON value.'),
-  "source_field": zod.string().min(1).optional(),
-  "parent_eval_id": zod.string().min(1).optional()
+  "group_by": zod.string().min(1).nullish(),
+  "output_type": zod.string().min(1).nullish(),
+  "reverse_output": zod.boolean().nullish(),
+  "annotation_label_type": zod.string().min(1).nullish(),
+  "choices": zod.array(zod.string().min(1).nullable()).nullish(),
+  "settings": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "choices_map": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "eval_template_id": zod.string().min(1).nullish(),
+  "annotators": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "source_field": zod.string().min(1).nullish(),
+  "parent_eval_id": zod.string().min(1).nullish()
 }))
 })
 })
@@ -42970,17 +43052,41 @@ export const tracerTraceListVoiceCallsResponseTotalPagesMin = 0;
 
 
 
+
+
+
+
+
+
+
+
+
 export const TracerTraceListVoiceCallsResponse = zod.object({
   "count": zod.number().min(tracerTraceListVoiceCallsResponseCountMin),
   "count_is_lower_bound": zod.boolean(),
   "total_pages": zod.number().min(tracerTraceListVoiceCallsResponseTotalPagesMin),
   "current_page": zod.number().min(1),
-  "next": zod.number().min(1),
-  "previous": zod.number().min(1),
-  "results": zod.array(zod.record(zod.string(), zod.string())),
-  "config": zod.array(zod.record(zod.string(), zod.string())),
+  "next": zod.number().min(1).nullable(),
+  "previous": zod.number().min(1).nullable(),
+  "results": zod.array(zod.record(zod.string(), jsonValueSchema.describe('Any valid JSON value.'))),
+  "config": zod.array(zod.object({
+  "id": zod.string().min(1),
+  "name": zod.string().min(1),
+  "is_visible": zod.boolean(),
+  "group_by": zod.string().min(1).nullish(),
+  "output_type": zod.string().min(1).nullish(),
+  "reverse_output": zod.boolean().nullish(),
+  "annotation_label_type": zod.string().min(1).nullish(),
+  "choices": zod.array(zod.string().min(1).nullable()).nullish(),
+  "settings": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "choices_map": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "eval_template_id": zod.string().min(1).nullish(),
+  "annotators": jsonValueSchema.optional().describe('Any valid JSON value.'),
+  "source_field": zod.string().min(1).nullish(),
+  "parent_eval_id": zod.string().min(1).nullish()
+})),
   "has_more": zod.boolean(),
-  "next_cursor": zod.string().min(1).optional(),
+  "next_cursor": zod.string().min(1).nullish(),
   "query_complete": zod.boolean(),
   "query_status": zod.enum(['complete', 'degraded']),
   "query_error_code": zod.string().min(1).optional()

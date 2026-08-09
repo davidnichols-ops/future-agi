@@ -90,10 +90,12 @@ from tracer.serializers.observation_span import (
     SpanListQuerySerializer,
     SpanObserveIndexQuerySerializer,
     SpanObserveListQuerySerializer,
+    SpanObserveListResponseSerializer,
+    SpanPrototypeListResponseSerializer,
     SubmitFeedbackActionTypeSerializer,
     SubmitFeedbackSerializer,
 )
-from tracer.serializers.trace import TraceObserveListResponseSerializer, TraceSerializer
+from tracer.serializers.trace import TraceSerializer
 from tracer.services.clickhouse.attribute_reads import (
     AttributeReadMetadata,
     AttributeReadSelector,
@@ -1297,12 +1299,14 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             )
 
     @validated_request(
+        query_serializer=SpanListQuerySerializer,
         responses={
+            200: SpanPrototypeListResponseSerializer,
             400: ApiErrorResponseSerializer,
             422: PageDepthExceededErrorSerializer,
             500: ApiErrorResponseSerializer,
             503: ApiErrorResponseSerializer,
-        }
+        },
     )
     @action(detail=False, methods=["get"])
     def list_spans(self, request, *args, **kwargs):
@@ -1589,7 +1593,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
     @validated_request(
         query_serializer=SpanObserveListQuerySerializer,
         responses={
-            200: TraceObserveListResponseSerializer,
+            200: SpanObserveListResponseSerializer,
             400: ApiErrorResponseSerializer,
             422: PageDepthExceededErrorSerializer,
             500: ApiErrorResponseSerializer,
@@ -2407,6 +2411,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 else None
             )
             entry = {
+                "project_id": str(row.get("project_id", "")),
                 "span_id": span_id,
                 "input": row.get("input", ""),
                 "output": row.get("output", ""),
@@ -2843,6 +2848,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                 span_id,
             )
             entry = {
+                "project_id": str(row.get("project_id", "")),
                 "node_type": row.get("observation_type", ""),
                 "span_id": span_id,
                 "input": row.get("input", ""),

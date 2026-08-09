@@ -33194,7 +33194,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
     "/tracer/observation-span/list_spans/": {
       "get": {
         "operationId": "tracer_observation-span_list_spans",
-        "runtimeRequestValidation": false,
+        "runtimeRequestValidation": true,
         "runtimeResponseValidation": true,
         "requestBody": null,
         "queryParameters": {
@@ -33209,36 +33209,49 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "schema": {
               "type": "integer"
             }
+          },
+          "project_version_id": {
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "filters": {
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "default": "[]"
+            }
+          },
+          "page_number": {
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          "page_size": {
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 30
+            }
+          },
+          "allow_sampled": {
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/ObservationSpan"
-                }
-              }
-            }
+            "$ref": "#/definitions/SpanPrototypeListResponse"
           },
           "400": {
             "$ref": "#/definitions/ApiErrorResponse"
@@ -33339,7 +33352,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "responses": {
           "200": {
-            "$ref": "#/definitions/TraceObserveListResponse"
+            "$ref": "#/definitions/SpanObserveListResponse"
           },
           "400": {
             "$ref": "#/definitions/ApiErrorResponse"
@@ -35727,32 +35740,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/Trace"
-                }
-              }
-            }
+            "$ref": "#/definitions/TraceAgentGraphResponse"
           },
           "400": {
             "$ref": "#/definitions/ApiErrorResponse"
@@ -36253,32 +36241,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "responses": {
           "200": {
-            "required": [
-              "count",
-              "results"
-            ],
-            "type": "object",
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "next": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "previous": {
-                "type": "string",
-                "format": "uri",
-                "x-nullable": true
-              },
-              "results": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/definitions/Trace"
-                }
-              }
-            }
+            "$ref": "#/definitions/TracePrototypeListResponse"
           },
           "400": {
             "$ref": "#/definitions/ApiErrorResponse"
@@ -71316,6 +71279,38 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "SpanObserveListResponse": {
+      "required": [
+        "status",
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean"
+        },
+        "result": {
+          "$ref": "#/definitions/SpanObserveListResult"
+        }
+      }
+    },
+    "SpanPrototypeListResponse": {
+      "required": [
+        "status",
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean"
+        },
+        "result": {
+          "$ref": "#/definitions/SpanPrototypeListResult"
+        }
+      }
+    },
     "SpendSummaryResponse": {
       "required": [
         "status",
@@ -72940,6 +72935,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "TraceAgentGraphResponse": {
+      "required": [
+        "status",
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean"
+        },
+        "result": {
+          "$ref": "#/definitions/TraceAgentGraphResult"
+        }
+      }
+    },
     "TraceDetailResponse": {
       "required": [
         "result"
@@ -73039,6 +73050,22 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
         "result": {
           "$ref": "#/definitions/TraceObserveListResult"
+        }
+      }
+    },
+    "TracePrototypeListResponse": {
+      "required": [
+        "status",
+        "result"
+      ],
+      "type": "object",
+      "properties": {
+        "status": {
+          "title": "Status",
+          "type": "boolean"
+        },
+        "result": {
+          "$ref": "#/definitions/TracePrototypeListResult"
         }
       }
     },
@@ -73323,19 +73350,17 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "items": {
             "type": "object",
             "additionalProperties": {
-              "type": "string",
-              "x-nullable": true
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
             }
           }
         },
         "config": {
           "type": "array",
           "items": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "string",
-              "x-nullable": true
-            }
+            "$ref": "#/definitions/TraceObserveColumnConfig"
           }
         },
         "has_more": {
@@ -91914,6 +91939,68 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "SpanObserveListResult": {
+      "required": [
+        "metadata",
+        "table",
+        "config"
+      ],
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "$ref": "#/definitions/SpanListMetadata"
+        },
+        "table": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          }
+        },
+        "config": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SpanListColumnConfig"
+          }
+        }
+      }
+    },
+    "SpanPrototypeListResult": {
+      "required": [
+        "column_config",
+        "metadata",
+        "table"
+      ],
+      "type": "object",
+      "properties": {
+        "column_config": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SpanListColumnConfig"
+          }
+        },
+        "metadata": {
+          "$ref": "#/definitions/SpanListMetadata"
+        },
+        "table": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          }
+        }
+      }
+    },
     "SpendSummaryResult": {
       "required": [
         "period",
@@ -92589,6 +92676,96 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "TraceAgentGraphResult": {
+      "required": [
+        "nodes",
+        "edges",
+        "path_edges"
+      ],
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TraceAgentGraphNode"
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TraceAgentGraphEdge"
+          }
+        },
+        "path_edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TraceAgentGraphEdge"
+          }
+        },
+        "graph_collapsed": {
+          "title": "Graph collapsed",
+          "type": "boolean"
+        },
+        "graph_node_limit": {
+          "title": "Graph node limit",
+          "type": "integer",
+          "minimum": 1
+        },
+        "omitted_node_count": {
+          "title": "Omitted node count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_complete": {
+          "title": "Query complete",
+          "type": "boolean"
+        },
+        "query_status": {
+          "title": "Query status",
+          "type": "string",
+          "enum": [
+            "complete",
+            "pending"
+          ]
+        },
+        "query_sampled": {
+          "title": "Query sampled",
+          "type": "boolean"
+        },
+        "query_count": {
+          "title": "Query count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_rows_returned": {
+          "title": "Query rows returned",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_elapsed_ms": {
+          "title": "Query elapsed ms",
+          "type": "number",
+          "minimum": 0
+        },
+        "query_completed_at": {
+          "title": "Query completed at",
+          "type": "string",
+          "format": "date-time"
+        },
+        "query_cached": {
+          "title": "Query cached",
+          "type": "boolean"
+        },
+        "query_refresh_failed": {
+          "title": "Query refresh failed",
+          "type": "boolean"
+        },
+        "query_refreshing": {
+          "title": "Query refreshing",
+          "type": "boolean"
+        }
+      }
+    },
     "TraceDetailResult": {
       "required": [
         "trace",
@@ -92831,6 +93008,37 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "TracePrototypeListResult": {
+      "required": [
+        "column_config",
+        "metadata",
+        "table"
+      ],
+      "type": "object",
+      "properties": {
+        "column_config": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TraceObserveColumnConfig"
+          }
+        },
+        "metadata": {
+          "$ref": "#/definitions/TraceObserveListMetadata"
+        },
+        "table": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "x-nullable": true,
+              "x-json-value": true,
+              "description": "Any valid JSON value."
+            }
+          }
+        }
+      }
+    },
     "TraceToGraphResult": {
       "required": [
         "graph_id",
@@ -92847,6 +93055,101 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "title": "Version id",
           "type": "string",
           "format": "uuid"
+        }
+      }
+    },
+    "TraceObserveColumnConfig": {
+      "required": [
+        "id",
+        "name",
+        "is_visible"
+      ],
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "title": "Name",
+          "type": "string",
+          "minLength": 1
+        },
+        "is_visible": {
+          "title": "Is visible",
+          "type": "boolean"
+        },
+        "group_by": {
+          "title": "Group by",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "output_type": {
+          "title": "Output type",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "reverse_output": {
+          "title": "Reverse output",
+          "type": "boolean",
+          "x-nullable": true
+        },
+        "annotation_label_type": {
+          "title": "Annotation label type",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "choices": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "x-nullable": true
+          },
+          "x-nullable": true
+        },
+        "settings": {
+          "title": "Settings",
+          "type": "object",
+          "x-nullable": true,
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "choices_map": {
+          "title": "Choices map",
+          "type": "object",
+          "x-nullable": true,
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "eval_template_id": {
+          "title": "Eval template id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "annotators": {
+          "title": "Annotators",
+          "type": "object",
+          "x-nullable": true,
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "source_field": {
+          "title": "Source field",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "parent_eval_id": {
+          "title": "Parent eval id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
         }
       }
     },
@@ -100857,6 +101160,172 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
+    "SpanListColumnConfig": {
+      "required": [
+        "id",
+        "name",
+        "is_visible"
+      ],
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "title": "Name",
+          "type": "string",
+          "minLength": 1
+        },
+        "is_visible": {
+          "title": "Is visible",
+          "type": "boolean"
+        },
+        "group_by": {
+          "title": "Group by",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "output_type": {
+          "title": "Output type",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "reverse_output": {
+          "title": "Reverse output",
+          "type": "boolean",
+          "x-nullable": true
+        },
+        "annotation_label_type": {
+          "title": "Annotation label type",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "choices": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "x-nullable": true
+          },
+          "x-nullable": true
+        },
+        "settings": {
+          "title": "Settings",
+          "type": "object",
+          "x-nullable": true,
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "choices_map": {
+          "title": "Choices map",
+          "type": "object",
+          "x-nullable": true,
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "eval_template_id": {
+          "title": "Eval template id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "annotators": {
+          "title": "Annotators",
+          "type": "object",
+          "x-nullable": true,
+          "x-json-value": true,
+          "description": "Any valid JSON value."
+        },
+        "source_field": {
+          "title": "Source field",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "parent_eval_id": {
+          "title": "Parent eval id",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        }
+      }
+    },
+    "SpanListMetadata": {
+      "required": [
+        "total_rows"
+      ],
+      "type": "object",
+      "properties": {
+        "total_rows": {
+          "title": "Total rows",
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_rows_exact": {
+          "title": "Total rows exact",
+          "type": "integer",
+          "minimum": 0,
+          "x-nullable": true
+        },
+        "total_rows_is_lower_bound": {
+          "title": "Total rows is lower bound",
+          "type": "boolean"
+        },
+        "has_more": {
+          "title": "Has more",
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "title": "Next cursor",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "query_complete": {
+          "title": "Query complete",
+          "type": "boolean"
+        },
+        "query_status": {
+          "title": "Query status",
+          "type": "string",
+          "enum": [
+            "complete",
+            "degraded"
+          ]
+        },
+        "query_error_code": {
+          "title": "Query error code",
+          "type": "string",
+          "minLength": 1,
+          "x-nullable": true
+        },
+        "query_elapsed_ms": {
+          "title": "Query elapsed ms",
+          "type": "number",
+          "minimum": 0
+        },
+        "query_count": {
+          "title": "Query count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_rows_returned": {
+          "title": "Query rows returned",
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_result_payload_bytes": {
+          "title": "Query result payload bytes",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
     "SpendSummaryOrg": {
       "required": [
         "total_spend",
@@ -101049,11 +101518,86 @@ export const OPENAPI_CONTRACT = Object.freeze({
         }
       }
     },
-    "TraceObserveColumnConfig": {
+    "TraceAgentGraphEdge": {
+      "required": [
+        "source",
+        "target",
+        "transition_count",
+        "avg_latency_ms",
+        "total_tokens",
+        "total_cost",
+        "error_count",
+        "trace_count",
+        "is_self_loop"
+      ],
+      "type": "object",
+      "properties": {
+        "source": {
+          "title": "Source",
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "title": "Target",
+          "type": "string",
+          "minLength": 1
+        },
+        "transition_count": {
+          "title": "Transition count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "avg_latency_ms": {
+          "title": "Avg latency ms",
+          "type": "number",
+          "minimum": 0
+        },
+        "total_tokens": {
+          "title": "Total tokens",
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_cost": {
+          "title": "Total cost",
+          "type": "number",
+          "minimum": 0
+        },
+        "error_count": {
+          "title": "Error count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "trace_count": {
+          "title": "Trace count",
+          "type": "integer",
+          "minimum": 0,
+          "x-nullable": true
+        },
+        "trace_count_exact": {
+          "title": "Trace count exact",
+          "type": "boolean"
+        },
+        "is_self_loop": {
+          "title": "Is self loop",
+          "type": "boolean"
+        },
+        "is_aggregate": {
+          "title": "Is aggregate",
+          "type": "boolean"
+        }
+      }
+    },
+    "TraceAgentGraphNode": {
       "required": [
         "id",
         "name",
-        "is_visible"
+        "type",
+        "span_count",
+        "avg_latency_ms",
+        "total_tokens",
+        "total_cost",
+        "error_count",
+        "trace_count"
       ],
       "type": "object",
       "properties": {
@@ -101067,80 +101611,54 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "minLength": 1
         },
-        "is_visible": {
-          "title": "Is visible",
+        "type": {
+          "title": "Type",
+          "type": "string",
+          "minLength": 1
+        },
+        "span_count": {
+          "title": "Span count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "avg_latency_ms": {
+          "title": "Avg latency ms",
+          "type": "number",
+          "minimum": 0
+        },
+        "total_tokens": {
+          "title": "Total tokens",
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_cost": {
+          "title": "Total cost",
+          "type": "number",
+          "minimum": 0
+        },
+        "error_count": {
+          "title": "Error count",
+          "type": "integer",
+          "minimum": 0
+        },
+        "trace_count": {
+          "title": "Trace count",
+          "type": "integer",
+          "minimum": 0,
+          "x-nullable": true
+        },
+        "trace_count_exact": {
+          "title": "Trace count exact",
           "type": "boolean"
         },
-        "group_by": {
-          "title": "Group by",
-          "type": "string",
-          "minLength": 1,
-          "x-nullable": true
+        "is_aggregate": {
+          "title": "Is aggregate",
+          "type": "boolean"
         },
-        "output_type": {
-          "title": "Output type",
-          "type": "string",
-          "minLength": 1,
-          "x-nullable": true
-        },
-        "reverse_output": {
-          "title": "Reverse output",
-          "type": "boolean",
-          "x-nullable": true
-        },
-        "annotation_label_type": {
-          "title": "Annotation label type",
-          "type": "string",
-          "minLength": 1,
-          "x-nullable": true
-        },
-        "choices": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "x-nullable": true
-          },
-          "x-nullable": true
-        },
-        "settings": {
-          "title": "Settings",
-          "type": "object",
-          "x-nullable": true,
-          "x-json-value": true,
-          "description": "Any valid JSON value."
-        },
-        "choices_map": {
-          "title": "Choices map",
-          "type": "object",
-          "x-nullable": true,
-          "x-json-value": true,
-          "description": "Any valid JSON value."
-        },
-        "eval_template_id": {
-          "title": "Eval template id",
-          "type": "string",
-          "minLength": 1,
-          "x-nullable": true
-        },
-        "annotators": {
-          "title": "Annotators",
-          "type": "object",
-          "x-nullable": true,
-          "x-json-value": true,
-          "description": "Any valid JSON value."
-        },
-        "source_field": {
-          "title": "Source field",
-          "type": "string",
-          "minLength": 1,
-          "x-nullable": true
-        },
-        "parent_eval_id": {
-          "title": "Parent eval id",
-          "type": "string",
-          "minLength": 1,
-          "x-nullable": true
+        "member_count": {
+          "title": "Member count",
+          "type": "integer",
+          "minimum": 0
         }
       }
     },

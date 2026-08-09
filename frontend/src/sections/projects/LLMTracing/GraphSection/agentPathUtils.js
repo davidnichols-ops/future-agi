@@ -240,14 +240,54 @@ export const computeNaturalSize = (layout) => {
 };
 
 export const computeSankeyLayout = (graphData) => {
-  if (!graphData?.nodes?.length) return null;
+  if (!graphData || typeof graphData !== "object") {
+    throw new Error("Agent Path data is missing");
+  }
+  if (!Array.isArray(graphData.nodes)) {
+    throw new Error("Agent Path data is missing nodes");
+  }
+  if (!Array.isArray(graphData.path_edges)) {
+    throw new Error("Agent Path data is missing canonical path_edges");
+  }
+  graphData.nodes.forEach((node, index) => {
+    if (
+      typeof node?.id !== "string" ||
+      !node.id ||
+      !Number.isFinite(node.span_count) ||
+      node.span_count < 0
+    ) {
+      throw new Error(`Agent Path node #${index} is malformed`);
+    }
+  });
+  graphData.path_edges.forEach((edge, index) => {
+    if (
+      typeof edge?.source !== "string" ||
+      !edge.source ||
+      typeof edge.target !== "string" ||
+      !edge.target ||
+      !Number.isFinite(edge.transition_count) ||
+      edge.transition_count < 0
+    ) {
+      throw new Error(`Agent Path edge #${index} is malformed`);
+    }
+  });
+  if (!graphData.nodes.length) return null;
 
-  // Agent Path is the exact recorded parent_span_id flow rendered as a Sankey;
-  // timestamps alone never create a transition between sibling spans.
-  // Falling back to `edges` keeps compatibility with older cached payloads
-  // that predate `path_edges`, while an explicit empty path stays empty.
-  const graphEdges =
-    graphData.path_edges ?? graphData.pathEdges ?? graphData.edges ?? [];
+  const allNodeIds = new Set(graphData.nodes.map((node) => node.id));
+  if (allNodeIds.size !== graphData.nodes.length) {
+    throw new Error("Agent Path contains duplicate node ids");
+  }
+  graphData.path_edges.forEach((edge) => {
+    if (!allNodeIds.has(edge.source) || !allNodeIds.has(edge.target)) {
+      throw new Error(
+        `Agent Path edge references an unknown node: ${edge.source}->${edge.target}`,
+      );
+    }
+  });
+
+  // Agent Path is the producer's exact recorded path projection rendered as a
+  // Sankey. Presentation never substitutes aggregate graph edges for it.
+  const graphEdges = graphData.path_edges;
 
   const nodeMap = new Map();
   graphData.nodes.forEach((n) => {
@@ -386,7 +426,7 @@ export const computeSankeyLayout = (graphData) => {
     flows.push({
       source: e.source,
       target: e.target,
-      count: e.transition_count ?? e.transitionCount ?? 1,
+      count: e.transition_count,
       sourceColor: getColor(nodeMap.get(e.source)?.type),
       targetColor: getColor(nodeMap.get(e.target)?.type),
       sourceRank,

@@ -967,6 +967,7 @@ function PropertyPicker({
     browseStatus: exactAttributeBrowseStatus,
     pageCount: exactAttributePageCount,
     exactSearchMatched: exactAttributeSearchMatched = false,
+    cursorRetryExhausted: exactAttributeCursorRetryExhausted = false,
     debouncedSearch,
     refetch: refetchAttributePages,
   } = useExactTraceAttributeProperties({
@@ -1058,6 +1059,12 @@ function PropertyPicker({
     hasNextAttributePage &&
     !exactAttributeSearchMatched &&
     !propertySearchHasExactSystemRawId;
+  const exactAttributeDiscoveryTerminal =
+    exactAttributeCursorRetryExhausted ||
+    exactAttributeBrowseStatus === "exhausted" ||
+    exactAttributeBrowseStatus === "limit_reached" ||
+    exactAttributeReadState === "error" ||
+    exactAttributeReadState === "degraded";
   const manualAttributeProperty = useMemo(
     () =>
       debouncedSearch === search.trim() && !exactAttributeLoading
@@ -1070,7 +1077,7 @@ function PropertyPicker({
             // offered only after the frozen retained catalog is exhausted.
             enabled:
               enableExactAttributeLookup &&
-              exactAttributeBrowseStatus === "exhausted" &&
+              exactAttributeDiscoveryTerminal &&
               !hasNextAttributePage,
             hasCategorySidebar,
           })
@@ -1079,7 +1086,7 @@ function PropertyPicker({
       category,
       debouncedSearch,
       enableExactAttributeLookup,
-      exactAttributeBrowseStatus,
+      exactAttributeDiscoveryTerminal,
       exactAttributeLoading,
       hasCategorySidebar,
       hasNextAttributePage,
@@ -1220,6 +1227,8 @@ function PropertyPicker({
             {enableExactAttributeLookup &&
               (source === "traces" || source === "spans") &&
               exactAttributeReadState !== "complete" &&
+              !isNextAttributePageError &&
+              !exactAttributeCursorRetryExhausted &&
               !exactAttributeLoading && (
                 <Button
                   size="small"
@@ -2854,28 +2863,139 @@ const TraceFilterPanel = ({
     error: aiError,
   } = useAIFilter(aiFilterSchema);
   const [rows, setRows] = useState([{ ...DEFAULT_ROW }]);
+  const [queryFieldSearch, setQueryFieldSearch] = useState("");
+  const [pinnedQueryAttributeProperties, setPinnedQueryAttributeProperties] =
+    useState([]);
   // Serialized snapshot of the filter set last sent to onApply. Auto-apply
   // compares against this so we only hit the API when the applyable filter set
   // actually changes — picking a field/operator with no value, or re-opening
   // the popover, yields the same set and is skipped.
   const lastAppliedRef = useRef(undefined);
 
+  const queryAttributeLookupEnabled = Boolean(
+    open &&
+      showQueryTab &&
+      activeTab === "query" &&
+      observeId &&
+      (exactAttributeSource === "traces" || exactAttributeSource === "spans"),
+  );
+  const {
+    data: queryExactAttributeProperties = [],
+    isFetching: queryAttributeLoading,
+    fetchNextPage: fetchNextQueryAttributePage,
+    hasNextPage: hasNextQueryAttributePage,
+    isFetchingNextPage: isFetchingNextQueryAttributePage,
+    queryReadState: queryAttributeReadState,
+    browseStatus: queryAttributeBrowseStatus,
+    debouncedSearch: debouncedQueryFieldSearch,
+  } = useExactTraceAttributeProperties({
+    projectId: observeId,
+    search: queryFieldSearch,
+    source: exactAttributeSource,
+    enabled: queryAttributeLookupEnabled,
+  });
+
+  useEffect(() => {
+    setQueryFieldSearch("");
+    setPinnedQueryAttributeProperties([]);
+  }, [observeId, exactAttributeSource]);
+
+  const filteredQueryExactAttributeProperties = useMemo(
+    () =>
+      propertyFilter
+        ? queryExactAttributeProperties.filter(propertyFilter)
+        : queryExactAttributeProperties,
+    [propertyFilter, queryExactAttributeProperties],
+  );
+  const queryUsesRetainedAttributePages = shouldUseRetainedAttributePages({
+    enabled: queryAttributeLookupEnabled,
+    source: exactAttributeSource,
+    readState: queryAttributeReadState,
+    attributes: filteredQueryExactAttributeProperties,
+    browseStatus: queryAttributeBrowseStatus,
+  });
+  const selectedQueryAttributeProperties = useMemo(
+    () =>
+      rows.flatMap((row) => {
+        if (
+          !row.field ||
+          (row.fieldCategory !== "attribute" &&
+            row.apiColType !== "SPAN_ATTRIBUTE")
+        ) {
+          return [];
+        }
+        return [
+          {
+            id: row.field,
+            name: row.fieldName || row.field,
+            category: "attribute",
+            rawCategory: "custom_attribute",
+            type: row.fieldType || "string",
+            attributeTypes: row.attributeTypes,
+            attributeTypesExact: row.attributeTypesExact,
+            apiColType: row.apiColType || "SPAN_ATTRIBUTE",
+          },
+        ];
+      }),
+    [rows],
+  );
+  const queryProperties = useMemo(() => {
+    const discovered = mergeRetainedAttributeProperties(
+      properties,
+      filteredQueryExactAttributeProperties,
+      { canonical: queryUsesRetainedAttributePages },
+    );
+    const selectedAttributesById = new Map();
+    for (const property of [
+      ...selectedQueryAttributeProperties,
+      ...pinnedQueryAttributeProperties,
+    ]) {
+      selectedAttributesById.set(property.id, property);
+    }
+    return mergeRetainedAttributeProperties(discovered, [
+      ...selectedAttributesById.values(),
+    ]);
+  }, [
+    filteredQueryExactAttributeProperties,
+    pinnedQueryAttributeProperties,
+    properties,
+    queryUsesRetainedAttributePages,
+    selectedQueryAttributeProperties,
+  ]);
+
   // Convert dashboard properties to QueryInput format (same IDs as dashboard API)
   const queryFilterFields = useMemo(() => {
-    return properties.map((p) => ({
+    return queryProperties.map((p) => ({
       value: p.id,
       label: p.name,
       type: p.type || "string",
       choices: p.choices,
       panelType: p.type || "string",
       category: p.category, // system, eval, annotation, attribute
+      rawCategory: p.rawCategory,
       apiColType: p.apiColType,
+      attributeTypes: p.attributeTypes,
+      attributeTypesExact: p.attributeTypesExact,
     }));
-  }, [properties]);
+  }, [queryProperties]);
   const queryFieldMap = useMemo(
     () => Object.fromEntries(queryFilterFields.map((f) => [f.value, f])),
     [queryFilterFields],
   );
+  const queryPropertyById = useMemo(
+    () => Object.fromEntries(queryProperties.map((p) => [p.id, p])),
+    [queryProperties],
+  );
+  const loadNextQueryAttributePage = useSingleFlightPageRequest({
+    identity: JSON.stringify([
+      observeId,
+      exactAttributeSource,
+      debouncedQueryFieldSearch,
+    ]),
+    enabled:
+      Boolean(hasNextQueryAttributePage) && !isFetchingNextQueryAttributePage,
+    request: fetchNextQueryAttributePage,
+  });
 
   // Query tab — fetch values for the selected field
   const [queryField, setQueryField] = useState(null);
@@ -2884,7 +3004,7 @@ const TraceFilterPanel = ({
     value: "",
   });
   const debouncedQueryValueSearch = useDebounce(queryValueSearch, 500);
-  const queryFieldProp = properties.find((p) => p.id === queryField);
+  const queryFieldProp = queryPropertyById[queryField];
   const queryMetricType = (() => {
     const cat = queryFieldProp?.category || "system";
     if (cat === "system") return "system_metric";
@@ -2939,8 +3059,7 @@ const TraceFilterPanel = ({
       queryField,
       effectiveQueryValueSearch,
     ]),
-    enabled:
-      Boolean(hasNextQueryValuesPage) && !isFetchingNextQueryValuesPage,
+    enabled: Boolean(hasNextQueryValuesPage) && !isFetchingNextQueryValuesPage,
     request: fetchNextQueryValuesPage,
   });
   const queryValuesMessage = getQueryReadMessage(
@@ -3018,7 +3137,7 @@ const TraceFilterPanel = ({
     (tokens) =>
       tokens.map((t) => {
         const queryFieldDef = queryFieldMap[t.field];
-        const prop = propertyById[t.field];
+        const prop = queryPropertyById[t.field];
         const fieldType =
           prop?.type ||
           queryFieldDef?.panelType ||
@@ -3035,15 +3154,16 @@ const TraceFilterPanel = ({
           fieldName: prop?.name || queryFieldDef?.label,
           fieldCategory: resolveFieldCategory(undefined, prop || queryFieldDef),
           fieldType,
-          attributeTypes: prop?.attributeTypes,
-          attributeTypesExact: prop?.attributeTypesExact,
+          attributeTypes: prop?.attributeTypes || queryFieldDef?.attributeTypes,
+          attributeTypesExact:
+            prop?.attributeTypesExact ?? queryFieldDef?.attributeTypesExact,
           apiColType: prop?.apiColType || queryFieldDef?.apiColType,
           operator: QUERY_TO_BASIC_OP[t.operator] || t.operator,
           valueTypes: t.valueTypes,
           value,
         };
       }),
-    [propertyById, queryFieldMap],
+    [queryFieldMap, queryPropertyById],
   );
 
   const handleQueryTokensChange = useCallback(
@@ -3334,7 +3454,11 @@ const TraceFilterPanel = ({
                     freeSoloValues={freeSoloValues}
                     operatorFilter={operatorFilter}
                     defaultOperatorForType={defaultOperatorForType}
-                    enableExactAttributeLookup={!skipDynamicProperties}
+                    enableExactAttributeLookup={Boolean(
+                      observeId &&
+                        (exactAttributeSource === "traces" ||
+                          exactAttributeSource === "spans"),
+                    )}
                     catalogError={!skipDynamicProperties && dynamicPropsError}
                     attributeSource={exactAttributeSource}
                   />
@@ -3414,6 +3538,15 @@ const TraceFilterPanel = ({
                   };
                 })}
               valueOptions={queryValueOptions}
+              fieldLoading={
+                queryAttributeLookupEnabled &&
+                (queryAttributeLoading ||
+                  queryFieldSearch.trim() !== debouncedQueryFieldSearch)
+              }
+              fieldLoadingMore={isFetchingNextQueryAttributePage}
+              hasMoreFields={Boolean(hasNextQueryAttributePage)}
+              onLoadMoreFields={loadNextQueryAttributePage}
+              onFieldSearchChange={setQueryFieldSearch}
               valueLoading={queryValuesLoading}
               valueLoadingMore={isFetchingNextQueryValuesPage}
               hasMoreValues={Boolean(hasNextQueryValuesPage)}
@@ -3424,6 +3557,15 @@ const TraceFilterPanel = ({
               onFieldChange={(field) => {
                 setQueryValueSearch({ field, value: "" });
                 setQueryField(field);
+                setQueryFieldSearch("");
+                const selectedProperty = queryPropertyById[field];
+                if (selectedProperty?.category === "attribute") {
+                  setPinnedQueryAttributeProperties((current) =>
+                    mergeRetainedAttributeProperties(current, [
+                      selectedProperty,
+                    ]),
+                  );
+                }
               }}
             />
             {shouldFetchQueryValues && queryValuesMessage && (

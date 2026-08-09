@@ -27,6 +27,7 @@ import { useQuery } from "@tanstack/react-query";
 import { generateAnnotationColumnsForTracing } from "src/sections/projects/LLMTracing/common";
 import { useShallowToggleAnnotationsStore } from "src/sections/agents/store";
 import { getListTotalState } from "src/sections/projects/LLMTracing/listTotalMetadata";
+import { parsePrototypeTraceListResponse } from "src/api/project/telemetry-list-contract";
 
 const defaultFilter = {
   column_id: "",
@@ -37,34 +38,13 @@ const defaultFilter = {
   },
 };
 
-const normalizeColumnConfig = (column = {}) => ({
-  ...column,
-  isVisible: column.isVisible ?? column.is_visible,
-  groupBy: column.groupBy ?? column.group_by,
-  outputType: column.outputType ?? column.output_type,
-  reverseOutput: column.reverseOutput ?? column.reverse_output,
-  annotationLabelType:
-    column.annotationLabelType ?? column.annotation_label_type,
-  choicesMap: column.choicesMap ?? column.choices_map,
-  evalTemplateId: column.evalTemplateId ?? column.eval_template_id,
-  sourceField: column.sourceField ?? column.source_field,
-  parentEvalId: column.parentEvalId ?? column.parent_eval_id,
-});
-
-const normalizeTraceListPayload = (payload = {}) => {
-  const metadata = payload.metadata || {};
+const normalizeTraceListPayload = (payload) => {
+  const normalized = parsePrototypeTraceListResponse(payload);
+  const metadata = normalized.metadata;
   const totalState = getListTotalState(metadata);
 
   return {
-    columnConfig: (
-      payload.columnConfig ||
-      payload.column_config ||
-      payload.config ||
-      []
-    ).map(normalizeColumnConfig),
-    table: payload.table || [],
-    totalRows: metadata.totalRows ?? metadata.total_rows ?? 0,
-    hasMore: metadata.hasMore ?? metadata.has_more ?? false,
+    ...normalized,
     ...totalState,
   };
 };
@@ -313,7 +293,7 @@ const TraceTab = React.forwardRef(
                 filters: JSON.stringify(debouncedValidatedFilters),
               },
             });
-            const res = normalizeTraceListPayload(results?.data?.result);
+            const res = normalizeTraceListPayload(results.data);
             const columns = res.columnConfig.map((o) => ({
               ...o,
               id: o.id,
@@ -334,7 +314,7 @@ const TraceTab = React.forwardRef(
           }
         },
         getRowId: ({ data }) => {
-          return data.rowId;
+          return data.trace_id;
         },
       }),
       [debouncedValidatedFilters, runId, selectedTraceIds, setColumns],

@@ -4042,18 +4042,21 @@ export const SpanAttributeTopValueApiType = {
   json: 'json',
 } as const;
 
-export type SpanAttributeJsonValueApi =
+export type JsonValueApi =
   | string
   | number
   | boolean
   | null
-  | SpanAttributeJsonValueApi[]
-  | { [key: string]: SpanAttributeJsonValueApi };
+  | JsonValueApi[]
+  | { [key: string]: JsonValueApi };
+
+/** @deprecated Use JsonValueApi. */
+export type SpanAttributeJsonValueApi = JsonValueApi;
 
 /**
  * Any valid JSON value.
  */
-export type SpanAttributeTopValueApiValue = SpanAttributeJsonValueApi;
+export type SpanAttributeTopValueApiValue = JsonValueApi;
 
 export interface SpanAttributeTopValueApi {
   /** Any valid JSON value. */
@@ -4229,7 +4232,7 @@ export const SpanAttributeValueApiType = {
 /**
  * Any valid JSON value.
  */
-export type SpanAttributeValueApiValue = SpanAttributeJsonValueApi;
+export type SpanAttributeValueApiValue = JsonValueApi;
 
 export interface SpanAttributeValueApi {
   /** Any valid JSON value. */
@@ -19141,7 +19144,7 @@ export const DashboardFilterValueOptionApiType = {
 /**
  * Any valid JSON value.
  */
-export type DashboardFilterValueOptionApiValue = SpanAttributeJsonValueApi;
+export type DashboardFilterValueOptionApiValue = JsonValueApi;
 
 export interface DashboardFilterValueOptionApi {
   /** Any valid JSON value. */
@@ -21066,6 +21069,93 @@ export interface ObserveGraphDataResponseApi {
   result: ObserveGraphDataResultApi;
 }
 
+/**
+ * Any valid JSON value.
+ */
+export type SpanListColumnConfigApiSettings = JsonValueApi;
+
+/**
+ * Any valid JSON value.
+ */
+export type SpanListColumnConfigApiChoicesMap = JsonValueApi;
+
+/**
+ * Any valid JSON value.
+ */
+export type SpanListColumnConfigApiAnnotators = JsonValueApi;
+
+export interface SpanListColumnConfigApi {
+  /** @minLength 1 */
+  id: string;
+  /** @minLength 1 */
+  name: string;
+  is_visible: boolean;
+  /** @minLength 1 */
+  group_by?: string | null;
+  /** @minLength 1 */
+  output_type?: string | null;
+  reverse_output?: boolean | null;
+  /** @minLength 1 */
+  annotation_label_type?: string | null;
+  choices?: (string | null)[] | null;
+  /** Any valid JSON value. */
+  settings?: SpanListColumnConfigApiSettings;
+  /** Any valid JSON value. */
+  choices_map?: SpanListColumnConfigApiChoicesMap;
+  /** @minLength 1 */
+  eval_template_id?: string | null;
+  /** Any valid JSON value. */
+  annotators?: SpanListColumnConfigApiAnnotators;
+  /** @minLength 1 */
+  source_field?: string | null;
+  /** @minLength 1 */
+  parent_eval_id?: string | null;
+}
+
+export type SpanListMetadataApiQueryStatus = typeof SpanListMetadataApiQueryStatus[keyof typeof SpanListMetadataApiQueryStatus];
+
+
+export const SpanListMetadataApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
+export interface SpanListMetadataApi {
+  /** @minimum 0 */
+  total_rows: number;
+  /** @minimum 0 */
+  total_rows_exact?: number | null;
+  total_rows_is_lower_bound?: boolean;
+  has_more?: boolean;
+  /** @minLength 1 */
+  next_cursor?: string | null;
+  query_complete?: boolean;
+  query_status?: SpanListMetadataApiQueryStatus;
+  /** @minLength 1 */
+  query_error_code?: string | null;
+  /** @minimum 0 */
+  query_elapsed_ms?: number;
+  /** @minimum 0 */
+  query_count?: number;
+  /** @minimum 0 */
+  query_rows_returned?: number;
+  /** @minimum 0 */
+  query_result_payload_bytes?: number;
+}
+
+export type SpanPrototypeListResultApiTableItem = { [key: string]: JsonValueApi };
+
+export interface SpanPrototypeListResultApi {
+  column_config: SpanListColumnConfigApi[];
+  metadata: SpanListMetadataApi;
+  table: SpanPrototypeListResultApiTableItem[];
+}
+
+export interface SpanPrototypeListResponseApi {
+  status: boolean;
+  result: SpanPrototypeListResultApi;
+}
+
 export type PageDepthExceededErrorApiType = typeof PageDepthExceededErrorApiType[keyof typeof PageDepthExceededErrorApiType];
 
 
@@ -21106,88 +21196,17 @@ export interface PageDepthExceededErrorApi {
   details?: PageDepthExceededErrorApiDetails;
 }
 
-export type TraceObserveListMetadataApiQueryStatus = typeof TraceObserveListMetadataApiQueryStatus[keyof typeof TraceObserveListMetadataApiQueryStatus];
+export type SpanObserveListResultApiTableItem = { [key: string]: JsonValueApi };
 
-
-export const TraceObserveListMetadataApiQueryStatus = {
-  complete: 'complete',
-  degraded: 'degraded',
-} as const;
-
-export interface TraceObserveListMetadataApi {
-  total_rows: number;
-  total_rows_exact?: number;
-  total_rows_is_lower_bound?: boolean;
-  has_more?: boolean;
-  /** @minLength 1 */
-  next_cursor?: string;
-  query_complete?: boolean;
-  query_status?: TraceObserveListMetadataApiQueryStatus;
-  /** @minLength 1 */
-  query_error_code?: string;
-  query_elapsed_ms?: number;
-  /** @minimum 0 */
-  query_count?: number;
-  /** @minimum 0 */
-  query_rows_returned?: number;
-  /** @minimum 0 */
-  query_result_payload_bytes?: number;
+export interface SpanObserveListResultApi {
+  metadata: SpanListMetadataApi;
+  table: SpanObserveListResultApiTableItem[];
+  config: SpanListColumnConfigApi[];
 }
 
-/**
- * Any valid JSON value.
- */
-export type TraceObserveColumnConfigApiSettings = { [key: string]: unknown };
-
-/**
- * Any valid JSON value.
- */
-export type TraceObserveColumnConfigApiChoicesMap = { [key: string]: unknown };
-
-/**
- * Any valid JSON value.
- */
-export type TraceObserveColumnConfigApiAnnotators = { [key: string]: unknown };
-
-export interface TraceObserveColumnConfigApi {
-  /** @minLength 1 */
-  id: string;
-  /** @minLength 1 */
-  name: string;
-  is_visible: boolean;
-  /** @minLength 1 */
-  group_by?: string;
-  /** @minLength 1 */
-  output_type?: string;
-  reverse_output?: boolean;
-  /** @minLength 1 */
-  annotation_label_type?: string;
-  choices?: string[];
-  /** Any valid JSON value. */
-  settings?: TraceObserveColumnConfigApiSettings;
-  /** Any valid JSON value. */
-  choices_map?: TraceObserveColumnConfigApiChoicesMap;
-  /** @minLength 1 */
-  eval_template_id?: string;
-  /** Any valid JSON value. */
-  annotators?: TraceObserveColumnConfigApiAnnotators;
-  /** @minLength 1 */
-  source_field?: string;
-  /** @minLength 1 */
-  parent_eval_id?: string;
-}
-
-export type TraceObserveListResultApiTableItem = {[key: string]: { [key: string]: unknown }};
-
-export interface TraceObserveListResultApi {
-  metadata: TraceObserveListMetadataApi;
-  table: TraceObserveListResultApiTableItem[];
-  config: TraceObserveColumnConfigApi[];
-}
-
-export interface TraceObserveListResponseApi {
+export interface SpanObserveListResponseApi {
   status: boolean;
-  result: TraceObserveListResultApi;
+  result: SpanObserveListResultApi;
 }
 
 export type RootSpansResponseApiResult = {[key: string]: string};
@@ -22460,6 +22479,90 @@ export interface ObserveGraphDataErrorResponseApi {
   details?: ObserveGraphDataErrorResponseApiDetails;
 }
 
+export type TraceObserveListMetadataApiQueryStatus = typeof TraceObserveListMetadataApiQueryStatus[keyof typeof TraceObserveListMetadataApiQueryStatus];
+
+
+export const TraceObserveListMetadataApiQueryStatus = {
+  complete: 'complete',
+  degraded: 'degraded',
+} as const;
+
+export interface TraceObserveListMetadataApi {
+  total_rows: number;
+  total_rows_exact?: number | null;
+  total_rows_is_lower_bound?: boolean;
+  has_more?: boolean;
+  /** @minLength 1 */
+  next_cursor?: string | null;
+  query_complete?: boolean;
+  query_status?: TraceObserveListMetadataApiQueryStatus;
+  /** @minLength 1 */
+  query_error_code?: string | null;
+  query_elapsed_ms?: number;
+  /** @minimum 0 */
+  query_count?: number;
+  /** @minimum 0 */
+  query_rows_returned?: number;
+  /** @minimum 0 */
+  query_result_payload_bytes?: number;
+}
+
+/**
+ * Any valid JSON value.
+ */
+export type TraceObserveColumnConfigApiSettings = JsonValueApi;
+
+/**
+ * Any valid JSON value.
+ */
+export type TraceObserveColumnConfigApiChoicesMap = JsonValueApi;
+
+/**
+ * Any valid JSON value.
+ */
+export type TraceObserveColumnConfigApiAnnotators = JsonValueApi;
+
+export interface TraceObserveColumnConfigApi {
+  /** @minLength 1 */
+  id: string;
+  /** @minLength 1 */
+  name: string;
+  is_visible: boolean;
+  /** @minLength 1 */
+  group_by?: string | null;
+  /** @minLength 1 */
+  output_type?: string | null;
+  reverse_output?: boolean | null;
+  /** @minLength 1 */
+  annotation_label_type?: string | null;
+  choices?: (string | null)[] | null;
+  /** Any valid JSON value. */
+  settings?: TraceObserveColumnConfigApiSettings;
+  /** Any valid JSON value. */
+  choices_map?: TraceObserveColumnConfigApiChoicesMap;
+  /** @minLength 1 */
+  eval_template_id?: string | null;
+  /** Any valid JSON value. */
+  annotators?: TraceObserveColumnConfigApiAnnotators;
+  /** @minLength 1 */
+  source_field?: string | null;
+  /** @minLength 1 */
+  parent_eval_id?: string | null;
+}
+
+export type TraceObserveListResultApiTableItem = { [key: string]: JsonValueApi };
+
+export interface TraceObserveListResultApi {
+  metadata: TraceObserveListMetadataApi;
+  table: TraceObserveListResultApiTableItem[];
+  config: TraceObserveColumnConfigApi[];
+}
+
+export interface TraceObserveListResponseApi {
+  status: boolean;
+  result: TraceObserveListResultApi;
+}
+
 export type TraceApiMetadata = { [key: string]: unknown };
 
 export type TraceApiInput = { [key: string]: unknown };
@@ -22486,9 +22589,104 @@ export interface TraceApi {
   tags?: TraceApiTags;
 }
 
-export type TraceVoiceCallListResponseApiResultsItem = {[key: string]: string};
+export interface TraceAgentGraphNodeApi {
+  /** @minLength 1 */
+  id: string;
+  /** @minLength 1 */
+  name: string;
+  /** @minLength 1 */
+  type: string;
+  /** @minimum 0 */
+  span_count: number;
+  /** @minimum 0 */
+  avg_latency_ms: number;
+  /** @minimum 0 */
+  total_tokens: number;
+  /** @minimum 0 */
+  total_cost: number;
+  /** @minimum 0 */
+  error_count: number;
+  /** @minimum 0 */
+  trace_count: number | null;
+  trace_count_exact?: boolean;
+  is_aggregate?: boolean;
+  /** @minimum 0 */
+  member_count?: number;
+}
 
-export type TraceVoiceCallListResponseApiConfigItem = {[key: string]: string};
+export interface TraceAgentGraphEdgeApi {
+  /** @minLength 1 */
+  source: string;
+  /** @minLength 1 */
+  target: string;
+  /** @minimum 0 */
+  transition_count: number;
+  /** @minimum 0 */
+  avg_latency_ms: number;
+  /** @minimum 0 */
+  total_tokens: number;
+  /** @minimum 0 */
+  total_cost: number;
+  /** @minimum 0 */
+  error_count: number;
+  /** @minimum 0 */
+  trace_count: number | null;
+  trace_count_exact?: boolean;
+  is_self_loop: boolean;
+  is_aggregate?: boolean;
+}
+
+export type TraceAgentGraphResultApiQueryStatus = typeof TraceAgentGraphResultApiQueryStatus[keyof typeof TraceAgentGraphResultApiQueryStatus];
+
+
+export const TraceAgentGraphResultApiQueryStatus = {
+  complete: 'complete',
+  pending: 'pending',
+} as const;
+
+export interface TraceAgentGraphResultApi {
+  nodes: TraceAgentGraphNodeApi[];
+  edges: TraceAgentGraphEdgeApi[];
+  path_edges: TraceAgentGraphEdgeApi[];
+  graph_collapsed?: boolean;
+  /** @minimum 1 */
+  graph_node_limit?: number;
+  /** @minimum 0 */
+  omitted_node_count?: number;
+  query_complete?: boolean;
+  query_status?: TraceAgentGraphResultApiQueryStatus;
+  query_sampled?: boolean;
+  /** @minimum 0 */
+  query_count?: number;
+  /** @minimum 0 */
+  query_rows_returned?: number;
+  /** @minimum 0 */
+  query_elapsed_ms?: number;
+  query_completed_at?: string;
+  query_cached?: boolean;
+  query_refresh_failed?: boolean;
+  query_refreshing?: boolean;
+}
+
+export interface TraceAgentGraphResponseApi {
+  status: boolean;
+  result: TraceAgentGraphResultApi;
+}
+
+export type TracePrototypeListResultApiTableItem = { [key: string]: JsonValueApi };
+
+export interface TracePrototypeListResultApi {
+  column_config: TraceObserveColumnConfigApi[];
+  metadata: TraceObserveListMetadataApi;
+  table: TracePrototypeListResultApiTableItem[];
+}
+
+export interface TracePrototypeListResponseApi {
+  status: boolean;
+  result: TracePrototypeListResultApi;
+}
+
+export type TraceVoiceCallListResponseApiResultsItem = { [key: string]: JsonValueApi };
 
 export type TraceVoiceCallListResponseApiQueryStatus = typeof TraceVoiceCallListResponseApiQueryStatus[keyof typeof TraceVoiceCallListResponseApiQueryStatus];
 
@@ -22507,14 +22705,14 @@ export interface TraceVoiceCallListResponseApi {
   /** @minimum 1 */
   current_page: number;
   /** @minimum 1 */
-  next: number;
+  next: number | null;
   /** @minimum 1 */
-  previous: number;
+  previous: number | null;
   results: TraceVoiceCallListResponseApiResultsItem[];
-  config: TraceVoiceCallListResponseApiConfigItem[];
+  config: TraceObserveColumnConfigApi[];
   has_more: boolean;
   /** @minLength 1 */
-  next_cursor?: string;
+  next_cursor?: string | null;
   query_complete: boolean;
   query_status: TraceVoiceCallListResponseApiQueryStatus;
   /** @minLength 1 */
@@ -27706,13 +27904,25 @@ page?: number;
  * Number of results to return per page.
  */
 limit?: number;
-};
-
-export type TracerObservationSpanListSpans200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: ObservationSpanApi[];
+project_version_id: string;
+/**
+ * @minLength 1
+ */
+filters?: string;
+/**
+ * Zero-based numbered page. Pages whose required ordered work exceeds the finite read contract return HTTP 422 with code page_depth_exceeded; request an earlier page or narrow the time range.
+ * @minimum 0
+ */
+page_number?: number;
+/**
+ * @minimum 1
+ * @maximum 500
+ */
+page_size?: number;
+/**
+ * Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.
+ */
+allow_sampled?: boolean;
 };
 
 export type TracerObservationSpanListSpansObserveParams = {
@@ -28195,13 +28405,6 @@ filters?: string;
 refresh?: boolean;
 };
 
-export type TracerTraceAgentGraph200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: TraceApi[];
-};
-
 export type TracerTraceGetEvalNamesParams = {
 /**
  * A page number within the paginated result set.
@@ -28348,13 +28551,6 @@ page_size?: number;
  * Omit for backward-compatible complete bounded pages, which may label total_rows as a lower bound. Send false to require an exact total, or true to opt in explicitly to lower-bound totals.
  */
 allow_sampled?: boolean;
-};
-
-export type TracerTraceListTraces200 = {
-  count: number;
-  next?: string;
-  previous?: string;
-  results: TraceApi[];
 };
 
 export type TracerTraceListTracesOfSessionParams = {

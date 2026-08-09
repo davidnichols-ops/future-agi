@@ -400,14 +400,14 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         return self._bounded_delegate().recommended_filter_classify_batch_size()
 
     def _filter_exact_zero_probe_plans(self) -> tuple[Any, list[Any]] | None:
-        """Return scalar Map leaves eligible for an exact negative proof.
+        """Return scalar Map leaves accepted by the legacy temporal probe.
 
-        The probe reads physical raw witnesses, which are a superset of
-        latest-live membership.  Therefore an exhausted intersection proves
-        exact zero, while any returned trace merely falls back to the normal
-        latest-state selector.  Restrict the optimization to the two-or-more
-        positive scalar equality/IN shapes whose compiler explicitly exposes
-        that exhaustive raw witness.
+        The SQL remains buildable for compatibility and diagnostics, but its
+        request-window child branches are not a global membership proof. The
+        selector consults ``filter_exact_zero_probe_proves_global_membership``
+        before execution and therefore never uses this query to terminate a
+        page. Restrict construction to the original two-or-more positive
+        scalar equality/IN shapes.
         """
 
         if (
@@ -453,9 +453,24 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         return root_plans[0], any_span_plans
 
     def supports_filter_exact_zero_probe(self) -> bool:
-        """Whether this public voice page can prove a zero-result conjunction."""
+        """Whether the legacy temporal witness query can be constructed."""
 
         return self._filter_exact_zero_probe_plans() is not None
+
+    @staticmethod
+    def filter_exact_zero_probe_proves_global_membership() -> bool:
+        """Reject the legacy request-window child witness as a negative proof.
+
+        The voice-call datetime filter binds the canonical conversation root,
+        while an attribute filter may be satisfied by any current descendant
+        regardless of that descendant's timestamp.  The compatibility SQL
+        below restricts every child branch to the root window, so an empty
+        result cannot prove that no matching call exists.  The shared bounded
+        selector therefore skips it and uses ordered roots plus all-history
+        candidate classification.
+        """
+
+        return False
 
     @staticmethod
     def recommended_filter_exact_zero_probe_timeout_ms() -> int:
@@ -466,15 +481,12 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         return 256 * 1024 * 1024
 
     def build_filter_exact_zero_probe(self) -> tuple[str, dict[str, Any]]:
-        """Build an exact-zero proof for independent any-span Map leaves.
+        """Build the compatibility witness for independent any-span leaves.
 
-        Each UNION branch is an exhaustive *raw* witness for one positive
-        latest-state filter.  The outer GROUP BY intersects those witnesses by
-        trace, preserving the documented semantics that separate sibling spans
-        may satisfy separate leaves.  Returning no row is conclusive because a
-        latest-live match must have a corresponding physical raw witness.
-        Returning a row is intentionally inconclusive (it may be stale or
-        deleted) and the caller continues through the exact latest-state path.
+        The outer GROUP BY preserves sibling-span conjunction semantics, but
+        the request-window child bounds mean absence is not conclusive. This
+        builder is retained for backwards compatibility; the bounded selector
+        skips it until a global candidate-scoped proof replaces it.
         """
 
         probe_plans = self._filter_exact_zero_probe_plans()
@@ -633,11 +645,24 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         if not query:
             return query, params
 
+        # The delegated trace classifier has already validated and de-duplicated
+        # this finite identity set.  Preserve its full result envelope through
+        # the voice-only wrappers: bulk queue reads intentionally grow simulator
+        # batches above fifty to prove a 10k+sentinel prefix within the fixed
+        # query budget.  A hard-coded outer LIMIT 50 silently turned every later
+        # identity in such a batch into a false non-match.
+        candidate_trace_ids = params.get("candidate_trace_ids")
+        if not isinstance(candidate_trace_ids, (list, tuple)):
+            raise ValueError("voice classifier requires finite candidate identities")
+        bounded_voice_limit = len(candidate_trace_ids)
+        if not 1 <= bounded_voice_limit <= 1_000:
+            raise ValueError("voice classifier candidate limit is invalid")
+
         if self.remove_simulation_calls:
             # Simulator exclusion used to happen after pagination in Python.
             # That returned short/incorrect pages whenever a simulator occupied
             # a page slot. Keep the expensive raw-log JSON work candidate-scoped:
-            # at most the 50 trace IDs in this classifier batch are inspected,
+            # only the finite trace IDs in this classifier batch are inspected,
             # and every physical root is reduced to its latest version before
             # the predicate.
             params = {**params, "simulator_phone_numbers": tuple(VAPI_PHONE_NUMBERS)}
@@ -721,7 +746,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
               )
         )
         ORDER BY start_time DESC, trace_id DESC
-        LIMIT 50
+        LIMIT {bounded_voice_limit}
         """
 
         if self._bounded_sampling_rate is not None:
@@ -746,7 +771,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
                 100
             ) < %(bounded_sampling_rate)s
             ORDER BY start_time DESC, trace_id DESC
-            LIMIT 50
+            LIMIT {bounded_voice_limit}
             """
         return query, params
 

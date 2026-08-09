@@ -714,6 +714,16 @@ def read_bounded_filter_page(
         ),
         None,
     )
+    anchor_population_proof_builder = getattr(
+        builder,
+        "filter_anchor_probe_proves_complete_population",
+        None,
+    )
+    anchor_probe_proves_complete_population = bool(
+        anchor_population_proof_builder()
+        if callable(anchor_population_proof_builder)
+        else True
+    )
     if graph_key_witness_probe and not (
         callable(anchor_builder) and callable(anchor_support) and bool(anchor_support())
     ):
@@ -975,8 +985,19 @@ def read_bounded_filter_page(
     # strata recommendation hook. Legacy one-shot probes expose only
     # ``build_filter_candidate_witness_probe(rows)`` and must fall straight
     # back to exact classification after a failed full-window attempt.
-    candidate_witness_probe_supports_slices = callable(
-        candidate_witness_probe_strata_builder
+    candidate_witness_global_scope_builder = getattr(
+        builder,
+        "filter_candidate_witness_replays_global_membership",
+        None,
+    )
+    candidate_witness_replays_global_membership = bool(
+        candidate_witness_global_scope_builder()
+        if callable(candidate_witness_global_scope_builder)
+        else False
+    )
+    candidate_witness_probe_supports_slices = bool(
+        callable(candidate_witness_probe_strata_builder)
+        and not candidate_witness_replays_global_membership
     )
     if candidate_witness_probe_enabled and callable(
         candidate_witness_probe_strata_builder
@@ -1797,6 +1818,16 @@ def read_bounded_filter_page(
         exact_zero_bytes_builder = getattr(
             builder, "recommended_filter_exact_zero_probe_max_bytes", None
         )
+        exact_zero_global_scope_builder = getattr(
+            builder,
+            "filter_exact_zero_probe_proves_global_membership",
+            None,
+        )
+        exact_zero_proves_global_membership = bool(
+            exact_zero_global_scope_builder()
+            if callable(exact_zero_global_scope_builder)
+            else True
+        )
         exact_zero_timeout_ms = (
             int(exact_zero_timeout_builder())
             if callable(exact_zero_timeout_builder)
@@ -1828,6 +1859,7 @@ def read_bounded_filter_page(
             and callable(exact_zero_probe_builder)
             and callable(exact_zero_probe_support)
             and exact_zero_probe_support()
+            and exact_zero_proves_global_membership
             and int((classification_deadline - monotonic()) * 1000)
             >= exact_zero_timeout_ms + _EXACT_ZERO_FALLBACK_RESERVE_MS
         )
@@ -2021,13 +2053,14 @@ def read_bounded_filter_page(
                     pending_identity_candidates.clear()
                     pending_identity_candidates.update(saved_pending_candidates)
 
-        # Eligible any-span trace filters first ask a direct key+value predicate
-        # for a finite DISTINCT trace-id sentinel. If it exhausts, that is an
-        # exact candidate superset and no root-history scan is needed. Long
-        # windows may skip that broad sentinel and start with ordered roots. If
-        # an attempted probe reaches the sentinel (or its read budget), switch
-        # to ordered root batches, where a proven page prefix can close without
-        # materialising the tenant-wide set that triggered Code 159.
+        # Eligible any-span trace filters may first ask a direct key+value
+        # predicate for a finite DISTINCT trace-id sentinel. The probe is a
+        # positive accelerator unless the builder explicitly proves complete
+        # population coverage; a temporal child probe can never prove absence
+        # for an in-window root. Long windows may skip that broad sentinel and
+        # start with ordered roots. After exhaustion or saturation, canonical
+        # root batches plus global finite classification provide the exact
+        # result-order proof without materialising a tenant-wide trace-id Set.
         seed_page_builder = builder.build_filter_seed_page
         if not use_seed_loop:
             pass
@@ -2156,8 +2189,23 @@ def read_bounded_filter_page(
                         active_start=request_start,
                         active_end=request_end,
                     )
-                    page_complete = True
-                    use_seed_loop = False
+                    if anchor_probe_proves_complete_population:
+                        page_complete = True
+                        use_seed_loop = False
+                    elif anchor_probe_only:
+                        # Trace child anchors are temporal positive samples,
+                        # never exact absence proofs.  Preserve any classified
+                        # candidates but make incompleteness explicit to the
+                        # graph caller instead of publishing a false-empty
+                        # exact stratum.
+                        degraded_error_code = "sample_limit"
+                        use_seed_loop = False
+                    elif callable(ordered_seed_builder):
+                        # Continue with canonical roots. Their request-window
+                        # order plus global finite classification is the first
+                        # path that can prove an exact trace page.
+                        seed_page_builder = ordered_seed_builder
+                        seed_proves_result_order = True
                 elif anchor_probe_only:
                     # The sentinel proves only that this value is not sparse.
                     # A partitioned graph probe classifies only this finite

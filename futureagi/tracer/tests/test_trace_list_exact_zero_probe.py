@@ -1,4 +1,4 @@
-"""Focused exact-zero coverage for the generic trace-list endpoint."""
+"""Focused negative-proof coverage for the generic trace-list endpoint."""
 
 from datetime import UTC, datetime, timedelta
 
@@ -54,7 +54,7 @@ def _result(rows: list[dict]) -> QueryResult:
 
 
 @pytest.mark.unit
-def test_generic_trace_exact_zero_probe_intersects_independent_span_witnesses():
+def test_generic_trace_short_window_disables_temporal_exact_zero_proof():
     end = datetime(2026, 8, 8, tzinfo=UTC)
     builder = TraceListQueryBuilderV2(
         project_id=PROJECT_ID,
@@ -62,29 +62,13 @@ def test_generic_trace_exact_zero_probe_intersects_independent_span_witnesses():
         filters=_filters(end, window=timedelta(minutes=5)),
     )
 
-    sql, params = builder.build_filter_exact_zero_probe()
-    first_leaf_branch, second_leaf_branch = sql.split("UNION ALL")
-
-    assert builder.supports_filter_exact_zero_probe() is True
-    assert "%(latest_filter_key_0)s" in first_leaf_branch
-    assert "%(latest_filter_key_1)s" not in first_leaf_branch
-    assert "%(latest_filter_key_1)s" in second_leaf_branch
-    assert "%(latest_filter_key_0)s" not in second_leaf_branch
-    assert "countIf(witness_kind = 0) > 0" in sql
-    assert "countIf(witness_kind = 1) > 0" in sql
-    assert params["latest_filter_key_0"] == "call.total_turns"
-    assert params["latest_filter_param_0"] == 2
-    assert params["latest_filter_key_1"] == "conversation.transcript.16.message.role"
-    assert params["latest_filter_param_1"] == ("assistant",)
-    assert "attrs_number" in sql
-    assert "attrs_string" in sql
-    assert "span_attr_num" not in sql
-    assert "span_attr_str" not in sql
-    assert sql.count("SETTINGS ") == 1
+    assert builder.supports_filter_exact_zero_probe() is False
+    with pytest.raises(ValueError, match="exact-zero probe is unavailable"):
+        builder.build_filter_exact_zero_probe()
 
 
 @pytest.mark.unit
-def test_generic_trace_exact_zero_probe_terminal_empty_skips_bounded_scan():
+def test_generic_trace_empty_anchor_continues_to_ordered_root_proof():
     end = datetime(2026, 8, 8, tzinfo=UTC)
 
     class Executor:
@@ -116,8 +100,9 @@ def test_generic_trace_exact_zero_probe_terminal_empty_skips_bounded_scan():
     assert page.complete is True
     assert page.rows == []
     assert page.error_code is None
-    assert [attempt.kind for attempt in page.attempts] == ["zero_probe"]
-    assert len(executor.calls) == 1
+    assert [attempt.kind for attempt in page.attempts] == ["anchor", "seed"]
+    assert len(executor.calls) == 2
+    assert all(attempt.kind != "zero_probe" for attempt in page.attempts)
 
 
 @pytest.mark.unit
@@ -137,7 +122,7 @@ def test_generic_trace_exact_zero_probe_skips_broad_long_window_union():
 
 
 @pytest.mark.unit
-def test_generic_trace_positive_zero_probe_falls_back_to_exact_bounded_scan():
+def test_generic_trace_temporal_anchor_never_prunes_global_child_match():
     end = datetime(2026, 8, 8, tzinfo=UTC)
     filters = _filters(end, window=timedelta(minutes=5))
     candidates = [
@@ -160,7 +145,11 @@ def test_generic_trace_positive_zero_probe_falls_back_to_exact_bounded_scan():
         def __init__(self):
             self.calls: list[tuple[str, dict, dict]] = []
             self.results = [
-                [{"trace_id": "raw-witness-is-not-public"}],
+                # No child witness exists inside the root's five-minute
+                # request window. This is not an exact negative: the ordered
+                # root scan below still acquires every candidate and the
+                # classifier represents its all-history child replay.
+                [],
                 candidates,
                 candidates[:10],
                 candidates[10:20],
@@ -191,10 +180,9 @@ def test_generic_trace_positive_zero_probe_falls_back_to_exact_bounded_scan():
     assert [row["trace_id"] for row in page.rows] == [
         row["trace_id"] for row in hydrated
     ]
-    assert "raw-witness-is-not-public" not in {row["trace_id"] for row in page.rows}
     assert [attempt.kind for attempt in page.attempts] == [
-        "zero_probe",
         "anchor",
+        "seed",
         "classify",
         "classify",
         "classify",

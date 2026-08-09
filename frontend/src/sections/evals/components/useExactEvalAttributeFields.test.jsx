@@ -223,8 +223,22 @@ describe("useExactEvalAttributeFields", () => {
     expect(result.current.isFetchNextPageError).toBe(false);
   });
 
-  it("keeps prior fields and makes a repeated cursor degraded and retryable", async () => {
+  it("retries a repeated cursor once, then terminalizes with prior fields intact", async () => {
     mocks.get
+      .mockResolvedValueOnce(
+        retainedPage(["recent"], {
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "same-cursor",
+        }),
+      )
+      .mockResolvedValueOnce(
+        retainedPage([], {
+          browse_status: "continuation",
+          has_more: true,
+          next_cursor: "same-cursor",
+        }),
+      )
       .mockResolvedValueOnce(
         retainedPage(["recent"], {
           browse_status: "continuation",
@@ -258,6 +272,17 @@ describe("useExactEvalAttributeFields", () => {
     expect(result.current.data).toEqual(["spans.0.recent"]);
     expect(result.current.hasNextPage).toBe(true);
     expect(result.current.isFetchNextPageError).toBe(true);
+
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.cursorRetryExhausted).toBe(true));
+
+    expect(mocks.get).toHaveBeenCalledTimes(4);
+    expect(result.current.data).toEqual(["spans.0.recent"]);
+    expect(result.current.hasNextPage).toBe(false);
+    expect(result.current.isFetchNextPageError).toBe(false);
+
+    await act(async () => result.current.fetchNextPage());
+    expect(mocks.get).toHaveBeenCalledTimes(4);
   });
 
   it("continues exact search to an older key and stops at the terminal page", async () => {

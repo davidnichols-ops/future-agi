@@ -9,6 +9,7 @@ import {
   getAggregationRefreshState,
   getExactAggregationReadState,
 } from "src/utils/queryReadState";
+import { parseAgentGraphResponse } from "./agent-graph-contract";
 
 export const getAgentGraphPresentationState = (query) => {
   const readState = query.data
@@ -84,7 +85,7 @@ export const useAgentGraph = (
             }),
           { timeoutMs: AGGREGATION_REQUEST_TIMEOUT_MS, signal },
         );
-        const result = response.data?.result;
+        const result = parseAgentGraphResponse(response.data);
         const { isRefreshing, refreshFailed } =
           getAggregationRefreshState(result);
         const readState = getExactAggregationReadState(result);

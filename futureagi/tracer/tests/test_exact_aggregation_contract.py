@@ -1737,6 +1737,7 @@ def test_running_lease_keepalive_covers_the_actual_sync_query_lifetime(monkeypat
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 def test_keeper_start_failure_still_releases_the_fenced_refresh_claim(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 
@@ -2057,6 +2058,7 @@ def test_cold_miss_enqueue_failure_releases_claim_and_fails_closed():
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 def test_background_worker_publishes_only_after_complete_loader(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 
@@ -2093,6 +2095,7 @@ def test_background_worker_publishes_only_after_complete_loader(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 def test_background_worker_failure_leaves_cache_unpublished_and_retryable(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 
@@ -2208,6 +2211,7 @@ def test_exact_refresh_workflow_id_is_deterministic_and_opaque_per_claim():
 
 
 @pytest.mark.unit
+@pytest.mark.django_db
 def test_redelivered_exact_refresh_cannot_publish_after_claim_finished(monkeypatch):
     from tracer.tasks import exact_aggregation as task_module
 
@@ -2462,6 +2466,8 @@ class _BudgetSplittingAnalytics:
                 columns=["version_ceiling"],
             )
         self.partition_calls.append((query, dict(params), timeout_ms, dict(settings)))
+        if "exact_graph_candidate_limit" in params:
+            raise ServerException("private detail", code=self.error_code)
         if (params["end_date"] - params["start_date"]).total_seconds() > 3600:
             raise ServerException("private detail", code=self.error_code)
         return SimpleNamespace(data=[], columns=["time_bucket"])
@@ -2691,6 +2697,112 @@ def _exact_structured_filters(start: datetime, end: datetime) -> list[dict]:
             },
         },
     ]
+
+
+@pytest.mark.unit
+def test_exact_trace_candidate_probe_is_all_time_but_classifier_stays_authoritative():
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
+
+    start = datetime(2026, 7, 24, 2, 43, 12)
+    end = datetime(2026, 7, 31, 6, 59, 59)
+    builder = TraceListQueryBuilderV2(
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_structured_filters(start, end),
+        page_number=0,
+        page_size=200,
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
+    )
+
+    probe_sql, probe_params = builder.build_exact_graph_candidate_witness_probe(
+        limit=201
+    )
+    classify_sql, classify_params = (
+        builder.build_filter_identity_match_query_from_seed_rows(
+            [{"trace_id": "candidate-from-late-or-stale-child"}]
+        )
+    )
+
+    assert "LIMIT 1 BY trace_id" in probe_sql
+    assert "GROUP BY trace_id" not in probe_sql
+    assert "ORDER BY trace_id" not in probe_sql
+    assert "LIMIT %(exact_graph_candidate_limit)s" in probe_sql
+    assert "start_time >=" not in probe_sql
+    assert "start_time <" not in probe_sql
+    assert "latest_filter_key_0" in probe_sql
+    assert "latest_filter_key_1" not in probe_sql
+    assert "latest_filter_key_2" not in probe_sql
+    assert "latest_filter_key_3" not in probe_sql
+    assert probe_params["latest_filter_key_0"] == "final_status"
+    assert probe_params["latest_filter_param_0"] == "rechazado"
+    assert probe_params["exact_graph_candidate_limit"] == 201
+    # The existing classifier, not the raw witness, retains every scalar and
+    # structured leaf plus the canonical root request window.
+    assert "latest_attr_exists_0" in classify_sql
+    assert "latest_json_array_exists_1" in classify_sql
+    assert "latest_json_map_exists_2" in classify_sql
+    assert "latest_json_map_exists_3" in classify_sql
+    assert classify_params["candidate_trace_ids"] == (
+        "candidate-from-late-or-stale-child",
+    )
+    assert classify_params["candidate_start_date"] == start
+    assert classify_params["candidate_end_date"] == end
+    assert "candidate_witness_start_date_us" not in classify_params
+    assert "candidate_witness_end_date_us" not in classify_params
+
+
+@pytest.mark.unit
+def test_exact_trace_candidate_probe_rejects_structured_only_filter():
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
+
+    start = datetime(2026, 8, 1)
+    end = datetime(2026, 8, 2)
+    structured_filters = _exact_structured_filters(start, end)
+    builder = TraceListQueryBuilderV2(
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=[structured_filters[0], structured_filters[2]],
+        page_number=0,
+        page_size=200,
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
+    )
+
+    assert builder.build_exact_graph_candidate_witness_probe(limit=201) == ("", {})
+
+
+@pytest.mark.unit
+def test_exact_trace_candidate_probe_rejects_sampling():
+    from tracer.services.clickhouse.v2.query_builders.trace_list import (
+        TraceListQueryBuilderV2,
+    )
+
+    start = datetime(2026, 8, 1)
+    end = datetime(2026, 8, 2)
+    builder = TraceListQueryBuilderV2(
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_structured_filters(start, end),
+        page_number=0,
+        page_size=200,
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
+        bounded_sampling_salt="exactness-forbids-this",
+        bounded_sampling_rate=50,
+    )
+
+    assert builder.build_exact_graph_candidate_witness_probe(limit=201) == ("", {})
 
 
 def _combined_relation_filters(start: datetime, end: datetime) -> list[dict]:
@@ -3044,6 +3156,240 @@ def test_exact_system_graph_combines_scalar_array_map_and_legacy_json(observe_ty
     assert result["query_count"] == 1
     assert result["query_complete"] is True
     assert result["query_sampled"] is False
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_sparse_candidate_probe_avoids_root_fanout(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 7, 24, 2, 43, 12)
+    request_end = datetime(2026, 7, 31, 6, 59, 59)
+    constructor_kwargs = {}
+    calls = []
+
+    class Builder:
+        def __init__(self, **kwargs):
+            constructor_kwargs.update(kwargs)
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def build_exact_graph_candidate_witness_probe(*, limit):
+            return "CANDIDATE", {"limit": limit}
+
+        @staticmethod
+        def build_filter_ordered_seed_page(**_kwargs):
+            pytest.fail("a closed sparse candidate probe must skip root enumeration")
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            return "CLASSIFY", {"ids": tuple(row["trace_id"] for row in rows)}
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(query, params, **kwargs):
+            calls.append((query, dict(params), dict(kwargs["settings"])))
+            if query == "CANDIDATE":
+                return SimpleNamespace(
+                    data=[
+                        {"trace_id": "late-child-valid-root"},
+                        {"trace_id": "stale-or-root-outside"},
+                    ],
+                    columns=["trace_id"],
+                    query_time_ms=1,
+                )
+            assert query == "CLASSIFY"
+            # Latest-state replay is authoritative: it accepts the trace whose
+            # matching child was written after the root window and rejects a
+            # stale raw match or a trace whose canonical root is out of range.
+            assert params["ids"] == (
+                "late-child-valid-root",
+                "stale-or-root-outside",
+            )
+            return SimpleNamespace(
+                data=[{"trace_id": "late-child-valid-root"}],
+                columns=["trace_id"],
+                query_time_ms=1,
+            )
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert constructor_kwargs["bounded_global_span_witnesses"] is True
+    assert trace_ids == ["late-child-valid-root"]
+    assert query_count == 2
+    assert rows_returned == 3
+    assert calls[0][0] == "CANDIDATE"
+    assert calls[0][1]["limit"] == exact_module.EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL
+    assert (
+        calls[0][2]["max_result_rows"]
+        == exact_module.EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("candidate_outcome", ["broad", "read_budget"])
+def test_exact_trace_membership_candidate_probe_falls_back_without_partial_rows(
+    monkeypatch,
+    candidate_outcome,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=5)
+    root_start = request_end - timedelta(minutes=1)
+    classifier_batches = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def build_exact_graph_candidate_witness_probe(*, limit):
+            return "CANDIDATE", {"limit": limit}
+
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def build_filter_ordered_seed_page(**_kwargs):
+            return "ROOT", {}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            ids = tuple(row["trace_id"] for row in rows)
+            classifier_batches.append(ids)
+            return "CLASSIFY", {"ids": ids}
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(query, _params, **_kwargs):
+            if query == "CANDIDATE":
+                if candidate_outcome == "read_budget":
+                    raise ServerException("private bounded probe cap", code=158)
+                return SimpleNamespace(
+                    data=[
+                        {"trace_id": "raw-1"},
+                        {"trace_id": "raw-2"},
+                        {"trace_id": "raw-3"},
+                    ],
+                    columns=["trace_id"],
+                    query_time_ms=1,
+                )
+            if query == "ROOT":
+                return SimpleNamespace(
+                    data=[{"trace_id": "root-proven", "start_time": root_start}],
+                    columns=["trace_id", "start_time"],
+                    query_time_ms=1,
+                )
+            assert query == "CLASSIFY"
+            return SimpleNamespace(
+                data=[{"trace_id": "root-proven"}],
+                columns=["trace_id"],
+                query_time_ms=1,
+            )
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL", 3)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == ["root-proven"]
+    assert classifier_batches == [("root-proven",)]
+    assert query_count == 3
+    assert rows_returned == (5 if candidate_outcome == "broad" else 2)
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_candidate_probe_programming_error_fails_closed(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=5)
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def build_exact_graph_candidate_witness_probe(*, limit):
+            return "CANDIDATE", {"limit": limit}
+
+        @staticmethod
+        def build_filter_ordered_seed_page(**_kwargs):
+            pytest.fail("a programming error must not fall back or publish")
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(*_args, **_kwargs):
+            raise RuntimeError("candidate compiler defect")
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+
+    with pytest.raises(RuntimeError, match="candidate compiler defect"):
+        _enumerate_exact_trace_ids(
+            analytics=Analytics(),
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(request_start, request_end),
+            annotation_label_ids=None,
+            started=exact_module.monotonic(),
+        )
 
 
 @pytest.mark.unit
@@ -3881,22 +4227,22 @@ def test_exact_trace_membership_rejects_seed_when_latest_live_root_is_outside_wi
 
 
 @pytest.mark.unit
-def test_exact_trace_membership_exhausts_200_identity_classifier_boundary(monkeypatch):
+def test_exact_trace_membership_exhausts_5k_identity_classifier_boundary(monkeypatch):
     from tracer.services.clickhouse import exact_graph_reads as exact_module
 
     request_start = datetime(2026, 8, 1)
     request_end = request_start + timedelta(minutes=5)
     checkpoint = request_end - timedelta(minutes=1)
-    ordered_ids = [f"trace-{index:030d}" for index in range(400, -1, -1)]
+    ordered_ids = [f"trace-{index:030d}" for index in range(10_000, -1, -1)]
     seed_pages = iter(
         [
             [
                 {"trace_id": trace_id, "start_time": checkpoint}
-                for trace_id in ordered_ids[:200]
+                for trace_id in ordered_ids[:5_000]
             ],
             [
                 {"trace_id": trace_id, "start_time": checkpoint}
-                for trace_id in ordered_ids[200:400]
+                for trace_id in ordered_ids[5_000:10_000]
             ],
             [{"trace_id": ordered_ids[-1], "start_time": checkpoint}],
         ]
@@ -3957,11 +4303,13 @@ def test_exact_trace_membership_exhausts_200_identity_classifier_boundary(monkey
         started=exact_module.monotonic(),
     )
 
-    assert exact_module.EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE == 200
+    assert exact_module.EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE == 5_000
+    assert exact_module.EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL == 1_001
+    assert exact_module.EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE == 5_000
     assert trace_ids == ordered_ids
-    assert [len(batch) for batch in classifier_batches] == [200, 200, 1]
+    assert [len(batch) for batch in classifier_batches] == [5_000, 5_000, 1]
     assert query_count == 6
-    assert rows_returned == 802
+    assert rows_returned == 20_002
 
 
 @pytest.mark.unit
@@ -4502,6 +4850,15 @@ def test_exact_trace_graph_merges_all_contribution_batches_before_averages(
         "trace_id IN %(graph_candidate_trace_ids)s" in call[0]
         for call in analytics.calls
     )
+    assert all(
+        call[2] <= exact_module.EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS
+        for call in analytics.calls
+    )
+    assert all(
+        call[3]["max_bytes_to_read"]
+        == exact_module.EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ
+        for call in analytics.calls
+    )
     # final_status and confidence establish trace membership on possibly
     # different siblings; they are intentionally absent from the all-live-span
     # contribution scan once that identity membership has been proven.
@@ -4511,6 +4868,127 @@ def test_exact_trace_graph_merges_all_contribution_batches_before_averages(
     assert observed["primary_traffic"] == 3
     assert result["query_count"] == 6
     assert result["query_sampled"] is False
+
+
+@pytest.mark.unit
+def test_exact_trace_contribution_builder_accepts_5k_and_rejects_larger_batch():
+    from tracer.services.clickhouse.query_builders.time_series import (
+        TimeSeriesQueryBuilder,
+    )
+
+    start = datetime(2026, 8, 1)
+    end = datetime(2026, 8, 2)
+    builder = TimeSeriesQueryBuilder(
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(start, end),
+        interval="day",
+        exact_snapshot=True,
+        observe_type="trace",
+        start_date=start,
+        end_date=end,
+    )
+    trace_ids = [f"trace-{index:04d}" for index in range(5_001)]
+
+    query, params = builder.build_exact_trace_contribution_batch(trace_ids[:5_000])
+
+    assert query
+    assert "toDecimal128(toString(ifNull(cost, 0.0)), 18)" in query
+    assert len(params["graph_candidate_trace_ids"]) == 5_000
+    with pytest.raises(ValueError, match="exceeds 5000 identities"):
+        builder.build_exact_trace_contribution_batch(trace_ids)
+
+
+@pytest.mark.unit
+def test_exact_trace_graph_bisects_budget_limited_contribution_without_gaps(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    bucket = datetime(2026, 8, 1)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE", 4)
+    monkeypatch.setattr(
+        exact_module,
+        "_enumerate_exact_trace_ids",
+        lambda **_kwargs: ([f"trace-{index}" for index in range(4)], 0, 4),
+    )
+
+    class Analytics:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def execute_ch_query(self, _query, params, **_kwargs):
+            batch_size = len(params["graph_candidate_trace_ids"])
+            self.batch_sizes.append(batch_size)
+            if batch_size > 2:
+                raise ServerException("private detail", code=159)
+            return SimpleNamespace(
+                data=[
+                    {
+                        "time_bucket": bucket,
+                        "traffic_count": batch_size,
+                    }
+                ],
+                columns=["time_bucket", "traffic_count"],
+            )
+
+    analytics = Analytics()
+    result = read_exact_system_graph(
+        analytics=analytics,
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(bucket, bucket + timedelta(days=1)),
+        interval="day",
+        metric_id="traffic",
+        observe_type="trace",
+    )
+
+    assert analytics.batch_sizes == [4, 2, 2]
+    assert result["query_count"] == 3
+    assert next(point for point in result["data"] if point["value"])["value"] == 4
+
+
+@pytest.mark.unit
+def test_exact_trace_decimal_cost_merge_is_batch_size_and_order_invariant():
+    bucket = datetime(2026, 8, 1)
+    columns = ["time_bucket", "cost_sum", "traffic_count"]
+    costs = [
+        Decimal("0.100000000000000001"),
+        Decimal("0.200000000000000002"),
+        Decimal("0.300000000000000003"),
+    ]
+    one_batch = [
+        (
+            [
+                {
+                    "time_bucket": bucket,
+                    "cost_sum": sum(costs, Decimal(0)),
+                    "traffic_count": len(costs),
+                }
+            ],
+            columns,
+        )
+    ]
+    reversed_singleton_batches = [
+        (
+            [
+                {
+                    "time_bucket": bucket,
+                    "cost_sum": cost,
+                    "traffic_count": 1,
+                }
+            ],
+            columns,
+        )
+        for cost in reversed(costs)
+    ]
+
+    merged_one, merged_columns = _merge_exact_trace_contribution_rows(one_batch)
+    merged_many, many_columns = _merge_exact_trace_contribution_rows(
+        reversed_singleton_batches
+    )
+
+    assert merged_one == merged_many
+    assert merged_columns == many_columns
+    assert merged_one[0]["avg_cost"] == float(sum(costs, Decimal(0)) / len(costs))
 
 
 @pytest.mark.unit
@@ -5010,7 +5488,11 @@ def test_exact_graph_budget_failure_does_not_publish_or_split_contribution_batch
     assert "trace_id IN %(graph_candidate_trace_ids)s" in query
     assert "snapshot_version_ceiling" not in params
     assert "additional_table_filters" not in settings
-    assert timeout == 3_300_000
+    assert timeout == exact_module.EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS
+    assert (
+        settings["max_bytes_to_read"]
+        == exact_module.EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ
+    )
 
 
 @pytest.mark.unit
@@ -5357,6 +5839,89 @@ def test_exact_session_graph_combines_native_session_and_aggregate_filters():
 
 
 @pytest.mark.unit
+def test_exact_session_scalar_filters_intersect_after_session_membership():
+    analytics = _ExactEntityAnalytics()
+    start = datetime(2026, 1, 1, 0, 2)
+    end = datetime(2026, 3, 15, 3, 4)
+    filters = [
+        _time_filter(start, end),
+        {
+            "column_id": "status",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "ERROR",
+            },
+        },
+        {
+            "column_id": "customer_tier",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "gold",
+            },
+        },
+        {
+            "column_id": "region",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "west",
+            },
+        },
+    ]
+
+    read_exact_session_system_graph(
+        analytics=analytics,
+        project_id="22222222-2222-4222-8222-222222222222",
+        filters=filters,
+        interval="day",
+        metric_id="total_tokens",
+    )
+
+    query, params, _settings = analytics.main_calls[0]
+    candidate_sql = query.split("WITH candidate_sessions AS (", 1)[1].split(
+        "),\n    latest_session_filter_spans AS (", 1
+    )[0]
+    matching_sql = query.split("latest_session_filter_spans AS (", 1)[1].split(
+        "),\n    selected_sessions AS (", 1
+    )[0]
+    hydration_sql = query.split("selected_sessions AS (", 1)[1].split(
+        "\n    SELECT\n", 1
+    )[1]
+    hydration_sql = hydration_sql.split(") AS exact_sessions", 1)[0]
+
+    # Candidate discovery is entity-safe but filter-free. Each leaf is tested
+    # independently over all traces in the candidate session, so three
+    # different sibling traces can establish the three-way intersection.
+    assert "session_scalar_" not in candidate_sql
+    assert matching_sql.count("countIf(") == 3
+    assert "GROUP BY session_id" in matching_sql
+    assert "HAVING countIf(" in matching_sql
+    assert "SELECT session_id FROM selected_sessions" in hydration_sql
+
+    # Hydration is deliberately free of the selection predicates: the metric
+    # sums every live root in the selected session, including non-matching
+    # sibling traces. Per-leaf namespacing also prevents equal compiler-local
+    # parameter names from overwriting each other.
+    assert "session_scalar_" not in hydration_sql
+    assert params["session_scalar_latest_filter_param_0"] == "error"
+    assert params["session_scalar_latest_filter_param_1"] == "gold"
+    assert params["session_scalar_latest_filter_param_2"] == "west"
+    assert params["snapshot_scan_start_date"] == datetime(2026, 1, 1)
+    assert params["snapshot_scan_end_date"] == datetime(2026, 3, 15, 4)
+    assert "start_time >= %(snapshot_scan_start_date)s" in matching_sql
+    assert "start_time < %(snapshot_scan_end_date)s" in matching_sql
+    assert "latest_start_time >= %(snapshot_start_date)s" in matching_sql
+    assert "latest_start_time < %(snapshot_end_date)s" in matching_sql
+    assert "%(start_date)s" not in matching_sql
+    assert "%(end_date)s" not in matching_sql
+
+
+@pytest.mark.unit
 def test_exact_session_system_graph_supports_array_map_and_legacy_json_filters():
     analytics = _ExactEntityAnalytics()
     start = datetime(2026, 1, 1)
@@ -5372,7 +5937,16 @@ def test_exact_session_system_graph_supports_array_map_and_legacy_json_filters()
 
     _assert_entity_output_partitions(analytics.main_calls, start, end)
     query, params, settings = analytics.main_calls[0]
-    assert query.count("SELECT DISTINCT trace_id") >= 3
+    assert "latest_session_filter_spans AS" in query
+    assert query.count("countIf(") >= 4
+    assert "argMax(start_time, _version) AS latest_start_time" in query
+    assert "argMax(is_deleted, _version) AS latest_is_deleted" in query
+    assert "WHERE latest_is_deleted = 0" in query
+    assert (
+        "GROUP BY\n            project_id,\n            observation_type,\n"
+        "            service_name,\n            toStartOfHour(start_time),\n"
+        "            trace_id,\n            id" in query
+    )
     assert "JSONExtractArrayRaw(attributes_extra" in query
     assert "JSONExtractRaw(attributes_extra" in query
     assert params["snapshot_start_date"] == start
@@ -5545,7 +6119,11 @@ class _SessionContextAnalytics(_ExactEntityAnalytics):
 
 def _assert_session_membership_sql(query, params, start, end):
     assert "SELECT DISTINCT toString(candidate_member.trace_id) AS trace_id" in query
-    assert "FROM spans AS candidate_member FINAL" in query
+    assert "AS snapshot_members" in query
+    assert "start_time >= %(snapshot_scan_start_date)s" in query
+    assert "start_time < %(snapshot_scan_end_date)s" in query
+    assert "snapshot_members.start_time >= %(snapshot_start_date)s" in query
+    assert "snapshot_members.start_time < %(snapshot_end_date)s" in query
     assert "FROM (" in query and "AS selected_sessions" in query
     assert "argMin(rs.input, rs.start_time) AS first_message" in query
     assert "session_duration >= %(session_having_1)s" in query
@@ -5554,6 +6132,8 @@ def _assert_session_membership_sql(query, params, start, end):
     assert "span_attr_str['first_message']" not in query
     assert params["snapshot_start_date"] == start
     assert params["snapshot_end_date"] == end
+    assert params["snapshot_scan_start_date"] == start
+    assert params["snapshot_scan_end_date"] == end
     assert params["session_having_1"] == 5
     assert params["session_having_2"] == "%hello%"
 

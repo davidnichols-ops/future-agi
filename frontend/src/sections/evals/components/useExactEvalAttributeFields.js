@@ -1,9 +1,11 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
 import {
   ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+  getAttributeKeyCursorStopSignature,
   getNextAttributeKeyPageParam,
   isAttributeKeyCursorChainStopped,
   readAttributeKeyPage,
@@ -67,6 +69,16 @@ export function useExactEvalAttributeFields({
     normalizedRowType,
     exactSearch,
   ];
+  const retainedRetryIdentity = JSON.stringify([projectId, normalizedRowType]);
+  const exactRetryIdentity = JSON.stringify([
+    projectId,
+    normalizedRowType,
+    exactSearch,
+  ]);
+  const [cursorRetryState, setCursorRetryState] = useState({
+    retained: null,
+    exact: null,
+  });
 
   const retainedQuery = useInfiniteQuery({
     // The retained project schema is deliberately independent of the task's
@@ -144,6 +156,26 @@ export function useExactEvalAttributeFields({
     retainedQuery.data,
   );
   const exactCursorStopped = isAttributeKeyCursorChainStopped(exactQuery.data);
+  const retainedStopSignature = getAttributeKeyCursorStopSignature(
+    retainedQuery.data,
+  );
+  const exactStopSignature = getAttributeKeyCursorStopSignature(
+    exactQuery.data,
+  );
+  const retainedStopRetryAttempted = Boolean(
+    retainedStopSignature &&
+      cursorRetryState.retained?.identity === retainedRetryIdentity &&
+      cursorRetryState.retained?.signature === retainedStopSignature,
+  );
+  const exactStopRetryAttempted = Boolean(
+    exactStopSignature &&
+      cursorRetryState.exact?.identity === exactRetryIdentity &&
+      cursorRetryState.exact?.signature === exactStopSignature,
+  );
+  const retainedStoppedRetryAvailable =
+    retainedCursorStopped && !retainedStopRetryAttempted;
+  const exactStoppedRetryAvailable =
+    exactCursorStopped && !exactStopRetryAttempted;
   const seenRetainedKeys = new Set();
   const retainedFields = retainedPages.flatMap((page) =>
     (Array.isArray(page?.result) ? page.result : []).flatMap(({ key }) => {
@@ -178,21 +210,36 @@ export function useExactEvalAttributeFields({
       ),
   );
   const retainedHasNextPage =
-    retainedQuery.hasNextPage || retainedCursorStopped;
+    retainedQuery.hasNextPage || retainedStoppedRetryAvailable;
   const shouldAdvanceExact = Boolean(exactSearch) && !exactSearchMatched;
   const exactHasNextPage =
-    shouldAdvanceExact && (exactQuery.hasNextPage || exactCursorStopped);
+    shouldAdvanceExact &&
+    (exactQuery.hasNextPage || exactStoppedRetryAvailable);
   const shouldAdvanceRetained = !exactSearchMatched;
   const hasNextPage =
     exactHasNextPage || (shouldAdvanceRetained && retainedHasNextPage);
   const fetchNextPage = (...args) => {
     const reads = [];
-    if (shouldAdvanceRetained && retainedCursorStopped) {
+    if (shouldAdvanceRetained && retainedStoppedRetryAvailable) {
+      setCursorRetryState((current) => ({
+        ...current,
+        retained: {
+          identity: retainedRetryIdentity,
+          signature: retainedStopSignature,
+        },
+      }));
       reads.push(retainedQuery.refetch(...args));
     } else if (shouldAdvanceRetained && retainedQuery.hasNextPage) {
       reads.push(retainedQuery.fetchNextPage(...args));
     }
-    if (shouldAdvanceExact && exactCursorStopped) {
+    if (shouldAdvanceExact && exactStoppedRetryAvailable) {
+      setCursorRetryState((current) => ({
+        ...current,
+        exact: {
+          identity: exactRetryIdentity,
+          signature: exactStopSignature,
+        },
+      }));
       reads.push(exactQuery.refetch(...args));
     } else if (shouldAdvanceExact && exactQuery.hasNextPage) {
       reads.push(exactQuery.fetchNextPage(...args));
@@ -224,8 +271,13 @@ export function useExactEvalAttributeFields({
     isFetchNextPageError:
       (shouldAdvanceRetained && retainedQuery.isFetchNextPageError) ||
       (shouldAdvanceExact && exactQuery.isFetchNextPageError) ||
-      (shouldAdvanceRetained && retainedCursorStopped) ||
-      (shouldAdvanceExact && exactCursorStopped),
+      (shouldAdvanceRetained && retainedStoppedRetryAvailable) ||
+      (shouldAdvanceExact && exactStoppedRetryAvailable),
+    cursorRetryExhausted:
+      (shouldAdvanceRetained &&
+        retainedCursorStopped &&
+        retainedStopRetryAttempted) ||
+      (shouldAdvanceExact && exactCursorStopped && exactStopRetryAttempted),
     pageCount: retainedPages.length + exactPages.length,
     browseStatus:
       (exactSearch ? exactPages.at(-1)?.browse_status : undefined) ||

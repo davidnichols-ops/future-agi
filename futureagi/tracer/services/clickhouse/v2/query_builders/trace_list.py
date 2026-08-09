@@ -66,6 +66,22 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
     # (end_users, etc.) instead of the dropped legacy CDC tables.
     _FILTER_BUILDER_CLS = ClickHouseFilterBuilderV2
 
+    @staticmethod
+    def filter_classifier_has_exact_start_time_identity() -> bool:
+        """CH25 replacement identity uses start hour, not exact producer time."""
+
+        return False
+
+    @staticmethod
+    def filter_classifier_physical_group_by(*, org_scope: bool) -> str:
+        """Collapse by the complete deployed CH25 ReplacingMergeTree key."""
+
+        project_prefix = "project_id, " if org_scope else ""
+        return (
+            f"{project_prefix}observation_type, service_name, "
+            "toStartOfHour(start_time), trace_id, id"
+        )
+
     def build_span_attributes_query(
         self,
         trace_ids: list[str],

@@ -251,6 +251,56 @@ async function runGeneration(schemaPath) {
     return source.replace(pattern, replacement);
   }
 
+  function assertReplaceInNamedBlock(
+    source,
+    declaration,
+    anchor,
+    replacement,
+    label,
+  ) {
+    const start = source.indexOf(declaration);
+    if (start < 0) {
+      throw new Error(
+        `Contract post-processing failed: declaration for "${label}" no longer matches.`,
+      );
+    }
+    const nextExport = source.indexOf("\nexport ", start + declaration.length);
+    const end = nextExport < 0 ? source.length : nextExport;
+    const block = source.slice(start, end);
+    const rewritten = block.replaceAll(anchor, replacement);
+    if (rewritten === block) {
+      throw new Error(
+        `Contract post-processing failed: block anchor for "${label}" no longer matches.`,
+      );
+    }
+    return source.slice(0, start) + rewritten + source.slice(end);
+  }
+
+  function assertReplaceRegexInNamedBlock(
+    source,
+    declaration,
+    pattern,
+    replacement,
+    label,
+  ) {
+    const start = source.indexOf(declaration);
+    if (start < 0) {
+      throw new Error(
+        `Contract post-processing failed: declaration for "${label}" no longer matches.`,
+      );
+    }
+    const nextExport = source.indexOf("\nexport ", start + declaration.length);
+    const end = nextExport < 0 ? source.length : nextExport;
+    const block = source.slice(start, end);
+    const rewritten = block.replace(pattern, replacement);
+    if (rewritten === block) {
+      throw new Error(
+        `Contract post-processing failed: block regex anchor for "${label}" no longer matches.`,
+      );
+    }
+    return source.slice(0, start) + rewritten + source.slice(end);
+  }
+
   const schemasOutputPath = path.join(outputDir, "api.schemas.ts");
   if (fs.existsSync(schemasOutputPath)) {
     let schemas = fs.readFileSync(schemasOutputPath, "utf8");
@@ -275,52 +325,147 @@ async function runGeneration(schemaPath) {
       "x-string-or-object TS aliases → string | object",
     );
 
-    // Span-attribute array members are JSON scalars on the wire. Orval ignores
-    // x-json-value and narrows both response fields to object-only, so keep a
-    // focused recursive JSON type for these two public picker contracts.
+    // Orval ignores x-json-value and narrows arbitrary JSON to object-only.
+    // Define one recursive JSON type, then use it for every field carrying the
+    // extension (including dynamic trace/span list row cells).
     schemas = assertReplace(
       schemas,
       `/**
  * Any valid JSON value.
  */
 export type SpanAttributeTopValueApiValue = { [key: string]: unknown };`,
-      `export type SpanAttributeJsonValueApi =
+      `export type JsonValueApi =
   | string
   | number
   | boolean
   | null
-  | SpanAttributeJsonValueApi[]
-  | { [key: string]: SpanAttributeJsonValueApi };
+  | JsonValueApi[]
+  | { [key: string]: JsonValueApi };
+
+/** @deprecated Use JsonValueApi. */
+export type SpanAttributeJsonValueApi = JsonValueApi;
 
 /**
  * Any valid JSON value.
  */
-export type SpanAttributeTopValueApiValue = SpanAttributeJsonValueApi;`,
-      "SpanAttributeTopValueApiValue → recursive JSON value",
+export type SpanAttributeTopValueApiValue = JsonValueApi;`,
+      "declare recursive JSON TS type",
     );
-    schemas = assertReplace(
+    for (const jsonAlias of [
+      "SpanAttributeValueApiValue",
+      "DashboardFilterValueOptionApiValue",
+      "SpanListColumnConfigApiSettings",
+      "SpanListColumnConfigApiChoicesMap",
+      "SpanListColumnConfigApiAnnotators",
+      "TraceObserveColumnConfigApiSettings",
+      "TraceObserveColumnConfigApiChoicesMap",
+      "TraceObserveColumnConfigApiAnnotators",
+    ]) {
+      schemas = assertReplace(
+        schemas,
+        `/**
+ * Any valid JSON value.
+ */
+export type ${jsonAlias} = { [key: string]: unknown };`,
+        `/**
+ * Any valid JSON value.
+ */
+export type ${jsonAlias} = JsonValueApi;`,
+        `${jsonAlias} → recursive JSON value`,
+      );
+    }
+
+    for (const rowType of [
+      "TracePrototypeListResultApiTableItem",
+      "TraceObserveListResultApiTableItem",
+      "SpanPrototypeListResultApiTableItem",
+      "SpanObserveListResultApiTableItem",
+      "TraceVoiceCallListResponseApiResultsItem",
+    ]) {
+      schemas = assertReplace(
+        schemas,
+        `export type ${rowType} = {[key: string]: { [key: string]: unknown }};`,
+        `export type ${rowType} = { [key: string]: JsonValueApi };`,
+        `${rowType} → recursive JSON row`,
+      );
+    }
+
+    const columnConfigNullableFields = [
+      ["group_by?: string;", "group_by?: string | null;"],
+      ["output_type?: string;", "output_type?: string | null;"],
+      ["reverse_output?: boolean;", "reverse_output?: boolean | null;"],
+      [
+        "annotation_label_type?: string;",
+        "annotation_label_type?: string | null;",
+      ],
+      ["choices?: string[];", "choices?: (string | null)[] | null;"],
+      ["eval_template_id?: string;", "eval_template_id?: string | null;"],
+      ["source_field?: string;", "source_field?: string | null;"],
+      ["parent_eval_id?: string;", "parent_eval_id?: string | null;"],
+    ];
+    for (const configType of [
+      "SpanListColumnConfigApi",
+      "TraceObserveColumnConfigApi",
+    ]) {
+      for (const [anchor, replacement] of columnConfigNullableFields) {
+        schemas = assertReplaceInNamedBlock(
+          schemas,
+          `export interface ${configType} {`,
+          anchor,
+          replacement,
+          `${configType} nullable ${anchor}`,
+        );
+      }
+    }
+
+    for (const metadataType of [
+      "SpanListMetadataApi",
+      "TraceObserveListMetadataApi",
+    ]) {
+      for (const field of [
+        "total_rows_exact",
+        "next_cursor",
+        "query_error_code",
+      ]) {
+        const valueType = field === "total_rows_exact" ? "number" : "string";
+        schemas = assertReplaceInNamedBlock(
+          schemas,
+          `export interface ${metadataType} {`,
+          `${field}?: ${valueType};`,
+          `${field}?: ${valueType} | null;`,
+          `${metadataType}.${field} nullable`,
+        );
+      }
+    }
+
+    for (const graphType of [
+      "TraceAgentGraphNodeApi",
+      "TraceAgentGraphEdgeApi",
+    ]) {
+      schemas = assertReplaceInNamedBlock(
+        schemas,
+        `export interface ${graphType} {`,
+        "trace_count: number;",
+        "trace_count: number | null;",
+        `${graphType}.trace_count nullable`,
+      );
+    }
+
+    for (const field of ["next", "previous"]) {
+      schemas = assertReplaceInNamedBlock(
+        schemas,
+        "export interface TraceVoiceCallListResponseApi {",
+        `${field}: number;`,
+        `${field}: number | null;`,
+        `TraceVoiceCallListResponseApi.${field} nullable`,
+      );
+    }
+    schemas = assertReplaceInNamedBlock(
       schemas,
-      `/**
- * Any valid JSON value.
- */
-export type SpanAttributeValueApiValue = { [key: string]: unknown };`,
-      `/**
- * Any valid JSON value.
- */
-export type SpanAttributeValueApiValue = SpanAttributeJsonValueApi;`,
-      "SpanAttributeValueApiValue → recursive JSON value",
-    );
-    schemas = assertReplace(
-      schemas,
-      `/**
- * Any valid JSON value.
- */
-export type DashboardFilterValueOptionApiValue = { [key: string]: unknown };`,
-      `/**
- * Any valid JSON value.
- */
-export type DashboardFilterValueOptionApiValue = SpanAttributeJsonValueApi;`,
-      "DashboardFilterValueOptionApiValue → recursive JSON value",
+      "export interface TraceVoiceCallListResponseApi {",
+      "next_cursor?: string;",
+      "next_cursor?: string | null;",
+      "TraceVoiceCallListResponseApi.next_cursor nullable",
     );
 
     fs.writeFileSync(schemasOutputPath, schemas);
@@ -331,48 +476,163 @@ export type DashboardFilterValueOptionApiValue = SpanAttributeJsonValueApi;`,
 
     zod = assertReplace(
       zod,
-      `export const ApiTracesSpanAttributeDetailListResponse = zod.object({`,
-      `type SpanAttributeJsonValue =
+      `import * as zod from 'zod';`,
+      `import * as zod from 'zod';
+
+type JsonValue =
   | string
   | number
   | boolean
   | null
-  | SpanAttributeJsonValue[]
-  | { [key: string]: SpanAttributeJsonValue };
+  | JsonValue[]
+  | { [key: string]: JsonValue };
 
-const spanAttributeJsonValueSchema: zod.ZodType<SpanAttributeJsonValue> =
+const jsonValueSchema: zod.ZodType<JsonValue> =
   zod.lazy(() =>
     zod.union([
       zod.string(),
       zod.number(),
       zod.boolean(),
       zod.null(),
-      zod.array(spanAttributeJsonValueSchema),
-      zod.record(spanAttributeJsonValueSchema),
+      zod.array(jsonValueSchema),
+      zod.record(jsonValueSchema),
     ]),
-  );
-
-export const ApiTracesSpanAttributeDetailListResponse = zod.object({`,
-      "span-attribute recursive JSON zod schema",
+  );`,
+      "recursive JSON zod schema",
     );
     zod = assertReplaceRegex(
       zod,
-      /(export const ApiTracesSpanAttributeDetailListResponse = zod\.object\(\{[\s\S]*?"top_values": zod\.array\(zod\.object\(\{\n  "value": )zod\.object\(\{\n\n\}\)\.passthrough\(\)\.describe\('Any valid JSON value\.'\),/,
-      "$1spanAttributeJsonValueSchema,",
+      /(export const ApiTracesSpanAttributeDetailListResponse = zod\.object\(\{[\s\S]*?"top_values": zod\.array\(zod\.object\(\{\n {2}"value": )zod\.object\(\{\n\n\}\)\.passthrough\(\)\.describe\('Any valid JSON value\.'\),/,
+      "$1jsonValueSchema.describe('Any valid JSON value.'),",
       "SpanAttributeTopValue zod value → recursive JSON value",
     );
     zod = assertReplaceRegex(
       zod,
-      /(export const ApiTracesSpanAttributeValuesListResponse = zod\.object\(\{[\s\S]*?"result": zod\.array\(zod\.object\(\{\n  "value": )zod\.object\(\{\n\n\}\)\.passthrough\(\)\.describe\('Any valid JSON value\.'\),/,
-      "$1spanAttributeJsonValueSchema,",
+      /(export const ApiTracesSpanAttributeValuesListResponse = zod\.object\(\{[\s\S]*?"result": zod\.array\(zod\.object\(\{\n {2}"value": )zod\.object\(\{\n\n\}\)\.passthrough\(\)\.describe\('Any valid JSON value\.'\),/,
+      "$1jsonValueSchema.describe('Any valid JSON value.'),",
       "SpanAttributeValue zod value → recursive JSON value",
     );
     zod = assertReplaceRegex(
       zod,
-      /(export const TracerDashboardFilterValuesResponse = zod\.object\(\{[\s\S]*?"values": zod\.array\(zod\.object\(\{\n  "value": )zod\.object\(\{\n\n\}\)\.passthrough\(\)\.describe\('Any valid JSON value\.'\),/,
-      "$1spanAttributeJsonValueSchema,",
+      /(export const TracerDashboardFilterValuesResponse = zod\.object\(\{[\s\S]*?"values": zod\.array\(zod\.object\(\{\n {2}"value": )zod\.object\(\{\n\n\}\)\.passthrough\(\)\.describe\('Any valid JSON value\.'\),/,
+      "$1jsonValueSchema.describe('Any valid JSON value.'),",
       "DashboardFilterValueOption zod value → recursive JSON value",
     );
+
+    const listResponseExports = [
+      "TracerTraceListTracesResponse",
+      "TracerTraceListTracesOfSessionResponse",
+      "TracerTraceSessionListSessionsResponse",
+      "TracerObservationSpanListSpansResponse",
+      "TracerObservationSpanListSpansObserveResponse",
+      "TracerTraceListVoiceCallsResponse",
+    ];
+    for (const exportName of listResponseExports) {
+      zod = assertReplaceRegexInNamedBlock(
+        zod,
+        `export const ${exportName} = zod.object({`,
+        /zod\.object\(\{\n\n\}\)\.passthrough\(\)(?=(?:\.(?:optional|nullish|nullable)\(\)|\.default\([^)]*\))*\.describe\('Any valid JSON value\.'\))/g,
+        "jsonValueSchema",
+        `${exportName} JSON cells → recursive JSON value`,
+      );
+    }
+    const columnConfigNullableZodFields = [
+      [
+        '"group_by": zod.string().min(1).optional(),',
+        '"group_by": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"output_type": zod.string().min(1).optional(),',
+        '"output_type": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"reverse_output": zod.boolean().optional(),',
+        '"reverse_output": zod.boolean().nullish(),',
+      ],
+      [
+        '"annotation_label_type": zod.string().min(1).optional(),',
+        '"annotation_label_type": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"choices": zod.array(zod.string().min(1)).optional(),',
+        '"choices": zod.array(zod.string().min(1).nullable()).nullish(),',
+      ],
+      [
+        '"eval_template_id": zod.string().min(1).optional(),',
+        '"eval_template_id": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"source_field": zod.string().min(1).optional(),',
+        '"source_field": zod.string().min(1).nullish(),',
+      ],
+      [
+        '"parent_eval_id": zod.string().min(1).optional()',
+        '"parent_eval_id": zod.string().min(1).nullish()',
+      ],
+    ];
+    for (const exportName of listResponseExports) {
+      for (const [anchor, replacement] of columnConfigNullableZodFields) {
+        zod = assertReplaceInNamedBlock(
+          zod,
+          `export const ${exportName} = zod.object({`,
+          anchor,
+          replacement,
+          `${exportName} nullable column config`,
+        );
+      }
+    }
+
+    for (const exportName of listResponseExports.slice(0, -1)) {
+      for (const [field, pattern] of [
+        [
+          "total_rows_exact",
+          /("total_rows_exact": zod\.number\(\)(?:\.min\([^)]*\))?)\.optional\(\),/,
+        ],
+        [
+          "next_cursor",
+          /("next_cursor": zod\.string\(\)\.min\(1\))\.optional\(\),/,
+        ],
+        [
+          "query_error_code",
+          /("query_error_code": zod\.string\(\)\.min\(1\))\.optional\(\),/,
+        ],
+      ]) {
+        zod = assertReplaceRegexInNamedBlock(
+          zod,
+          `export const ${exportName} = zod.object({`,
+          pattern,
+          "$1.nullish(),",
+          `${exportName}.${field} nullable`,
+        );
+      }
+    }
+
+    for (const field of ["next", "previous"]) {
+      zod = assertReplaceInNamedBlock(
+        zod,
+        "export const TracerTraceListVoiceCallsResponse = zod.object({",
+        `"${field}": zod.number().min(1),`,
+        `"${field}": zod.number().min(1).nullable(),`,
+        `TracerTraceListVoiceCallsResponse.${field} nullable`,
+      );
+    }
+    zod = assertReplaceInNamedBlock(
+      zod,
+      "export const TracerTraceListVoiceCallsResponse = zod.object({",
+      '"next_cursor": zod.string().min(1).optional(),',
+      '"next_cursor": zod.string().min(1).nullish(),',
+      "TracerTraceListVoiceCallsResponse.next_cursor nullable",
+    );
+
+    for (const fieldPrefix of ["Nodes", "Edges", "PathEdges"]) {
+      zod = assertReplaceInNamedBlock(
+        zod,
+        "export const TracerTraceAgentGraphResponse = zod.object({",
+        `"trace_count": zod.number().min(tracerTraceAgentGraphResponseResult${fieldPrefix}ItemTraceCountMin),`,
+        `"trace_count": zod.number().min(tracerTraceAgentGraphResponseResult${fieldPrefix}ItemTraceCountMin).nullable(),`,
+        `TracerTraceAgentGraphResponse.${fieldPrefix}.trace_count nullable`,
+      );
+    }
 
     // x-string-or-array: orval generates zod.object({}).passthrough() for these
     // fields. Use the unique description emitted by StringOrArrayField as anchor.

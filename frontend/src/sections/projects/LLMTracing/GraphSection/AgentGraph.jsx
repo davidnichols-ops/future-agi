@@ -592,30 +592,109 @@ const layoutGraph = (nodes, edges, direction = "LR") => {
 // ---------------------------------------------------------------------------
 // Build React Flow nodes + edges from API data
 // ---------------------------------------------------------------------------
+const NODE_METRICS = [
+  "span_count",
+  "avg_latency_ms",
+  "total_tokens",
+  "total_cost",
+  "error_count",
+];
+const EDGE_METRICS = [
+  "transition_count",
+  "avg_latency_ms",
+  "total_tokens",
+  "total_cost",
+  "error_count",
+];
+
+const assertFiniteMetric = (record, key, label) => {
+  if (!Number.isFinite(record?.[key]) || record[key] < 0) {
+    throw new Error(`${label} is missing canonical ${key}`);
+  }
+};
+
+const assertTraceCount = (record, label) => {
+  if (
+    record?.trace_count_exact !== undefined &&
+    typeof record.trace_count_exact !== "boolean"
+  ) {
+    throw new Error(`${label} has malformed trace_count_exact`);
+  }
+  if (record?.trace_count === null) {
+    if (record.trace_count_exact !== false) {
+      throw new Error(`${label} has an inexact trace_count without disclosure`);
+    }
+    return;
+  }
+  assertFiniteMetric(record, "trace_count", label);
+};
+
+const assertCanonicalGraph = (graphData) => {
+  if (!graphData || typeof graphData !== "object") {
+    throw new Error("Agent Graph data is missing");
+  }
+  if (!Array.isArray(graphData.nodes) || !Array.isArray(graphData.edges)) {
+    throw new Error("Agent Graph data is missing nodes or edges");
+  }
+
+  graphData.nodes.forEach((node, index) => {
+    const label = `Agent Graph node #${index}`;
+    if (
+      typeof node?.id !== "string" ||
+      !node.id ||
+      typeof node.name !== "string" ||
+      !node.name ||
+      typeof node.type !== "string" ||
+      !node.type
+    ) {
+      throw new Error(`${label} is malformed`);
+    }
+    NODE_METRICS.forEach((key) => assertFiniteMetric(node, key, label));
+    assertTraceCount(node, label);
+  });
+
+  graphData.edges.forEach((edge, index) => {
+    const label = `Agent Graph edge #${index}`;
+    if (
+      typeof edge?.source !== "string" ||
+      !edge.source ||
+      typeof edge.target !== "string" ||
+      !edge.target ||
+      typeof edge.is_self_loop !== "boolean"
+    ) {
+      throw new Error(`${label} is malformed`);
+    }
+    EDGE_METRICS.forEach((key) => assertFiniteMetric(edge, key, label));
+    assertTraceCount(edge, label);
+  });
+};
+
 export const buildFlowData = (graphData, direction = "LR", theme = null) => {
-  if (!graphData?.nodes?.length) return { nodes: [], edges: [] };
+  assertCanonicalGraph(graphData);
+  if (!graphData.nodes.length) return { nodes: [], edges: [] };
 
   const nodeIdSet = new Set(graphData.nodes.map((n) => n.id));
+  if (nodeIdSet.size !== graphData.nodes.length) {
+    throw new Error("Agent Graph contains duplicate node ids");
+  }
 
-  // Agent Graph renders the recorded parent_span_id topology. Agent Path is
-  // the separate chronological projection and consumes `path_edges` itself.
-  // Using path_edges here invents parent/child relationships between adjacent
-  // sibling starts and can turn an otherwise acyclic span tree into a cycle.
-  const graphEdges = graphData.edges ?? [];
+  // Agent Graph renders the producer's canonical aggregate projection.
+  // Agent Path consumes the separately recorded `path_edges` projection.
+  // Substituting one for the other changes the meaning of both views.
+  const graphEdges = graphData.edges;
+  graphEdges.forEach((edge) => {
+    if (!nodeIdSet.has(edge.source) || !nodeIdSet.has(edge.target)) {
+      throw new Error(
+        `Agent Graph edge references an unknown node: ${edge.source}->${edge.target}`,
+      );
+    }
+  });
 
   const flowNodes = graphData.nodes.map((node) => ({
     id: node.id,
     type: "agentNode",
     data: {
       ...node,
-      // Aggregate API payloads are canonical snake_case. Trace-detail graphs
-      // are built in the browser and remain camelCase. Normalise both without
-      // allowing a missing camelCase alias to overwrite an exact API value.
-      span_count: node.span_count ?? node.spanCount ?? 0,
-      avg_latency_ms: node.avg_latency_ms ?? node.avgLatencyMs ?? 0,
-      total_tokens: node.total_tokens ?? node.totalTokens ?? 0,
-      total_cost: node.total_cost ?? node.totalCost ?? 0,
-      error_count: node.error_count ?? node.errorCount ?? 0,
       _direction: direction,
     },
     position: { x: 0, y: 0 },
@@ -625,83 +704,79 @@ export const buildFlowData = (graphData, direction = "LR", theme = null) => {
   // Find max transition count for scaling edge thickness
   const maxTransitions = Math.max(
     1,
-    ...graphEdges.map(
-      (edge) => edge.transition_count ?? edge.transitionCount ?? 1,
-    ),
+    ...graphEdges.map((edge) => edge.transition_count),
   );
 
-  const flowEdges = graphEdges
-    .filter((edge) => nodeIdSet.has(edge.source) && nodeIdSet.has(edge.target))
-    .map((edge, idx) => {
-      const count = edge.transition_count ?? edge.transitionCount ?? 1;
-      // Scale thickness: 0.75px min, 2px max — subtle, not overpowering
-      const thickness = 0.75 + (count / maxTransitions) * 1.25;
+  const flowEdges = graphEdges.map((edge, idx) => {
+    const count = edge.transition_count;
+    // Scale thickness: 0.75px min, 2px max — subtle, not overpowering
+    const thickness = 0.75 + (count / maxTransitions) * 1.25;
 
-      const edgeColor = theme ? theme.palette.text.disabled : "#94a3b8";
-      const strokeColor = theme ? theme.palette.divider : "#cbd5e1";
-      const labelBgColor = theme ? theme.palette.background.paper : "#ffffff";
+    const edgeColor = theme ? theme.palette.text.disabled : "#94a3b8";
+    const strokeColor = theme ? theme.palette.divider : "#cbd5e1";
+    const labelBgColor = theme ? theme.palette.background.paper : "#ffffff";
 
-      // Synthetic "skipped path" edges from the error-feed diff helper
-      // override the regular styling: dashed red stroke + a SKIPPED PATH
-      // pill so the divergence is unmistakable. Inert in the Observe view.
-      if (edge._skipped) {
-        const skippedColor = errorPalette.main;
-        return {
-          id: `e-skipped-${idx}`,
-          source: edge.source,
-          target: edge.target,
-          type: "default",
-          animated: false,
-          markerEnd: {
-            type: MarkerType.ArrowClosed,
-            color: skippedColor,
-            width: 10,
-            height: 10,
-          },
-          style: {
-            stroke: skippedColor,
-            strokeWidth: 1.6,
-            strokeDasharray: "6 4",
-          },
-          label: "SKIPPED PATH",
-          labelStyle: {
-            fontSize: 9,
-            fill: "#fff",
-            fontWeight: 700,
-            letterSpacing: "0.04em",
-          },
-          labelBgStyle: { fill: skippedColor, fillOpacity: 0.95 },
-          labelBgPadding: [5, 3],
-          labelBgBorderRadius: 4,
-          zIndex: 5,
-        };
-      }
-
+    // Synthetic "skipped path" edges from the error-feed diff helper
+    // override the regular styling: dashed red stroke + a SKIPPED PATH
+    // pill so the divergence is unmistakable. Inert in the Observe view.
+    if (edge._skipped) {
+      const skippedColor = errorPalette.main;
       return {
-        id: `e-${idx}`,
+        id: `e-skipped-${idx}`,
         source: edge.source,
         target: edge.target,
         type: "default",
-        animated: edge.is_self_loop ?? edge.isSelfLoop ?? false,
+        animated: false,
         markerEnd: {
           type: MarkerType.ArrowClosed,
-          color: edgeColor,
-          width: 8,
-          height: 8,
+          color: skippedColor,
+          width: 10,
+          height: 10,
         },
         style: {
-          stroke: strokeColor,
-          strokeWidth: Math.round(thickness * 10) / 10,
+          stroke: skippedColor,
+          strokeWidth: 1.6,
+          strokeDasharray: "6 4",
         },
-        // Show transition count on edges with > 1 transition
-        ...(count > 1 && {
-          label: `×${count}`,
-          labelStyle: { fontSize: 9, fill: edgeColor, fontWeight: 500 },
-          labelBgStyle: { fill: labelBgColor, fillOpacity: 0.9 },
-          labelBgPadding: [3, 2],
-        }),
+        label: "SKIPPED PATH",
+        labelStyle: {
+          fontSize: 9,
+          fill: "#fff",
+          fontWeight: 700,
+          letterSpacing: "0.04em",
+        },
+        labelBgStyle: { fill: skippedColor, fillOpacity: 0.95 },
+        labelBgPadding: [5, 3],
+        labelBgBorderRadius: 4,
+        zIndex: 5,
       };
-    });
+    }
+
+    return {
+      id: `e-${idx}`,
+      source: edge.source,
+      target: edge.target,
+      type: "default",
+      animated: edge.is_self_loop,
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color: edgeColor,
+        width: 8,
+        height: 8,
+      },
+      style: {
+        stroke: strokeColor,
+        strokeWidth: Math.round(thickness * 10) / 10,
+      },
+      // Show transition count on edges with > 1 transition
+      ...(count > 1 && {
+        label: `×${count}`,
+        labelStyle: { fontSize: 9, fill: edgeColor, fontWeight: 500 },
+        labelBgStyle: { fill: labelBgColor, fillOpacity: 0.9 },
+        labelBgPadding: [3, 2],
+      }),
+    };
+  });
 
   const layoutNodes = layoutGraph(flowNodes, flowEdges, direction);
   return { nodes: layoutNodes, edges: flowEdges };
@@ -793,8 +868,11 @@ const AgentGraphInner = ({
   const theme = useTheme();
   const [isHovering, setIsHovering] = useState(false);
   const { nodes: layoutNodes, edges: layoutEdges } = useMemo(
-    () => buildFlowData(data, direction, theme),
-    [data, direction, theme],
+    () =>
+      isLoading || isError || !data
+        ? { nodes: [], edges: [] }
+        : buildFlowData(data, direction, theme),
+    [data, direction, isError, isLoading, theme],
   );
 
   const [nodes, setNodes, onNodesChange] = useNodesState(layoutNodes);

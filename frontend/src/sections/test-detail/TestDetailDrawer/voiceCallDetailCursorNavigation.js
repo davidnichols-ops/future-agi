@@ -2,6 +2,7 @@ import {
   isLegacyListCursorValidationError,
   listContinuationParams,
 } from "src/sections/projects/LLMTracing/listCursorPagination";
+import { TracerTraceListVoiceCallsResponse } from "src/generated/api-contracts/api.zod";
 
 const DEFAULT_MAX_RESPONSES_PER_ATTEMPT = 13;
 const DEFAULT_ATTEMPT_DEADLINE_MS = 30_000;
@@ -10,17 +11,34 @@ const REQUEST_DEADLINE_REACHED = Symbol("voice-call-request-deadline");
 const hasOwn = (value, key) =>
   Object.prototype.hasOwnProperty.call(value || {}, key);
 
-const payloadFromResponse = (response) => {
-  const body = response?.data ?? response ?? {};
-  return body?.result ?? body;
+const rowsFromPayload = (payload) => {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Voice-call list returned an invalid response");
+  }
+  if (!Array.isArray(payload.results)) {
+    throw new Error("Voice-call list response is missing results");
+  }
+  return payload.results;
 };
 
-const rowsFromResponse = (response) => {
-  const payload = payloadFromResponse(response);
-  return payload?.results || payload?.data || payload?.calls || [];
+const parseCurrentVoiceCallPage = (payload) => {
+  rowsFromPayload(payload);
+  if (!hasOwn(payload, "has_more") || !hasOwn(payload, "next_cursor")) {
+    throw new Error("Voice-call list does not support exact cursors");
+  }
+  return TracerTraceListVoiceCallsResponse.parse(payload);
 };
 
-const rowIdentity = (row) => row?.call_id || row?.id || row?.trace_id || null;
+const parseLegacyVoiceCallPage = (payload) => {
+  const results = rowsFromPayload(payload);
+  const next = payload.next;
+  if (next !== null && (!Number.isInteger(next) || next < 1)) {
+    throw new Error("Legacy voice-call list returned invalid pagination");
+  }
+  return { results, next };
+};
+
+export const getVoiceCallRowIdentity = (row) => row?.trace_id ?? null;
 
 const cleanBaseParams = (baseParams) => {
   const {
@@ -157,7 +175,7 @@ export const createVoiceCallDetailCursorNavigator = ({
 
   const appendRows = (nextRows) => {
     for (const row of Array.isArray(nextRows) ? nextRows : []) {
-      const identity = rowIdentity(row);
+      const identity = getVoiceCallRowIdentity(row);
       if (
         (typeof identity !== "string" && typeof identity !== "number") ||
         String(identity).length === 0
@@ -244,22 +262,19 @@ export const createVoiceCallDetailCursorNavigator = ({
       if (requestResult.deadlineReached) {
         return resultFor(index, { pending: true });
       }
-      const response = requestResult.response;
+      const payload = legacyMode
+        ? parseLegacyVoiceCallPage(requestResult.response)
+        : parseCurrentVoiceCallPage(requestResult.response);
       responseCount += 1;
       started = true;
 
-      const responseRows = rowsFromResponse(response);
+      const responseRows = rowsFromPayload(payload);
       appendRows(responseRows);
-      const payload = payloadFromResponse(response);
-      if (!hasOwn(payload, "has_more") || !hasOwn(payload, "next_cursor")) {
-        if (!legacyMode) {
-          throw new Error("Voice-call list does not support exact cursors");
-        }
-        const nextPage = Number(payload?.next);
+      if (legacyMode) {
+        const nextPage = payload.next;
         if (
           responseRows.length < pageSize ||
-          payload?.next == null ||
-          !Number.isInteger(nextPage) ||
+          nextPage == null ||
           nextPage <= legacyPage
         ) {
           terminal = true;

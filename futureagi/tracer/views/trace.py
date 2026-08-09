@@ -72,6 +72,7 @@ from tracer.serializers.filters import (
 )
 from tracer.serializers.trace import (
     TraceAgentGraphQuerySerializer,
+    TraceAgentGraphResponseSerializer,
     TraceDetailResponseSerializer,
     TraceExportQuerySerializer,
     TraceIndexQuerySerializer,
@@ -79,6 +80,7 @@ from tracer.serializers.trace import (
     TraceObserveIndexQuerySerializer,
     TraceObserveListQuerySerializer,
     TraceObserveListResponseSerializer,
+    TracePrototypeListResponseSerializer,
     TraceSerializer,
     TraceVoiceCallListQuerySerializer,
     TraceVoiceCallListResponseSerializer,
@@ -2444,6 +2446,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     @validated_request(
         query_serializer=TraceListQuerySerializer,
         responses={
+            200: TracePrototypeListResponseSerializer,
             400: ApiErrorResponseSerializer,
             422: PageDepthExceededErrorSerializer,
             500: ApiErrorResponseSerializer,
@@ -6664,6 +6667,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     @validated_request(
         query_serializer=TraceAgentGraphQuerySerializer,
         responses={
+            200: TraceAgentGraphResponseSerializer,
             400: ApiErrorResponseSerializer,
             500: ApiErrorResponseSerializer,
             503: ApiErrorResponseSerializer,

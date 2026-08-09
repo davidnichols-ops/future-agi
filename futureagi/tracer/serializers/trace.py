@@ -318,6 +318,21 @@ class TraceObserveListResponseSerializer(serializers.Serializer):
     result = TraceObserveListResultSerializer()
 
 
+class TracePrototypeListResultSerializer(serializers.Serializer):
+    """Prototype trace list wire shape (uses ``column_config``)."""
+
+    column_config = TraceObserveColumnConfigSerializer(many=True)
+    metadata = TraceObserveListMetadataSerializer()
+    table = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+
+
+class TracePrototypeListResponseSerializer(serializers.Serializer):
+    status = serializers.BooleanField()
+    result = TracePrototypeListResultSerializer()
+
+
 class TraceExportQuerySerializer(StrictInputSerializer):
     project_id = serializers.UUIDField()
     filters = filter_list_query_param_field(required=False, default=list)
@@ -371,8 +386,10 @@ class TraceVoiceCallListResponseSerializer(serializers.Serializer):
     current_page = serializers.IntegerField(min_value=1)
     next = serializers.IntegerField(min_value=1, allow_null=True)
     previous = serializers.IntegerField(min_value=1, allow_null=True)
-    results = serializers.ListField(child=serializers.DictField())
-    config = serializers.ListField(child=serializers.DictField())
+    results = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+    config = TraceObserveColumnConfigSerializer(many=True)
     has_more = serializers.BooleanField()
     next_cursor = serializers.CharField(required=False, allow_null=True)
     query_complete = serializers.BooleanField()
@@ -400,6 +417,61 @@ class TraceAgentGraphQuerySerializer(StrictInputSerializer):
         default=False,
         help_text="Recompute and atomically replace the last exact graph snapshot.",
     )
+
+
+class TraceAgentGraphNodeSerializer(serializers.Serializer):
+    id = serializers.CharField()
+    name = serializers.CharField()
+    type = serializers.CharField()
+    span_count = serializers.IntegerField(min_value=0)
+    avg_latency_ms = serializers.FloatField(min_value=0)
+    total_tokens = serializers.IntegerField(min_value=0)
+    total_cost = serializers.FloatField(min_value=0)
+    error_count = serializers.IntegerField(min_value=0)
+    trace_count = serializers.IntegerField(min_value=0, allow_null=True)
+    trace_count_exact = serializers.BooleanField(required=False)
+    is_aggregate = serializers.BooleanField(required=False)
+    member_count = serializers.IntegerField(required=False, min_value=0)
+
+
+class TraceAgentGraphEdgeSerializer(serializers.Serializer):
+    source = serializers.CharField()
+    target = serializers.CharField()
+    transition_count = serializers.IntegerField(min_value=0)
+    avg_latency_ms = serializers.FloatField(min_value=0)
+    total_tokens = serializers.IntegerField(min_value=0)
+    total_cost = serializers.FloatField(min_value=0)
+    error_count = serializers.IntegerField(min_value=0)
+    trace_count = serializers.IntegerField(min_value=0, allow_null=True)
+    trace_count_exact = serializers.BooleanField(required=False)
+    is_self_loop = serializers.BooleanField()
+    is_aggregate = serializers.BooleanField(required=False)
+
+
+class TraceAgentGraphResultSerializer(serializers.Serializer):
+    nodes = TraceAgentGraphNodeSerializer(many=True)
+    edges = TraceAgentGraphEdgeSerializer(many=True)
+    path_edges = TraceAgentGraphEdgeSerializer(many=True)
+    graph_collapsed = serializers.BooleanField(required=False)
+    graph_node_limit = serializers.IntegerField(required=False, min_value=1)
+    omitted_node_count = serializers.IntegerField(required=False, min_value=0)
+    query_complete = serializers.BooleanField(required=False)
+    query_status = serializers.ChoiceField(
+        choices=("complete", "pending"), required=False
+    )
+    query_sampled = serializers.BooleanField(required=False)
+    query_count = serializers.IntegerField(required=False, min_value=0)
+    query_rows_returned = serializers.IntegerField(required=False, min_value=0)
+    query_elapsed_ms = serializers.FloatField(required=False, min_value=0)
+    query_completed_at = serializers.DateTimeField(required=False)
+    query_cached = serializers.BooleanField(required=False)
+    query_refresh_failed = serializers.BooleanField(required=False)
+    query_refreshing = serializers.BooleanField(required=False)
+
+
+class TraceAgentGraphResponseSerializer(serializers.Serializer):
+    status = serializers.BooleanField()
+    result = TraceAgentGraphResultSerializer()
 
 
 class UsersQuerySerializer(StrictInputSerializer):

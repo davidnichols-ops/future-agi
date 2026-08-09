@@ -198,6 +198,22 @@ def test_non_observe_list_has_no_pg_telemetry_fallback():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "method_name",
+    ["_list_spans_clickhouse", "_list_spans_non_observe_clickhouse"],
+)
+def test_span_list_rows_expose_project_scoped_physical_identity(method_name):
+    """Keep the wire row identity aligned with the physical CH25 span key."""
+
+    source = inspect.getsource(getattr(ObservationSpanView, method_name))
+
+    assert '"project_id": str(row.get("project_id", ""))' in source
+    assert '"trace_id": str(row.get("trace_id", ""))' in source
+    assert '"span_id": span_id' in source
+    assert '"start_time": row.get("start_time")' in source
+
+
+@pytest.mark.unit
 def test_content_query_uses_physical_identity_and_latest_version():
     started = datetime(2026, 7, 30, 12, 0)
     sql, params = _builder().build_content_query(

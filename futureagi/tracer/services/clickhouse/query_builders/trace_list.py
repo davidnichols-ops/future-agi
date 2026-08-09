@@ -79,6 +79,12 @@ _BULK_ANY_SPAN_CLASSIFY_BATCH_SIZE = 20
 # that internal bulk shape and keeps 10k+sentinel proofs within 128 queries.
 _BULK_IDENTITY_CLASSIFY_BATCH_SIZE = 100
 
+# Exact asynchronous graphs only return membership identities, never hydrated
+# span payloads.  Their global child classifier was production-qualified at a
+# five-thousand-trace finite batch; the reader halves a resource-limited batch
+# recursively, so this is an initial query size rather than a result ceiling.
+_EXACT_GRAPH_IDENTITY_CLASSIFY_BATCH_SIZE = 5_000
+
 # Normal trace pages classify identities only and hydrate at most the final
 # public page in a separate bounded statement.  Production replay showed that
 # 100 candidates can cross the interactive statement deadline on the largest
@@ -668,63 +674,40 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     def _filter_exact_zero_probe_plans(
         self,
     ) -> list[LatestFilterPredicate] | None:
-        """Return scalar Map leaves eligible for an exact negative proof.
+        """Disable request-window-only negative proofs for trace membership.
 
-        Each returned raw witness is an exhaustive superset of one positive
-        latest-state leaf.  Intersecting the witnesses by trace can therefore
-        prove that a conjunction has no result, while a positive intersection
-        is intentionally inconclusive and must fall back to the normal exact
-        latest-state selector.  Separate branches preserve trace any-span
-        semantics: sibling spans may satisfy separate leaves.
+        A trace's positive datetime filter binds its canonical root, while an
+        any-span attribute may be satisfied by a current child at any
+        timestamp.  The former short-window UNION scanned child witnesses only
+        inside the root window, so an empty result could incorrectly exclude a
+        valid trace whose sole matching child was written before or after that
+        window.  Ordered canonical-root acquisition plus the finite global
+        classifier is the authoritative exact path.
 
-        Keep this optional accelerator on the public, one-project list shape.
-        Root, relational, structured, negative, internal, and organization
-        reads retain their existing bounded path unchanged.
+        Voice-call builders retain a separate compatibility query, but their
+        capability hook declines the same request-window-only negative proof.
+        Generic trace pages deliberately expose no exact-zero shortcut until
+        a candidate-scoped all-history proof is available.
         """
 
-        if (
-            self._bounded_internal_scan
-            or self._bounded_identity_only
-            or self.project_ids is not None
-            or not self.project_id
-        ):
-            return None
-
-        request_start, request_end = self._bounded_request_window
-        if request_end - request_start > timedelta(hours=1):
-            # The UNION branches each scan the complete tenant/time window.
-            # That is a useful short-window proof, but on year-wide customer
-            # ranges it can hit the byte ceiling before the bounded selector
-            # starts. Long windows use the finite, candidate-scoped temporal
-            # witness path below instead.
-            return None
-
-        plans, residual_filters = self._partition_trace_filter_plans(
-            self._bounded_filters()
-        )
-        if residual_filters or any(plan.scope == "root" for plan in plans):
-            return None
-        any_span_plans = [plan for plan in plans if plan.scope == "any"]
-        if len(any_span_plans) < 2:
-            return None
-
-        for plan in any_span_plans:
-            raw_witness = str(plan.raw_witness_predicate or "")
-            seed_predicate = str(plan.seed_predicate or "")
-            if (
-                plan.raw_witness_rank != 0
-                or len(plan.aggregates) != 2
-                or not raw_witness
-                or "JSONExtract" in raw_witness
-                or "mapContains(span_attr_" not in seed_predicate
-            ):
-                return None
-        return any_span_plans
+        return None
 
     def supports_filter_exact_zero_probe(self) -> bool:
         """Whether this generic public trace page can prove an empty result."""
 
         return self._filter_exact_zero_probe_plans() is not None
+
+    @staticmethod
+    def filter_exact_zero_probe_proves_global_membership() -> bool:
+        """Return false for every request-window-only trace zero probe.
+
+        Subclasses may retain their SQL builder for compatibility, but the
+        shared selector must not let a temporal child-witness query terminate
+        an exact trace/voice page. A future implementation may opt in only
+        after proving absence across all child timestamps for finite roots.
+        """
+
+        return False
 
     @staticmethod
     def recommended_filter_exact_zero_probe_timeout_ms() -> int:
@@ -1198,6 +1181,19 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         return bool(self._filter_anchor_plans())
 
+    @staticmethod
+    def filter_anchor_probe_proves_complete_population() -> bool:
+        """Return false because a temporal child anchor cannot prove absence.
+
+        The probe remains useful as a positive candidate accelerator.  Its
+        exhaustion is not a population proof: the canonical root may be in the
+        requested time window while the only matching child lies outside it.
+        The bounded reader must therefore continue through ordered roots and
+        global finite classification before claiming an exact page.
+        """
+
+        return False
+
     def supports_graph_key_witness_probe(self) -> bool:
         """Whether graph discovery can use one cheap typed-Map key leaf."""
 
@@ -1404,6 +1400,489 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         params["filter_graph_key_witness"] = 1
         return query, params
 
+    def build_exact_graph_candidate_witness_probe(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return a finite all-time superset for a selective exact graph.
+
+        Positive scalar typed-Map equality/IN predicates have an exhaustive
+        raw witness: every latest-live matching span necessarily has a raw
+        live version carrying the same key/value.  Historical matching rows
+        may also survive before ReplacingMergeTree merges, so this result is
+        deliberately *not* authoritative.  The exact graph reader must replay
+        every returned trace through its ordinary latest-state classifier,
+        which also verifies the canonical root is inside the request window.
+
+        Child spans have no maximum duration relative to their root.  This
+        probe therefore has no request-window or adjacent-day predicate.  A
+        ``limit`` sentinel lets the caller use the shortcut only when the
+        complete candidate population is demonstrably small; a full sentinel
+        falls back to exhaustive root enumeration without publishing rows.
+        """
+
+        if limit <= 1:
+            raise ValueError("exact graph candidate limit must include a sentinel")
+        if not (
+            self._bounded_global_span_witnesses
+            and self._bounded_internal_scan
+            and self._bounded_identity_only
+            and self._bounded_bulk_scan
+            and not self._bounded_include_filter_witnesses
+            and self.project_id is not None
+            and self.project_ids is None
+            and not self.search
+            and self._bounded_sampling_rate is None
+        ):
+            return "", {}
+        anchor = self._positive_typed_map_anchor_plan()
+        if anchor is None:
+            return "", {}
+        raw_witness_predicate = str(anchor.raw_witness_predicate or "")
+        if not raw_witness_predicate:
+            return "", {}
+
+        params: dict[str, Any] = {
+            **self.params,
+            **{
+                key: value
+                for key, value in anchor.params.items()
+                if f"%({key})s" in raw_witness_predicate
+            },
+            "exact_graph_candidate_limit": int(limit),
+        }
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = "AND project_version_id = %(project_version_id)s"
+        query = f"""
+        SELECT trace_id
+        FROM {self.TABLE}
+        PREWHERE {self.project_filter_sql()}
+          AND is_deleted = 0
+          {project_version_fragment}
+        WHERE {raw_witness_predicate}
+        LIMIT 1 BY trace_id
+        LIMIT %(exact_graph_candidate_limit)s
+        """
+        return query, params
+
+    def _exact_graph_authoritative_anchor_plan(
+        self,
+    ) -> LatestFilterPredicate | None:
+        """Return the sole any-span leaf supported by the partitioned graph lane.
+
+        This is deliberately narrower than ``_positive_typed_map_anchor_plan``.
+        A raw anchor is only a necessary condition when a request contains
+        additional leaves; treating it as the complete graph membership set
+        would silently drop traces whose sibling spans satisfy those leaves.
+        The first authoritative lane therefore accepts exactly one non-time
+        positive scalar typed-Map equals/IN filter and no relational/root
+        residual. Other shapes keep the existing fail-closed classifier path.
+        """
+
+        if not (
+            self._bounded_global_span_witnesses
+            and self._bounded_internal_scan
+            and self._bounded_identity_only
+            and self._bounded_bulk_scan
+            and not self._bounded_include_filter_witnesses
+            and self.project_id is not None
+            and self.project_ids is None
+            and not self.search
+            and self._bounded_sampling_rate is None
+        ):
+            return None
+        active_filters = self._active_non_time_filters()
+        if len(active_filters) != 1:
+            return None
+        try:
+            plans, residual_filters = self._partition_trace_filter_plans(active_filters)
+        except (TypeError, ValueError):
+            return None
+        if residual_filters or len(plans) != 1:
+            return None
+        plan = plans[0]
+        predicate = str(plan.raw_witness_predicate or plan.seed_predicate or "")
+        if not (
+            plan.scope == "any"
+            and plan.raw_witness_rank == 0
+            and plan.aggregates
+            and plan.predicate
+            and "JSONExtract" not in predicate
+            and re.search(
+                r"\bmapContains\(span_attr_(?:str|num|bool),",
+                predicate,
+            )
+        ):
+            return None
+        return plan
+
+    def exact_graph_supports_authoritative_anchor_partition(self) -> bool:
+        """Whether this graph can replace repeated all-history classification."""
+
+        return self._exact_graph_authoritative_anchor_plan() is not None
+
+    def build_exact_graph_anchor_scan_bounds(self) -> tuple[str, dict[str, Any]]:
+        """Freeze the physical time range required by the authoritative lane."""
+
+        if self._exact_graph_authoritative_anchor_plan() is None:
+            return "", {}
+        params: dict[str, Any] = {**self.params}
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = "AND project_version_id = %(project_version_id)s"
+        query = f"""
+        SELECT
+            min(start_time) AS min_start_time,
+            max(start_time) AS max_start_time
+        FROM {self.TABLE}
+        PREWHERE {self.project_filter_sql()}
+          {project_version_fragment}
+        """
+        return query, params
+
+    def build_exact_graph_latest_anchor_partition(
+        self,
+        *,
+        partition_start: datetime,
+        partition_end: datetime,
+        before_trace_id: str | None = None,
+        limit: int = 50_001,
+    ) -> tuple[str, dict[str, Any]]:
+        """Resolve authoritative latest-live attribute membership in one range.
+
+        ``toStartOfHour(start_time)`` belongs to the production ReplacingMergeTree
+        identity, so callers may combine hours but may never bisect one. Mutable
+        deletion/key/value predicates are intentionally evaluated *after* the
+        version collapse. The ordered trace-id keyset bounds transport memory;
+        a full page is continued rather than interpreted as sampling.
+        """
+
+        plan = self._exact_graph_authoritative_anchor_plan()
+        if plan is None:
+            return "", {}
+        if not (
+            partition_start < partition_end
+            and partition_start.minute == 0
+            and partition_start.second == 0
+            and partition_start.microsecond == 0
+            and partition_end.minute == 0
+            and partition_end.second == 0
+            and partition_end.microsecond == 0
+        ):
+            raise ValueError(
+                "exact graph anchor partition must use whole-hour scan bounds"
+            )
+        if not 1 <= int(limit) <= 100_001:
+            raise ValueError("exact graph anchor partition limit is invalid")
+
+        params: dict[str, Any] = {
+            **self.params,
+            **plan.params,
+            "exact_graph_anchor_start_us": _unix_microseconds(partition_start),
+            "exact_graph_anchor_end_us": _unix_microseconds(partition_end),
+            "exact_graph_anchor_limit": int(limit),
+        }
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = "AND project_version_id = %(project_version_id)s"
+        keyset_fragment = ""
+        physical_keyset_fragment = ""
+        if before_trace_id is not None:
+            if not str(before_trace_id):
+                raise ValueError("exact graph anchor cursor must be non-empty")
+            params["exact_graph_anchor_after_trace_id"] = str(before_trace_id)
+            keyset_fragment = (
+                "AND grouped_trace_id > %(exact_graph_anchor_after_trace_id)s"
+            )
+            # ``trace_id`` is immutable within the full physical RMT identity,
+            # so this transport cursor is safe before the latest-state collapse.
+            # Keep the outer guard as an executable ordering assertion while
+            # avoiding a complete partition replay on every large page.
+            physical_keyset_fragment = (
+                "AND trace_id > %(exact_graph_anchor_after_trace_id)s"
+            )
+        aggregate_fragment = ",\n                    ".join(plan.aggregates)
+        raw_witness_predicate = str(plan.raw_witness_predicate or "")
+        if not raw_witness_predicate:
+            return "", {}
+        query = f"""
+        WITH raw_anchor_identities AS (
+            SELECT
+                project_id,
+                observation_type,
+                service_name,
+                toStartOfHour(start_time) AS start_hour,
+                trace_id,
+                id
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              {project_version_fragment}
+              AND is_deleted = 0
+              AND toDate(start_time) >= toDate(
+                    fromUnixTimestamp64Micro(%(exact_graph_anchor_start_us)s)
+                  )
+              AND toDate(start_time) <= toDate(
+                    fromUnixTimestamp64Micro(%(exact_graph_anchor_end_us)s)
+                  )
+              AND start_time >= fromUnixTimestamp64Micro(
+                    %(exact_graph_anchor_start_us)s
+                  )
+              AND start_time < fromUnixTimestamp64Micro(
+                    %(exact_graph_anchor_end_us)s
+                  )
+              {physical_keyset_fragment}
+            WHERE {raw_witness_predicate}
+            GROUP BY
+                project_id,
+                observation_type,
+                service_name,
+                toStartOfHour(start_time),
+                trace_id,
+                id
+        )
+        SELECT grouped_trace_id AS trace_id
+        FROM (
+            SELECT
+                trace_id AS grouped_trace_id,
+                argMax(is_deleted, _peerdb_version) AS latest_is_deleted,
+                {aggregate_fragment}
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              {project_version_fragment}
+              AND toDate(start_time) >= toDate(
+                    fromUnixTimestamp64Micro(%(exact_graph_anchor_start_us)s)
+                  )
+              AND toDate(start_time) <= toDate(
+                    fromUnixTimestamp64Micro(%(exact_graph_anchor_end_us)s)
+                  )
+              AND start_time >= fromUnixTimestamp64Micro(
+                    %(exact_graph_anchor_start_us)s
+                  )
+              AND start_time < fromUnixTimestamp64Micro(
+                    %(exact_graph_anchor_end_us)s
+                  )
+              {physical_keyset_fragment}
+              AND (
+                    project_id,
+                    observation_type,
+                    service_name,
+                    toStartOfHour(start_time),
+                    trace_id,
+                    id
+                  ) IN (
+                    SELECT
+                        project_id,
+                        observation_type,
+                        service_name,
+                        start_hour,
+                        trace_id,
+                        id
+                    FROM raw_anchor_identities
+                  )
+            GROUP BY
+                project_id,
+                observation_type,
+                service_name,
+                toStartOfHour(start_time),
+                trace_id,
+                id
+        ) AS latest_anchor_spans
+        WHERE latest_is_deleted = 0
+          AND ({plan.predicate})
+          {keyset_fragment}
+        GROUP BY grouped_trace_id
+        ORDER BY grouped_trace_id
+        LIMIT %(exact_graph_anchor_limit)s
+        """
+        return query, params
+
+    def build_exact_graph_root_membership_query(
+        self,
+        *,
+        candidate_trace_ids: list[str] | tuple[str, ...],
+        request_start: datetime,
+        request_end: datetime,
+    ) -> tuple[str, dict[str, Any]]:
+        """Verify live canonical roots after version collapse for finite IDs."""
+
+        normalized_trace_ids = tuple(
+            dict.fromkeys(str(trace_id) for trace_id in candidate_trace_ids if trace_id)
+        )
+        if not normalized_trace_ids:
+            return "", {}
+        if len(normalized_trace_ids) > 512:
+            raise ValueError("exact graph root batch exceeds 512 identities")
+        if request_start >= request_end:
+            raise ValueError("exact graph root window is empty")
+
+        params: dict[str, Any] = {
+            **self.params,
+            "exact_graph_root_trace_ids": normalized_trace_ids,
+            "exact_graph_root_start_us": _unix_microseconds(request_start),
+            "exact_graph_root_end_us": _unix_microseconds(request_end),
+            "exact_graph_root_limit": len(normalized_trace_ids),
+        }
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = "AND project_version_id = %(project_version_id)s"
+        query = f"""
+        SELECT grouped_trace_id AS trace_id
+        FROM (
+            SELECT
+                trace_id AS grouped_trace_id,
+                argMax(tuple(parent_span_id), _peerdb_version).1
+                    AS latest_parent_span_id,
+                argMax(start_time, _peerdb_version) AS latest_start_time,
+                argMax(is_deleted, _peerdb_version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              {project_version_fragment}
+              AND trace_id IN %(exact_graph_root_trace_ids)s
+            GROUP BY
+                project_id,
+                observation_type,
+                service_name,
+                toStartOfHour(start_time),
+                trace_id,
+                id
+        ) AS latest_root_spans
+        WHERE latest_is_deleted = 0
+          AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
+          AND latest_start_time >= fromUnixTimestamp64Micro(
+                %(exact_graph_root_start_us)s
+              )
+          AND latest_start_time < fromUnixTimestamp64Micro(
+                %(exact_graph_root_end_us)s
+              )
+        GROUP BY grouped_trace_id
+        ORDER BY grouped_trace_id
+        LIMIT %(exact_graph_root_limit)s
+        """
+        return query, params
+
+    def build_exact_graph_latest_root_partition(
+        self,
+        *,
+        partition_start: datetime,
+        partition_end: datetime,
+        request_start: datetime,
+        request_end: datetime,
+        before_trace_id: str | None = None,
+        limit: int = 50_001,
+    ) -> tuple[str, dict[str, Any]]:
+        """Enumerate authoritative live roots in one physical time range.
+
+        Long exact attribute graphs can discover hundreds of thousands of
+        matching trace IDs. Replaying all retained history once per finite ID
+        batch merely to verify their roots does not scale. This cursor instead
+        collapses each physical root version exactly once in disjoint whole-
+        hour ranges; the reader intersects the resulting trace IDs with the
+        independently authoritative attribute population.
+
+        The partition bounds are physical pruning only. The caller's frozen
+        half-open request window is re-applied to ``latest_start_time`` after
+        version collapse, including for the first and last partial hour.
+        """
+
+        if self._exact_graph_authoritative_anchor_plan() is None:
+            return "", {}
+        if not (
+            partition_start < partition_end
+            and request_start < request_end
+            and partition_start.minute == 0
+            and partition_start.second == 0
+            and partition_start.microsecond == 0
+            and partition_end.minute == 0
+            and partition_end.second == 0
+            and partition_end.microsecond == 0
+        ):
+            raise ValueError(
+                "exact graph root partition must use ordered whole-hour bounds"
+            )
+        if not 1 <= int(limit) <= 100_001:
+            raise ValueError("exact graph root partition limit is invalid")
+
+        params: dict[str, Any] = {
+            **self.params,
+            "exact_graph_root_partition_start_us": _unix_microseconds(partition_start),
+            "exact_graph_root_partition_end_us": _unix_microseconds(partition_end),
+            "exact_graph_root_start_us": _unix_microseconds(request_start),
+            "exact_graph_root_end_us": _unix_microseconds(request_end),
+            "exact_graph_root_partition_limit": int(limit),
+        }
+        project_version_fragment = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version_fragment = "AND project_version_id = %(project_version_id)s"
+        keyset_fragment = ""
+        physical_keyset_fragment = ""
+        if before_trace_id is not None:
+            if not str(before_trace_id):
+                raise ValueError("exact graph root cursor must be non-empty")
+            params["exact_graph_root_after_trace_id"] = str(before_trace_id)
+            keyset_fragment = (
+                "AND grouped_trace_id > %(exact_graph_root_after_trace_id)s"
+            )
+            # Trace ID is immutable within the physical RMT identity, so the
+            # cursor can prune subsequent transport pages before collapse.
+            physical_keyset_fragment = (
+                "AND trace_id > %(exact_graph_root_after_trace_id)s"
+            )
+
+        query = f"""
+        SELECT grouped_trace_id AS trace_id
+        FROM (
+            SELECT
+                trace_id AS grouped_trace_id,
+                argMax(tuple(parent_span_id), _peerdb_version).1
+                    AS latest_parent_span_id,
+                argMax(start_time, _peerdb_version) AS latest_start_time,
+                argMax(is_deleted, _peerdb_version) AS latest_is_deleted
+            FROM {self.TABLE}
+            PREWHERE {self.project_filter_sql()}
+              {project_version_fragment}
+              AND toDate(start_time) >= toDate(
+                    fromUnixTimestamp64Micro(%(exact_graph_root_partition_start_us)s)
+                  )
+              AND toDate(start_time) <= toDate(
+                    fromUnixTimestamp64Micro(%(exact_graph_root_partition_end_us)s)
+                  )
+              AND start_time >= fromUnixTimestamp64Micro(
+                    %(exact_graph_root_partition_start_us)s
+                  )
+              AND start_time < fromUnixTimestamp64Micro(
+                    %(exact_graph_root_partition_end_us)s
+                  )
+              {physical_keyset_fragment}
+            GROUP BY
+                project_id,
+                observation_type,
+                service_name,
+                toStartOfHour(start_time),
+                trace_id,
+                id
+        ) AS latest_root_spans
+        WHERE latest_is_deleted = 0
+          AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
+          AND latest_start_time >= fromUnixTimestamp64Micro(
+                %(exact_graph_root_start_us)s
+              )
+          AND latest_start_time < fromUnixTimestamp64Micro(
+                %(exact_graph_root_end_us)s
+              )
+          {keyset_fragment}
+        GROUP BY grouped_trace_id
+        ORDER BY grouped_trace_id
+        LIMIT %(exact_graph_root_partition_limit)s
+        """
+        return query, params
+
     def _candidate_witness_plans(self) -> list[LatestFilterPredicate]:
         """Return positive any-span leaves safe for a finite exact prefilter.
 
@@ -1582,7 +2061,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return False
 
     def prefer_filter_candidate_witness_probe_first(self) -> bool:
-        """Use a finite temporal witness before expensive long-window replay."""
+        """Use a finite global witness before expensive long-window replay."""
 
         request_start, request_end = self._bounded_request_window
         interactive_list = bool(
@@ -1612,11 +2091,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         return 128 if self.prefer_filter_candidate_witness_probe_first() else None
 
     def recommended_filter_candidate_witness_probe_strata(self) -> int | None:
-        """Resolve the finite candidate batch in one partition-pruned query."""
+        """Resolve the finite candidate batch in one all-history query."""
 
         if not self.prefer_filter_candidate_witness_probe_first():
             return None
         return _LONG_WINDOW_CANDIDATE_WITNESS_STRATA
+
+    def filter_candidate_witness_replays_global_membership(self) -> bool:
+        """Whether candidate-witness absence covers all child timestamps."""
+
+        return self._candidate_witness_anchor_plan() is not None
 
     def recommended_filter_candidate_witness_probe_timeout_ms(self) -> int | None:
         """Give the finite latest-state anchor one normal CH statement budget."""
@@ -1667,14 +2151,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         slice_start: datetime | None = None,
         slice_end: datetime | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Return finite candidates satisfying one necessary any-span leaf.
+        """Return finite candidates satisfying one global necessary leaf.
 
         Physical span versions are collapsed first and the selected leaf is
-        reduced at trace scope.  Using exactly one leaf matters because two
-        filters may be satisfied by sibling spans in different temporal
-        strata; ANDing them inside each stratum would be an unsafe negative.
+        reduced at trace scope across all history.  The candidate identities
+        are finite, so this can safely prove that one required any-span leaf is
+        absent without assuming a maximum trace duration. Using exactly one
+        leaf matters because two filters may be satisfied by sibling spans.
         Survivors still pass the complete latest-state classifier before
-        publication.
+        publication. ``slice_start``/``slice_end`` are accepted for backwards
+        compatibility but never narrow this global membership replay.
         """
 
         if not isinstance(seed_rows, list) or not seed_rows or len(seed_rows) > 512:
@@ -1728,25 +2214,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             }
             candidate_count = len(candidate_trace_ids)
 
-        request_start, request_end = self._bounded_request_window
-        if request_start >= request_end:
-            return "", {}
         if (slice_start is None) != (slice_end is None):
             raise ValueError("candidate witness slice values must be provided together")
-        probe_start = request_start if slice_start is None else slice_start
-        probe_end = request_end if slice_end is None else slice_end
-        if not request_start <= probe_start < probe_end <= request_end:
-            raise ValueError(
-                "candidate witness slice must stay inside the request window"
-            )
         if not anchor.aggregates or not anchor.predicate:
             return "", {}
         params: dict[str, Any] = {
             **self.params,
             **anchor.params,
             **candidate_params,
-            "filter_candidate_start_us": _unix_microseconds(probe_start),
-            "filter_candidate_end_us": _unix_microseconds(probe_end),
             "filter_candidate_witness_limit": candidate_count,
         }
         project_version_fragment = ""
@@ -1785,10 +2260,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             PREWHERE {self.project_filter_sql()}
               {project_version_fragment}
               {candidate_fragment}
-              AND toDate(start_time) >= toDate(fromUnixTimestamp64Micro(%(filter_candidate_start_us)s))
-              AND toDate(start_time) <= toDate(fromUnixTimestamp64Micro(%(filter_candidate_end_us)s))
-              AND start_time >= fromUnixTimestamp64Micro(%(filter_candidate_start_us)s)
-              AND start_time < fromUnixTimestamp64Micro(%(filter_candidate_end_us)s)
             GROUP BY {physical_group_by}
         ) AS latest_anchor_spans
         WHERE 1 = 1
@@ -2373,19 +2844,23 @@ class TraceListQueryBuilder(BaseQueryBuilder):
     ) -> tuple[str, dict[str, Any]]:
         """Classify bounded trace IDs against their latest span versions.
 
-        Direct-write OTLP rows treat ``(project_id, trace_id, id, start_time)``
-        as immutable identity. Payload columns and tombstones may acquire newer
-        versions and are resolved with ``argMax`` below.  One candidate-trace
-        scan resolves every physical span, selects the newest live root, and
-        evaluates any-span membership.  This avoids both the production-timeout
-        nested physical-ID set and a false negative when the raw seed root was
-        tombstoned but another root for the trace remains live.
+        The schema-specific physical identity is resolved with ``argMax`` below.
+        Legacy CDC keys on exact ``start_time``; CH25 overrides the grouping to
+        its deployed observation/service/start-hour RMT key, where a newer poll
+        may carry a producer-corrected timestamp. One candidate-trace scan then
+        selects the newest live root and evaluates any-span membership. This
+        avoids both the production-timeout nested physical-ID set and a false
+        negative when the raw seed root was tombstoned but another root for the
+        trace remains live.
         """
 
         trace_ids = tuple(dict.fromkeys(str(value) for value in candidate_ids if value))
         if not trace_ids:
             return "", {}
-        candidate_limit = 200 if self._bounded_bulk_scan else 512
+        if self._bounded_global_span_witnesses:
+            candidate_limit = _EXACT_GRAPH_IDENTITY_CLASSIFY_BATCH_SIZE
+        else:
+            candidate_limit = 200 if self._bounded_bulk_scan else 512
         org_scope = self.project_ids is not None
         trace_identities: tuple[tuple[str, str], ...] = ()
         if org_scope:
@@ -2434,19 +2909,22 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         # Preserve an explicit user time filter, however, because that *is*
         # part of the task's selection contract.
         scope_to_request_window = not candidate_full_state or has_explicit_time_filter
-        # Exact aggregate refreshes first enumerate a finite set of canonical
-        # roots inside the requested window. For that internal mode, project +
-        # trace identity is the complete child-membership bound: a child may be
-        # written days after its root, and ingestion enforces no maximum trace
-        # duration. Keep the root predicate windowed below while removing the
-        # heuristic physical child-time envelope. Normal list/task classifiers
-        # retain their existing time-scoped behavior.
-        scope_span_witnesses_to_request_window = (
-            scope_to_request_window and not self._bounded_global_span_witnesses
-        )
         plans, residual_filters = self._partition_trace_filter_plans(match_filters)
         root_plans = [plan for plan in plans if plan.scope == "root"]
         any_span_plans = [plan for plan in plans if plan.scope == "any"]
+        # Public trace time filters bind only to the canonical root. Once a
+        # finite candidate trace identity is known, non-root membership must
+        # inspect every current child version: ingestion enforces no maximum
+        # trace duration and a child may be written days after its root. This
+        # is the same contract used by exact graphs, task/eval selection, and
+        # list pagination. Root-only classifiers can still prune their physical
+        # scan to the request window because no child can affect membership.
+        has_non_root_membership = bool(any_span_plans or residual_filters)
+        scope_span_witnesses_to_request_window = (
+            scope_to_request_window
+            and not self._bounded_global_span_witnesses
+            and not has_non_root_membership
+        )
         candidate_witness_start = request_start
         candidate_witness_end = request_end
         if scope_span_witnesses_to_request_window and any_span_plans:
@@ -2467,7 +2945,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     "candidate_end_date_us": _unix_microseconds(request_end),
                 }
             )
-        if scope_span_witnesses_to_request_window:
+        prune_candidate_versions_to_request_window = (
+            scope_span_witnesses_to_request_window
+            and self.filter_classifier_has_exact_start_time_identity()
+        )
+        if prune_candidate_versions_to_request_window:
             params.update(
                 {
                     "candidate_witness_start_date_us": _unix_microseconds(
@@ -2479,7 +2961,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 }
             )
         candidate_time_fragment = ""
-        if scope_span_witnesses_to_request_window:
+        if prune_candidate_versions_to_request_window:
             # start_time is part of the immutable physical span identity. All
             # versions of a witness span therefore stay in the same daily
             # partition, so pruning outside the list/oracle's adjacent-day
@@ -2557,16 +3039,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         )
         root_predicate = " AND ".join(plan.predicate for plan in root_plans) or "1 = 1"
 
-        # ``start_time`` is part of the immutable physical span identity
-        # ``(project_id, trace_id, id, start_time)``.  Gate each any-span leaf
-        # after version collapse, not only the canonical root. Trace datetime
-        # applies to the root. Normal list/task reads retain their adjacent-day
-        # child envelope; an exact graph's finite identity classifier evaluates
-        # child witnesses globally because no maximum trace duration is enforced.
+        # A request-window predicate is safe only when every membership predicate
+        # is root-scoped. Any-span and residual predicates deliberately evaluate
+        # globally for the finite candidate identity because no maximum trace
+        # duration is enforced.
         if scope_span_witnesses_to_request_window:
             any_span_window_condition = """(
-                    latest_start_time >= fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s)
-                    AND latest_start_time < fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s)
+                    latest_start_time >= fromUnixTimestamp64Micro(%(candidate_start_date_us)s)
+                    AND latest_start_time < fromUnixTimestamp64Micro(%(candidate_end_date_us)s)
                 )"""
             any_span_having = " AND ".join(
                 (f"countIf({any_span_window_condition} AND ({plan.predicate})) > 0")
@@ -2765,10 +3245,8 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         grouped_project_select_fragment = (
             "project_id AS grouped_project_id," if org_scope else ""
         )
-        physical_group_by = (
-            "project_id, trace_id, id, start_time"
-            if org_scope
-            else "trace_id, id, start_time"
+        physical_group_by = self.filter_classifier_physical_group_by(
+            org_scope=org_scope
         )
         trace_group_by = (
             "grouped_project_id, grouped_trace_id" if org_scope else "grouped_trace_id"
@@ -2871,7 +3349,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                     trace_id AS grouped_trace_id,
                     argMax(tuple(parent_span_id), _peerdb_version).1
                         AS latest_parent_span_id,
-                    start_time AS latest_start_time,
+                    argMax(start_time, _peerdb_version) AS latest_start_time,
                     argMax(is_deleted, _peerdb_version) AS latest_is_deleted
                     {hydrate_root_aggregate_fragment}
                     {plan_aggregate_fragment}
@@ -2896,6 +3374,22 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         LIMIT {output_limit}
         """
         return query, params
+
+    @staticmethod
+    def filter_classifier_has_exact_start_time_identity() -> bool:
+        """Whether exact time bounds preserve every physical row version."""
+
+        return True
+
+    @staticmethod
+    def filter_classifier_physical_group_by(*, org_scope: bool) -> str:
+        """Return the legacy CDC replacement identity used by the classifier."""
+
+        return (
+            "project_id, trace_id, id, start_time"
+            if org_scope
+            else "trace_id, id, start_time"
+        )
 
     def build_filter_navigation_target_query(
         self,

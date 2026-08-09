@@ -3,6 +3,7 @@ import json
 from django.db.models import Q
 from rest_framework import serializers
 
+from tfc.utils.serializer_fields import JsonValueField
 from tracer.constants.provider_logos import PROVIDER_LOGOS
 from tracer.models.observation_span import ObservationSpan
 from tracer.models.project import Project
@@ -302,6 +303,76 @@ class SpanObserveListQuerySerializer(StrictInputSerializer):
     def validate(self, attrs):
         attrs = super().validate(attrs)
         return validate_cursor_exclusivity(self, attrs, page_field="page_number")
+
+
+class SpanListMetadataSerializer(serializers.Serializer):
+    """Metadata shared by prototype and Observe span list responses."""
+
+    total_rows = serializers.IntegerField(min_value=0)
+    total_rows_exact = serializers.IntegerField(
+        required=False, min_value=0, allow_null=True
+    )
+    total_rows_is_lower_bound = serializers.BooleanField(required=False)
+    has_more = serializers.BooleanField(required=False)
+    next_cursor = serializers.CharField(required=False, allow_null=True)
+    query_complete = serializers.BooleanField(required=False)
+    query_status = serializers.ChoiceField(
+        choices=("complete", "degraded"), required=False
+    )
+    query_error_code = serializers.CharField(required=False, allow_null=True)
+    query_elapsed_ms = serializers.FloatField(required=False, min_value=0)
+    query_count = serializers.IntegerField(required=False, min_value=0)
+    query_rows_returned = serializers.IntegerField(required=False, min_value=0)
+    query_result_payload_bytes = serializers.IntegerField(required=False, min_value=0)
+
+
+class SpanListColumnConfigSerializer(serializers.Serializer):
+    """Typed wire form of ``tracer.utils.helper.FieldConfig``."""
+
+    id = serializers.CharField()
+    name = serializers.CharField()
+    is_visible = serializers.BooleanField()
+    group_by = serializers.CharField(required=False, allow_null=True)
+    output_type = serializers.CharField(required=False, allow_null=True)
+    reverse_output = serializers.BooleanField(required=False, allow_null=True)
+    annotation_label_type = serializers.CharField(required=False, allow_null=True)
+    choices = serializers.ListField(
+        child=serializers.CharField(allow_null=True),
+        required=False,
+        allow_null=True,
+    )
+    settings = JsonValueField(required=False, allow_null=True)
+    choices_map = JsonValueField(required=False, allow_null=True)
+    eval_template_id = serializers.CharField(required=False, allow_null=True)
+    annotators = JsonValueField(required=False, allow_null=True)
+    source_field = serializers.CharField(required=False, allow_null=True)
+    parent_eval_id = serializers.CharField(required=False, allow_null=True)
+
+
+class SpanPrototypeListResultSerializer(serializers.Serializer):
+    column_config = SpanListColumnConfigSerializer(many=True)
+    metadata = SpanListMetadataSerializer()
+    table = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+
+
+class SpanPrototypeListResponseSerializer(serializers.Serializer):
+    status = serializers.BooleanField()
+    result = SpanPrototypeListResultSerializer()
+
+
+class SpanObserveListResultSerializer(serializers.Serializer):
+    metadata = SpanListMetadataSerializer()
+    table = serializers.ListField(
+        child=serializers.DictField(child=JsonValueField(allow_null=True))
+    )
+    config = SpanListColumnConfigSerializer(many=True)
+
+
+class SpanObserveListResponseSerializer(serializers.Serializer):
+    status = serializers.BooleanField()
+    result = SpanObserveListResultSerializer()
 
 
 class SpanIndexQuerySerializer(StrictInputSerializer):

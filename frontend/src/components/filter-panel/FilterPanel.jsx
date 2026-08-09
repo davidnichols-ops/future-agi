@@ -599,6 +599,8 @@ const isCompleteNumericInput = (v) => {
   return Number.isFinite(parseFloat(str));
 };
 
+const QUERY_FIELD_LOAD_MORE_OPTION = "__query_field_load_more__";
+
 const QueryInput = forwardRef(function QueryInput(
   {
     filterFields,
@@ -608,9 +610,14 @@ const QueryInput = forwardRef(function QueryInput(
     valueOptions = [],
     valueLoading = false,
     valueLoadingMore = false,
+    fieldLoading = false,
+    fieldLoadingMore = false,
     onFieldChange,
+    onFieldSearchChange,
+    onLoadMoreFields,
     onValueSearchChange,
     onLoadMoreValues,
+    hasMoreFields = false,
     hasMoreValues = false,
     getOperators: getOperatorsProp,
   },
@@ -729,10 +736,21 @@ const QueryInput = forwardRef(function QueryInput(
   ]);
 
   const filtered = useMemo(() => {
-    if (!inputValue) return options;
-    const q = inputValue.toLowerCase();
-    return options.filter((o) => o.label.toLowerCase().includes(q));
-  }, [options, inputValue]);
+    const matchingOptions = inputValue
+      ? options.filter((option) =>
+          option.label.toLowerCase().includes(inputValue.toLowerCase()),
+        )
+      : options;
+    if (phase !== "field" || !hasMoreFields) return matchingOptions;
+    return [
+      ...matchingOptions,
+      {
+        id: QUERY_FIELD_LOAD_MORE_OPTION,
+        label: fieldLoadingMore ? "Loading more fields..." : "Load more fields",
+        type: "field_load_more",
+      },
+    ];
+  }, [fieldLoadingMore, hasMoreFields, inputValue, options, phase]);
 
   const exactInputOption = useMemo(() => {
     const candidate = inputValue.trim().toLowerCase();
@@ -918,6 +936,11 @@ const QueryInput = forwardRef(function QueryInput(
   const handleSelect = useCallback(
     (_, option) => {
       if (!option) return;
+      if (option?.type === "field_load_more") {
+        if (!fieldLoadingMore) onLoadMoreFields?.();
+        reopenDropdown();
+        return;
+      }
       if (typeof option === "string") {
         const explicitValue = option.trim();
         if (
@@ -969,6 +992,8 @@ const QueryInput = forwardRef(function QueryInput(
       opDefFor,
       hasStaticValueChoices,
       isNumericScalar,
+      fieldLoadingMore,
+      onLoadMoreFields,
     ],
   );
 
@@ -1107,15 +1132,25 @@ const QueryInput = forwardRef(function QueryInput(
     [tokens, onApply],
   );
 
-  const handleValuesScroll = useCallback(
+  const handleOptionsScroll = useCallback(
     (event) => {
-      if (phase !== "value" || !hasMoreValues || valueLoadingMore) return;
       const { scrollTop, clientHeight, scrollHeight } = event.currentTarget;
-      if (scrollHeight - scrollTop - clientHeight <= 40) {
+      if (scrollHeight - scrollTop - clientHeight > 40) return;
+      if (phase === "field" && hasMoreFields && !fieldLoadingMore) {
+        onLoadMoreFields?.();
+      } else if (phase === "value" && hasMoreValues && !valueLoadingMore) {
         onLoadMoreValues?.();
       }
     },
-    [hasMoreValues, onLoadMoreValues, phase, valueLoadingMore],
+    [
+      fieldLoadingMore,
+      hasMoreFields,
+      hasMoreValues,
+      onLoadMoreFields,
+      onLoadMoreValues,
+      phase,
+      valueLoadingMore,
+    ],
   );
 
   const inlinePrefix = useMemo(() => {
@@ -1137,9 +1172,11 @@ const QueryInput = forwardRef(function QueryInput(
   const placeholder = isRangePhase
     ? ""
     : phase === "field"
-      ? tokens.length
-        ? "add filter..."
-        : "type to filter — e.g. field → operator → value"
+      ? fieldLoading && filterFields.length === 0
+        ? "loading fields..."
+        : tokens.length
+          ? "add filter..."
+          : "type to filter — e.g. field → operator → value"
       : phase === "operator"
         ? "pick operator..."
         : valueLoading
@@ -1288,6 +1325,7 @@ const QueryInput = forwardRef(function QueryInput(
       size="small"
       freeSolo={phase === "value" && !isRangePhase && !hasStaticValueChoices}
       options={filtered}
+      filterOptions={(availableOptions) => availableOptions}
       getOptionLabel={(o) => (typeof o === "string" ? o : o.label)}
       inputValue={inputValue}
       onInputChange={(_, v, reason) => {
@@ -1297,20 +1335,28 @@ const QueryInput = forwardRef(function QueryInput(
             setPartialOriginalValue(undefined);
           }
           setInputValue(v);
-          if (phase === "value") onValueSearchChange?.(v, partialField);
+          if (phase === "field") onFieldSearchChange?.(v);
+          else if (phase === "value") onValueSearchChange?.(v, partialField);
         }
       }}
       onChange={handleSelect}
-      open={!isRangePhase && dropdownOpen && focused && filtered.length > 0}
+      open={
+        !isRangePhase &&
+        dropdownOpen &&
+        focused &&
+        (phase === "field" || filtered.length > 0)
+      }
       onOpen={() => setDropdownOpen(true)}
       onClose={() => setDropdownOpen(false)}
+      loading={phase === "field" ? fieldLoading : valueLoading}
       autoHighlight
       clearOnBlur={false}
       disableClearable
       value={null}
       ListboxProps={{
+        "data-query-field-options-list": phase === "field" ? "" : undefined,
         "data-query-value-options-list": phase === "value" ? "" : undefined,
-        onScroll: handleValuesScroll,
+        onScroll: handleOptionsScroll,
       }}
       slotProps={{
         popper: { sx: { zIndex: 1500 } },
@@ -1326,6 +1372,7 @@ const QueryInput = forwardRef(function QueryInput(
       renderOption={(props, option) => {
         const { key, ...rest } = props;
         const isField = option.type === "field";
+        const isFieldLoadMore = option.type === "field_load_more";
         const isOperator = option.type === "operator";
         const isValue = option.type === "value";
         const fieldDef = isField ? fieldMap[option.id] : null;
@@ -1368,6 +1415,9 @@ const QueryInput = forwardRef(function QueryInput(
                 width={14}
                 sx={{ color: "text.disabled", flexShrink: 0 }}
               />
+            )}
+            {isFieldLoadMore && fieldLoadingMore && (
+              <CircularProgress size={14} sx={{ flexShrink: 0 }} />
             )}
             <Box
               sx={{
@@ -1415,7 +1465,8 @@ const QueryInput = forwardRef(function QueryInput(
               </>
             ),
             endAdornment:
-              (valueLoading || valueLoadingMore) && phase === "value" ? (
+              (phase === "field" && (fieldLoading || fieldLoadingMore)) ||
+              (phase === "value" && (valueLoading || valueLoadingMore)) ? (
                 <CircularProgress size={14} sx={{ mr: 1 }} />
               ) : (
                 params.InputProps.endAdornment
@@ -1442,9 +1493,14 @@ QueryInput.propTypes = {
   valueOptions: PropTypes.array,
   valueLoading: PropTypes.bool,
   valueLoadingMore: PropTypes.bool,
+  fieldLoading: PropTypes.bool,
+  fieldLoadingMore: PropTypes.bool,
   onFieldChange: PropTypes.func,
+  onFieldSearchChange: PropTypes.func,
+  onLoadMoreFields: PropTypes.func,
   onValueSearchChange: PropTypes.func,
   onLoadMoreValues: PropTypes.func,
+  hasMoreFields: PropTypes.bool,
   hasMoreValues: PropTypes.bool,
   getOperators: PropTypes.func,
 };

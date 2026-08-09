@@ -332,6 +332,7 @@ def test_voice_multi_filter_exact_zero_probe_intersects_independent_span_witness
     squashed = _squash(sql)
 
     assert builder.supports_filter_exact_zero_probe() is True
+    assert builder.filter_exact_zero_probe_proves_global_membership() is False
     assert squashed.count("UNION ALL") == 2
     assert "GROUP BY trace_id HAVING countIf(witness_kind = 0) > 0" in squashed
     assert "AND countIf(witness_kind = 1) > 0" in squashed
@@ -424,6 +425,43 @@ def test_voice_only_constraints_are_preserved_on_identity_classifier():
 
 
 @pytest.mark.unit
+def test_voice_constraints_preserve_grown_bulk_classifier_batch():
+    """Simulator/sampling wrappers must not truncate finite bulk batches."""
+
+    candidate_count = 130
+    builder = VoiceCallListQueryBuilder(
+        project_id=PROJECT_ID,
+        page_size=10_001,
+        remove_simulation_calls=True,
+        bounded_sampling_salt="task-1",
+        bounded_sampling_rate=100,
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+    )
+    candidate_rows = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index:03d}",
+            "root_span_id": f"root-{index:03d}",
+            "start_time": datetime(2026, 8, 8),
+        }
+        for index in range(candidate_count)
+    ]
+
+    sql, params = builder.build_filter_identity_match_query_from_seed_rows(
+        candidate_rows
+    )
+    squashed = _squash(sql)
+
+    assert len(params["candidate_trace_ids"]) == candidate_count
+    assert "AS bounded_voice_candidates" in squashed
+    assert "AS bounded_sampled_voice_candidates" in squashed
+    assert squashed.count(f"LIMIT {candidate_count}") == 3
+    assert "LIMIT 50" not in squashed
+
+
+@pytest.mark.unit
 def test_voice_bounded_reader_uses_identity_classification_before_page_hydration():
     from tracer.selectors.trace_filter_reads import read_bounded_filter_page
     from tracer.services.clickhouse.query_service import QueryResult
@@ -460,10 +498,10 @@ def test_voice_bounded_reader_uses_identity_classification_before_page_hydration
 
         def __init__(self):
             self.calls = []
-            # A non-empty raw intersection is inconclusive and must fall back
-            # to seed -> exact latest-state classify -> page hydration.
+            # The request-window child intersection is not a global negative
+            # proof. Start directly with canonical roots, then classify their
+            # descendants across all history before page hydration.
             self.results = [
-                [{"trace_id": "raw-witness"}],
                 candidates,
                 candidates[:10],
                 candidates[10:20],
@@ -501,26 +539,25 @@ def test_voice_bounded_reader_uses_identity_classification_before_page_hydration
         row["trace_id"] for row in hydrated
     ]
     assert [attempt.kind for attempt in page.attempts] == [
-        "zero_probe",
         "seed",
         "classify",
         "classify",
         "classify",
         "hydrate",
     ]
-    assert "latest_trace_name AS trace_name" not in executor.calls[2][0]
-    assert executor.calls[2][1]["latest_filter_key_0"] == "call.total_turns"
-    assert executor.calls[2][1]["latest_filter_param_0"] == 2
+    assert "latest_trace_name AS trace_name" not in executor.calls[1][0]
+    assert executor.calls[1][1]["latest_filter_key_0"] == "call.total_turns"
+    assert executor.calls[1][1]["latest_filter_param_0"] == 2
     assert (
-        executor.calls[2][1]["latest_filter_key_1"]
+        executor.calls[1][1]["latest_filter_key_1"]
         == "conversation.transcript.16.message.role"
     )
-    assert executor.calls[2][1]["latest_filter_param_1"] == ("assistant",)
-    assert "latest_trace_name AS trace_name" in executor.calls[5][0]
+    assert executor.calls[1][1]["latest_filter_param_1"] == ("assistant",)
+    assert "latest_trace_name AS trace_name" in executor.calls[4][0]
 
 
 @pytest.mark.unit
-def test_voice_exact_zero_probe_returns_terminal_empty_without_seed_scan():
+def test_voice_temporal_exact_zero_probe_never_terminates_an_empty_page():
     from tracer.selectors.trace_filter_reads import read_bounded_filter_page
     from tracer.services.clickhouse.query_service import QueryResult
     from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
@@ -566,30 +603,95 @@ def test_voice_exact_zero_probe_returns_terminal_empty_without_seed_scan():
     assert page.rows == []
     assert page.has_more is False
     assert page.total_rows_lower_bound == 0
-    assert [attempt.kind for attempt in page.attempts] == ["zero_probe"]
-    assert len(executor.calls) == 1
-    assert executor.calls[0][2]["timeout_ms"] == 1_500
-    assert executor.calls[0][2]["settings"]["max_bytes_to_read"] == 256 * 1024 * 1024
+    assert page.attempts
+    assert all(attempt.kind == "seed" for attempt in page.attempts)
+    assert len(executor.calls) == len(page.attempts)
+    assert all(
+        "witness_kind" not in query for query, _params, _kwargs in executor.calls
+    )
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "probe_error",
-    [
-        TimeoutError("optional probe timed out"),
-        pytest.param("read_budget", id="read-budget-cap"),
-    ],
-)
-def test_voice_exact_zero_probe_failure_preserves_normal_exact_scan(probe_error):
+def test_voice_root_in_window_is_not_pruned_by_remote_child_witnesses():
+    """A child outside the root window is classified globally, never zeroed."""
+
     from tracer.selectors.trace_filter_reads import read_bounded_filter_page
     from tracer.services.clickhouse.query_service import QueryResult
-    from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
     from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
         VoiceCallListQueryBuilderV2,
     )
 
-    if probe_error == "read_budget":
-        probe_error = ReadDeadlineExceeded("bounded probe cap")
+    end = datetime(2026, 8, 8)
+    filters = _voice_multi_filters(end)
+    filters[0]["filter_config"]["filter_value"] = [
+        end - timedelta(minutes=5),
+        end,
+    ]
+    root = {
+        "project_id": PROJECT_ID,
+        "trace_id": "remote-child-trace",
+        "root_span_id": "conversation-root",
+        "start_time": end - timedelta(minutes=1),
+    }
+    hydrated = {**root, "trace_name": "remote-child-call"}
+
+    class Executor:
+        supports_per_query_read_settings = True
+
+        def __init__(self):
+            self.calls = []
+            # The exact classifier result represents two matching descendants
+            # written outside the five-minute root window.
+            self.results = [[root], [root], [hydrated]]
+
+        def execute_ch_query(self, query, params, **kwargs):
+            assert "witness_kind" not in query
+            self.calls.append((query, params, kwargs))
+            rows = self.results.pop(0)
+            return QueryResult(
+                data=rows,
+                row_count=len(rows),
+                backend_used="clickhouse",
+                query_time_ms=1,
+            )
+
+    executor = Executor()
+    page = read_bounded_filter_page(
+        builder=VoiceCallListQueryBuilderV2(
+            project_id=PROJECT_ID,
+            page_size=1,
+            filters=filters,
+        ),
+        analytics=executor,
+        filters=filters,
+        key_field="trace_id",
+        page_number=0,
+        page_size=1,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is True
+    assert [row["trace_id"] for row in page.rows] == ["remote-child-trace"]
+    assert [attempt.kind for attempt in page.attempts] == [
+        "seed",
+        "classify",
+        "hydrate",
+    ]
+    classifier_query, classifier_params, _ = executor.calls[1]
+    assert "exact_zero_start_us" not in classifier_query
+    assert "exact_zero_end_us" not in classifier_query
+    assert "exact_zero_start_us" not in classifier_params
+    assert "exact_zero_end_us" not in classifier_params
+
+
+@pytest.mark.unit
+def test_voice_request_window_zero_probe_is_skipped_before_global_exact_scan():
+    from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+    from tracer.services.clickhouse.query_service import QueryResult
+    from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+        VoiceCallListQueryBuilderV2,
+    )
+
     end = datetime(2026, 8, 8)
     filters = _voice_multi_filters(end)
     candidates = [
@@ -618,8 +720,6 @@ def test_voice_exact_zero_probe_failure_preserves_normal_exact_scan(probe_error)
 
         def execute_ch_query(self, query, params, **kwargs):
             self.calls += 1
-            if self.calls == 1:
-                raise probe_error
             rows = self.results.pop(0)
             return QueryResult(
                 data=rows,
@@ -645,21 +745,16 @@ def test_voice_exact_zero_probe_failure_preserves_normal_exact_scan(probe_error)
     assert page.complete is True
     assert len(page.rows) == 25
     assert [attempt.kind for attempt in page.attempts] == [
-        "zero_probe",
         "seed",
         "classify",
         "classify",
         "classify",
         "hydrate",
     ]
-    assert page.attempts[0].error_code in {
-        "prefilter_unavailable",
-        "read_budget_exceeded",
-    }
 
 
 @pytest.mark.unit
-def test_voice_exact_zero_probe_fallback_keeps_required_failure_fatal():
+def test_voice_global_exact_scan_keeps_required_failure_fatal():
     from tracer.selectors.trace_filter_reads import read_bounded_filter_page
     from tracer.services.clickhouse.query_service import QueryResult
     from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
@@ -688,8 +783,6 @@ def test_voice_exact_zero_probe_fallback_keeps_required_failure_fatal():
         def execute_ch_query(self, query, params, **kwargs):
             self.calls += 1
             if self.calls == 1:
-                raise TimeoutError("optional probe timed out")
-            if self.calls == 2:
                 return QueryResult(
                     data=candidates,
                     row_count=len(candidates),
@@ -716,11 +809,9 @@ def test_voice_exact_zero_probe_fallback_keeps_required_failure_fatal():
     assert page.rows == []
     assert page.error_code == "read_budget_exceeded"
     assert [attempt.kind for attempt in page.attempts] == [
-        "zero_probe",
         "seed",
         "classify",
     ]
-    assert page.attempts[0].error_code == "prefilter_unavailable"
     assert page.attempts[-1].error_code == "read_budget_exceeded"
 
 

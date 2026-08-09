@@ -51,6 +51,8 @@ from tracer.services.clickhouse.client import (
 )
 from tracer.services.clickhouse.filter_value_reads import (
     SYSTEM_FILTER_VALUE_METRICS,
+    read_end_user_filter_value_cursor_page,
+    read_span_system_filter_value_cursor_page,
     read_span_system_filter_values,
 )
 from tracer.services.clickhouse.list_cursor import (
@@ -1346,6 +1348,251 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     "user_id": "user_id",
                     "user_id_type": "user_id_type",
                 }
+
+                def system_value_options(raw_values):
+                    if metric_name == "session" and source == "sessions":
+                        from tracer.services.clickhouse.v2.trace_session_dict_reader import (
+                            resolve_session_fields,
+                        )
+
+                        session_fields = resolve_session_fields(raw_values)
+                        return [
+                            {
+                                "value": value,
+                                "label": str(
+                                    session_fields.get(value, {}).get("display_name")
+                                    or session_fields.get(value, {}).get(
+                                        "external_session_id"
+                                    )
+                                    or value
+                                ),
+                            }
+                            for value in raw_values
+                        ]
+                    if metric_name == "project":
+                        name_map = dict(
+                            Project.objects.filter(
+                                id__in=project_ids,
+                                workspace=request.workspace,
+                            ).values_list("id", "name")
+                        )
+                        normalized_names = {
+                            str(key): value for key, value in name_map.items()
+                        }
+                        return [
+                            {
+                                "value": value,
+                                "label": normalized_names.get(value, value),
+                            }
+                            for value in raw_values
+                        ]
+                    return [{"value": value, "label": value} for value in raw_values]
+
+                page_size = query_params.get("page_size")
+                cursor_token = query_params.get("cursor")
+                if page_size is not None:
+                    page_size = int(page_size)
+                    cursor_scope = cursor_scope_for_request(
+                        request,
+                        project_ids=project_ids,
+                    )
+                    cursor_query = {
+                        "metric_name": metric_name,
+                        "metric_type": metric_type,
+                        "source": source,
+                        "project_ids": sorted(str(value) for value in project_ids),
+                        "search": search,
+                    }
+                    cursor_resource = "dashboard_system_filter_values"
+
+                    if metric_name in enduser_string_cols:
+                        if cursor_token:
+                            cursor_state = decode_list_cursor(
+                                cursor_token,
+                                resource=cursor_resource,
+                                scope=cursor_scope,
+                                query=cursor_query,
+                                page_size=page_size,
+                            )
+                            if (
+                                len(cursor_state.order) != 1
+                                or not isinstance(cursor_state.order[0], str)
+                                or not cursor_state.order[0]
+                            ):
+                                raise ListCursorError(
+                                    "invalid_cursor",
+                                    "The continuation cursor is invalid.",
+                                )
+                            value_after = cursor_state.order[0]
+                            window_start = cursor_state.window_start
+                            window_end = cursor_state.window_end
+                        else:
+                            value_after = None
+                            window_start = datetime(1970, 1, 1, tzinfo=UTC)
+                            window_end = datetime.now(UTC)
+                        page_read = read_end_user_filter_value_cursor_page(
+                            analytics,
+                            project_ids=project_ids,
+                            source_column=enduser_string_cols[metric_name],
+                            page_size=page_size,
+                            search=search,
+                            value_after=value_after,
+                        )
+                        next_cursor = None
+                        if page_read.has_more:
+                            next_cursor = encode_list_cursor(
+                                resource=cursor_resource,
+                                scope=cursor_scope,
+                                query=cursor_query,
+                                page_size=page_size,
+                                window_start=window_start,
+                                window_end=window_end,
+                                order=(page_read.next_value_after,),
+                                seen_rows=0,
+                            )
+                        return self._gm.success_response(
+                            {
+                                "values": system_value_options(page_read.values),
+                                "query_complete": True,
+                                "query_status": "complete",
+                                "has_more": page_read.has_more,
+                                "browse_status": page_read.browse_status,
+                                "next_cursor": next_cursor,
+                            }
+                        )
+
+                    if metric_name not in SYSTEM_FILTER_VALUE_METRICS:
+                        return self._gm.success_response(
+                            {
+                                "values": [],
+                                "query_complete": True,
+                                "query_status": "complete",
+                                "has_more": False,
+                                "browse_status": "exhausted",
+                                "next_cursor": None,
+                            }
+                        )
+
+                    selector = AttributeReadSelector(
+                        typed_only=True,
+                        json_attribute_mode="arrays",
+                    )
+                    if cursor_token:
+                        cursor_state = decode_list_cursor(
+                            cursor_token,
+                            resource=cursor_resource,
+                            scope=cursor_scope,
+                            query=cursor_query,
+                            page_size=page_size,
+                        )
+                        if (
+                            len(cursor_state.order) != 4
+                            or not isinstance(cursor_state.order[0], datetime)
+                            or not isinstance(cursor_state.order[1], datetime)
+                            or not isinstance(cursor_state.order[2], str)
+                            or not isinstance(cursor_state.order[3], tuple)
+                        ):
+                            raise ListCursorError(
+                                "invalid_cursor",
+                                "The continuation cursor is invalid.",
+                            )
+                        segment_end = cursor_state.order[0]
+                        segment_start = cursor_state.order[1]
+                        value_after = cursor_state.order[2] or None
+                        seen_reference = cursor_state.order[3]
+                        window_start = cursor_state.window_start
+                        window_end = cursor_state.window_end
+                    else:
+                        window_end = datetime.now(UTC)
+                        retained_start = selector.retained_window_start(
+                            project_ids,
+                            window_end=window_end,
+                        )
+                        window_start = retained_attribute_window_start(
+                            retained_start,
+                            window_end=window_end,
+                        )
+                        segment_end = window_end
+                        segment_start = None
+                        value_after = None
+                        seen_reference = ()
+
+                    state_binding = {
+                        "scope": cursor_scope,
+                        "query": cursor_query,
+                        "page_size": page_size,
+                        "window_start": window_start,
+                        "window_end": window_end,
+                    }
+                    seen_state = load_attribute_cursor_seen_state(
+                        seen_reference,
+                        resource=cursor_resource,
+                        binding=state_binding,
+                        validate_digest=lambda value: (
+                            len(value) == 32
+                            and all(char in "0123456789abcdef" for char in value)
+                        ),
+                    )
+                    if cursor_token and cursor_state.seen_rows != len(
+                        seen_state.digests
+                    ):
+                        raise ListCursorError(
+                            "invalid_cursor",
+                            "The continuation cursor is invalid.",
+                        )
+                    page_read = read_span_system_filter_value_cursor_page(
+                        analytics,
+                        project_ids=project_ids,
+                        metric_name=metric_name,
+                        page_size=page_size,
+                        window_start=window_start,
+                        window_end=window_end,
+                        search=search,
+                        segment_end=segment_end,
+                        segment_start=segment_start,
+                        value_after=value_after,
+                        seen_value_digests=seen_state.digests,
+                    )
+                    next_cursor = None
+                    if page_read.has_more:
+                        appended_digests = page_read.seen_value_digests[
+                            len(seen_state.digests) :
+                        ]
+                        seen_reference = persist_attribute_cursor_seen_state(
+                            seen_state,
+                            appended_digests,
+                            resource=cursor_resource,
+                            binding=state_binding,
+                            validate_digest=lambda value: (
+                                len(value) == 32
+                                and all(char in "0123456789abcdef" for char in value)
+                            ),
+                        )
+                        next_cursor = encode_list_cursor(
+                            resource=cursor_resource,
+                            scope=cursor_scope,
+                            query=cursor_query,
+                            page_size=page_size,
+                            window_start=window_start,
+                            window_end=window_end,
+                            order=(
+                                page_read.next_segment_end,
+                                page_read.next_segment_start,
+                                page_read.next_value_after or "",
+                                seen_reference,
+                            ),
+                            seen_rows=len(page_read.seen_value_digests),
+                        )
+                    return self._gm.success_response(
+                        {
+                            "values": system_value_options(page_read.values),
+                            **page_read.metadata(),
+                            "has_more": page_read.has_more,
+                            "browse_status": page_read.browse_status,
+                            "next_cursor": next_cursor,
+                        }
+                    )
+
                 if metric_name in enduser_string_cols:
                     enduser_col = enduser_string_cols[metric_name]
                     try:
@@ -1432,36 +1679,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         code="server_error",
                     )
 
-                if metric_name == "session" and source == "sessions":
-                    from tracer.services.clickhouse.v2.trace_session_dict_reader import (
-                        resolve_session_fields,
-                    )
-
-                    session_fields = resolve_session_fields(values)
-                    values = [
-                        {
-                            "value": value,
-                            "label": str(
-                                session_fields.get(value, {}).get("display_name")
-                                or session_fields.get(value, {}).get(
-                                    "external_session_id"
-                                )
-                                or value
-                            ),
-                        }
-                        for value in values
-                    ]
-                elif metric_name == "project":
-                    name_map = dict(
-                        Project.objects.filter(
-                            id__in=project_ids,
-                            workspace=request.workspace,
-                        ).values_list("id", "name")
-                    )
-                    name_map = {str(k): v for k, v in name_map.items()}
-                    values = [{"value": v, "label": name_map.get(v, v)} for v in values]
-                else:
-                    values = [{"value": v, "label": v} for v in values]
+                values = system_value_options(values)
                 return self._gm.success_response(
                     {"values": values, **value_read.metadata()}
                 )
@@ -1987,6 +2205,24 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Filter values are temporarily unavailable. Please retry.",
                 code="service_unavailable",
+            )
+        except AttributeCursorStateError as exc:
+            if exc.code == "cursor_state_unavailable":
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    str(exc),
+                    code="service_unavailable",
+                )
+            return self._gm.custom_error_response(
+                status.HTTP_400_BAD_REQUEST,
+                str(exc),
+                code=exc.code,
+            )
+        except ListCursorError as exc:
+            return self._gm.custom_error_response(
+                status.HTTP_400_BAD_REQUEST,
+                str(exc),
+                code=exc.code,
             )
         except Exception as exc:
             if is_clickhouse_api_read_unavailable_error(exc):

@@ -1,5 +1,6 @@
 """Exact direct-write and async-snapshot contracts for Agent Graph/Path."""
 
+from datetime import UTC, datetime, timedelta
 from inspect import unwrap
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -173,6 +174,56 @@ def test_agent_graph_is_one_latest_state_v2_statement_for_all_outputs():
     collapse_suffix = query.split(") AS graph_physical_versions", 1)[1]
     assert "attrs_string" not in collapse_suffix
     assert "attributes_extra" not in collapse_suffix
+
+
+@pytest.mark.unit
+def test_agent_graph_membership_is_global_but_unfiltered_scan_stays_bounded():
+    start = datetime(2026, 8, 1, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    date_filter = {
+        "column_id": "created_at",
+        "filter_config": {
+            "filter_type": "datetime",
+            "filter_op": "between",
+            "filter_value": [start, end],
+        },
+    }
+    remote_child_filter = {
+        "column_id": "span_name",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "text",
+            "filter_op": "equals",
+            "filter_value": "remote-child",
+        },
+    }
+
+    filtered_query, filtered_params = AgentGraphQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[date_filter, remote_child_filter],
+    ).build()
+    filtered_prewhere = filtered_query.split("PREWHERE", 1)[1].split("GROUP BY", 1)[0]
+
+    assert "graph_witness_start_date" not in filtered_query
+    assert "graph_witness_end_date" not in filtered_query
+    assert "graph_witness_start_date" not in filtered_params
+    assert "graph_witness_end_date" not in filtered_params
+    assert "start_time >=" not in filtered_prewhere
+    assert "start_time <" not in filtered_prewhere
+    assert "graph_root_in_output_window = 1" in filtered_query
+    assert "groupArrayIf(" in filtered_query
+    assert "start_time >= %(start_date)s" in filtered_query
+    assert "start_time < %(end_date)s" in filtered_query
+
+    unfiltered_query, _ = AgentGraphQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[date_filter],
+    ).build()
+    unfiltered_prewhere = unfiltered_query.split("PREWHERE", 1)[1].split("GROUP BY", 1)[
+        0
+    ]
+    assert "start_time >= %(start_date)s" in unfiltered_prewhere
+    assert "start_time < %(end_date)s" in unfiltered_prewhere
 
 
 @pytest.mark.unit

@@ -184,3 +184,26 @@ export const isAttributeKeyCursorChainStopped = (data) => {
     undefined
   );
 };
+
+/**
+ * Stable identity for one deterministic cursor-protocol stop.
+ *
+ * Consumers use this to offer one explicit fresh-chain retry without turning a
+ * malformed/repeated cursor into an endless Retry loop. If a later request
+ * advances to a different physical cursor, it is a new stop and may be retried
+ * independently.
+ */
+export const getAttributeKeyCursorStopSignature = (data) => {
+  if (!isAttributeKeyCursorChainStopped(data)) return null;
+
+  const pages = Array.isArray(data?.pages) ? data.pages : [];
+  const pageParams = Array.isArray(data?.pageParams) ? data.pageParams : [];
+  const lastPage = pages.at(-1) || {};
+  const lastPageParam = pageParams.at(-1);
+
+  return JSON.stringify([
+    lastPage?.[CURSOR_STOPPED_KEY] || "chain_stopped",
+    typeof lastPageParam === "string" ? lastPageParam : null,
+    typeof lastPage?.next_cursor === "string" ? lastPage.next_cursor : null,
+  ]);
+};

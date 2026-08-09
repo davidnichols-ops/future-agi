@@ -2388,6 +2388,89 @@ class TestMetricsEndpoint:
         assert call.kwargs["settings"]["read_overflow_mode"] == "throw"
 
     @pytest.mark.django_db
+    @patch("tracer.views.dashboard.AttributeReadSelector")
+    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
+    def test_filter_values_system_metric_cursor_uses_retained_window_without_sampling(
+        self,
+        mock_analytics_cls,
+        mock_selector_cls,
+        auth_client,
+        observe_project,
+    ):
+        retained_start = datetime(2024, 1, 1, tzinfo=UTC)
+        mock_selector_cls.return_value.retained_window_start.return_value = (
+            retained_start
+        )
+        mock_analytics_cls.return_value.execute_ch_query.return_value = MagicMock(
+            data=[{"val": "gpt-4o"}, {"val": "gpt-5"}]
+        )
+
+        response = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {
+                "metric_name": "model",
+                "metric_type": "system_metric",
+                "project_ids": str(observe_project.id),
+                "source": "traces",
+                "page_size": 1,
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()["result"]
+        assert payload["values"] == [{"value": "gpt-4o", "label": "gpt-4o"}]
+        assert payload["query_complete"] is True
+        assert payload["query_status"] == "complete"
+        assert payload["has_more"] is True
+        assert payload["browse_status"] == "continuation"
+        assert isinstance(payload["next_cursor"], str)
+        assert payload["query_window_start"] == "2024-01-01T00:00:00+00:00"
+        call = mock_analytics_cls.return_value.execute_ch_query.call_args
+        assert call.args[1]["window_end"] - call.args[1]["window_start"] == timedelta(
+            minutes=5
+        )
+        assert "LIMIT %(result_limit)s" in call.args[0]
+
+    @pytest.mark.django_db
+    @patch("tracer.views.dashboard.V2AnalyticsQueryService")
+    def test_filter_values_end_user_cursor_reaches_values_after_first_page(
+        self,
+        mock_analytics_cls,
+        auth_client,
+        observe_project,
+    ):
+        analytics = mock_analytics_cls.return_value
+        analytics.execute_ch_query.side_effect = [
+            MagicMock(data=[{"val": "alice"}, {"val": "bob"}]),
+            MagicMock(data=[{"val": "bob"}]),
+        ]
+        params = {
+            "metric_name": "user_id",
+            "metric_type": "system_metric",
+            "project_ids": str(observe_project.id),
+            "source": "traces",
+            "page_size": 1,
+        }
+
+        first = auth_client.get("/tracer/dashboard/filter_values/", params)
+        first_payload = first.json()["result"]
+        second = auth_client.get(
+            "/tracer/dashboard/filter_values/",
+            {**params, "cursor": first_payload["next_cursor"]},
+        )
+
+        assert first.status_code == second.status_code == 200
+        assert first_payload["values"] == [{"value": "alice", "label": "alice"}]
+        assert first_payload["has_more"] is True
+        assert second.json()["result"]["values"] == [{"value": "bob", "label": "bob"}]
+        assert second.json()["result"]["has_more"] is False
+        first_sql = analytics.execute_ch_query.call_args_list[0].args[0]
+        second_params = analytics.execute_ch_query.call_args_list[1].args[1]
+        assert "FROM end_users" in first_sql
+        assert "FINAL" not in first_sql
+        assert second_params["value_after"] == "alice"
+
+    @pytest.mark.django_db
     @patch("tracer.views.dashboard.is_clickhouse_enabled", return_value=False)
     @patch("tracer.views.dashboard.V2AnalyticsQueryService")
     def test_filter_values_uses_direct_write_service_when_legacy_client_is_disabled(

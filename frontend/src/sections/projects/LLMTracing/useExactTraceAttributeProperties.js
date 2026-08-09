@@ -1,9 +1,11 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { useDebounce } from "src/hooks/use-debounce";
 import axios, { endpoints } from "src/utils/axios";
 import { getQueryReadState } from "src/utils/queryReadState";
 import {
   ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+  getAttributeKeyCursorStopSignature,
   getNextAttributeKeyPageParam,
   isAttributeKeyCursorChainStopped,
   readAttributeKeyPage,
@@ -50,6 +52,16 @@ export function useExactTraceAttributeProperties({
     source,
     debouncedSearch,
   ];
+  const retainedRetryIdentity = JSON.stringify([projectId, source]);
+  const exactRetryIdentity = JSON.stringify([
+    projectId,
+    source,
+    debouncedSearch,
+  ]);
+  const [cursorRetryState, setCursorRetryState] = useState({
+    retained: null,
+    exact: null,
+  });
 
   const retainedQuery = useInfiniteQuery({
     // Attribute names describe the retained project schema. Task/dashboard
@@ -127,6 +139,26 @@ export function useExactTraceAttributeProperties({
     retainedQuery.data,
   );
   const exactCursorStopped = isAttributeKeyCursorChainStopped(exactQuery.data);
+  const retainedStopSignature = getAttributeKeyCursorStopSignature(
+    retainedQuery.data,
+  );
+  const exactStopSignature = getAttributeKeyCursorStopSignature(
+    exactQuery.data,
+  );
+  const retainedStopRetryAttempted = Boolean(
+    retainedStopSignature &&
+      cursorRetryState.retained?.identity === retainedRetryIdentity &&
+      cursorRetryState.retained?.signature === retainedStopSignature,
+  );
+  const exactStopRetryAttempted = Boolean(
+    exactStopSignature &&
+      cursorRetryState.exact?.identity === exactRetryIdentity &&
+      cursorRetryState.exact?.signature === exactStopSignature,
+  );
+  const retainedStoppedRetryAvailable =
+    retainedCursorStopped && !retainedStopRetryAttempted;
+  const exactStoppedRetryAvailable =
+    exactCursorStopped && !exactStopRetryAttempted;
   // During an exact lookup, prefer its typed row over a duplicate from an
   // earlier generic catalog page. The exact row may be the only one carrying
   // authoritative mixed/structured type metadata needed by filter controls.
@@ -191,10 +223,11 @@ export function useExactTraceAttributeProperties({
     ? exactLastPage?.browse_status || retainedLastPage?.browse_status
     : retainedLastPage?.browse_status;
   const retainedHasNextPage =
-    retainedQuery.hasNextPage || retainedCursorStopped;
+    retainedQuery.hasNextPage || retainedStoppedRetryAvailable;
   const shouldAdvanceExact = Boolean(debouncedSearch) && !exactSearchMatched;
   const exactHasNextPage =
-    shouldAdvanceExact && (exactQuery.hasNextPage || exactCursorStopped);
+    shouldAdvanceExact &&
+    (exactQuery.hasNextPage || exactStoppedRetryAvailable);
   // The base cursor remains cached for browse/partial-search continuation, but
   // a verified exact key is terminal for the current search. Advancing the
   // unrelated base catalog after that point produced a no-op Load more loop.
@@ -203,12 +236,26 @@ export function useExactTraceAttributeProperties({
     exactHasNextPage || (shouldAdvanceRetained && retainedHasNextPage);
   const fetchNextPage = (...args) => {
     const reads = [];
-    if (shouldAdvanceRetained && retainedCursorStopped) {
+    if (shouldAdvanceRetained && retainedStoppedRetryAvailable) {
+      setCursorRetryState((current) => ({
+        ...current,
+        retained: {
+          identity: retainedRetryIdentity,
+          signature: retainedStopSignature,
+        },
+      }));
       reads.push(retainedQuery.refetch(...args));
     } else if (shouldAdvanceRetained && retainedQuery.hasNextPage) {
       reads.push(retainedQuery.fetchNextPage(...args));
     }
-    if (shouldAdvanceExact && exactCursorStopped) {
+    if (shouldAdvanceExact && exactStoppedRetryAvailable) {
+      setCursorRetryState((current) => ({
+        ...current,
+        exact: {
+          identity: exactRetryIdentity,
+          signature: exactStopSignature,
+        },
+      }));
       reads.push(exactQuery.refetch(...args));
     } else if (shouldAdvanceExact && exactQuery.hasNextPage) {
       reads.push(exactQuery.fetchNextPage(...args));
@@ -258,8 +305,13 @@ export function useExactTraceAttributeProperties({
     isFetchNextPageError:
       (shouldAdvanceRetained && retainedQuery.isFetchNextPageError) ||
       (shouldAdvanceExact && exactQuery.isFetchNextPageError) ||
-      (shouldAdvanceRetained && retainedCursorStopped) ||
-      (shouldAdvanceExact && exactCursorStopped),
+      (shouldAdvanceRetained && retainedStoppedRetryAvailable) ||
+      (shouldAdvanceExact && exactStoppedRetryAvailable),
+    cursorRetryExhausted:
+      (shouldAdvanceRetained &&
+        retainedCursorStopped &&
+        retainedStopRetryAttempted) ||
+      (shouldAdvanceExact && exactCursorStopped && exactStopRetryAttempted),
     // Consumers use this completion revision to unlock exactly one new
     // scroll-to-load action even when a valid continuation page contains no
     // previously unseen keys and therefore leaves `data.length` unchanged.

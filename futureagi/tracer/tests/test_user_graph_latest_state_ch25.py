@@ -421,6 +421,20 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
                 # neither a node nor a transition.
                 row("deleted", "root", "deleted", 40, 0, 1, 8, 1, "tool"),
                 row("deleted", "root", "deleted", 40, 1, 2, 8, 1, "tool"),
+                # Membership witnesses are not constrained by the root's
+                # selected window. This child is deliberately beyond the
+                # retired +/- one-day witness heuristic.
+                row(
+                    "remote",
+                    "root",
+                    "remote-child",
+                    50,
+                    0,
+                    1,
+                    3 * 24 * 60 * 60,
+                    1,
+                    "tool",
+                ),
             ],
         )
 
@@ -464,6 +478,42 @@ def test_agent_graph_one_statement_replays_corrections_and_tombstones(ch_client)
             ("agent:agent", "llm:answer"),
         }
         assert payload["path_edges"] == payload["edges"]
+
+        remote_builder = AgentGraphQueryBuilderV2(
+            project_id=project_id,
+            filters=[
+                *builder.filters,
+                {
+                    "column_id": "span_name",
+                    "filter_config": {
+                        "col_type": "SYSTEM_METRIC",
+                        "filter_type": "text",
+                        "filter_op": "equals",
+                        "filter_value": "remote-child",
+                    },
+                },
+            ],
+        )
+        remote_builder.TABLE = table
+        remote_query, remote_params = remote_builder.build()
+        remote_payload = remote_builder.format_result(
+            _execute(ch_client, remote_query, remote_params), []
+        )
+
+        # The remote child qualifies its in-window root but never contributes
+        # a visible node/edge outside the requested graph window.
+        assert {node["name"] for node in remote_payload["nodes"]} == {
+            "agent",
+            "lookup",
+            "search",
+            "answer",
+        }
+        assert "remote-child" not in {node["name"] for node in remote_payload["nodes"]}
+        assert remote_payload["edges"] == payload["edges"]
+        assert "graph_witness_start_date" not in remote_query
+        remote_prewhere = remote_query.split("PREWHERE", 1)[1].split("GROUP BY", 1)[0]
+        assert "start_time >=" not in remote_prewhere
+        assert "start_time <" not in remote_prewhere
     finally:
         ch_client.execute(f"DROP TABLE {table}")
 

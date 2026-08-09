@@ -166,6 +166,7 @@ import { selectPanelGraphFilters } from "./GraphSection/graphFilterUtils";
 import { buildAddEvalsDraft } from "./buildAddEvalsDraft";
 import SelectAllBanner from "./SelectAllBanner";
 import { getSelectionCountState } from "./listTotalMetadata";
+import { spanSourceIdsFromPhysicalRowIds } from "./spanPhysicalIdentity";
 import useProjectFilterField from "../UsersView/useProjectFilterField";
 import FilterChips from "./FilterChips";
 import { useDashboardFilterValues } from "src/hooks/useDashboards";
@@ -871,6 +872,16 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     totalRowCountLowerBound: spanTotalLowerBound,
     totalRowCountIsLowerBound: spanTotalIsLowerBound,
   });
+  const spanSourceSelection = useMemo(() => {
+    try {
+      return {
+        ids: spanSourceIdsFromPhysicalRowIds(selectedSpans || []),
+        error: null,
+      };
+    } catch (error) {
+      return { ids: [], error };
+    }
+  }, [selectedSpans]);
 
   const {
     openReplaySessionDrawer,
@@ -3963,6 +3974,16 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                   selectedTab === "trace"
                     ? allTracesSelected
                     : allSpansSelected;
+                if (
+                  selectedTab === "spans" &&
+                  spanSourceSelection.error &&
+                  ["dataset", "annotation-queue", "annotate"].includes(actionId)
+                ) {
+                  enqueueSnackbar(spanSourceSelection.error.message, {
+                    variant: "error",
+                  });
+                  return;
+                }
                 // Tags / annotate operate on enumerated IDs. ag-grid's
                 // "Select all" inverts toggledNodes (it lists *deselected*
                 // rows), so these actions can't target the full set without
@@ -4334,9 +4355,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                       []
                     );
                   })()}
-                  selectedSpans={
-                    selectedSpans?.filter((id) => id != null && id !== "") || []
-                  }
+                  selectedSpans={spanSourceSelection.ids}
                   currentTab={
                     projectSource === PROJECT_SOURCE.SIMULATOR
                       ? "trace"
@@ -4427,7 +4446,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     return selectedTraces || [];
                   }
                   if (spanFilterSelectionMode && selectedTab === "spans") {
-                    return selectedSpans || [];
+                    return spanSourceSelection.ids;
                   }
                   if (
                     simCallFilterSelectionMode &&
@@ -4439,7 +4458,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     return (selectedCallIds || []).filter(Boolean);
                   return selectedTab === "trace"
                     ? (selectedTraces || []).filter(Boolean)
-                    : (selectedSpans || []).filter(Boolean);
+                    : spanSourceSelection.ids;
                 })()}
                 itemName={(() => {
                   if (projectSource === PROJECT_SOURCE.SIMULATOR) return "Call";
@@ -4493,14 +4512,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                   }
                   return null;
                 })()}
-                projectId={
-                  (filterSelectionMode && selectedTab === "trace") ||
-                  (spanFilterSelectionMode && selectedTab === "spans") ||
-                  (simCallFilterSelectionMode &&
-                    projectSource === PROJECT_SOURCE.SIMULATOR)
-                    ? observeId
-                    : null
-                }
+                projectId={observeId}
                 isVoiceCall={projectSource === PROJECT_SOURCE.SIMULATOR}
                 removeSimulationCalls={
                   projectSource === PROJECT_SOURCE.SIMULATOR
@@ -4548,7 +4560,9 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                 onClose={() => setOpenAnnotateDrawer(false)}
                 projectId={observeId}
                 listSpanId={
-                  selectedTab === "spans" ? selectedSpans?.[0] || null : null
+                  selectedTab === "spans"
+                    ? spanSourceSelection.ids[0] || null
+                    : null
                 }
                 voiceObserveSpanId={null}
                 runName=""
@@ -4556,7 +4570,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                 observationName=""
                 onSubmit={(data) => {
                   const spanId =
-                    selectedTab === "spans" ? selectedSpans?.[0] : null;
+                    selectedTab === "spans" ? spanSourceSelection.ids[0] : null;
                   if (!spanId) {
                     enqueueSnackbar("Select a single span to annotate", {
                       variant: "warning",

@@ -4303,6 +4303,10 @@ class AttributeReadSelector:
             resume_identity,
             int(resume_member_offset),
         )
+        initial_segment_start = max(
+            start,
+            current_segment_end - empty_segment_width,
+        )
 
         def frontier_state() -> tuple[Any, ...]:
             return (
@@ -5068,13 +5072,6 @@ class AttributeReadSelector:
             "exhausted" if exhausted else "continuation"
         )
         has_more = browse_status == "continuation"
-        if has_more and frontier_state() == initial_cursor_state:
-            # Never return a successful Load-more cursor that repeats the same
-            # unproven read forever. The API boundary sanitizes this honest
-            # bounded-read failure without leaking ClickHouse diagnostics.
-            raise ReadDeadlineExceeded(
-                "Exact filter-value cursor made no physical progress"
-            )
         # A list page is exact even while a later continuation exists.  This is
         # not an aggregate coverage claim: every emitted option was verified
         # against latest state and the cursor can exhaust the remaining window.
@@ -5088,6 +5085,19 @@ class AttributeReadSelector:
         next_segment_start = (
             max(start, current_segment_end - empty_segment_width) if has_more else None
         )
+        if (
+            has_more
+            and frontier_state() == initial_cursor_state
+            and next_segment_start == initial_segment_start
+        ):
+            # A narrower next slice changes no coverage state but is still a
+            # finite retry strategy: the signed cursor retries the identical
+            # frontier with less work and can narrow only to the five-second
+            # floor. Reject only a truly repeated frontier *and* width, which
+            # would otherwise leave Load more in an endless loop.
+            raise ReadDeadlineExceeded(
+                "Exact filter-value cursor made no physical progress"
+            )
         return AttributeValueCursorPageRead(
             tuple(emitted[digest] for digest in emitted_digests),
             metadata,

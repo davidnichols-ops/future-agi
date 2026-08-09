@@ -8,11 +8,18 @@ import {
 } from "../voiceCallDetailCursorNavigation";
 
 const response = ({ rows = [], hasMore, nextCursor }) => ({
-  data: {
-    results: rows,
-    has_more: hasMore,
-    next_cursor: nextCursor,
-  },
+  count: rows.length,
+  count_is_lower_bound: hasMore,
+  total_pages: hasMore ? 2 : 1,
+  current_page: 1,
+  next: hasMore ? 2 : null,
+  previous: null,
+  results: rows,
+  config: [],
+  has_more: hasMore,
+  next_cursor: nextCursor,
+  query_complete: true,
+  query_status: "complete",
 });
 
 describe("voice-call detail exact cursor navigation", () => {
@@ -34,16 +41,12 @@ describe("voice-call detail exact cursor navigation", () => {
       .fn()
       .mockRejectedValueOnce(cursorValidationError)
       .mockResolvedValueOnce({
-        data: {
-          results: [{ id: "legacy-call-0" }, { id: "legacy-call-1" }],
-          next: 2,
-        },
+        results: [{ trace_id: "legacy-call-0" }, { trace_id: "legacy-call-1" }],
+        next: 2,
       })
       .mockResolvedValueOnce({
-        data: {
-          results: [{ id: "legacy-call-2" }],
-          next: null,
-        },
+        results: [{ trace_id: "legacy-call-2" }],
+        next: null,
       });
     const navigator = createVoiceCallDetailCursorNavigator({
       request,
@@ -52,7 +55,7 @@ describe("voice-call detail exact cursor navigation", () => {
     });
 
     await expect(navigator.loadRow(2)).resolves.toMatchObject({
-      row: { id: "legacy-call-2" },
+      row: { trace_id: "legacy-call-2" },
       pending: false,
       terminal: true,
     });
@@ -81,21 +84,21 @@ describe("voice-call detail exact cursor navigation", () => {
       .fn()
       .mockResolvedValueOnce(
         response({
-          rows: [{ id: "call-0" }, { id: "call-1" }],
+          rows: [{ trace_id: "call-0" }, { trace_id: "call-1" }],
           hasMore: true,
           nextCursor: "signed-2",
         }),
       )
       .mockResolvedValueOnce(
         response({
-          rows: [{ id: "call-2" }, { id: "call-3" }],
+          rows: [{ trace_id: "call-2" }, { trace_id: "call-3" }],
           hasMore: true,
           nextCursor: "signed-3",
         }),
       )
       .mockResolvedValueOnce(
         response({
-          rows: [{ id: "call-4" }],
+          rows: [{ trace_id: "call-4" }],
           hasMore: false,
           nextCursor: null,
         }),
@@ -112,7 +115,7 @@ describe("voice-call detail exact cursor navigation", () => {
     });
 
     await expect(navigator.loadRow(4)).resolves.toMatchObject({
-      row: { id: "call-4" },
+      row: { trace_id: "call-4" },
       pending: false,
       terminal: true,
     });
@@ -154,7 +157,7 @@ describe("voice-call detail exact cursor navigation", () => {
       )
       .mockResolvedValueOnce(
         response({
-          rows: [{ id: "real-call" }],
+          rows: [{ trace_id: "real-call" }],
           hasMore: false,
           nextCursor: null,
         }),
@@ -166,7 +169,7 @@ describe("voice-call detail exact cursor navigation", () => {
     });
 
     await expect(navigator.loadRow(0)).resolves.toMatchObject({
-      row: { id: "real-call" },
+      row: { trace_id: "real-call" },
       pending: false,
       terminal: true,
     });
@@ -178,14 +181,14 @@ describe("voice-call detail exact cursor navigation", () => {
       .fn()
       .mockResolvedValueOnce(
         response({
-          rows: [{ id: "call-0" }],
+          rows: [{ trace_id: "call-0" }],
           hasMore: true,
           nextCursor: "resume-here",
         }),
       )
       .mockResolvedValueOnce(
         response({
-          rows: [{ id: "call-1" }],
+          rows: [{ trace_id: "call-1" }],
           hasMore: false,
           nextCursor: null,
         }),
@@ -203,7 +206,7 @@ describe("voice-call detail exact cursor navigation", () => {
       loadedRowCount: 1,
     });
     await expect(navigator.loadRow(1)).resolves.toMatchObject({
-      row: { id: "call-1" },
+      row: { trace_id: "call-1" },
       pending: false,
       terminal: true,
     });
@@ -222,7 +225,7 @@ describe("voice-call detail exact cursor navigation", () => {
       .fn()
       .mockResolvedValueOnce(
         response({
-          rows: [{ id: "call-0" }],
+          rows: [{ trace_id: "call-0" }],
           hasMore: true,
           nextCursor: "resume-after-deadline",
         }),
@@ -243,7 +246,7 @@ describe("voice-call detail exact cursor navigation", () => {
       })
       .mockResolvedValueOnce(
         response({
-          rows: [{ id: "call-1" }],
+          rows: [{ trace_id: "call-1" }],
           hasMore: false,
           nextCursor: null,
         }),
@@ -264,7 +267,7 @@ describe("voice-call detail exact cursor navigation", () => {
     expect(stalledSignal?.aborted).toBe(true);
 
     await expect(navigator.loadRow(1)).resolves.toMatchObject({
-      row: { id: "call-1" },
+      row: { trace_id: "call-1" },
       pending: false,
       terminal: true,
     });
@@ -279,7 +282,7 @@ describe("voice-call detail exact cursor navigation", () => {
 
   it("fails closed instead of falling back to numbered pagination", async () => {
     const request = vi.fn().mockResolvedValue({
-      data: { results: [{ id: "call-0" }] },
+      results: [{ trace_id: "call-0" }],
     });
     const navigator = createVoiceCallDetailCursorNavigator({
       request,
@@ -295,6 +298,39 @@ describe("voice-call detail exact cursor navigation", () => {
       page: 1,
       cursor_mode: true,
     });
+  });
+
+  it("rejects a missing results field instead of treating it as an empty page", async () => {
+    const navigator = createVoiceCallDetailCursorNavigator({
+      request: vi.fn().mockResolvedValue({
+        has_more: false,
+        next_cursor: null,
+      }),
+      baseParams: { project_id: "project-1" },
+      pageSize: 25,
+    });
+
+    await expect(navigator.loadRow(0)).rejects.toThrow(
+      "Voice-call list response is missing results",
+    );
+  });
+
+  it("rejects legacy row identity aliases instead of guessing a trace id", async () => {
+    const navigator = createVoiceCallDetailCursorNavigator({
+      request: vi.fn().mockResolvedValue(
+        response({
+          rows: [{ id: "legacy-only-id" }],
+          hasMore: false,
+          nextCursor: null,
+        }),
+      ),
+      baseParams: { project_id: "project-1" },
+      pageSize: 25,
+    });
+
+    await expect(navigator.loadRow(0)).rejects.toThrow(
+      "Voice-call row is missing a stable identity",
+    );
   });
 
   it("rejects a repeated signed checkpoint instead of looping", async () => {

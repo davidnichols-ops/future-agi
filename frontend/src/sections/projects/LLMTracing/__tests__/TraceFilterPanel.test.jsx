@@ -44,6 +44,8 @@ beforeEach(() => {
     queryReadState: "complete",
     browseStatus: "exhausted",
     pageCount: 1,
+    exactSearchMatched: false,
+    cursorRetryExhausted: false,
     debouncedSearch: "",
     refetch: vi.fn(),
   });
@@ -95,6 +97,8 @@ function renderPanel({
   onClose = vi.fn(),
   open = true,
   showQueryTab = false,
+  projectId,
+  source,
 }) {
   const anchorEl = document.createElement("button");
   document.body.appendChild(anchorEl);
@@ -111,6 +115,8 @@ function renderPanel({
         currentFilters={[...currentFilters]}
         properties={properties}
         showQueryTab={showQueryTab}
+        projectId={projectId}
+        source={source}
       />
     </QueryClientProvider>
   );
@@ -1094,7 +1100,8 @@ describe("exact manual attribute fallback", () => {
       hasNextPage: true,
       isFetchingNextPage: false,
       isFetchNextPageError: true,
-      queryReadState: "complete",
+      queryReadState: "degraded",
+      cursorRetryExhausted: false,
       debouncedSearch: "",
     });
     const { anchorEl } = renderPanel({ properties: [] });
@@ -1103,6 +1110,9 @@ describe("exact manual attribute fallback", () => {
     expect(
       screen.getByText("More attributes could not be loaded. Please retry."),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry attribute suggestions" }),
+    ).not.toBeInTheDocument();
     fireEvent.click(
       screen.getByRole("button", { name: "Retry loading attributes" }),
     );
@@ -1126,7 +1136,10 @@ describe("exact manual attribute fallback", () => {
       debouncedSearch: "",
       refetch,
     });
-    const { anchorEl } = renderPanel({});
+    const { anchorEl } = renderPanel({
+      projectId: "project-synthetic",
+      properties: [],
+    });
 
     fireEvent.click(screen.getByRole("button", { name: "Property" }));
     expect(
@@ -1139,6 +1152,56 @@ describe("exact manual attribute fallback", () => {
     );
 
     expect(refetch).toHaveBeenCalledOnce();
+    document.body.removeChild(anchorEl);
+  });
+
+  it("terminalizes a repeated cursor and preserves manual exact attribute entry", () => {
+    exactAttributePropertiesMock.mockReturnValue({
+      data: [
+        {
+          id: "recent_attribute",
+          name: "recent_attribute",
+          category: "attribute",
+          rawCategory: "custom_attribute",
+          type: "string",
+          apiColType: "SPAN_ATTRIBUTE",
+        },
+      ],
+      isFetching: false,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "degraded",
+      browseStatus: "continuation",
+      pageCount: 2,
+      exactSearchMatched: false,
+      cursorRetryExhausted: true,
+      debouncedSearch: "final_status",
+      refetch: vi.fn(),
+    });
+    const { anchorEl } = renderPanel({
+      projectId: "project-synthetic",
+      properties: [],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "final_status" },
+    });
+
+    expect(
+      screen.queryByRole("button", { name: "Retry attribute suggestions" }),
+    ).not.toBeInTheDocument();
+    const manualOption = document.querySelector(
+      "[data-filter-property-manual-exact]",
+    );
+    expect(manualOption).toHaveTextContent("final_status");
+    fireEvent.click(manualOption);
+    expect(
+      screen.getByRole("button", { name: /final_status/i }),
+    ).toBeInTheDocument();
+
     document.body.removeChild(anchorEl);
   });
 });
@@ -1659,6 +1722,106 @@ describe("filter-value picker bounded-read UX", () => {
         }),
       ]),
     );
+
+    document.body.removeChild(anchorEl);
+  });
+
+  it("discovers and applies a rare exact attribute from the Query tab", async () => {
+    const fetchNextAttributePage = vi.fn();
+    exactAttributePropertiesMock.mockImplementation(
+      ({ projectId, search, source, enabled }) => ({
+        data:
+          search === "final_status"
+            ? [
+                {
+                  id: "final_status",
+                  name: "final_status",
+                  category: "attribute",
+                  rawCategory: "custom_attribute",
+                  type: "string",
+                  attributeTypes: ["string"],
+                  attributeTypesExact: true,
+                  apiColType: "SPAN_ATTRIBUTE",
+                },
+              ]
+            : [],
+        isFetching: false,
+        fetchNextPage: fetchNextAttributePage,
+        hasNextPage: false,
+        isFetchingNextPage: false,
+        isFetchNextPageError: false,
+        queryReadState: "complete",
+        browseStatus: "exhausted",
+        pageCount: 1,
+        exactSearchMatched: search === "final_status",
+        cursorRetryExhausted: false,
+        debouncedSearch: search,
+        refetch: vi.fn(),
+        projectId,
+        source,
+        enabled,
+      }),
+    );
+    dashboardFilterValuesMock.mockImplementation((request) => ({
+      ...defaultDashboardFilterValues(),
+      data:
+        request.metricName === "final_status"
+          ? [{ value: "Rechazado", label: "Rechazado", type: "string" }]
+          : [],
+    }));
+    const onApply = vi.fn();
+    const { anchorEl } = renderPanel({
+      properties: [],
+      projectId: "project-coletia",
+      source: "traces",
+      onApply,
+      showQueryTab: true,
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    const queryInput = await selectQueryPhaseOption(
+      "final_status",
+      "pick operator...",
+    );
+    fireEvent.change(queryInput, { target: { value: "equals" } });
+    fireEvent.click(await screen.findByRole("option", { name: /^equals$/i }));
+    await waitFor(() =>
+      expect(queryInput).toHaveAttribute(
+        "placeholder",
+        "type or pick value...",
+      ),
+    );
+    await selectQueryPhaseOption("Rechazado", "add filter...");
+
+    expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: "project-coletia",
+        search: "final_status",
+        source: "traces",
+        enabled: true,
+      }),
+    );
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metricName: "final_status",
+        metricType: "custom_attribute",
+        source: "traces",
+        attributeType: "string",
+        enabled: true,
+      }),
+    );
+    await waitFor(() => expect(onApply).toHaveBeenCalled());
+    expect(onApply.mock.calls.at(-1)[0]).toEqual([
+      expect.objectContaining({
+        field: "final_status",
+        fieldCategory: "attribute",
+        fieldType: "string",
+        apiColType: "SPAN_ATTRIBUTE",
+        operator: "in",
+        value: ["Rechazado"],
+        valueTypes: ["string"],
+      }),
+    ]);
 
     document.body.removeChild(anchorEl);
   });

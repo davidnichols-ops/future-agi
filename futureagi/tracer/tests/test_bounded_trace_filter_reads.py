@@ -613,6 +613,33 @@ def test_exact_graph_global_classifier_collapses_mutations_before_tombstone_filt
     assert "candidate_witness_start_date_us" not in sql
 
 
+def test_exact_graph_global_classifier_accepts_5k_and_rejects_larger_batch() -> None:
+    builder = TraceListQueryBuilderV2(
+        project_id=PROJECT_ID,
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
+    )
+    rows = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index:030d}",
+            "start_time": END - timedelta(minutes=1),
+        }
+        for index in range(5_001)
+    ]
+
+    sql, params = builder.build_filter_identity_match_query_from_seed_rows(rows[:5_000])
+
+    assert sql
+    assert len(params["candidate_trace_ids"]) == 5_000
+    with pytest.raises(ValueError, match="candidate trace batch exceeds bounded limit"):
+        builder.build_filter_identity_match_query_from_seed_rows(rows)
+
+
 def test_exact_graph_bulk_classifier_accepts_200_and_rejects_201_identities() -> None:
     builder = TraceListQueryBuilderV2(
         project_id=PROJECT_ID,
@@ -1015,10 +1042,8 @@ def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
     assert "latest_is_deleted = 0" in sql
     assert "trace_id IN %(filter_candidate_trace_ids)s" in sql
     assert "grouped_trace_id IN %(filter_candidate_trace_ids)s" in sql
-    assert (
-        "start_time >= fromUnixTimestamp64Micro(%(filter_candidate_start_us)s)" in sql
-    )
-    assert "start_time < fromUnixTimestamp64Micro(%(filter_candidate_end_us)s)" in sql
+    assert "filter_candidate_start_us" not in sql
+    assert "filter_candidate_end_us" not in sql
     assert (
         f"argMax(mapContains({map_column}, %(latest_filter_key_0)s), "
         "_peerdb_version)" in sql
@@ -1026,8 +1051,8 @@ def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
     assert " FINAL" not in sql
     assert params["filter_candidate_trace_ids"] == ("trace-a", "trace-b")
     assert params["filter_candidate_witness_limit"] == 2
-    assert params["filter_candidate_start_us"] == 1_735_689_600_000_000
-    assert params["filter_candidate_end_us"] == 1_767_225_600_000_000
+    assert "filter_candidate_start_us" not in params
+    assert "filter_candidate_end_us" not in params
     assert params["latest_filter_key_0"] == "final_status"
     # A plain typed-Map scalar classifier is faster than a year-window witness
     # on large tenants, so the query remains available for internal callers but
@@ -1045,25 +1070,29 @@ def test_trace_candidate_witness_probe_resolves_finite_typed_map_latest_state(
 
     slice_start = START + timedelta(days=100)
     slice_end = START + timedelta(days=110)
-    _slice_sql, slice_params = builder.build_filter_candidate_witness_probe(
+    slice_sql, slice_params = builder.build_filter_candidate_witness_probe(
         [{"trace_id": "trace-a"}],
         slice_start=slice_start,
         slice_end=slice_end,
     )
-    assert slice_params["filter_candidate_start_us"] == 1_744_329_600_000_000
-    assert slice_params["filter_candidate_end_us"] == 1_745_193_600_000_000
+    assert "filter_candidate_start_us" not in slice_params
+    assert "filter_candidate_end_us" not in slice_params
+    assert "filter_candidate_start_us" not in slice_sql
+    assert "filter_candidate_end_us" not in slice_sql
+    assert builder.filter_candidate_witness_replays_global_membership() is True
 
     with pytest.raises(ValueError, match="provided together"):
         builder.build_filter_candidate_witness_probe(
             [{"trace_id": "trace-a"}],
             slice_start=slice_start,
         )
-    with pytest.raises(ValueError, match="inside the request window"):
-        builder.build_filter_candidate_witness_probe(
-            [{"trace_id": "trace-a"}],
-            slice_start=START - timedelta(microseconds=1),
-            slice_end=slice_end,
-        )
+    outside_sql, outside_params = builder.build_filter_candidate_witness_probe(
+        [{"trace_id": "trace-a"}],
+        slice_start=START - timedelta(days=365),
+        slice_end=END + timedelta(days=365),
+    )
+    assert "filter_candidate_start_us" not in outside_sql
+    assert "filter_candidate_end_us" not in outside_params
 
 
 def test_nested_array_path_keeps_interactive_candidate_witness() -> None:
@@ -1758,7 +1787,9 @@ def test_map_plus_json_anchor_uses_only_indexed_map_leaf() -> None:
     assert builder.recommended_filter_classify_batch_size() == 10
 
 
-def test_trace_candidate_classifier_prunes_to_adjacent_witness_partitions() -> None:
+def test_trace_candidate_classifier_keeps_root_window_and_global_child_witnesses() -> (
+    None
+):
     builder = TraceListQueryBuilder(
         project_id=PROJECT_ID,
         filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
@@ -1767,28 +1798,14 @@ def test_trace_candidate_classifier_prunes_to_adjacent_witness_partitions() -> N
     sql, params = builder.build_filter_match_query(["trace-a"])
 
     prewhere = sql.split("GROUP BY trace_id, id, start_time", 1)[0]
-    assert (
-        "toDate(fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s))"
-        in prewhere
-    )
-    assert (
-        "toDate(fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s))"
-        in prewhere
-    )
-    assert (
-        "start_time >= fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s)"
-        in prewhere
-    )
-    assert (
-        "start_time < fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s)"
-        in prewhere
-    )
+    assert "candidate_witness_start_date_us" not in prewhere
+    assert "candidate_witness_end_date_us" not in prewhere
     assert params["candidate_start_date"] == START
     assert params["candidate_end_date"] == END
     assert params["candidate_start_date_us"] == 1_735_689_600_000_000
     assert params["candidate_end_date_us"] == 1_767_225_600_000_000
-    assert params["candidate_witness_start_date_us"] == 1_735_603_200_000_000
-    assert params["candidate_witness_end_date_us"] == 1_767_312_000_000_000
+    assert "candidate_witness_start_date_us" not in params
+    assert "candidate_witness_end_date_us" not in params
 
 
 def test_root_seed_replay_does_not_trust_one_raw_physical_root_id() -> None:
@@ -2619,7 +2636,9 @@ def test_trace_has_eval_false_is_latest_state_candidate_scoped(
     assert "trace_id NOT IN (" in sql
     assert "FROM tracer_eval_logger_v2 AS eval_scan" in sql
     assert "toString(eval_scan.trace_id) IN %(candidate_trace_ids)s" in sql
-    assert "eval_scan.created_at >= %(start_date)s - INTERVAL 7 DAY" in sql
+    # Trace time binds the canonical root. An eval may be written later, so
+    # candidate-scoped has_eval membership must inspect its complete history.
+    assert "eval_scan.created_at >= %(start_date)s - INTERVAL 7 DAY" not in sql
     assert "ORDER BY eval_scan._version DESC" in sql
     assert "LIMIT 1 BY eval_scan.id" in sql
     assert "latest_eval.is_deleted = 0" in sql
@@ -3008,10 +3027,10 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
     assert match_sql.count("FROM spans") == 1
     assert match_sql.count("GROUP BY grouped_trace_id") == 1
     assert match_sql.count("countIf(") == 3
-    # Canonical-root selection remains constrained to the half-open request
-    # window after latest-version collapse. Each independent any-span leaf
-    # uses the adjacent-day witness gate once to project its physical witness
-    # and once in its countIf HAVING, matching list/monolithic graph semantics.
+    # Canonical-root selection remains constrained to the exact half-open
+    # request window. Any-span membership and the exact witness identities are
+    # global within the finite trace-ID batch, matching list, graph, and task
+    # semantics even when a child arrives days after its root.
     any_span_leaf_count = 2
     assert match_sql.count("argMinIf(") == any_span_leaf_count
     assert (
@@ -3030,13 +3049,13 @@ def test_trace_any_span_root_seed_and_single_latest_state_scan() -> None:
         match_sql.count(
             "latest_start_time >= fromUnixTimestamp64Micro(%(candidate_witness_start_date_us)s)"
         )
-        == 2 * any_span_leaf_count
+        == 0
     )
     assert (
         match_sql.count(
             "latest_start_time < fromUnixTimestamp64Micro(%(candidate_witness_end_date_us)s)"
         )
-        == 2 * any_span_leaf_count
+        == 0
     )
     first_match_filter = "mapContains(span_attr_str, %(latest_filter_key_0)s)"
     second_match_filter = "mapContains(span_attr_str, %(latest_filter_key_1)s)"

@@ -7,6 +7,7 @@ import {
   buildReadOnlyColumnDefs,
   buildSimulationSelectorColumnDefs,
   buildSimulationSelectorFilterFields,
+  assertExactEnumerationComplete,
   DatasetRowSelector,
   ExactSelectorReadFailureNotice,
   getSelectorPageTotalState,
@@ -23,6 +24,24 @@ import {
   buildSessionSelectorFilterFields,
   getSessionSelectionRowId,
 } from "../items/add-items-session-utils";
+import {
+  parseSessionSelectorPage,
+  parseSpanSelectorPage,
+  parseTraceSelectorPage,
+  spanSelectorRowIdentity,
+} from "../items/telemetry-selector-contract";
+
+const selectorResponse = (row, overrides = {}) => ({
+  data: {
+    status: true,
+    result: {
+      metadata: { total_rows: 1 },
+      table: [row],
+      config: [],
+    },
+    ...overrides,
+  },
+});
 
 const agGridMock = vi.hoisted(() => ({
   api: {
@@ -190,6 +209,93 @@ describe("Simulation add-items columns", () => {
     const values = valuesByHeader({});
 
     expect(values["Agent Talk (%)"]).toBe("-");
+  });
+});
+
+describe("annotation select-all exactness", () => {
+  it("rejects a safety-bound exit instead of returning a partial selection", () => {
+    expect(() =>
+      assertExactEnumerationComplete({
+        hasMore: true,
+        sourceLabel: "dataset rows",
+      }),
+    ).toThrow(
+      "All matching dataset rows could not be resolved safely. Narrow the filters and retry.",
+    );
+  });
+
+  it("accepts only a proven terminal page", () => {
+    expect(
+      assertExactEnumerationComplete({
+        hasMore: false,
+        sourceLabel: "dataset rows",
+      }),
+    ).toBeUndefined();
+  });
+});
+
+describe("annotation telemetry selector contracts", () => {
+  it("accepts only canonical trace, span, and session row identities", () => {
+    expect(
+      parseTraceSelectorPage(selectorResponse({ trace_id: "trace-1" })).table,
+    ).toEqual([{ trace_id: "trace-1" }]);
+    expect(
+      parseSpanSelectorPage(
+        selectorResponse({
+          project_id: "project-1",
+          trace_id: "trace-1",
+          span_id: "span-1",
+          start_time: "2026-08-09T00:00:00Z",
+        }),
+      ).table,
+    ).toEqual([
+      {
+        project_id: "project-1",
+        trace_id: "trace-1",
+        span_id: "span-1",
+        start_time: "2026-08-09T00:00:00Z",
+      },
+    ]);
+    expect(
+      parseSessionSelectorPage(selectorResponse({ session_id: "session-1" }))
+        .table,
+    ).toEqual([{ session_id: "session-1" }]);
+  });
+
+  it("keeps reused span IDs in different traces as separate selector rows", () => {
+    const first = {
+      project_id: "project-1",
+      trace_id: "trace-a",
+      span_id: "reused-span",
+      start_time: "2026-08-09T00:00:00Z",
+    };
+    const second = {
+      project_id: "project-1",
+      trace_id: "trace-b",
+      span_id: "reused-span",
+      start_time: "2026-08-09T00:01:00Z",
+    };
+
+    expect(spanSelectorRowIdentity(first)).not.toBe(
+      spanSelectorRowIdentity(second),
+    );
+  });
+
+  it("rejects legacy aliases and missing response fields instead of showing an empty page", () => {
+    expect(() =>
+      parseTraceSelectorPage(selectorResponse({ traceId: "trace-1" })),
+    ).toThrow("missing its canonical identity");
+    expect(() =>
+      parseSpanSelectorPage(
+        selectorResponse({ trace_id: "trace-1", span_id: "span-1" }),
+      ),
+    ).toThrow("missing its canonical identity");
+    expect(() => parseSpanSelectorPage({ data: { status: true } })).toThrow();
+    expect(() =>
+      parseSessionSelectorPage(
+        selectorResponse({ session_id: "session-1" }, { status: false }),
+      ),
+    ).toThrow("Session list response was not successful");
   });
 });
 

@@ -484,14 +484,33 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         )
         if not normalized_trace_ids:
             return "", {}
-        if len(normalized_trace_ids) > 512:
-            raise ValueError("exact trace contribution batch exceeds 512 identities")
+        if len(normalized_trace_ids) > 5_000:
+            raise ValueError("exact trace contribution batch exceeds 5000 identities")
         if self.start_date is None or self.end_date is None:
             self.start_date, self.end_date = self.parse_time_range(self.filters)
+        # CH25 replaces versions by ``toStartOfHour(start_time)``. A newer poll
+        # may correct the producer timestamp across the exact request boundary
+        # while remaining in that same physical identity. Scan both boundary
+        # hours completely, collapse first, then apply the frozen output window
+        # through ``contribution_condition`` below.
+        trace_scan_start = self.start_date.replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        trace_scan_end = self.end_date.replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if trace_scan_end < self.end_date:
+            trace_scan_end += timedelta(hours=1)
         self.params.update(
             {
                 "start_date": self.start_date,
                 "end_date": self.end_date,
+                "graph_trace_scan_start": trace_scan_start,
+                "graph_trace_scan_end": trace_scan_end,
                 "graph_candidate_trace_ids": normalized_trace_ids,
             }
         )
@@ -521,8 +540,8 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         latest_source = self._exact_latest_scalar_source(
             row_predicates=(),
             contribution_predicates=exact_filter_plan.contribution_predicates,
-            scan_start_param="start_date",
-            scan_end_param="end_date",
+            scan_start_param="graph_trace_scan_start",
+            scan_end_param="graph_trace_scan_end",
             candidate_trace_ids_param="graph_candidate_trace_ids",
         )
         bucket_fn = self.time_bucket_expr(self.interval)
@@ -532,7 +551,10 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
             sumIf(toInt64(latency_ms), {contribution_condition}) AS latency_sum,
             sumIf(toInt64(total_tokens), {contribution_condition})
                 AS total_tokens,
-            sumIf(cost, {contribution_condition}) AS cost_sum,
+            sumIf(
+                toDecimal128(toString(ifNull(cost, 0.0)), 18),
+                {contribution_condition}
+            ) AS cost_sum,
             countIf({contribution_condition}) AS traffic_count,
             sumIf(toInt64(prompt_tokens), {contribution_condition})
                 AS prompt_tokens,

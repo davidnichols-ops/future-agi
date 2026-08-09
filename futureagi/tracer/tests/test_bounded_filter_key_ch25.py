@@ -2711,10 +2711,10 @@ def test_trace_root_seed_and_any_span_match_execute_on_different_spans(
     assert any(attempt.kind == "classify" for attempt in page.attempts)
 
 
-def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
+def test_trace_any_span_classifier_matches_children_outside_root_window(
     ch_client, bounded_span_table
 ) -> None:
-    """A stale in-window seed cannot borrow a current match outside the window."""
+    """The date binds the root while any current child can satisfy attributes."""
 
     project_id = "00000000-0000-4000-8000-000000000008"
     window_start = datetime(2025, 1, 1, 9, 45)
@@ -2773,15 +2773,36 @@ def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
             window_end - timedelta(minutes=8),
             {"customer.country": "ES"},
         ),
-        # End is exclusive; this current match must not rescue trace-stale.
+        # This trace has no matching child inside the request window.  The
+        # temporal anchor therefore returns no candidate for it; only ordered
+        # canonical-root acquisition plus global child replay can retain it.
         span(
-            "child-at-exclusive-end",
+            "root-outside-only",
+            "trace-outside-only",
+            None,
+            window_end - timedelta(minutes=7),
+            {},
+        ),
+        span(
+            "child-outside-only",
+            "trace-outside-only",
+            "root-outside-only",
+            window_end + timedelta(days=3),
+            {
+                "customer.final_status": "Rejected",
+                "customer.country": "ES",
+            },
+        ),
+        # A child outside the root window remains part of this trace. It must
+        # satisfy any-span membership even when written more than one day later.
+        span(
+            "child-two-days-late",
             "trace-stale",
             "root-stale",
-            window_end,
+            window_end + timedelta(days=2),
             {"customer.final_status": "Rejected"},
         ),
-        # Nor may a current match just before the lower boundary rescue it.
+        # A current child before the root window is also a valid witness.
         span(
             "child-before-start",
             "trace-stale",
@@ -2903,9 +2924,10 @@ def test_trace_any_span_classifier_excludes_out_of_window_current_matches(
     assert page.complete is True
     assert [item["trace_id"] for item in page.rows] == [
         "trace-live",
+        "trace-outside-only",
+        "trace-stale",
         "trace-boundary",
     ]
-    assert "trace-stale" not in {item["trace_id"] for item in page.rows}
     assert any(attempt.kind == "anchor" for attempt in page.attempts)
     assert any(attempt.kind == "classify" for attempt in page.attempts)
 

@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
+from threading import Lock
 from time import monotonic
 from typing import Any
 
@@ -44,6 +46,7 @@ from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     compile_exact_graph_filter_predicates,
     compile_span_attribute_row_predicate,
+    partition_span_filter_plans,
 )
 from tracer.services.clickhouse.query_builders.session_filters import (
     SESSION_ID_FILTER_COLS,
@@ -98,19 +101,68 @@ EXACT_GRAPH_MEMBERSHIP_BATCH_SIZE = 1_000
 # refresh exhausts a necessary raw filter-witness cursor, classifies every
 # finite identity batch against latest state, then aggregates only proven trace
 # identities.  Neither value is a result ceiling.
-EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE = 200
-# The bounded-bulk classifier enforces the same 200-identity ceiling. Using
-# that complete finite page avoids rescanning the adjacent-day partitions once
-# per ten traces (92 serial scans on the production dense-slice fixture).
-EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE = 200
-EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 100
+EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE = 5_000
+# A selective raw witness is only an optimization when it proves the complete
+# candidate population is genuinely small. Keep this sentinel independent of
+# the larger root transport page: broad values should abandon the optional
+# probe promptly instead of reading another 4k raw witnesses. The extra row is
+# an exact broadness sentinel, not sampling or a public result ceiling.
+EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL = 1_001
+# Broad positive scalar Map filters use an authoritative latest-state scan over
+# disjoint whole-hour storage identities.  Two hours stays below the 15-second
+# statement ceiling on the densest observed production period; the corresponding
+# three-hour page exceeded it after the transport sentinel was raised to 50k.
+# A failing slice is still split to whole-hour children without publishing its
+# partial rows.
+EXACT_GRAPH_TRACE_ANCHOR_PARTITION_WIDTH = timedelta(hours=2)
+EXACT_GRAPH_TRACE_ANCHOR_MIN_PARTITION_WIDTH = timedelta(hours=1)
+# Exact aggregation has one admitted background refresh at a time and the
+# ClickHouse client owns a thread-safe connection pool.  Two independent
+# one-thread partition reads halve the dense-retention wall clock without the
+# four-to-ten-way I/O burst used by interactive fan-out endpoints.  Results are
+# still withheld until every disjoint partition completes.
+EXACT_GRAPH_TRACE_ANCHOR_MAX_WORKERS = 2
+EXACT_GRAPH_TRACE_ANCHOR_PAGE_SIZE = 50_000
+EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL = EXACT_GRAPH_TRACE_ANCHOR_PAGE_SIZE + 1
+EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS = 15_000
+EXACT_GRAPH_TRACE_ANCHOR_MAX_BYTES_TO_READ = 20 * 1024 * 1024 * 1024
+# Scanning complete retained history is worthwhile only when the requested
+# root window is both substantial in absolute terms and covers a meaningful
+# fraction of project retention.  Shorter/narrower windows stay on the ordered
+# root cursor, whose finite 5k-identity classifier is cheaper than replaying
+# every retained hour.
+EXACT_GRAPH_TRACE_ANCHOR_MIN_REQUEST_WIDTH = timedelta(days=30)
+EXACT_GRAPH_TRACE_ANCHOR_MIN_RETENTION_FRACTION = 0.25
+# The bounded-bulk classifier enforces the same 5k-identity ceiling. Using
+# that complete finite page avoids rescanning retained child history once per
+# much smaller root page while adaptive bisection still handles a hot batch.
+# Production A/B on Coletia measured the 5k classifier at 3.05--3.22 seconds
+# versus 1.63--1.79 seconds for 1k; reducing roughly 70 repeated scans to 14 is
+# the material wall-clock win. This changes query chunking only.
+EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE = 5_000
+# The compatibility root verifier builder has a separately proven 512-ID hard
+# ceiling. The authoritative partition route normally avoids this replay, but
+# alternate builders must still receive valid finite batches.
+EXACT_GRAPH_TRACE_ROOT_VERIFY_BATCH_SIZE = 512
+# Once exact trace membership is proven, contribution rows are additive across
+# disjoint trace-ID batches.  A 5k initial batch materially reduces repeated
+# range scans; resource-limited batches are bisected without publishing any
+# partial aggregate.
+EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE = 5_000
+# Production A/B on a fixed 5k Coletia population measured the one-statement
+# contribution at 0.95 seconds and 1.79 GB. Preserve explicit headroom, then
+# bisect a hotter tenant-specific batch instead of allowing one statement to
+# inherit the whole background-refresh deadline.
+EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS = 15_000
+EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ = 20 * 1024 * 1024 * 1024
 # Witness work runs only in the exact-snapshot background activity; public
 # graph polls never wait on an individual statement.  Production qualification
 # includes raw witness slices whose valid bounded reads exceed the former
-# three-second ceiling. Keep the cheap, identity-scoped classifier at its
-# original tight ceiling; only the raw witness scan receives more time.
+# three-second ceiling. The identity-scoped classifier was production-qualified
+# at five thousand candidates below five seconds; adaptive bisection preserves
+# fail-closed behavior when a tenant-specific batch exceeds that ceiling.
 EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS = 15_000
-EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 3_000
+EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 5_000
 EXACT_GRAPH_TRACE_INITIAL_SLICE = timedelta(minutes=5)
 # A failed raw witness slice is retried at the same upper bound so no interval
 # is skipped. Thirty seconds bounds retry fan-out while still allowing a hot
@@ -192,10 +244,19 @@ EXACT_GRAPH_READ_SETTINGS = {
 EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS = {
     **EXACT_GRAPH_READ_SETTINGS,
     "max_rows_to_read": 2_000_000,
-    # The production Coletia five-minute exact statement reads 2.66 GiB while
+    # The densest observed production five-minute statement reads 2.66 GiB while
     # touching 720k rows. Preserve finite measured headroom without reverting
     # to an unbounded tenant-wide filtered scan.
     "max_bytes_to_read": 4 * 1024 * 1024 * 1024,
+}
+EXACT_GRAPH_TRACE_ANCHOR_READ_SETTINGS = {
+    **EXACT_GRAPH_READ_SETTINGS,
+    "max_bytes_to_read": EXACT_GRAPH_TRACE_ANCHOR_MAX_BYTES_TO_READ,
+    "max_result_rows": EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL,
+}
+EXACT_GRAPH_TRACE_CONTRIBUTION_READ_SETTINGS = {
+    **EXACT_GRAPH_READ_SETTINGS,
+    "max_bytes_to_read": EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ,
 }
 
 
@@ -359,6 +420,451 @@ def _frozen_trace_membership_filters(
     return frozen
 
 
+def _normalize_driver_datetime(value: Any, reference: datetime) -> datetime:
+    """Normalize native-driver timezone decoration for in-process boundaries."""
+
+    if not isinstance(value, datetime):
+        raise ExactGraphReadError(
+            "Exact trace graph anchor bounds returned an invalid timestamp."
+        )
+    if reference.tzinfo is None and value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    if reference.tzinfo is not None and value.tzinfo is None:
+        return value.replace(tzinfo=reference.tzinfo)
+    return value
+
+
+def _enumerate_authoritative_anchor_trace_ids(
+    *,
+    analytics: Any,
+    builder: TraceListQueryBuilderV2,
+    request_start: datetime,
+    request_end: datetime,
+    started: float,
+) -> tuple[list[str], int, int] | None:
+    """Resolve a broad scalar Map leaf once per physical time partition.
+
+    The ordinary exact graph classifier is candidate-scoped but, for global
+    child semantics, rereads all retained project history for every finite root
+    batch.
+    A broad scalar value can therefore repeat the same scan hundreds of times.
+    This narrow lane instead collapses every physical span version once in
+    disjoint whole-hour-aligned partitions, unions the authoritative matching
+    trace identities, and then verifies live canonical roots in the frozen
+    request window. It is exact, unsampled, and returns nothing until all
+    partitions and root batches succeed.
+
+    ``None`` means the filter shape is not eligible and the caller must retain
+    the general exact fallback. An eligible empty project returns ``([], 1, 0)``.
+    """
+
+    supports = getattr(
+        builder,
+        "exact_graph_supports_authoritative_anchor_partition",
+        None,
+    )
+    if not callable(supports) or not bool(supports()):
+        return None
+
+    request_width = request_end - request_start
+    if request_width < EXACT_GRAPH_TRACE_ANCHOR_MIN_REQUEST_WIDTH:
+        return None
+
+    query_count = 0
+    rows_returned = 0
+    stats_lock = Lock()
+
+    def remaining_timeout_ms(statement_ceiling_ms: int) -> int:
+        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
+            (monotonic() - started) * 1000
+        )
+        if remaining_ms < 25:
+            raise ExactGraphReadError(
+                "Exact trace graph refresh exceeded its bounded deadline."
+            )
+        return min(statement_ceiling_ms, remaining_ms)
+
+    bounds_query, bounds_params = builder.build_exact_graph_anchor_scan_bounds()
+    if not bounds_query:
+        return None
+    query_count += 1
+    bounds_result = analytics.execute_ch_query(
+        bounds_query,
+        bounds_params,
+        timeout_ms=remaining_timeout_ms(EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS),
+        settings={
+            **EXACT_GRAPH_TRACE_ANCHOR_READ_SETTINGS,
+            "max_result_rows": 1,
+        },
+    )
+    bounds_rows = list(bounds_result.data or [])
+    rows_returned += len(bounds_rows)
+    if len(bounds_rows) != 1:
+        raise ExactGraphReadError(
+            "Exact trace graph anchor bounds returned an invalid result."
+        )
+    bounds_columns = list(bounds_result.columns or [])
+    min_start = _row_value(bounds_rows[0], bounds_columns, "min_start_time", None)
+    max_start = _row_value(bounds_rows[0], bounds_columns, "max_start_time", None)
+    if min_start is None and max_start is None:
+        return [], query_count, rows_returned
+    if min_start is None or max_start is None:
+        raise ExactGraphReadError(
+            "Exact trace graph anchor bounds returned a partial range."
+        )
+    min_start = _normalize_driver_datetime(min_start, request_start)
+    max_start = _normalize_driver_datetime(max_start, request_start)
+    if min_start > max_start:
+        raise ExactGraphReadError(
+            "Exact trace graph anchor bounds returned an inverted range."
+        )
+    scan_start = min_start.replace(minute=0, second=0, microsecond=0)
+    scan_end = max_start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    retention_width = scan_end - scan_start
+    if (
+        EXACT_GRAPH_TRACE_ANCHOR_MIN_RETENTION_FRACTION > 0
+        and request_width.total_seconds()
+        < retention_width.total_seconds()
+        * EXACT_GRAPH_TRACE_ANCHOR_MIN_RETENTION_FRACTION
+    ):
+        # The ordered-root lane only replays retained child history for finite
+        # request-window roots.  It is cheaper than a complete-retention anchor
+        # when the requested root window covers only a small share of history.
+        return None
+
+    def scan_partition(
+        partition_start: datetime,
+        partition_end: datetime,
+    ) -> set[str]:
+        """Read one range, splitting only on whole-hour resource failures."""
+
+        nonlocal query_count, rows_returned
+        partition_trace_ids: set[str] = set()
+        before_trace_id: str | None = None
+        try:
+            while True:
+                query, params = builder.build_exact_graph_latest_anchor_partition(
+                    partition_start=partition_start,
+                    partition_end=partition_end,
+                    before_trace_id=before_trace_id,
+                    limit=EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL,
+                )
+                if not query:
+                    raise ExactGraphReadError(
+                        "Exact trace graph anchor partition could not be constructed."
+                    )
+                # Top-level partitions execute concurrently. Keep diagnostic
+                # counters exact without making the result depend on their
+                # completion order.
+                with stats_lock:
+                    query_count += 1
+                result = analytics.execute_ch_query(
+                    query,
+                    params,
+                    timeout_ms=remaining_timeout_ms(
+                        EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS
+                    ),
+                    settings=EXACT_GRAPH_TRACE_ANCHOR_READ_SETTINGS,
+                )
+                page_rows = list(result.data or [])
+                with stats_lock:
+                    rows_returned += len(page_rows)
+                if len(page_rows) > EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL:
+                    raise ExactGraphReadError(
+                        "Exact trace graph anchor partition exceeded its page."
+                    )
+                page_trace_ids: list[str] = []
+                for row in page_rows:
+                    trace_id = str(row.get("trace_id") or "")
+                    if (
+                        not trace_id
+                        or trace_id in partition_trace_ids
+                        or (before_trace_id is not None and trace_id <= before_trace_id)
+                    ):
+                        raise ExactGraphReadError(
+                            "Exact trace graph anchor cursor returned an invalid identity."
+                        )
+                    page_trace_ids.append(trace_id)
+                    partition_trace_ids.add(trace_id)
+                if page_trace_ids != sorted(page_trace_ids):
+                    raise ExactGraphReadError(
+                        "Exact trace graph anchor cursor returned unordered identities."
+                    )
+                if len(page_rows) < EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL:
+                    return partition_trace_ids
+                next_trace_id = page_trace_ids[-1] if page_trace_ids else ""
+                if not next_trace_id or next_trace_id == before_trace_id:
+                    raise ExactGraphReadError(
+                        "Exact trace graph anchor cursor did not make forward progress."
+                    )
+                before_trace_id = next_trace_id
+        except Exception as exc:
+            duration_hours = int(
+                (partition_end - partition_start).total_seconds() // 3600
+            )
+            if not is_read_budget_error(exc) or duration_hours <= 1:
+                raise
+            # Discard every row from the failed parent attempt. Both children
+            # completely cover it and share an hour boundary, so successful
+            # recursive results are gap-free and safe to union.
+            left_hours = max(1, duration_hours // 2)
+            midpoint = partition_start + timedelta(hours=left_hours)
+            if not partition_start < midpoint < partition_end:
+                raise
+            return scan_partition(partition_start, midpoint) | scan_partition(
+                midpoint, partition_end
+            )
+
+    partitions: list[tuple[datetime, datetime]] = []
+    partition_start = scan_start
+    while partition_start < scan_end:
+        partition_end = min(
+            partition_start + EXACT_GRAPH_TRACE_ANCHOR_PARTITION_WIDTH,
+            scan_end,
+        )
+        partitions.append((partition_start, partition_end))
+        partition_start = partition_end
+
+    candidate_trace_ids: set[str] = set()
+    worker_count = min(EXACT_GRAPH_TRACE_ANCHOR_MAX_WORKERS, len(partitions))
+    if worker_count <= 1:
+        for partition_start, partition_end in partitions:
+            candidate_trace_ids.update(scan_partition(partition_start, partition_end))
+    else:
+        # Each future owns one disjoint whole-hour-aligned top-level range.
+        # Recursive retries stay inside that range.  If any future fails, the
+        # context waits only for the at-most-one other in-flight bounded read;
+        # queued work is cancelled and no candidate or graph row is returned.
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="exact-graph-anchor",
+        ) as executor:
+            futures = [
+                executor.submit(scan_partition, start, end) for start, end in partitions
+            ]
+            try:
+                for future in as_completed(futures):
+                    candidate_trace_ids.update(future.result())
+            except Exception:
+                for future in futures:
+                    future.cancel()
+                raise
+
+    if not candidate_trace_ids:
+        return [], query_count, rows_returned
+
+    # The production V2 builder can enumerate authoritative live roots once
+    # per requested physical time partition.  Intersecting those IDs with the
+    # independently authoritative attribute population avoids replaying all
+    # retained project history once per finite matching-candidate batch. Keep the old
+    # finite-ID verifier below as a compatibility fallback for alternate/test
+    # builders that do not yet expose the partition cursor.
+    root_partition_builder = getattr(
+        builder,
+        "build_exact_graph_latest_root_partition",
+        None,
+    )
+    if callable(root_partition_builder):
+
+        def scan_root_partition(
+            partition_start: datetime,
+            partition_end: datetime,
+        ) -> set[str]:
+            """Return matching trace IDs whose latest live root is in range."""
+
+            nonlocal query_count, rows_returned
+            partition_verified_ids: set[str] = set()
+            before_trace_id: str | None = None
+            try:
+                while True:
+                    query, params = root_partition_builder(
+                        partition_start=partition_start,
+                        partition_end=partition_end,
+                        request_start=request_start,
+                        request_end=request_end,
+                        before_trace_id=before_trace_id,
+                        limit=EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL,
+                    )
+                    if not query:
+                        raise ExactGraphReadError(
+                            "Exact trace graph root partition could not be constructed."
+                        )
+                    with stats_lock:
+                        query_count += 1
+                    result = analytics.execute_ch_query(
+                        query,
+                        params,
+                        timeout_ms=remaining_timeout_ms(
+                            EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS
+                        ),
+                        settings=EXACT_GRAPH_TRACE_ANCHOR_READ_SETTINGS,
+                    )
+                    page_rows = list(result.data or [])
+                    with stats_lock:
+                        rows_returned += len(page_rows)
+                    if len(page_rows) > EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL:
+                        raise ExactGraphReadError(
+                            "Exact trace graph root partition exceeded its page."
+                        )
+                    page_trace_ids: list[str] = []
+                    page_trace_id_set: set[str] = set()
+                    for row in page_rows:
+                        trace_id = str(row.get("trace_id") or "")
+                        if (
+                            not trace_id
+                            or trace_id in page_trace_id_set
+                            or (
+                                before_trace_id is not None
+                                and trace_id <= before_trace_id
+                            )
+                        ):
+                            raise ExactGraphReadError(
+                                "Exact trace graph root cursor returned an invalid identity."
+                            )
+                        page_trace_ids.append(trace_id)
+                        page_trace_id_set.add(trace_id)
+                        if trace_id in candidate_trace_ids:
+                            partition_verified_ids.add(trace_id)
+                    if page_trace_ids != sorted(page_trace_ids):
+                        raise ExactGraphReadError(
+                            "Exact trace graph root cursor returned unordered identities."
+                        )
+                    if len(page_rows) < EXACT_GRAPH_TRACE_ANCHOR_RESULT_SENTINEL:
+                        return partition_verified_ids
+                    next_trace_id = page_trace_ids[-1] if page_trace_ids else ""
+                    if not next_trace_id or next_trace_id == before_trace_id:
+                        raise ExactGraphReadError(
+                            "Exact trace graph root cursor did not make forward progress."
+                        )
+                    before_trace_id = next_trace_id
+            except Exception as exc:
+                duration_hours = int(
+                    (partition_end - partition_start).total_seconds() // 3600
+                )
+                if not is_read_budget_error(exc) or duration_hours <= 1:
+                    raise
+                left_hours = max(1, duration_hours // 2)
+                midpoint = partition_start + timedelta(hours=left_hours)
+                if not partition_start < midpoint < partition_end:
+                    raise
+                return scan_root_partition(
+                    partition_start,
+                    midpoint,
+                ) | scan_root_partition(midpoint, partition_end)
+
+        root_scan_start = request_start.replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        root_scan_end = request_end.replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if root_scan_end < request_end:
+            root_scan_end += timedelta(hours=1)
+        root_partitions: list[tuple[datetime, datetime]] = []
+        root_partition_start = root_scan_start
+        while root_partition_start < root_scan_end:
+            root_partition_end = min(
+                root_partition_start + EXACT_GRAPH_TRACE_ANCHOR_PARTITION_WIDTH,
+                root_scan_end,
+            )
+            root_partitions.append((root_partition_start, root_partition_end))
+            root_partition_start = root_partition_end
+
+        verified_trace_ids: set[str] = set()
+        root_worker_count = min(
+            EXACT_GRAPH_TRACE_ANCHOR_MAX_WORKERS,
+            len(root_partitions),
+        )
+        if root_worker_count <= 1:
+            for root_partition_start, root_partition_end in root_partitions:
+                verified_trace_ids.update(
+                    scan_root_partition(root_partition_start, root_partition_end)
+                )
+        else:
+            with ThreadPoolExecutor(
+                max_workers=root_worker_count,
+                thread_name_prefix="exact-graph-roots",
+            ) as executor:
+                futures = [
+                    executor.submit(scan_root_partition, start, end)
+                    for start, end in root_partitions
+                ]
+                try:
+                    for future in as_completed(futures):
+                        verified_trace_ids.update(future.result())
+                except Exception:
+                    for future in futures:
+                        future.cancel()
+                    raise
+        return sorted(verified_trace_ids), query_count, rows_returned
+
+    sorted_candidates = sorted(candidate_trace_ids)
+    verified_trace_ids: set[str] = set()
+
+    def verify_root_batch(batch: list[str]) -> None:
+        nonlocal query_count, rows_returned
+        if not batch:
+            return
+        query, params = builder.build_exact_graph_root_membership_query(
+            candidate_trace_ids=batch,
+            request_start=request_start,
+            request_end=request_end,
+        )
+        if not query:
+            raise ExactGraphReadError(
+                "Exact trace graph root verifier could not be constructed."
+            )
+        query_count += 1
+        try:
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=remaining_timeout_ms(
+                    EXACT_GRAPH_TRACE_ANCHOR_QUERY_TIMEOUT_MS
+                ),
+                settings={
+                    **EXACT_GRAPH_READ_SETTINGS,
+                    "max_result_rows": len(batch),
+                },
+            )
+        except Exception as exc:
+            if is_read_budget_error(exc) and len(batch) > 1:
+                midpoint = len(batch) // 2
+                verify_root_batch(batch[:midpoint])
+                verify_root_batch(batch[midpoint:])
+                return
+            raise
+        matched_rows = list(result.data or [])
+        rows_returned += len(matched_rows)
+        batch_ids = set(batch)
+        for row in matched_rows:
+            trace_id = str(row.get("trace_id") or "")
+            if (
+                not trace_id
+                or trace_id not in batch_ids
+                or trace_id in verified_trace_ids
+            ):
+                raise ExactGraphReadError(
+                    "Exact trace graph root verifier returned an invalid identity."
+                )
+            verified_trace_ids.add(trace_id)
+
+    for offset in range(
+        0, len(sorted_candidates), EXACT_GRAPH_TRACE_ROOT_VERIFY_BATCH_SIZE
+    ):
+        verify_root_batch(
+            sorted_candidates[
+                offset : offset + EXACT_GRAPH_TRACE_ROOT_VERIFY_BATCH_SIZE
+            ]
+        )
+
+    return sorted(verified_trace_ids), query_count, rows_returned
+
+
 def _enumerate_exact_trace_ids(
     *,
     analytics: Any,
@@ -484,7 +990,7 @@ def _enumerate_exact_trace_ids(
                     # The classifier is identity-bounded but intentionally
                     # scans child witnesses across all time: ingestion has no
                     # maximum trace duration. A tenant can therefore make a
-                    # valid 200-trace page exceed the per-statement deadline
+                    # valid finite trace batch exceed the per-statement deadline
                     # even though smaller exact identity sets complete. Split
                     # the same finite batch in order and replay both halves;
                     # no identity is skipped and no failed statement can
@@ -522,6 +1028,77 @@ def _enumerate_exact_trace_ids(
                 offset += batch_size
 
         classify_rows(candidate_rows)
+
+    # A positive scalar typed-Map equality/IN leaf has an all-time raw witness
+    # that is a necessary superset of exact latest-state membership. Prove that the
+    # complete population is smaller than one page, then classify only those
+    # trace identities.  This avoids enumerating and globally classifying every
+    # root in a large tenant when the requested value is sparse.  A full
+    # sentinel or a resource-bounded optional probe falls back to the unchanged
+    # exhaustive root walk; malformed data and programming errors still fail
+    # closed.
+    candidate_probe = getattr(
+        builder,
+        "build_exact_graph_candidate_witness_probe",
+        None,
+    )
+    if callable(candidate_probe):
+        candidate_query, candidate_params = candidate_probe(
+            limit=EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL,
+        )
+        if candidate_query:
+            query_count += 1
+            try:
+                candidate_result = analytics.execute_ch_query(
+                    candidate_query,
+                    candidate_params,
+                    timeout_ms=remaining_statement_timeout_ms(
+                        EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS
+                    ),
+                    settings={
+                        **EXACT_GRAPH_READ_SETTINGS,
+                        "max_result_rows": EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL,
+                    },
+                )
+            except Exception as exc:
+                if not is_read_budget_error(exc):
+                    raise
+            else:
+                candidate_rows = list(candidate_result.data or [])
+                rows_returned += len(candidate_rows)
+                if len(candidate_rows) > EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL:
+                    raise ExactGraphReadError(
+                        "Exact trace graph candidate witness exceeded its sentinel."
+                    )
+                candidate_trace_ids: set[str] = set()
+                for row in candidate_rows:
+                    trace_id = str(row.get("trace_id") or "")
+                    if not trace_id or trace_id in candidate_trace_ids:
+                        raise ExactGraphReadError(
+                            "Exact trace graph candidate witness returned an invalid identity."
+                        )
+                    candidate_trace_ids.add(trace_id)
+                if len(candidate_rows) < EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL:
+                    seen_candidate_trace_ids.update(candidate_trace_ids)
+                    classify(candidate_rows)
+                    return trace_ids, query_count, rows_returned
+
+    authoritative_anchor = _enumerate_authoritative_anchor_trace_ids(
+        analytics=analytics,
+        builder=builder,
+        request_start=request_start,
+        request_end=request_end,
+        started=started,
+    )
+    if authoritative_anchor is not None:
+        authoritative_ids, anchor_query_count, anchor_rows_returned = (
+            authoritative_anchor
+        )
+        return (
+            authoritative_ids,
+            query_count + anchor_query_count,
+            rows_returned + anchor_rows_returned,
+        )
 
     slice_end = root_seed_end
     slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, root_seed_end - root_seed_start)
@@ -799,28 +1376,46 @@ def _read_exact_filtered_trace_graph(
         started=started,
     )
     batches: list[tuple[list[Any], list[str]]] = []
-    for offset in range(0, len(trace_ids), EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE):
+
+    def read_contribution_batch(batch_trace_ids: list[str]) -> None:
+        nonlocal query_count, rows_returned
+        if not batch_trace_ids:
+            return
         remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
             (monotonic() - started) * 1000
         )
-        if remaining_ms <= 0:
+        if remaining_ms < 25:
             raise ExactGraphReadError(
                 "Exact trace graph refresh exceeded its bounded deadline."
             )
-        query, params = builder.build_exact_trace_contribution_batch(
-            trace_ids[offset : offset + EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE]
-        )
-        result = analytics.execute_ch_query(
-            query,
-            params,
-            timeout_ms=remaining_ms,
-            settings=EXACT_GRAPH_READ_SETTINGS,
-        )
+        query, params = builder.build_exact_trace_contribution_batch(batch_trace_ids)
+        query_count += 1
+        try:
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=min(
+                    remaining_ms,
+                    EXACT_GRAPH_TRACE_CONTRIBUTION_QUERY_TIMEOUT_MS,
+                ),
+                settings=EXACT_GRAPH_TRACE_CONTRIBUTION_READ_SETTINGS,
+            )
+        except Exception as exc:
+            if is_read_budget_error(exc) and len(batch_trace_ids) > 1:
+                midpoint = len(batch_trace_ids) // 2
+                read_contribution_batch(batch_trace_ids[:midpoint])
+                read_contribution_batch(batch_trace_ids[midpoint:])
+                return
+            raise
         batch_rows = list(result.data or [])
         batch_columns = list(result.columns or [])
         batches.append((batch_rows, batch_columns))
-        query_count += 1
         rows_returned += len(batch_rows)
+
+    for offset in range(0, len(trace_ids), EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE):
+        read_contribution_batch(
+            trace_ids[offset : offset + EXACT_GRAPH_TRACE_CONTRIBUTION_BATCH_SIZE]
+        )
 
     merged_rows, merged_columns = _merge_exact_trace_contribution_rows(batches)
     return (
@@ -1896,6 +2491,135 @@ def _session_having_clause(
     return " AND ".join(clauses)
 
 
+@dataclass(frozen=True)
+class _SessionMembershipPlan:
+    scalar_aggregates: tuple[str, ...]
+    scalar_predicates: tuple[str, ...]
+    relational_predicates: tuple[str, ...]
+    params: dict[str, Any]
+
+
+def _session_membership_plan(
+    *,
+    project_id: str,
+    filters: list[dict[str, Any]],
+) -> _SessionMembershipPlan:
+    """Compile independent trace leaves for session-level intersection.
+
+    The session list contract allows separate traces in one session to satisfy
+    separate scalar/attribute/relational leaves.  Compiling the complete list
+    as one trace predicate would instead require a single trace to satisfy
+    every leaf.  Keep each leaf independent, namespace its bound parameters,
+    and let the caller intersect them only after grouping by resolved session.
+
+    Filter membership is frozen to the complete request snapshot.  The shared
+    relational compiler names that range ``start_date``/``end_date``, but
+    entity graph callers reuse those names for each output partition. Retarget
+    only relational leaf predicates to the immutable ``snapshot_*`` bounds so
+    a sibling match cannot disappear on page N.
+    """
+
+    root_filters = [
+        item
+        for item in filters
+        if (item.get("column_id") or item.get("columnId")) == "end_time"
+    ]
+    scalar_filters = [
+        item
+        for item in filters
+        if (item.get("column_id") or item.get("columnId")) != "end_time"
+    ]
+    scalar_plans, relational_filters = partition_span_filter_plans(scalar_filters)
+    scalar_aggregates = [
+        rewrite_v1_sql_to_v2(aggregate)
+        for plan in scalar_plans
+        for aggregate in plan.aggregates
+    ]
+    scalar_predicates = [rewrite_v1_sql_to_v2(plan.predicate) for plan in scalar_plans]
+    params: dict[str, Any] = {}
+    scalar_params = {
+        param_name: value
+        for plan in scalar_plans
+        for param_name, value in plan.params.items()
+    }
+    for param_name, value in scalar_params.items():
+        placeholder = f"%({param_name})s"
+        namespaced_name = f"session_scalar_{param_name}"
+        namespaced_placeholder = f"%({namespaced_name})s"
+        used = False
+        for index, aggregate in enumerate(scalar_aggregates):
+            if placeholder in aggregate:
+                scalar_aggregates[index] = aggregate.replace(
+                    placeholder,
+                    namespaced_placeholder,
+                )
+                used = True
+        for index, predicate in enumerate(scalar_predicates):
+            if placeholder in predicate:
+                scalar_predicates[index] = predicate.replace(
+                    placeholder,
+                    namespaced_placeholder,
+                )
+                used = True
+        if used:
+            params[namespaced_name] = value
+
+    relational_predicates: list[str] = []
+    for leaf_index, item in enumerate(root_filters):
+        predicate, leaf_params = compile_exact_graph_filter_predicates(
+            [item],
+            project_id=project_id,
+            observe_type="span",
+        )
+        if not predicate:
+            continue
+        for param_name, value in leaf_params.items():
+            placeholder = f"%({param_name})s"
+            if placeholder not in predicate:
+                continue
+            namespaced_name = f"session_root_{leaf_index}_{param_name}"
+            predicate = predicate.replace(
+                placeholder,
+                f"%({namespaced_name})s",
+            )
+            params[namespaced_name] = value
+        relational_predicates.append(predicate)
+
+    annotation_label_ids = _annotation_label_ids_for_filters(
+        project_id,
+        relational_filters,
+    )
+    for leaf_index, item in enumerate(relational_filters):
+        predicate, leaf_params = compile_exact_graph_filter_predicates(
+            [item],
+            project_id=project_id,
+            observe_type="trace",
+            annotation_label_ids=annotation_label_ids,
+        )
+        if not predicate:
+            continue
+        predicate = predicate.replace(
+            "%(start_date)s", "%(snapshot_start_date)s"
+        ).replace("%(end_date)s", "%(snapshot_end_date)s")
+        for param_name, value in leaf_params.items():
+            placeholder = f"%({param_name})s"
+            if placeholder not in predicate:
+                continue
+            namespaced_name = f"session_relational_{leaf_index}_{param_name}"
+            predicate = predicate.replace(
+                placeholder,
+                f"%({namespaced_name})s",
+            )
+            params[namespaced_name] = value
+        relational_predicates.append(predicate)
+    return _SessionMembershipPlan(
+        scalar_aggregates=tuple(scalar_aggregates),
+        scalar_predicates=tuple(scalar_predicates),
+        relational_predicates=tuple(relational_predicates),
+        params=params,
+    )
+
+
 def _session_aggregate_source_sql(
     *,
     project_id: str,
@@ -1910,11 +2634,12 @@ def _session_aggregate_source_sql(
     """Build one full-window, remap-resolved per-session source.
 
     System, eval, and annotation session graphs must agree on membership. Raw
-    trace/span predicates are applied before grouping; session identity,
-    numeric aggregates, and first/last messages are applied only after the
-    canonical session has been assembled. The fixed ``snapshot_*`` parameters
-    are deliberately distinct from an outer graph partition's dates so a
-    session can never be split at an output-bucket boundary.
+    trace/span leaves are intersected after grouping their independent matches
+    by resolved session. Numeric aggregates and first/last messages are then
+    computed from every live root in that selected session. The fixed
+    ``snapshot_*`` parameters are deliberately distinct from an outer graph
+    partition's dates so a session can never be split at an output-bucket
+    boundary.
     """
 
     span_filters = [
@@ -1927,16 +2652,10 @@ def _session_aggregate_source_sql(
             *SESSION_ID_FILTER_COLS,
         }
     ]
-    extra_where, extra_params = compile_exact_graph_filter_predicates(
-        span_filters,
+    membership_plan = _session_membership_plan(
         project_id=project_id,
-        observe_type="trace",
-        annotation_label_ids=_annotation_label_ids_for_filters(
-            project_id,
-            span_filters,
-        ),
+        filters=span_filters,
     )
-    filter_clause = f"AND {extra_where}" if extra_where else ""
     session_survivor_map = survivor_map_subquery("trace_session_id_remap")
     resolved_session_id = (
         "if(ts_remap.survivor_id IS NULL OR "
@@ -1945,11 +2664,43 @@ def _session_aggregate_source_sql(
         "rs.trace_session_id, ts_remap.survivor_id)"
     )
     params = {
-        **extra_params,
+        **membership_plan.params,
         "project_id": project_id,
         "snapshot_start_date": start_date,
         "snapshot_end_date": end_date,
     }
+    snapshot_scan_start = start_date.replace(minute=0, second=0, microsecond=0)
+    snapshot_scan_end = end_date.replace(minute=0, second=0, microsecond=0)
+    if snapshot_scan_end < end_date:
+        snapshot_scan_end += timedelta(hours=1)
+    params.update(
+        {
+            "snapshot_scan_start_date": snapshot_scan_start,
+            "snapshot_scan_end_date": snapshot_scan_end,
+        }
+    )
+    # ``toStartOfHour(start_time)`` is part of the deployed CH25 replacement
+    # identity. A producer may correct start_time across an exact request
+    # boundary while keeping the same physical identity. FINAL must therefore
+    # see both complete boundary hours; apply the frozen request window only
+    # after that collapse so an older live row cannot survive a newer tombstone.
+    session_root_rows = """
+        SELECT *
+        FROM (
+            SELECT *
+            FROM spans FINAL
+            PREWHERE project_id = toUUID(%(project_id)s)
+              AND start_time >= %(snapshot_scan_start_date)s
+              AND start_time < %(snapshot_scan_end_date)s
+        ) AS snapshot_roots
+        WHERE snapshot_roots.start_time >= %(snapshot_start_date)s
+          AND snapshot_roots.start_time < %(snapshot_end_date)s
+          AND snapshot_roots.is_deleted = 0
+          AND (snapshot_roots.parent_span_id IS NULL OR
+               snapshot_roots.parent_span_id = '')
+          AND snapshot_roots.trace_session_id !=
+              toUUID('00000000-0000-0000-0000-000000000000')
+    """
     session_id_clause = build_session_id_filter_clause(
         filters,
         params,
@@ -1974,16 +2725,107 @@ def _session_aggregate_source_sql(
         )
     else:
         raise ValueError("session source requires an entity-safe candidate scope")
-    # For an outer eval/annotation candidate, entity membership may be caused
-    # by a different trace in the same session.  Candidate discovery therefore
-    # identifies only the session; the raw predicate is evaluated while the
-    # complete frozen session is hydrated below.  The SYSTEM path anchors on
-    # the earliest *filtered* root span, so it intentionally applies the raw
-    # predicate during candidate discovery as well.
-    candidate_filter_clause = filter_clause if anchor_by_session_start else ""
-
+    membership_ctes = ""
+    selected_session_predicates: list[str] = []
+    if membership_plan.scalar_predicates:
+        scalar_aggregate_select = ",\n            ".join(
+            membership_plan.scalar_aggregates
+        )
+        scalar_membership_having = "\n          AND ".join(
+            f"countIf({predicate}) > 0"
+            for predicate in membership_plan.scalar_predicates
+        )
+        scalar_resolved_session_id = resolved_id_expr(
+            "latest_trace_session_id",
+            "scalar_ts_remap",
+        )
+        membership_ctes += f""",
+    latest_session_filter_spans AS (
+        SELECT
+            project_id,
+            observation_type,
+            service_name,
+            trace_id,
+            id,
+            argMax(start_time, _version) AS latest_start_time,
+            argMax(tuple(trace_session_id), _version).1
+                AS latest_trace_session_id,
+            argMax(is_deleted, _version) AS latest_is_deleted,
+            {scalar_aggregate_select}
+        FROM spans
+        PREWHERE project_id = toUUID(%(project_id)s)
+          AND start_time >= %(snapshot_scan_start_date)s
+          AND start_time < %(snapshot_scan_end_date)s
+        GROUP BY
+            project_id,
+            observation_type,
+            service_name,
+            toStartOfHour(start_time),
+            trace_id,
+            id
+    ),
+    resolved_session_filter_spans AS (
+        SELECT
+            latest_session_filter_spans.*,
+            {scalar_resolved_session_id} AS session_id
+        FROM latest_session_filter_spans
+        LEFT JOIN ({session_survivor_map}) AS scalar_ts_remap
+          ON latest_trace_session_id = scalar_ts_remap.any_id
+        WHERE latest_is_deleted = 0
+          AND latest_start_time >= %(snapshot_start_date)s
+          AND latest_start_time < %(snapshot_end_date)s
+          AND isNotNull(latest_trace_session_id)
+          AND latest_trace_session_id !=
+              toUUID('00000000-0000-0000-0000-000000000000')
+          AND {scalar_resolved_session_id} IN (
+              SELECT session_id FROM candidate_sessions
+          )
+    ),
+    matching_scalar_sessions AS (
+        SELECT session_id
+        FROM resolved_session_filter_spans
+        GROUP BY session_id
+        HAVING {scalar_membership_having}
+    )"""
+        selected_session_predicates.append(
+            "session_id IN (SELECT session_id FROM matching_scalar_sessions)"
+        )
+    if membership_plan.relational_predicates:
+        relational_membership_having = "\n          AND ".join(
+            f"countIf({predicate}) > 0"
+            for predicate in membership_plan.relational_predicates
+        )
+        membership_ctes += f""",
+    matching_relational_sessions AS (
+        SELECT
+            {resolved_session_id} AS session_id
+        FROM (
+            {session_root_rows}
+        ) AS rs
+        LEFT JOIN ({session_survivor_map}) AS ts_remap
+          ON rs.trace_session_id = ts_remap.any_id
+        WHERE {resolved_session_id} IN (
+            SELECT session_id FROM candidate_sessions
+        )
+        GROUP BY session_id
+        HAVING {relational_membership_having}
+    )"""
+        selected_session_predicates.append(
+            "session_id IN (SELECT session_id FROM matching_relational_sessions)"
+        )
+    selected_session_where = (
+        "WHERE " + " AND ".join(selected_session_predicates)
+        if selected_session_predicates
+        else ""
+    )
+    membership_ctes += f""",
+    selected_sessions AS (
+        SELECT session_id
+        FROM candidate_sessions
+        {selected_session_where}
+    )"""
     source_where_clauses = [
-        f"{resolved_session_id} IN (SELECT session_id FROM candidate_sessions)"
+        f"{resolved_session_id} IN (SELECT session_id FROM selected_sessions)"
     ]
     if session_id_clause:
         source_where_clauses.append(session_id_clause)
@@ -2021,20 +2863,14 @@ def _session_aggregate_source_sql(
                    toUUID('00000000-0000-0000-0000-000000000000'),
                candidate_rs.trace_session_id,
                candidate_remap.survivor_id) AS session_id
-        FROM spans AS candidate_rs FINAL
+        FROM (
+            {session_root_rows}
+        ) AS candidate_rs
         LEFT JOIN ({session_survivor_map}) AS candidate_remap
           ON candidate_rs.trace_session_id = candidate_remap.any_id
-        PREWHERE candidate_rs.project_id = toUUID(%(project_id)s)
-          AND candidate_rs.start_time >= %(snapshot_start_date)s
-          AND candidate_rs.start_time < %(snapshot_end_date)s
-        WHERE candidate_rs.is_deleted = 0
-          AND (candidate_rs.parent_span_id IS NULL OR
-               candidate_rs.parent_span_id = '')
-          AND candidate_rs.trace_session_id !=
-              toUUID('00000000-0000-0000-0000-000000000000')
+        WHERE 1 = 1
           {candidate_trace_clause}
-          {candidate_filter_clause.replace("rs.", "candidate_rs.")}
-    )
+    ){membership_ctes}
     SELECT
         {resolved_session_id} AS session_id,
         min(rs.start_time) AS session_start,
@@ -2052,16 +2888,7 @@ def _session_aggregate_source_sql(
         {message_aggregate_select}
         {trace_ids_select}
     FROM (
-        SELECT *
-        FROM spans FINAL
-        PREWHERE project_id = toUUID(%(project_id)s)
-          AND start_time >= %(snapshot_start_date)s
-          AND start_time < %(snapshot_end_date)s
-        WHERE is_deleted = 0
-          AND (parent_span_id IS NULL OR parent_span_id = '')
-          AND trace_session_id !=
-              toUUID('00000000-0000-0000-0000-000000000000')
-          {filter_clause}
+        {session_root_rows}
     ) AS rs
     LEFT JOIN ({session_survivor_map}) AS ts_remap
       ON rs.trace_session_id = ts_remap.any_id
@@ -2113,17 +2940,28 @@ def _session_trace_membership_sql(
         "candidate_member.trace_session_id",
         "candidate_member_remap",
     )
+    session_member_rows = """
+        SELECT *
+        FROM (
+            SELECT *
+            FROM spans FINAL
+            PREWHERE project_id = toUUID(%(project_id)s)
+              AND start_time >= %(snapshot_scan_start_date)s
+              AND start_time < %(snapshot_scan_end_date)s
+        ) AS snapshot_members
+        WHERE snapshot_members.start_time >= %(snapshot_start_date)s
+          AND snapshot_members.start_time < %(snapshot_end_date)s
+          AND snapshot_members.is_deleted = 0
+    """
     return (
         f"""
         SELECT DISTINCT toString(candidate_member.trace_id) AS trace_id
-        FROM spans AS candidate_member FINAL
+        FROM (
+            {session_member_rows}
+        ) AS candidate_member
         LEFT JOIN ({session_survivor_map}) AS candidate_member_remap
           ON candidate_member.trace_session_id = candidate_member_remap.any_id
-        PREWHERE candidate_member.project_id = toUUID(%(project_id)s)
-          AND candidate_member.start_time >= %(snapshot_start_date)s
-          AND candidate_member.start_time < %(snapshot_end_date)s
-        WHERE candidate_member.is_deleted = 0
-          AND {candidate_clause}
+        WHERE {candidate_clause}
           AND {resolved_session_id} IN (
               SELECT session_id
               FROM ({source}) AS selected_sessions

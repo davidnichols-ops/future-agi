@@ -5941,6 +5941,48 @@ def test_filter_value_cursor_minimum_floor_failure_remains_fail_closed(
     )
 
 
+def test_filter_value_cursor_persists_narrower_retry_when_request_budget_ends(
+    monkeypatch,
+):
+    """A changed retry width is finite progress even before rows are consumed."""
+
+    attempted_widths = []
+
+    def respond(call, _):
+        assert "segment_start" in call.params
+        attempted_widths.append(
+            call.params["segment_end"] - call.params["segment_start"]
+        )
+        return ReadDeadlineExceeded("wide candidate deadline")
+
+    # Admit the first typed candidate statement, but leave no query budget for
+    # its five-second retry.  The response must persist that narrower strategy
+    # instead of returning a repeated cursor or a 503.  A later request that
+    # also fails at the persisted floor is covered by the fail-closed test
+    # above.
+    monkeypatch.setattr(
+        "tracer.services.clickhouse.attribute_reads.ATTRIBUTE_READ_MAX_QUERY_COUNT",
+        3,
+    )
+    read = AttributeReadSelector(
+        RecordingExecutor(respond), now=NOW
+    ).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        attribute_type="string",
+        window_start=NOW - timedelta(days=1),
+        window_end=NOW,
+    )
+
+    assert read.rows == ()
+    assert read.has_more is True
+    assert read.browse_status == "continuation"
+    assert read.next_segment_end == NOW
+    assert read.next_segment_start == NOW - ATTRIBUTE_VALUE_CURSOR_MIN_SEGMENT
+    assert attempted_widths == [ATTRIBUTE_READ_EXPLICIT_SEGMENT]
+
+
 def test_filter_value_cursor_resume_budget_failure_never_advances_cursor():
     resume_identity = (
         PROJECT_A,

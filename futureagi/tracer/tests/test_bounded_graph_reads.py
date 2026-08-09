@@ -692,8 +692,13 @@ def test_trace_multi_child_filters_match_across_separate_temporal_strata():
     )
 
     assert tuple(row["trace_id"] for row in sample.rows) == ("cross-stratum-trace",)
-    assert sample.query_complete is True
-    assert sample.query_status == "complete"
+    # Temporal child anchors found this positive candidate, but cannot prove
+    # the absence of another trace whose sole child witness lies outside the
+    # root window. The legacy candidate sampler must never label that set as
+    # exact; exact aggregations use the exhaustive graph reader.
+    assert sample.query_complete is False
+    assert sample.query_status == "sampled"
+    assert sample.query_error_code == "sample_limit"
     classifier_query, classifier_params, *_ = next(
         call for call in analytics.calls if "candidate_trace_ids" in call[1]
     )
@@ -1382,7 +1387,7 @@ def test_compiler_error_is_never_recast_as_a_cardinality_sample(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("window_days", [14, 180, 365])
-def test_sparse_old_and_new_matches_are_exact_across_stratum_anchors(window_days):
+def test_sparse_old_and_new_temporal_anchors_never_claim_exact(window_days):
     window_end = datetime(2026, 7, 31, 7)
     window_start = window_end - timedelta(days=window_days)
     rows = [
@@ -1409,7 +1414,9 @@ def test_sparse_old_and_new_matches_are_exact_across_stratum_anchors(window_days
         observe_type="trace",
     )
 
-    assert sample.query_complete is True
+    assert sample.query_complete is False
+    assert sample.query_status == "sampled"
+    assert sample.query_error_code == "sample_limit"
     assert {row["trace_id"] for row in sample.rows} == {"trace-old", "trace-new"}
     anchor_calls = [
         call for call in analytics.calls if "filter_anchor_limit" in call[1]
@@ -1471,7 +1478,9 @@ def test_long_window_scalar_datetime_bounds_are_preserved_by_stratum_anchors(
     )
 
     assert sample.rows == (row,)
-    assert sample.query_complete is True
+    assert sample.query_complete is False
+    assert sample.query_status == "sampled"
+    assert sample.query_error_code == "sample_limit"
     assert filters[0]["filter_config"]["filter_op"] == lower_op
     assert filters[1]["filter_config"]["filter_op"] == upper_op
     anchor_ranges = [
@@ -1501,7 +1510,7 @@ def test_long_window_scalar_datetime_bounds_are_preserved_by_stratum_anchors(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("window_days", [14, 180, 365])
-def test_empty_long_window_is_exact_and_not_mislabeled_as_sampled(window_days):
+def test_empty_temporal_child_anchors_do_not_prove_empty_trace_population(window_days):
     window_end = datetime(2026, 7, 31, 7)
     window_start = window_end - timedelta(days=window_days)
     analytics = _CandidateAnalytics(observe_type="trace", rows=[])
@@ -1517,9 +1526,9 @@ def test_empty_long_window_is_exact_and_not_mislabeled_as_sampled(window_days):
     )
 
     assert sample.rows == ()
-    assert sample.query_complete is True
-    assert sample.query_status == "complete"
-    assert sample.query_error_code is None
+    assert sample.query_complete is False
+    assert sample.query_status == "sampled"
+    assert sample.query_error_code == "sample_limit"
 
 
 @pytest.mark.unit

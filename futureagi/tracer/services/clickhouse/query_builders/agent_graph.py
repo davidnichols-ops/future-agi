@@ -18,7 +18,6 @@ one compact array, and emits node/hierarchy/path events through one final
 
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any
 
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
@@ -68,11 +67,6 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
             {
                 "start_date": self.start_date,
                 "end_date": self.end_date,
-                # Preserve the established trace-filter contract: ordinary
-                # scalar witnesses may sit in the adjacent ingest window,
-                # while contribution rows remain inside the selected window.
-                "graph_witness_start_date": self.start_date - timedelta(days=1),
-                "graph_witness_end_date": self.end_date + timedelta(days=1),
                 "graph_visible_keep_count": AGENT_GRAPH_MAX_VISIBLE_NODES - 1,
                 "graph_other_node_name": AGENT_GRAPH_OTHER_NODE_NAME,
             }
@@ -178,8 +172,6 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
         match_having = []
         for index in range(len(plan.predicates)):
             match_condition = f"graph_row_match_{index} = 1"
-            if plan.output_window_only[index]:
-                match_condition = f"({match_condition}) AND ({output_window})"
             match_columns.append(
                 "            max(toUInt8(ifNull(("
                 f"{match_condition}), 0))) AS graph_match_{index}"
@@ -196,13 +188,38 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                 + ")"
             )
 
-        trace_projection = ""
-        if match_columns:
-            trace_projection = ",\n" + ",\n".join(match_columns)
-        trace_having = ["length(graph_spans) > 0", *match_having]
+        # A trace datetime filter belongs to its canonical root. Attribute,
+        # relation, Map, and JSON membership may be witnessed by any current
+        # descendant at any timestamp. Keep the graph contribution array
+        # request-window bounded, but never time-bound those membership flags.
+        root_window_column = (
+            "            max(toUInt8(ifNull(((parent_span_id IS NULL OR "
+            "parent_span_id = '') AND ("
+            f"{output_window})), 0))) AS graph_root_in_output_window"
+        )
+        trace_projection = ",\n" + ",\n".join([root_window_column, *match_columns])
+        trace_having = [
+            "length(graph_spans) > 0",
+            "graph_root_in_output_window = 1",
+            *match_having,
+        ]
         if self.empty_window:
             trace_having.append("0 = 1")
         trace_having_sql = " AND ".join(f"({item})" for item in trace_having)
+
+        # With no non-temporal filter, only output-window rows can contribute,
+        # so retain the partition-prunable physical read. Once trace membership
+        # has any additional predicate, the sole matching descendant may lie
+        # arbitrarily far from its in-window root. The single-snapshot collapse
+        # must then replay candidate membership across all child timestamps;
+        # ``groupArrayIf`` below still prevents those remote witnesses from
+        # becoming graph nodes or edges.
+        physical_window = ""
+        if not plan.predicates:
+            physical_window = (
+                "\n                  AND start_time >= %(start_date)s"
+                "\n                  AND start_time < %(end_date)s"
+            )
 
         span_tuple = self._span_tuple("")
         # Tuple indexes in ``graph_spans``:
@@ -281,8 +298,7 @@ class AgentGraphQueryBuilder(BaseQueryBuilder):
                     ) AS graph_latest_row
                 FROM {self.TABLE}
                 PREWHERE {self.project_filter_sql()}
-                  AND start_time >= %(graph_witness_start_date)s
-                  AND start_time < %(graph_witness_end_date)s
+                  {physical_window}
                 GROUP BY
                     project_id,
                     observation_type,

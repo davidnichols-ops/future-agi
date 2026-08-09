@@ -1047,6 +1047,8 @@ import type {
   SpanAttributeDetailResponseApi,
   SpanAttributeKeysResponseApi,
   SpanAttributeValuesResponseApi,
+  SpanObserveListResponseApi,
+  SpanPrototypeListResponseApi,
   SpendSummaryResponseApi,
   StartEvalsProcessRequestApi,
   StopUserEvalRequestApi,
@@ -1097,6 +1099,7 @@ import type {
   ToolDiscoveryResponseApi,
   ToolsApi,
   TopicCategoriesResponseApi,
+  TraceAgentGraphResponseApi,
   TraceApi,
   TraceDetailResponseApi,
   TraceErrorAnalysisResponseApi,
@@ -1104,6 +1107,7 @@ import type {
   TraceErrorTaskUpdateRequestApi,
   TraceErrorTaskUpdateResponseApi,
   TraceObserveListResponseApi,
+  TracePrototypeListResponseApi,
   TraceSessionApi,
   TraceSessionGraphDataRequestApi,
   TraceTagsUpdateApi,
@@ -1165,7 +1169,6 @@ import type {
   TracerObservationSpanGetTraceIdByIndexSpansAsObserveParams,
   TracerObservationSpanList200,
   TracerObservationSpanListParams,
-  TracerObservationSpanListSpans200,
   TracerObservationSpanListSpansObserveParams,
   TracerObservationSpanListSpansParams,
   TracerObservationSpanRetrieveLoading200,
@@ -1195,7 +1198,6 @@ import type {
   TracerSavedViewsListParams,
   TracerSharedLinksList200,
   TracerSharedLinksListParams,
-  TracerTraceAgentGraph200,
   TracerTraceAgentGraphParams,
   TracerTraceAnnotationGetAnnotationValuesParams,
   TracerTraceGetEvalNames200,
@@ -1211,7 +1213,6 @@ import type {
   TracerTraceGetTraceIdByIndexParams,
   TracerTraceList200,
   TracerTraceListParams,
-  TracerTraceListTraces200,
   TracerTraceListTracesOfSessionParams,
   TracerTraceListTracesParams,
   TracerTraceListVoiceCallsParams,
@@ -62843,7 +62844,7 @@ export const tracerObservationSpanGetTraceIdByIndexSpansAsObserve = async (param
 
 
 export type tracerObservationSpanListSpansResponse200 = {
-  data: TracerObservationSpanListSpans200
+  data: SpanPrototypeListResponseApi
   status: 200
 }
 
@@ -62881,7 +62882,7 @@ export type tracerObservationSpanListSpansResponseError = (tracerObservationSpan
 
 export type tracerObservationSpanListSpansResponse = (tracerObservationSpanListSpansResponseSuccess | tracerObservationSpanListSpansResponseError)
 
-export const getTracerObservationSpanListSpansUrl = (params?: TracerObservationSpanListSpansParams,) => {
+export const getTracerObservationSpanListSpansUrl = (params: TracerObservationSpanListSpansParams,) => {
   const normalizedParams = new URLSearchParams();
 
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -62903,7 +62904,7 @@ export const getTracerObservationSpanListSpansUrl = (params?: TracerObservationS
 /**
  * List spans filtered by project ID and project version ID with optimized queries.
  */
-export const tracerObservationSpanListSpans = async (params?: TracerObservationSpanListSpansParams, options?: RequestInit): Promise<tracerObservationSpanListSpansResponse> => {
+export const tracerObservationSpanListSpans = async (params: TracerObservationSpanListSpansParams, options?: RequestInit): Promise<tracerObservationSpanListSpansResponse> => {
 
   return apiMutator<tracerObservationSpanListSpansResponse>(getTracerObservationSpanListSpansUrl(params),
   {
@@ -62917,7 +62918,7 @@ export const tracerObservationSpanListSpans = async (params?: TracerObservationS
 
 
 export type tracerObservationSpanListSpansObserveResponse200 = {
-  data: TraceObserveListResponseApi
+  data: SpanObserveListResponseApi
   status: 200
 }
 
@@ -66826,7 +66827,7 @@ export const tracerTraceCreate = async (traceApi: NonReadonly<TraceApi>, options
 
 
 export type tracerTraceAgentGraphResponse200 = {
-  data: TracerTraceAgentGraph200
+  data: TraceAgentGraphResponseApi
   status: 200
 }
 
@@ -67337,7 +67338,7 @@ export const tracerTraceGetTraceIdByIndexObserve = async (params: TracerTraceGet
 
 
 export type tracerTraceListTracesResponse200 = {
-  data: TracerTraceListTraces200
+  data: TracePrototypeListResponseApi
   status: 200
 }
 

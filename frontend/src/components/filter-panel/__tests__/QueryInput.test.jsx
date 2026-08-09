@@ -204,6 +204,31 @@ describe("QueryInput explicit values", () => {
     expect(onLoadMoreValues).toHaveBeenCalledOnce();
   });
 
+  it("requests exact field search and advances field discovery explicitly", async () => {
+    const field = {
+      value: "recent_attribute",
+      label: "Recent attribute",
+      type: "string",
+    };
+    const onFieldSearchChange = vi.fn();
+    const onLoadMoreFields = vi.fn();
+    const { utils } = renderQueryInput({
+      field,
+      onFieldSearchChange,
+      onLoadMoreFields,
+      hasMoreFields: true,
+    });
+
+    const input = utils.getByRole("combobox");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "final_status" } });
+
+    expect(onFieldSearchChange).toHaveBeenLastCalledWith("final_status");
+    fireEvent.click(await utils.findByText("Load more fields"));
+    expect(onLoadMoreFields).toHaveBeenCalledOnce();
+    expect(input).toHaveValue("final_status");
+  });
+
   it("fetches and preserves type when an existing token is edited", async () => {
     const inputRef = createRef();
     const onFieldChange = vi.fn();

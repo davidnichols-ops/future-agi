@@ -461,6 +461,31 @@ def test_graph_boundaries_return_503_for_partial_degraded_coverage(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("view_kind", ["trace", "span"])
+def test_graph_boundaries_return_200_while_exact_snapshot_refreshes(
+    monkeypatch,
+    view_kind,
+):
+    response = _graph_call(
+        monkeypatch,
+        view_kind,
+        {
+            "metric_name": "latency",
+            "data": [],
+            "query_complete": False,
+            "query_status": "pending",
+            "query_sampled": False,
+            "query_refreshing": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.data["result"]["data"] == []
+    assert response.data["result"]["query_status"] == "pending"
+    assert response.data["result"]["query_refreshing"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("view_kind", ["trace", "span"])
 def test_graph_boundaries_reject_labelled_sample_even_with_legacy_opt_in(
     monkeypatch,
     view_kind,

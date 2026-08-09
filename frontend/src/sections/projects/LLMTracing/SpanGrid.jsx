@@ -57,14 +57,9 @@ import {
 } from "./listCursorPagination";
 import ListCursorContinuationNotice from "./ListCursorContinuationNotice";
 import { getListTotalState } from "./listTotalMetadata";
+import { getSpanPhysicalRowId } from "./spanPhysicalIdentity";
 
 const ROWS_LIMIT = 25;
-const spanRowIdentity = (row) => {
-  const id = row?.span_id || row?.id;
-  return id
-    ? `${row?.project_id || ""}:${row?.trace_id || ""}:${id}:${row?.start_time || ""}`
-    : null;
-};
 
 const getSpanListColumnDefs = (col) => {
   const colId = col?.id;
@@ -506,7 +501,7 @@ const SpanGrid = React.forwardRef(
                   response?.data?.result?.table || [],
                 metadataFromResponse: (response) =>
                   response?.data?.result?.metadata || {},
-                rowIdentity: spanRowIdentity,
+                rowIdentity: getSpanPhysicalRowId,
                 isCurrent: () =>
                   cursorPagination.current.isCurrent(requestGeneration),
                 nextResponse: () =>
@@ -724,7 +719,9 @@ const SpanGrid = React.forwardRef(
         ? params.api.getServerSideSelectionState() || {}
         : {};
       const nodes = params.api.getSelectedNodes?.() || [];
-      const idsFromNodes = nodes.map((n) => n.data?.span_id).filter(Boolean);
+      const idsFromNodes = nodes
+        .map((n) => getSpanPhysicalRowId(n.data))
+        .filter(Boolean);
       const toggled = isServerSide ? ssState.toggledNodes || [] : idsFromNodes;
       useSpanGridStore.setState({
         toggledNodes: toggled,
@@ -758,7 +755,7 @@ const SpanGrid = React.forwardRef(
               : {};
             const nodes = event.api.getSelectedNodes?.() || [];
             const idsFromNodes = nodes
-              .map((n) => n.data?.span_id)
+              .map((n) => getSpanPhysicalRowId(n.data))
               .filter(Boolean);
             const toggled = isServerSide
               ? ssState.toggledNodes || []
@@ -898,9 +895,7 @@ const SpanGrid = React.forwardRef(
           // suppressColumnVirtualisation={true}
           statusBar={statusBar}
           blockLoadDebounceMillis={300}
-          getRowId={(d) => {
-            return d?.data?.span_id;
-          }}
+          getRowId={(d) => getSpanPhysicalRowId(d?.data)}
         />
         <LLMTracingSpanDetailDrawer refreshGrid={refreshGrid} />
         <NumberQuickFilterPopover
