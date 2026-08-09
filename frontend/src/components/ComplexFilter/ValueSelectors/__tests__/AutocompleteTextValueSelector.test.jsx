@@ -1,7 +1,7 @@
 import React from "react";
 import PropTypes from "prop-types";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ get: vi.fn(), params: {} }));
@@ -126,6 +126,64 @@ describe("AutocompleteTextValueSelector", () => {
       }),
     );
     expect(screen.queryByText(/incomplete|sample/i)).not.toBeInTheDocument();
+  });
+
+  it("coalesces repeated bottom-scroll events into one cursor request", async () => {
+    let resolveSecondPage;
+    const secondPage = new Promise((resolve) => {
+      resolveSecondPage = resolve;
+    });
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "completed", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: true,
+            next_cursor: "page-2",
+          },
+        },
+      })
+      .mockReturnValueOnce(secondPage);
+
+    render(
+      <AutocompleteTextValueSelector
+        definition={{ propertyId: "call.status", type: "text" }}
+        filter={{ id: "filter-1", filter_config: { filter_value: "" } }}
+        updateFilter={vi.fn()}
+      />,
+      { wrapper: Wrapper },
+    );
+
+    fireEvent.mouseDown(screen.getByRole("combobox"));
+    await screen.findByRole("option", { name: "completed" });
+    const listbox = screen.getByRole("listbox");
+    Object.defineProperties(listbox, {
+      scrollTop: { configurable: true, get: () => 80 },
+      clientHeight: { configurable: true, get: () => 20 },
+      scrollHeight: { configurable: true, get: () => 100 },
+    });
+
+    fireEvent.scroll(listbox);
+    fireEvent.scroll(listbox);
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      resolveSecondPage({
+        data: {
+          result: {
+            values: [{ value: "ended", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            has_more: false,
+            next_cursor: null,
+          },
+        },
+      });
+    });
+    expect(await screen.findByRole("option", { name: "ended" })).toBeVisible();
+    expect(mocks.get).toHaveBeenCalledTimes(2);
   });
 
   it("uses an explicit selected project across task, eval, and annotation consumers", async () => {
@@ -382,11 +440,47 @@ describe("AutocompleteTextValueSelector", () => {
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
 
     fireEvent.click(retry);
-    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(4));
+    // Retry retains the consumed-cursor guard and therefore fails closed on
+    // the first repeated checkpoint instead of issuing the same request twice.
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(3));
     expect(
       await screen.findByRole("option", { name: "Retry loading values" }),
     ).toBeVisible();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
+
+  it("preserves values and offers retry for a malformed cursor contract", async () => {
+    mocks.get.mockResolvedValue({
+      data: {
+        result: {
+          values: [{ value: "completed", type: "string" }],
+          query_complete: true,
+          query_status: "complete",
+          has_more: true,
+        },
+      },
+    });
+
+    render(
+      <AutocompleteTextValueSelector
+        definition={{ propertyId: "broken.status", type: "text" }}
+        filter={{ id: "filter-1", filter_config: { filter_value: "" } }}
+        updateFilter={vi.fn()}
+      />,
+      { wrapper: Wrapper },
+    );
+
+    fireEvent.mouseDown(screen.getByRole("combobox"));
+    expect(
+      await screen.findByRole("option", { name: "completed" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("option", { name: "Retry loading values" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("option", { name: "Load more values" }),
+    ).not.toBeInTheDocument();
+    expect(mocks.get).toHaveBeenCalledOnce();
   });
 
   it("preserves loaded values when next-page retry reaches the empty-hop bound", async () => {

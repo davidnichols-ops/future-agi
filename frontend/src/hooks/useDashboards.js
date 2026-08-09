@@ -33,6 +33,52 @@ const FILTER_VALUE_TERMINAL_BROWSE_STATUSES = new Set([
   "limit_reached",
 ]);
 const FILTER_VALUE_FOLLOWED_CURSORS_KEY = "__filterValueFollowedCursors";
+const FILTER_VALUE_CURSOR_STOPPED_KEY = "__filterValueCursorStopped";
+
+const hasOwn = (value, key) =>
+  Object.prototype.hasOwnProperty.call(value || {}, key);
+
+const normalizeFilterValuePage = (page = {}) =>
+  FILTER_VALUE_TERMINAL_BROWSE_STATUSES.has(page?.browse_status)
+    ? { ...page, has_more: false, next_cursor: null }
+    : page;
+
+const stopFilterValueCursor = (page, reason) => ({
+  ...page,
+  [FILTER_VALUE_CURSOR_STOPPED_KEY]: reason,
+});
+
+const isFilterValueCursorStopped = (page) =>
+  typeof page?.[FILTER_VALUE_CURSOR_STOPPED_KEY] === "string";
+
+const validateFilterValueCursor = (page, consumedCursors = new Set()) => {
+  const normalized = normalizeFilterValuePage(page);
+  const hasMoreField = hasOwn(normalized, "has_more");
+  const nextCursorField = hasOwn(normalized, "next_cursor");
+
+  // Keep compatibility with an older, wholly cursor-less response. A partial
+  // cursor contract is never safe to interpret as exact exhaustion, though.
+  if (!hasMoreField && !nextCursorField) return normalized;
+  if (!hasMoreField || !nextCursorField) {
+    return stopFilterValueCursor(normalized, "malformed_cursor");
+  }
+
+  if (normalized.has_more === true) {
+    const cursor = normalized.next_cursor;
+    if (typeof cursor !== "string" || cursor.length === 0) {
+      return stopFilterValueCursor(normalized, "malformed_cursor");
+    }
+    if (consumedCursors.has(cursor)) {
+      return stopFilterValueCursor(normalized, "repeated_cursor");
+    }
+    return normalized;
+  }
+
+  if (normalized.has_more === false && normalized.next_cursor == null) {
+    return normalized;
+  }
+  return stopFilterValueCursor(normalized, "malformed_cursor");
+};
 
 // The shared Axios instance intentionally has no global timeout. Distinct
 // value browsing is interactive and the API has a 30-second read ceiling, so
@@ -51,15 +97,36 @@ const getFilterValueIdentity = (option) => {
 };
 
 const getFilterValueNextCursor = (page) => {
-  if (FILTER_VALUE_TERMINAL_BROWSE_STATUSES.has(page?.browse_status)) {
-    return undefined;
-  }
-  const cursor = page?.next_cursor;
-  return page?.has_more === true &&
+  if (isFilterValueCursorStopped(page)) return undefined;
+  const normalized = normalizeFilterValuePage(page);
+  const cursor = normalized?.next_cursor;
+  return normalized?.has_more === true &&
     typeof cursor === "string" &&
     cursor.length > 0
     ? cursor
     : undefined;
+};
+
+const isFilterValueCursorChainStopped = (data) => {
+  const pages = Array.isArray(data?.pages) ? data.pages : [];
+  if (pages.some(isFilterValueCursorStopped)) return true;
+  if (pages.length === 0) return false;
+
+  const pageParams = Array.isArray(data?.pageParams) ? data.pageParams : [];
+  const nextCursor = getFilterValueNextCursor(pages.at(-1));
+  if (!nextCursor) return false;
+
+  const consumedCursors = new Set(
+    pageParams.filter(
+      (cursor) => typeof cursor === "string" && cursor.length > 0,
+    ),
+  );
+  for (const page of pages) {
+    for (const cursor of page?.[FILTER_VALUE_FOLLOWED_CURSORS_KEY] || []) {
+      consumedCursors.add(cursor);
+    }
+  }
+  return consumedCursors.has(nextCursor);
 };
 
 export function useDashboardList() {
@@ -359,21 +426,28 @@ export function useDashboardFilterValues({
           .then((res) => res.data?.result || {});
       const cachedData = queryClient.getQueryData(queryKey);
       const cachedPages = cachedData?.pages || [];
+      const isFreshChainRead = pageParam == null;
       const knownValueIdentities = new Set(
-        cachedPages.flatMap((page) =>
-          (page?.values || []).map(getFilterValueIdentity),
-        ),
+        isFreshChainRead
+          ? []
+          : cachedPages.flatMap((page) =>
+              (page?.values || []).map(getFilterValueIdentity),
+            ),
       );
       const followedCursors = new Set(
         [
-          ...(cachedData?.pageParams || []),
-          ...cachedPages.flatMap(
-            (page) => page?.[FILTER_VALUE_FOLLOWED_CURSORS_KEY] || [],
-          ),
+          ...(isFreshChainRead ? [] : cachedData?.pageParams || []),
+          ...(isFreshChainRead
+            ? []
+            : cachedPages.flatMap(
+                (page) => page?.[FILTER_VALUE_FOLLOWED_CURSORS_KEY] || [],
+              )),
           pageParam,
         ].filter((cursor) => typeof cursor === "string" && cursor.length > 0),
       );
       const initialPage = await requestPage(pageParam);
+      const checkedMetadata = (response) =>
+        validateFilterValueCursor(response, followedCursors);
       const page = await followEmptyListContinuations({
         initialResponse: initialPage,
         rowsFromResponse: (response) =>
@@ -383,12 +457,14 @@ export function useDashboardFilterValues({
             knownValueIdentities.add(identity);
             return true;
           }),
+        // A private marker records a protocol stop for the picker. Project it
+        // as terminal only for this bounded follower so no malformed/repeated
+        // cursor is requested and the published response remains retryable.
         metadataFromResponse: (response) => {
-          const nextCursor = getFilterValueNextCursor(response);
-          if (!nextCursor || followedCursors.has(nextCursor)) {
-            return { ...response, has_more: false, next_cursor: null };
-          }
-          return response;
+          const checked = checkedMetadata(response);
+          return isFilterValueCursorStopped(checked)
+            ? { ...checked, has_more: false, next_cursor: null }
+            : checked;
         },
         nextResponse: requestPage,
         onContinuation: (metadata) => {
@@ -397,8 +473,9 @@ export function useDashboardFilterValues({
         },
         isCurrent: () => !signal.aborted,
       });
+      const checkedPage = checkedMetadata(page);
       return {
-        ...page,
+        ...checkedPage,
         [FILTER_VALUE_FOLLOWED_CURSORS_KEY]: [...followedCursors],
       };
     },
@@ -430,6 +507,7 @@ export function useDashboardFilterValues({
   });
 
   const pages = query.data?.pages || [];
+  const cursorChainStopped = isFilterValueCursorChainStopped(query.data);
   const seenValues = new Set();
   const values = pages.flatMap((page) =>
     (page?.values || []).filter((option) => {
@@ -442,7 +520,7 @@ export function useDashboardFilterValues({
   const pageReadStates = pages.map((page) => getFilterValueReadState(page));
   const queryReadState = query.isError
     ? "error"
-    : pageReadStates.includes("degraded")
+    : cursorChainStopped || pageReadStates.includes("degraded")
       ? "degraded"
       : pageReadStates.includes("sampled")
         ? "sampled"

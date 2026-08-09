@@ -1347,6 +1347,37 @@ describe("filter-value picker bounded-read UX", () => {
     document.body.removeChild(anchorEl);
   });
 
+  it("coalesces scroll and Load more while the same value page is in flight", () => {
+    const fetchNextPage = vi.fn(() => new Promise(() => {}));
+    dashboardFilterValuesMock.mockReturnValue({
+      ...defaultDashboardFilterValues(),
+      data: [{ value: "completed", label: "completed" }],
+      hasNextPage: true,
+      fetchNextPage,
+    });
+    const { anchorEl } = renderPanel({
+      currentFilters,
+      properties: [statusProperty],
+    });
+
+    openValuePicker();
+    const optionsList = document.querySelector(
+      "[data-filter-value-options-list]",
+    );
+    Object.defineProperties(optionsList, {
+      scrollTop: { configurable: true, value: 180 },
+      clientHeight: { configurable: true, value: 220 },
+      scrollHeight: { configurable: true, value: 400 },
+    });
+
+    fireEvent.scroll(optionsList);
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+    document.body.removeChild(anchorEl);
+  });
+
   it("carries mixed option storage types into the applied filter row", async () => {
     dashboardFilterValuesMock.mockReturnValue({
       ...defaultDashboardFilterValues(),

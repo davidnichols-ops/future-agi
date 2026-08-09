@@ -66,6 +66,31 @@ import {
   VOICE_CALL_FILTER_FIELDS,
 } from "./voiceCallFilterFields";
 
+function useSingleFlightPageRequest({ identity, enabled, request }) {
+  const activeRequestRef = useRef(null);
+
+  return useCallback(() => {
+    const activeRequest = activeRequestRef.current;
+    if (activeRequest?.identity === identity) return activeRequest.promise;
+    if (!enabled) return Promise.resolve();
+
+    const response = request();
+    const promise = Promise.resolve(response);
+    // React Query returns a promise. Keep synchronous test/legacy callbacks
+    // compatible without leaving a phantom request latched until a microtask.
+    if (!response || typeof response.then !== "function") return promise;
+    const nextRequest = { identity, promise };
+    activeRequestRef.current = nextRequest;
+    const clearRequest = () => {
+      if (activeRequestRef.current === nextRequest) {
+        activeRequestRef.current = null;
+      }
+    };
+    promise.then(clearRequest, clearRequest);
+    return promise;
+  }, [enabled, identity, request]);
+}
+
 // ---------------------------------------------------------------------------
 // Trace filter fields (for Query tab via shared FilterPanel)
 // ---------------------------------------------------------------------------
@@ -1064,10 +1089,14 @@ function PropertyPicker({
   );
 
   const paperWidth = hasCategorySidebar ? 480 : 320;
-  const loadNextAttributePage = useCallback(() => {
-    autoAttributeScrollPageUsedRef.current = true;
-    return fetchNextAttributePage();
-  }, [fetchNextAttributePage]);
+  const loadNextAttributePage = useSingleFlightPageRequest({
+    identity: JSON.stringify([projectId, source, debouncedSearch]),
+    enabled: canLoadNextAttributePage && !isFetchingNextAttributePage,
+    request: () => {
+      autoAttributeScrollPageUsedRef.current = true;
+      return fetchNextAttributePage();
+    },
+  });
   const revealNextPropertyBatch = useCallback(() => {
     autoAttributeScrollPageUsedRef.current = true;
     setVisiblePropertyLimit((current) =>
@@ -1591,6 +1620,16 @@ function ValuePicker({
     Boolean(hasNextDashboardPage) &&
     dashboardBrowseStatus !== "exhausted" &&
     dashboardBrowseStatus !== "limit_reached";
+  const loadNextDashboardValues = useSingleFlightPageRequest({
+    identity: JSON.stringify([
+      projectId,
+      source,
+      propertyId,
+      usesBackendSearch ? debouncedSearch : "",
+    ]),
+    enabled: hasMoreDashboardValues && !isFetchingNextDashboardPage,
+    request: fetchNextDashboardPage,
+  });
 
   // Fallback: session filter values endpoint (for session-specific fields)
   const {
@@ -1677,13 +1716,13 @@ function ValuePicker({
         !isFetchingNextDashboardPage
       ) {
         autoScrollPageUsedRef.current = true;
-        fetchNextDashboardPage();
+        loadNextDashboardValues();
       }
     },
     [
-      fetchNextDashboardPage,
       hasMoreDashboardValues,
       isFetchingNextDashboardPage,
+      loadNextDashboardValues,
     ],
   );
 
@@ -2129,7 +2168,7 @@ function ValuePicker({
             <Box sx={{ display: "flex", justifyContent: "center", py: 0.5 }}>
               <Button
                 size="small"
-                onClick={() => fetchNextDashboardPage()}
+                onClick={loadNextDashboardValues}
                 sx={{ fontSize: 11 }}
               >
                 Load more
@@ -2893,6 +2932,17 @@ const TraceFilterPanel = ({
         : undefined,
     enabled: shouldFetchQueryValues,
   });
+  const loadNextQueryValuesPage = useSingleFlightPageRequest({
+    identity: JSON.stringify([
+      observeId,
+      source,
+      queryField,
+      effectiveQueryValueSearch,
+    ]),
+    enabled:
+      Boolean(hasNextQueryValuesPage) && !isFetchingNextQueryValuesPage,
+    request: fetchNextQueryValuesPage,
+  });
   const queryValuesMessage = getQueryReadMessage(
     queryValuesError ? "error" : queryValuesReadState,
   );
@@ -3367,7 +3417,7 @@ const TraceFilterPanel = ({
               valueLoading={queryValuesLoading}
               valueLoadingMore={isFetchingNextQueryValuesPage}
               hasMoreValues={Boolean(hasNextQueryValuesPage)}
-              onLoadMoreValues={() => fetchNextQueryValuesPage?.()}
+              onLoadMoreValues={loadNextQueryValuesPage}
               onValueSearchChange={(value, field) =>
                 setQueryValueSearch({ field: field ?? queryField, value })
               }

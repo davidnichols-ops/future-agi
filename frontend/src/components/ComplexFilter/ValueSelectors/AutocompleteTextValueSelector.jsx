@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import PropTypes from "prop-types";
 import { Autocomplete, TextField, CircularProgress } from "@mui/material";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
@@ -17,6 +17,7 @@ const LIST_OPERATORS = new Set(LIST_FILTER_OPS);
 const TERMINAL_BROWSE_STATUSES = new Set(["exhausted", "limit_reached"]);
 const EMPTY_CONTINUATION_GUARD_EXHAUSTED = "empty_continuation_guard_exhausted";
 const FOLLOWED_CURSORS_KEY = "followed_value_cursors";
+const CURSOR_STOPPED_KEY = "filter_value_cursor_stopped";
 // The shared Axios client intentionally has no global timeout. Attribute
 // browsing is interactive, though, and an interrupted proxy/backend response
 // must not leave the picker in an endless "Loading more" state. This is just
@@ -28,6 +29,47 @@ const normalizeBrowseMetadata = (result = {}) =>
   TERMINAL_BROWSE_STATUSES.has(result?.browse_status)
     ? { ...result, has_more: false, next_cursor: null }
     : result;
+
+const hasOwn = (value, key) =>
+  Object.prototype.hasOwnProperty.call(value || {}, key);
+
+const stopBrowseCursor = (result, reason) => ({
+  ...result,
+  [CURSOR_STOPPED_KEY]: reason,
+});
+
+const isBrowseCursorStopped = (result) =>
+  typeof result?.[CURSOR_STOPPED_KEY] === "string";
+
+const validateBrowseCursor = (result, consumedCursors = new Set()) => {
+  const normalized = normalizeBrowseMetadata(result);
+  const hasMoreField = hasOwn(normalized, "has_more");
+  const nextCursorField = hasOwn(normalized, "next_cursor");
+  if (!hasMoreField && !nextCursorField) return normalized;
+  if (!hasMoreField || !nextCursorField) {
+    return stopBrowseCursor(normalized, "malformed_cursor");
+  }
+  if (normalized.has_more === true) {
+    const cursor = normalized.next_cursor;
+    if (typeof cursor !== "string" || cursor.length === 0) {
+      return stopBrowseCursor(normalized, "malformed_cursor");
+    }
+    return consumedCursors.has(cursor)
+      ? stopBrowseCursor(normalized, "repeated_cursor")
+      : normalized;
+  }
+  return normalized.has_more === false && normalized.next_cursor == null
+    ? normalized
+    : stopBrowseCursor(normalized, "malformed_cursor");
+};
+
+const withBrowseResult = (response, result) => ({
+  ...response,
+  data: {
+    ...response?.data,
+    result,
+  },
+});
 
 const hasEmptyContinuation = (response) => {
   const result = normalizeBrowseMetadata(response?.data?.result || {});
@@ -115,6 +157,8 @@ const AutocompleteTextValueSelector = ({
     attributeType || "all-types",
     debouncedInput,
   ];
+  const nextPageRequestRef = useRef(null);
+  const paginationIdentity = JSON.stringify(queryKey);
   const {
     data,
     isLoading,
@@ -145,21 +189,32 @@ const AutocompleteTextValueSelector = ({
         });
       const cachedData = queryClient.getQueryData(queryKey);
       const cachedPages = cachedData?.pages || [];
+      const isFreshChainRead = pageParam == null;
       const knownValueIdentities = new Set(
-        cachedPages.flatMap((page) =>
-          (page?.data?.result?.values || []).map(optionIdentity),
-        ),
+        isFreshChainRead
+          ? []
+          : cachedPages.flatMap((page) =>
+              (page?.data?.result?.values || []).map(optionIdentity),
+            ),
       );
       const followedCursors = new Set(
         [
-          ...(cachedData?.pageParams || []),
-          ...cachedPages.flatMap(
-            (page) => page?.data?.result?.[FOLLOWED_CURSORS_KEY] || [],
-          ),
+          ...(isFreshChainRead ? [] : cachedData?.pageParams || []),
+          ...(isFreshChainRead
+            ? []
+            : cachedPages.flatMap(
+                (page) =>
+                  page?.data?.result?.[FOLLOWED_CURSORS_KEY] || [],
+              )),
           pageParam,
         ].filter((cursor) => typeof cursor === "string" && cursor.length > 0),
       );
       const initialResponse = await requestPage(pageParam);
+      const checkedResult = (response) =>
+        validateBrowseCursor(
+          response?.data?.result || {},
+          followedCursors,
+        );
       // The shared guard follows at most 12 empty checkpoints per UI action.
       // Its 30-second elapsed check is deliberately soft and runs between
       // completed requests; cancellation of an in-flight request remains the
@@ -173,8 +228,12 @@ const AutocompleteTextValueSelector = ({
             knownValueIdentities.add(identity);
             return true;
           }),
-        metadataFromResponse: (response) =>
-          normalizeBrowseMetadata(response?.data?.result || {}),
+        metadataFromResponse: (response) => {
+          const checked = checkedResult(response);
+          return isBrowseCursorStopped(checked)
+            ? { ...checked, has_more: false, next_cursor: null }
+            : checked;
+        },
         nextResponse: requestPage,
         onContinuation: (metadata) => {
           if (metadata?.next_cursor) {
@@ -190,12 +249,16 @@ const AutocompleteTextValueSelector = ({
       const boundedResponse = hasEmptyContinuation(response)
         ? markEmptyContinuationGuardExhausted(response)
         : response;
+      const checkedResponse = withBrowseResult(
+        boundedResponse,
+        checkedResult(boundedResponse),
+      );
       return {
-        ...boundedResponse,
+        ...checkedResponse,
         data: {
-          ...boundedResponse?.data,
+          ...checkedResponse?.data,
           result: {
-            ...boundedResponse?.data?.result,
+            ...checkedResponse?.data?.result,
             [FOLLOWED_CURSORS_KEY]: [...followedCursors],
           },
         },
@@ -204,6 +267,7 @@ const AutocompleteTextValueSelector = ({
     initialPageParam: null,
     getNextPageParam: (lastPage, allPages, lastPageParam, allPageParams) => {
       const result = normalizeBrowseMetadata(lastPage?.data?.result || {});
+      if (isBrowseCursorStopped(result)) return undefined;
       const nextCursor = result.has_more === true ? result.next_cursor : null;
       if (!nextCursor) return undefined;
       const requestedCursors = new Set(
@@ -225,6 +289,24 @@ const AutocompleteTextValueSelector = ({
     retry: false,
     meta: { errorHandled: true },
   });
+  const requestNextPage = useCallback(() => {
+    const activeRequest = nextPageRequestRef.current;
+    if (activeRequest?.identity === paginationIdentity) {
+      return activeRequest.promise;
+    }
+    if (!hasNextPage || isFetchingNextPage) return Promise.resolve();
+
+    const promise = Promise.resolve(fetchNextPage());
+    const request = { identity: paginationIdentity, promise };
+    nextPageRequestRef.current = request;
+    const clearRequest = () => {
+      if (nextPageRequestRef.current === request) {
+        nextPageRequestRef.current = null;
+      }
+    };
+    promise.then(clearRequest, clearRequest);
+    return promise;
+  }, [fetchNextPage, hasNextPage, isFetchingNextPage, paginationIdentity]);
   const seen = new Set();
   const options = (data?.pages || []).flatMap((page) =>
     (page?.data?.result?.values || []).flatMap((item) => {
@@ -239,9 +321,37 @@ const AutocompleteTextValueSelector = ({
   const continuationGuardExhausted = Boolean(
     data?.pages?.at(-1)?.data?.result?.[EMPTY_CONTINUATION_GUARD_EXHAUSTED],
   );
+  const cursorChainStopped = (() => {
+    const pages = data?.pages || [];
+    if (
+      pages.some((page) =>
+        isBrowseCursorStopped(page?.data?.result || {}),
+      )
+    ) {
+      return true;
+    }
+    const lastResult = normalizeBrowseMetadata(
+      pages.at(-1)?.data?.result || {},
+    );
+    const nextCursor =
+      lastResult.has_more === true ? lastResult.next_cursor : null;
+    if (typeof nextCursor !== "string" || nextCursor.length === 0) return false;
+    const consumedCursors = new Set(
+      (data?.pageParams || []).filter(
+        (cursor) => typeof cursor === "string" && cursor.length > 0,
+      ),
+    );
+    for (const page of pages) {
+      for (const cursor of
+        page?.data?.result?.[FOLLOWED_CURSORS_KEY] || []) {
+        consumedCursors.add(cursor);
+      }
+    }
+    return consumedCursors.has(nextCursor);
+  })();
   const pickerOptions = hasNextPage
     ? [...options, LOAD_MORE_OPTION]
-    : isError
+    : isError || cursorChainStopped
       ? [...options, RETRY_OPTION]
       : options;
   const filterConfig = filter?.filter_config || {};
@@ -342,8 +452,8 @@ const AutocompleteTextValueSelector = ({
               event.stopPropagation();
               if (option === RETRY_OPTION) {
                 if (!isFetching) refetch();
-              } else if (!isFetchingNextPage) {
-                fetchNextPage();
+              } else {
+                requestNextPage();
               }
             }}
           >
@@ -374,7 +484,7 @@ const AutocompleteTextValueSelector = ({
             !isFetchingNextPage &&
             list.scrollTop + list.clientHeight >= list.scrollHeight - 24
           ) {
-            fetchNextPage();
+            requestNextPage();
           }
         },
       }}
@@ -397,7 +507,7 @@ const AutocompleteTextValueSelector = ({
           return;
         }
         if (newValue === LOAD_MORE_OPTION) {
-          if (!isFetchingNextPage) fetchNextPage();
+          requestNextPage();
           return;
         }
         if (
@@ -406,8 +516,8 @@ const AutocompleteTextValueSelector = ({
         ) {
           if (newValue.includes(RETRY_OPTION)) {
             if (!isFetching) refetch();
-          } else if (!isFetchingNextPage) {
-            fetchNextPage();
+          } else {
+            requestNextPage();
           }
           return;
         }

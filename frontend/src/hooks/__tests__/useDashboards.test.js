@@ -477,8 +477,38 @@ describe("useDashboardFilterValues bounded-read state", () => {
       { value: "CONVERSATION", type: "string" },
     ]);
     expect(result.current.isError).toBe(false);
+    expect(result.current.queryReadState).toBe("degraded");
     expect(mocks.get).toHaveBeenCalledTimes(2);
   });
+
+  it.each([
+    { has_more: true },
+    { next_cursor: "orphaned-cursor" },
+    { has_more: false, next_cursor: "unexpected-cursor" },
+  ])(
+    "makes malformed cursor metadata retryable instead of claiming exhaustion: %j",
+    async (cursorMetadata) => {
+      mocks.get.mockResolvedValueOnce({
+        data: {
+          result: {
+            values: [{ value: "CONVERSATION", type: "string" }],
+            query_complete: true,
+            query_status: "complete",
+            ...cursorMetadata,
+          },
+        },
+      });
+      const { result } = renderValues({ pageSize: 10 });
+
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(result.current.data).toEqual([
+        { value: "CONVERSATION", type: "string" },
+      ]);
+      expect(result.current.hasNextPage).toBe(false);
+      expect(result.current.queryReadState).toBe("degraded");
+      expect(mocks.get).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("does not follow a cursor consumed inside an earlier fetch action", async () => {
     mocks.get
