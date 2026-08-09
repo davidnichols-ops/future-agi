@@ -2434,13 +2434,19 @@ def read_bounded_filter_page(
             before_start_time = safe_before_start_time
             before_id = safe_before_id
 
-    # A response may never claim completeness after any ClickHouse statement
-    # failed, even if a later narrower/speculative fallback happened to find a
-    # sufficient prefix. Logical row correctness is not enough: hiding the
-    # failed statement makes production query regressions invisible and can
-    # turn a partially covered window into a false exact result.
+    # A response may never claim completeness after a required ClickHouse
+    # statement failed, even if a later narrower fallback happened to find a
+    # sufficient prefix. The exact-zero probe is the sole exception: its
+    # contract treats every failure as inconclusive and deliberately restores
+    # the unchanged required seed/classify path. Keep the failed probe in the
+    # attempt telemetry, but do not let it invalidate a subsequently proven
+    # exact page. Required seed, classify, and hydration failures remain fatal.
     failed_attempt = next(
-        (attempt for attempt in attempts if attempt.error_code is not None),
+        (
+            attempt
+            for attempt in attempts
+            if attempt.error_code is not None and attempt.kind != "zero_probe"
+        ),
         None,
     )
     if failed_attempt is not None:

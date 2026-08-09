@@ -658,6 +658,72 @@ def test_voice_exact_zero_probe_failure_preserves_normal_exact_scan(probe_error)
     }
 
 
+@pytest.mark.unit
+def test_voice_exact_zero_probe_fallback_keeps_required_failure_fatal():
+    from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+    from tracer.services.clickhouse.query_service import QueryResult
+    from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
+    from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
+        VoiceCallListQueryBuilderV2,
+    )
+
+    end = datetime(2026, 8, 8)
+    filters = _voice_multi_filters(end)
+    candidates = [
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": f"trace-{index:02d}",
+            "root_span_id": f"root-{index:02d}",
+            "start_time": end - timedelta(seconds=index + 1),
+        }
+        for index in range(26)
+    ]
+
+    class Executor:
+        supports_per_query_read_settings = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def execute_ch_query(self, query, params, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("optional probe timed out")
+            if self.calls == 2:
+                return QueryResult(
+                    data=candidates,
+                    row_count=len(candidates),
+                    backend_used="clickhouse",
+                    query_time_ms=1,
+                )
+            raise ReadDeadlineExceeded("required classifier cap")
+
+    page = read_bounded_filter_page(
+        builder=VoiceCallListQueryBuilderV2(
+            project_id=PROJECT_ID,
+            page_size=25,
+            filters=filters,
+        ),
+        analytics=Executor(),
+        filters=filters,
+        key_field="trace_id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=5_000,
+    )
+
+    assert page.complete is False
+    assert page.rows == []
+    assert page.error_code == "read_budget_exceeded"
+    assert [attempt.kind for attempt in page.attempts] == [
+        "zero_probe",
+        "seed",
+        "classify",
+    ]
+    assert page.attempts[0].error_code == "prefilter_unavailable"
+    assert page.attempts[-1].error_code == "read_budget_exceeded"
+
+
 # ---------------------------------------------------------------------------
 # build_id_query — same predicate/window, no pagination/order limit params
 # ---------------------------------------------------------------------------
