@@ -1807,7 +1807,7 @@ def test_filter_relation_snapshot_plan_detects_every_relational_filter(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("observe_type", ["trace", "span"])
+@pytest.mark.parametrize("observe_type", ["span"])
 def test_exact_system_graph_compiles_relations_in_one_project_scoped_statement(
     monkeypatch,
     observe_type,
@@ -1873,7 +1873,7 @@ def test_user_id_relation_filter_uses_one_spans_source_and_curated_remap():
         filters=[_time_filter(start, end), user_filter],
         interval="day",
         metric_id="traffic",
-        observe_type="trace",
+        observe_type="span",
     )
 
     assert analytics.capture_calls == []
@@ -1915,7 +1915,7 @@ def test_system_graph_does_not_issue_separate_relation_snapshot_queries(
         filters=_combined_relation_filters(datetime(2026, 1, 1), datetime(2026, 4, 15)),
         interval="day",
         metric_id="traffic",
-        observe_type="trace",
+        observe_type="span",
     )
 
     assert analytics.capture_calls == []
@@ -1923,7 +1923,7 @@ def test_system_graph_does_not_issue_separate_relation_snapshot_queries(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("observe_type", ["trace", "span"])
+@pytest.mark.parametrize("observe_type", ["span"])
 def test_exact_system_graph_combines_scalar_array_map_and_legacy_json(observe_type):
     analytics = _ConcurrentArrivalAnalytics()
     start = datetime(2026, 8, 1)
@@ -2224,6 +2224,64 @@ def test_exact_trace_graph_merges_all_contribution_batches_before_averages(
 
 
 @pytest.mark.unit
+def test_exact_trace_graph_delegates_scalar_array_map_and_json_membership(
+    monkeypatch,
+):
+    captured_filters = []
+
+    def read_page(**kwargs):
+        captured_filters.extend(kwargs["filters"])
+        return _bounded_page(
+            [{"trace_id": "trace-1", "start_time": datetime(2026, 8, 1)}]
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", read_page
+    )
+
+    class Analytics:
+        def __init__(self):
+            self.calls = []
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            self.calls.append((query, dict(params), timeout_ms, dict(settings)))
+            return SimpleNamespace(data=[], columns=[])
+
+    analytics = Analytics()
+    result = read_exact_system_graph(
+        analytics=analytics,
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_structured_filters(datetime(2026, 8, 1), datetime(2026, 8, 4)),
+        interval="day",
+        metric_id="traffic",
+        observe_type="trace",
+    )
+
+    assert [item["column_id"] for item in captured_filters] == [
+        "final_status",
+        "tags",
+        "profile",
+        "legacy_payload",
+        "start_time",
+    ]
+    assert [item["filter_config"]["filter_type"] for item in captured_filters[:-1]] == [
+        "text",
+        "array",
+        "map",
+        "json",
+    ]
+    query, params, _timeout, _settings = analytics.calls[0]
+    assert params["graph_candidate_trace_ids"] == ("trace-1",)
+    assert "trace_id IN %(graph_candidate_trace_ids)s" in query
+    assert "attrs_string" not in query
+    assert "attrs_number" not in query
+    assert "attrs_bool" not in query
+    assert "attributes_extra" not in query
+    assert result["query_count"] == 2
+    assert result["query_sampled"] is False
+
+
+@pytest.mark.unit
 def test_exact_trace_contribution_merge_preserves_additive_cost_and_error_state():
     bucket = datetime(2026, 8, 1)
     rows, columns = _merge_exact_trace_contribution_rows(
@@ -2464,10 +2522,16 @@ def test_exact_membership_preserves_known_empty_annotation_label_set(
 
 
 @pytest.mark.unit
-def test_exact_graph_budget_failure_does_not_stitch_cross_query_partitions():
+def test_exact_graph_budget_failure_does_not_publish_or_split_contribution_batch(
+    monkeypatch,
+):
     analytics = _BudgetSplittingAnalytics()
     start = datetime(2026, 8, 1, 0, 0)
     end = datetime(2026, 8, 1, 4, 0)
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+        lambda **_kwargs: _bounded_page([{"trace_id": "trace-1", "start_time": start}]),
+    )
 
     with pytest.raises(ServerException):
         read_exact_system_graph(
@@ -2482,7 +2546,8 @@ def test_exact_graph_budget_failure_does_not_stitch_cross_query_partitions():
     assert len(analytics.partition_calls) == 1
     query, params, timeout, settings = analytics.partition_calls[0]
     assert (params["start_date"], params["end_date"]) == (start, end)
-    assert "attrs_string" in query and "attrs_number" in query
+    assert "attrs_string" not in query and "attrs_number" not in query
+    assert "trace_id IN %(graph_candidate_trace_ids)s" in query
     assert "snapshot_version_ceiling" not in params
     assert "additional_table_filters" not in settings
     assert timeout == 3_300_000
@@ -2542,7 +2607,7 @@ def test_exact_graph_does_not_retry_programming_errors():
 
 
 @pytest.mark.unit
-def test_long_exact_system_window_remains_one_statement():
+def test_long_exact_span_window_remains_one_statement():
     analytics = _ConcurrentArrivalAnalytics()
     start = datetime(2026, 1, 1)
     end = datetime(2026, 4, 15)
@@ -2564,7 +2629,7 @@ def test_long_exact_system_window_remains_one_statement():
         ],
         interval="day",
         metric_id="traffic",
-        observe_type="trace",
+        observe_type="span",
     )
 
     assert len(analytics.partition_calls) == 1
@@ -2576,8 +2641,7 @@ def test_long_exact_system_window_remains_one_statement():
     assert "FROM spans FINAL" not in query
     assert "argMax(" in query
     assert "OVER (PARTITION BY trace_id) AS graph_match_" not in query
-    assert query.count("AS graph_bucket_match_") == 1
-    assert query.count("max(graph_bucket_match_") == 1
+    assert "AS graph_bucket_match_" not in query
     assert (params["start_date"], params["end_date"]) == (start, end)
     assert result["query_count"] == 1
     assert "query_snapshot_version_ceiling" not in result
