@@ -356,7 +356,10 @@ const EvalUsageTab = ({
                 setPage(0);
                 if (opt !== "Custom") setDateFilter(null);
               }}
-              setParentDateFilter={setDateFilter}
+              setParentDateFilter={(nextDateFilter) => {
+                setDateFilter(nextDateFilter);
+                setPage(0);
+              }}
               dateFilter={dateFilter}
             />
             {validCompletedAt && (

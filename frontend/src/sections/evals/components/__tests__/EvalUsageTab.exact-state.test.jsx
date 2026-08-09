@@ -19,7 +19,21 @@ vi.mock("@tanstack/react-query", () => ({
   useQueryClient: () => ({ invalidateQueries: vi.fn() }),
 }));
 vi.mock("src/sections/projects/DateTimeRangePicker", () => ({
-  default: () => null,
+  default: ({ setDateOption, setParentDateFilter }) => (
+    <>
+      <button type="button" onClick={() => setDateOption("Custom")}>
+        Select custom range
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          setParentDateFilter(["2026-08-01", "2026-08-02"])
+        }
+      >
+        Change custom range
+      </button>
+    </>
+  ),
 }));
 vi.mock("../UsageChart", () => ({
   default: () => <div data-testid="usage-chart" />,
@@ -29,10 +43,22 @@ vi.mock("src/components/data-table", () => {
     <div data-testid="usage-table">{emptyMessage}</div>
   );
   MockDataTable.propTypes = { emptyMessage: PropTypes.string };
+  const MockDataTablePagination = ({ page, onPageChange }) => (
+    <div data-testid="usage-pagination">
+      <span>Page {page}</span>
+      <button type="button" onClick={() => onPageChange(3)}>
+        Go to page 4
+      </button>
+    </div>
+  );
+  MockDataTablePagination.propTypes = {
+    page: PropTypes.number,
+    onPageChange: PropTypes.func,
+  };
 
   return {
     DataTable: MockDataTable,
-    DataTablePagination: () => <div data-testid="usage-pagination" />,
+    DataTablePagination: MockDataTablePagination,
   };
 });
 vi.mock("../../Helpers/evalUsageColumns", () => ({
@@ -193,6 +219,32 @@ describe("EvalUsageTab exact read states", () => {
       ),
     ).not.toBeInTheDocument();
     expect(screen.getByText(/Last updated/i)).toBeInTheDocument();
+  });
+
+  it("returns to the first page when an existing Custom range changes", () => {
+    h.chart = {
+      data: { stats: {}, chart: [] },
+      isLoading: false,
+      isFetching: false,
+      isError: false,
+      refresh: h.refetchChart,
+    };
+    h.logs = {
+      data: { table: [], pagination: { total: 100 } },
+      isLoading: false,
+      isFetching: false,
+      isError: false,
+      refresh: h.refetchLogs,
+    };
+
+    render(<EvalUsageTab templateId="eval-1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Select custom range" }));
+    fireEvent.click(screen.getByRole("button", { name: "Go to page 4" }));
+    expect(screen.getByText("Page 3")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Change custom range" }));
+    expect(screen.getByText("Page 0")).toBeInTheDocument();
   });
 
   it("retains prior exact chart and table data when a manual refresh fails", () => {
