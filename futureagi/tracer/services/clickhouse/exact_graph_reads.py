@@ -435,6 +435,7 @@ def _enumerate_exact_trace_ids(
 
     slice_end = request_end
     slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, request_end - request_start)
+    max_slice_width = min(EXACT_GRAPH_TRACE_MAX_SLICE, request_end - request_start)
     while slice_end > request_start:
         slice_start = max(request_start, slice_end - slice_width)
         before_start_time: datetime | None = None
@@ -471,6 +472,11 @@ def _enumerate_exact_trace_ids(
                     slice_width = max(
                         EXACT_GRAPH_TRACE_INITIAL_SLICE, slice_width / 2
                     )
+                    # Remember the largest width that has proved safe during
+                    # this refresh. Growing straight back to a failed width
+                    # makes every adjacent slice pay the same timeout and can
+                    # churn the database connection without making progress.
+                    max_slice_width = min(max_slice_width, slice_width)
                     retry_narrower = True
                     break
                 raise
@@ -527,7 +533,7 @@ def _enumerate_exact_trace_ids(
         if retry_narrower:
             continue
         slice_end = slice_start
-        slice_width = min(slice_width * 2, EXACT_GRAPH_TRACE_MAX_SLICE)
+        slice_width = min(slice_width * 2, max_slice_width)
 
     return trace_ids, query_count, rows_returned
 
