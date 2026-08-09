@@ -54,6 +54,7 @@ from tracer.services.clickhouse.attribute_reads import (
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_INITIAL_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
+    ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION,
     ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_LIMIT,
     ATTRIBUTE_VALUE_CURSOR_MAX_CANDIDATE_PAGES,
@@ -853,6 +854,37 @@ def test_v2_executor_reuses_the_process_singleton_ch25_pool(monkeypatch):
     assert first.client is client
     assert second.client is client
     assert page.data == [{"value": "ok"}]
+    assert page.read_rows is None
+    assert page.read_bytes is None
+
+
+def test_v2_executor_adds_native_read_progress_when_client_supports_it():
+    class ProgressClient:
+        def execute_read_with_progress(self, query, params, *, timeout_ms, settings):
+            return (
+                [("ok",)],
+                [("value", "String")],
+                529.732,
+                148_494,
+                595_674_646,
+            )
+
+        def execute_read(self, *_args, **_kwargs):
+            pytest.fail("progress-aware client must use the additive read method")
+
+    page = V2AttributeQueryExecutor(client=ProgressClient()).execute(
+        "SELECT 1",
+        {},
+        timeout_ms=2_500,
+        settings={"max_threads": 1},
+    )
+
+    assert page == AttributeQueryPage(
+        data=[{"value": "ok"}],
+        query_time_ms=529.732,
+        read_rows=148_494,
+        read_bytes=595_674_646,
+    )
 
 
 def test_v2_executor_normalizes_builtin_driver_timeout_to_read_deadline():
@@ -3212,6 +3244,66 @@ def test_filter_value_cursor_distinct_growth_stops_before_observed_density_cliff
     assert read.next_segment_end == NOW - timedelta(seconds=1_275)
     assert read.next_segment_start == read.next_segment_end - timedelta(seconds=320)
     assert read.metadata.query_count == len(proof_calls) == 9
+    assert not any("segment_start" in call.params for call in executor.calls)
+
+
+def test_filter_value_cursor_resource_telemetry_shrinks_before_adjacent_byte_cliff():
+    # Integrated production evidence through the last successful proof, then a
+    # conservative half-width read over the beginning of the adjacent slice
+    # that previously raised TOO_MANY_BYTES at the same 320 s width.
+    observed_proofs = (
+        (5, 234.840, 21_420, 52_918_976),
+        (10, 285.617, 21_420, 90_916_980),
+        (20, 229.947, 21_420, 90_916_980),
+        (40, 293.742, 21_420, 90_916_980),
+        (80, 335.757, 38_299, 158_435_053),
+        (160, 332.233, 58_458, 241_914_449),
+        (320, 529.732, 148_494, 595_674_646),
+        (160, 400.000, 74_247, 297_837_323),
+    )
+
+    def distinct_respond(call, call_number):
+        expected_width, query_time_ms, read_rows, read_bytes = observed_proofs[
+            call_number - 1
+        ]
+        width_us = call.params["segment_end_us"] - call.params["segment_start_us"]
+        assert width_us == expected_width * 1_000_000
+        return AttributeQueryPage(
+            data=[],
+            query_time_ms=query_time_ms,
+            read_rows=read_rows,
+            read_bytes=read_bytes,
+        )
+
+    executor = RecordingExecutor(distinct_responder=distinct_respond)
+    read = AttributeReadSelector(executor, now=NOW).read_value_cursor_page(
+        [PROJECT_A],
+        "final_status",
+        page_size=10,
+        search="value-that-does-not-exist",
+        attribute_type="string",
+        window_start=NOW - timedelta(seconds=795),
+        window_end=NOW,
+    )
+
+    proof_calls = [call for call in executor.calls if "distinct_limit" in call.params]
+    widths = [
+        (call.params["segment_end_us"] - call.params["segment_start_us"]) // 1_000_000
+        for call in proof_calls
+    ]
+    assert ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION == 0.5
+    assert widths == [5, 10, 20, 40, 80, 160, 320, 160]
+    assert all(
+        newer.params["segment_start_us"] == older.params["segment_end_us"]
+        for newer, older in zip(proof_calls, proof_calls[1:], strict=False)
+    )
+    assert proof_calls[6].settings["max_bytes_to_read"] == 1_024 * 1024 * 1024
+    assert proof_calls[6].settings["max_rows_to_read"] == 500_000
+    assert read.rows == ()
+    assert read.browse_status == "exhausted"
+    assert read.has_more is False
+    assert read.next_segment_end == NOW - timedelta(seconds=795)
+    assert read.metadata.query_count == len(proof_calls) == len(observed_proofs)
     assert not any("segment_start" in call.params for call in executor.calls)
 
 

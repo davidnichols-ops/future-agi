@@ -1,5 +1,6 @@
 """Contracts for server-locked read-only ClickHouse connections."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
@@ -100,6 +101,28 @@ def test_regular_read_keeps_client_side_guardrails(monkeypatch):
         "readonly": 2,
         "max_execution_time": 0.25,
     }
+
+
+def test_progress_read_adds_native_rows_and_bytes_without_changing_read_api(
+    monkeypatch,
+):
+    native = Mock()
+    native.execute.return_value = ([("ok",)], [("value", "String")])
+    native.last_query = SimpleNamespace(
+        progress=SimpleNamespace(rows=148_494, bytes=595_674_646)
+    )
+    client = _client(server_enforced_readonly=False)
+    monkeypatch.setattr(client, "_get_client", Mock(return_value=native))
+    monkeypatch.setattr(client, "_return_client", Mock())
+
+    result = client.execute_read_with_progress(
+        "SELECT 'ok' AS value",
+        timeout_ms=2_500,
+        settings={"max_threads": 1},
+    )
+
+    assert result[:2] == ([("ok",)], [("value", "String")])
+    assert result[3:] == (148_494, 595_674_646)
 
 
 class _ClickHouseReadError(Exception):

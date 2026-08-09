@@ -254,6 +254,48 @@ class ClickHouseClient:
         timeout_ms: int | None = None,
         settings: dict[str, Any] | None = None,
     ) -> tuple[list[tuple], list[tuple], float]:
+        """Execute a guarded read while preserving the historical result tuple."""
+
+        result = self._execute_read(
+            query,
+            params,
+            timeout_ms=timeout_ms,
+            settings=settings,
+            include_progress=False,
+        )
+        return result[0], result[1], result[2]
+
+    def execute_read_with_progress(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+        timeout_ms: int | None = None,
+        settings: dict[str, Any] | None = None,
+    ) -> tuple[list[tuple], list[tuple], float, int | None, int | None]:
+        """Execute a guarded read and include native rows/bytes progress."""
+
+        result = self._execute_read(
+            query,
+            params,
+            timeout_ms=timeout_ms,
+            settings=settings,
+            include_progress=True,
+        )
+        assert len(result) == 5
+        return result
+
+    def _execute_read(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+        timeout_ms: int | None = None,
+        settings: dict[str, Any] | None = None,
+        *,
+        include_progress: bool,
+    ) -> (
+        tuple[list[tuple], list[tuple], float]
+        | tuple[list[tuple], list[tuple], float, int | None, int | None]
+    ):
         """
         Execute a read-only query with ClickHouse readonly=2 setting.
 
@@ -268,7 +310,8 @@ class ClickHouseClient:
             timeout_ms: Optional query timeout in milliseconds (maps to max_execution_time)
 
         Returns:
-            Tuple of (rows, column_types, query_time_ms)
+            Tuple of (rows, column_types, query_time_ms), optionally followed
+            by native read_rows and read_bytes progress.
         """
         query_settings: dict[str, Any] | None
         if self.server_enforced_readonly:
@@ -373,16 +416,38 @@ class ClickHouseClient:
             rows, column_types = result
             query_time_ms = (time.monotonic() - t_start) * 1000
             rows_returned = len(rows) if rows else 0
+            progress = getattr(getattr(client, "last_query", None), "progress", None)
+
+            def progress_metric(name: str) -> int | None:
+                try:
+                    value = int(getattr(progress, name))
+                except (AttributeError, TypeError, ValueError):
+                    return None
+                return value if value >= 0 else None
+
+            read_rows = progress_metric("rows")
+            read_bytes = progress_metric("bytes")
 
             logger.info(
                 "ClickHouse read query completed",
                 query=query[:200],
                 query_time_ms=round(query_time_ms, 2),
                 rows_returned=rows_returned,
+                read_rows=read_rows,
+                read_bytes=read_bytes,
                 backend="clickhouse",
             )
 
-            return rows, column_types, round(query_time_ms, 2)
+            rounded_query_time_ms = round(query_time_ms, 2)
+            if include_progress:
+                return (
+                    rows,
+                    column_types,
+                    rounded_query_time_ms,
+                    read_rows,
+                    read_bytes,
+                )
+            return rows, column_types, rounded_query_time_ms
 
         except CHError as e:
             query_time_ms = (time.monotonic() - t_start) * 1000

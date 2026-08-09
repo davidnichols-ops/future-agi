@@ -165,6 +165,13 @@ ATTRIBUTE_VALUE_CURSOR_DISTINCT_MAX_SEGMENT = ATTRIBUTE_VALUE_CURSOR_MAX_EMPTY_S
 # timeout, while still allowing its 438 ms predecessor to grow once.
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_TIMEOUT_MS = 2_500
 ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS = 500
+# Retain at least two-times resource headroom before carrying the same width
+# into an adjacent slice, whose density is not known yet. A proof at or above
+# half of either native read cap shrinks the next width; a proof below one
+# quarter may still double when its time telemetry is also cheap. Values in
+# between freeze the width. Missing progress telemetry preserves the legacy
+# time-only policy for compatible external executors.
+ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION = 0.5
 # Dense projects can cross the ordinary row/byte envelope even inside the
 # production-qualified six-hour seed.  A failed statement proves nothing, so
 # retry its identical newest-first frontier in this smaller exact slice before
@@ -322,6 +329,8 @@ class AttributeReadQueryLimitExceeded(ReadDeadlineExceeded):
 class AttributeQueryPage:
     data: list[dict[str, Any]]
     query_time_ms: float
+    read_rows: int | None = None
+    read_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -597,12 +606,32 @@ class V2AttributeQueryExecutor:
         settings: dict[str, Any],
     ) -> AttributeQueryPage:
         try:
-            rows, columns, query_time_ms = self._client.execute_read(
-                query,
-                params,
-                timeout_ms=timeout_ms,
-                settings=settings,
+            progress_execute = getattr(
+                type(self._client), "execute_read_with_progress", None
             )
+            if callable(progress_execute):
+                (
+                    rows,
+                    columns,
+                    query_time_ms,
+                    read_rows,
+                    read_bytes,
+                ) = progress_execute(
+                    self._client,
+                    query,
+                    params,
+                    timeout_ms=timeout_ms,
+                    settings=settings,
+                )
+            else:
+                rows, columns, query_time_ms = self._client.execute_read(
+                    query,
+                    params,
+                    timeout_ms=timeout_ms,
+                    settings=settings,
+                )
+                read_rows = None
+                read_bytes = None
         except TimeoutError as exc:
             # Some native-driver wrappers surface socket/read deadlines as the
             # built-in timeout type. Normalize only at this CH25 read boundary;
@@ -615,6 +644,8 @@ class V2AttributeQueryExecutor:
         return AttributeQueryPage(
             data=[dict(zip(names, row, strict=False)) for row in rows],
             query_time_ms=float(query_time_ms),
+            read_rows=read_rows,
+            read_bytes=read_bytes,
         )
 
 
@@ -1119,6 +1150,8 @@ class AttributeReadSelector:
         self._window_end = _utc(now or datetime.now(UTC))
         self._query_count = 0
         self._last_query_time_ms: float | None = None
+        self._last_query_read_rows: int | None = None
+        self._last_query_read_bytes: int | None = None
         # ``typed_only`` remains the compatibility switch for callers that
         # must never touch the JSON overflow.  Filter pickers opt into
         # ``structured`` explicitly: bounded predicates support JSON array and
@@ -1225,6 +1258,8 @@ class AttributeReadSelector:
         self._deadline = self._clock() + self._wall_timeout_seconds
         self._query_count = 0
         self._last_query_time_ms = None
+        self._last_query_read_rows = None
+        self._last_query_read_bytes = None
 
     def _execute(
         self,
@@ -1264,6 +1299,8 @@ class AttributeReadSelector:
                 )
             )
             self._last_query_time_ms = None
+            self._last_query_read_rows = None
+            self._last_query_read_bytes = None
             page = self._executor.execute(
                 query,
                 params,
@@ -1286,6 +1323,16 @@ class AttributeReadSelector:
             measured_query_time_ms = math.inf
         if math.isfinite(measured_query_time_ms) and measured_query_time_ms >= 0:
             self._last_query_time_ms = measured_query_time_ms
+
+        def progress_metric(value: Any) -> int | None:
+            try:
+                measured = int(value)
+            except (TypeError, ValueError):
+                return None
+            return measured if measured >= 0 else None
+
+        self._last_query_read_rows = progress_metric(page.read_rows)
+        self._last_query_read_bytes = progress_metric(page.read_bytes)
         return page.data
 
     def _windows(
@@ -4560,6 +4607,8 @@ class AttributeReadSelector:
                         query_timeout_ms=proof_timeout_ms,
                     )
                     proof_query_time_ms = self._last_query_time_ms
+                    proof_read_rows = self._last_query_read_rows
+                    proof_read_bytes = self._last_query_read_bytes
                 except Exception as exc:
                     if not is_read_budget_error(exc):
                         raise
@@ -4656,16 +4705,49 @@ class AttributeReadSelector:
                     empty_segment_width = proven_width
                     last_successful_segment_width = proven_width
                 # A completed proof advances this exact half-open slice before
-                # deciding how to read the next adjacent one. Grow only from a
-                # comfortably cheap success. An expensive success retains its
-                # proven width, avoiding a doubled timeout as normal density
-                # discovery; once an older adjacent slice becomes cheap again,
-                # geometric sparse traversal resumes without a gap.
+                # deciding how to read the next adjacent one. Native progress
+                # is the only proactive signal of row/byte pressure: preserve
+                # two-times headroom for unknown adjacent density, shrinking a
+                # width already at half a cap and freezing intermediate widths.
+                # Cheap, low-volume slices still grow geometrically.
                 failed_distinct_ceiling = None
-                if (
+                resource_utilizations = []
+                for consumed, cap in (
+                    (proof_read_rows, ATTRIBUTE_READ_SETTINGS["max_rows_to_read"]),
+                    (
+                        proof_read_bytes,
+                        _ATTRIBUTE_VALUE_PROOF_MAP_SETTINGS["max_bytes_to_read"],
+                    ),
+                ):
+                    if consumed is not None and int(cap) > 0:
+                        resource_utilizations.append(consumed / int(cap))
+                peak_resource_utilization = (
+                    max(resource_utilizations) if resource_utilizations else None
+                )
+                resource_requires_shrink = (
+                    peak_resource_utilization is not None
+                    and peak_resource_utilization
+                    >= ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION
+                )
+                resource_allows_growth = (
+                    peak_resource_utilization is None
+                    or peak_resource_utilization * 2
+                    < ATTRIBUTE_VALUE_CURSOR_DISTINCT_RESOURCE_TARGET_FRACTION
+                )
+                if resource_requires_shrink:
+                    distinct_width = max(
+                        ATTRIBUTE_VALUE_CURSOR_DISTINCT_MIN_SEGMENT,
+                        proven_width / 2,
+                    )
+                    # The signed continuation field is a safe next-width hint,
+                    # not a coverage claim. Carry the narrower width if the
+                    # request wall ends before it can be exercised.
+                    empty_segment_width = distinct_width
+                elif (
                     proof_query_time_ms is not None
                     and proof_query_time_ms
                     <= ATTRIBUTE_VALUE_CURSOR_DISTINCT_GROWTH_QUERY_TIME_MS
+                    and resource_allows_growth
                 ):
                     distinct_width = min(
                         proven_width * 2,
