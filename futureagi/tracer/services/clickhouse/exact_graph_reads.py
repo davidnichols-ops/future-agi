@@ -411,6 +411,7 @@ def _enumerate_exact_trace_ids(
     seen_seed_ids: set[Any] = set()
     query_count = 0
     rows_returned = 0
+    learned_classifier_batch_size = EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE
 
     def remaining_statement_timeout_ms(statement_ceiling_ms: int) -> int:
         remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
@@ -444,15 +445,12 @@ def _enumerate_exact_trace_ids(
         return seed_start_time, order_token
 
     def classify(candidate_rows: list[dict[str, Any]]) -> None:
-        nonlocal query_count, rows_returned
-        for offset in range(
-            0, len(candidate_rows), EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE
-        ):
-            batch = candidate_rows[
-                offset : offset + EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE
-            ]
+        nonlocal learned_classifier_batch_size, query_count, rows_returned
+
+        def classify_batch(batch: list[dict[str, Any]]) -> None:
+            nonlocal learned_classifier_batch_size, query_count, rows_returned
             if not batch:
-                continue
+                return
             candidate_ids = {str(row.get("trace_id") or "") for row in batch}
             if "" in candidate_ids:
                 raise ExactGraphReadError(
@@ -466,17 +464,38 @@ def _enumerate_exact_trace_ids(
                     "Exact trace graph classifier could not be constructed."
                 )
             query_count += 1
-            result = analytics.execute_ch_query(
-                query,
-                params,
-                timeout_ms=remaining_statement_timeout_ms(
-                    EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS
-                ),
-                settings={
-                    **EXACT_GRAPH_READ_SETTINGS,
-                    "max_result_rows": len(batch),
-                },
-            )
+            try:
+                result = analytics.execute_ch_query(
+                    query,
+                    params,
+                    timeout_ms=remaining_statement_timeout_ms(
+                        EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS
+                    ),
+                    settings={
+                        **EXACT_GRAPH_READ_SETTINGS,
+                        "max_result_rows": len(batch),
+                    },
+                )
+            except Exception as exc:
+                if is_read_budget_error(exc) and len(batch) > 1:
+                    # The classifier is identity-bounded but intentionally
+                    # scans child witnesses across all time: ingestion has no
+                    # maximum trace duration. A tenant can therefore make a
+                    # valid 200-trace page exceed the per-statement deadline
+                    # even though smaller exact identity sets complete. Split
+                    # the same finite batch in order and replay both halves;
+                    # no identity is skipped and no failed statement can
+                    # contribute a row. A one-identity failure still escapes
+                    # fail-closed instead of publishing a partial graph.
+                    midpoint = len(batch) // 2
+                    learned_classifier_batch_size = min(
+                        learned_classifier_batch_size,
+                        max(midpoint, len(batch) - midpoint),
+                    )
+                    classify_rows(batch[:midpoint])
+                    classify_rows(batch[midpoint:])
+                    return
+                raise
             classified_rows = list(result.data or [])
             rows_returned += len(classified_rows)
             for row in classified_rows:
@@ -488,6 +507,18 @@ def _enumerate_exact_trace_ids(
                 if trace_id not in seen_matched_trace_ids:
                     seen_matched_trace_ids.add(trace_id)
                     trace_ids.append(trace_id)
+
+        def classify_rows(rows: list[dict[str, Any]]) -> None:
+            offset = 0
+            while offset < len(rows):
+                batch_size = min(
+                    learned_classifier_batch_size,
+                    len(rows) - offset,
+                )
+                classify_batch(rows[offset : offset + batch_size])
+                offset += batch_size
+
+        classify_rows(candidate_rows)
 
     slice_end = root_seed_end
     slice_width = min(EXACT_GRAPH_TRACE_INITIAL_SLICE, root_seed_end - root_seed_start)

@@ -3254,6 +3254,262 @@ def test_exact_trace_membership_exhausts_200_identity_classifier_boundary(monkey
 
 
 @pytest.mark.unit
+def test_exact_trace_membership_bisects_read_budget_classifier_without_gaps(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=5)
+    checkpoint = request_end - timedelta(minutes=1)
+    ordered_ids = [f"trace-{index}" for index in reversed(range(4))]
+    classifier_batches = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def build_filter_ordered_seed_page(**_kwargs):
+            return "WITNESS", {}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            ids = tuple(row["trace_id"] for row in rows)
+            classifier_batches.append(ids)
+            return "CLASSIFY", {"ids": ids}
+
+    class Analytics:
+        seed_returned = False
+
+        @staticmethod
+        def execute_ch_query(query, params, **_kwargs):
+            if query == "WITNESS":
+                if Analytics.seed_returned:
+                    return SimpleNamespace(data=[], columns=[], query_time_ms=1)
+                Analytics.seed_returned = True
+                return SimpleNamespace(
+                    data=[
+                        {"trace_id": trace_id, "start_time": checkpoint}
+                        for trace_id in ordered_ids
+                    ],
+                    columns=[],
+                    query_time_ms=1,
+                )
+            if len(params["ids"]) > 1:
+                raise ServerException("private bounded classifier timeout", code=159)
+            return SimpleNamespace(
+                data=[{"trace_id": params["ids"][0]}],
+                columns=["trace_id"],
+                query_time_ms=1,
+            )
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE", 10)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE", 4)
+
+    trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+        analytics=Analytics(),
+        project_id="11111111-1111-4111-8111-111111111111",
+        filters=_exact_multi_filters(request_start, request_end),
+        annotation_label_ids=None,
+        started=exact_module.monotonic(),
+    )
+
+    assert trace_ids == ordered_ids
+    assert classifier_batches == [
+        tuple(ordered_ids),
+        tuple(ordered_ids[:2]),
+        (ordered_ids[0],),
+        (ordered_ids[1],),
+        (ordered_ids[2],),
+        (ordered_ids[3],),
+    ]
+    assert query_count == 7
+    assert rows_returned == 8
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_learns_classifier_ceiling_per_refresh(monkeypatch):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=5)
+    checkpoint = request_end - timedelta(minutes=1)
+    ordered_ids = [f"trace-{index}" for index in reversed(range(8))]
+    classifier_batches = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def build_filter_ordered_seed_page(**_kwargs):
+            return "WITNESS", {}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            ids = tuple(row["trace_id"] for row in rows)
+            classifier_batches.append(ids)
+            return "CLASSIFY", {"ids": ids}
+
+    class Analytics:
+        def __init__(self):
+            self.seed_pages = iter(
+                [
+                    [
+                        {"trace_id": trace_id, "start_time": checkpoint}
+                        for trace_id in ordered_ids[:4]
+                    ],
+                    [
+                        {"trace_id": trace_id, "start_time": checkpoint}
+                        for trace_id in ordered_ids[4:]
+                    ],
+                    [],
+                ]
+            )
+
+        def execute_ch_query(self, query, params, **_kwargs):
+            if query == "WITNESS":
+                return SimpleNamespace(
+                    data=next(self.seed_pages), columns=[], query_time_ms=1
+                )
+            if len(params["ids"]) > 2:
+                raise ServerException("private bounded classifier timeout", code=159)
+            return SimpleNamespace(
+                data=[{"trace_id": trace_id} for trace_id in params["ids"]],
+                columns=["trace_id"],
+                query_time_ms=1,
+            )
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE", 4)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE", 4)
+
+    expected_batch_sizes = [4, 2, 2, 2, 2]
+    for _refresh in range(2):
+        classifier_batches.clear()
+        trace_ids, query_count, rows_returned = _enumerate_exact_trace_ids(
+            analytics=Analytics(),
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(request_start, request_end),
+            annotation_label_ids=None,
+            started=exact_module.monotonic(),
+        )
+
+        assert trace_ids == ordered_ids
+        assert [len(batch) for batch in classifier_batches] == expected_batch_sizes
+        assert query_count == 8
+        assert rows_returned == 16
+
+
+@pytest.mark.unit
+def test_exact_trace_membership_fails_closed_when_one_identity_exceeds_classifier_budget(
+    monkeypatch,
+):
+    from tracer.services.clickhouse import exact_graph_reads as exact_module
+
+    request_start = datetime(2026, 8, 1)
+    request_end = request_start + timedelta(minutes=5)
+    checkpoint = request_end - timedelta(minutes=1)
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def supports_bounded_filter_scan():
+            return True
+
+        @staticmethod
+        def parse_time_range(_filters):
+            return request_start, request_end
+
+        @staticmethod
+        def exact_graph_filter_witness_range():
+            return request_start, request_end
+
+        @staticmethod
+        def bounded_filter_seed_identity(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def bounded_filter_seed_order_token(row):
+            return row["trace_id"]
+
+        @staticmethod
+        def build_filter_ordered_seed_page(**_kwargs):
+            return "WITNESS", {}
+
+        @staticmethod
+        def build_filter_identity_match_query_from_seed_rows(rows):
+            return "CLASSIFY", {"ids": tuple(row["trace_id"] for row in rows)}
+
+    class Analytics:
+        @staticmethod
+        def execute_ch_query(query, _params, **_kwargs):
+            if query == "WITNESS":
+                return SimpleNamespace(
+                    data=[{"trace_id": "trace-1", "start_time": checkpoint}],
+                    columns=[],
+                    query_time_ms=1,
+                )
+            raise ServerException("private bounded classifier timeout", code=159)
+
+    monkeypatch.setattr(exact_module, "TraceListQueryBuilderV2", Builder)
+    monkeypatch.setattr(exact_module, "EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE", 10)
+
+    with pytest.raises(ServerException, match="private bounded classifier timeout"):
+        _enumerate_exact_trace_ids(
+            analytics=Analytics(),
+            project_id="11111111-1111-4111-8111-111111111111",
+            filters=_exact_multi_filters(request_start, request_end),
+            annotation_label_ids=None,
+            started=exact_module.monotonic(),
+        )
+
+
+@pytest.mark.unit
 def test_exact_trace_membership_deduplicates_across_slices_and_classifies_latest_state(
     monkeypatch,
 ):
