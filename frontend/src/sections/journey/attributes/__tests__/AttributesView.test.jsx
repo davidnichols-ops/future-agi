@@ -35,9 +35,28 @@ vi.mock("../AttributeGroupList", () => ({
   ),
 }));
 vi.mock("../AttributeKeyList", () => ({
-  default: ({ keys }) => (
-    <div data-testid="attribute-keys">
-      {keys.map(({ key }) => key).join(",")}
+  default: ({
+    keys,
+    hasMore,
+    isLoadingMore,
+    onLoadMore,
+    search,
+    onSearchChange,
+  }) => (
+    <div>
+      <input
+        aria-label="attribute-search"
+        value={search}
+        onChange={(event) => onSearchChange(event.target.value)}
+      />
+      <div data-testid="attribute-keys">
+        {keys.map(({ key }) => key).join(",")}
+      </div>
+      {hasMore && (
+        <button disabled={isLoadingMore} onClick={onLoadMore}>
+          Load more attributes
+        </button>
+      )}
     </div>
   ),
 }));
@@ -136,6 +155,171 @@ describe("AttributesView errors", () => {
     expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
     expect(
       screen.queryByText(/private|clickhouse|stack trace/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("paginates an exact-key search with the signed cursor", async () => {
+    mocks.get.mockImplementation((_url, { params }) => {
+      if (!params.q) {
+        return Promise.resolve({
+          data: {
+            result: [{ key: "seed.attribute", type: "string" }],
+            has_more: false,
+            next_cursor: null,
+            browse_status: "exhausted",
+          },
+        });
+      }
+      if (!params.cursor) {
+        return Promise.resolve({
+          data: {
+            result: [{ key: "final_state", type: "string" }],
+            has_more: true,
+            next_cursor: "search-page-2",
+            browse_status: "continuation",
+          },
+        });
+      }
+      return Promise.resolve({
+        data: {
+          result: [{ key: "final_status", type: "string" }],
+          exact_match: true,
+          has_more: true,
+          next_cursor: "unneeded-page-3",
+          browse_status: "continuation",
+        },
+      });
+    });
+
+    renderView();
+    expect(await screen.findByTestId("attribute-keys")).toHaveTextContent(
+      "seed.attribute",
+    );
+    fireEvent.change(screen.getByLabelText("attribute-search"), {
+      target: { value: "final_status" },
+    });
+
+    expect(await screen.findByTestId("attribute-keys")).toHaveTextContent(
+      "final_state",
+    );
+    expect(mocks.get).toHaveBeenCalledWith(
+      "/span-attribute-keys/",
+      expect.objectContaining({
+        timeout: 35_000,
+        params: {
+          project_id: "project-large",
+          page_size: 25,
+          q: "final_status",
+        },
+      }),
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Load more attributes" }),
+    );
+    await waitFor(() =>
+      expect(
+        mocks.get.mock.calls.filter(
+          ([, options]) => options.params.q === "final_status",
+        ),
+      ).toHaveLength(2),
+    );
+    expect(mocks.get).toHaveBeenCalledWith(
+      "/span-attribute-keys/",
+      expect.objectContaining({
+        timeout: 35_000,
+        params: {
+          project_id: "project-large",
+          page_size: 25,
+          q: "final_status",
+          cursor: "search-page-2",
+        },
+      }),
+    );
+    expect(screen.getByTestId("attribute-keys")).toHaveTextContent(
+      "final_state,final_status",
+    );
+    expect(
+      screen.queryByRole("button", { name: "Load more attributes" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("terminalizes a repeated cursor without leaving Load more available", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: [{ key: "recent.attribute", type: "string" }],
+          has_more: true,
+          next_cursor: "same-cursor",
+          browse_status: "continuation",
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: [],
+          has_more: true,
+          next_cursor: "same-cursor",
+          browse_status: "continuation",
+        },
+      });
+
+    renderView();
+    expect(await screen.findByTestId("attribute-keys")).toHaveTextContent(
+      "recent.attribute",
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Load more attributes" }),
+    );
+
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Load more attributes" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("attribute-keys")).toHaveTextContent(
+      "recent.attribute",
+    );
+  });
+
+  it("follows an empty transport checkpoint before publishing the page", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: [],
+          has_more: true,
+          next_cursor: "empty-checkpoint",
+          browse_status: "continuation",
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: [{ key: "older.attribute", type: "number" }],
+          has_more: false,
+          next_cursor: null,
+          browse_status: "exhausted",
+        },
+      });
+
+    renderView();
+
+    expect(await screen.findByTestId("attribute-keys")).toHaveTextContent(
+      "older.attribute",
+    );
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.get).toHaveBeenNthCalledWith(
+      2,
+      "/span-attribute-keys/",
+      expect.objectContaining({
+        params: {
+          project_id: "project-large",
+          page_size: 25,
+          cursor: "empty-checkpoint",
+        },
+      }),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Load more attributes" }),
     ).not.toBeInTheDocument();
   });
 });

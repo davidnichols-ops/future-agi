@@ -14,6 +14,11 @@ import { useDebounce } from "src/hooks/use-debounce";
 import AttributeGroupList from "./AttributeGroupList";
 import AttributeKeyList from "./AttributeKeyList";
 import AttributeDetail from "./AttributeDetail";
+import {
+  ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+  getNextAttributeKeyPageParam,
+  readAttributeKeyPage,
+} from "src/sections/projects/LLMTracing/attributeKeyCursorPagination";
 
 const AttributesView = () => {
   const { id: projectId } = useParams();
@@ -34,32 +39,37 @@ const AttributesView = () => {
   } = useInfiniteQuery({
     queryKey: ["span-attribute-keys", projectId, debouncedSearch],
     queryFn: ({ signal, pageParam }) =>
-      axios.get(endpoints.project.spanAttributeKeys(), {
+      readAttributeKeyPage({
+        pageParam,
         signal,
-        params: {
-          project_id: projectId,
-          ...(debouncedSearch
-            ? { q: debouncedSearch }
-            : {
+        requestPage: (cursor) =>
+          axios
+            .get(endpoints.project.spanAttributeKeys(), {
+              signal,
+              timeout: ATTRIBUTE_KEY_REQUEST_TIMEOUT_MS,
+              params: {
+                project_id: projectId,
                 page_size: 25,
-                ...(pageParam ? { cursor: pageParam } : {}),
-              }),
-        },
+                ...(debouncedSearch ? { q: debouncedSearch } : {}),
+                ...(cursor ? { cursor } : {}),
+              },
+            })
+            .then(({ data: page }) => page || {}),
       }),
     initialPageParam: null,
-    getNextPageParam: (lastPage) =>
-      !debouncedSearch &&
-      lastPage?.data?.has_more &&
-      lastPage?.data?.next_cursor
-        ? lastPage.data.next_cursor
-        : undefined,
+    getNextPageParam: (lastPage, ...paginationState) =>
+      debouncedSearch &&
+      (lastPage?.exact_match === true ||
+        lastPage?.result?.some(({ key }) => key === debouncedSearch))
+        ? undefined
+        : getNextAttributeKeyPageParam(lastPage, ...paginationState),
     enabled: Boolean(projectId),
     retry: false,
     meta: { errorHandled: true },
   });
   const seenAttributeKeys = new Set();
   const attributeKeys = (data?.pages || []).flatMap((page) =>
-    (page?.data?.result || []).filter(({ key }) => {
+    (page?.result || []).filter(({ key }) => {
       if (!key || seenAttributeKeys.has(key)) return false;
       seenAttributeKeys.add(key);
       return true;
