@@ -84,6 +84,10 @@ _BULK_IDENTITY_CLASSIFY_BATCH_SIZE = 100
 # five-thousand-trace finite batch; the reader halves a resource-limited batch
 # recursively, so this is an initial query size rather than a result ceiling.
 _EXACT_GRAPH_IDENTITY_CLASSIFY_BATCH_SIZE = 5_000
+# Organization classifiers must carry a composite (project, trace) identity.
+# Keep their separately rendered payload at the previously safe 1k envelope;
+# a 5k composite tuple alone exceeds ClickHouse's default parser limit.
+_EXACT_GRAPH_ORG_IDENTITY_CLASSIFY_BATCH_SIZE = 1_000
 
 # Normal trace pages classify identities only and hydrate at most the final
 # public page in a separate bounded statement.  Production replay showed that
@@ -2857,11 +2861,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         trace_ids = tuple(dict.fromkeys(str(value) for value in candidate_ids if value))
         if not trace_ids:
             return "", {}
+        org_scope = self.project_ids is not None
         if self._bounded_global_span_witnesses:
-            candidate_limit = _EXACT_GRAPH_IDENTITY_CLASSIFY_BATCH_SIZE
+            candidate_limit = (
+                _EXACT_GRAPH_ORG_IDENTITY_CLASSIFY_BATCH_SIZE
+                if org_scope
+                else _EXACT_GRAPH_IDENTITY_CLASSIFY_BATCH_SIZE
+            )
         else:
             candidate_limit = 200 if self._bounded_bulk_scan else 512
-        org_scope = self.project_ids is not None
         trace_identities: tuple[tuple[str, str], ...] = ()
         if org_scope:
             if candidate_trace_identities is None:
@@ -3236,12 +3244,11 @@ class TraceListQueryBuilder(BaseQueryBuilder):
             if org_scope
             else ""
         )
-        candidate_identity_result_fragment = (
-            "AND (grouped_project_id, grouped_trace_id) "
-            "IN %(candidate_trace_identities)s"
-            if org_scope
-            else ""
-        )
+        # Keep the finite candidate tuple at the physical scan only.
+        # grouped_trace_id/grouped_project_id are direct aliases of those
+        # scoped columns, so repeating the tuple after aggregation is
+        # redundant and can push a 5k driver-expanded query beyond
+        # ClickHouse's 256-KiB parser envelope.
         grouped_project_select_fragment = (
             "project_id AS grouped_project_id," if org_scope else ""
         )
@@ -3362,8 +3369,6 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 GROUP BY {physical_group_by}
             )
             WHERE latest_is_deleted = 0
-              AND grouped_trace_id IN %(candidate_trace_ids)s
-              {candidate_identity_result_fragment}
             GROUP BY {trace_group_by}
             HAVING countIf({canonical_root_condition}) > 0
               AND {root_predicate}

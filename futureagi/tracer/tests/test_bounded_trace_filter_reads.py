@@ -8,6 +8,7 @@ from typing import Any
 from unittest import mock
 
 import pytest
+from clickhouse_driver.util.escape import escape_params
 from django.test import override_settings
 
 from tracer.selectors.trace_filter_reads import (
@@ -43,6 +44,15 @@ from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
 PROJECT_ID = "00000000-0000-4000-8000-000000000001"
 START = datetime(2025, 1, 1)
 END = START + timedelta(days=365)
+
+
+def _render_driver_sql(sql: str, params: dict[str, Any]) -> str:
+    """Render parameters exactly as clickhouse-driver does before transport."""
+
+    context = SimpleNamespace(
+        server_info=SimpleNamespace(get_timezone=lambda: "UTC")
+    )
+    return sql % escape_params(params, context)
 
 
 def _time_filter(start: datetime = START, end: datetime = END) -> dict[str, Any]:
@@ -308,7 +318,7 @@ def test_customer_final_status_trace_query_uses_indexed_any_span_anchor() -> Non
     assert "GROUP BY trace_id, id, start_time" in match_sql
     assert "SELECT id\n" not in match_sql
     assert "parent_span_id IS NULL" in match_sql
-    assert "grouped_trace_id IN %(candidate_trace_ids)s" in match_sql
+    assert match_sql.count("%(candidate_trace_ids)s") == 1
     assert "latest_attr_exists_0" in match_sql
     assert match_sql.count("FROM spans") == 1
     assert "SELECT latest_trace_id" not in match_sql
@@ -570,10 +580,8 @@ def test_exact_graph_global_classifier_preserves_org_composite_identity() -> Non
     assert "candidate_witness_end_date_us" not in params
     assert "start_time >=" not in physical_scan
     assert "start_time <" not in physical_scan
-    assert (
-        "(grouped_project_id, grouped_trace_id) "
-        "IN %(candidate_trace_identities)s" in sql
-    )
+    assert sql.count("%(candidate_trace_identities)s") == 1
+    assert "(grouped_project_id, grouped_trace_id) IN" not in " ".join(sql.split())
     canonical_root = sql.split("AS canonical_root_identity", 1)[0]
     assert "candidate_start_date_us" in canonical_root
     assert "candidate_end_date_us" in canonical_root
@@ -636,6 +644,41 @@ def test_exact_graph_global_classifier_accepts_5k_and_rejects_larger_batch() -> 
 
     assert sql
     assert len(params["candidate_trace_ids"]) == 5_000
+    # clickhouse-driver expands tuple parameters before transport. Repeating
+    # this production-sized UUID-shaped tuple used to render a >256-KiB query,
+    # which ClickHouse rejected with Code 62 before reading any rows.
+    assert sql.count("%(candidate_trace_ids)s") == 1
+    rendered_sql = _render_driver_sql(sql, params)
+    assert len(rendered_sql.encode()) < 256 * 1024
+    with pytest.raises(ValueError, match="candidate trace batch exceeds bounded limit"):
+        builder.build_filter_identity_match_query_from_seed_rows(rows)
+
+
+def test_exact_graph_org_classifier_keeps_composite_batch_below_parser_limit() -> None:
+    project_b = "00000000-0000-4000-8000-000000000002"
+    builder = TraceListQueryBuilderV2(
+        project_ids=[PROJECT_ID, project_b],
+        filters=[_time_filter(), _attribute_filter("final_status", "Rejected")],
+        bounded_internal_scan=True,
+        bounded_identity_only=True,
+        bounded_bulk_scan=True,
+        bounded_include_filter_witnesses=False,
+        bounded_global_span_witnesses=True,
+    )
+    rows = [
+        {
+            "project_id": PROJECT_ID if index % 2 == 0 else project_b,
+            "trace_id": f"trace-{index:030d}",
+            "start_time": END - timedelta(minutes=1),
+        }
+        for index in range(1_001)
+    ]
+
+    sql, params = builder.build_filter_identity_match_query_from_seed_rows(rows[:1_000])
+
+    assert sql.count("%(candidate_trace_ids)s") == 1
+    assert sql.count("%(candidate_trace_identities)s") == 1
+    assert len(_render_driver_sql(sql, params).encode()) < 256 * 1024
     with pytest.raises(ValueError, match="candidate trace batch exceeds bounded limit"):
         builder.build_filter_identity_match_query_from_seed_rows(rows)
 
@@ -1986,9 +2029,9 @@ def test_org_trace_builder_keeps_project_in_seed_classifier_and_page_keys() -> N
     assert (
         match_sql.count("(project_id, trace_id) IN %(candidate_trace_identities)s") == 1
     )
-    assert (
-        "(grouped_project_id, grouped_trace_id) "
-        "IN %(candidate_trace_identities)s" in match_sql
+    assert match_sql.count("%(candidate_trace_identities)s") == 1
+    assert "(grouped_project_id, grouped_trace_id) IN" not in " ".join(
+        match_sql.split()
     )
     assert "GROUP BY project_id, trace_id, id, start_time" in match_sql
     assert "GROUP BY grouped_project_id, grouped_trace_id" in match_sql
