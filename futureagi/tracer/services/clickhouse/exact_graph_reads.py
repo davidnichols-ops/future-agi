@@ -3,18 +3,19 @@
 ClickHouse 25.3 cannot share a snapshot across separately executed statements,
 and a version predicate on ``ReplacingMergeTree`` is not time travel after a
 background merge. Most aggregate readers therefore use one full-window
-statement. Filtered trace graphs are the deliberate exception: the background
-worker freezes the request window, exhausts a necessary raw filter-witness
-cursor, exact-classifies finite trace-id batches, and aggregates the proven
-identities. A late arrival or background merge between those statements can
-affect a refresh, so the sequence is not advertised as MVCC; de-duplication
-prevents duplicate contribution and any partial query fails the refresh. Only
-a complete result may replace the prior snapshot in ``exact_aggregation_cache``.
+statement. Filtered trace graphs use finite identity batches; filtered span
+graphs use adjacent half-open event-time partitions because span membership is
+row-local and ``start_time`` is immutable for an identity. A late arrival or
+background merge between statements can affect a refresh, so neither sequence
+is advertised as MVCC. Both freeze the requested window, prevent duplicate
+contribution, and fail before publication if any required read fails. Only a
+complete result may replace the prior snapshot in ``exact_aggregation_cache``.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -84,8 +85,8 @@ logger = structlog.get_logger(__name__)
 # atomically published exact snapshot.
 EXACT_GRAPH_QUERY_TIMEOUT_MS = 3_300_000
 # This partition size belongs to the PostgreSQL-backed annotation membership
-# reader below.  System graphs deliberately remain one ClickHouse statement so
-# CH25.3 cannot stitch independently changing ReplacingMergeTree snapshots.
+# reader below. Most system graphs deliberately remain one ClickHouse statement
+# so CH25.3 cannot stitch independently changing ReplacingMergeTree snapshots.
 EXACT_GRAPH_MAX_BUCKETS_PER_PARTITION = 31
 EXACT_GRAPH_MEMBERSHIP_BATCH_SIZE = 1_000
 # Filtered trace graphs cannot retain tenant-wide per-trace membership state in
@@ -118,6 +119,20 @@ EXACT_GRAPH_TRACE_MAX_SLICE = timedelta(days=2)
 # Widen only cheap, fully exhausted slices. QueryResult exposes the measured
 # ClickHouse wall time; the monotonic fallback keeps alternate executors safe.
 EXACT_GRAPH_TRACE_GROWTH_QUERY_TIME_MS = 2_000
+# Span membership is row-local. Resolve latest state and emit additive bucket
+# states over adjacent, half-open windows small enough for the measured Coletia
+# production envelope. A span's immutable ``start_time`` is part of its
+# identity, so every ReplacingMergeTree version (including a winning tombstone)
+# remains in exactly one partition. The caller withholds all results until every
+# partition succeeds.
+EXACT_GRAPH_SPAN_PARTITION_WIDTH = timedelta(minutes=5)
+EXACT_GRAPH_SPAN_MAX_PARTITION_WIDTH = timedelta(days=1)
+# A result-row count cannot reveal how many physical rows ClickHouse scanned.
+# Grow only when the executor's measured statement latency proves that the
+# current slice was cheap.  The dense Coletia five-minute qualification slice
+# takes ~842 ms, so it remains pinned to the proven five-minute floor.
+EXACT_GRAPH_SPAN_GROW_BELOW_QUERY_MS = 250.0
+EXACT_GRAPH_SPAN_PARTITION_QUERY_TIMEOUT_MS = 15_000
 EXACT_GRAPH_READ_SETTINGS = {
     "max_threads": 1,
     # Attribute maps are several KiB per row on the heaviest tenants.  Smaller
@@ -164,10 +179,31 @@ EXACT_GRAPH_READ_SETTINGS = {
     "result_overflow_mode": "throw",
     "timeout_overflow_mode": "throw",
 }
+EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS = {
+    **EXACT_GRAPH_READ_SETTINGS,
+    "max_rows_to_read": 2_000_000,
+    # The production Coletia five-minute exact statement reads 2.66 GiB while
+    # touching 720k rows. Preserve finite measured headroom without reverting
+    # to an unbounded tenant-wide filtered scan.
+    "max_bytes_to_read": 4 * 1024 * 1024 * 1024,
+}
 
 
 class ExactGraphReadError(RuntimeError):
     """A complete exact graph refresh could not be produced."""
+
+
+def _exact_span_partitions(
+    start_date: datetime,
+    end_date: datetime,
+) -> Iterator[tuple[datetime, datetime]]:
+    """Yield gap-free half-open span windows no wider than five minutes."""
+
+    cursor = start_date
+    while cursor < end_date:
+        partition_end = min(cursor + EXACT_GRAPH_SPAN_PARTITION_WIDTH, end_date)
+        yield cursor, partition_end
+        cursor = partition_end
 
 
 def output_bucket_partitions(
@@ -633,7 +669,7 @@ def _enumerate_exact_trace_ids(
 def _merge_exact_trace_contribution_rows(
     batches: list[tuple[list[Any], list[str]]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Merge additive bucket states only after all required batches succeed."""
+    """Merge additive bucket states only after all required reads succeed."""
 
     merged: dict[Any, dict[str, Any]] = {}
     for rows, columns in batches:
@@ -641,7 +677,7 @@ def _merge_exact_trace_contribution_rows(
             bucket = _row_value(row, columns, "time_bucket", None)
             if bucket is None:
                 raise ExactGraphReadError(
-                    "Exact trace contribution batch returned an invalid bucket."
+                    "Exact graph contribution read returned an invalid bucket."
                 )
             state = merged.setdefault(
                 bucket,
@@ -751,6 +787,97 @@ def _read_exact_filtered_trace_graph(
     )
 
 
+def _read_exact_filtered_span_graph(
+    *,
+    analytics: Any,
+    builder: TimeSeriesQueryBuilder,
+    exact_filter_plan: Any,
+    start_date: datetime,
+    end_date: datetime,
+    started: float,
+) -> tuple[dict[str, list[dict[str, Any]]], int, int]:
+    """Merge exact row-local span states after every bounded read succeeds.
+
+    The result list is intentionally retained privately until the final slice
+    completes. Any timeout, read-budget error, or malformed result propagates
+    before formatting, so the background refresh cannot publish a partial
+    graph over the prior complete snapshot. The first slice uses the production
+    qualified five-minute floor. Cheap successful slices may double up to one
+    day; a resource failure halves and retries the exact same cursor, and the
+    failed width becomes a ceiling for the remainder of this refresh.
+    """
+
+    batches: list[tuple[list[Any], list[str]]] = []
+    query_count = 0
+    rows_returned = 0
+    partition_start = start_date
+    request_width = end_date - start_date
+    partition_width = min(EXACT_GRAPH_SPAN_PARTITION_WIDTH, request_width)
+    max_partition_width = min(EXACT_GRAPH_SPAN_MAX_PARTITION_WIDTH, request_width)
+    while partition_start < end_date:
+        partition_end = min(partition_start + partition_width, end_date)
+        remaining_ms = EXACT_GRAPH_QUERY_TIMEOUT_MS - int(
+            (monotonic() - started) * 1000
+        )
+        if remaining_ms < 25:
+            raise ExactGraphReadError(
+                "Exact span graph refresh exceeded its bounded deadline."
+            )
+        query, params = builder.build_exact_span_partition(
+            partition_start=partition_start,
+            partition_end=partition_end,
+            exact_filter_plan=exact_filter_plan,
+        )
+        query_count += 1
+        try:
+            result = analytics.execute_ch_query(
+                query,
+                params,
+                timeout_ms=min(
+                    EXACT_GRAPH_SPAN_PARTITION_QUERY_TIMEOUT_MS,
+                    remaining_ms,
+                ),
+                settings=EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS,
+            )
+        except Exception as exc:
+            if (
+                is_read_budget_error(exc)
+                and partition_width > EXACT_GRAPH_SPAN_PARTITION_WIDTH
+            ):
+                partition_width = max(
+                    EXACT_GRAPH_SPAN_PARTITION_WIDTH,
+                    partition_width / 2,
+                )
+                max_partition_width = min(max_partition_width, partition_width)
+                # Retry without advancing. No failed statement contributes a
+                # row, so the successful windows remain gap-free and disjoint.
+                continue
+            raise
+        rows = list(result.data or [])
+        columns = list(result.columns or [])
+        batches.append((rows, columns))
+        rows_returned += len(rows)
+        partition_start = partition_end
+
+        query_time_ms = getattr(result, "query_time_ms", None)
+        try:
+            cheap_slice = (
+                query_time_ms is not None
+                and 0 <= float(query_time_ms) <= EXACT_GRAPH_SPAN_GROW_BELOW_QUERY_MS
+            )
+        except (TypeError, ValueError):
+            cheap_slice = False
+        if cheap_slice and partition_width < max_partition_width:
+            partition_width = min(partition_width * 2, max_partition_width)
+
+    merged_rows, merged_columns = _merge_exact_trace_contribution_rows(batches)
+    return (
+        builder.format_result(merged_rows, merged_columns),
+        query_count,
+        rows_returned,
+    )
+
+
 def read_exact_system_graph(
     *,
     analytics: Any,
@@ -800,9 +927,8 @@ def read_exact_system_graph(
         observe_type=observe_type,
         annotation_label_ids=annotation_label_ids,
     )
-    if str(observe_type or "").strip().lower() == "trace" and (
-        exact_filter_plan.predicates
-    ):
+    normalized_observe_type = str(observe_type or "").strip().lower()
+    if normalized_observe_type == "trace" and exact_filter_plan.predicates:
         frozen_filters = _frozen_trace_membership_filters(
             filters,
             start_date=start_date,
@@ -814,6 +940,24 @@ def read_exact_system_graph(
             project_id=str(project_id),
             filters=frozen_filters,
             annotation_label_ids=annotation_label_ids,
+            started=started,
+        )
+        return _system_metric_payload(
+            metrics,
+            metric_id,
+            _metadata(
+                started=started,
+                query_count=query_count,
+                rows_returned=rows_returned,
+            ),
+        )
+    if normalized_observe_type == "span" and exact_filter_plan.predicates:
+        metrics, query_count, rows_returned = _read_exact_filtered_span_graph(
+            analytics=analytics,
+            builder=builder,
+            exact_filter_plan=exact_filter_plan,
+            start_date=start_date,
+            end_date=end_date,
             started=started,
         )
         return _system_metric_payload(

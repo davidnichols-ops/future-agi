@@ -548,6 +548,108 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         """
         return query, self.params
 
+    def build_exact_span_partition(
+        self,
+        *,
+        partition_start: datetime,
+        partition_end: datetime,
+        exact_filter_plan: Any | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return additive exact span states for one half-open time slice.
+
+        Span filters are row-local, so each slice can collapse current state,
+        apply every scalar/array/Map/legacy-JSON predicate, and emit only
+        additive metric states. ``start_time`` is immutable for a span identity;
+        all versions and its winning tombstone therefore land in the same slice.
+        The caller merges states only after every requested slice succeeds.
+        """
+
+        if not self.exact_snapshot or self.observe_type != "span":
+            raise ValueError("exact span partitions require an exact span builder")
+        if self.start_date is None or self.end_date is None:
+            self.start_date, self.end_date = self.parse_time_range(self.filters)
+        if not (self.start_date <= partition_start < partition_end <= self.end_date):
+            raise ValueError("exact span partition must be inside the request window")
+
+        if exact_filter_plan is None:
+            from tracer.services.clickhouse.query_builders.exact_graph_predicates import (
+                compile_exact_graph_row_predicates,
+            )
+
+            exact_filter_plan = compile_exact_graph_row_predicates(
+                self.filters,
+                project_id=str(self.project_id),
+                observe_type=self.observe_type,
+                annotation_label_ids=self.annotation_label_ids,
+            )
+        self.params.update(exact_filter_plan.params)
+        self.params.update(
+            {
+                "start_date": self.start_date,
+                "end_date": self.end_date,
+                "graph_partition_start": partition_start,
+                "graph_partition_end": partition_end,
+            }
+        )
+
+        contribution_terms = [
+            (
+                "start_time >= %(graph_partition_start)s "
+                "AND start_time < %(graph_partition_end)s"
+            ),
+            *(
+                f"graph_contribution_match_{index} = 1"
+                for index in range(len(exact_filter_plan.contribution_predicates))
+            ),
+        ]
+        contribution_condition = " AND ".join(
+            f"({predicate})" for predicate in contribution_terms
+        )
+        row_filter = " AND ".join(
+            (
+                f"graph_row_match_{group[0][0]} = {1 if group[0][1] else 0}"
+                if len(group) == 1
+                else "("
+                + " OR ".join(
+                    f"graph_row_match_{index} = {1 if required else 0}"
+                    for index, required in group
+                )
+                + ")"
+            )
+            for group in exact_filter_plan.match_condition_groups
+        )
+        filters = [contribution_condition]
+        if row_filter:
+            filters.append(row_filter)
+        exact_row_filter = " AND ".join(f"({item})" for item in filters)
+
+        latest_source = self._exact_latest_scalar_source(
+            row_predicates=exact_filter_plan.predicates,
+            contribution_predicates=exact_filter_plan.contribution_predicates,
+            scan_start_param="graph_partition_start",
+            scan_end_param="graph_partition_end",
+        )
+        bucket_fn = self.time_bucket_expr(self.interval)
+        query = f"""
+        SELECT
+            {bucket_fn}(start_time) AS time_bucket,
+            sum(toInt64(latency_ms)) AS latency_sum,
+            sum(toInt64(total_tokens)) AS total_tokens,
+            sum(cost) AS cost_sum,
+            count() AS traffic_count,
+            sum(toInt64(prompt_tokens)) AS prompt_tokens,
+            sum(toInt64(completion_tokens)) AS completion_tokens,
+            countIf(upper(status) IN ('ERROR', 'ERRORED', 'FAILED'))
+                AS error_count
+        FROM {latest_source}
+        WHERE {exact_row_filter}
+        GROUP BY time_bucket
+        ORDER BY time_bucket
+        """
+        # Repeated partition builds mutate ``self.params``. Return an isolated
+        # snapshot so a queued statement can never inherit the next slice.
+        return query, dict(self.params)
+
     def _build_exact_raw_query(
         self,
         row_predicates: tuple[str, ...],
