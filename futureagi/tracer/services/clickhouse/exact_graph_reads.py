@@ -374,6 +374,12 @@ def _enumerate_exact_trace_ids(
             raise ExactGraphReadError(
                 "Exact trace graph witness returned an invalid checkpoint."
             )
+        if seed_start_time.tzinfo is not None:
+            # The native driver can attach server timezone information even
+            # when the builder's frozen request bounds are naive UTC values.
+            # ClickHouse comparisons are already UTC; normalize only the
+            # in-process keyset representation so the next page remains valid.
+            seed_start_time = seed_start_time.replace(tzinfo=None)
         order_token = builder.bounded_filter_seed_order_token(row)
         try:
             hash(order_token)
