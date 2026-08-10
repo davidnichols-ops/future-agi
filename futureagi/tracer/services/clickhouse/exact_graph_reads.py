@@ -159,12 +159,13 @@ EXACT_GRAPH_TRACE_CONTRIBUTION_MAX_BYTES_TO_READ = 20 * 1024 * 1024 * 1024
 # graph polls never wait on an individual statement.  Production qualification
 # includes raw witness slices whose valid bounded reads exceed the former
 # three-second ceiling. A deployed-credential Coletia replay measured the
-# identity-scoped 5k classifier at 6.9 seconds, so its ceiling must leave bounded
-# headroom instead of repeatedly discarding successful work at five seconds.
-# Adaptive bisection preserves fail-closed behavior when a tenant-specific batch
-# exceeds the ten-second ceiling.
+# identity-scoped classifier above ten seconds on a dense Coletia batch.  A
+# frozen 1,012-ID A/B completed exactly in 12.581 seconds under a 15-second
+# ceiling, while the former 10-second ceiling discarded the same work and
+# replayed both halves.  Match the independently bounded witness/contribution
+# statements; adaptive bisection remains fail-closed for any hotter batch.
 EXACT_GRAPH_TRACE_WITNESS_QUERY_TIMEOUT_MS = 15_000
-EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 10_000
+EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS = 15_000
 EXACT_GRAPH_TRACE_INITIAL_SLICE = timedelta(minutes=5)
 # A failed raw witness slice is retried at the same upper bound so no interval
 # is skipped. Thirty seconds bounds retry fan-out while still allowing a hot
@@ -229,8 +230,9 @@ EXACT_GRAPH_READ_SETTINGS = {
     # seven-day attribute graph reading 68,719,963,633 bytes: the former was
     # rejected by the old 100M-row cap and the latter crossed the old 64-GiB
     # cap by 486,897 bytes.  ClickHouse defines zero as unlimited for these two
-    # settings.  Time, memory, one-thread execution, refresh admission, bounded
-    # result size, and atomic publication remain the operational safeguards.
+    # settings.  Time, memory, default one-thread execution, refresh admission,
+    # bounded result size, and atomic publication remain the operational
+    # safeguards.
     "max_rows_to_read": 0,
     "max_bytes_to_read": 0,
     # The same observed seven-day read peaked at 1,055,221,165 bytes.  Preserve
@@ -242,6 +244,18 @@ EXACT_GRAPH_READ_SETTINGS = {
     "max_result_bytes": EXACT_GRAPH_MAX_RESULT_BYTES,
     "result_overflow_mode": "throw",
     "timeout_overflow_mode": "throw",
+}
+# The all-time latest-state classifier is the one measured exception to the
+# default single-thread policy. On a frozen Coletia population, four threads
+# reduced an exact 1,012-ID classification from 12.15s to 3.34s and completed
+# the existing 5,000-ID maximum in 10.62s (the one-thread query timed out at
+# 15s). Both successful reads returned the same identities/digests; peak memory
+# stayed below 376 MiB. Exact refresh admission and classifier batches are
+# serial, so this does not multiply concurrent statements or relax any time,
+# memory, result, or read-only guardrail.
+EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS = {
+    **EXACT_GRAPH_READ_SETTINGS,
+    "max_threads": 4,
 }
 EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS = {
     **EXACT_GRAPH_READ_SETTINGS,
@@ -983,7 +997,7 @@ def _enumerate_exact_trace_ids(
                         EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS
                     ),
                     settings={
-                        **EXACT_GRAPH_READ_SETTINGS,
+                        **EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS,
                         "max_result_rows": len(batch),
                     },
                 )

@@ -4249,6 +4249,7 @@ def test_exact_trace_membership_exhausts_5k_identity_classifier_boundary(monkeyp
     )
     classifier_batches = []
     classifier_timeouts = []
+    classifier_settings = []
 
     class Builder:
         def __init__(self, **_kwargs):
@@ -4290,6 +4291,7 @@ def test_exact_trace_membership_exhausts_5k_identity_classifier_boundary(monkeyp
             if query == "WITNESS":
                 return SimpleNamespace(data=next(seed_pages), columns=[])
             classifier_timeouts.append(kwargs["timeout_ms"])
+            classifier_settings.append(kwargs["settings"])
             return SimpleNamespace(
                 data=[{"trace_id": trace_id} for trace_id in params["ids"]],
                 columns=["trace_id"],
@@ -4308,10 +4310,18 @@ def test_exact_trace_membership_exhausts_5k_identity_classifier_boundary(monkeyp
     assert exact_module.EXACT_GRAPH_TRACE_SELECTOR_PAGE_SIZE == 5_000
     assert exact_module.EXACT_GRAPH_TRACE_CANDIDATE_SENTINEL == 1_001
     assert exact_module.EXACT_GRAPH_TRACE_CLASSIFY_BATCH_SIZE == 5_000
-    assert exact_module.EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS == 10_000
+    assert exact_module.EXACT_GRAPH_TRACE_CLASSIFIER_QUERY_TIMEOUT_MS == 15_000
+    assert exact_module.EXACT_GRAPH_READ_SETTINGS["max_threads"] == 1
+    assert exact_module.EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS["max_threads"] == 4
     assert trace_ids == ordered_ids
     assert [len(batch) for batch in classifier_batches] == [5_000, 5_000, 1]
-    assert classifier_timeouts == [10_000, 10_000, 10_000]
+    assert classifier_timeouts == [15_000, 15_000, 15_000]
+    assert [settings["max_threads"] for settings in classifier_settings] == [4, 4, 4]
+    assert [settings["max_result_rows"] for settings in classifier_settings] == [
+        5_000,
+        5_000,
+        1,
+    ]
     assert query_count == 6
     assert rows_returned == 20_002
 
