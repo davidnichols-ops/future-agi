@@ -80,59 +80,9 @@ def start_activity(
     )
 
     try:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            has_running_loop = False
-        else:
-            has_running_loop = True
+        from tfc.temporal.common.client import _run_async_in_sync_context
 
-        if has_running_loop:
-            # We're in an async context - need to run synchronously in a new thread
-            # to avoid blocking the event loop
-            import concurrent.futures
-
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                coroutine = _start_activity_async(
-                    activity_name,
-                    args,
-                    kwargs,
-                    temporal_queue,
-                    task_id,
-                    id_conflict_policy,
-                    start_delay,
-                )
-                if dispatch_timeout_seconds is not None:
-                    coroutine = asyncio.wait_for(
-                        coroutine,
-                        timeout=max(float(dispatch_timeout_seconds), 0.001),
-                    )
-                future = executor.submit(
-                    asyncio.run,
-                    coroutine,
-                )
-                wait_timeout = (
-                    max(float(dispatch_timeout_seconds), 0.001) + 1
-                    if dispatch_timeout_seconds is not None
-                    else 30
-                )
-                result = future.result(timeout=wait_timeout)
-                logger.info(
-                    "start_activity_completed",
-                    activity_name=activity_name,
-                    workflow_id=result,
-                    context="async",
-                )
-                return result
-            finally:
-                # On a bounded dispatch timeout, never make the request wait
-                # for the worker thread during executor shutdown. The wrapped
-                # asyncio.wait_for cancellation closes its event loop shortly
-                # afterward.
-                executor.shutdown(wait=False, cancel_futures=True)
-        else:
-            # No running loop, create one - this is the normal case for sync Django views
+        async def dispatch() -> str:
             coroutine = _start_activity_async(
                 activity_name,
                 args,
@@ -143,18 +93,20 @@ def start_activity(
                 start_delay,
             )
             if dispatch_timeout_seconds is not None:
-                coroutine = asyncio.wait_for(
+                return await asyncio.wait_for(
                     coroutine,
                     timeout=max(float(dispatch_timeout_seconds), 0.001),
                 )
-            result = asyncio.run(coroutine)
-            logger.info(
-                "start_activity_completed",
-                activity_name=activity_name,
-                workflow_id=result,
-                context="sync",
-            )
-            return result
+            return await coroutine
+
+        result = _run_async_in_sync_context(dispatch)
+        logger.info(
+            "start_activity_completed",
+            activity_name=activity_name,
+            workflow_id=result,
+            context="sync_bridge",
+        )
+        return result
     except Exception as e:
         logger.exception(
             "start_activity_failed", activity_name=activity_name, error=str(e)
@@ -285,23 +237,14 @@ def start_activity_sync(
 ) -> str:
     """
     Synchronous version of start_activity.
-    Always creates a new event loop.
+    Uses the persistent synchronous Temporal bridge loop.
     """
-    kwargs = kwargs or {}
-    task_id = task_id or f"{activity_name}-{uuid.uuid4().hex[:8]}"
-
-    queue_mapping = {
-        "tasks_s": "tasks_s",
-        "tasks_l": "tasks_l",
-        "tasks_xl": "tasks_xl",
-        "default": "default",
-        "trace_ingestion": "trace_ingestion",
-        "agent_compass": "agent_compass",
-    }
-    temporal_queue = queue_mapping.get(queue, queue)
-
-    return asyncio.run(
-        _start_activity_async(activity_name, args, kwargs, temporal_queue, task_id)
+    return start_activity(
+        activity_name,
+        args=args,
+        kwargs=kwargs,
+        queue=queue,
+        task_id=task_id,
     )
 
 
