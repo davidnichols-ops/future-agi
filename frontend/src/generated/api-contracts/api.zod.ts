@@ -42712,8 +42712,7 @@ export const TracerTraceGetPropertiesResponse = zod.object({
 
 
 /**
- * Export traces filtered by project ID with optimized queries.
-Auto-detects voice/conversation projects and exports voice-specific fields.
+ * Fail closed until a complete ClickHouse trace exporter is available.
  */
 export const TracerTraceGetTraceExportDataQueryParams = zod.object({
   "page": zod.number().optional().describe('A page number within the paginated result set.'),

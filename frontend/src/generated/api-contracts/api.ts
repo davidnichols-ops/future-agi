@@ -64218,15 +64218,30 @@ export type tracerProjectGetGraphDataResponse200 = {
   status: 200
 }
 
+export type tracerProjectGetGraphDataResponse400 = {
+  data: ApiErrorResponseApi
+  status: 400
+}
+
+export type tracerProjectGetGraphDataResponse500 = {
+  data: ApiErrorResponseApi
+  status: 500
+}
+
+export type tracerProjectGetGraphDataResponse503 = {
+  data: ApiErrorResponseApi
+  status: 503
+}
+
 export type tracerProjectGetGraphDataResponseDefault = {
   data: ManagementAPIErrorResponseApi
-  status: Exclude<HTTPStatusCodes, 200>
+  status: Exclude<HTTPStatusCodes, 200 | 400 | 500 | 503>
 }
 
 export type tracerProjectGetGraphDataResponseSuccess = (tracerProjectGetGraphDataResponse200) & {
   headers: Headers;
 };
-export type tracerProjectGetGraphDataResponseError = (tracerProjectGetGraphDataResponseDefault) & {
+export type tracerProjectGetGraphDataResponseError = (tracerProjectGetGraphDataResponse400 | tracerProjectGetGraphDataResponse500 | tracerProjectGetGraphDataResponse503 | tracerProjectGetGraphDataResponseDefault) & {
   headers: Headers;
 };
 
@@ -67256,8 +67271,7 @@ export const getTracerTraceGetTraceExportDataUrl = (params?: TracerTraceGetTrace
 }
 
 /**
- * Export traces filtered by project ID with optimized queries.
-Auto-detects voice/conversation projects and exports voice-specific fields.
+ * Fail closed until a complete ClickHouse trace exporter is available.
  */
 export const tracerTraceGetTraceExportData = async (params?: TracerTraceGetTraceExportDataParams, options?: RequestInit): Promise<tracerTraceGetTraceExportDataResponse> => {
 
