@@ -52448,6 +52448,11 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "type": "string",
           "readOnly": true
         },
+        "model_deprecated": {
+          "title": "Model deprecated",
+          "type": "boolean",
+          "readOnly": true
+        },
         "column_id": {
           "title": "Column id",
           "type": "string",
@@ -81442,6 +81447,11 @@ export const OPENAPI_CONTRACT = Object.freeze({
           "readOnly": true,
           "minLength": 1,
           "x-nullable": true
+        },
+        "model_deprecated": {
+          "title": "Model deprecated",
+          "type": "boolean",
+          "readOnly": true
         },
         "provider_logo": {
           "title": "Provider logo",

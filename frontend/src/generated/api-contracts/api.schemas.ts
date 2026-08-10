@@ -7750,6 +7750,7 @@ export interface DatasetOptimizationListApi {
   readonly trial_count?: string;
   optimizer_algorithm?: DatasetOptimizationListApiOptimizerAlgorithm;
   readonly optimizer_model_id?: string;
+  readonly model_deprecated?: boolean;
   readonly column_id?: string;
   status?: DatasetOptimizationListApiStatus;
   error_message?: string;
@@ -7861,6 +7862,7 @@ export interface DatasetOptimizationDetailApi {
   readonly optimiser_type?: string;
   /** @minLength 1 */
   readonly model?: string;
+  readonly model_deprecated?: boolean;
   /** @minLength 1 */
   readonly provider_logo?: string;
   readonly configuration?: DatasetOptimizationDetailApiConfiguration;
