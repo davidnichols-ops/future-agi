@@ -315,17 +315,21 @@ def user_logout(request):
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def activate_account(request, uidb64, token):
-    # Rate-limit by IP: 10 requests per minute.
-    ip = request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", ""))
-    if ip:
-        ip = ip.split(",")[0].strip()
-    rate_key = f"activate_account_rate:{ip}"
-    attempts = cache.get(rate_key, 0)
-    if attempts >= 10:
-        return _gm.too_many_requests(
-            "Too many activation attempts. Please try again later."
+    # Rate-limit by IP: 10 requests per minute. Skipped in OSS mode where all
+    # traffic shares a single IP (localhost / Docker gateway).
+    if not is_oss():
+        ip = request.META.get(
+            "HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "")
         )
-    cache.set(rate_key, attempts + 1, timeout=60)
+        if ip:
+            ip = ip.split(",")[0].strip()
+        rate_key = f"activate_account_rate:{ip}"
+        attempts = cache.get(rate_key, 0)
+        if attempts >= 10:
+            return _gm.too_many_requests(
+                "Too many activation attempts. Please try again later."
+            )
+        cache.set(rate_key, attempts + 1, timeout=60)
 
     try:
         # Decode the uidb64 to the user ID
