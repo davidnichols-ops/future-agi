@@ -3,7 +3,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("tracer", "0095_merge_20260722_1400"),
+        ("tracer", "0096_repair_scanner_cluster_error_count"),
     ]
 
     operations = [
