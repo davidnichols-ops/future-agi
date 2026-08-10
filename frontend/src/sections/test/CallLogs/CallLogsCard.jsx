@@ -207,8 +207,6 @@ const CallLogsCard = ({ log }) => {
           open={open}
           onClose={() => setOpen(false)}
           transcript={filteredTranscript}
-          agentName={agentDefinitionUsedName}
-          simulatorName={simulatorAgentName}
           simulationCallType={simulationCallType}
         />
       </Suspense>
