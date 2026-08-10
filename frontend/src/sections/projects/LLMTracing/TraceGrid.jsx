@@ -56,6 +56,10 @@ import {
   parseAxiosResult,
   parseTraceObserveListResponse,
 } from "src/api/project/observe-contracts";
+import {
+  getCanonicalColumnSnapshot,
+  mergeColumnsWithAuthoritativeConfig,
+} from "./defaultColumns";
 
 const ROWS_LIMIT = 25;
 const traceRowIdentity = (row) => {
@@ -87,6 +91,7 @@ const TraceGrid = React.forwardRef(
       metricFilters,
       pendingCustomColumnsRef,
       canonicalOrderRef,
+      canonicalColumnsRef,
       enabled = true,
       showErrors = false,
     },
@@ -123,6 +128,7 @@ const TraceGrid = React.forwardRef(
 
     // Use ref to track latest columns for comparison without triggering dataSource recreation
     const columnsRef = useRef(columns);
+    const authoritativeConfigProjectRef = useRef(null);
     useEffect(() => {
       columnsRef.current = columns;
     }, [columns]);
@@ -383,54 +389,46 @@ const TraceGrid = React.forwardRef(
               // Use ref to get latest columns for comparison without triggering dataSource recreation
               // Compare only non-custom columns to avoid unnecessary re-renders
               if (newCols) {
-                // Canonical order, to restore default when leaving a saved view.
+                // The response config is authoritative and has not had saved-
+                // view state applied. Capture it even on a cold saved-view load.
+                const canonical = getCanonicalColumnSnapshot(newCols);
                 if (canonicalOrderRef)
-                  canonicalOrderRef.current = newCols.map((c) => c.id);
-                const currentNonCustom = (columnsRef.current || []).filter(
-                  (c) => c.groupBy !== "Custom Columns",
-                );
-                const existingCustom = (columnsRef.current || []).filter(
-                  (c) => c.groupBy === "Custom Columns",
-                );
+                  canonicalOrderRef.current = canonical.order;
+                if (canonicalColumnsRef)
+                  canonicalColumnsRef.current = canonical.columns;
+                const firstAuthoritativeConfig =
+                  authoritativeConfigProjectRef.current !== projectId;
+                authoritativeConfigProjectRef.current = projectId;
+                const currentColumns = columnsRef.current || [];
                 const pending = pendingCustomColumnsRef?.current || [];
-                const existingIds = new Set(existingCustom.map((c) => c.id));
-                const dedupedPending = pending.filter(
-                  (c) => !existingIds.has(c.id),
-                );
                 // Diff by ID set — order isn't a schema change (TH-4996).
                 const newIds = new Set(newCols.map((c) => c.id));
-                const currentIdSet = new Set(currentNonCustom.map((c) => c.id));
+                // A persisted custom may now be a first-class API field. Count
+                // that id as represented so the collision alias doesn't make
+                // every subsequent page look like a schema change.
+                const currentIdSet = new Set(
+                  currentColumns
+                    .filter(
+                      (column) =>
+                        column.groupBy !== "Custom Columns" ||
+                        newIds.has(column.id),
+                    )
+                    .map((column) => column.id),
+                );
                 const idSetChanged =
                   newIds.size !== currentIdSet.size ||
                   [...newIds].some((id) => !currentIdSet.has(id));
-                const hasPending = dedupedPending.length > 0;
-                if (idSetChanged || hasPending) {
-                  const allCustom = [...existingCustom, ...dedupedPending];
+                const hasPending = pending.length > 0;
+                if (idSetChanged || hasPending || firstAuthoritativeConfig) {
                   if (pending.length > 0 && pendingCustomColumnsRef) {
                     pendingCustomColumnsRef.current = [];
                   }
-                  let finalNonCustom;
-                  if (idSetChanged) {
-                    const newById = new Map(newCols.map((nc) => [nc.id, nc]));
-                    const seen = new Set();
-                    const kept = currentNonCustom
-                      .filter((cc) => newById.has(cc.id))
-                      .map((cc) => {
-                        seen.add(cc.id);
-                        return {
-                          ...newById.get(cc.id),
-                          isVisible: cc.isVisible,
-                        };
-                      });
-                    const added = newCols.filter((nc) => !seen.has(nc.id));
-                    finalNonCustom = [...kept, ...added];
-                  } else {
-                    finalNonCustom = currentNonCustom;
-                  }
                   setColumns(
-                    allCustom.length > 0
-                      ? [...finalNonCustom, ...allCustom]
-                      : finalNonCustom,
+                    mergeColumnsWithAuthoritativeConfig(
+                      currentColumns,
+                      newCols,
+                      pending,
+                    ),
                   );
                 }
               }

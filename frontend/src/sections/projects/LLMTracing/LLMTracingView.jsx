@@ -157,10 +157,24 @@ import {
   restampColumns,
   columnStateToHideMap,
   reorderColumns,
-  mergePersistedCustomColumns,
   isColumnVisibilityDirty,
   isColumnOrderDirty,
 } from "./savedViewColumns";
+import {
+  addCustomColumnsToTab,
+  clearSavedViewCustomColumns,
+  clearSavedColumnHydrationRefs,
+  createInitialTracingColumns,
+  getCanonicalColumnSnapshot,
+  getCustomColumnsByTab as selectCustomColumnsByTab,
+  mergeAuthoritativeNonCustomColumns,
+  mergeColumnsWithAuthoritativeConfig,
+  removeCustomColumnsFromTab,
+  resetColumnsForTab,
+  restoreCanonicalColumnVisibility,
+  SPAN_BUILT_IN_COLUMNS,
+  TRACE_BUILT_IN_COLUMNS,
+} from "./defaultColumns";
 import TracingControls from "./TracingControls";
 import ObserveToolbar from "./ObserveToolbar";
 import { selectPanelGraphFilters } from "./GraphSection/graphFilterUtils";
@@ -944,35 +958,31 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   //     window.removeEventListener("mouseup", handleMouseUp);
   //   };
   // }, [handleMouseMove, handleMouseUp]);
-  const [columns, setColumns] = useState({
-    "primary-trace": [],
-    "compare-trace": [],
-    "primary-spans": [],
-    "compare-spans": [],
-  });
+  const [columns, setColumns] = useState(createInitialTracingColumns);
 
   const handleAddCustomColumns = useCallback(
     (newCols) => {
-      const ck = `${selectedGraph}-${selectedTab === "spans" ? "spans" : "trace"}`;
-      setColumns((prev) => {
-        const existingIds = new Set((prev[ck] || []).map((c) => c.id));
-        const deduped = newCols.filter((c) => !existingIds.has(c.id));
-        return { ...prev, [ck]: [...(prev[ck] || []), ...deduped] };
-      });
+      setColumns((prev) => addCustomColumnsToTab(prev, selectedTab, newCols));
     },
-    [selectedGraph, selectedTab],
+    [selectedTab],
   );
 
   const handleRemoveCustomColumns = useCallback(
     (removeIds) => {
-      const ck = `${selectedGraph}-${selectedTab === "spans" ? "spans" : "trace"}`;
-      const removeSet = new Set(removeIds);
-      setColumns((prev) => ({
-        ...prev,
-        [ck]: (prev[ck] || []).filter((c) => !removeSet.has(c.id)),
-      }));
+      const canonicalColumns =
+        selectedTab === "spans"
+          ? canonicalSpanColumnsRef.current
+          : canonicalTraceColumnsRef.current;
+      setColumns((prev) =>
+        removeCustomColumnsFromTab(
+          prev,
+          selectedTab,
+          removeIds,
+          canonicalColumns,
+        ),
+      );
     },
-    [selectedGraph, selectedTab],
+    [selectedTab],
   );
 
   const [selectedPrimaryInterval, setSelectedPrimaryInterval] = useUrlState(
@@ -1008,6 +1018,13 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   // Canonical order per grid, to restore default when leaving a saved view.
   const canonicalTraceOrderRef = useRef(null);
   const canonicalSpanOrderRef = useRef(null);
+  const canonicalTraceColumnsRef = useRef(
+    TRACE_BUILT_IN_COLUMNS.map((column) => ({ ...column })),
+  );
+  const canonicalSpanColumnsRef = useRef(
+    SPAN_BUILT_IN_COLUMNS.map((column) => ({ ...column })),
+  );
+  const simulatorConfigProjectRef = useRef(null);
   // Cols the user manually toggled; the saved-view re-stamp skips these.
   const userToggledColsRef = useRef(new Set());
 
@@ -1332,24 +1349,31 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
   const handleSimulatorConfigLoaded = useCallback(
     (config) => {
       if (projectSource === PROJECT_SOURCE.SIMULATOR && config?.length > 0) {
+        // CallLogsGrid reports its pristine definitions before external saved-
+        // view visibility/order is applied. Capture them even on a cold saved-
+        // view entry so leaving the view restores hidden voice ids and order.
+        const canonical = getCanonicalColumnSnapshot(config);
+        canonicalTraceColumnsRef.current = canonical.columns;
+        canonicalTraceOrderRef.current = canonical.order;
+        const isFirstProjectConfig =
+          simulatorConfigProjectRef.current !== observeId;
+        simulatorConfigProjectRef.current = observeId;
         setColumns((prev) => {
           // Voice projects use CallLogsGrid (no per-fetch merge to drain
           // pending custom cols), so this callback is the only path that
           // drains them on backend column-count changes.
           const drainPending = (key, ref) => {
             const existing = prev[key] || [];
-            const customCols = existing.filter(
-              (c) => c.groupBy === "Custom Columns",
-            );
             const pending = ref?.current || [];
-            const existingIds = new Set(customCols.map((c) => c.id));
-            const dedupedPending = pending.filter(
-              (c) => !existingIds.has(c.id),
-            );
             if (pending.length > 0 && ref) {
               ref.current = [];
             }
-            return [...config, ...customCols, ...dedupedPending];
+            return mergeColumnsWithAuthoritativeConfig(
+              existing,
+              config,
+              pending,
+              { preserveCurrentOrder: !isFirstProjectConfig },
+            );
           };
           const drained = {
             ...prev,
@@ -1374,7 +1398,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
         });
       }
     },
-    [projectSource],
+    [observeId, projectSource],
   );
 
   const queryClient = useQueryClient();
@@ -1882,14 +1906,21 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       setColumns((prev) => {
         const next = {};
         Object.keys(prev).forEach((ck) => {
-          const stripped = (prev[ck] || [])
-            .filter((c) => c.groupBy !== "Custom Columns")
-            .map((c) => (c.isVisible ? c : { ...c, isVisible: true }));
+          const stripped = (prev[ck] || []).filter(
+            (c) => c.groupBy !== "Custom Columns",
+          );
+          const canonicalColumns = ck.includes("spans")
+            ? canonicalSpanColumnsRef.current
+            : canonicalTraceColumnsRef.current;
+          const restored = restoreCanonicalColumnVisibility(
+            mergeAuthoritativeNonCustomColumns(stripped, canonicalColumns),
+            canonicalColumns,
+          );
           // Restore default order (the saved view's order was baked into the slot).
           const canonical = ck.includes("spans")
             ? canonicalSpanOrderRef.current
             : canonicalTraceOrderRef.current;
-          next[ck] = reorderColumns(stripped, canonical);
+          next[ck] = reorderColumns(restored, canonical);
         });
         return next;
       });
@@ -1934,25 +1965,58 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       // count changes, so saved-view → default transitions need an explicit
       // drain here.
       if (projectSource === PROJECT_SOURCE.SIMULATOR) {
-        const draining = primaryTracePendingRef.current || [];
-        if (draining.length > 0) {
+        const primaryPending = primaryTracePendingRef.current || [];
+        const comparePending = compareTracePendingRef.current || [];
+        if (primaryPending.length > 0 || comparePending.length > 0) {
           setColumns((prev) => {
-            const merge = (key) => {
-              const existing = prev[key] || [];
-              const stripped = existing.filter(
-                (c) => c.groupBy !== "Custom Columns",
-              );
-              return [...stripped, ...draining];
-            };
             return {
               ...prev,
-              "primary-trace": merge("primary-trace"),
-              "compare-trace": merge("compare-trace"),
+              "primary-trace": mergeColumnsWithAuthoritativeConfig(
+                prev["primary-trace"],
+                canonicalTraceColumnsRef.current,
+                primaryPending,
+              ),
+              "compare-trace": mergeColumnsWithAuthoritativeConfig(
+                prev["compare-trace"],
+                canonicalTraceColumnsRef.current,
+                comparePending,
+              ),
             };
           });
           primaryTracePendingRef.current = [];
           compareTracePendingRef.current = [];
         }
+      } else {
+        // The initialized fallback means all four slots are warm even if their
+        // lazy grids never refetch after leaving a saved view. Merge stored
+        // customs immediately instead of waiting forever in pending refs.
+        const targets = [
+          ["primary-trace", primaryTracePendingRef],
+          ["compare-trace", compareTracePendingRef],
+          ["primary-spans", primarySpansPendingRef],
+          ["compare-spans", compareSpansPendingRef],
+        ];
+        setColumns((prev) => {
+          let next = prev;
+          targets.forEach(([slotKey, pendingRef]) => {
+            const pending = pendingRef.current || [];
+            if (pending.length === 0) return;
+            const canonicalColumns = slotKey.includes("spans")
+              ? canonicalSpanColumnsRef.current
+              : canonicalTraceColumnsRef.current;
+            const merged = mergeColumnsWithAuthoritativeConfig(
+              prev[slotKey],
+              canonicalColumns,
+              pending,
+            );
+            if (merged !== prev[slotKey]) {
+              if (next === prev) next = { ...prev };
+              next[slotKey] = merged;
+            }
+            pendingRef.current = [];
+          });
+          return next;
+        });
       }
       const activeApi =
         selectedTab === "trace"
@@ -1991,15 +2055,13 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
 
     // Strip customs from all slots + reset all pending refs so a prior view's
     // queued customs can't drain into this view's slot.
-    setColumns((prev) => {
-      const next = {};
-      Object.keys(prev).forEach((ck) => {
-        next[ck] = (prev[ck] || []).filter(
-          (c) => c.groupBy !== "Custom Columns",
-        );
-      });
-      return next;
-    });
+    setColumns((prev) =>
+      clearSavedViewCustomColumns(
+        prev,
+        canonicalTraceColumnsRef.current,
+        canonicalSpanColumnsRef.current,
+      ),
+    );
     primaryTracePendingRef.current = [];
     compareTracePendingRef.current = [];
     primarySpansPendingRef.current = [];
@@ -2023,46 +2085,27 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
             ];
       setColumns((prev) => {
         const next = { ...prev };
+        const canonicalColumns =
+          viewTabType === "trace"
+            ? canonicalTraceColumnsRef.current
+            : canonicalSpanColumnsRef.current;
         targets.forEach(([slot, pendingRef]) => {
           const fresh = display.customColumns.map((c) => ({ ...c }));
           const nonCustom = (prev[slot] || []).filter(
             (c) => c.groupBy !== "Custom Columns",
           );
           if (nonCustom.length > 0) {
-            next[slot] = [...nonCustom, ...fresh];
+            next[slot] = mergeColumnsWithAuthoritativeConfig(
+              nonCustom,
+              canonicalColumns,
+              fresh,
+            );
           } else {
             pendingRef.current = fresh;
           }
         });
         return next;
       });
-    }
-
-    // Voice/simulator: same-tab-type saved-view switch doesn't trigger
-    // handleSimulatorConfigLoaded, so drain into columns directly.
-    if (
-      projectSource === PROJECT_SOURCE.SIMULATOR &&
-      display.customColumns?.length > 0
-    ) {
-      setColumns((prev) => {
-        const merge = (key) => {
-          const existing = prev[key] || [];
-          const stripped = existing.filter(
-            (c) => c.groupBy !== "Custom Columns",
-          );
-          const fresh = display.customColumns.map((c) => ({ ...c }));
-          return [...stripped, ...fresh];
-        };
-        return {
-          ...prev,
-          "primary-trace": merge("primary-trace"),
-          "compare-trace": merge("compare-trace"),
-        };
-      });
-      // Clear pending refs so handleSimulatorConfigLoaded doesn't drain
-      // them again on a later config callback.
-      primaryTracePendingRef.current = [];
-      compareTracePendingRef.current = [];
     }
 
     // Bake visibility + order into `columns` (applyColumnState alone is clobbered
@@ -2351,7 +2394,14 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
               (col) => col?.groupBy !== "Custom Columns",
             );
             if (!hasBaseColumns) return;
-            const merged = mergePersistedCustomColumns(slot, persisted);
+            const canonicalColumns = slotKey.includes("spans")
+              ? canonicalSpanColumnsRef.current
+              : canonicalTraceColumnsRef.current;
+            const merged = mergeColumnsWithAuthoritativeConfig(
+              slot,
+              canonicalColumns,
+              persisted,
+            );
             if (merged !== slot) {
               if (next === prev) next = { ...prev };
               next[slotKey] = merged;
@@ -2428,24 +2478,15 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
 
   // Helper: get current custom columns
   const getCustomColumns = useCallback(() => {
-    const ck = `${selectedGraph}-${selectedTab === "spans" ? "spans" : "trace"}`;
-    return (columns[ck] || []).filter((c) => c.groupBy === "Custom Columns");
-  }, [columns, selectedGraph, selectedTab]);
+    const customByTab = selectCustomColumnsByTab(columns);
+    return selectedTab === "spans" ? customByTab.spans : customByTab.trace;
+  }, [columns, selectedTab]);
 
   // Used by the localStorage save so adding customs on one tab doesn't
   // wipe the other's customs (storage key is project-scoped, not tab-scoped).
   const getCustomColumnsByTab = useCallback(() => {
-    const traceKey = `${selectedGraph}-trace`;
-    const spansKey = `${selectedGraph}-spans`;
-    return {
-      trace: (columns[traceKey] || []).filter(
-        (c) => c.groupBy === "Custom Columns",
-      ),
-      spans: (columns[spansKey] || []).filter(
-        (c) => c.groupBy === "Custom Columns",
-      ),
-    };
-  }, [columns, selectedGraph]);
+    return selectCustomColumnsByTab(columns);
+  }, [columns]);
 
   const { mutate: updateSavedView } = useUpdateSavedView(observeId);
   const { mutate: createSavedView } = useCreateSavedView(observeId);
@@ -2641,12 +2682,41 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     setCellHeight(DEFAULT_DISPLAY_CONFIG.cellHeight);
     setShowErrors(DEFAULT_DISPLAY_CONFIG.showErrors);
     setShowNonAnnotated(DEFAULT_DISPLAY_CONFIG.showNonAnnotated);
-    // Remove custom columns
-    const ck = `${selectedGraph}-${selectedTab === "spans" ? "spans" : "trace"}`;
-    setColumns((prev) => ({
-      ...prev,
-      [ck]: (prev[ck] || []).filter((c) => c.groupBy !== "Custom Columns"),
-    }));
+    // A saved view's late-column restamp runs whenever the id set changes.
+    // Clear that hydration state before Reset removes customs, otherwise the
+    // saved hide map immediately overwrites the canonical visibility again.
+    clearSavedColumnHydrationRefs({
+      pendingColumnStateRef,
+      pendingSavedColsRef,
+      appliedIdSetKeyRef,
+      userToggledColsRef,
+    });
+    setIsHydratingView(false);
+    if (selectedTab === "spans") {
+      primarySpansPendingRef.current = [];
+      compareSpansPendingRef.current = [];
+    } else {
+      primaryTracePendingRef.current = [];
+      compareTracePendingRef.current = [];
+    }
+    // Primary/compare share one persisted custom-column selection per tab.
+    const canonicalColumns =
+      selectedTab === "spans"
+        ? canonicalSpanColumnsRef.current
+        : canonicalTraceColumnsRef.current;
+    setColumns((prev) =>
+      resetColumnsForTab(prev, selectedTab, canonicalColumns),
+    );
+    const gridRefs =
+      selectedTab === "spans"
+        ? [primarySpanGridRef, compareSpanGridRef]
+        : [
+            primaryTraceGridRef,
+            compareTraceGridRef,
+            primaryCallLogsGridRef,
+            compareCallLogsGridRef,
+          ];
+    gridRefs.forEach((ref) => ref.current?.api?.resetColumnState?.());
     try {
       localStorage.removeItem(displayStorageKey);
     } catch {
@@ -2658,7 +2728,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
       /* noop */
     }
     enqueueSnackbar("View reset to defaults", { variant: "info" });
-  }, [selectedGraph, selectedTab, displayStorageKey, filtersStorageKey]);
+  }, [selectedTab, displayStorageKey, filtersStorageKey]);
 
   const handleSetDefaultView = useCallback(() => {
     const configPayload = buildViewConfig();
@@ -4589,6 +4659,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     metricFilters={metricFilters}
                     pendingCustomColumnsRef={primaryTracePendingRef}
                     canonicalOrderRef={canonicalTraceOrderRef}
+                    canonicalColumnsRef={canonicalTraceColumnsRef}
                     showErrors={showErrors}
                     enabled={traceListProjectReady && selectedTab === "trace"}
                   />
@@ -4623,6 +4694,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     metricFilters={metricFilters}
                     pendingCustomColumnsRef={compareTracePendingRef}
                     canonicalOrderRef={canonicalTraceOrderRef}
+                    canonicalColumnsRef={canonicalTraceColumnsRef}
                     projectId={observeId}
                     showErrors={showErrors}
                     enabled={
@@ -4686,6 +4758,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     metricFilters={metricFilters}
                     pendingCustomColumnsRef={primarySpansPendingRef}
                     canonicalOrderRef={canonicalSpanOrderRef}
+                    canonicalColumnsRef={canonicalSpanColumnsRef}
                     setFilters={setPrimarySpanFilters}
                     setExtraFilters={setExtraFilters}
                     setFilterOpen={setIsPrimaryFilterOpen}
@@ -4716,6 +4789,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     metricFilters={metricFilters}
                     pendingCustomColumnsRef={compareSpansPendingRef}
                     canonicalOrderRef={canonicalSpanOrderRef}
+                    canonicalColumnsRef={canonicalSpanColumnsRef}
                     filters={compareSpansValidatedFilters}
                     extraFilters={compareExtraFilters}
                     ref={compareSpanGridRef}
