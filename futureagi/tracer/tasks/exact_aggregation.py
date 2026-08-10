@@ -13,8 +13,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import structlog
-
 from tfc.temporal import temporal_activity
+
 from tracer.services.exact_aggregation_cache import (
     EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS,
     EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS,
@@ -37,6 +37,7 @@ def _reauthorize_exact_observe_project(identity: dict[str, Any]) -> None:
     """Re-resolve the trusted tenant scope before any Observe ClickHouse read."""
 
     from accounts.models import Organization, Workspace
+
     from tracer.utils.workspace_scope import project_queryset_for_request
 
     organization_id = identity.get("organization_id")
@@ -147,6 +148,7 @@ def _observe_payload(namespace: str, identity: dict[str, Any]) -> Any:
 
 def _dashboard_payload(identity: dict[str, Any]) -> Any:
     from accounts.models import Workspace
+
     from tracer.views.dashboard import DashboardWidgetViewSet
 
     workspace = Workspace.objects.select_related("organization").get(
@@ -215,6 +217,7 @@ def _attribute_detail_payload(identity: dict[str, Any]) -> Any:
     """Re-authorize then compute one exact span-attribute snapshot."""
 
     from accounts.models import Workspace
+
     from tracer.services.clickhouse.exact_attribute_detail import (
         read_exact_attribute_detail,
     )

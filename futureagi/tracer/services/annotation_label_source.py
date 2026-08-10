@@ -220,7 +220,6 @@ class AnnotationLabelScoresProjectPG:
 
         from django.db.models import CharField, Q, Value
         from django.db.models.functions import Cast, Concat
-
         from model_hub.models.score import Score
 
         unique_trace_ids = tuple(

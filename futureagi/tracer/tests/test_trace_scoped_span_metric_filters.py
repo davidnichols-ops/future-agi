@@ -64,6 +64,7 @@ def _span_builder() -> ClickHouseFilterBuilder:
 @pytest.mark.unit
 def test_span_eval_filter_matches_trace_and_span_pair(monkeypatch):
     from model_hub.models.evals_metric import EvalTemplate
+
     from tracer.models.custom_eval_config import CustomEvalConfig
 
     eval_id = str(uuid.uuid4())

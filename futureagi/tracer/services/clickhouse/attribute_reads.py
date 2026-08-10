@@ -27,7 +27,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import structlog
-
 from tracer.services.clickhouse.attribute_cursor_state import (
     ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS,
 )

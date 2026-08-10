@@ -9742,6 +9742,7 @@ class TestFilterValuesEvalBranches:
     @staticmethod
     def _eval_config(project, organization, workspace, *, output, choices=None):
         from model_hub.models.evals_metric import EvalTemplate
+
         from tracer.models.custom_eval_config import CustomEvalConfig
 
         template = EvalTemplate.no_workspace_objects.create(

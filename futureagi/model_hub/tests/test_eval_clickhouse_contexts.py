@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
 from model_hub.selectors.eval_list_charts import read_eval_list_charts
 from model_hub.serializers.contracts import (
@@ -10,7 +11,6 @@ from model_hub.serializers.contracts import (
     LegacyEvalTemplatesRequestSerializer,
 )
 from model_hub.views.separate_evals import EvalTemplateListChartsView
-from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
 
 class _FakeClickHouseClient:

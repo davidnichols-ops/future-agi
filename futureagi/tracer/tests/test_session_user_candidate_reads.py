@@ -948,6 +948,7 @@ def test_session_annotation_leaves_combine_with_namespaced_params():
 @override_settings(CH25_EVAL_LOGGER_TABLE="tracer_eval_logger_v2")
 def test_session_eval_value_filter_uses_candidate_trace_cte(monkeypatch):
     from model_hub.models.evals_metric import EvalTemplate
+
     from tracer.models.custom_eval_config import CustomEvalConfig
 
     class _Values(list):

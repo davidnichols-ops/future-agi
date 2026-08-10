@@ -491,7 +491,6 @@ def _ensure_test_score_tenant_column():
     """
     try:
         import clickhouse_connect
-
         from tracer.services.clickhouse.schema import CDC_MODEL_HUB_SCORE
         from tracer.services.clickhouse.v2 import get_v2_config
 

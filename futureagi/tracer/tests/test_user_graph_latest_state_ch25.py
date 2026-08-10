@@ -10,8 +10,8 @@ from time import monotonic, sleep
 
 import pytest
 from clickhouse_driver import Client
-
 from conftest import _require_safe_ch25_test_target
+
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
 from tracer.services.clickhouse.query_builders.user_list import UserListQueryBuilder
 from tracer.services.clickhouse.v2.query_builders.agent_graph import (

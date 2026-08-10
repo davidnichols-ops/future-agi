@@ -6,14 +6,14 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-
-from model_hub.views.ai_filter import _fetch_trace_field_values
 from tracer.services.clickhouse.attribute_reads import (
     AttributeReadMetadata,
     AttributeValueRead,
     AttributeValueRow,
 )
 from tracer.services.clickhouse.filter_value_reads import FilterValueRead
+
+from model_hub.views.ai_filter import _fetch_trace_field_values
 
 pytestmark = pytest.mark.unit
 

@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-
 from tfc.management.commands.start_temporal_worker import (
     _generic_all_queues,
     _workflow_cache_kwargs,

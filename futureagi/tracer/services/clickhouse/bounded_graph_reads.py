@@ -18,7 +18,6 @@ from time import monotonic
 from typing import Any
 
 import structlog
-
 from tracer.selectors.trace_filter_reads import read_bounded_filter_page
 from tracer.services.clickhouse.query_builders.base import BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (

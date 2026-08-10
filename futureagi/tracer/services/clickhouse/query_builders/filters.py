@@ -1772,7 +1772,6 @@ class ClickHouseFilterBuilder:
         to compare the correct column in ``tracer_eval_logger``.
         """
         from django.core.exceptions import ValidationError
-
         from model_hub.models.evals_metric import EvalTemplate
         from tracer.models.custom_eval_config import CustomEvalConfig
 

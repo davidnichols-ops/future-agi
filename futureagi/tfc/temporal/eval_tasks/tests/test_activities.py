@@ -7,7 +7,6 @@ from datetime import timedelta
 
 import pytest
 from django.utils import timezone
-
 from tracer.models.eval_task import EvalTask, EvalTaskStatus
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger
 
@@ -15,10 +14,10 @@ from tracer.models.observation_span import EvalEntryStatus, EvalLogger
 @pytest.mark.asyncio
 async def test_exact_selection_budget_error_is_non_retryable(monkeypatch):
     from temporalio.exceptions import ApplicationError
+    from tracer.selectors.eval_tasks.row_resolver import EvalTaskReadBudgetExceeded
 
     import tfc.temporal.eval_tasks.activities as activities
     from tfc.temporal.eval_tasks.types import ReconcileActivityInput
-    from tracer.selectors.eval_tasks.row_resolver import EvalTaskReadBudgetExceeded
 
     class NoopHeartbeater:
         async def __aenter__(self):

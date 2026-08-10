@@ -1,5 +1,4 @@
 from rest_framework import serializers
-
 from tfc.utils.serializer_fields import JsonValueField
 from tracer.services.clickhouse.attribute_reads import (
     validate_attribute_key,

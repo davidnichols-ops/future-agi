@@ -2262,6 +2262,7 @@ def test_exact_refresh_has_a_dedicated_minimal_temporal_queue():
         _ACTIVITY_WRAPPERS,
     )
     from tfc.temporal.drop_in.workflow import TaskRunnerWorkflow
+
     from tracer.services import exact_aggregation_cache as cache_module
     from tracer.tasks.exact_aggregation import (
         EXACT_AGGREGATION_TASK_QUEUE,

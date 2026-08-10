@@ -646,7 +646,6 @@ def get_annotation_labels_by_project(
     """
 
     from django.db.models import Q
-
     from tracer.services.annotation_label_source import AnnotationLabelScoresProjectPG
 
     normalized = tuple(dict.fromkeys(str(value) for value in project_ids if value))

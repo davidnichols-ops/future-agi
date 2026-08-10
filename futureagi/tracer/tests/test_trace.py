@@ -1121,8 +1121,9 @@ def test_annotation_score_span_id_discovery_is_label_and_tracer_project_scoped(
 def test_annotation_score_span_id_discovery_is_bounded_and_fails_closed(
     monkeypatch,
 ):
-    import tracer.views.trace as trace_mod
     from model_hub.models.score import Score
+
+    import tracer.views.trace as trace_mod
 
     captured = {}
 
@@ -1160,8 +1161,9 @@ def test_annotation_score_span_id_discovery_is_bounded_and_fails_closed(
 def test_annotation_score_span_id_discovery_fails_closed_without_project_scope(
     monkeypatch,
 ):
-    import tracer.views.trace as trace_mod
     from model_hub.models.score import Score
+
+    import tracer.views.trace as trace_mod
 
     class ForbiddenManager:
         def filter(self, **_kwargs):
@@ -1176,8 +1178,9 @@ def test_annotation_score_span_id_discovery_fails_closed_without_project_scope(
 def test_annotation_score_span_id_discovery_org_is_candidate_project_scoped(
     monkeypatch,
 ):
-    import tracer.views.trace as trace_mod
     from model_hub.models.score import Score
+
+    import tracer.views.trace as trace_mod
 
     captured = {}
 
@@ -1241,8 +1244,9 @@ def test_annotation_score_span_id_discovery_org_is_candidate_project_scoped(
 def test_annotation_score_span_id_discovery_org_high_cardinality_fails_closed(
     monkeypatch,
 ):
-    import tracer.views.trace as trace_mod
     from model_hub.models.score import Score
+
+    import tracer.views.trace as trace_mod
 
     class FakeValues:
         def order_by(self):
@@ -1282,8 +1286,9 @@ def test_annotation_score_span_id_discovery_org_high_cardinality_fails_closed(
 
 def test_build_annotation_map_pg_has_no_observation_span_join(monkeypatch):
     """Regression: _build_annotation_map_from_scores_pg must not JOIN the dropped table."""
-    import tracer.views.trace as trace_mod
     from model_hub.models.score import Score
+
+    import tracer.views.trace as trace_mod
 
     captured = {}
     real_manager = Score.no_workspace_objects  # capture BEFORE patching
@@ -1312,8 +1317,9 @@ def test_build_annotation_map_pg_has_no_observation_span_join(monkeypatch):
 def test_build_annotation_map_pg_org_two_projects_is_tenant_exact(monkeypatch):
     from types import SimpleNamespace
 
-    import tracer.views.trace as trace_mod
     from model_hub.models.score import Score
+
+    import tracer.views.trace as trace_mod
 
     scores = [
         SimpleNamespace(
@@ -1411,9 +1417,9 @@ def test_build_annotation_map_pg_org_two_projects_is_tenant_exact(monkeypatch):
 
 def test_build_annotation_map_pg_org_query_shape_scales_with_projects(monkeypatch):
     from django.db.models import Q
+    from model_hub.models.score import Score
 
     import tracer.views.trace as trace_mod
-    from model_hub.models.score import Score
 
     captured = {}
 
@@ -1476,8 +1482,9 @@ def test_build_annotation_map_pg_org_query_shape_scales_with_projects(monkeypatc
 def test_build_annotation_map_preserves_all_high_fanout_span_scores(monkeypatch):
     from types import SimpleNamespace
 
-    import tracer.views.trace as trace_mod
     from model_hub.models.score import Score
+
+    import tracer.views.trace as trace_mod
 
     trace_id = "22222222-2222-2222-2222-222222222222"
     label_id = "33333333-3333-3333-3333-333333333333"

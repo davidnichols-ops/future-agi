@@ -9,17 +9,17 @@ from types import SimpleNamespace
 
 import pytest
 from clickhouse_driver import Client
-
-from model_hub.services.bulk_selection import (
-    BulkSelectionAmbiguousIdentity,
-    _resolve_span_ids_clickhouse,
-)
 from tracer.selectors.trace_filter_reads import read_bounded_filter_page
 from tracer.services.clickhouse.v2.query_builders.span_list import (
     SpanListQueryBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
+)
+
+from model_hub.services.bulk_selection import (
+    BulkSelectionAmbiguousIdentity,
+    _resolve_span_ids_clickhouse,
 )
 
 pytestmark = pytest.mark.integration

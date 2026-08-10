@@ -399,7 +399,6 @@ def _bridge_retired_dispatcher(eval_task: EvalTask) -> bool:
         return True
 
     from temporalio.exceptions import WorkflowAlreadyStartedError
-
     from tfc.temporal.eval_tasks.client import start_eval_task_workflow_sync
 
     try:

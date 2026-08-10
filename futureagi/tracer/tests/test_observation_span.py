@@ -163,6 +163,7 @@ class TestObservationSpanWorkspaceScopeAPI:
     ):
         """API-key requests without a workspace cannot see another tenant."""
         from accounts.models.organization import Organization
+
         from tracer.views.observation_span import _project_workspace_scope_q
 
         foreign_organization = Organization.objects.create(

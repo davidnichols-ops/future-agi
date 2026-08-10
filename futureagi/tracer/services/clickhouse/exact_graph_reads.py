@@ -28,7 +28,6 @@ from typing import Any
 
 import structlog
 from django.db import DatabaseError, connection, transaction
-
 from model_hub.models.choices import AnnotationTypeChoices
 from model_hub.models.score import Score
 from tracer.models.custom_eval_config import CustomEvalConfig

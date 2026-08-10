@@ -1530,7 +1530,6 @@ def read_or_schedule_exact_snapshot(
     if token is not None:
         try:
             from temporalio.common import WorkflowIDConflictPolicy
-
             from tracer.tasks.exact_aggregation import (
                 refresh_exact_aggregation_snapshot,
             )

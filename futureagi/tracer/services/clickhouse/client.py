@@ -12,7 +12,6 @@ from typing import Any
 
 import structlog
 from django.conf import settings
-
 from tracer.services.clickhouse.server_readonly import (
     ensure_read_statement,
     without_query_settings,

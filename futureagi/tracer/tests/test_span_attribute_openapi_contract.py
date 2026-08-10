@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 
 import pytest
-
 from tfc.utils.serializer_fields import JsonValueField
+
 from tracer.serializers.dashboard import DashboardFilterValueOptionSerializer
 from tracer.serializers.observation_span import (
     ObservationAttributeListResponseSerializer,

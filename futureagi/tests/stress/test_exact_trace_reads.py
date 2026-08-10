@@ -9,6 +9,12 @@ resource measurements.  No production credentials or customer data are used.
 from __future__ import annotations
 
 import pytest
+from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+from tracer.services.clickhouse.exact_graph_reads import read_exact_system_graph
+from tracer.services.clickhouse.v2.query_builders.trace_list import (
+    TraceListQueryBuilderV2,
+)
+from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 
 from tests.stress.budgets import (
     EXACT_TRACE_GRAPH_MAX_CH_QUERIES,
@@ -22,12 +28,6 @@ from tests.stress.budgets import (
     EXACT_TRACE_LIST_READ_ROWS_GRANULE_FLOOR,
 )
 from tests.stress.ch_asserts import BudgetResult, ch_query_budget
-from tracer.selectors.trace_filter_reads import read_bounded_filter_page
-from tracer.services.clickhouse.exact_graph_reads import read_exact_system_graph
-from tracer.services.clickhouse.v2.query_builders.trace_list import (
-    TraceListQueryBuilderV2,
-)
-from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 
 pytestmark = pytest.mark.stress
 

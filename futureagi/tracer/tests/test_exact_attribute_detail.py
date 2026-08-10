@@ -7,9 +7,9 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-
 from accounts.models.workspace import Workspace
 from model_hub.models.ai_model import AIModel
+
 from tracer.models.project import Project
 from tracer.serializers.dashboard import DashboardFilterValuesQuerySerializer
 from tracer.serializers.span_attributes import SpanAttributeDetailResponseSerializer

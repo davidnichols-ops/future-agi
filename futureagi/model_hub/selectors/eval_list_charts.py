@@ -12,7 +12,6 @@ import structlog
 from django.conf import settings
 from django.core.cache import cache
 from django.utils import timezone
-
 from tfc.constants.api_calls import APICallStatusChoices
 from tracer.services.clickhouse.client import get_clickhouse_client
 from tracer.services.clickhouse.read_budget import (

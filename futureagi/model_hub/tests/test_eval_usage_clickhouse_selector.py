@@ -9,11 +9,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from clickhouse_driver import Client
 from clickhouse_driver.errors import NetworkError, ServerException
+from tracer.services.clickhouse import trace_project_scope
+from tracer.services.clickhouse.client import ClickHouseClient
 
 from model_hub.selectors import eval_usage
 from model_hub.selectors.eval_usage import read_eval_usage
-from tracer.services.clickhouse import trace_project_scope
-from tracer.services.clickhouse.client import ClickHouseClient
 
 
 class _FakeClient:
