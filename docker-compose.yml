@@ -274,6 +274,13 @@ services:
       <<: *backend-env
       SERVICE_TYPE: temporal-worker
       TEMPORAL_TASK_QUEUE: exact_aggregation
+      # This always-on worker must never become an additional schema/migration
+      # runner. Keep literal fail-closed values here instead of inheriting the
+      # local-stack defaults from backend-env.
+      NO_STARTUP_DB_MUTATIONS: "true"
+      CH25_DROP_LEGACY_CDC_CHAIN: "false"
+      CH25_TRACE_DUAL_WRITE: "false"
+      CH_DUAL_WRITE: "false"
       # This worker is the cluster admission boundary for expensive exact reads.
       TEMPORAL_MAX_CONCURRENT_ACTIVITIES: 1
       TEMPORAL_MAX_CONCURRENT_WORKFLOW_TASKS: 1
