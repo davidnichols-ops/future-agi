@@ -68,6 +68,85 @@ describe("getAgentGraphPresentationState", () => {
     expect(state.isError).toBe(false);
   });
 
+  it("presents exhausted client polling as paused instead of failed", () => {
+    const state = getAgentGraphPresentationState({
+      data: {
+        nodes: [],
+        edges: [],
+        path_edges: [],
+        query_complete: false,
+        query_status: "pending",
+        query_sampled: false,
+        query_refreshing: true,
+        query_refresh_failed: false,
+      },
+      isLoading: false,
+      isError: false,
+      pollingPaused: true,
+    });
+
+    expect(state.data).toBeUndefined();
+    expect(state.isLoading).toBe(false);
+    expect(state.isError).toBe(false);
+    expect(state.pollingPaused).toBe(true);
+  });
+
+  it("does not let a paused marker mask a true terminal failure", () => {
+    const state = getAgentGraphPresentationState({
+      data: {
+        nodes: [],
+        edges: [],
+        path_edges: [],
+        query_complete: false,
+        query_status: "pending",
+        query_sampled: false,
+        query_refreshing: false,
+        query_refresh_failed: true,
+      },
+      isLoading: false,
+      isError: true,
+      pollingPaused: true,
+    });
+
+    expect(state.isLoading).toBe(false);
+    expect(state.isError).toBe(true);
+    expect(state.pollingPaused).toBe(false);
+  });
+
+  it("keeps a cached exact graph visible with an explicit paused marker", () => {
+    const previousExactData = {
+      nodes: [{ id: "agent:a" }],
+      edges: [],
+      path_edges: [],
+      query_complete: true,
+      query_status: "complete",
+      query_sampled: false,
+      query_refreshing: false,
+      query_refresh_failed: false,
+    };
+    const state = getAgentGraphPresentationState({
+      data: {
+        nodes: [],
+        edges: [],
+        path_edges: [],
+        query_complete: false,
+        query_status: "pending",
+        query_sampled: false,
+        query_refreshing: true,
+        query_refresh_failed: false,
+      },
+      previousExactData,
+      isLoading: false,
+      isError: false,
+      pollingPaused: true,
+    });
+
+    expect(state.data).toBe(previousExactData);
+    expect(state.isLoading).toBe(false);
+    expect(state.isError).toBe(false);
+    expect(state.pollingPaused).toBe(true);
+  });
+
   it("does not keep loading when a pending poll request fails", () => {
     const state = getAgentGraphPresentationState({
       data: {

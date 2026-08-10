@@ -3,7 +3,10 @@ import { act, fireEvent, render, screen, waitFor } from "src/utils/test-utils";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import axios from "src/utils/axios";
-import { AGGREGATION_REQUEST_TIMEOUT_MS } from "src/utils/queryReadState";
+import {
+  AGGREGATION_POLLING_PAUSED_MESSAGE,
+  AGGREGATION_REQUEST_TIMEOUT_MS,
+} from "src/utils/queryReadState";
 import GraphSection from "../GraphSection";
 
 vi.mock("react-apexcharts", () => ({
@@ -344,9 +347,12 @@ describe("GraphSection exact graph boundary", () => {
 
     const boundedRequestCount = axios.post.mock.calls.length;
     expect(boundedRequestCount).toBeLessThanOrEqual(13);
+    expect(screen.getByText(AGGREGATION_POLLING_PAUSED_MESSAGE)).toBeVisible();
     expect(
-      screen.getByText("We couldn't load this data. Please retry in a moment."),
-    ).toBeInTheDocument();
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
 
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
     expect(axios.post).toHaveBeenCalledTimes(boundedRequestCount);

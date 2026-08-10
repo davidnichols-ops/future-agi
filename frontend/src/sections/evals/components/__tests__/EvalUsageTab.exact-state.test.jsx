@@ -3,6 +3,7 @@ import PropTypes from "prop-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "src/utils/test-utils";
 import EvalUsageTab from "../EvalUsageTab";
+import { AGGREGATION_POLLING_PAUSED_MESSAGE } from "src/utils/queryReadState";
 
 const h = vi.hoisted(() => ({
   chart: {},
@@ -449,5 +450,53 @@ describe("EvalUsageTab exact read states", () => {
     expect(screen.queryByText(/No data to show/i)).not.toBeInTheDocument();
     expect(screen.queryByTestId("usage-table")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Refreshing" })).toBeDisabled();
+  });
+
+  it("presents an exhausted polling budget as paused with manual retry", () => {
+    h.chart = {
+      data: {
+        stats: {},
+        chart: [],
+        queryPending: true,
+        queryRefreshing: false,
+      },
+      isLoading: false,
+      isFetching: false,
+      isError: false,
+      isPollingPaused: true,
+      refresh: h.refetchChart,
+    };
+    h.logs = {
+      data: {
+        table: [],
+        pagination: {},
+        queryPending: true,
+        queryRefreshing: false,
+      },
+      isLoading: false,
+      isFetching: false,
+      isError: false,
+      isPollingPaused: true,
+      refresh: h.refetchLogs,
+    };
+
+    render(<EvalUsageTab templateId="eval-1" />);
+
+    expect(
+      screen.getAllByText(AGGREGATION_POLLING_PAUSED_MESSAGE),
+    ).toHaveLength(2);
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+
+    const retryButtons = screen.getAllByRole("button", { name: "Retry" });
+    fireEvent.click(retryButtons[0]);
+    expect(h.refetchChart).toHaveBeenCalledOnce();
+    expect(h.refetchLogs).toHaveBeenCalledOnce();
+    fireEvent.click(retryButtons[1]);
+    expect(h.refetchLogs).toHaveBeenCalledTimes(2);
   });
 });

@@ -1260,6 +1260,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     data: agentGraphData,
     isLoading: isAgentGraphLoading,
     isError: isAgentGraphError,
+    pollingPaused: isAgentGraphPollingPaused,
   } = useAgentGraph(
     observeId,
     selectedTab === "trace"
@@ -1275,6 +1276,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
     data: compareAgentGraphData,
     isLoading: isCompareAgentGraphLoading,
     isError: isCompareAgentGraphError,
+    pollingPaused: isCompareAgentGraphPollingPaused,
   } = useAgentGraph(
     observeId,
     selectedTab === "trace"
@@ -3514,6 +3516,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                     data={agentGraphData}
                     isLoading={isAgentGraphLoading}
                     isError={isAgentGraphError}
+                    pollingPaused={isAgentGraphPollingPaused}
                     onNodeClick={handleAgentNodeClick}
                   />
                 </Box>
@@ -3550,6 +3553,7 @@ const LLMTracingView = ({ mode = "project", userIdForUserMode = null }) => {
                       data={compareAgentGraphData}
                       isLoading={isCompareAgentGraphLoading}
                       isError={isCompareAgentGraphError}
+                      pollingPaused={isCompareAgentGraphPollingPaused}
                       onNodeClick={handleAgentNodeClick}
                     />
                   </Box>

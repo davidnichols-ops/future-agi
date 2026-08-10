@@ -12,9 +12,7 @@ import {
   MenuItem,
 } from "@mui/material";
 import { useNavigate, useParams, useLocation } from "react-router";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { enqueueSnackbar } from "notistack";
-import axios, { endpoints } from "src/utils/axios";
+import { useQueryClient } from "@tanstack/react-query";
 import Iconify from "src/components/iconify";
 // palette import removed — no longer used
 import { useUrlState } from "src/routes/hooks/use-url-state";
@@ -51,18 +49,7 @@ const ProjectDropdownButton = styled(Button)(({ theme }) => ({
   },
 }));
 
-const ObserveHeader = ({
-  text,
-  filterTrace,
-  filterSpan,
-  selectedTab,
-  filterSession,
-  filterUsers,
-  searchUsers,
-  sortUsers,
-  refreshData,
-  resetFilters,
-}) => {
+const ObserveHeader = ({ text, refreshData, resetFilters }) => {
   const [openConfigDialog, setOpenConfigDialog] = useState(false);
   const queryClient = useQueryClient();
   const [openShareUrl, setOpenShareUrl] = useState(false);
@@ -263,90 +250,6 @@ const ObserveHeader = ({
   const handleDropdownClose = () => {
     setProjectDropdownOpen(false);
     setSearchText("");
-  };
-
-  const { mutate: exportData, isPending: isExportData } = useMutation({
-    mutationFn: () => {
-      let url;
-      let filters;
-      const extraParams = {};
-
-      if (text === "Sessions") {
-        url = endpoints.project.projectSessionListExport;
-        filters = filterSession;
-      } else if (text === "Users") {
-        url = endpoints.project.getUsersList();
-        filters = filterUsers;
-        extraParams.export = true;
-        // Match the grid: it fetches with search + sort_params too, so the CSV
-        // reflects a searched/sorted table rather than just the filter set.
-        if (searchUsers) extraParams.search = searchUsers;
-        if (sortUsers && sortUsers.length) {
-          extraParams.sort_params = JSON.stringify(sortUsers);
-        }
-      } else if (selectedTab === "spans") {
-        url = endpoints.project.getSpansForObserveExport;
-        filters = filterSpan;
-      } else {
-        // Default to trace export
-        url = endpoints.project.getTraceForObserveExport;
-        filters = filterTrace || [];
-      }
-
-      return axios.get(url, {
-        params: {
-          project_id: observeId,
-          filters: JSON.stringify(filters || []),
-          ...extraParams,
-        },
-      });
-    },
-
-    onSuccess: (response) => {
-      const fileSuffix =
-        text === "Sessions"
-          ? "sessions"
-          : text === "Users"
-            ? "users"
-            : selectedTab === "trace"
-              ? "traces"
-              : selectedTab === "spans"
-                ? "spans"
-                : "data";
-
-      enqueueSnackbar(
-        `${fileSuffix.charAt(0).toUpperCase() + fileSuffix.slice(1)} downloaded successfully`,
-        {
-          variant: "success",
-        },
-      );
-
-      const blob = new Blob([response.data], {
-        type: "text/csv;charset=utf-8;",
-      });
-
-      // Prefer the backend's Content-Disposition name for every export so the
-      // server is the single source of truth; fall back to the readable
-      // project-label name when the header isn't present.
-      let downloadName = `${currentProject?.label || "project"}-${fileSuffix}.csv`;
-      const disposition = response.headers?.["content-disposition"] || "";
-      const match = /filename="?([^";]+)"?/i.exec(disposition);
-      if (match?.[1]) downloadName = match[1];
-
-      const link = document.createElement("a");
-      const url = window.URL.createObjectURL(blob);
-      link.href = url;
-      link.setAttribute("download", downloadName);
-      document.body.appendChild(link);
-      link.click();
-
-      link.remove();
-      window.URL.revokeObjectURL(url);
-    },
-  });
-
-  const handleExportClick = () => {
-    exportData();
   };
 
   const handleDocLink = () => {
@@ -662,12 +565,12 @@ const ObserveHeader = ({
               </ObserveIconButton>
             </CustomTooltip>
 
-            {/* Users export is hidden until it has an exact bounded preflight.
-                The previous streaming path could return a partial 200 CSV. */}
-            {text !== "Users" && (
+            {/* Exact Observe exports remain fail-closed until a bounded,
+                resumable export contract is available. */}
+            {(text === "LLM Tracing" || text === "Sessions") && (
               <CustomTooltip
                 show
-                title={isExportData ? "Exporting..." : "Export CSV"}
+                title="Exact CSV export is temporarily unavailable"
                 arrow
                 size="small"
                 type="black"
@@ -675,8 +578,8 @@ const ObserveHeader = ({
                 <span>
                   <ObserveIconButton
                     size="small"
-                    onClick={handleExportClick}
-                    disabled={isExportData}
+                    aria-label="Exact CSV export is temporarily unavailable"
+                    disabled
                   >
                     <Iconify icon="mdi:download-outline" width={16} />
                   </ObserveIconButton>
@@ -753,13 +656,6 @@ const ObserveHeader = ({
 
 ObserveHeader.propTypes = {
   text: PropTypes.string,
-  filterTrace: PropTypes.array,
-  filterSpan: PropTypes.array,
-  selectedTab: PropTypes.string,
-  filterSession: PropTypes.array,
-  filterUsers: PropTypes.array,
-  searchUsers: PropTypes.string,
-  sortUsers: PropTypes.array,
   refreshData: PropTypes.func,
   resetFilters: PropTypes.func,
 };

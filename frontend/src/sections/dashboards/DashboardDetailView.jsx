@@ -755,6 +755,7 @@ export default function DashboardDetailView() {
   const refreshSequenceRef = useRef(0);
   const pendingRefreshWidgetsRef = useRef(new Set());
   const refreshFailedRef = useRef(false);
+  const refreshPausedRef = useRef(false);
   const refreshTimesRef = useRef([]);
   const [refreshRequestId, setRefreshRequestId] = useState(0);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -765,6 +766,7 @@ export default function DashboardDetailView() {
   useEffect(() => {
     pendingRefreshWidgetsRef.current.clear();
     refreshFailedRef.current = false;
+    refreshPausedRef.current = false;
     refreshTimesRef.current = [];
     setIsRefreshing(false);
     setLastUpdated(null);
@@ -798,6 +800,7 @@ export default function DashboardDetailView() {
     refreshSequenceRef.current += 1;
     pendingRefreshWidgetsRef.current = new Set(queryableWidgetIds);
     refreshFailedRef.current = false;
+    refreshPausedRef.current = false;
     refreshTimesRef.current = [];
     setIsRefreshing(true);
     setRefreshRequestId(refreshSequenceRef.current);
@@ -810,6 +813,7 @@ export default function DashboardDetailView() {
       refreshRequestId: requestId,
       manualRefresh,
       exact,
+      pollingPaused,
       updatedAt,
     }) => {
       if (
@@ -838,12 +842,13 @@ export default function DashboardDetailView() {
       if (!pending.has(widgetId)) return;
 
       pending.delete(widgetId);
-      if (!exact) refreshFailedRef.current = true;
+      if (!exact && !pollingPaused) refreshFailedRef.current = true;
+      if (pollingPaused) refreshPausedRef.current = true;
       if (exact && validUpdatedAt) refreshTimesRef.current.push(validUpdatedAt);
 
       if (pending.size === 0) {
         setIsRefreshing(false);
-        if (!refreshFailedRef.current) {
+        if (!refreshFailedRef.current && !refreshPausedRef.current) {
           const completedAt = refreshTimesRef.current.reduce(
             (latest, value) => (!latest || value > latest ? value : latest),
             null,

@@ -23,6 +23,7 @@ import {
 } from "./widgetUtils";
 import { toTimeRangePayload } from "./dashboardDateRange";
 import {
+  AGGREGATION_POLLING_PAUSED_MESSAGE,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   AGGREGATION_PREPARING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
@@ -93,8 +94,15 @@ function getApexType(chartType) {
   return map[chartType] || "line";
 }
 
-function QueryReadStatus({ unavailable, hasSnapshot, retryUnavailable }) {
-  if (!unavailable || (hasSnapshot && !retryUnavailable)) return null;
+function QueryReadStatus({
+  unavailable,
+  hasSnapshot,
+  retryUnavailable,
+  pollingPaused,
+}) {
+  if (!unavailable || (hasSnapshot && !retryUnavailable && !pollingPaused)) {
+    return null;
+  }
 
   return (
     <Typography
@@ -105,7 +113,9 @@ function QueryReadStatus({ unavailable, hasSnapshot, retryUnavailable }) {
     >
       {retryUnavailable
         ? QUERY_FAILED_RETRY_MESSAGE
-        : AGGREGATION_PREPARING_MESSAGE}
+        : pollingPaused
+          ? AGGREGATION_POLLING_PAUSED_MESSAGE
+          : AGGREGATION_PREPARING_MESSAGE}
     </Typography>
   );
 }
@@ -114,6 +124,7 @@ QueryReadStatus.propTypes = {
   unavailable: PropTypes.bool,
   hasSnapshot: PropTypes.bool,
   retryUnavailable: PropTypes.bool,
+  pollingPaused: PropTypes.bool,
 };
 
 const getExactDashboardSnapshot = (response, signature) => {
@@ -201,6 +212,7 @@ export default function WidgetChart({
     signature: querySignature,
     unavailable: Boolean(queryMutation.data && !initialSnapshot),
     retryUnavailable: false,
+    pollingPaused: false,
   }));
   const previousSignatureRef = useRef(null);
   const previousRefreshRequestRef = useRef(refreshRequestId);
@@ -224,7 +236,7 @@ export default function WidgetChart({
     let refreshWasQueued = false;
     let settled = false;
 
-    const settle = (snapshot, exact) => {
+    const settle = (snapshot, exact, pollingPaused = false) => {
       if (!active || settled) return;
       settled = true;
       if (pollTimer !== null) {
@@ -243,6 +255,7 @@ export default function WidgetChart({
         refreshRequestId,
         manualRefresh: isManualRefresh,
         exact,
+        pollingPaused,
         updatedAt: exact ? snapshot?.updatedAt || null : null,
       });
     };
@@ -252,12 +265,15 @@ export default function WidgetChart({
       pollingController.start();
       const delay = pollingController.nextDelay();
       if (delay === false) {
+        const pollingPaused =
+          pollingController.getTerminationReason() === "poll_budget";
         setLatestOutcome({
           signature: querySignature,
           unavailable: true,
-          retryUnavailable: true,
+          retryUnavailable: !pollingPaused,
+          pollingPaused,
         });
-        settle(null, false);
+        settle(null, false, pollingPaused);
         return;
       }
       pollTimer = window.setTimeout(() => {
@@ -281,6 +297,7 @@ export default function WidgetChart({
           signature: querySignature,
           unavailable: true,
           retryUnavailable: exhausted,
+          pollingPaused: false,
         });
         if (exhausted) settle(null, false);
         else schedulePoll();
@@ -299,6 +316,7 @@ export default function WidgetChart({
           signature: querySignature,
           unavailable: true,
           retryUnavailable: true,
+          pollingPaused: false,
         });
         settle(null, false);
       }, AGGREGATION_REQUEST_TIMEOUT_MS);
@@ -338,6 +356,7 @@ export default function WidgetChart({
                 signature: querySignature,
                 unavailable: !snapshot,
                 retryUnavailable: false,
+                pollingPaused: false,
               });
               refreshWasQueued = true;
               schedulePoll();
@@ -348,6 +367,7 @@ export default function WidgetChart({
                 signature: querySignature,
                 unavailable: true,
                 retryUnavailable: true,
+                pollingPaused: false,
               });
               settle(snapshot, false);
               return;
@@ -357,6 +377,7 @@ export default function WidgetChart({
                 signature: querySignature,
                 unavailable: false,
                 retryUnavailable: false,
+                pollingPaused: false,
               });
               settle(snapshot, true);
               return;
@@ -368,6 +389,7 @@ export default function WidgetChart({
               signature: querySignature,
               unavailable: true,
               retryUnavailable: true,
+              pollingPaused: false,
             });
             settle(null, false);
           },
@@ -381,6 +403,7 @@ export default function WidgetChart({
               signature: querySignature,
               unavailable: true,
               retryUnavailable: true,
+              pollingPaused: false,
             });
             settle(null, false);
           },
@@ -425,6 +448,9 @@ export default function WidgetChart({
   const retryUnavailable =
     latestOutcome.signature === querySignature &&
     latestOutcome.retryUnavailable === true;
+  const pollingPaused =
+    latestOutcome.signature === querySignature &&
+    latestOutcome.pollingPaused === true;
 
   // Auto-select top 10 series by total value when there are many breakdown series
   const MAX_CHART_SERIES = 10;
@@ -567,7 +593,12 @@ export default function WidgetChart({
   // this component's independently bounded request has timed out. Once the
   // current query scope is terminal, render the retry state instead of letting
   // the adapter's stale pending flag mask it forever.
-  if (queryMutation.isPending && !exactSnapshot && !retryUnavailable) {
+  if (
+    queryMutation.isPending &&
+    !exactSnapshot &&
+    !retryUnavailable &&
+    !pollingPaused
+  ) {
     return (
       <Box
         ref={containerRef}
@@ -603,6 +634,7 @@ export default function WidgetChart({
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
           retryUnavailable={retryUnavailable}
+          pollingPaused={pollingPaused}
         />
         {!readUnavailable && (
           <Typography variant="body2" color="text.disabled">
@@ -632,6 +664,7 @@ export default function WidgetChart({
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
           retryUnavailable={retryUnavailable}
+          pollingPaused={pollingPaused}
         />
         <Typography variant="body2" color="text.disabled">
           {NO_DATA_FOR_RANGE_MESSAGE}
@@ -657,6 +690,7 @@ export default function WidgetChart({
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
           retryUnavailable={retryUnavailable}
+          pollingPaused={pollingPaused}
         />
         <Stack
           direction="row"
@@ -713,6 +747,7 @@ export default function WidgetChart({
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
           retryUnavailable={retryUnavailable}
+          pollingPaused={pollingPaused}
         />
         <table
           style={{
@@ -934,6 +969,7 @@ export default function WidgetChart({
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
           retryUnavailable={retryUnavailable}
+          pollingPaused={pollingPaused}
         />
         {pieLegendNames.length > 1 && (
           <ChartLegend items={pieLegendNames} colors={COLORS} />
@@ -1032,6 +1068,7 @@ export default function WidgetChart({
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
           retryUnavailable={retryUnavailable}
+          pollingPaused={pollingPaused}
         />
         {/* Legend */}
         <Stack
@@ -1210,6 +1247,7 @@ export default function WidgetChart({
           unavailable={readUnavailable}
           hasSnapshot={Boolean(exactSnapshot)}
           retryUnavailable={retryUnavailable}
+          pollingPaused={pollingPaused}
         />
         <Alert severity="warning" sx={{ width: "100%" }}>
           {outOfRangeWarning}
@@ -1568,6 +1606,7 @@ export default function WidgetChart({
         unavailable={readUnavailable}
         hasSnapshot={Boolean(exactSnapshot)}
         retryUnavailable={retryUnavailable}
+        pollingPaused={pollingPaused}
       />
       {legendNames.length > 1 && (
         <ChartLegend

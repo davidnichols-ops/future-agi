@@ -33,6 +33,7 @@ import { logger } from "src/utils/logger";
 import { FILTER_FOR_HAS_EVAL, toBackendFilters } from "../common";
 import { buildDefaultDateEntry } from "./graphFilterUtils";
 import {
+  AGGREGATION_POLLING_PAUSED_MESSAGE,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   GRAPH_LOADING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
@@ -154,6 +155,8 @@ const GraphSection = ({
   }
   const [aggregationTransportFailed, setAggregationTransportFailed] =
     useState(false);
+  const [aggregationPollingPaused, setAggregationPollingPaused] =
+    useState(false);
   const requestScopeRef = useRef(null);
   const requestGenerationRef = useRef(0);
 
@@ -163,6 +166,7 @@ const GraphSection = ({
     pollingControllerRef.current.reset();
     pollingRef.current = false;
     setAggregationTransportFailed(false);
+    setAggregationPollingPaused(false);
   }, []);
 
   const runAggregationRequest = useCallback(
@@ -173,6 +177,7 @@ const GraphSection = ({
         pollingControllerRef.current.reset();
         pollingRef.current = false;
         setAggregationTransportFailed(false);
+        setAggregationPollingPaused(false);
       }
 
       const generation = requestGenerationRef.current;
@@ -188,6 +193,7 @@ const GraphSection = ({
   const recordAggregationResponse = useCallback((response) => {
     pollingControllerRef.current.recordSuccess();
     setAggregationTransportFailed(false);
+    setAggregationPollingPaused(false);
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(response);
     const readState = getExactAggregationReadState(response);
@@ -207,12 +213,14 @@ const GraphSection = ({
     if (!pollingControllerRef.current.recordFailure()) {
       pollingRef.current = false;
       setAggregationTransportFailed(true);
+      setAggregationPollingPaused(false);
     }
   }, []);
   const recordAggregationTerminalFailure = useCallback(() => {
     pollingControllerRef.current.terminate();
     pollingRef.current = false;
     setAggregationTransportFailed(true);
+    setAggregationPollingPaused(false);
   }, []);
 
   // Graph APIs
@@ -302,7 +310,11 @@ const GraphSection = ({
       const delay = pollingControllerRef.current.nextDelay();
       if (delay === false) {
         pollingRef.current = false;
-        setAggregationTransportFailed(true);
+        if (
+          pollingControllerRef.current.getTerminationReason() === "poll_budget"
+        ) {
+          setAggregationPollingPaused(true);
+        }
       }
       return delay;
     },
@@ -396,7 +408,11 @@ const GraphSection = ({
       const delay = pollingControllerRef.current.nextDelay();
       if (delay === false) {
         pollingRef.current = false;
-        setAggregationTransportFailed(true);
+        if (
+          pollingControllerRef.current.getTerminationReason() === "poll_budget"
+        ) {
+          setAggregationPollingPaused(true);
+        }
       }
       return delay;
     },
@@ -500,6 +516,11 @@ const GraphSection = ({
       notifyAggregationRefresh(false);
       return;
     }
+    if (aggregationPollingPaused) {
+      setRefreshUnavailable(true);
+      notifyAggregationRefresh(false);
+      return;
+    }
     if (!apiGraphData) return;
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(apiGraphData);
@@ -545,6 +566,7 @@ const GraphSection = ({
     apiGraphData,
     apiGraphError,
     apiGraphReadState,
+    aggregationPollingPaused,
     graphSnapshotKey,
     notifyAggregationRefresh,
     observeId,
@@ -571,13 +593,15 @@ const GraphSection = ({
       apiGraphReadState !== "pending");
   const apiGraphReadMessage = apiGraphReadFailed
     ? QUERY_FAILED_RETRY_MESSAGE
-    : !exactSnapshot &&
-        (apiGraphLoading ||
-          refreshUnavailable ||
-          apiGraphReadState === "pending" ||
-          !apiGraphData)
-      ? GRAPH_LOADING_MESSAGE
-      : null;
+    : aggregationPollingPaused
+      ? AGGREGATION_POLLING_PAUSED_MESSAGE
+      : !exactSnapshot &&
+          (apiGraphLoading ||
+            refreshUnavailable ||
+            apiGraphReadState === "pending" ||
+            !apiGraphData)
+        ? GRAPH_LOADING_MESSAGE
+        : null;
 
   const chartData = useMemo(() => {
     const primaryData = [];

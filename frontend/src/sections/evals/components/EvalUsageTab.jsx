@@ -47,7 +47,10 @@ import {
 } from "../Helpers/evalUsageColumns";
 import { useAuthContext } from "src/auth/hooks";
 import { PERMISSIONS, RolePermission } from "src/utils/rolePermissionMapping";
-import { QUERY_FAILED_RETRY_MESSAGE } from "src/utils/queryReadState";
+import {
+  AGGREGATION_POLLING_PAUSED_MESSAGE,
+  QUERY_FAILED_RETRY_MESSAGE,
+} from "src/utils/queryReadState";
 
 // ── Main ──
 const EvalUsageTab = ({
@@ -84,6 +87,7 @@ const EvalUsageTab = ({
     isLoading: chartLoading,
     isFetching: chartFetching,
     isError: chartError,
+    isPollingPaused: chartPollingPaused,
     refresh: refreshChart,
   } = useEvalUsageChart(templateId, period, dateOption, dateFilter);
   const {
@@ -91,6 +95,7 @@ const EvalUsageTab = ({
     isLoading: logsLoading,
     isFetching: logsFetching,
     isError: logsError,
+    isPollingPaused: logsPollingPaused,
     refresh: refreshLogs,
   } = useEvalUsageLogs(templateId, {
     page,
@@ -380,14 +385,19 @@ const EvalUsageTab = ({
             >
               {isRefreshing ? "Refreshing" : "Refresh"}
             </Button>
-            {(chartError || logsError) &&
+            {(chartError ||
+              logsError ||
+              chartPollingPaused ||
+              logsPollingPaused) &&
               (displayChartData || displayLogsData) && (
                 <Typography
                   role="status"
                   variant="caption"
                   color="text.secondary"
                 >
-                  {QUERY_FAILED_RETRY_MESSAGE}
+                  {chartError || logsError
+                    ? QUERY_FAILED_RETRY_MESSAGE
+                    : AGGREGATION_POLLING_PAUSED_MESSAGE}
                 </Typography>
               )}
           </Box>
@@ -465,7 +475,11 @@ const EvalUsageTab = ({
               }}
             >
               <Typography variant="caption" color="text.secondary">
-                {chartError ? QUERY_FAILED_RETRY_MESSAGE : "Loading results…"}
+                {chartError
+                  ? QUERY_FAILED_RETRY_MESSAGE
+                  : chartPollingPaused
+                    ? AGGREGATION_POLLING_PAUSED_MESSAGE
+                    : "Loading results…"}
               </Typography>
               {!chartRefreshing && (
                 <Button size="small" onClick={handleRefresh}>
@@ -572,7 +586,11 @@ const EvalUsageTab = ({
                 }}
               >
                 <Typography variant="caption" color="text.secondary">
-                  {logsError ? QUERY_FAILED_RETRY_MESSAGE : "Loading results…"}
+                  {logsError
+                    ? QUERY_FAILED_RETRY_MESSAGE
+                    : logsPollingPaused
+                      ? AGGREGATION_POLLING_PAUSED_MESSAGE
+                      : "Loading results…"}
                 </Typography>
                 {!logsRefreshing && (
                   <Button size="small" onClick={() => refreshLogs()}>

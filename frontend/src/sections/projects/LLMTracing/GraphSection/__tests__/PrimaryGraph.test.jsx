@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen, waitFor } from "src/utils/test-utils";
 import axios from "src/utils/axios";
-import { AGGREGATION_REQUEST_TIMEOUT_MS } from "src/utils/queryReadState";
+import {
+  AGGREGATION_POLLING_PAUSED_MESSAGE,
+  AGGREGATION_REQUEST_TIMEOUT_MS,
+} from "src/utils/queryReadState";
 import PrimaryGraph from "../PrimaryGraph";
 
 vi.mock("react-apexcharts", () => ({
@@ -447,9 +450,12 @@ describe("PrimaryGraph", () => {
 
     const boundedRequestCount = axios.post.mock.calls.length;
     expect(boundedRequestCount).toBeLessThanOrEqual(13);
+    expect(screen.getByText(AGGREGATION_POLLING_PAUSED_MESSAGE)).toBeVisible();
     expect(
-      screen.getByText("We couldn't load this data. Please retry in a moment."),
-    ).toBeInTheDocument();
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
     expect(screen.queryByTestId("apex-chart")).not.toBeInTheDocument();
 
     await act(async () => vi.advanceTimersByTimeAsync(500_000));

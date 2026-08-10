@@ -2,7 +2,10 @@ import React from "react";
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { act, render, screen, waitFor } from "src/utils/test-utils";
 import WidgetChart from "../WidgetChart";
-import { AGGREGATION_REQUEST_TIMEOUT_MS } from "src/utils/queryReadState";
+import {
+  AGGREGATION_POLLING_PAUSED_MESSAGE,
+  AGGREGATION_REQUEST_TIMEOUT_MS,
+} from "src/utils/queryReadState";
 
 const h = vi.hoisted(() => ({
   query: { data: null, isPending: false, isError: false, mutate: vi.fn() },
@@ -408,13 +411,14 @@ describe("WidgetChart — queued exact refresh", () => {
     const boundedRequestCount = h.query.mutate.mock.calls.length;
     expect(boundedRequestCount).toBeLessThanOrEqual(13);
     expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+    expect(screen.getByText(AGGREGATION_POLLING_PAUSED_MESSAGE)).toBeVisible();
     expect(
-      screen.getByText(
+      screen.queryByText(
         "We couldn't load this data. Please retry in a moment.",
       ),
-    ).toBeInTheDocument();
+    ).not.toBeInTheDocument();
     expect(onQuerySettled).toHaveBeenCalledWith(
-      expect.objectContaining({ exact: false }),
+      expect.objectContaining({ exact: false, pollingPaused: true }),
     );
 
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
@@ -439,6 +443,47 @@ describe("WidgetChart — queued exact refresh", () => {
       expect.objectContaining({ exact: true }),
     );
     expect(screen.getByTestId("apex-line")).toBeInTheDocument();
+  });
+
+  it("pauses a cold pending widget without turning it into a load failure", async () => {
+    vi.useFakeTimers();
+    const pendingResponse = {
+      data: {
+        result: {
+          metrics: [],
+          query_complete: false,
+          query_status: "pending",
+          query_sampled: false,
+          query_refreshing: true,
+        },
+      },
+    };
+    const onQuerySettled = vi.fn();
+    h.query.mutate.mockImplementation((_request, options) =>
+      options?.onSuccess?.(pendingResponse),
+    );
+
+    render(
+      <WidgetChart
+        widget={baseWidget}
+        dashboardId="dashboard-1"
+        globalDateRange={null}
+        onQuerySettled={onQuerySettled}
+      />,
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(500_000));
+
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(screen.getByText(AGGREGATION_POLLING_PAUSED_MESSAGE)).toBeVisible();
+    expect(
+      screen.queryByText(
+        "We couldn't load this data. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(onQuerySettled).toHaveBeenCalledWith(
+      expect.objectContaining({ exact: false, pollingPaused: true }),
+    );
   });
 
   it("times out an unresolved request while preserving the previous exact snapshot", async () => {

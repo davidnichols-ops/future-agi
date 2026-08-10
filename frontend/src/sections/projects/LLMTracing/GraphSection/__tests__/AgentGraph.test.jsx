@@ -2,6 +2,7 @@ import React from "react";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import AgentGraph, { buildFlowData } from "../AgentGraph";
+import { AGGREGATION_POLLING_PAUSED_MESSAGE } from "src/utils/queryReadState";
 
 const canonicalNode = (id, type = "agent", metrics = {}) => ({
   id,
@@ -215,5 +216,41 @@ describe("AgentGraph request states", () => {
         "We couldn't load the agent graph. Please retry in a moment.",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("renders a neutral paused state when the exact job outlives polling", () => {
+    render(
+      <AgentGraph
+        data={undefined}
+        isLoading={false}
+        isError={false}
+        pollingPaused
+      />,
+    );
+
+    expect(screen.getByText(AGGREGATION_POLLING_PAUSED_MESSAGE)).toBeVisible();
+    expect(
+      screen.queryByText(
+        "We couldn't load the agent graph. Please retry in a moment.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps a cached graph visible while reporting paused polling", () => {
+    const { container } = render(
+      <AgentGraph
+        data={{
+          nodes: [canonicalNode("agent:a")],
+          edges: [],
+          path_edges: [],
+        }}
+        isLoading={false}
+        isError={false}
+        pollingPaused
+      />,
+    );
+
+    expect(screen.getByText(AGGREGATION_POLLING_PAUSED_MESSAGE)).toBeVisible();
+    expect(container.querySelector(".react-flow")).toBeInTheDocument();
   });
 });

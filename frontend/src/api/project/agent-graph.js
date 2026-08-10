@@ -21,21 +21,24 @@ export const getAgentGraphPresentationState = (query) => {
     readState === "pending" && (refreshFailed || query.isError);
   const hasUnreadablePayload =
     Boolean(query.data) && readState !== "complete" && readState !== "pending";
+  const pollingPaused = query.pollingPaused === true;
+  const terminalError =
+    query.isError || hasUnreadablePayload || failedPendingRefresh;
 
   return {
     data: exactSnapshot,
     isLoading:
       !exactSnapshot &&
-      !query.isError &&
+      !terminalError &&
+      !pollingPaused &&
       (query.isLoading || (readState === "pending" && !failedPendingRefresh)),
     // A polling transport/refresh failure must never hide an exact snapshot
     // already returned by the server. Cold failures still render the generic,
     // retryable error state below the exactness gate.
-    isError:
-      !exactSnapshot &&
-      (query.isError || hasUnreadablePayload || failedPendingRefresh),
+    isError: !exactSnapshot && terminalError,
     queryReadState: readState,
     refreshUnavailable: query.refreshUnavailable === true,
+    pollingPaused: pollingPaused && !terminalError,
   };
 };
 
@@ -62,6 +65,8 @@ export const useAgentGraph = (
   const lastExactSnapshotRef = useRef(null);
   const [aggregationTransportFailed, setAggregationTransportFailed] =
     useState(false);
+  const [aggregationPollingPaused, setAggregationPollingPaused] =
+    useState(false);
 
   const query = useQuery({
     queryKey: ["agent-graph", projectId, filters],
@@ -73,6 +78,7 @@ export const useAgentGraph = (
         serverPendingRef.current = false;
         lastExactSnapshotRef.current = null;
         setAggregationTransportFailed(false);
+        setAggregationPollingPaused(false);
       }
       pollingControllerRef.current.recordAttempt();
       const refresh = forceRefreshRef.current;
@@ -96,6 +102,7 @@ export const useAgentGraph = (
           if (!pollingControllerRef.current.recordFailure()) {
             serverPendingRef.current = false;
             setAggregationTransportFailed(true);
+            setAggregationPollingPaused(false);
           }
         }
         throw error;
@@ -111,6 +118,7 @@ export const useAgentGraph = (
         pollingControllerRef.current.terminate();
         serverPendingRef.current = false;
         setAggregationTransportFailed(true);
+        setAggregationPollingPaused(false);
         throw error;
       }
 
@@ -126,6 +134,7 @@ export const useAgentGraph = (
       if (serverPendingRef.current) pollingControllerRef.current.start();
       else pollingControllerRef.current.stop();
       setAggregationTransportFailed(false);
+      setAggregationPollingPaused(false);
       return result;
     },
     enabled: !!projectId && enabled,
@@ -150,7 +159,11 @@ export const useAgentGraph = (
       const delay = pollingControllerRef.current.nextDelay();
       if (delay === false) {
         serverPendingRef.current = false;
-        setAggregationTransportFailed(true);
+        if (
+          pollingControllerRef.current.getTerminationReason() === "poll_budget"
+        ) {
+          setAggregationPollingPaused(true);
+        }
       }
       return delay;
     },
@@ -165,6 +178,7 @@ export const useAgentGraph = (
     pollingControllerRef.current.reset();
     serverPendingRef.current = false;
     setAggregationTransportFailed(false);
+    setAggregationPollingPaused(false);
     return refetch({ cancelRefetch: true });
   }, [refetch]);
 
@@ -191,6 +205,7 @@ export const useAgentGraph = (
     ...query,
     previousExactData: lastExactSnapshotRef.current,
     refreshUnavailable: aggregationTransportFailed,
+    pollingPaused: aggregationPollingPaused,
     isError:
       aggregationTransportFailed || (query.isError && !pollingTransportError),
   });

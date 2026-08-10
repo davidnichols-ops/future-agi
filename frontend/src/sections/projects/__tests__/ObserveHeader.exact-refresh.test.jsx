@@ -6,13 +6,14 @@ import ObserveHeader from "../ObserveHeader";
 
 const h = vi.hoisted(() => ({
   invalidateQueries: vi.fn(),
+  useMutation: vi.fn(),
   getStorage: vi.fn(() => false),
   observeId: "project-1",
   pathname: "/dashboard/observe/project-1/llm-tracing",
 }));
 
 vi.mock("@tanstack/react-query", () => ({
-  useMutation: () => ({ mutate: vi.fn(), isPending: false }),
+  useMutation: h.useMutation,
   useQueryClient: () => ({ invalidateQueries: h.invalidateQueries }),
 }));
 
@@ -232,5 +233,35 @@ describe("ObserveHeader exact aggregation refresh state", () => {
     expect(refreshData).toHaveBeenCalledWith({ includeAggregations: false });
     expect(aggregationRefresh).not.toHaveBeenCalled();
     expect(screen.queryByText(/Last updated on/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["LLM Tracing", "/dashboard/observe/project-1/llm-tracing"],
+    ["Sessions", "/dashboard/observe/project-1/sessions"],
+  ])(
+    "keeps the %s exact CSV export unavailable without creating a request path",
+    (text, pathname) => {
+      h.pathname = pathname;
+      render(<ObserveHeader text={text} refreshData={vi.fn()} />);
+
+      const exportButton = screen.getByRole("button", {
+        name: "Exact CSV export is temporarily unavailable",
+      });
+      expect(exportButton).toBeDisabled();
+
+      fireEvent.click(exportButton);
+      expect(h.useMutation).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps the Users export control hidden", () => {
+    h.pathname = "/dashboard/observe/project-1/users";
+    render(<ObserveHeader text="Users" refreshData={vi.fn()} />);
+
+    expect(
+      screen.queryByRole("button", {
+        name: "Exact CSV export is temporarily unavailable",
+      }),
+    ).not.toBeInTheDocument();
   });
 });

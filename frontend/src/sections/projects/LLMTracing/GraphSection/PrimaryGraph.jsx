@@ -50,6 +50,7 @@ import { formatDate } from "src/utils/report-utils";
 import { toBackendFilters } from "../common";
 import { combineGraphFilters } from "./graphFilterUtils";
 import {
+  AGGREGATION_POLLING_PAUSED_MESSAGE,
   AGGREGATION_REQUEST_TIMEOUT_MS,
   GRAPH_LOADING_MESSAGE,
   QUERY_FAILED_RETRY_MESSAGE,
@@ -343,6 +344,8 @@ const PrimaryGraph = ({
   }
   const [aggregationTransportFailed, setAggregationTransportFailed] =
     useState(false);
+  const [aggregationPollingPaused, setAggregationPollingPaused] =
+    useState(false);
   const requestScopeRef = useRef(null);
   const requestGenerationRef = useRef(0);
   const resetAggregationBudget = useCallback(() => {
@@ -351,6 +354,7 @@ const PrimaryGraph = ({
     pollingControllerRef.current.reset();
     pollingRef.current = false;
     setAggregationTransportFailed(false);
+    setAggregationPollingPaused(false);
   }, []);
   const runAggregationRequest = useCallback(
     async (scopeKey, signal, request) => {
@@ -360,6 +364,7 @@ const PrimaryGraph = ({
         pollingControllerRef.current.reset();
         pollingRef.current = false;
         setAggregationTransportFailed(false);
+        setAggregationPollingPaused(false);
       }
 
       const generation = requestGenerationRef.current;
@@ -374,6 +379,7 @@ const PrimaryGraph = ({
   const recordAggregationResponse = useCallback((response) => {
     pollingControllerRef.current.recordSuccess();
     setAggregationTransportFailed(false);
+    setAggregationPollingPaused(false);
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(response);
     const readState = getExactAggregationReadState(response);
@@ -394,12 +400,14 @@ const PrimaryGraph = ({
     if (!pollingControllerRef.current.recordFailure()) {
       pollingRef.current = false;
       setAggregationTransportFailed(true);
+      setAggregationPollingPaused(false);
     }
   }, []);
   const recordAggregationTerminalFailure = useCallback(() => {
     pollingControllerRef.current.terminate();
     pollingRef.current = false;
     setAggregationTransportFailed(true);
+    setAggregationPollingPaused(false);
   }, []);
   const {
     data: graphData,
@@ -485,7 +493,11 @@ const PrimaryGraph = ({
       const delay = pollingControllerRef.current.nextDelay();
       if (delay === false) {
         pollingRef.current = false;
-        setAggregationTransportFailed(true);
+        if (
+          pollingControllerRef.current.getTerminationReason() === "poll_budget"
+        ) {
+          setAggregationPollingPaused(true);
+        }
       }
       return delay;
     },
@@ -575,6 +587,11 @@ const PrimaryGraph = ({
       notifyAggregationRefresh(false);
       return;
     }
+    if (aggregationPollingPaused) {
+      setRefreshUnavailable(true);
+      notifyAggregationRefresh(false);
+      return;
+    }
     if (!graphData) return;
     const { isRefreshing, refreshFailed } =
       getAggregationRefreshState(graphData);
@@ -621,6 +638,7 @@ const PrimaryGraph = ({
     graphData,
     graphError,
     graphReadState,
+    aggregationPollingPaused,
     notifyAggregationRefresh,
     snapshotKey,
   ]);
@@ -649,13 +667,15 @@ const PrimaryGraph = ({
       graphReadState !== "pending");
   const graphStatusMessage = graphReadFailed
     ? QUERY_FAILED_RETRY_MESSAGE
-    : !exactSnapshot &&
-        (isLoading ||
-          refreshUnavailable ||
-          graphReadState === "pending" ||
-          !graphData)
-      ? GRAPH_LOADING_MESSAGE
-      : null;
+    : aggregationPollingPaused
+      ? AGGREGATION_POLLING_PAUSED_MESSAGE
+      : !exactSnapshot &&
+          (isLoading ||
+            refreshUnavailable ||
+            graphReadState === "pending" ||
+            !graphData)
+        ? GRAPH_LOADING_MESSAGE
+        : null;
 
   // Parse API data → [{timestamp, value, primary_traffic}, ...]
   const { metricData, trafficData } = useMemo(() => {

@@ -204,6 +204,28 @@ describe("DashboardDetailView — exact aggregation refresh", () => {
     ).toBeInTheDocument();
   });
 
+  it("unlocks manual refresh without reporting completion when polling pauses", () => {
+    render(<DashboardDetailView />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(screen.getByRole("button", { name: "Refreshing" })).toBeDisabled();
+
+    act(() => {
+      h.widgetChartProps.onQuerySettled({
+        dashboardId: "dash-1",
+        widgetId: "w-1",
+        refreshRequestId: 1,
+        manualRefresh: true,
+        exact: false,
+        pollingPaused: true,
+        updatedAt: null,
+      });
+    });
+
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+    expect(screen.queryByText(/Last updated/i)).not.toBeInTheDocument();
+  });
+
   it("clears completion state on dashboard navigation and ignores stale callbacks", () => {
     const view = render(<DashboardDetailView />);
     const staleCallback = h.widgetChartProps.onQuerySettled;

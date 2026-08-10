@@ -33,7 +33,10 @@ import Iconify from "src/components/iconify";
 import CustomTooltip from "src/components/tooltip";
 import { error as errorPalette, success } from "src/theme/palette";
 import FullscreenGraphDialog from "./FullscreenGraphDialog";
-import { GRAPH_LOADING_MESSAGE } from "src/utils/queryReadState";
+import {
+  AGGREGATION_POLLING_PAUSED_MESSAGE,
+  GRAPH_LOADING_MESSAGE,
+} from "src/utils/queryReadState";
 
 // ---------------------------------------------------------------------------
 // Diff-overlay status (set by buildGraphDiff for the error-feed split view)
@@ -860,6 +863,7 @@ const AgentGraphInner = ({
   data,
   isLoading,
   isError,
+  pollingPaused,
   direction = "LR",
   onNodeClick,
   isFullscreen = false,
@@ -925,6 +929,24 @@ const AgentGraphInner = ({
     );
   }
 
+  if (pollingPaused && !data) {
+    return (
+      <Box
+        sx={{
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "center",
+          height: 80,
+          color: "text.disabled",
+        }}
+      >
+        <Typography role="status" variant="body2" sx={{ fontSize: 13 }}>
+          {AGGREGATION_POLLING_PAUSED_MESSAGE}
+        </Typography>
+      </Box>
+    );
+  }
+
   if (!data?.nodes?.length) {
     return (
       <Box
@@ -955,6 +977,26 @@ const AgentGraphInner = ({
       onMouseEnter={() => setIsHovering(true)}
       onMouseLeave={() => setIsHovering(false)}
     >
+      {pollingPaused && (
+        <Typography
+          role="status"
+          variant="caption"
+          color="text.secondary"
+          sx={{
+            position: "absolute",
+            zIndex: 2,
+            top: 4,
+            left: "50%",
+            transform: "translateX(-50%)",
+            bgcolor: "background.paper",
+            px: 1,
+            borderRadius: 0.5,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {AGGREGATION_POLLING_PAUSED_MESSAGE}
+        </Typography>
+      )}
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -994,6 +1036,7 @@ AgentGraphInner.propTypes = {
   data: PropTypes.object,
   isLoading: PropTypes.bool,
   isError: PropTypes.bool,
+  pollingPaused: PropTypes.bool,
   direction: PropTypes.oneOf(["LR", "TB"]),
   onNodeClick: PropTypes.func,
   isFullscreen: PropTypes.bool,
@@ -1020,6 +1063,7 @@ AgentGraph.propTypes = {
   data: PropTypes.object,
   isLoading: PropTypes.bool,
   isError: PropTypes.bool,
+  pollingPaused: PropTypes.bool,
   direction: PropTypes.oneOf(["LR", "TB"]),
   onNodeClick: PropTypes.func,
 };

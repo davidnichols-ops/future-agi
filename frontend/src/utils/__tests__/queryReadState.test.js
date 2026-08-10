@@ -189,12 +189,15 @@ describe("queryReadState", () => {
     }
     expect(controller.nextDelay()).toBe(false);
     expect(controller.isExhausted()).toBe(true);
+    expect(controller.getTerminationReason()).toBe("poll_budget");
     expect(controller.start()).toBe(false);
 
     controller.reset();
+    expect(controller.getTerminationReason()).toBeNull();
     expect(controller.start()).toBe(true);
     now += AGGREGATION_POLL_TIMEOUT_MS;
     expect(controller.nextDelay()).toBe(false);
+    expect(controller.getTerminationReason()).toBe("poll_budget");
   });
 
   it("terminates a polling lifecycle after bounded consecutive failures", () => {
@@ -211,6 +214,7 @@ describe("queryReadState", () => {
     expect(controller.recordFailure()).toBe(false);
     expect(controller.isActive()).toBe(false);
     expect(controller.isExhausted()).toBe(true);
+    expect(controller.getTerminationReason()).toBe("transport_failures");
   });
 
   it("aborts the underlying aggregation request at its transport deadline and ignores late completion", async () => {

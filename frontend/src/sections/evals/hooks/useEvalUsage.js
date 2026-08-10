@@ -42,10 +42,13 @@ function useAggregationPolling(identity) {
   }
   const [aggregationTransportFailed, setAggregationTransportFailed] =
     useState(false);
+  const [aggregationPollingPaused, setAggregationPollingPaused] =
+    useState(false);
 
   const reset = useCallback(() => {
     pollingControllerRef.current.reset();
     setAggregationTransportFailed(false);
+    setAggregationPollingPaused(false);
   }, []);
 
   useEffect(() => reset(), [identity, reset]);
@@ -53,6 +56,7 @@ function useAggregationPolling(identity) {
   const record = useCallback(({ queryRefreshing, queryRefreshFailed }) => {
     pollingControllerRef.current.recordSuccess();
     setAggregationTransportFailed(false);
+    setAggregationPollingPaused(false);
     const shouldPoll = queryRefreshing && !queryRefreshFailed;
     if (!shouldPoll) {
       pollingControllerRef.current.stop();
@@ -67,6 +71,7 @@ function useAggregationPolling(identity) {
       !pollingControllerRef.current.recordFailure()
     ) {
       setAggregationTransportFailed(true);
+      setAggregationPollingPaused(false);
     }
   }, []);
 
@@ -80,6 +85,7 @@ function useAggregationPolling(identity) {
   const recordTerminalFailure = useCallback(() => {
     pollingControllerRef.current.terminate();
     setAggregationTransportFailed(true);
+    setAggregationPollingPaused(false);
   }, []);
 
   const refetchInterval = useCallback((query) => {
@@ -90,7 +96,13 @@ function useAggregationPolling(identity) {
     }
     pollingControllerRef.current.start();
     const delay = pollingControllerRef.current.nextDelay();
-    if (delay === false) setAggregationTransportFailed(true);
+    if (delay === false) {
+      if (
+        pollingControllerRef.current.getTerminationReason() === "poll_budget"
+      ) {
+        setAggregationPollingPaused(true);
+      }
+    }
     return delay;
   }, []);
 
@@ -108,6 +120,7 @@ function useAggregationPolling(identity) {
     reset,
     isFailureTerminal,
     aggregationTransportFailed,
+    aggregationPollingPaused,
   };
 }
 
@@ -168,6 +181,7 @@ export function useEvalUsageChart(
     reset,
     isFailureTerminal,
     aggregationTransportFailed,
+    aggregationPollingPaused,
   } = useAggregationPolling(pollIdentity);
   const query = useQuery({
     queryKey: ["evals", "usage-chart", templateId, period, dateParams],
@@ -253,7 +267,7 @@ export function useEvalUsageChart(
       (query.isError && isFailureTerminal()) ||
       query.data?.queryRefreshFailed === true);
   const data =
-    terminalError && query.data?.queryRefreshing
+    (terminalError || aggregationPollingPaused) && query.data?.queryRefreshing
       ? { ...query.data, queryRefreshing: false }
       : query.data;
 
@@ -261,6 +275,7 @@ export function useEvalUsageChart(
     ...query,
     data,
     isError: terminalError,
+    isPollingPaused: aggregationPollingPaused,
     refresh,
   };
 }
@@ -291,6 +306,7 @@ export function useEvalUsageLogs(
     reset,
     isFailureTerminal,
     aggregationTransportFailed,
+    aggregationPollingPaused,
   } = useAggregationPolling(pollIdentity);
   const query = useQuery({
     queryKey: [
@@ -387,7 +403,7 @@ export function useEvalUsageLogs(
       (query.isError && isFailureTerminal()) ||
       query.data?.queryRefreshFailed === true);
   const data =
-    terminalError && query.data?.queryRefreshing
+    (terminalError || aggregationPollingPaused) && query.data?.queryRefreshing
       ? { ...query.data, queryRefreshing: false }
       : query.data;
 
@@ -395,6 +411,7 @@ export function useEvalUsageLogs(
     ...query,
     data,
     isError: terminalError,
+    isPollingPaused: aggregationPollingPaused,
     refresh,
   };
 }

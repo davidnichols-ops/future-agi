@@ -20,6 +20,9 @@ export const QUERY_FAILED_RETRY_MESSAGE =
 
 export const AGGREGATION_PREPARING_MESSAGE = "Loading results…";
 
+export const AGGREGATION_POLLING_PAUSED_MESSAGE =
+  "Still preparing exact results. Refresh to check again.";
+
 export const GRAPH_LOADING_MESSAGE = "Loading graph data…";
 
 const payloadCandidates = (payload) => {
@@ -431,6 +434,7 @@ export function createAggregationPollController({
   let consecutiveFailures = 0;
   let active = false;
   let exhausted = false;
+  let terminationReason = null;
 
   const reset = () => {
     attempt = 0;
@@ -438,6 +442,7 @@ export function createAggregationPollController({
     consecutiveFailures = 0;
     active = false;
     exhausted = false;
+    terminationReason = null;
   };
 
   const start = () => {
@@ -458,11 +463,13 @@ export function createAggregationPollController({
     startedAt = null;
     consecutiveFailures = 0;
     active = false;
+    terminationReason = null;
   };
 
-  const exhaust = () => {
+  const exhaust = (reason = "terminated") => {
     active = false;
     exhausted = true;
+    terminationReason = reason;
     return false;
   };
 
@@ -476,7 +483,7 @@ export function createAggregationPollController({
         now: currentTime,
       })
     ) {
-      return exhaust();
+      return exhaust("poll_budget");
     }
 
     const delay = getAggregationPollDelay(attempt);
@@ -484,7 +491,7 @@ export function createAggregationPollController({
     // ceiling.  The server-owned job remains intact and an explicit refresh
     // can start a fresh bounded observation window.
     if (currentTime + delay - startedAt >= AGGREGATION_POLL_TIMEOUT_MS) {
-      return exhaust();
+      return exhaust("poll_budget");
     }
     return delay;
   };
@@ -505,7 +512,7 @@ export function createAggregationPollController({
     if (!active) return false;
     consecutiveFailures += 1;
     if (consecutiveFailures >= AGGREGATION_POLL_MAX_CONSECUTIVE_FAILURES) {
-      return exhaust();
+      return exhaust("transport_failures");
     }
     return true;
   };
@@ -521,12 +528,14 @@ export function createAggregationPollController({
     recordFailure,
     isActive: () => active,
     isExhausted: () => exhausted,
+    getTerminationReason: () => terminationReason,
     snapshot: () => ({
       attempt,
       startedAt,
       consecutiveFailures,
       active,
       exhausted,
+      terminationReason,
     }),
   };
 }

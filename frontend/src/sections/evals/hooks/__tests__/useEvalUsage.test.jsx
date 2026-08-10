@@ -206,6 +206,7 @@ describe("useEvalUsage date params", () => {
 
     expect(mocks.get).toHaveBeenCalledTimes(4);
     expect(result.current.isError).toBe(true);
+    expect(result.current.isPollingPaused).toBe(false);
     expect(result.current.data?.queryPending).toBe(true);
     expect(result.current.data?.queryRefreshing).toBe(false);
 
@@ -221,6 +222,7 @@ describe("useEvalUsage date params", () => {
     expect(mocks.get).toHaveBeenCalledTimes(5);
     expect(mocks.get.mock.calls[4][1].params.refresh).toBe(true);
     expect(result.current.isError).toBe(false);
+    expect(result.current.isPollingPaused).toBe(false);
     expect(result.current.data?.queryRefreshing).toBe(false);
     expect(result.current.data?.chart).toHaveLength(1);
   });
@@ -286,8 +288,10 @@ describe("useEvalUsage date params", () => {
 
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
     const boundedRequestCount = mocks.get.mock.calls.length;
-    expect(result.current.isError).toBe(true);
+    expect(result.current.isError).toBe(false);
+    expect(result.current.isPollingPaused).toBe(true);
     expect(result.current.data?.queryPending).toBe(true);
+    expect(result.current.data?.queryRefreshing).toBe(false);
     expect(boundedRequestCount).toBeLessThanOrEqual(13);
 
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
@@ -303,6 +307,7 @@ describe("useEvalUsage date params", () => {
     await act(async () => result.current.refresh());
     expect(mocks.get).toHaveBeenCalledTimes(boundedRequestCount + 1);
     expect(result.current.isError).toBe(false);
+    expect(result.current.isPollingPaused).toBe(false);
     expect(result.current.data?.chart).toHaveLength(1);
   });
 });
@@ -463,6 +468,7 @@ describe("useEvalUsageLogs response mapping", () => {
 
     expect(mocks.get).toHaveBeenCalledTimes(4);
     expect(result.current.isError).toBe(true);
+    expect(result.current.isPollingPaused).toBe(false);
     expect(result.current.data?.queryPending).toBe(true);
     expect(result.current.data?.queryRefreshing).toBe(false);
 
@@ -479,6 +485,7 @@ describe("useEvalUsageLogs response mapping", () => {
     expect(mocks.get).toHaveBeenCalledTimes(5);
     expect(mocks.get.mock.calls[4][1].params.refresh).toBe(true);
     expect(result.current.isError).toBe(false);
+    expect(result.current.isPollingPaused).toBe(false);
     expect(result.current.data?.queryRefreshing).toBe(false);
     expect(result.current.data?.table?.[0]?.row_id).toBe("recovered");
   });
@@ -542,8 +549,10 @@ describe("useEvalUsageLogs response mapping", () => {
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
 
     const boundedRequestCount = mocks.get.mock.calls.length;
-    expect(result.current.isError).toBe(true);
+    expect(result.current.isError).toBe(false);
+    expect(result.current.isPollingPaused).toBe(true);
     expect(result.current.data?.queryPending).toBe(true);
+    expect(result.current.data?.queryRefreshing).toBe(false);
     expect(boundedRequestCount).toBeLessThanOrEqual(13);
 
     await act(async () => vi.advanceTimersByTimeAsync(500_000));
@@ -559,6 +568,7 @@ describe("useEvalUsageLogs response mapping", () => {
     });
     await act(async () => result.current.refresh());
     expect(mocks.get).toHaveBeenCalledTimes(boundedRequestCount + 1);
+    expect(result.current.isPollingPaused).toBe(false);
     expect(result.current.data?.queryPending).toBe(false);
     expect(result.current.data?.table?.[0]?.row_id).toBe("eventual");
   });
