@@ -177,7 +177,9 @@ class _ReaderCM:
         ids = {str(s) for s in span_ids}
         if self._span is None or str(self._span.id) not in ids:
             return {}
-        return {str(self._span.id): SimpleNamespace(project_id=str(self._span.project_id))}
+        return {
+            str(self._span.id): SimpleNamespace(project_id=str(self._span.project_id))
+        }
 
 
 class _MultiSpanReaderCM(_ReaderCM):
@@ -218,9 +220,7 @@ def test_enumerated_queue_resolution_rejects_reused_bare_span_id():
         start_time=datetime(2025, 5, 1, 10, 1, 0, tzinfo=UTC),
     )
 
-    with mock.patch(
-        CH_READER_PATH, return_value=_MultiSpanReaderCM([first, second])
-    ):
+    with mock.patch(CH_READER_PATH, return_value=_MultiSpanReaderCM([first, second])):
         resolved = _batch_ch_spans(
             ["reused-span"],
             project_id=project_id,
@@ -395,7 +395,6 @@ class TestExportToDatasetCollectorSpan:
         assert result["rows_created"] == 1
         assert result["columns"] == ["input", "model", "span_id"]
 
-
         row = Row.objects.get(dataset_id=result["dataset_id"], deleted=False)
         assert row.metadata["queue_item_id"] == str(item.id)
         cells = {
@@ -441,9 +440,9 @@ class TestExportCollectorSessionContent:
             )
 
         assert resp.status_code == status.HTTP_200_OK, resp.data
-        source = next(
-            r for r in _result(resp) if r["item_id"] == str(item.id)
-        )["source"]
+        source = next(r for r in _result(resp) if r["item_id"] == str(item.id))[
+            "source"
+        ]
         assert source["type"] == QueueItemSourceType.TRACE_SESSION.value
         assert "deleted" not in source
         assert source["session_id"] == session_id

@@ -14,6 +14,7 @@ from tfc.middleware.db_health_check import db_connection_required
 from tfc.middleware.query_timeout import monitor_query_performance
 from tfc.routers import uses_db
 from tfc.utils.api_contracts import validated_request
+from tfc.utils.api_serializers import ApiErrorResponseSerializer
 from tfc.utils.base_viewset import BaseModelViewSetMixinWithUserOrg
 from tfc.utils.error_codes import get_error_message
 from tfc.utils.general_methods import GeneralMethods
@@ -47,6 +48,9 @@ from tracer.services.clickhouse.graph_dispatch import (
     fetch_user_system_metric_graph_ch,
     graph_payload_is_publishable,
 )
+from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.read_budget import (
     is_clickhouse_api_read_unavailable_error,
 )
@@ -58,6 +62,7 @@ from tracer.services.clickhouse.v2.query_builders.user_time_series import (
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.services.filter_principal_context import (
+    FilterPrincipalContextError,
     bind_request_my_annotations_principal,
 )
 from tracer.utils.constants import (
@@ -67,7 +72,10 @@ from tracer.utils.constants import (
     ORG_KEYS,
     PROTOTYPE_CODEBLOCK,
 )
-from tracer.utils.graphs_optimized import get_all_system_metrics
+from tracer.utils.graphs_optimized import (
+    SystemMetricGraphReadError,
+    get_all_system_metrics,
+)
 from tracer.utils.helper import get_default_project_version_config, get_sort_query
 
 logger = structlog.get_logger(__name__)
@@ -672,7 +680,14 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             logger.exception(f"Error updating project tags: {e}")
             return self._gm.bad_request("Error updating tags")
 
-    @validated_request(query_serializer=ProjectGraphDataQuerySerializer)
+    @validated_request(
+        query_serializer=ProjectGraphDataQuerySerializer,
+        responses={
+            400: ApiErrorResponseSerializer,
+            500: ApiErrorResponseSerializer,
+            503: ApiErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=["get"])
     def get_graph_data(self, request, *args, **kwargs):
         query_params = request.validated_query_data
@@ -681,8 +696,10 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
         refresh = query_params.get("refresh", False)
 
         try:
-            if not self._get_project_in_scope(project_id):
+            project = self._get_project_in_scope(project_id)
+            if not project:
                 return self._gm.bad_request("Project not found.")
+            workspace_id = getattr(getattr(request, "workspace", None), "id", None)
             response_data = get_all_system_metrics(
                 interval=query_params["interval"],
                 filters=bind_request_my_annotations_principal(
@@ -692,6 +709,8 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                 property="average",
                 system_metric_filters={"project_id": project_id},
                 refresh=refresh,
+                organization_id=str(project.organization_id),
+                workspace_id=str(workspace_id) if workspace_id else None,
             )
             if not graph_payload_is_publishable(
                 response_data,
@@ -710,9 +729,32 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
 
         except Project.DoesNotExist:
             return self._gm.bad_request("Project not found.")
-        except Exception as e:
-            logger.exception(f"Error in get_graph_data: {str(e)}")
-            return self._gm.bad_request("Error fetching graph data")
+        except (UnsupportedFilterShapeError, FilterPrincipalContextError):
+            return self._gm.bad_request("Graph filter configuration is invalid")
+        except Exception as exc:
+            if isinstance(
+                exc, SystemMetricGraphReadError
+            ) or is_clickhouse_api_read_unavailable_error(exc):
+                logger.warning(
+                    "project_graph_data_unavailable",
+                    project_id=project_id,
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Graph data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
+            logger.exception(
+                "project_graph_data_failed",
+                project_id=project_id,
+                error_type=type(exc).__name__,
+            )
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Graph data could not be loaded",
+                code="server_error",
+            )
 
     @validated_request(request_serializer=ProjectUserMetricsRequestSerializer)
     @action(detail=False, methods=["post"])
@@ -726,7 +768,8 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                 body["filters"],
             )
 
-            if not self._get_project_in_scope(project_id):
+            project = self._get_project_in_scope(project_id)
+            if not project:
                 return self._gm.bad_request("Project not found.")
 
             _org = get_request_organization(request) or request.user.organization
@@ -812,8 +855,10 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
             metric_type = req_data_config.get("type", "SYSTEM_METRIC")
             metric_id = req_data_config.get("id", "active_users")
 
-            if not self._get_project_in_scope(project_id):
+            project = self._get_project_in_scope(project_id)
+            if not project:
                 return self._gm.bad_request("Project not found.")
+            workspace_id = getattr(getattr(request, "workspace", None), "id", None)
 
             if (
                 metric_type == "EVAL"
@@ -838,6 +883,8 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                         interval=interval,
                         metric_id=metric_id,
                         refresh=refresh,
+                        organization_id=str(project.organization_id),
+                        workspace_id=str(workspace_id) if workspace_id else None,
                     )
                     graph_data = enforce_exact_graph_data_contract(graph_data)
                     if not graph_payload_is_publishable(
@@ -877,6 +924,8 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                             req_data_config=req_data_config,
                             refresh=refresh,
                             aggregation_context="user",
+                            organization_id=str(project.organization_id),
+                            workspace_id=str(workspace_id) if workspace_id else None,
                         )
                     except Exception as e:
                         logger.exception(
@@ -896,6 +945,8 @@ class ProjectView(BaseModelViewSetMixinWithUserOrg, ModelViewSet):
                             observe_type="trace",
                             refresh=refresh,
                             aggregation_context="user",
+                            organization_id=str(project.organization_id),
+                            workspace_id=str(workspace_id) if workspace_id else None,
                         )
                     except Exception as e:
                         logger.exception(

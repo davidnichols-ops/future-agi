@@ -1321,6 +1321,12 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     interval=body["interval"],
                     req_data_config=req_data_config,
                     refresh=refresh,
+                    organization_id=str(project.organization_id),
+                    workspace_id=(
+                        str(request.workspace.id)
+                        if getattr(request, "workspace", None)
+                        else None
+                    ),
                 )
             except Exception as exc:
                 if isinstance(exc, BoundedGraphReadError):

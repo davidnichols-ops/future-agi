@@ -7,8 +7,8 @@ from accounts.models.workspace import Workspace
 from model_hub.models.ai_model import AIModel
 from model_hub.models.choices import DatasetSourceChoices, OwnerChoices, StatusType
 from model_hub.models.develop_dataset import Dataset
-from model_hub.models.evaluation import Evaluation
 from model_hub.models.evals_metric import EvalTemplate, UserEvalMetric
+from model_hub.models.evaluation import Evaluation
 from model_hub.models.run_prompt import PromptEvalConfig, PromptTemplate
 from tfc.constants.api_calls import APICallStatusChoices, APICallTypeChoices
 from tracer.models.custom_eval_config import CustomEvalConfig, InlineEval

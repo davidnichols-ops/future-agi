@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from clickhouse_driver.errors import ServerException
 from django.utils import timezone
 from rest_framework import status
 
@@ -708,6 +709,42 @@ class TestProjectGraphDataAPI:
         assert response.status_code == status.HTTP_200_OK
         data = get_result(response)
         assert data == {"system_metrics": exact_metrics, "evaluations": {}}
+
+    @pytest.mark.parametrize(
+        ("failure", "expected_status", "expected_code"),
+        [
+            (
+                ServerException("private timeout stack", code=159),
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "service_unavailable",
+            ),
+            (
+                RuntimeError("private programming defect"),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "server_error",
+            ),
+        ],
+    )
+    def test_get_graph_data_classifies_and_sanitizes_failures(
+        self,
+        auth_client,
+        project,
+        failure,
+        expected_status,
+        expected_code,
+    ):
+        with patch(
+            "tracer.views.project.get_all_system_metrics",
+            side_effect=failure,
+        ):
+            response = auth_client.get(
+                "/tracer/project/get_graph_data/",
+                {"project_id": str(project.id), "interval": "hour"},
+            )
+
+        assert response.status_code == expected_status
+        assert response.json()["code"] == expected_code
+        assert "private" not in str(response.json())
 
     @patch("tracer.views.project.get_all_system_metrics")
     def test_get_graph_data_rejects_sample_even_with_legacy_opt_in(

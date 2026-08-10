@@ -555,6 +555,8 @@ def fetch_session_graph_ch(
     req_data_config: dict[str, Any],
     wall_deadline_ms: int = SESSION_GRAPH_WALL_DEADLINE_MS,
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Dispatch complete exact session aggregates to direct-write CH25."""
 
@@ -572,6 +574,10 @@ def fetch_session_graph_ch(
             "interval": interval,
             "metric_id": metric_id,
         }
+        if organization_id is not None:
+            identity["organization_id"] = str(organization_id)
+        if workspace_id is not None:
+            identity["workspace_id"] = str(workspace_id)
         return read_or_schedule_exact_snapshot(
             "observe-session-system-graph",
             identity,
@@ -597,6 +603,8 @@ def fetch_session_graph_ch(
             observe_type="trace",
             refresh=refresh,
             aggregation_context="session",
+            organization_id=organization_id,
+            workspace_id=workspace_id,
         )
     if metric_type == "ANNOTATION":
         return fetch_annotation_graph_ch(
@@ -608,6 +616,8 @@ def fetch_session_graph_ch(
             observe_type="trace",
             refresh=refresh,
             aggregation_context="session",
+            organization_id=organization_id,
+            workspace_id=workspace_id,
         )
     raise ValueError("Unsupported session graph metric type")
 

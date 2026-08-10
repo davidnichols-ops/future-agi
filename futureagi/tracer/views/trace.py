@@ -1,16 +1,12 @@
 import concurrent.futures
-import csv
-import io
 import json
 import math
 import re
-import traceback
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-import pandas as pd
 import structlog
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.db import models
@@ -18,7 +14,6 @@ from django.db.models import (
     Avg,
     BooleanField,
     Case,
-    CharField,
     Count,
     Exists,
     F,
@@ -32,7 +27,6 @@ from django.db.models import (
     When,
 )
 from django.db.models.functions import Coalesce, JSONObject, Round
-from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_yasg.utils import swagger_auto_schema
@@ -2611,6 +2605,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             # pooled V2 client; the legacy CH connection and PostgreSQL span /
             # trace models are never a fallback for this endpoint.
             analytics = V2AnalyticsQueryService()
+            workspace_id = getattr(getattr(request, "workspace", None), "id", None)
             try:
                 if metric_type == "SYSTEM_METRIC":
                     graph = fetch_system_metric_graph_ch(
@@ -2621,6 +2616,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         metric_id=metric_id,
                         observe_type="trace",
                         refresh=refresh,
+                        organization_id=(
+                            str(project.organization_id)
+                            if getattr(project, "organization_id", None)
+                            else None
+                        ),
+                        workspace_id=str(workspace_id) if workspace_id else None,
                     )
                 elif metric_type == "EVAL":
                     graph = fetch_eval_graph_ch(
@@ -2631,6 +2632,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         req_data_config=req_data_config,
                         observe_type="trace",
                         refresh=refresh,
+                        organization_id=(
+                            str(project.organization_id)
+                            if getattr(project, "organization_id", None)
+                            else None
+                        ),
+                        workspace_id=str(workspace_id) if workspace_id else None,
                     )
                 else:
                     graph = fetch_annotation_graph_ch(
@@ -2641,6 +2648,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         req_data_config=req_data_config,
                         observe_type="trace",
                         refresh=refresh,
+                        organization_id=(
+                            str(project.organization_id)
+                            if getattr(project, "organization_id", None)
+                            else None
+                        ),
+                        workspace_id=str(workspace_id) if workspace_id else None,
                     )
                 graph = enforce_exact_graph_data_contract(graph)
                 if not graph_payload_is_publishable(
@@ -4048,10 +4061,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def get_trace_export_data(self, request, *args, **kwargs):
-        """
-        Export traces filtered by project ID with optimized queries.
-        Auto-detects voice/conversation projects and exports voice-specific fields.
-        """
+        """Fail closed until a complete ClickHouse trace exporter is available."""
         try:
             serializer = TraceExportQuerySerializer(data=request.query_params)
             if not serializer.is_valid():
@@ -4065,280 +4075,26 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             if not project:
                 return self._gm.bad_request("Project not found")
 
-            # Check if project has voice/conversation traces.
-            # Wave-3 (commit 93c5c415f) added the exact reader the prior
-            # CH25-TODO requested: `has_root_spans_of_type(project_id,
-            # observation_type)` ANDs is_deleted=0 + parent_span_id='' +
-            # observation_type on the CH side, returning a bool from a
-            # SELECT … LIMIT 1. Tenant scope is preserved by the
-            # workspace-scoped `_project_queryset_for_request` check
-            # above; the reader call is project-scoped.
-            from tracer.services.clickhouse.v2 import get_reader
-
-            with get_reader() as reader:
-                has_voice_traces = reader.has_root_spans_of_type(
-                    str(project_id), "conversation"
-                )
-
-            if has_voice_traces:
-                # Voice telemetry is direct-write-only. The legacy exporter reads
-                # PostgreSQL and can therefore return stale or empty data; fail
-                # closed until a complete ClickHouse export collector is available.
-                return self._gm.custom_error_response(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "A complete voice call export is temporarily unavailable. Please retry later.",
-                    code="service_unavailable",
-                )
-
-            # Regular observe export path
-            response = self.list_traces_of_session(request, export=True)
-
-            if response.status_code != 200:
-                return response
-
-            result = response.data.get("result")
-            table_data = result.get("table", None)
-
-            df = pd.DataFrame(table_data)
-
-            # Convert to CSV buffer
-            buffer = io.BytesIO()
-            df.to_csv(buffer, index=False, encoding="utf-8")
-            buffer.seek(0)
-
-            # Create the response with the file
-            filename = f"{project.name or 'project'}_traces.csv"
-            response = FileResponse(
-                buffer, as_attachment=True, filename=filename, content_type="text/csv"
+            # Trace lists are intentionally bounded and paginated. Reusing a
+            # page as a CSV would silently publish partial customer data. Voice
+            # and non-voice exports therefore share one explicit fail-closed
+            # contract until the background CH25 exporter can prove completion.
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "A complete trace export is temporarily unavailable. Please retry later.",
+                code="service_unavailable",
             )
 
-            return response
-
-        except Exception as e:
-            traceback.print_exc()
-            logger.exception(f"Error in fetching the traces list of observe: {str(e)}")
-
-    def _export_voice_calls(self, request, project, project_id):
-        """
-        Export voice/conversation traces as CSV with call-specific fields.
-        """
-        # CH25-TODO: voice-call CSV export is PG-only. Two blockers:
-        #   1. Unbounded walk — no CH equivalent in
-        #      VoiceCallListQueryBuilder today. The CH list endpoint
-        #      always paginates; export skips pagination.
-        #   2. populate_call_logs_result (L1586-1707) iterates a Django
-        #      queryset and reads per-row annotations attached upstream
-        #      (`span_attributes`, `provider`, `metadata`,
-        #      `metric_{config.id}`, `annotation_{label.id}`, etc.).
-        #      The wave-3 reader's `list_by_trace_ids` returns
-        #      list[CHSpan] without these annotations; reusing
-        #      `populate_call_logs_result` would require either a
-        #      wrapper that fakes the queryset attribute shape or a
-        #      rewritten variant that takes
-        #      (CHSpan-rooted-rows, eval_outputs_map,
-        #       annotation_outputs_map) and emits the same dict.
-        # Migrating cleanly would need (a) a CH unbounded-walk builder
-        # (or a Temporal job that streams CH rows in batches), and (b)
-        # a `populate_call_logs_result_from_ch(...)` variant that does
-        # not rely on Django-queryset side annotations. Staying PG-only
-        # until both land or this export is moved to a Temporal job
-        # that streams unbounded CH rows + assembles voice-call shape +
-        # writes the CSV to S3.
-        serializer = TraceExportQuerySerializer(data=request.query_params)
-        if not serializer.is_valid():
-            return self._gm.bad_request(serializer.errors)
-
-        validated_data = serializer.validated_data
-
-        # Build query (same as list_voice_calls but without pagination)
-        root_span_qs = ObservationSpan.objects.filter(
-            trace_id=OuterRef("id"), parent_span_id__isnull=True
-        )
-
-        base_query = (
-            Trace.objects.filter(project_id=project_id)
-            .annotate(
-                has_conversation_root=Exists(
-                    root_span_qs.filter(observation_type="conversation")
-                ),
-                trace_id=F("id"),
-                # Fetch span_attributes from root span (fallback to eval_attributes for old data)
-                span_attributes=Subquery(
-                    root_span_qs.annotate(
-                        _attrs=Coalesce("span_attributes", "eval_attributes")
-                    ).values("_attrs")[:1]
-                ),
-                root_metadata=Subquery(root_span_qs.values("metadata")[:1]),
-                provider=Subquery(root_span_qs.values("provider")[:1]),
-                start_time=Coalesce(
-                    Subquery(
-                        root_span_qs.order_by("start_time").values("start_time")[:1]
-                    ),
-                    "created_at",
-                ),
-                end_time=Subquery(
-                    root_span_qs.order_by("-end_time").values("end_time")[:1]
-                ),
-                status=Case(
-                    When(
-                        Exists(root_span_qs.filter(status="ERROR")),
-                        then=Value("ERROR"),
-                    ),
-                    When(
-                        Exists(root_span_qs.filter(status="OK")),
-                        then=Value("OK"),
-                    ),
-                    default=Value("UNSET"),
-                    output_field=CharField(),
-                ),
+        except Exception as exc:
+            logger.exception(
+                "trace_export_failed",
+                error_type=type(exc).__name__,
             )
-            .filter(has_conversation_root=True)
-        )
-
-        eval_configs, base_query = self.get_eval_configs(project_id, base_query)
-
-        # Apply filters
-        filters = validated_data.get("filters", [])
-        if filters:
-            system_filter_conditions = (
-                FilterEngine.get_filter_conditions_for_system_metrics(filters)
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Trace export could not be generated",
+                code="server_error",
             )
-            if system_filter_conditions:
-                base_query = base_query.filter(system_filter_conditions)
-
-            # Apply voice system metric filters (agent latency, turn count, etc.)
-            voice_metric_conditions, voice_annotations = (
-                FilterEngine.get_filter_conditions_for_voice_system_metrics(filters)
-            )
-            if voice_annotations:
-                base_query = base_query.annotate(**voice_annotations)
-            if voice_metric_conditions:
-                base_query = base_query.filter(voice_metric_conditions)
-
-            # Separate annotation filters from eval filters
-            def _get_col_type(f):
-                fc = f.get("filter_config", {})
-                return fc.get("col_type", f.get("col_type", ""))
-
-            annotation_col_types = {"ANNOTATION"}
-            annotation_column_ids = {"my_annotations", "annotator"}
-            non_annotation_filters = [
-                f
-                for f in filters
-                if _get_col_type(f) not in annotation_col_types
-                and f.get("column_id") not in annotation_column_ids
-            ]
-
-            eval_filter_conditions = (
-                FilterEngine.get_filter_conditions_for_non_system_metrics(
-                    non_annotation_filters
-                )
-            )
-            if eval_filter_conditions:
-                base_query = base_query.filter(eval_filter_conditions)
-
-            span_attribute_conditions = (
-                FilterEngine.get_filter_conditions_for_span_attributes(filters)
-            )
-            if span_attribute_conditions:
-                base_query = base_query.filter(span_attribute_conditions)
-
-        base_query = base_query.order_by("-start_time", "-id")
-
-        # Process call logs using existing method
-        results = self.populate_call_logs_result(base_query, eval_configs)
-
-        # Collect dynamic eval column names
-        eval_columns = set()
-        for result in results:
-            if result.get("eval_outputs"):
-                for config_id, eval_data in result["eval_outputs"].items():
-                    eval_name = eval_data.get("name", f"Eval_{config_id}")
-                    eval_columns.add(eval_name)
-
-        # Build CSV
-        fieldnames = [
-            "ID",
-            "Call ID",
-            "Phone Number",
-            "Call Type",
-            "Status",
-            "Started At",
-            "Ended At",
-            "Duration (s)",
-            "Recording URL",
-            "Stereo Recording URL",
-            "Call Summary",
-            "Overall Score",
-            "Response Time (ms)",
-            "Cost (cents)",
-            "Ended Reason",
-            "Transcript",
-        ]
-
-        sorted_eval_columns = sorted(eval_columns)
-        for eval_name in sorted_eval_columns:
-            fieldnames.append(eval_name)
-
-        response = HttpResponse(content_type="text/csv")
-        filename = f"{project.name or 'project'}_voice_calls.csv"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-
-        writer = csv.DictWriter(response, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for result in results:
-            # Format transcript as "role: content" per line
-            transcript_text = ""
-            if result.get("transcript"):
-                lines = []
-                for entry in result["transcript"]:
-                    role = entry.get("role", "unknown")
-                    content = entry.get("content", "")
-                    lines.append(f"{role}: {content}")
-                transcript_text = "\n".join(lines)
-
-            # Build recording URL from nested recording dict
-            recording = result.get("recording", {}) or {}
-            mono = recording.get("mono", {}) or {}
-            recording_url = result.get("recording_url") or mono.get("combinedUrl") or ""
-            stereo_url = (
-                result.get("stereo_recording_url") or recording.get("stereoUrl") or ""
-            )
-
-            row_data = {
-                "ID": result.get("id", ""),
-                "Call ID": result.get("call_id", ""),
-                "Phone Number": result.get("phone_number", ""),
-                "Call Type": result.get("call_type", ""),
-                "Status": result.get("status", ""),
-                "Started At": result.get("started_at", ""),
-                "Ended At": result.get("ended_at", ""),
-                "Duration (s)": result.get("duration_seconds", ""),
-                "Recording URL": recording_url,
-                "Stereo Recording URL": stereo_url,
-                "Call Summary": result.get("call_summary", ""),
-                "Overall Score": result.get("overall_score", ""),
-                "Response Time (ms)": result.get("response_time_ms", ""),
-                "Cost (cents)": result.get("cost_cents", ""),
-                "Ended Reason": result.get("ended_reason", ""),
-                "Transcript": transcript_text,
-            }
-
-            # Initialize eval columns with empty values
-            for eval_name in sorted_eval_columns:
-                row_data[eval_name] = ""
-
-            # Fill in eval outputs
-            if result.get("eval_outputs"):
-                for config_id, eval_data in result["eval_outputs"].items():
-                    eval_name = eval_data.get("name", f"Eval_{config_id}")
-                    output = eval_data.get("output", "")
-                    row_data[eval_name] = str(output) if output is not None else ""
-
-            writer.writerow(row_data)
-
-        return response
 
     def _list_traces_of_session_clickhouse(
         self,
@@ -6854,11 +6610,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 list(query.get("filters") or []),
             )
             refresh = bool(query.get("refresh", False))
+            tenant_scope = {}
+            if getattr(project, "organization_id", None):
+                tenant_scope["organization_id"] = str(project.organization_id)
+            if getattr(request, "workspace", None):
+                tenant_scope["workspace_id"] = str(request.workspace.id)
 
             result = fetch_agent_graph_ch(
                 project_id=project_id,
                 filters=filters,
                 refresh=refresh,
+                **tenant_scope,
             )
             return self._gm.success_response(result)
 

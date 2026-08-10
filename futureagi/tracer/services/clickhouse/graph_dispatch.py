@@ -367,9 +367,15 @@ def _read_or_refresh_exact_graph(
     identity: dict[str, Any],
     refresh: bool,
     pending_payload: Any,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> Any:
     """Return immediately while a deduplicated exact refresh runs out of band."""
 
+    if organization_id is not None:
+        identity["organization_id"] = str(organization_id)
+    if workspace_id is not None:
+        identity["workspace_id"] = str(workspace_id)
     return read_or_schedule_exact_snapshot(
         namespace,
         identity,
@@ -820,6 +826,8 @@ def fetch_system_metric_graph_ch(
     observe_type: str = "trace",
     timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Read one complete exact graph, reusing its last successful snapshot."""
 
@@ -839,6 +847,8 @@ def fetch_system_metric_graph_ch(
         identity=identity,
         refresh=bool(refresh),
         pending_payload=_pending_graph_payload(str(metric_id or "")),
+        organization_id=organization_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -847,6 +857,8 @@ def fetch_agent_graph_ch(
     project_id: str,
     filters: list[dict[str, Any]],
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Read or schedule one exact Agent Graph snapshot.
 
@@ -874,6 +886,8 @@ def fetch_agent_graph_ch(
             "query_sampled": False,
             "query_refreshing": True,
         },
+        organization_id=organization_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -885,6 +899,8 @@ def fetch_all_system_metrics_ch(
     interval: str,
     timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Read the complete exact project-chart metric bundle."""
 
@@ -910,6 +926,8 @@ def fetch_all_system_metrics_ch(
             "query_sampled": False,
             "query_refreshing": True,
         },
+        organization_id=organization_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -921,6 +939,8 @@ def fetch_user_system_metric_graph_ch(
     interval: str,
     metric_id: str,
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Read one complete exact user-grain graph snapshot."""
 
@@ -937,6 +957,8 @@ def fetch_user_system_metric_graph_ch(
         identity=identity,
         refresh=bool(refresh),
         pending_payload=_pending_graph_payload(str(metric_id or "")),
+        organization_id=organization_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -1225,6 +1247,8 @@ def fetch_eval_graph_ch(
     timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
     refresh: bool = False,
     aggregation_context: str = "trace",
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     del timeout_ms
     project_id = _validated_project_id(project_id)
@@ -1246,6 +1270,8 @@ def fetch_eval_graph_ch(
         identity=identity,
         refresh=bool(refresh),
         pending_payload=_pending_graph_payload(str(req_data_config.get("id") or "")),
+        organization_id=organization_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -1258,6 +1284,8 @@ def fetch_eval_chart_series_ch(
     req_data_config: dict[str, Any],
     eval_name: str,
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return a cached complete exact eval-chart series bundle."""
 
@@ -1281,6 +1309,8 @@ def fetch_eval_chart_series_ch(
                 name=str(eval_name or ""),
             )
         ],
+        organization_id=organization_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -1501,6 +1531,8 @@ def fetch_annotation_graph_ch(
     timeout_ms: int = GRAPH_QUERY_TIMEOUT_MS,
     refresh: bool = False,
     aggregation_context: str = "trace",
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     del timeout_ms
     project_id = _validated_project_id(project_id)
@@ -1525,6 +1557,8 @@ def fetch_annotation_graph_ch(
         identity=identity,
         refresh=bool(refresh),
         pending_payload=_pending_graph_payload(label_id),
+        organization_id=organization_id,
+        workspace_id=workspace_id,
     )
 
 

@@ -2525,6 +2525,21 @@ def test_redis_lua_fence_rejects_old_token_and_atomically_publishes_new(monkeypa
 
 
 @pytest.mark.unit
+def test_snapshot_key_changes_when_exact_query_contract_version_changes(monkeypatch):
+    from tracer.services import exact_aggregation_cache as cache_module
+
+    identity = {"project": "p", "metric": "latency"}
+    current_key = cache_module.snapshot_cache_key("observe-system-graph", identity)
+
+    monkeypatch.setattr(cache_module, "_CACHE_VERSION", 1)
+    legacy_key = cache_module.snapshot_cache_key("observe-system-graph", identity)
+
+    assert current_key.startswith("exact-aggregation:v2:")
+    assert legacy_key.startswith("exact-aggregation:v1:")
+    assert current_key != legacy_key
+
+
+@pytest.mark.unit
 def test_snapshot_key_fails_closed_for_unknown_identity_types():
     with pytest.raises(TypeError, match="unsupported snapshot identity type"):
         snapshot_cache_key("test", {"bad": object()})
@@ -6860,6 +6875,11 @@ def test_exact_worker_forwards_session_context_to_eval_annotation_reader(
 
     monkeypatch.setattr(exact_graph_reads, reader_name, reader)
     monkeypatch.setattr(query_service, "V2AnalyticsQueryService", lambda: object())
+    monkeypatch.setattr(
+        exact_aggregation,
+        "_reauthorize_exact_observe_project",
+        lambda _identity: None,
+    )
     exact_aggregation._observe_payload(
         namespace,
         {

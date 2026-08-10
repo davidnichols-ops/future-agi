@@ -255,7 +255,7 @@ def test_exact_attribute_detail_executes_distinct_latest_state_contract_on_ch25(
         ("number", 1, 1, 50.0),
     }
     assert all(
-        item["value"] not in {"tombstoned", 99, 99.0} for item in payload["top_values"]
+        item["value"] not in {"tombstoned", 99} for item in payload["top_values"]
     )
 
 

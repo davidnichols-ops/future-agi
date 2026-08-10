@@ -33,6 +33,9 @@ from model_hub.models.develop_annotations import AnnotationsLabels
 from model_hub.models.score import Score
 from tracer.models.custom_eval_config import CustomEvalConfig, EvalOutputType
 from tracer.models.observation_span import ObservationSpan
+from tracer.services.clickhouse.read_budget import (
+    is_clickhouse_api_read_unavailable_error,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -111,6 +114,8 @@ def get_eval_graph_data(
     req_data_config: dict,
     eval_logger_filters: dict,
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> Any:
     """Read an eval graph from the authoritative direct-write CH25 tables."""
     del property
@@ -156,6 +161,11 @@ def get_eval_graph_data(
 
         output_type = custom_eval_config.eval_template.config.get("output", "SCORE")
         choices = custom_eval_config.eval_template.choices or []
+        tenant_scope = {}
+        if organization_id is not None:
+            tenant_scope["organization_id"] = organization_id
+        if workspace_id is not None:
+            tenant_scope["workspace_id"] = workspace_id
         return fetch_eval_chart_series_ch(
             analytics=V2AnalyticsQueryService(),
             project_id=str(ch_project_id),
@@ -168,6 +178,7 @@ def get_eval_graph_data(
             },
             eval_name=custom_eval_config.name,
             refresh=refresh,
+            **tenant_scope,
         )
     except Exception as exc:
         logger.exception(
@@ -424,6 +435,8 @@ def _read_direct_system_metrics(
     filters: list[dict],
     interval: str,
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Execute the direct-write system-metric builder on the CH25 service."""
     try:
@@ -434,21 +447,29 @@ def _read_direct_system_metrics(
             V2AnalyticsQueryService,
         )
 
+        tenant_scope = {}
+        if organization_id is not None:
+            tenant_scope["organization_id"] = organization_id
+        if workspace_id is not None:
+            tenant_scope["workspace_id"] = workspace_id
         return fetch_all_system_metrics_ch(
             analytics=V2AnalyticsQueryService(),
             project_id=project_id,
             filters=filters,
             interval=interval,
             refresh=refresh,
+            **tenant_scope,
         )
     except Exception as exc:
         logger.exception(
             "ch_system_metric_graph_read_failed",
             error_type=type(exc).__name__,
         )
-        raise SystemMetricGraphReadError(
-            "System metric graph data is temporarily unavailable"
-        ) from None
+        if is_clickhouse_api_read_unavailable_error(exc):
+            raise SystemMetricGraphReadError(
+                "System metric graph data is temporarily unavailable"
+            ) from None
+        raise
 
 
 def get_all_system_metrics(
@@ -457,6 +478,8 @@ def get_all_system_metrics(
     property: str,
     system_metric_filters: dict,
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict:
     """Read latency, token, cost, and traffic series in one CH25 query."""
     del property
@@ -470,6 +493,8 @@ def get_all_system_metrics(
         filters=filters,
         interval=interval,
         refresh=refresh,
+        organization_id=organization_id,
+        workspace_id=workspace_id,
     )
     # Preserve the historical public response exactly; the shared builder also
     # exposes additional aliases used by newer dashboard endpoints.
@@ -675,6 +700,8 @@ def get_system_metric_data(
     system_metric_filters: dict,
     observe_type: str = "span",
     refresh: bool = False,
+    organization_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict:
     """Read one public system-metric series from direct-write CH25."""
     del property
@@ -695,6 +722,8 @@ def get_system_metric_data(
         filters=filters,
         interval=interval,
         refresh=refresh,
+        organization_id=organization_id,
+        workspace_id=workspace_id,
     )
     metric_key = metric_name if metric_name in metrics else "latency"
     traffic_by_timestamp = {

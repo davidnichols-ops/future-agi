@@ -89,7 +89,9 @@ def test_model_null_filters_include_empty_string_sentinel(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("operation", ["is_null", "is_not_null"])
-@pytest.mark.parametrize("compiler", [compile_span_filter_plans, compile_trace_filter_plans])
+@pytest.mark.parametrize(
+    "compiler", [compile_span_filter_plans, compile_trace_filter_plans]
+)
 def test_nullable_uuid_null_filters_do_not_compare_uuid_to_empty_string(
     compiler,
     operation,
@@ -108,7 +110,9 @@ def test_nullable_uuid_null_filters_do_not_compare_uuid_to_empty_string(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("operation", ["is_null", "is_not_null"])
-@pytest.mark.parametrize("compiler", [compile_span_filter_plans, compile_trace_filter_plans])
+@pytest.mark.parametrize(
+    "compiler", [compile_span_filter_plans, compile_trace_filter_plans]
+)
 def test_non_nullable_project_uuid_null_filters_do_not_compare_to_empty_string(
     compiler,
     operation,

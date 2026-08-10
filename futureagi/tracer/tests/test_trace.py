@@ -746,13 +746,16 @@ class TestTraceExportAPI:
         assert response.status_code == status.HTTP_400_BAD_REQUEST
 
     def test_export_traces_success(self, auth_client, project, trace, observation_span):
-        """Export traces for a project."""
+        """A bounded trace page must never be published as a complete export."""
         response = auth_client.get(
             "/tracer/trace/get_trace_export_data/",
             {"project_id": str(project.id)},
         )
-        # Can be 200 with data or 400 if no traces match filters
-        assert response.status_code in [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST]
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.json()["code"] == "service_unavailable"
+        assert response.json()["result"] == (
+            "A complete trace export is temporarily unavailable. Please retry later."
+        )
 
 
 def test_get_span_trace_map_selects_from_spans(monkeypatch):

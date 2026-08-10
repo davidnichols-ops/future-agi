@@ -1293,7 +1293,7 @@ class TestObservationSpanExportAPI:
     def test_export_spans_success(
         self, auth_client, project, project_version, trace, observation_span
     ):
-        """Export spans for a project version."""
+        """A bounded span page must never be published as a complete export."""
         # Associate span with project version
         observation_span.project_version = project_version
         observation_span.save()
@@ -1302,8 +1302,8 @@ class TestObservationSpanExportAPI:
             "/tracer/observation-span/get_spans_export_data/",
             {"project_version_id": str(project_version.id)},
         )
-        # Can be 200 with file or 400 if no spans
-        assert response.status_code in [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST]
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.json()["code"] == "service_unavailable"
 
 
 @pytest.mark.integration

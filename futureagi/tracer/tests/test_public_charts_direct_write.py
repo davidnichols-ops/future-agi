@@ -8,6 +8,7 @@ from unittest import mock
 from urllib.parse import urlencode
 
 import pytest
+from clickhouse_driver.errors import ServerException
 
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.models.observation_span import ObservationSpan
@@ -103,7 +104,9 @@ def test_single_system_metric_does_not_fall_back_or_expose_ch_error(
     analytics_cls,
     exact_metrics,
 ):
-    exact_metrics.side_effect = RuntimeError("secret ClickHouse host and stack")
+    exact_metrics.side_effect = ServerException(
+        "secret ClickHouse host and stack", code=159
+    )
 
     with mock.patch.object(ObservationSpan.objects, "filter") as pg_filter:
         with pytest.raises(SystemMetricGraphReadError) as exc_info:
@@ -119,6 +122,30 @@ def test_single_system_metric_does_not_fall_back_or_expose_ch_error(
     pg_filter.assert_not_called()
     assert str(exc_info.value) == "System metric graph data is temporarily unavailable"
     assert "secret ClickHouse host" not in str(exc_info.value)
+
+
+@pytest.mark.unit
+@mock.patch("tracer.services.clickhouse.graph_dispatch.fetch_all_system_metrics_ch")
+@mock.patch("tracer.services.clickhouse.v2.query_service.V2AnalyticsQueryService")
+def test_single_system_metric_preserves_unexpected_programming_error(
+    analytics_cls,
+    exact_metrics,
+):
+    del analytics_cls
+    exact_metrics.side_effect = RuntimeError("unexpected programming failure")
+
+    with mock.patch.object(ObservationSpan.objects, "filter") as pg_filter:
+        with pytest.raises(RuntimeError, match="unexpected programming failure"):
+            get_system_metric_data(
+                interval="day",
+                filters=[WINDOW_FILTER, FINAL_STATUS_FILTER],
+                property="average",
+                req_data_config={"id": "latency", "type": "SYSTEM_METRIC"},
+                system_metric_filters={"project_id": PROJECT_ID},
+                observe_type="charts",
+            )
+
+    pg_filter.assert_not_called()
 
 
 @pytest.mark.unit

@@ -355,7 +355,7 @@ def test_observation_span_export_fails_closed_before_paginated_list():
 
 
 @pytest.mark.unit
-def test_voice_export_fails_closed_before_legacy_postgres_exporter():
+def test_trace_export_fails_closed_before_any_telemetry_read():
     from tracer.views.trace import TraceView
 
     request = SimpleNamespace(query_params={})
@@ -366,14 +366,9 @@ def test_voice_export_fails_closed_before_legacy_postgres_exporter():
     serializer.is_valid.return_value = True
     serializer.validated_data = {"project_id": "project-1"}
 
-    project = SimpleNamespace(name="voice-project")
+    project = SimpleNamespace(name="project")
     project_queryset = MagicMock()
     project_queryset.filter.return_value.first.return_value = project
-
-    reader = MagicMock()
-    reader.has_root_spans_of_type.return_value = True
-    reader_context = MagicMock()
-    reader_context.__enter__.return_value = reader
 
     with (
         patch(
@@ -384,18 +379,13 @@ def test_voice_export_fails_closed_before_legacy_postgres_exporter():
             "tracer.views.trace._project_queryset_for_request",
             return_value=project_queryset,
         ),
-        patch(
-            "tracer.services.clickhouse.v2.get_reader",
-            return_value=reader_context,
-        ),
-        patch.object(view, "_export_voice_calls") as legacy_export,
+        patch.object(view, "list_traces_of_session") as list_traces,
     ):
         response = view.get_trace_export_data(request)
 
     assert response.status_code == 503
     assert response.data["code"] == "service_unavailable"
     assert response.data["result"] == (
-        "A complete voice call export is temporarily unavailable. Please retry later."
+        "A complete trace export is temporarily unavailable. Please retry later."
     )
-    reader.has_root_spans_of_type.assert_called_once_with("project-1", "conversation")
-    legacy_export.assert_not_called()
+    list_traces.assert_not_called()

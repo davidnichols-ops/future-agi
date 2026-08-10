@@ -33,6 +33,35 @@ EXACT_AGGREGATION_TASK_QUEUE = "exact_aggregation"
 EXACT_AGGREGATION_LEASE_RENEW_INTERVAL_SECONDS = 60
 
 
+def _reauthorize_exact_observe_project(identity: dict[str, Any]) -> None:
+    """Re-resolve the trusted tenant scope before any Observe ClickHouse read."""
+
+    from accounts.models import Organization, Workspace
+    from tracer.utils.workspace_scope import project_queryset_for_request
+
+    organization_id = identity.get("organization_id")
+    project_id = identity.get("project_id")
+    if not organization_id or not project_id:
+        raise ValueError("exact Observe tenant scope is unavailable")
+
+    organization = Organization.objects.get(id=organization_id)
+    workspace = None
+    workspace_id = identity.get("workspace_id")
+    if workspace_id:
+        workspace = Workspace.no_workspace_objects.get(
+            id=workspace_id,
+            organization=organization,
+            is_active=True,
+        )
+    scope_request = SimpleNamespace(
+        organization=organization,
+        workspace=workspace,
+        user=SimpleNamespace(organization=organization, workspace=workspace),
+    )
+    if not project_queryset_for_request(scope_request).filter(id=project_id).exists():
+        raise ValueError("exact Observe project scope is unavailable")
+
+
 def _renew_exact_refresh_lease_until_stopped(
     *,
     namespace: str,
@@ -66,6 +95,7 @@ def _observe_payload(namespace: str, identity: dict[str, Any]) -> Any:
     )
     from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 
+    _reauthorize_exact_observe_project(identity)
     analytics = V2AnalyticsQueryService()
     if namespace == "observe-agent-graph":
         return read_exact_agent_graph(

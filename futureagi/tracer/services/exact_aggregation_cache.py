@@ -25,7 +25,10 @@ from django.core.cache import cache
 
 logger = structlog.get_logger(__name__)
 
-_CACHE_VERSION = 1
+# Bump whenever a release changes exact-query semantics. Cache keys are shared
+# across deployments and snapshots live for up to 30 days, so reusing the old
+# namespace could otherwise serve results computed by pre-deploy code.
+_CACHE_VERSION = 2
 _DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60
 EXACT_AGGREGATION_ACTIVITY_TIMEOUT_SECONDS = 60 * 60
 EXACT_AGGREGATION_SCHEDULE_TO_START_TIMEOUT_SECONDS = 12 * 60 * 60

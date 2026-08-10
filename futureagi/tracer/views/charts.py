@@ -132,6 +132,8 @@ class ChartsView(GenericViewSet):
                 return self._gm.bad_request("Project does not exist")
 
             project_id = str(project.id)
+            organization_id = str(project.organization_id)
+            workspace_id = str(request.workspace.id)
 
             if data_type == "EVAL":
                 metric_data = get_eval_graph_data(
@@ -142,6 +144,8 @@ class ChartsView(GenericViewSet):
                     eval_logger_filters={"project_id": project_id},
                     observe_type="charts",
                     refresh=refresh,
+                    organization_id=organization_id,
+                    workspace_id=workspace_id,
                 )
 
             elif data_type == "SYSTEM_METRICS":
@@ -151,6 +155,8 @@ class ChartsView(GenericViewSet):
                     property=property,
                     system_metric_filters={"project_id": project_id},
                     refresh=refresh,
+                    organization_id=organization_id,
+                    workspace_id=workspace_id,
                 )
 
             elif data_type == "SYSTEM_METRIC":
@@ -162,6 +168,8 @@ class ChartsView(GenericViewSet):
                     system_metric_filters={"project_id": project_id},
                     observe_type="charts",
                     refresh=refresh,
+                    organization_id=organization_id,
+                    workspace_id=workspace_id,
                 )
 
             else:

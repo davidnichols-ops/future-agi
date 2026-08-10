@@ -3006,6 +3006,7 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             # pool and return a typed unavailable response on bounded read
             # failure; never rebuild telemetry from stale PostgreSQL rows.
             analytics = V2AnalyticsQueryService()
+            workspace_id = getattr(getattr(request, "workspace", None), "id", None)
             try:
                 if metric_type == "SYSTEM_METRIC":
                     graph = fetch_system_metric_graph_ch(
@@ -3016,6 +3017,12 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         metric_id=metric_id,
                         observe_type="span",
                         refresh=refresh,
+                        organization_id=(
+                            str(project.organization_id)
+                            if getattr(project, "organization_id", None)
+                            else None
+                        ),
+                        workspace_id=str(workspace_id) if workspace_id else None,
                     )
                 elif metric_type == "EVAL":
                     graph = fetch_eval_graph_ch(
@@ -3026,6 +3033,12 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         req_data_config=req_data_config,
                         observe_type="span",
                         refresh=refresh,
+                        organization_id=(
+                            str(project.organization_id)
+                            if getattr(project, "organization_id", None)
+                            else None
+                        ),
+                        workspace_id=str(workspace_id) if workspace_id else None,
                     )
                 else:
                     graph = fetch_annotation_graph_ch(
@@ -3036,6 +3049,12 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                         req_data_config=req_data_config,
                         observe_type="span",
                         refresh=refresh,
+                        organization_id=(
+                            str(project.organization_id)
+                            if getattr(project, "organization_id", None)
+                            else None
+                        ),
+                        workspace_id=str(workspace_id) if workspace_id else None,
                     )
                 graph = enforce_exact_graph_data_contract(graph)
                 if not graph_payload_is_publishable(
@@ -3641,9 +3660,10 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             if not serializer.is_valid():
                 return self._gm.bad_request(serializer.errors)
 
-            # Observe span reads are intentionally bounded and paginated. Until an
-            # exact ClickHouse export collector exists, exporting that first page
-            # would silently produce an incomplete CSV.
+            # Span reads are intentionally bounded and paginated. Until an exact
+            # ClickHouse export collector exists, exporting a list page would
+            # silently produce an incomplete CSV. The retired PostgreSQL export
+            # path must not be used because direct-write CH25 owns telemetry.
             return self._gm.custom_error_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "A complete span export is temporarily unavailable. Please retry later.",
@@ -3654,7 +3674,11 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
             logger.exception(
                 "observation_span_export_failed", error_type=type(exc).__name__
             )
-            return self._gm.bad_request("Span export could not be generated")
+            return self._gm.custom_error_response(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Span export could not be generated",
+                code="server_error",
+            )
 
     @validated_request(request_serializer=AddObservationSpanAnnotationsSerializer)
     @action(detail=False, methods=["post"])

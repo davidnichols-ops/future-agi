@@ -62,11 +62,31 @@ VOICE_NUM_SPEC: list[tuple] = [
     ("agent_latency", "avg_agent_latency_ms", lambda i: float(500 + i * 25), "int"),
     ("ai_interruptions", "ai_interruption_count", lambda i: float(i % 4), "int"),
     ("user_interruptions", "user_interruption_count", lambda i: float(i % 5), "int"),
-    ("ai_interruption_rate", "ai_interruption_rate", lambda i: round((i % 8) / 10.0 + 0.03, 4), "raw"),
-    ("user_interruption_rate", "user_interruption_rate", lambda i: round((i % 10) / 10.0 + 0.05, 4), "raw"),
-    ("stop_time_after_interruption", "avg_stop_time_after_interruption_ms", lambda i: float(100 + i * 10), "raw"),
+    (
+        "ai_interruption_rate",
+        "ai_interruption_rate",
+        lambda i: round((i % 8) / 10.0 + 0.03, 4),
+        "raw",
+    ),
+    (
+        "user_interruption_rate",
+        "user_interruption_rate",
+        lambda i: round((i % 10) / 10.0 + 0.05, 4),
+        "raw",
+    ),
+    (
+        "stop_time_after_interruption",
+        "avg_stop_time_after_interruption_ms",
+        lambda i: float(100 + i * 10),
+        "raw",
+    ),
     ("total_cost", "cost_breakdown.total", lambda i: round(0.01 * (i + 1), 4), "raw"),
-    ("customer_cost", "cost_breakdown.total", lambda i: round(0.01 * (i + 1), 4), "raw"),
+    (
+        "customer_cost",
+        "cost_breakdown.total",
+        lambda i: round(0.01 * (i + 1), 4),
+        "raw",
+    ),
     ("llm_cost", "cost_breakdown.llm", lambda i: round(0.005 * (i + 1), 4), "raw"),
     ("stt_cost", "cost_breakdown.stt", lambda i: round(0.002 * (i + 1), 4), "raw"),
     ("tts_cost", "cost_breakdown.tts", lambda i: round(0.003 * (i + 1), 4), "raw"),
@@ -92,7 +112,11 @@ VOICE_NUM_SPEC: list[tuple] = [
 # (col_id, seed_key, formula)
 _PERSONA = ["formal", "casual", "curt"]
 VOICE_STR_SPEC: list[tuple] = [
-    ("ended_reason", "ended_reason", lambda i: "customer-ended-call" if i % 2 == 0 else "exceeded-max-duration"),
+    (
+        "ended_reason",
+        "ended_reason",
+        lambda i: "customer-ended-call" if i % 2 == 0 else "exceeded-max-duration",
+    ),
     # call.status is stored raw ('ended'); the voice-list matrix filters the
     # normalized public value ('completed'). call_type is seeded below but
     # SKIPPED by the matrix (its filter reads raw_log.type, not this key).
@@ -100,7 +124,11 @@ VOICE_STR_SPEC: list[tuple] = [
     ("call_type", "call_type", lambda i: "inbound" if i % 2 == 0 else "outbound"),
     # fallback string metrics — seeded under the FE col_id key.
     ("scenario", "scenario", lambda i: ["refund", "billing", "support"][i % 3]),
-    ("scenario_type", "scenario_type", lambda i: "inbound" if i % 2 == 0 else "outbound"),
+    (
+        "scenario_type",
+        "scenario_type",
+        lambda i: "inbound" if i % 2 == 0 else "outbound",
+    ),
     ("simulation", "simulation", lambda i: f"sim_{i % 3}"),
     ("run_test", "run_test", lambda i: f"run_{i % 4}"),
     ("test_execution", "test_execution", lambda i: f"exec_{i % 3}"),
@@ -114,13 +142,25 @@ VOICE_STR_SPEC: list[tuple] = [
     ("persona", "persona", lambda i: _PERSONA[i % 3]),
     ("persona_gender", "persona_gender", lambda i: ["male", "female"][i % 2]),
     ("persona_accent", "persona_accent", lambda i: ["us", "uk", "in"][i % 3]),
-    ("persona_age_group", "persona_age_group", lambda i: ["18-25", "26-40", "40+"][i % 3]),
+    (
+        "persona_age_group",
+        "persona_age_group",
+        lambda i: ["18-25", "26-40", "40+"][i % 3],
+    ),
     ("persona_language", "persona_language", lambda i: ["en", "es"][i % 2]),
     ("persona_location", "persona_location", lambda i: ["us", "eu"][i % 2]),
     ("persona_profession", "persona_profession", lambda i: ["eng", "sales"][i % 2]),
     ("persona_personality", "persona_personality", lambda i: _PERSONA[i % 3]),
-    ("persona_communication_style", "persona_communication_style", lambda i: _PERSONA[i % 3]),
-    ("persona_conversation_speed", "persona_conversation_speed", lambda i: ["slow", "fast"][i % 2]),
+    (
+        "persona_communication_style",
+        "persona_communication_style",
+        lambda i: _PERSONA[i % 3],
+    ),
+    (
+        "persona_conversation_speed",
+        "persona_conversation_speed",
+        lambda i: ["slow", "fast"][i % 2],
+    ),
 ]
 
 # stored_key -> formula (deduped) for the seeder.

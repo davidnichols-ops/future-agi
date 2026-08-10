@@ -516,6 +516,11 @@ def test_exact_aggregation_worker_routes_agent_graph_without_interval(monkeypatc
     reader = MagicMock(return_value=_complete_payload())
     monkeypatch.setattr(query_service, "V2AnalyticsQueryService", lambda: analytics)
     monkeypatch.setattr(exact_graph_reads, "read_exact_agent_graph", reader)
+    monkeypatch.setattr(
+        exact_aggregation,
+        "_reauthorize_exact_observe_project",
+        lambda _identity: None,
+    )
 
     payload = exact_aggregation._observe_payload(
         "observe-agent-graph",

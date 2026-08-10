@@ -199,9 +199,7 @@ def test_system_values_cursor_exhausts_dense_slice_without_duplicates():
 def test_system_values_cursor_uses_exact_count_only_state_past_4096():
     class Analytics:
         def execute_ch_query(self, _query, _params, **_kwargs):
-            return SimpleNamespace(
-                data=[{"val": "completed"}, {"val": "new-status"}]
-            )
+            return SimpleNamespace(data=[{"val": "completed"}, {"val": "new-status"}])
 
     completed_digest = _value_digest("completed")
     read = read_span_system_filter_value_cursor_page(

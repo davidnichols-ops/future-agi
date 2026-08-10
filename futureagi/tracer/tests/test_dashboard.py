@@ -2483,8 +2483,7 @@ class TestMetricsEndpoint:
             resource="dashboard_system_filter_values",
             binding=state_binding,
             validate_digest=lambda value: (
-                len(value) == 32
-                and all(char in "0123456789abcdef" for char in value)
+                len(value) == 32 and all(char in "0123456789abcdef" for char in value)
             ),
         )
         cursor = encode_list_cursor(
@@ -2519,9 +2518,7 @@ class TestMetricsEndpoint:
 
         assert response.status_code == 200
         payload = response.json()["result"]
-        assert payload["values"] == [
-            {"value": "new-status", "label": "new-status"}
-        ]
+        assert payload["values"] == [{"value": "new-status", "label": "new-status"}]
         assert payload["has_more"] is True
         continued = decode_list_cursor(
             payload["next_cursor"],
@@ -2536,8 +2533,7 @@ class TestMetricsEndpoint:
             resource="dashboard_system_filter_values",
             binding=state_binding,
             validate_digest=lambda value: (
-                len(value) == 32
-                and all(char in "0123456789abcdef" for char in value)
+                len(value) == 32 and all(char in "0123456789abcdef" for char in value)
             ),
         )
         assert continued_state.seen_count == ATTRIBUTE_CURSOR_STATE_MAX_DIGESTS + 2

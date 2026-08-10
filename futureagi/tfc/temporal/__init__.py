@@ -67,7 +67,7 @@ def get_queue_name(celery_style_name: str) -> str:
 # =============================================================================
 
 # Client functions
-from tfc.temporal.common.client import (
+from tfc.temporal.common.client import (  # noqa: E402
     cancel_workflow_async,
     cancel_workflow_sync,
     get_client,
@@ -79,7 +79,7 @@ from tfc.temporal.common.client import (
 )
 
 # Registry functions
-from tfc.temporal.common.registry import (
+from tfc.temporal.common.registry import (  # noqa: E402
     get_activities_for_queue,
     get_all_queues,
     get_registry_info,
@@ -90,16 +90,16 @@ from tfc.temporal.common.registry import (
 )
 
 # Worker functions
-from tfc.temporal.common.worker import run_worker, start_worker
+from tfc.temporal.common.worker import run_worker, start_worker  # noqa: E402
 
 # Compat functions
-from tfc.temporal.compat import (
+from tfc.temporal.compat import (  # noqa: E402
     get_temporal_client,
     get_workflows_and_activities_for_queue,
 )
 
 # Drop-in replacement functions
-from tfc.temporal.drop_in import (
+from tfc.temporal.drop_in import (  # noqa: E402
     TaskRunnerWorkflow,
     get_drop_in_activities,
     get_drop_in_workflows,
@@ -110,7 +110,7 @@ from tfc.temporal.drop_in import (
 )
 
 # Schedule functions
-from tfc.temporal.schedules import (
+from tfc.temporal.schedules import (  # noqa: E402
     ALL_SCHEDULES,
     MODEL_HUB_SCHEDULES,
     TRACER_SCHEDULES,
