@@ -1051,6 +1051,14 @@ class TestActivateAccountRateLimit:
     """Rate-limit boundary tests for GET /accounts/activate/<uidb64>/<token>/."""
 
     @pytest.fixture(autouse=True)
+    def _non_oss(self):
+        # The IP rate limit is skipped entirely in OSS mode (TH-7179), and
+        # this repo's test environment defaults to OSS — pin non-OSS so the
+        # blocking behavior stays exercised.
+        with patch("accounts.views.signup.is_oss", return_value=False):
+            yield
+
+    @pytest.fixture(autouse=True)
     def _clear_rate_limit_cache(self):
         yield
         from django.core.cache import cache
@@ -1136,6 +1144,24 @@ class TestActivateAccountRateLimit:
         )
         # First IP in X-Forwarded-For is used for rate limiting
         assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+    def test_rate_limit_skipped_in_oss_mode(self, api_client, db):
+        """OSS mode skips IP rate limiting — all traffic shares one IP (TH-7179)."""
+        from django.core.cache import cache
+
+        user = self._inactive_user(db)
+        url = self._activation_url(user)
+        ip = "10.20.30.1"
+        cache.set(f"activate_account_rate:{ip}", 10, timeout=60)
+
+        with patch("accounts.views.signup.is_oss", return_value=True):
+            response = api_client.get(url, REMOTE_ADDR=ip)
+
+        assert response.status_code == status.HTTP_200_OK
+        user.refresh_from_db()
+        assert user.is_active is True
+        # OSS mode must not touch the rate-limit counter either
+        assert cache.get(f"activate_account_rate:{ip}") == 10
 
 
 @pytest.mark.integration
