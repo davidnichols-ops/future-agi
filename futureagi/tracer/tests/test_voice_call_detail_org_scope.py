@@ -294,7 +294,7 @@ def test_list_returns_sanitized_server_error_for_unexpected_failure(
         raise RuntimeError("private compiler state and SQL")
 
     monkeypatch.setattr(
-        "tracer.views.trace.TraceViewSet._list_voice_calls_clickhouse",
+        "tracer.views.trace.TraceView._list_voice_calls_clickhouse",
         fail_with_private_detail,
     )
 

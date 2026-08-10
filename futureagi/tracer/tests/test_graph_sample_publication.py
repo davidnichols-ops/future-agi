@@ -107,7 +107,13 @@ def test_project_system_graph_view_fails_closed_without_opt_in(monkeypatch):
         project_view, "get_all_system_metrics", lambda **_kwargs: sample
     )
     view = project_view.ProjectView()
-    monkeypatch.setattr(view, "_get_project_in_scope", lambda _project_id: object())
+    monkeypatch.setattr(
+        view,
+        "_get_project_in_scope",
+        lambda _project_id: SimpleNamespace(
+            organization_id="22222222-2222-4222-8222-222222222222"
+        ),
+    )
 
     def call(allow_sampled):
         request = SimpleNamespace(
@@ -136,7 +142,13 @@ def test_users_aggregate_graph_view_fails_closed_without_opt_in(monkeypatch):
         lambda **_kwargs: _sampled_series(metric_name="annotation-id"),
     )
     view = project_view.ProjectView()
-    monkeypatch.setattr(view, "_get_project_in_scope", lambda _project_id: object())
+    monkeypatch.setattr(
+        view,
+        "_get_project_in_scope",
+        lambda _project_id: SimpleNamespace(
+            organization_id="22222222-2222-4222-8222-222222222222"
+        ),
+    )
 
     def call(allow_sampled):
         request = SimpleNamespace(
@@ -170,7 +182,10 @@ def test_public_charts_view_fails_closed_without_opt_in(monkeypatch):
     monkeypatch.setattr(
         charts_view.Project.objects,
         "get",
-        lambda **_kwargs: SimpleNamespace(id="11111111-1111-4111-8111-111111111111"),
+        lambda **_kwargs: SimpleNamespace(
+            id="11111111-1111-4111-8111-111111111111",
+            organization_id="22222222-2222-4222-8222-222222222222",
+        ),
     )
     monkeypatch.setattr(
         charts_view,
@@ -193,7 +208,7 @@ def test_public_charts_view_fails_closed_without_opt_in(monkeypatch):
                 "req_data_config": {"id": "latency", "type": "SYSTEM_METRIC"},
                 "allow_sampled": allow_sampled,
             },
-            workspace=object(),
+            workspace=SimpleNamespace(id="33333333-3333-4333-8333-333333333333"),
         )
         view.request = request
         return unwrap(charts_view.ChartsView.fetch_graph)(view, request)
@@ -209,7 +224,10 @@ def test_session_graph_view_fails_closed_without_opt_in_and_clears_points(
     from tracer.views import trace_session as session_view
 
     project_scope = MagicMock()
-    project_scope.get.return_value = SimpleNamespace(trace_type="observe")
+    project_scope.get.return_value = SimpleNamespace(
+        trace_type="observe",
+        organization_id="22222222-2222-4222-8222-222222222222",
+    )
     monkeypatch.setattr(
         session_view,
         "_project_queryset_for_request",

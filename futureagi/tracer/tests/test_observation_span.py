@@ -357,7 +357,7 @@ class TestObservationSpanWorkspaceScopeAPI:
         )
 
         assert list_response.status_code == status.HTTP_400_BAD_REQUEST
-        assert export_response.status_code == status.HTTP_400_BAD_REQUEST
+        assert export_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
         assert graph_response.status_code == status.HTTP_400_BAD_REQUEST
         assert index_response.status_code == status.HTTP_400_BAD_REQUEST
 
@@ -1300,7 +1300,7 @@ class TestObservationSpanExportAPI:
 
         response = auth_client.get(
             "/tracer/observation-span/get_spans_export_data/",
-            {"project_version_id": str(project_version.id)},
+            {"project_id": str(project.id)},
         )
         assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
         assert response.json()["code"] == "service_unavailable"
