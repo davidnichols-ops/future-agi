@@ -68,7 +68,7 @@ const VOICE_ROWS = [
 const noop = () => {};
 
 describe("ViewFullTranscript", () => {
-  it("renders chat rows, reading the turn body from messages[0]", () => {
+  it("renders chat rows, reading the turn body from the message list", () => {
     render(
       <ViewFullTranscript
         open
@@ -100,6 +100,85 @@ describe("ViewFullTranscript", () => {
     expect(
       screen.getByText("I would like to check my order."),
     ).toBeInTheDocument();
+  });
+
+  it("does not render fake durations or interrupt badges for chat", () => {
+    render(
+      <ViewFullTranscript
+        open
+        onClose={noop}
+        transcript={CHAT_ROWS}
+        simulationCallType="text"
+      />,
+    );
+
+    expect(screen.queryByText(/interrupt/i)).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/\d+\.\d\s*s/);
+  });
+
+  it("still renders durations for voice", () => {
+    render(
+      <ViewFullTranscript
+        open
+        onClose={noop}
+        transcript={VOICE_ROWS}
+        simulationCallType="voice"
+      />,
+    );
+
+    // Voice timings are real, so the per-turn duration chip stays.
+    expect(document.body.textContent).toMatch(/\d+\.\d\s*s/);
+  });
+
+  // Real row from a chat sim: the agent's reply carries a `cancel_order` tool
+  // call, and the tool result is a second entry in the same row's `content`.
+  // Neither appears in `messages`, so both are lost unless the raw list is
+  // carried through the flattening in `turns`.
+  const CHAT_ROW_WITH_TOOLS = [
+    {
+      id: "e9d7f5f2",
+      role: "assistant",
+      messages: ["I've submitted a cancellation request for your order 499-20A!"],
+      content: [
+        {
+          role: "assistant",
+          content:
+            "I've submitted a cancellation request for your order 499-20A!",
+          tool_calls: [
+            {
+              id: "call_fbXjmMbOqdUwRnr4qvOsCO3Y",
+              type: "function",
+              function: {
+                name: "cancel_order",
+                arguments: '{"order_id":"499-20A"}',
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: "{'ok': True, 'request_id': 'CAN-98411'}",
+          tool_call_id: "call_fbXjmMbOqdUwRnr4qvOsCO3Y",
+        },
+      ],
+      session_id: "a630253d",
+      tool_calls: [],
+      created_at: "2026-01-27T13:06:50.188584Z",
+    },
+  ];
+
+  it("renders tool calls and tool results nested in a chat row", () => {
+    render(
+      <ViewFullTranscript
+        open
+        onClose={noop}
+        transcript={CHAT_ROW_WITH_TOOLS}
+        simulationCallType="text"
+      />,
+    );
+
+    expect(screen.getByText(/cancel_order/)).toBeInTheDocument();
+    expect(screen.getByText(/CAN-98411/)).toBeInTheDocument();
   });
 
   it("shows the empty state instead of crashing when transcript is missing", () => {

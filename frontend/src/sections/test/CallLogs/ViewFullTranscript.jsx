@@ -57,6 +57,8 @@ const ViewFullTranscript = ({
       return {
         ...item,
         content,
+
+        rawMessages: Array.isArray(item.content) ? item.content : null,
         ...(ts != null ? { startTimeSeconds: ts } : {}),
         ...(existingDuration == null ? { duration: countWords(content) } : {}),
       };
@@ -84,6 +86,8 @@ const ViewFullTranscript = ({
               hideTalkRatioLabel={isChat}
               hideTalkRatioPercentages={isChat}
               hideSilenceMarkers={isChat}
+              hideTurnDurations={isChat}
+              hideInterruptBadges={isChat}
             />
           )}
         </Box>

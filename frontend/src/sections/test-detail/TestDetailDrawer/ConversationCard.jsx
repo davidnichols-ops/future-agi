@@ -61,7 +61,7 @@ const ConversationCard = ({
   // Check if content is JSON and parse it
   const isJsonContent = useMemo(() => isJsonValue(content), [content]);
 
-  const toolMessages = useMemo(
+  const rawMessages = useMemo(
     () => (Array.isArray(rawContent) ? rawContent : []),
     [rawContent],
   );
@@ -178,9 +178,9 @@ const ConversationCard = ({
           </Typography>
         </Box>
         {renderContent()}
-        <ShowComponent condition={toolMessages.length > 0}>
+        <ShowComponent condition={rawMessages.length > 0}>
           <Stack spacing={0.5} sx={{ mt: 0.5 }}>
-            {toolMessages.flatMap((message, index) => {
+            {rawMessages.flatMap((message, index) => {
               if (message.role === "tool") {
                 return [
                   <ToolResultCard
